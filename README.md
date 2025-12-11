@@ -76,8 +76,8 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 
 ### Prerequisites
 * Hardware
-  * NVIDIA GPU with CUDA Compute Capability 8.0, 8.6, or later
-  * x86_64 architecture
+  * NVIDIA GPU with CUDA Compute Capability 8.0, 8.6, 9.0 or later
+  * x86_64 / ARM architecture
 * Software
   * C++ 17 or later
   * CMake 3.31 or later
