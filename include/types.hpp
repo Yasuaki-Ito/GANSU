@@ -161,6 +161,15 @@ inline real_t angstrom_to_bohr(const real_t angstrom){
 }
 
 /**
+ * @brief Constant values
+ */
+
+inline real_t bohr_to_angstrom(const real_t bohr){
+    const real_t b_to_a = 0.529177210903; ///< 1 bohr = 0.529177210903 angstrom
+    return bohr * b_to_a;
+}
+
+/**
  * @brief Shell type info in the primitive shell list
  */
 struct ShellTypeInfo {

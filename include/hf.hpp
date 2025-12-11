@@ -325,7 +325,13 @@ protected:
     */
     virtual std::vector<real_t> analyze_mulliken_population() const = 0;
 
-
+    /**
+     * @brief Compute Mayer bond order
+     * @returns Mayer bond order matrix
+     * @details This function computes the Mayer bond order.
+     * @details This function is a virtual function and must be implemented in the derived class.
+    */
+    virtual std::vector<std::vector<real_t>> compute_mayer_bond_order() const = 0;
 
 
 public:

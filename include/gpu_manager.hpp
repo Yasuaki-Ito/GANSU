@@ -86,9 +86,10 @@ void computeSchwarzUpperBounds(const std::vector<ShellTypeInfo>& shell_type_info
 void computeAuxiliarySchwarzUpperBounds(const std::vector<ShellTypeInfo>& shell_aux_type_infos, const PrimitiveShell* d_primitive_shells_aux, const real_t* d_boys_grid, const real_t* d_cgto_aux_normalization_factors, real_t* d_upper_bound_factors_aux, const bool verbose);
 
 
-void computeMullikenPopulation_RHF(const real_t* d_density_matrix, const real_t* overlap_matrix, real_t* mulliken_population_basis, const int num_basis);
+void computeMullikenPopulation_RHF(const real_t* d_density_matrix, const real_t* d_overlap_matrix, real_t* mulliken_population_basis, const int num_basis);
 void computeMullikenPopulation_UHF(const real_t* d_density_matrix_a, const real_t* d_density_matrix_b, const real_t* overlap_matrix, real_t* mulliken_population_basis, const int num_basis);
 
+void computeDensityOverlapMatrix(const real_t* d_density_matrix, const real_t* overlap_matrix, real_t* result_matrix, const int num_basis); // for Mayer bond order
 
 void constructERIHash(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors, /* Hash memoryへのポインタ, */ const bool verbose);
 void computeFockMatrix_Hash_RHF(const real_t* d_density_matrix, const real_t* d_core_hamiltonian_matrix, /* Hash memoryへのポインタ, */ real_t* d_fock_matrix, const int num_basis, const int verbose);

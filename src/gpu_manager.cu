@@ -2174,7 +2174,7 @@ void computeFockMatrix_Direct_RHF(
 
 void computeMullikenPopulation_RHF(
         const real_t* d_density_matrix,
-        const real_t* overlap_matrix,
+        const real_t* d_overlap_matrix,
         real_t* mulliken_population_basis,
         const int num_basis
     )
@@ -2193,7 +2193,7 @@ void computeMullikenPopulation_RHF(
     const size_t num_blocks = (num_basis + threads_per_block - 1) / threads_per_block;
     compute_diagonal_of_product<<<num_blocks, threads_per_block>>>(
         d_density_matrix, 
-        overlap_matrix, 
+        d_overlap_matrix, 
         d_mulliken_population, 
         num_basis
     );
@@ -2237,6 +2237,32 @@ void computeMullikenPopulation_UHF(
 
     // Free the memory for the temporary matrix
     cudaFree(d_mulliken_population);
+}
+
+
+void computeDensityOverlapMatrix(
+        const real_t* d_density_matrix,
+        const real_t* d_overlap_matrix,
+        real_t* result_matrix,
+        const int num_basis
+    )
+{
+    cudaError_t err;
+
+    real_t* d_result_matrix = nullptr;
+    err = cudaMalloc(&d_result_matrix, num_basis * num_basis * sizeof(real_t));
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for Density-Overlap-Matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+
+    // result_matrix = D * S
+    matrixMatrixProduct(d_density_matrix, d_overlap_matrix, d_result_matrix, num_basis, false, false);
+
+    // Data transfer to host
+    cudaMemcpy(result_matrix, d_result_matrix, num_basis * num_basis * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+    // Free the memory for the temporary matrix
+    cudaFree(d_result_matrix);
 }
 
 

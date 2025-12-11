@@ -410,7 +410,7 @@ void HF::report(){
         std::cout << "[Molecule Summary]" << std::endl;
         std::cout << "Number of atoms: " << atoms.size() << std::endl;
         for(size_t i=0; i<atoms.size(); i++){
-            std::cout << "Atom " << i+1 << ": " << atomic_number_to_element_name(atoms[i].atomic_number) << " (" << atoms[i].coordinate.x << ", " << atoms[i].coordinate.y << ", " << atoms[i].coordinate.z << ")" << std::endl;
+            std::cout << "Atom " << i << ": " << atomic_number_to_element_name(atoms[i].atomic_number) << " (" << atoms[i].coordinate.x << ", " << atoms[i].coordinate.y << ", " << atoms[i].coordinate.z << ")" << std::endl;
         }
     }
     std::cout << "Number of electrons: " << num_electrons << std::endl;
