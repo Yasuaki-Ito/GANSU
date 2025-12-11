@@ -47,6 +47,8 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
         * Tested by [Avogadro](https://avogadro.cc/) and [Pegamoid](https://github.com/Jellby/Pegamoid) 
       ![Orbital](/doc/images/orbital.png)
       *Resulting molecular orbital of Benzene*
+* etc.
+  * Mayer bond order (RHF, UHF, ROHF)
     
 ### Todo / Not Implemented yet
 * Convergence algorithms
