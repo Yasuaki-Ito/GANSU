@@ -42,7 +42,9 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Boys function
 * Charge analysis
     * Mulliken population analysis (RHF, UHF, ROHF)
-* Mayer bond order (RHF, UHF, ROHF)
+* Bond order analysis
+    * Mayer bond order (RHF, UHF, ROHF)
+    * Wiberg bond order (RHF, UHF, ROHF)
 * Export
     * Export wave function information in the Molden format for visualization
         * Tested by [Avogadro](https://avogadro.cc/) and [Pegamoid](https://github.com/Jellby/Pegamoid) 
