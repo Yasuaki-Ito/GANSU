@@ -31,6 +31,7 @@ namespace gansu::gpu{
 
 // prototype declarations
 void invertSqrtElements(real_t* d_vectors, const size_t size, const double threshold=1e-6);
+void sqrtElements(real_t* d_vectors, const size_t size);
 void transposeMatrixInPlace(real_t* d_matrix, const int size);
 void makeDiagonalMatrix(const real_t* d_vector, real_t* d_matrix, const int size);
 real_t computeMatrixTrace(const real_t* d_matrix, const int size);
@@ -89,7 +90,9 @@ void computeAuxiliarySchwarzUpperBounds(const std::vector<ShellTypeInfo>& shell_
 void computeMullikenPopulation_RHF(const real_t* d_density_matrix, const real_t* d_overlap_matrix, real_t* mulliken_population_basis, const int num_basis);
 void computeMullikenPopulation_UHF(const real_t* d_density_matrix_a, const real_t* d_density_matrix_b, const real_t* overlap_matrix, real_t* mulliken_population_basis, const int num_basis);
 
-void computeDensityOverlapMatrix(const real_t* d_density_matrix, const real_t* overlap_matrix, real_t* result_matrix, const int num_basis); // for Mayer/Wiberg bond order
+void computeDensityOverlapMatrix(const real_t* d_density_matrix, const real_t* overlap_matrix, real_t* result_matrix, const int num_basis); // for Mayer bond order
+
+void computeSqrtOverlapDensitySqrtOverlapMatrix(const real_t* d_density_matrix, const real_t* overlap_matrix, real_t* result_matrix, const int num_basis); // for Wiberg bond order (RHF, ROHF)
 
 
 void constructERIHash(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors, /* Hash memoryへのポインタ, */ const bool verbose);

@@ -339,7 +339,7 @@ protected:
      * @details This function computes the Wiberg bond order.
      * @details This function is a virtual function and must be implemented in the derived class.
     */
-    virtual std::vector<std::vector<real_t>> compute_wiberg_bond_order() const = 0;
+    virtual std::vector<std::vector<real_t>> compute_wiberg_bond_order() = 0;
 
 public:
 

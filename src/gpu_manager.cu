@@ -260,6 +260,20 @@ void invertSqrtElements(real_t* d_vectors, const size_t size, const double thres
 }
 
 /**
+ * @brief Computes the square root of the vector.
+ * 
+ * This function computes the root of each value of the vector.
+ * 
+ * @param d_vectors Device pointer to the vector.
+ * @param size Number of the vector.
+ */
+void sqrtElements(real_t* d_vectors, const size_t size) {
+    size_t blockSize = 256;
+    size_t numBlocks = (size + blockSize - 1) / blockSize;
+    sqrt_kernel<<<numBlocks, blockSize>>>(d_vectors, size);
+}
+
+/**
  * @brief Transpose a matrix in place.
  * @param d_matrix Device pointer to the matrix
  * @param size Size of the matrix (size x size)
@@ -2264,6 +2278,83 @@ void computeDensityOverlapMatrix(
     // Free the memory for the temporary matrix
     cudaFree(d_result_matrix);
 }
+
+void computeSqrtOverlapDensitySqrtOverlapMatrix(
+        const real_t* d_density_matrix,
+        const real_t* d_sqrt_overlap_matrix,
+        real_t* result_matrix,
+        const int num_basis
+    )
+{
+    cudaError_t err;
+
+    // Compute the intermediate matrix: temp_matrix = S^(1/2) * D * S^(1/2)
+
+    // Eigen decomposition of the overlap matrix S = U * diag(eigval) * U^T
+    real_t* d_eigval = nullptr;
+    err = cudaMalloc(&d_eigval, sizeof(real_t)*num_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for eigen values: ") + std::string(cudaGetErrorString(err)));
+    }
+    real_t* d_eigvec = nullptr;
+    err = cudaMalloc(&d_eigvec, sizeof(real_t)*num_basis*num_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for eigen vectors: ") + std::string(cudaGetErrorString(err)));
+    }
+    gpu::eigenDecomposition(d_sqrt_overlap_matrix, d_eigval, d_eigvec, num_basis);
+
+
+    // Compute diag(eigval)^(1/2)
+    gpu::sqrtElements(d_eigval, num_basis);
+
+
+    // Make diag(eigval)^(1/2) matrix
+    real_t* d_sqrt_eigval_matrix = nullptr;
+    err = cudaMalloc(&d_sqrt_eigval_matrix, sizeof(real_t)*num_basis*num_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for sqrt eigen value matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+    gpu::makeDiagonalMatrix(d_eigval, d_sqrt_eigval_matrix, num_basis);
+
+    // temp_matrix = U * diag(eigval)^(1/2) * U^T
+    real_t* d_temp_matrix = nullptr;
+    err = cudaMalloc(&d_temp_matrix, sizeof(real_t)*num_basis*num_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+    // temp_matrix = U * diag(eigval)^(1/2)
+    gpu::matrixMatrixProduct(d_eigvec, d_sqrt_eigval_matrix, d_temp_matrix, num_basis, false, false);
+    // S_sqrt = temp_matrix * U^T
+    real_t* d_S_sqrt = nullptr;
+    err = cudaMalloc(&d_S_sqrt, sizeof(real_t)*num_basis*num_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for S_sqrt matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+    gpu::matrixMatrixProduct(d_temp_matrix, d_eigvec, d_S_sqrt, num_basis, false, true);
+
+    // result_matrix = S^(1/2) * D * S^(1/2)
+    real_t* d_result_matrix = nullptr;
+    err = cudaMalloc(&d_result_matrix, sizeof(real_t)*num_basis*num_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for result matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+    gpu::matrixMatrixProduct(d_S_sqrt, d_density_matrix, d_temp_matrix, num_basis, false, false);
+    gpu::matrixMatrixProduct(d_temp_matrix, d_S_sqrt, d_result_matrix, num_basis, false, false);
+
+    // Data transfer to host
+    cudaMemcpy(result_matrix, d_result_matrix, sizeof(real_t)*num_basis*num_basis, cudaMemcpyDeviceToHost);
+
+    // Free the memory for the temporary matrices
+    cudaFree(d_eigval);
+    cudaFree(d_eigvec);
+    cudaFree(d_sqrt_eigval_matrix);
+    cudaFree(d_temp_matrix);
+    cudaFree(d_S_sqrt);
+    cudaFree(d_result_matrix);
+
+}
+
+
 
 
 void constructERIHash(

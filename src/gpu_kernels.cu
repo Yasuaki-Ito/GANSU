@@ -38,6 +38,23 @@ namespace gansu::gpu{
     }
 }
 
+/**
+ * @brief CUDA kernel for square root for individual values of input vectors
+ * @param d_eigenvalues Device pointer storing the eigenvalues as a vector
+ * @param size Size of the input vector
+ * @param threshold Threshold value to avoid negative square roots or zero
+ * @details This function computes the square root of each element of the input vector.
+ *         The input vector is modified in place.
+ */
+ __global__ void sqrt_kernel(real_t* d_eigenvalues, const size_t size, const double threshold) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        if(d_eigenvalues[idx] < threshold){
+            d_eigenvalues[idx] = threshold; // Avoid negative square roots or zero
+        }
+        d_eigenvalues[idx] = __dsqrt_rn(d_eigenvalues[idx]);
+    }
+}
 
 
 

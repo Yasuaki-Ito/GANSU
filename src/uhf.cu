@@ -555,22 +555,22 @@ std::vector<std::vector<real_t>> UHF::compute_mayer_bond_order() const{
 
 
 
-std::vector<std::vector<real_t>> UHF::compute_wiberg_bond_order() const{
+std::vector<std::vector<real_t>> UHF::compute_wiberg_bond_order() {
     std::vector<std::vector<real_t>> wiberg_bond_order_matrix(atoms.size(), std::vector<real_t>(atoms.size(), 0.0));
 
-    std::vector<real_t> temp_matrix_a(num_basis * num_basis, 0.0); // temporary matrix to store DS (product of density and overlap matrices) for alpha spin
-    std::vector<real_t> temp_matrix_b(num_basis * num_basis, 0.0); // temporary matrix to store DS (product of density and overlap matrices) for beta spin
+    std::vector<real_t> temp_matrix_a(num_basis * num_basis, 0.0); // temporary matrix to store S^{1/2} * D * S^{1/2}
+    std::vector<real_t> temp_matrix_b(num_basis * num_basis, 0.0); // temporary matrix to store S^{1/2} * D * S^{1/2}
 
-    // calculate the product of density and overlap matrices
-    gpu::computeDensityOverlapMatrix(
-        density_matrix_a.device_ptr(),
+    // Compute S^{1/2}
+    gpu::computeSqrtOverlapDensitySqrtOverlapMatrix(
         overlap_matrix.device_ptr(),
+        density_matrix_a.device_ptr(),
         temp_matrix_a.data(),
         num_basis
     );
-    gpu::computeDensityOverlapMatrix(
-        density_matrix_b.device_ptr(),
+    gpu::computeSqrtOverlapDensitySqrtOverlapMatrix(
         overlap_matrix.device_ptr(),
+        density_matrix_b.device_ptr(),
         temp_matrix_b.data(),
         num_basis
     );
@@ -585,7 +585,7 @@ std::vector<std::vector<real_t>> UHF::compute_wiberg_bond_order() const{
             real_t bond_order_ij = 0.0;
             for(int bi=basis_i_start; bi<basis_i_end; bi++){
                 for(int bj=basis_j_start; bj<basis_j_end; bj++){
-                    real_t d_ij = temp_matrix_a[bi * num_basis + bj]+temp_matrix_b[bi * num_basis + bj];
+                    real_t d_ij = temp_matrix_a[bi * num_basis + bj] + temp_matrix_b[bi * num_basis + bj];
                     bond_order_ij += d_ij * d_ij;
                 }
             }

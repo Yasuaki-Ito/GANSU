@@ -28,6 +28,7 @@ const unsigned int FULL_MASK = 0xffffffff;
 
 // prototype declarations of CUDA kernels
 __global__ void inverseSqrt_kernel(double* d_eigenvalues, const size_t size, const double threshold);
+__global__ void sqrt_kernel(double* d_eigenvalues, const size_t size, const double threshold=1e-8);
 __global__ void computeDensityMatrix_RHF_kernel(const double* d_coefficient_matrix, double* d_density_matrix, const int num_electron, const size_t num_basis);
 __global__ void computeDensityMatrix_UHF_kernel(const double* d_coefficient_matrix, double* d_density_matrix, const int num_spin, const size_t num_basis);
 __global__ void computeDensityMatrix_ROHF_kernel(const double* d_coefficient_matrix, double* d_density_matrix_closed, double* d_density_matrix_open, double* d_density_matrix, const int num_closed, const int num_open, const size_t num_basis);

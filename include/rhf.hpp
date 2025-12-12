@@ -69,7 +69,7 @@ public:
 
     std::vector<std::vector<real_t>> compute_mayer_bond_order() const override;
 
-    std::vector<std::vector<real_t>> compute_wiberg_bond_order() const override;
+    std::vector<std::vector<real_t>> compute_wiberg_bond_order() override;
 
     /**
      * @brief Get the reference to the coefficient matrix
