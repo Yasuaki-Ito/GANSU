@@ -507,42 +507,6 @@ public:
 
     }
 
-
-/*
-    void guess() override {
-        // allocate and initialize the density matrices of alpha and beta spins
-        std::unique_ptr<real_t[]> density_matrix(new real_t[hf_.get_num_basis() * hf_.get_num_basis()]);
-        memset(density_matrix.get(), 0, hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t));
-
-
-        // solve ROHF for each atom to get the density matrix
-        for(int i=0; i<hf_.get_atoms().size(); i++){
-            const std::vector<Atom> monatomic_atom = { {hf_.get_atoms()[i].atomic_number, {0.0, 0.0, 0.0}} };
-//            BasisSet basis_set = BasisSet::construct_from_gbs(hf_.get_gbsfilename());
-            const Molecular monatomic_molecule(monatomic_atom, hf_.get_gbsfilename());
-
-            auto [atom_density_matrix_alpha, atom_density_matrix_beta] = get_or_compute_density_matrix(hf_.get_atoms()[i].atomic_number, monatomic_molecule);
-
-            // copy the density matrix of the atom to the density matrix of the molecule in the corresponding diagonal block
-            for(size_t p=0; p < monatomic_molecule.get_num_basis(); p++){
-                for(size_t q = 0; q < monatomic_molecule.get_num_basis(); q++){
-                    size_t p_molecule = hf_.get_atom_to_basis_range()[i].start_index + p;
-                    size_t q_molecule = hf_.get_atom_to_basis_range()[i].start_index + q;
-                    density_matrix[p_molecule * hf_.get_num_basis() + q_molecule] = atom_density_matrix_alpha[p * monatomic_molecule.get_num_basis() + q] + atom_density_matrix_beta [p * monatomic_molecule.get_num_basis() + q];
-                }
-            }
-        }
-
-        cudaMemcpy(hf_.get_density_matrix().device_ptr(), density_matrix.get(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyHostToDevice);
-        hf_.compute_fock_matrix(); // compute the Fock matrix from the density matrix
-
-        // Since the above Fock matrix is not correct (the density matrix is not correct), the coefficient matrix is computed from the Fock matrix
-        hf_.compute_coefficient_matrix(); // compute the coefficient matrix from the density matrix
-        hf_.compute_density_matrix(); // compute the density matrix from the coefficient matrix
-        hf_.compute_fock_matrix(); // compute the Fock matrix from the density matrix
-    }
-*/
-
     void guess() override {
         // allocate and initialize the density matrices of alpha and beta spins
         std::unique_ptr<real_t[]> density_matrix(new real_t[hf_.get_num_basis() * hf_.get_num_basis()]);
