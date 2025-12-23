@@ -170,8 +170,17 @@ public:
         // initialization for the primitive shells and the shell type counts
 
         // sort the primitive shells by the shell type (Azimuthal quantum number)
-        std::sort(primitive_shells_.begin(), primitive_shells_.end(), 
-            [](const PrimitiveShell& a, const PrimitiveShell& b){return a.shell_type < b.shell_type;});
+        //std::sort(primitive_shells_.begin(), primitive_shells_.end(), 
+        //    [](const PrimitiveShell& a, const PrimitiveShell& b){return a.shell_type < b.shell_type;});
+        std::sort(primitive_shells_.begin(), primitive_shells_.end(), [](const PrimitiveShell& a, const PrimitiveShell& b) {
+            if (a.shell_type != b.shell_type) {
+                return a.shell_type < b.shell_type;
+            }
+            else {
+                return a.basis_index < b.basis_index;
+            }
+        });
+
         
         // count and store the shell type information
         int max_shell_type = primitive_shells_[primitive_shells_.size()-1].shell_type;

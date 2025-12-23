@@ -37,6 +37,12 @@ __global__ void generatePrimitiveShellPairIndices(size_t2* d_indices_array, size
     d_indices_array[id] = index1to2(id, is_symmetric, num_basis);
 }
 
+__global__ void initializePrimitiveShellPairIndices(int2* d_indices_array, int num_threads, bool is_symmetric, int num_basis) {
+    const int id = blockDim.x * blockIdx.x + threadIdx.x;
+    if (id >= num_threads) return;
+    size_t2 index_pair = index1to2(id, is_symmetric, num_basis);
+    d_indices_array[id] = make_int2(static_cast<int>(index_pair.x), static_cast<int>(index_pair.y));
+}
 
 
 
@@ -116,6 +122,11 @@ ERI_RI::ERI_RI(const HF& hf, const Molecular& auxiliary_molecular):
         auxiliary_primitive_shells_(auxiliary_molecular.get_primitive_shells()),
         auxiliary_cgto_nomalization_factors_(auxiliary_molecular.get_cgto_normalization_factors()),
         intermediate_matrix_B_(num_auxiliary_basis_, num_basis_*num_basis_),
+        d_J_(num_basis_, num_basis_),
+        d_K_(num_basis_, num_basis_),
+        d_W_tmp_(num_auxiliary_basis_),
+        d_T_tmp_(num_auxiliary_basis_, num_basis_*num_basis_),
+        d_V_tmp_(num_auxiliary_basis_, num_basis_*num_basis_),
         schwarz_upper_bound_factors(hf.get_num_primitive_shell_pairs()),
         auxiliary_schwarz_upper_bound_factors(auxiliary_molecular.get_primitive_shells().size())
 {
@@ -240,18 +251,66 @@ void ERI_RI::precomputation() {
 ERI_Direct::ERI_Direct(const HF& hf):
     hf_(hf),
     num_basis_(hf.get_num_basis()),
-    schwarz_upper_bound_factors(hf.get_num_primitive_shell_pairs())
+    schwarz_upper_bound_factors(hf.get_num_primitive_shell_pairs()),
+    primitive_shell_pair_indices(hf.get_num_primitive_shell_pairs()),
+    num_fock_replicas_(8)
 {
-    // nothing to do
+    // for distributed atomicAdd operations
+    cudaMalloc(&fock_matrix_replicas_, sizeof(real_t) * num_basis_ * num_basis_ * num_fock_replicas_);
+    //cudaMemset(fock_matrix_replicas_, 0.0, sizeof(real_t) * num_basis_ * num_basis_ * num_fock_replicas_);
 }
 
-void ERI_Direct::precomputation() {
+ERI_Direct::~ERI_Direct() {
+    for (auto p : global_counters_) { if (p) cudaFree(p); }
+    for (auto p : min_skipped_columns_) { if (p) cudaFree(p); }
+    global_counters_.clear();
+    min_skipped_columns_.clear();
+
+    if (fock_matrix_replicas_) {
+        cudaFree(fock_matrix_replicas_);
+        fock_matrix_replicas_ = nullptr;
+    }
+}
+
+void ERI_Direct::precomputation() 
+{
     const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
     const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
     const DeviceHostMemory<PrimitiveShell>& primitive_shells = hf_.get_primitive_shells();
     const DeviceHostMemory<real_t>& cgto_nomalization_factors = hf_.get_cgto_nomalization_factors();
     const DeviceHostMemory<real_t>& boys_grid = hf_.get_boys_grid();
     const int verbose = hf_.get_verbose();
+
+    // for dynamic Schwarz screening
+    const int shell_type_count = shell_type_infos.size();
+    std::vector<std::tuple<int, int, int, int>> shell_quadruples;
+    for (int a = 0; a < shell_type_count; ++a) {
+        for (int b = a; b < shell_type_count; ++b) {
+            for (int c = 0; c < shell_type_count; ++c) {
+                for (int d = c; d < shell_type_count; ++d) {
+                    if (a < c || (a == c && b <= d)) {
+                        shell_quadruples.emplace_back(a, b, c, d);
+                    }
+                }
+            }
+        }
+    }
+    const int task_group_size = 16;
+    const int num_braket_types = shell_quadruples.size();
+    global_counters_.resize(num_braket_types, nullptr);
+    min_skipped_columns_.resize(num_braket_types, nullptr);
+    int s0, s1, s2, s3;
+    ShellTypeInfo shell_s0, shell_s1; //shell_s2, shell_s3;
+    int num_bra, num_bra_groups;
+    for (int idx = 0; idx < num_braket_types; ++idx) {
+        std::tie(s0, s1, s2, s3) = shell_quadruples[idx];
+        shell_s0 = shell_type_infos[s0];
+        shell_s1 = shell_type_infos[s1];
+        num_bra = (s0 == s1) ? shell_s0.count * (shell_s0.count + 1) / 2 : shell_s0.count * shell_s1.count;
+        num_bra_groups = (num_bra + task_group_size - 1) / task_group_size;
+        cudaMalloc(&global_counters_[idx], sizeof(int) * num_bra_groups);
+        cudaMalloc(&min_skipped_columns_[idx], sizeof(int) * num_bra_groups);
+    }
 
     gpu::computeSchwarzUpperBounds(
         shell_type_infos,
@@ -262,6 +321,26 @@ void ERI_Direct::precomputation() {
         schwarz_upper_bound_factors.device_ptr(), 
         verbose
         );
+
+    // Create an array for storing pairs of primitive shell indices
+    const size_t num_primitive_shell_pairs = primitive_shells.size() * (primitive_shells.size() + 1) / 2;
+    int2* d_primitive_shell_pair_indices = primitive_shell_pair_indices.device_ptr();
+
+    // Store the pairs of primitive shell indices and sort them based on the Schwarz upper bound factors
+    int pair_idx = 0;
+    const int threads_per_block = 1024;
+    for(int s0 = 0; s0 < shell_type_infos.size(); s0++){
+        for(int s1 = s0; s1 < shell_type_infos.size(); s1++){
+            const int num_blocks = (shell_pair_type_infos[pair_idx].count + threads_per_block - 1) / threads_per_block; // the number of blocks
+            initializePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index], shell_pair_type_infos[pair_idx].count, s0 == s1, shell_type_infos[s1].count);
+            thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);  
+            thrust::device_ptr<real_t> keys_end(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index] + shell_pair_type_infos[pair_idx].count);
+            thrust::device_ptr<int2> values_begin(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index]);
+            thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+            pair_idx++;
+        }
+    }
+    cudaDeviceSynchronize();
 }
 
 

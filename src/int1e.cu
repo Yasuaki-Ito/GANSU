@@ -64,22 +64,35 @@ __device__ double calc_Norms(double alpha, double beta, int ijk, int lmn){
 }
 
 
-__global__ void Matrix_Symmetrization(double* matrix, int n){
-    __shared__ double sh_mem[32][33];
+//__global__ void Matrix_Symmetrization(double* matrix, int n){
+//    __shared__ double sh_mem[32][33];
+//
+//    if(blockIdx.y > blockIdx.x) return;
+//
+//    int src_block = blockIdx.y*32*n + blockIdx.x*32;
+//    int dst_block = blockIdx.x*32*n + blockIdx.y*32;
+//
+//    if(blockIdx.x*32+threadIdx.x < n || blockIdx.y*32+threadIdx.y < n){
+//    //if(blockIdx.x*32+threadIdx.x < n && blockIdx.y*32+threadIdx.y < n){
+//        sh_mem[threadIdx.y][threadIdx.x] = matrix[src_block + threadIdx.y*n+threadIdx.x];
+//    }
+//    __syncthreads();
+//
+//    if (blockIdx.y==blockIdx.x && threadIdx.y <= threadIdx.x || (dst_block + threadIdx.y*n+threadIdx.x >=n*n) ) return;
+//
+//    matrix[dst_block + threadIdx.y*n+threadIdx.x] = sh_mem[threadIdx.x][threadIdx.y];
+//}
 
-    if(blockIdx.y > blockIdx.x) return;
+__global__ void matrixSymmetrization(double* g_matrix, const int num_basis) 
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int mu = idx / num_basis;
+    const int nu = idx % num_basis;
 
-    int src_block = blockIdx.y*32*n + blockIdx.x*32;
-    int dst_block = blockIdx.x*32*n + blockIdx.y*32;
-
-    if(blockIdx.x*32+threadIdx.x < n || blockIdx.y*32+threadIdx.y < n){
-        sh_mem[threadIdx.y][threadIdx.x] = matrix[src_block + threadIdx.y*n+threadIdx.x];
+    if (mu < nu) {
+        g_matrix[num_basis * nu + mu] = g_matrix[num_basis * mu + nu];
     }
-    __syncthreads();
 
-    if (blockIdx.y==blockIdx.x && threadIdx.y <= threadIdx.x || (dst_block + threadIdx.y*n+threadIdx.x >=n*n) ) return;
-
-    matrix[dst_block + threadIdx.y*n+threadIdx.x] = sh_mem[threadIdx.x][threadIdx.y];
 }
 
 

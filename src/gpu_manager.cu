@@ -20,11 +20,16 @@
 #include "utils.hpp" // THROW_EXCEPTION
 #include "int2c2e.hpp"
 #include "int3c2e.hpp"
+#include "int2e_direct.hpp"
 
 #include <vector>    // std::vector
 #include <tuple>     // std::tuple
 #include <algorithm> // std::reverse
 #include <fstream>
+
+#include <cuda_runtime.h> // for int2 type
+#include <thrust/device_vector.h>
+#include <thrust/fill.h>
 
 namespace gansu::gpu{
 
@@ -309,11 +314,8 @@ void makeDiagonalMatrix(const real_t* d_vector, real_t* d_matrix, const int size
  * @param size Size of the matrix (size x size)
  * @return Trace of the matrix (the sum of the diagonal elements)
  */
- real_t computeMatrixTrace(const real_t* d_matrix, const int size) {
-    if(size > 1024){ // 1024 is the maximum number of threads per block. If the size is larger than 1024, two or more blocks are required.
-        THROW_EXCEPTION("Too many basis functions.");
-    }
-
+ real_t computeMatrixTrace(const real_t* d_matrix, const int size) 
+ {
     cudaError_t err;
 
     double* d_trace;
@@ -321,10 +323,13 @@ void makeDiagonalMatrix(const real_t* d_vector, real_t* d_matrix, const int size
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for trace: ") + std::string(cudaGetErrorString(err)));
     }
+    cudaMemset(d_trace, 0, sizeof(real_t));
 
     real_t h_trace = 0.0;
     
-    getMatrixTrace<<<1, size>>>(d_matrix, d_trace, size);
+    const int num_threads_per_block = 1024;
+    const int num_blocks = (size + num_threads_per_block - 1) / num_threads_per_block;
+    getMatrixTrace<<<num_blocks, num_threads_per_block>>>(d_matrix, d_trace, size);
     cudaMemcpy(&h_trace, d_trace, sizeof(real_t), cudaMemcpyDeviceToHost);
 
     cudaFree(d_trace);
@@ -403,10 +408,9 @@ void computeCoreHamiltonianMatrix(const std::vector<ShellTypeInfo>& shell_type_i
     // syncronize streams
     cudaDeviceSynchronize();
 
-    dim3 blocks(int((num_basis + 31) / 32), int((num_basis + 31) / 32));
-    dim3 threads(32,32);
-    Matrix_Symmetrization<<<blocks, threads>>>(d_overlap_matrix, num_basis);
-    Matrix_Symmetrization<<<blocks, threads>>>(d_core_hamiltonian_matrix, num_basis);
+    const int num_blocks_sym = (num_basis * num_basis + threads_per_block - 1) / threads_per_block;
+    matrixSymmetrization<<<num_blocks_sym, threads_per_block>>>(d_overlap_matrix, num_basis);
+    matrixSymmetrization<<<num_blocks_sym, threads_per_block>>>(d_core_hamiltonian_matrix, num_basis);
 
     // destory streams
     for (int i = 0; i < N; i++) {
@@ -1472,11 +1476,11 @@ void compute_RI_IntermediateMatrixB(
 
     // Allocate device memory for the three-center ERIs
     real_t* d_three_center_eri;
-    err = cudaMalloc(&d_three_center_eri, num_basis * num_basis * num_auxiliary_basis * sizeof(real_t));
+    err = cudaMalloc(&d_three_center_eri, (size_t)num_basis * (size_t)num_basis * (size_t)num_auxiliary_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for three-center ERIs: ") + std::string(cudaGetErrorString(err)));
     }
-    cudaMemset(d_three_center_eri, 0.0, num_basis * num_basis * num_auxiliary_basis * sizeof(real_t));
+    cudaMemset(d_three_center_eri, 0.0, num_basis * num_basis * (size_t)num_auxiliary_basis * sizeof(real_t));
 
     // Compute the three-center ERIs of the auxiliary basis functions and the basis functions
     computeThreeCenterERIs(
@@ -1526,91 +1530,52 @@ void computeIntermediateMatrixB(
 
 
 
-void computeFockMatrix_RI_RHF(const real_t* d_density_matrix, const real_t* d_core_hamiltonian_matrix, const real_t* d_intermediate_matrix_B, real_t* d_fock_matrix, const int num_basis, const int num_auxiliary_basis){
+void computeFockMatrix_RI_RHF(const real_t* d_density_matrix, const real_t* d_core_hamiltonian_matrix, const real_t* d_intermediate_matrix_B, real_t* d_fock_matrix, const int num_basis, const int num_auxiliary_basis, real_t* d_J, real_t* d_K, real_t* d_W, real_t* d_T, real_t* d_V){
     //cublasManager cublas;
     cublasHandle_t cublasHandle = GPUHandle::cublas();
-
-    cudaError_t err;
 
     // the following is used in the two kernels. So, if necessary, it should be changed for each kernel.
     const int num_threads = 256;
     const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
 
-    ////////////////////////////////// compute J-matrix //////////////////////////////////
-    real_t* d_J = nullptr;
-    err = cudaMalloc(&d_J, sizeof(real_t)*num_basis*num_basis);
-    if (err != cudaSuccess) {
-        THROW_EXCEPTION(std::string("Failed to allocate device memory for J matrix: ") + std::string(cudaGetErrorString(err)));
-    }
-
-
-    // W = B D (Matrix(M_aux x M^2 matrix) * Vector (M^2 x 1) )
-    real_t* d_W = nullptr;
-    err = cudaMalloc(&d_W, sizeof(real_t)*num_auxiliary_basis);
-    if (err != cudaSuccess) {
-        THROW_EXCEPTION(std::string("Failed to allocate device memory for W vector: ") + std::string(cudaGetErrorString(err)));
-    }
-
     double alpha = 1.0;
     double beta = 0.0;
 
+    ////////////////////////////////// compute J-matrix //////////////////////////////////
     cublasDgemv(cublasHandle, CUBLAS_OP_T, num_basis*num_basis, num_auxiliary_basis, &alpha, d_intermediate_matrix_B, num_basis*num_basis, d_density_matrix, 1, &beta, d_W, 1);
-
     // J = sum(W[i] * B[i])
     weighted_sum_matrices_kernel<<<num_blocks, num_threads>>>(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
 
-
-    // free the memory
-    cudaFree(d_W);
-
     ////////////////////////////////// compute K-matrix //////////////////////////////////
-    real_t* d_K = nullptr;
-    err = cudaMalloc(&d_K, sizeof(real_t)*num_basis*num_basis);
-    if (err != cudaSuccess) {
-        THROW_EXCEPTION(std::string("Failed to allocate device memory for K matrix: ") + std::string(cudaGetErrorString(err)));
-    }
-
-    // T^p = B^p D^T
-    real_t* d_T = nullptr;
-    err = cudaMalloc(&d_T, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
-    if (err != cudaSuccess) {
-        THROW_EXCEPTION(std::string("Failed to allocate device memory for T matrix: ") + std::string(cudaGetErrorString(err)));
-    }
-
-    // Note: cublasDgemmBatched shoul be used?
-    for(int p=0; p<num_auxiliary_basis; p++){
-        matrixMatrixProduct(&d_intermediate_matrix_B[p*num_basis*num_basis], d_density_matrix, &d_T[p*num_basis*num_basis], num_basis, false, true);
-    }
-
-
-    // V^p = B^p (T^p)^T
-    real_t* d_V = nullptr;
-    err = cudaMalloc(&d_V, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
-    if (err != cudaSuccess) {
-        THROW_EXCEPTION(std::string("Failed to allocate device memory for V matrix: ") + std::string(cudaGetErrorString(err)));
-    }
-
-    // Note: cublasDgemmBatched shoul be used?
-    for(int p=0; p<num_auxiliary_basis; p++){
-        matrixMatrixProduct(&d_intermediate_matrix_B[p*num_basis*num_basis], &d_T[p*num_basis*num_basis], &d_V[p*num_basis*num_basis], num_basis, false, true);
-    }
-
+    cublasDgemmStridedBatched(
+        cublasHandle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_basis, num_basis, num_basis,
+        &alpha,
+        d_density_matrix, num_basis, 0,
+        d_intermediate_matrix_B, num_basis, num_basis*num_basis,
+        &beta,
+        d_T, num_basis, num_basis*num_basis,
+        num_auxiliary_basis
+    );
+    cublasDgemmStridedBatched(
+        cublasHandle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_basis, num_basis, num_basis,
+        &alpha,
+        d_T, num_basis, num_basis*num_basis,
+        d_intermediate_matrix_B, num_basis, num_basis*num_basis,
+        &beta,
+        d_V, num_basis, num_basis*num_basis,
+        num_auxiliary_basis
+    );
     // K = sum(V^p)
     sum_matrices_kernel<<<num_blocks, num_threads>>>(d_K, d_V, num_basis, num_auxiliary_basis); 
 
-    // free the memory
-    cudaFree(d_T);
-    cudaFree(d_V);
-
-
     ////////////////////////////////// compute Fock matrix //////////////////////////////////
-
     // F = H + J - (1/2)*K
     computeFockMatrix_RI_RHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, num_basis);
-
-    // free the memory
-    cudaFree(d_J);
-    cudaFree(d_K);
+    cudaDeviceSynchronize();
 }
 
 void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_density_matrix_b, const real_t* d_core_hamiltonian_matrix, const real_t* d_intermediate_matrix_B, real_t* d_fock_matrix_a, real_t* d_fock_matrix_b, const int num_basis, const int num_auxiliary_basis){
@@ -1963,6 +1928,12 @@ void computeTwoCenterERIs(
     // make multi stream
     const int num_kernels = shell_pairs.size();
     std::vector<cudaStream_t> streams(num_kernels);
+    for (int i = 0; i < num_kernels; i++) {
+        cudaError_t err = cudaStreamCreate(&streams[i]);
+        if (err != cudaSuccess) {
+            THROW_EXCEPTION(std::string("Failed to create CUDA stream: ") + std::string(cudaGetErrorString(err)));
+        }
+    }
 
     // for-loop for sorted shell-type (s0, s1)
     int stream_id = 0;
@@ -2030,7 +2001,6 @@ void computeThreeCenterERIs(
     const int shell_type_count = shell_type_infos.size();
     const int auxiliary_shell_type_count = auxiliary_shell_type_infos.size();
 
-
     // Call the kernel functions from (ss|s),... (e.g. (ss|s), (ss|p), (sp|s), (sp|p), (pp|s), (pp|p) for s and p shells)
 
     // list shell-triples for sorted shell-type (s0, s1, s2)
@@ -2054,6 +2024,12 @@ void computeThreeCenterERIs(
     // make multi stream
     const int num_kernels = shell_triples.size();
     std::vector<cudaStream_t> streams(num_kernels);
+    for (int i = 0; i < num_kernels; i++) {
+        cudaError_t err = cudaStreamCreate(&streams[i]);
+        if (err != cudaSuccess) {
+            THROW_EXCEPTION(std::string("Failed to create CUDA stream: ") + std::string(cudaGetErrorString(err)));
+        }
+    }
 
     // for-loop for sorted shell-type (s0, s1, s2, s3)
     int stream_id = 0;
@@ -2065,8 +2041,9 @@ void computeThreeCenterERIs(
         const ShellTypeInfo shell_s1 = shell_type_infos[s1];
         const ShellTypeInfo shell_s2 = auxiliary_shell_type_infos[s2];
 
-        const int num_tasks = ( (s0==s1) ? (shell_s0.count*(shell_s0.count+1)/2) : (shell_s0.count*shell_s1.count) ) * shell_s2.count; // the number of pairs of primitive shells = the number of threads
-        const int num_blocks = (num_tasks + threads_per_block - 1) / threads_per_block; // the number of blocks
+        //const int num_tasks = ( (s0==s1) ? (shell_s0.count*(shell_s0.count+1)/2) : (shell_s0.count*shell_s1.count) ) * shell_s2.count; // the number of pairs of primitive shells = the number of threads
+        const size_t num_tasks = ( (s0==s1) ? ((size_t)shell_s0.count*(shell_s0.count+1)/2) : ((size_t)shell_s0.count*shell_s1.count) ) * (size_t)shell_s2.count; // the number of pairs of primitive shells = the number of threads
+        const size_t num_blocks = (num_tasks + threads_per_block - 1) / threads_per_block; // the number of blocks
         
         gpu::get_3center_kernel(s0, s1, s2)<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(d_three_center_eri, d_primitive_shells, d_auxiliary_primitive_shells, 
                                                                                 d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors, 
@@ -2167,22 +2144,169 @@ void computeAuxiliarySchwarzUpperBounds(
 }
 
 
+void checkMatrixSum(const real_t* d_matrix, const size_t num_basis)
+{
+    real_t* h_matrix;
+    cudaMallocHost(&h_matrix, sizeof(real_t) * num_basis * num_basis);
+    cudaMemcpy(h_matrix, d_matrix, sizeof(real_t) * num_basis * num_basis, cudaMemcpyDeviceToHost);
+    real_t matrix_sum = 0.0;
+    for (int i = 0; i < num_basis * num_basis; ++i) {
+        matrix_sum += h_matrix[i];
+    }
+    printf("sum of matrix: %.12lf\n", matrix_sum);
+    cudaFreeHost(h_matrix);
+}
+
+
+
+__global__ void initializeMinSkippedColumns(
+    int* g_min_skipped_column, int num_bra_groups, int num_ket_groups)
+{
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx < num_bra_groups) g_min_skipped_column[idx] = num_ket_groups;
+}
+
+
+__global__ void computeFockMatrix_DFT_kernel(const double* d_core_hamiltonian_matrix, double* d_Fock_matrix, const int num_basis) {
+    size_t id = threadIdx.x + blockIdx.x * blockDim.x;
+    if (id >= num_basis * num_basis) return;
+
+    d_Fock_matrix[id] = d_core_hamiltonian_matrix[id] + d_Fock_matrix[id];
+}
+
+
 
 void computeFockMatrix_Direct_RHF(
     const real_t* d_density_matrix,
     const real_t* d_core_hamiltonian_matrix,
     const std::vector<ShellTypeInfo>& shell_type_infos, 
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
     const PrimitiveShell* d_primitive_shells, 
-    const real_t* d_cgto_nomalization_factors, 
+    const int2* d_primitive_shell_pair_indices,
+    const real_t* d_cgto_normalization_factors, 
     const real_t* d_boys_grid, 
     const real_t* d_schwarz_upper_bound_factors,
-    const real_t  schwarz_screening_threshold,
+    const real_t schwarz_screening_threshold,
     real_t* d_fock_matrix,
     const int num_basis,
+    std::vector<int*>& d_global_counters,
+    std::vector<int*>& d_min_skipped_columns,
+    real_t* d_fock_matrix_replicas,
+    const int num_fock_replicas,
     const int verbose)
 {
-    // ここにDirect-SCF(RHF)のFock行列計算を書く
-    THROW_EXCEPTION("Not implemented yet.");
+    // compute the electron repulsion integrals
+    const int num_threads_per_block = 256;
+    const int shell_type_count = shell_type_infos.size();
+
+    //cudaMemset(d_fock_matrix, 0.0, sizeof(real_t) * num_basis * num_basis);
+    cudaMemset(d_fock_matrix_replicas, 0, sizeof(real_t) * num_basis * num_basis * num_fock_replicas);
+
+    // list shell-quadruples for sorted shell-type (s0, s1, s2, s3)
+    std::vector<std::tuple<int, int, int, int>> shell_quadruples;
+    for (int a = 0; a < shell_type_count; ++a) {
+        for (int b = a; b < shell_type_count; ++b) {
+            for (int c = 0; c < shell_type_count; ++c) {
+                for (int d = c; d < shell_type_count; ++d) {
+                    if (a < c || (a == c && b <= d)) {
+                        shell_quadruples.emplace_back(a, b, c, d);
+                    }
+                }
+            }
+        }
+    }
+    // reverse the order of the shell_quadruples to make it sorted by (s0, s1, s2, s3)
+    // e.g. (pp|pp), (sp|pp), (sp|sp), (ss|pp), (ss|sp), (ss|ss) for s and p shells
+    //std::reverse(shell_quadruples.begin(), shell_quadruples.end());
+
+    // make multi stream
+    const int num_kernels = shell_quadruples.size();
+    std::vector<cudaStream_t> streams(num_kernels);
+    for (int i = 0; i < num_kernels; i++) {
+        cudaError_t err = cudaStreamCreate(&streams[i]);
+        if (err != cudaSuccess) {
+            THROW_EXCEPTION(std::string("Failed to create CUDA stream: ") + std::string(cudaGetErrorString(err)));
+        }
+    }
+
+    // for-loop for sorted shell-type (s0, s1, s2, s3)
+    int kernel_idx = 0;
+    const int task_group_size = 16;
+    const int num_cuda_blocks = 256;
+    for (const auto& quadruple: shell_quadruples) {
+        int s0, s1, s2, s3;
+        std::tie(s0, s1, s2, s3) = quadruple;
+
+        const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+        const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+        const ShellTypeInfo shell_s2 = shell_type_infos[s2];
+        const ShellTypeInfo shell_s3 = shell_type_infos[s3];
+
+        const size_t num_bra = (s0==s1) ? shell_s0.count*(shell_s0.count+1)/2 : shell_s0.count*shell_s1.count;
+        const size_t num_ket = (s2==s3) ? shell_s2.count*(shell_s2.count+1)/2 : shell_s2.count*shell_s3.count;
+        //std::cout << "num_bra: " << num_bra << ", num_ket: " << num_ket << std::endl;
+        const size_t num_braket = ((s0==s2) && (s1==s3)) ? num_bra*(num_bra+1)/2 : num_bra*num_ket; // equal to the number of threads
+        const size_t num_blocks = (num_braket + num_threads_per_block - 1) / num_threads_per_block; // the number of blocks
+        //std::cout << "num_braket: " << num_braket << std::endl;
+
+        const size_t head_bra = shell_pair_type_infos[get_index_2to1_horizontal(s0, s1, shell_type_count)].start_index;
+        const size_t head_ket = shell_pair_type_infos[get_index_2to1_horizontal(s2, s3, shell_type_count)].start_index;
+        //std::cout << "head_bra: " << head_bra << ", head_ket: " << head_ket << std::endl;
+
+        if (s0 <= 1 && s1 <= 1 && s2 <= 1 && s3 <= 1) {
+            // initialzie global counters and minimum skipped columns for dynamic screening
+            const int num_bra_groups = (num_bra + task_group_size - 1) / task_group_size;
+            const int num_ket_groups = (num_ket + task_group_size - 1) / task_group_size;
+            const int num_init_blocks = (num_bra_groups + num_threads_per_block - 1) / num_threads_per_block;
+            //cudaMemset(d_global_counters[kernel_idx], 0, sizeof(int) * num_bra_groups);
+            cudaMemsetAsync(d_global_counters[kernel_idx], 0, sizeof(int) * num_bra_groups, streams[kernel_idx]);
+            initializeMinSkippedColumns<<<num_init_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>(d_min_skipped_columns[kernel_idx], num_bra_groups, num_ket_groups);
+
+            //gpu::get_eri_kernel_direct(s0, s1, s2, s3)<<<num_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
+            //    (d_fock_matrix_replicas, d_primitive_shells, d_primitive_shell_pair_indices, 
+            //     d_cgto_normalization_factors, shell_s0, shell_s1, shell_s2, shell_s3, 
+            //     num_braket, schwarz_screening_threshold, d_schwarz_upper_bound_factors, 
+            //     num_basis, d_boys_grid, d_density_matrix, head_bra, head_ket, num_fock_replicas);
+            gpu::get_eri_kernel_dynamic(s0, s1, s2, s3)<<<num_cuda_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
+                (d_fock_matrix_replicas, d_primitive_shells, d_primitive_shell_pair_indices, 
+                 d_cgto_normalization_factors, shell_s0, shell_s1, shell_s2, shell_s3, 
+                 schwarz_screening_threshold, d_schwarz_upper_bound_factors, num_basis, 
+                 d_boys_grid, d_density_matrix, d_global_counters[kernel_idx], d_min_skipped_columns[kernel_idx],
+                 head_bra, head_ket, num_bra, num_ket, num_fock_replicas);
+        }
+        else {
+            MD_direct_SCF_1T1SP<<<num_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
+                (d_fock_matrix_replicas, d_density_matrix, d_primitive_shells, num_fock_replicas, 
+                 d_cgto_normalization_factors, shell_s0, shell_s1, shell_s2, shell_s3, 
+                 num_braket, schwarz_screening_threshold, d_schwarz_upper_bound_factors, 
+                 d_primitive_shell_pair_indices, num_basis, d_boys_grid, head_bra, head_ket);
+        }
+        kernel_idx++;
+    
+        if (verbose) {
+            std::cout << "(" << shell_type_to_shell_name(s0) << shell_type_to_shell_name(s1) << "|" << shell_type_to_shell_name(s2) << shell_type_to_shell_name(s3) << "): ";
+            std::cout << "|" << shell_type_to_shell_name(s0) << "|=" << shell_s0.count << ", ";
+            std::cout << "|" << shell_type_to_shell_name(s1) << "|=" << shell_s1.count << ", ";
+            std::cout << "|" << shell_type_to_shell_name(s2) << "|=" << shell_s1.count << ", ";
+            std::cout << "|" << shell_type_to_shell_name(s3) << "|=" << shell_s1.count << ", ";
+            std::cout << "|bra|= " << num_bra << ", " ;
+            std::cout << "|ket|= " << num_ket << ", " ;
+            std::cout << "|braket|= " << num_braket << ", " ;
+            std::cout << "num_blocks: " << num_blocks << std::endl;
+        }
+    }
+    // syncronize streams
+    cudaDeviceSynchronize();
+
+    // destory streams
+    for (int i = 0; i < num_kernels; i++) {
+        cudaStreamDestroy(streams[i]);
+    }
+
+    const int num_blocks_fock = ((num_basis * (num_basis + 1) / 2) + num_threads_per_block - 1) / num_threads_per_block;
+    composeFockMatrix<<<num_blocks_fock, num_threads_per_block>>>(d_fock_matrix, d_fock_matrix_replicas, d_core_hamiltonian_matrix, num_basis, num_fock_replicas);
+
+    cudaDeviceSynchronize();
 }
 
 

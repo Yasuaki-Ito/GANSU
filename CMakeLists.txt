@@ -27,7 +27,10 @@ project(GANSU LANGUAGES CUDA CXX)
 
 
 # set compute capability
-set(CMAKE_CUDA_ARCHITECTURES 80 86)
+set(CMAKE_CUDA_ARCHITECTURES 80 86 90)
+
+# Enable line info and debug info for CUDA when in Debug mode
+set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -lineinfo")
 
 # C++ standard
 set(CMAKE_CXX_STANDARD 17)
@@ -42,6 +45,7 @@ add_library(int1e STATIC src/int1e.cu)
 add_library(int2e STATIC src/int2e.cu)
 add_library(int2c2e STATIC src/int2c2e.cu)
 add_library(int3c2e STATIC src/int3c2e.cu)
+add_library(int2e_direct STATIC src/int2e_direct.cu)
 
 set(SOURCES
     src/basis_set.cpp
@@ -69,6 +73,7 @@ target_link_libraries(gansu
         int2e
         int2c2e
         int3c2e
+        int2e_direct
     )
 
 

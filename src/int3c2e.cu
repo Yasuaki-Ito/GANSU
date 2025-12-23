@@ -29,7 +29,8 @@ __global__ void calc_sss_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 							int num_auxiliary_basis, 
 							const double* g_boys_grid){
                                 
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -68,7 +69,8 @@ __global__ void calc_sss_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (ss|p) */
 __global__ void calc_ssp_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -103,7 +105,8 @@ __global__ void calc_ssp_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (ss|d) */
 __global__ void calc_ssd_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -139,7 +142,8 @@ __global__ void calc_ssd_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (ss|f) */
 __global__ void calc_ssf_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -176,7 +180,8 @@ __global__ void calc_ssf_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (sp|s) */
 __global__ void calc_sps_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -209,7 +214,8 @@ __global__ void calc_sps_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (sp|p) */
 __global__ void calc_spp_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -242,7 +248,8 @@ __global__ void calc_spp_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (sp|d) */
 __global__ void calc_spd_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -276,7 +283,8 @@ __global__ void calc_spd_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (sp|f) */
 __global__ void calc_spf_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -310,7 +318,8 @@ __global__ void calc_spf_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (pp|s) */
 __global__ void calc_pps_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -345,7 +354,8 @@ __global__ void calc_pps_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (pp|p) */
 __global__ void calc_ppp_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -380,7 +390,8 @@ __global__ void calc_ppp_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (pp|d) */
 __global__ void calc_ppd_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -415,7 +426,8 @@ __global__ void calc_ppd_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (pp|f) */
 __global__ void calc_ppf_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -451,7 +463,8 @@ __global__ void calc_ppf_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 #if defined(COMPUTE_D_BASIS)
 /* (sd|s) */
 __global__ void calc_sds_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -483,7 +496,8 @@ __global__ void calc_sds_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (sd|p) */
 __global__ void calc_sdp_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -516,7 +530,8 @@ __global__ void calc_sdp_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (sd|d) */
 __global__ void calc_sdd_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -549,7 +564,8 @@ __global__ void calc_sdd_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (sd|f) */
 __global__ void calc_sdf_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -580,7 +596,8 @@ __global__ void calc_sdf_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (pd|s) */
 __global__ void calc_pds_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -612,7 +629,8 @@ __global__ void calc_pds_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (pd|p) */
 __global__ void calc_pdp_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -645,7 +663,8 @@ __global__ void calc_pdp_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (pd|d) */
 __global__ void calc_pdd_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -678,7 +697,8 @@ __global__ void calc_pdd_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (pd|f) */
 __global__ void calc_pdf_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -710,7 +730,8 @@ __global__ void calc_pdf_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (dd|s) */
 __global__ void calc_dds_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -744,7 +765,8 @@ __global__ void calc_dds_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (dd|p) */
 __global__ void calc_ddp_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -778,7 +800,8 @@ __global__ void calc_ddp_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (dd|d) */
 __global__ void calc_ddd_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -811,7 +834,8 @@ __global__ void calc_ddd_gpu(real_t* g_result, const PrimitiveShell* g_pshell, c
 
 /* (dd|f) */
 __global__ void calc_ddf_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	//uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	size_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_tasks){
 		const size_t2 abc = index1to2(idx, false, shell_s2.count);
@@ -1111,7 +1135,8 @@ __global__ void MD_int3c2e_1T1SP(real_t* g_result, const PrimitiveShell* g_pshel
                                  const double* g_boys_grid){
 {
     // 通し番号indexの計算
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    //const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
 
 
     if (id >= num_tasks) return;

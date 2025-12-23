@@ -188,7 +188,7 @@ __global__ void weighted_sum_matrices_kernel(double* d_J, const double* d_B, con
 
     double sum = 0.0;
     for (int j = 0; j < N; ++j) {
-        sum += d_W[j] * d_B[j * M * M + id];  // Apply scalar multiplication and accumulate
+        sum += d_W[j] * d_B[(size_t)j * M * M + id];  // Apply scalar multiplication and accumulate
     }
 
     if(accumulated){
@@ -214,7 +214,8 @@ __global__ void sum_matrices_kernel(double* d_K, const double* d_B, const int M,
 
     double sum = 0.0;
     for (int p = 0; p < N; p++) {
-        sum += d_B[p * M * M + id];  // Apply scalar multiplication and accumulate
+        //sum += d_B[p * M * M + id];  // Apply scalar multiplication and accumulate
+        sum += d_B[(size_t)p * M * M + id];  // Apply scalar multiplication and accumulate
     }
 
     if(accumulated){
@@ -458,20 +459,26 @@ __global__ void computeUnifiedFockMatrix_ROHF_kernel(const real_t* d_fock_mo_clo
  * @param num_basis Number of basis functions
  * @details This function computes the trace of a matrix.
  */
-__global__ void getMatrixTrace(const double* d_matrix, double* d_trace, const int num_basis)
+__global__ void getMatrixTrace(const double* g_matrix, double* g_trace, const int num_basis)
 {
-    if (threadIdx.x >= num_basis) return;
+    const int tid = blockDim.x * blockIdx.x + threadIdx.x;
 
     __shared__ double s_trace;
     if (threadIdx.x == 0) {
-        s_trace = 0;
+        s_trace = 0.0;
     }
     __syncthreads();
 
-    atomicAdd(&s_trace, d_matrix[num_basis * threadIdx.x + threadIdx.x]);
+    double val = 0.0;
+    if (tid < num_basis) {
+        val = g_matrix[num_basis * tid + tid];
+    }
+
+    atomicAdd(&s_trace, val);
     __syncthreads();
+
     if (threadIdx.x == 0) {
-        d_trace[0] = s_trace;
+        atomicAdd(g_trace, s_trace);
     }
 }
 

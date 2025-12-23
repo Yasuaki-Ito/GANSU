@@ -148,8 +148,10 @@
 
     __device__ __inline__ void addToResult_3center(double res, double *g_result, int p, int q, int r, int nCGTO, int nAux, bool is_prim_id_not_equal, const real_t* d_cgto_nomalization_factors, const real_t* d_auxiliary_cgto_nomalization_factors){
         res *= d_cgto_nomalization_factors[p] * d_cgto_nomalization_factors[q] * d_auxiliary_cgto_nomalization_factors[r];
-        atomicAdd(&g_result[r*nCGTO*nCGTO + p*nCGTO + q], res);
-        if(is_prim_id_not_equal) atomicAdd(&g_result[r*nCGTO*nCGTO + q*nCGTO + p], res);
+        //atomicAdd(&g_result[r*nCGTO*nCGTO + p*nCGTO + q], res);
+        atomicAdd(&g_result[(size_t)r*nCGTO*nCGTO + p*nCGTO + q], res);
+        //if(is_prim_id_not_equal) atomicAdd(&g_result[r*nCGTO*nCGTO + q*nCGTO + p], res);
+        if(is_prim_id_not_equal) atomicAdd(&g_result[(size_t)r*nCGTO*nCGTO + q*nCGTO + p], res);
     }
 
   

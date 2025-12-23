@@ -104,7 +104,8 @@ int factorial2_gpu(int n)
 }
 
 inline __device__
-long long int calcIdx4Dim(int i, int j, int k, int l, int nao)
+long long int calcIdx4Dim(size_t i, size_t j, size_t k, size_t l, size_t nao)
+//long long int calcIdx4Dim(int i, int j, int k, int l, int nao)
 {
     return nao * nao * nao * i + nao * nao * j + nao * k + l;
 }

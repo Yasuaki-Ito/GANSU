@@ -61,6 +61,9 @@ public:
 
     void report() override;
 
+    //suzuki
+    //void compute_RI_RMP2();
+
     void set_convergence_method(std::unique_ptr<Convergence_RHF> convergence_method);
 
     void set_eri_method(std::unique_ptr<ERI> eri_method);
@@ -618,7 +621,12 @@ public:
             intermediate_matrix_B_.device_ptr(),
             fock_matrix.device_ptr(),
             num_basis_,
-            num_auxiliary_basis_
+            num_auxiliary_basis_, 
+            d_J_.device_ptr(),
+            d_K_.device_ptr(),
+            d_W_tmp_.device_ptr(),
+            d_T_tmp_.device_ptr(),
+            d_V_tmp_.device_ptr()
         );
 
         { // nan check
@@ -666,6 +674,7 @@ public:
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
         const DeviceHostMatrix<real_t>& core_hamiltonian_matrix = rhf_.get_core_hamiltonian_matrix();
         const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
+        const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
         const DeviceHostMemory<PrimitiveShell>& primitive_shells = hf_.get_primitive_shells();
         const DeviceHostMemory<real_t>& cgto_nomalization_factors = hf_.get_cgto_nomalization_factors();
         const DeviceHostMemory<real_t>& boys_grid = hf_.get_boys_grid();
@@ -677,13 +686,19 @@ public:
             density_matrix.device_ptr(),
             core_hamiltonian_matrix.device_ptr(),
             shell_type_infos, 
+            shell_pair_type_infos,
             primitive_shells.device_ptr(), 
+            primitive_shell_pair_indices.device_ptr(),
             cgto_nomalization_factors.device_ptr(), 
             boys_grid.device_ptr(), 
             schwarz_upper_bound_factors.device_ptr(),
             schwarz_screening_threshold,
             fock_matrix.device_ptr(),
             num_basis_,
+            global_counters_,
+            min_skipped_columns_,
+            fock_matrix_replicas_,
+            num_fock_replicas_,
             verbose
         );
 

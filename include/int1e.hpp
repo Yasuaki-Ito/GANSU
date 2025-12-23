@@ -270,8 +270,8 @@ void nuclear_attraction_OSff(real_t* g_nucattr, const PrimitiveShell *g_shell, c
                            const int num_basis, const real_t* g_boys_grid);
 
 // 2025-05-26 define a function to target matrices
-__global__ void Matrix_Symmetrization(real_t* matrix, int n);
-
+//__global__ void Matrix_Symmetrization(real_t* g_matrix, const int num_basis);
+__global__ void matrixSymmetrization(real_t* g_matrix, const int num_basis);
 
 __global__
 void compute_kinetic_energy_integral(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, 

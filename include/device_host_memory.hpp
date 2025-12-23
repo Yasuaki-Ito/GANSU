@@ -230,7 +230,8 @@ public:
         if (rows == 0 || cols == 0) {
             THROW_EXCEPTION("Matrix dimensions must be greater than zero.");
         }
-        memory_manager_.allocate(); // Allocate memory via the provided manager
+        // double allocation?
+        //memory_manager_.allocate(); // Allocate memory via the provided manager
     }
 
     /**
