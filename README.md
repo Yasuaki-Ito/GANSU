@@ -17,6 +17,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Unrestricted Hartree-Fock (UHF)
     * Restricted Open-Shell Hartree-Fock (ROHF)
     * RI approximation (Density Fitting) (RHF, UHF, ROHF)
+    * Direct SCF (RHF) 
 * Initial Guess
     * Core Hamiltonian (RHF, UHF, ROHF) 
     * Generalized Wolfsberg-Helmholz (GWH) (RHF, UHF, ROHF)
@@ -59,7 +60,6 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 * Initial Guess
   * Random
   * Load the precomputed coefficients/Fock matrix
-* Direct SCF
 * Post-Hartree-Fock methods
   * Integral Transformation (AO -> MO)
   * Configuration Interaction (CI)
