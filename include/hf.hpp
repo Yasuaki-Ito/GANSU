@@ -25,13 +25,15 @@
 #include "basis_set.hpp"
 #include "molecular.hpp"
 
+#include "post_hf_method.hpp"
+
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
 #include "parameter_manager.hpp"
 #include "eri.hpp"
 
-namespace gansu{
 
+namespace gansu{
 
 // prototype of classes
 class ERI;
@@ -216,6 +218,24 @@ public:
      */
     real_t single_point_energy(const real_t* density_matrix_alpha=nullptr, const real_t* density_matrix_beta=nullptr, bool force_density=false);
 
+
+    /**
+     * @brief Post process after SCF calculation
+     * @details This function performs post processing after the SCF calculation (e.g., Post HF computation)
+     * @details This function is a virtual function and can be overridden in the derived class.
+     */
+    virtual void post_process_after_scf(){} ///< Post process after SCF calculation (e.g., Post HF computation)
+
+    /**
+     * @brief Get the post-HF method
+     */
+    PostHFMethod get_post_hf_method() const { return post_hf_method_; } ///< Get the post-HF method
+
+    /**
+     * @brief Get the post-HF energy
+     */
+    real_t get_post_hf_energy() const { return post_hf_energy_; } ///< Get the post-HF energy
+
 protected:
     long long solve_time_in_milliseconds_; ///< Time to solve the HF equation
 
@@ -250,12 +270,24 @@ protected:
 
     real_t nuclear_repulsion_energy_; ///< Nuclear repulsion energy
 
+    // Post-HF methods
+    PostHFMethod post_hf_method_; ///< Post-HF method
+    real_t post_hf_energy_; ///< Post-HF energy
+
+
     // for Diect SCF
     std::vector<ShellPairTypeInfo> shell_pair_type_infos;
     size_t num_primitive_shell_pairs;
 
     // for ERI (stored, RI, direct)
     std::unique_ptr<ERI> eri_method_; ///< ERI method
+
+
+    // Analysis flags
+    const bool is_mulliken_analysis_; ///< Mulliken population analysis flag
+    const bool is_mayer_bond_order_analysis_; ///< Mayer bond order analysis flag
+    const bool is_wiberg_bond_order_analysis_; ///< Wiberg bond order analysis
+    const bool is_export_molden_; ///< Export Molden file flag
 
     /**
      * @brief Virtual function to compute the Fock matrix
@@ -381,6 +413,8 @@ public:
      * @details Matrix must be allocated before calling this function, and the size of the matrix must be num_basis x num_basis.
      */
     virtual void export_density_matrix(real_t* density_matrix_a, real_t* density_martix_b, const int num_basis) = 0;
+
+
 
     void generate_sad_cache(const std::string& sad_cache_filename) {
         // This function is called after solving the HF equation

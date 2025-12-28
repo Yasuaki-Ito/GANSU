@@ -48,6 +48,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"charge", "0"},                            // int
         {"beta_to_alpha", "0"},                     // int
         {"eri_method", "stored"},                   // string
+        {"post_hf_method", "none"},                  // string
         {"auxiliary_gbsfilename", ""},              // string
         {"maxiter", "100"},                         // int
         {"convergence_energy_threshold", "1e-6"},   // real_t
@@ -60,7 +61,11 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"rohf_parameter_name", "roothaan"},        // string
         {"geometry_optimization", "0"},             // int (bool)
         {"geometry_optimization_method", "powell"}, // string
-        {"export_sad_cache", "0"}                   // int (bool)
+        {"export_sad_cache", "0"},                   // int (bool)
+        {"mulliken", "0"},                          // int (bool)
+        {"mayer", "0"},                             // int (bool)
+        {"wiberg", "0"},                            // int (bool)
+        {"export_molden", "0"},                     // int (bool)
     };
 
 

@@ -84,6 +84,11 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
     }else{
         THROW_EXCEPTION("Invalid ERI method name: " + eri_method);
     }
+
+    // Check if the selected ERI method supports post-HF methods
+    if(!eri_method_->supports_post_hf_method(get_post_hf_method())){
+        THROW_EXCEPTION("The selected ERI method does not support the selected post-HF method.");
+    }
 }
 
 /**
@@ -109,6 +114,25 @@ void RHF::precompute_eri_matrix(){
     PROFILE_FUNCTION();
 
     eri_method_->precomputation();
+}
+
+
+void RHF::post_process_after_scf() {
+    PROFILE_FUNCTION();
+
+    PostHFMethod post_hf_method = get_post_hf_method();
+    if(post_hf_method == PostHFMethod::None){
+        post_hf_energy_ = 0.0;
+        return; // do nothing
+    }else if(post_hf_method == PostHFMethod::MP2){
+        post_hf_energy_ = eri_method_->compute_mp2_energy();
+    }else if(post_hf_method == PostHFMethod::MP3){
+        post_hf_energy_ = eri_method_->compute_mp3_energy();
+    }else if(post_hf_method == PostHFMethod::CCSD){
+        post_hf_energy_ = eri_method_->compute_ccsd_energy();
+    }else{
+        THROW_EXCEPTION("Invalid post-HF method.");
+    }
 }
 
 
@@ -336,17 +360,17 @@ void RHF::report() {
 
     HF::report(); // prints the information of the input molecular and basis set
 
-    // print the results of the charge analysis
-    std::cout << std::endl;
-    std::cout << "[Charge analysis]" << std::endl;
-    std::cout << "Mulliken population" << std::endl;
-    const auto& mulliken_population = analyze_mulliken_population();
-    for(size_t i=0; i<atoms.size(); i++){
-        std::cout << "Atom " << i << " " << atomic_number_to_element_name(atoms[i].atomic_number) << ": " << std::setprecision(6) << mulliken_population[i] << std::endl;
+    if(is_mulliken_analysis_){
+        std::cout << std::endl;
+        std::cout << "[Mulliken population]" << std::endl;
+        const auto& mulliken_population = analyze_mulliken_population();
+        for(size_t i=0; i<atoms.size(); i++){
+            std::cout << "Atom " << i << " " << atomic_number_to_element_name(atoms[i].atomic_number) << ": " << std::setprecision(6) << mulliken_population[i] << std::endl;
+        }
     }
 
 
-    { // print Mayer bond order matrix
+    if(is_mayer_bond_order_analysis_){ // print Mayer bond order matrix
         std::cout << std::endl;
         std::cout << "[Mayer bond order]" << std::endl;
         const auto& mayer_bond_order_matrix = compute_mayer_bond_order();
@@ -364,7 +388,7 @@ void RHF::report() {
         std::cout.precision(old_precision);
     }
 
-    { // print Wiberg bond order matrix
+    if(is_wiberg_bond_order_analysis_){ // print Wiberg bond order matrix
         std::cout << std::endl;
         std::cout << "[Wiberg bond order]" << std::endl;
         const auto& wiberg_bond_order_matrix = compute_wiberg_bond_order();
@@ -394,6 +418,21 @@ void RHF::report() {
     std::cout << "Energy (without nuclear repulsion): " << std::setprecision(17) << get_energy() << " [hartree]" << std::endl;
     std::cout << "Total Energy: " << std::setprecision(17) << get_total_energy() << " [hartree]" << std::endl;
     std::cout << "Computing time: " << std::setprecision(5) << get_solve_time_in_milliseconds() << " [ms]" << std::endl;
+
+    if(get_post_hf_method() != PostHFMethod::None){
+        std::cout << std::endl;
+        std::cout << "[Calculation Summary (Post-HF)]" << std::endl;
+        std::cout << "Post-HF method: ";
+        if(get_post_hf_method() == PostHFMethod::MP2){
+            std::cout << "MP2" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::MP3){
+            std::cout << "MP3" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::CCSD){
+            std::cout << "CCSD" << std::endl;
+        }
+        std::cout << "Post-HF energy correction: " << std::setprecision(17) << get_post_hf_energy() << " [hartree]" << std::endl;
+        std::cout << "Total Energy (including post-HF correction): " << std::setprecision(17) << get_total_energy() + get_post_hf_energy() << " [hartree]" << std::endl;
+    }
 }
 
 /*

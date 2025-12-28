@@ -31,6 +31,7 @@
 
 namespace gansu {
 
+
 // prototype of function
 /**
  * @brief Function to convert a string to lowercase

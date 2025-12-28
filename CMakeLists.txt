@@ -59,6 +59,8 @@ set(SOURCES
     src/profiler.cu
     src/parameter_manager.cpp
     src/eri.cu
+    src/eri_ri.cu
+    src/eri_stored.cu
     src/utils.cpp
 )
 

@@ -18,6 +18,7 @@
 | maxiter | Maximum number of SCF iterations | int | 100 |
 | convergence_energy_threshold | Energy convergence threshold | double | 1.0e-6 |
 | eri_method | Method to use for two-electron repulsion integrals | string | stored |
+| post_hf_method | Post-Hartree-Fock method to use (MP2, CCSD, CCSD(T)) | string | none |
 | schwarz_screening_threshold | Schwarz screening threshold | double | 1.0e-12 |
 | initial_guess | Method to use for initial guess | string | core |
 | convergence_method | Method to use for convergence | string | DIIS |
@@ -25,7 +26,10 @@
 | diis_size | Number of previous Fock matrices to store | int | 8 |
 | diis_include_transform | Include the transformation matrix in DIIS | bool | false |
 | rohf_parameter_name | ROHF parameter set name | string | Roothaan |
-
+| mulliken | Perform Mulliken population analysis | bool | false |
+| mayer | Perform Mayer bond order analysis | bool | false |
+| wiberg | Perform Wiberg bond order analysis | bool | false |
+| export_molden | Output Molden file | bool | false |
 
 
 
@@ -138,6 +142,7 @@ If any of the following conditions are met, an exception is thrown:
 | diis_include_transform | Include the transformation matrix in DIIS | bool | false |
 | rohf_parameter_name | ROHF parameter set name | string | Roothaan |
 
+
 #### maxiter - Maximum number of SCF iterations
 * default:  100
 * Maximum number of SCF iterations to perform
@@ -152,6 +157,12 @@ If any of the following conditions are met, an exception is thrown:
 * RI - Resolution of the Identity (RI) approximation is used for the two-electron repulsion integrals (ERIs)
 * Direct - Direct calculation of the two-electron repulsion integrals (ERIs) without any approximation (Direct-SCF)
 
+#### post_hf_method - Post-Hartree-Fock method to use (MP2, CCSD, CCSD(T))
+* default: none
+* none - No post-Hartree-Fock method is applied
+* MP2 - Møller-Plesset perturbation theory of second order (MP2)
+* MP3 - Møller-Plesset perturbation theory of third order (MP3)
+* CCSD - Coupled Cluster with Single and Double excitations (CCSD)
 
 #### schwarz_screening_threshold - schwarz screening threshold
 * default:  1.0e-12
@@ -217,4 +228,22 @@ Otherwise, the two-electron repulsion integrals (ERIs) are set to zero.
 | Goddard |  $1/2$     |  $1/2$     |  $1/2$     |  $0$       |  $1/2$     |  $1/2$     |
 | Plakhutin-Gorelik-Breslavskaya |  $0$       |  $1$       |  $1$       |  $0$       |  $1$       |  $0$       | 
 
+#### mulliken - Perform Mulliken population analysis
+* default:  false
+* true - Perform Mulliken population analysis after the SCF calculation
+* false - Do not perform Mulliken population analysis
 
+#### mayer - Perform Mayer bond order analysis
+* default:  false
+* true - Perform Mayer bond order analysis after the SCF calculation
+* false - Do not perform Mayer bond order analysis
+
+#### wiberg - Perform Wiberg bond order analysis
+* default:  false
+* true - Perform Wiberg bond order analysis after the SCF calculation
+* false - Do not perform Wiberg bond order analysis
+
+#### export_molden - Export Molden file
+* default:  false
+* true - Export Molden file after the SCF calculation (output filename: output.molden)
+* false - Do not output Molden file

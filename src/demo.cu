@@ -74,7 +74,9 @@ int main(int argc, char* argv[]){
 
             rhf_energy =  rhf.get_total_energy();
             rhf_time = rhf.get_solve_time_in_milliseconds();
-            rhf.export_molden_file("rhf_" + round_to_1_decimal(r) + ".molden");
+            if(rhf.is_export_molden()){
+                rhf.export_molden_file("rhf_" + round_to_1_decimal(r) + ".molden");
+            }
         }
 
         double uhf_energy;
@@ -86,7 +88,9 @@ int main(int argc, char* argv[]){
 
             uhf_energy =  uhf.get_total_energy();
             uhf_time = uhf.get_solve_time_in_milliseconds();
-            uhf.export_molden_file("uhf_" + round_to_1_decimal(r) + ".molden");
+            if(uhf.is_export_molden()){
+                uhf.export_molden_file("uhf_" + round_to_1_decimal(r) + ".molden");
+            }
         }
 
         std::cout << "DEMO," << r << "," << rhf_energy << "," << uhf_energy << "," << rhf_time << "," << uhf_time << std::endl;
