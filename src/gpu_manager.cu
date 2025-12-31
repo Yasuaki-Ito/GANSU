@@ -152,10 +152,15 @@ int eigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_
     cublasHandle_t cublasHandle = GPUHandle::cublas();
 
     const double alpha = 1.0;
-    const double beta = 0.0;
+    double beta = 0.0;
 
     if (!accumulate){
         cudaMemset(d_matrix_C, 0, size * size * sizeof(double));
+        // beta = 0.0 for initialization
+        beta = 0.0; // redundant, but for clarity
+    }else{
+        // beta = 1.0 for accumulation
+        beta = 1.0;
     }
 
     const cublasOperation_t transA = (transpose_A) ? CUBLAS_OP_T : CUBLAS_OP_N;
@@ -474,6 +479,9 @@ void computeERIMatrix(const std::vector<ShellTypeInfo>& shell_type_infos, const 
     // make multi stream
     const int num_kernels = shell_quadruples.size();
     std::vector<cudaStream_t> streams(num_kernels);
+    for (int i = 0; i < num_kernels; ++i) {
+        cudaStreamCreate(&streams[i]);
+    }
 
     // for-loop for sorted shell-type (s0, s1, s2, s3)
     int stream_id = 0;
