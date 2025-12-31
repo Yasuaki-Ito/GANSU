@@ -107,6 +107,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 ├─ test/
 ├─ xyz/
 │   ├─ large_molecular/
+│   ├─ larger_molecular/
 │   └─ monatomic/
 ├─ CMakeLists.txt
 ├─ LICENSE
@@ -129,6 +130,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 | `test/` | Contains the test files |
 | `xyz/` | Contains the XYZ files (e.g., H2O.xyz) |
 | `xyz/large_molecular/` | Contains the XYZ files for large molecules (e.g., fullerene.xyz). RI approximation (density fitting) is neccesary for them. |
+| `xyz/larger_molecular/` | Contains the XYZ files for larger molecules (e.g., C720.xyz). Direct-SCF is neccesary for them. |
 | `xyz/monatomic/` | Contains the XYZ files for monatomic molecules (e.g., H.xyz) |
 | `CMakeLists.txt` | CMake configuration file |
 | `LICENSE` | License file |
