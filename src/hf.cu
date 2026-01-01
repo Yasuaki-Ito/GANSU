@@ -316,7 +316,10 @@ real_t HF::single_point_energy(const real_t* density_matrix_alpha, const real_t*
         std::cout << "---- Iteration: " << iter_ << " ----  ";
         std::cout << "Energy: " << std::setprecision(17) << energy << " ";
         std::cout << "Total energy: " << std::setprecision(17) << get_total_energy() << " ";
-        std::cout << "Difference: " << energy_difference_ << std::endl;
+        if(iter_ > 0){
+            std::cout << "Energy difference: " << std::setprecision(10) << energy_difference_ << " ";
+        }
+        std::cout << std::endl;
 
         if(energy_difference_ < convergence_energy_threshold){
             break;

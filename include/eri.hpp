@@ -131,6 +131,7 @@ public:
         if( method == PostHFMethod::None // always supported
             || method == PostHFMethod::MP2  // The stored ERI method supports MP2
             || method == PostHFMethod::MP3  // The stored ERI method supports MP3
+            || method == PostHFMethod::CCSD // The stored ERI method supports CCSD
           ){
             return true;
         }

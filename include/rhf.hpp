@@ -588,6 +588,7 @@ public:
 
     real_t compute_mp2_energy() override;
     real_t compute_mp3_energy() override;
+    real_t compute_ccsd_energy() override;
 
 
     void compute_fock_matrix() override {
