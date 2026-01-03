@@ -293,6 +293,7 @@ double mp2_from_aoeri_via_full_moeri(
     }
 
     // show all MO ERI
+    /*
     real_t* h_eri_ao = new real_t[N * N];
     for(int p = 0; p < nao; ++p){
         for(int q = 0; q < nao; ++q){
@@ -317,6 +318,7 @@ double mp2_from_aoeri_via_full_moeri(
         }
     }
     delete[] h_eri_ao;
+    */
 
     // ------------------------------------------------------------
     // 3) MP2 energy from full MO ERI
@@ -478,8 +480,8 @@ real_t ERI_Stored_RHF::compute_mp2_energy() {
 
 
 
-    real_t E_MP2 = mp2_naive(d_eri, d_C, d_eps, num_basis, num_occ);
-//    real_t E_MP2_stored = mp2_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ);
+//    real_t E_MP2 = mp2_naive(d_eri, d_C, d_eps, num_basis, num_occ);
+    real_t E_MP2 = mp2_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ);
 
 //    if(fabs(E_MP2_naive - E_MP2_stored) > 1e-8){
 //        std::cerr << "Warning: MP2 energy mismatch between naive and stored MOERI methods." << std::endl;
