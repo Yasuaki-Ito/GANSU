@@ -20,7 +20,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Direct SCF (RHF) 
 * Post-Hartree-Fock methods
     * Møller-Plesset Perturbation Theory (RMP2, RMP3, RI-RMP2)
-  * Coupled Cluster (RCCSD)
+  * Coupled Cluster (RCCSD, RCCSD(T))
 * Initial Guess
     * Core Hamiltonian (RHF, UHF, ROHF) 
     * Generalized Wolfsberg-Helmholz (GWH) (RHF, UHF, ROHF)

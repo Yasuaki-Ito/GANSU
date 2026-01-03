@@ -163,6 +163,7 @@ If any of the following conditions are met, an exception is thrown:
 * MP2 - Møller-Plesset perturbation theory of second order (MP2)
 * MP3 - Møller-Plesset perturbation theory of third order (MP3)
 * CCSD - Coupled Cluster with Single and Double excitations (CCSD)
+* CCSD_T - Coupled Cluster with Single, Double, and perturbative Triple excitations (CCSD(T))
 
 #### schwarz_screening_threshold - schwarz screening threshold
 * default:  1.0e-12
