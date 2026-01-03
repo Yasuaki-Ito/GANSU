@@ -2569,22 +2569,22 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
             str += "(initial amplitudes)";
             std::cout << str << std::endl;
         }else{
-            std::streamsize old_prec = std::cout.precision(); // save old precision
-            std::ios::fmtflags old_flags = std::cout.flags();      
+            //std::streamsize old_prec = std::cout.precision(); // save old precision
+            //std::ios::fmtflags old_flags = std::cout.flags();      
 
             std::cout << str
               //<< "E_CCSD: " << E_CCSD_new << " Hartree. "
               << "E_CCSD difference: " << fabs(E_CCSD_new - E_CCSD_old) << " Hartree. "
               //<< "T-amplitude difference: "
               << "T-amplitude RMS: "
-              << std::scientific        // or std::fixed
-              << std::setprecision(12)  // number of digits
+              //<< std::scientific        // or std::fixed
+              //<< std::setprecision(12)  // number of digits
               //<< diff
               << rms
               << std::endl;
 
-            std::cout.precision(old_prec); // restore old precision
-            std::cout.flags(old_flags);
+            //std::cout.precision(old_prec); // restore old precision
+            //std::cout.flags(old_flags);
         }
 
 
@@ -2641,9 +2641,9 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
             rms += h_residual[idx] * h_residual[idx];
         }
         rms = std::sqrt(rms/num_ccsd_amplitudes);
-        std::cout << "DIIS RMS of residuals: " << std::scientific << std::setprecision(12) << rms << std::endl;
+        std::cout << "DIIS RMS of residuals: " << rms << std::endl;
         real_t E_CCSD_diff = fabs(E_CCSD_new - E_CCSD_old);
-        std::cout << "CCSD Energy difference: " << std::scientific << std::setprecision(12) << E_CCSD_diff << " Hartree" <<  std::endl;
+        std::cout << "CCSD Energy difference: " << E_CCSD_diff << " Hartree" <<  std::endl;
 
         if(rms < convergence_threshold || E_CCSD_diff < convergence_threshold){
             std::cout << "CCSD converged in " << (loops+1) << " iterations." << std::endl;
