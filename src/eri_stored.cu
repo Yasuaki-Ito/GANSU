@@ -1313,10 +1313,10 @@ __global__ void compute_W_abef_kernel(const real_t* __restrict__ d_eri_mo, const
             sum -= amef * t_mb_val; // - <am||ef> * t_m^b
 
             // swap a and b
-            real_t bemf = antisym_eri(d_eri_mo, num_basis, b, m, e, f); // <bm||ef> = (be|mf) - (bf|me)
+            real_t bmef = antisym_eri(d_eri_mo, num_basis, b, m, e, f); // <bm||ef> = (be|mf) - (bf|me)
             real_t t_ma_val = t1_amplitude(t_ia, num_spin_occ, num_spin_vir, m, a_);
 
-            sum += bemf * t_ma_val; // + <bm||ef> * t_m^a
+            sum += bmef * t_ma_val; // + <bm||ef> * t_m^a
         }
 
         // sum over m,n
@@ -2038,7 +2038,7 @@ __global__ void compute_ccsd_energy_kernel(const real_t* __restrict__ d_eri_mo,
 
         
         // <ij||ab> = (ia|jb) - (ib|ja)
-        real_t ijab = antisym_eri(d_eri_mo, num_basis, i, a, j, b);
+        real_t ijab = antisym_eri(d_eri_mo, num_basis, i, j, a, b);
         
         real_t t_ijab_val = t2_amplitude(t_ijab, num_spin_occ, num_spin_vir, i, j, a_, b_);
         real_t t_ia_val = t1_amplitude(t_ia, num_spin_occ, num_spin_vir, i, a_);
@@ -2196,7 +2196,7 @@ __global__ void initialize_ccsd_amplitudes_kernel(const real_t* __restrict__ d_e
         }
 
         // <ij||ab> = (ia|jb) - (ib|ja)
-        real_t ijab = antisym_eri(d_eri_mo, num_basis, i, a, j, b);
+        real_t ijab = antisym_eri(d_eri_mo, num_basis, i, j, a, b);
 
         double denom = d_eps[i/2] + d_eps[j/2] - d_eps[a/2] - d_eps[b/2];
         // Avoid division by tiny denom (shouldn't happen in normal canonical RHF unless degenerate)
