@@ -141,6 +141,7 @@ If any of the following conditions are met, an exception is thrown:
 | diis_size | Number of previous Fock matrices to store | int | 8 |
 | diis_include_transform | Include the transformation matrix in DIIS | bool | false |
 | rohf_parameter_name | ROHF parameter set name | string | Roothaan |
+| post_hf_method | Post-Hartree-Fock method to use (MP2, CCSD, CCSD(T)) | string | none |
 
 
 #### maxiter - Maximum number of SCF iterations
