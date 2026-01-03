@@ -130,6 +130,8 @@ void RHF::post_process_after_scf() {
         post_hf_energy_ = eri_method_->compute_mp3_energy();
     }else if(post_hf_method == PostHFMethod::CCSD){
         post_hf_energy_ = eri_method_->compute_ccsd_energy();
+    }else if(post_hf_method == PostHFMethod::CCSD_T){
+        post_hf_energy_ = eri_method_->compute_ccsd_t_energy();
     }else{
         THROW_EXCEPTION("Invalid post-HF method.");
     }
@@ -429,6 +431,8 @@ void RHF::report() {
             std::cout << "MP3" << std::endl;
         }else if(get_post_hf_method() == PostHFMethod::CCSD){
             std::cout << "CCSD" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::CCSD_T){
+            std::cout << "CCSD(T)" << std::endl;
         }
         std::cout << "Post-HF energy correction: " << std::setprecision(17) << get_post_hf_energy() << " [hartree]" << std::endl;
         std::cout << "Total Energy (including post-HF correction): " << std::setprecision(17) << get_total_energy() + get_post_hf_energy() << " [hartree]" << std::endl;

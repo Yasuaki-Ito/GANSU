@@ -102,6 +102,16 @@ public:
         THROW_EXCEPTION("CCSD energy computation is not supported for the selected ERI method.");
     }
 
+    /**
+     * @brief Compute CCSD(T) energy
+        * @return CCSD(T) energy
+        * @details This function computes the CCSD(T) energy.
+        */
+    virtual real_t compute_ccsd_t_energy(){
+        THROW_EXCEPTION("CCSD(T) energy computation is not supported for the selected ERI method.");
+    }
+
+
 };
 
 /**
@@ -132,6 +142,7 @@ public:
             || method == PostHFMethod::MP2  // The stored ERI method supports MP2
             || method == PostHFMethod::MP3  // The stored ERI method supports MP3
             || method == PostHFMethod::CCSD // The stored ERI method supports CCSD
+            || method == PostHFMethod::CCSD_T // The stored ERI method supports CCSD(T)
           ){
             return true;
         }

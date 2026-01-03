@@ -86,6 +86,9 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     }else if(post_hf_method_str == "ccsd"){
         std::cout << "Messege: Post-HF method is CCSD." << std::endl;
         post_hf_method_ = PostHFMethod::CCSD;
+    }else if(post_hf_method_str == "ccsd_t"){
+        std::cout << "Messege: Post-HF method is CCSD(T)." << std::endl;
+        post_hf_method_ = PostHFMethod::CCSD_T;
     }else{
         throw std::runtime_error("Error: Unknown post-HF method: " + post_hf_method_str);
     }

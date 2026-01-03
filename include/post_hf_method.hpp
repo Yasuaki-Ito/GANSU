@@ -20,7 +20,8 @@ enum class PostHFMethod {
     None,
     MP2,
     MP3,
-    CCSD
+    CCSD,
+    CCSD_T
 };
 
 } // namespace gansu
