@@ -478,8 +478,8 @@ real_t ERI_Stored_RHF::compute_mp2_energy() {
 
 
 
-//    real_t E_MP2_naive = mp2_naive(d_eri, d_C, d_eps, num_basis, num_occ);
-    real_t E_MP2_stored = mp2_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ);
+    real_t E_MP2 = mp2_naive(d_eri, d_C, d_eps, num_basis, num_occ);
+//    real_t E_MP2_stored = mp2_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ);
 
 //    if(fabs(E_MP2_naive - E_MP2_stored) > 1e-8){
 //        std::cerr << "Warning: MP2 energy mismatch between naive and stored MOERI methods." << std::endl;
@@ -487,7 +487,7 @@ real_t ERI_Stored_RHF::compute_mp2_energy() {
 //        std::cerr << "  E_MP2_stored = " << E_MP2_stored << std::endl;
 //    }
 
-    return E_MP2_stored;
+    return E_MP2;
 }
 
 
@@ -2641,9 +2641,9 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
             rms += h_residual[idx] * h_residual[idx];
         }
         rms = std::sqrt(rms/num_ccsd_amplitudes);
-        std::cout << "DIIS RMS of residuals: " << rms << std::endl;
+        //std::cout << "DIIS RMS of residuals: " << rms << std::endl;
         real_t E_CCSD_diff = fabs(E_CCSD_new - E_CCSD_old);
-        std::cout << "CCSD Energy difference: " << E_CCSD_diff << " Hartree" <<  std::endl;
+        //std::cout << "CCSD Energy difference: " << E_CCSD_diff << " Hartree" <<  std::endl;
 
         if(rms < convergence_threshold || E_CCSD_diff < convergence_threshold){
             std::cout << "CCSD converged in " << (loops+1) << " iterations." << std::endl;
@@ -2740,9 +2740,9 @@ real_t ERI_Stored_RHF::compute_ccsd_energy() {
     const real_t* d_eps = orbital_energies.device_ptr();
     const real_t* d_eri = eri_matrix_.device_ptr();
 
-    bool including_ccsd_t = false;
+    bool computing_ccsd_t = false;
 
-    real_t E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, including_ccsd_t);
+    real_t E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, computing_ccsd_t);
 
     std::cout << "CCSD energy: " << E_CCSD << " Hartree" << std::endl;
 
