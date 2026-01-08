@@ -94,6 +94,15 @@ public:
     }
 
     /**
+     * @brief Compute MP4 energy
+        * @return MP4 energy
+        * @details This function computes the MP4 energy.
+        */
+    virtual real_t compute_mp4_energy(){
+        THROW_EXCEPTION("MP4 energy computation is not supported for the selected ERI method.");
+    }
+
+    /**
      * @brief Compute CCSD energy
         * @return CCSD energy
         * @details This function computes the CCSD energy.
@@ -141,6 +150,7 @@ public:
         if( method == PostHFMethod::None // always supported
             || method == PostHFMethod::MP2  // The stored ERI method supports MP2
             || method == PostHFMethod::MP3  // The stored ERI method supports MP3
+            || method == PostHFMethod::MP4  // The stored ERI method supports MP4
             || method == PostHFMethod::CCSD // The stored ERI method supports CCSD
             || method == PostHFMethod::CCSD_T // The stored ERI method supports CCSD(T)
           ){

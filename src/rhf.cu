@@ -128,6 +128,8 @@ void RHF::post_process_after_scf() {
         post_hf_energy_ = eri_method_->compute_mp2_energy();
     }else if(post_hf_method == PostHFMethod::MP3){
         post_hf_energy_ = eri_method_->compute_mp3_energy();
+    }else if(post_hf_method == PostHFMethod::MP4){
+        post_hf_energy_ = eri_method_->compute_mp4_energy();
     }else if(post_hf_method == PostHFMethod::CCSD){
         post_hf_energy_ = eri_method_->compute_ccsd_energy();
     }else if(post_hf_method == PostHFMethod::CCSD_T){

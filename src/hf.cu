@@ -83,6 +83,9 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     }else if(post_hf_method_str == "mp3"){
         std::cout << "Messege: Post-HF method is MP3." << std::endl;
         post_hf_method_ = PostHFMethod::MP3;
+    }else if(post_hf_method_str == "mp4"){
+        std::cout << "Messege: Post-HF method is MP4." << std::endl;
+        post_hf_method_ = PostHFMethod::MP4;
     }else if(post_hf_method_str == "ccsd"){
         std::cout << "Messege: Post-HF method is CCSD." << std::endl;
         post_hf_method_ = PostHFMethod::CCSD;
