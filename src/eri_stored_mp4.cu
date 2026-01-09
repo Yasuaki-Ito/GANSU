@@ -1712,11 +1712,11 @@ __global__ void compute_mp4_E2_8_kernel(const real_t* __restrict__ eri_mo,
             for(int a_ = 0; a_ < num_spin_vir; ++a_){
                 int a = a_ + num_spin_occ;
 
-                real_t eri_abij = antisym_eri(eri_mo, num_basis, a, b, i, j);
+                real_t eri_acij = antisym_eri(eri_mo, num_basis, a, c, i, j);
                 real_t eri_ibak = antisym_eri(eri_mo, num_basis, i, b, a, k);
                 real_t e_ijac = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[c/2];
 
-                T_jkbc += eri_abij * eri_ibak / e_ijac;
+                T_jkbc += eri_acij * eri_ibak / e_ijac;
             }
         }
 
@@ -2060,6 +2060,72 @@ __global__ void compute_mp4_E3_1_kernel(const real_t* __restrict__ eri_mo,
 }
 
 
+
+
+__global__ void compute_mp4_E3_1_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                          const int vir_b,
+                                          const int vir_c,
+                                          real_t* __restrict__ d_mp4_energy_E3_1)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir;// * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int c_ = vir_c; //(int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = vir_b; //(int)(t % num_spin_vir); t /= num_spin_vir;
+        int a_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int l = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j  = (int)(t % num_spin_occ);
+
+        int c = c_ + num_spin_occ;
+        int b = b_ + num_spin_occ;
+        int a = a_ + num_spin_occ;
+
+        // S_jklabc
+        real_t S_jklabc = 0.0;
+
+        // sum over d
+        for(int d_ = 0; d_ < num_spin_vir; ++d_){
+            int d = d_ + num_spin_occ;
+
+            real_t eri_jdab = antisym_eri(eri_mo, num_basis, j, d, a, b);
+            real_t eri_klcd = antisym_eri(eri_mo, num_basis, k, l, c, d);
+            real_t e_klcd = orbital_energies[k/2] + orbital_energies[l/2] - orbital_energies[c/2] - orbital_energies[d/2];
+
+            S_jklabc += eri_jdab * eri_klcd / e_klcd;
+        }
+
+        // T_jklabc
+        real_t T_jklabc = 0.0;
+
+        // sum over i
+        for(int i = 0; i < num_spin_occ; ++i){
+
+            real_t eri_acij = antisym_eri(eri_mo, num_basis, a, c, i, j);
+            real_t eri_ibkl = antisym_eri(eri_mo, num_basis, i, b, k, l);
+            real_t e_ijac = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[c/2];
+
+            T_jklabc += eri_acij * eri_ibkl / e_ijac;
+        }
+
+        real_t e_jklabc = orbital_energies[j/2] + orbital_energies[k/2] + orbital_energies[l/2] - orbital_energies[a/2] - orbital_energies[b/2] - orbital_energies[c/2];
+        contrib += (1.0) / (2.0) * S_jklabc * T_jklabc / e_jklabc;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_1, block_sum);
+    }
+}
+
 __global__ void compute_mp4_E3_2_kernel(const real_t* __restrict__ eri_mo,
                                           const real_t* __restrict__ orbital_energies,
                                           const int num_basis,
@@ -2076,6 +2142,71 @@ __global__ void compute_mp4_E3_2_kernel(const real_t* __restrict__ eri_mo,
         size_t t = gid;
         int c_ = (int)(t % num_spin_vir); t /= num_spin_vir;
         int b_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int a_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int l = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j  = (int)(t % num_spin_occ);
+
+        int c = c_ + num_spin_occ;
+        int b = b_ + num_spin_occ;
+        int a = a_ + num_spin_occ;
+
+        // S_jklabc
+        real_t S_jklabc = 0.0;
+
+        // sum over d
+        for(int d_ = 0; d_ < num_spin_vir; ++d_){
+            int d = d_ + num_spin_occ;
+
+            real_t eri_jdab = antisym_eri(eri_mo, num_basis, j, d, a, b);
+            real_t eri_klcd = antisym_eri(eri_mo, num_basis, k, l, c, d);
+            real_t e_klcd = orbital_energies[k/2] + orbital_energies[l/2] - orbital_energies[c/2] - orbital_energies[d/2];
+
+            S_jklabc += eri_jdab * eri_klcd / e_klcd;
+        }
+
+        // T_jklabc
+        real_t T_jklabc = 0.0;
+
+        // sum over i
+        for(int i = 0; i < num_spin_occ; ++i){
+
+            real_t eri_abij = antisym_eri(eri_mo, num_basis, a, b, i, j);
+            real_t eri_ickl = antisym_eri(eri_mo, num_basis, i, c, k, l);
+            real_t e_ijab = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[b/2];
+
+            T_jklabc += eri_abij * eri_ickl / e_ijab;
+        }
+
+        real_t e_jklabc = orbital_energies[j/2] + orbital_energies[k/2] + orbital_energies[l/2] - orbital_energies[a/2] - orbital_energies[b/2] - orbital_energies[c/2];
+        contrib += - (1.0) / (4.0) * S_jklabc * T_jklabc / e_jklabc;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_2, block_sum);
+    }
+}
+
+
+__global__ void compute_mp4_E3_2_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                          const int vir_b,
+                                          const int vir_c,
+                                          real_t* __restrict__ d_mp4_energy_E3_2)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir;// * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int c_ = vir_c; //(int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = vir_b; //(int)(t % num_spin_vir); t /= num_spin_vir;
         int a_ = (int)(t % num_spin_vir); t /= num_spin_vir;
         int l = (int)(t % num_spin_occ); t /= num_spin_occ;
         int k = (int)(t % num_spin_occ); t /= num_spin_occ;
@@ -2186,6 +2317,70 @@ __global__ void compute_mp4_E3_3_kernel(const real_t* __restrict__ eri_mo,
     }
 }
 
+__global__ void compute_mp4_E3_3_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_c,
+                                            const int vir_d,
+                                          real_t* __restrict__ d_mp4_energy_E3_3)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir; // * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int d_ = vir_d; // (int)(t % num_spin_vir); t /= num_spin_vir;
+        int c_ = vir_c; // (int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int i  = (int)(t % num_spin_occ);
+
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+        int d = d_ + num_spin_occ;
+
+        // S_ijkbcd
+        real_t S_ijkbcd = 0.0;
+
+        // sum over l
+        for(int l = 0; l < num_spin_occ; ++l){
+
+            real_t eri_ijbl = antisym_eri(eri_mo, num_basis, i, j, b, l);
+            real_t eri_klcd = antisym_eri(eri_mo, num_basis, k, l, c, d);
+            real_t e_klcd = orbital_energies[k/2] + orbital_energies[l/2] - orbital_energies[c/2] - orbital_energies[d/2];
+
+            S_ijkbcd += eri_ijbl * eri_klcd / e_klcd;
+        }
+
+        // T_ijkbcd
+        real_t T_ijkbcd = 0.0;
+
+        // sum over a
+        for(int a_ = 0; a_ < num_spin_vir; ++a_){
+            int a = a_ + num_spin_occ;
+
+            real_t eri_abij = antisym_eri(eri_mo, num_basis, a, b, i, j);
+            real_t eri_cdak = antisym_eri(eri_mo, num_basis, c, d, a, k);
+            real_t e_ijab = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[b/2];
+
+            T_ijkbcd += eri_abij * eri_cdak / e_ijab;
+        }
+
+        real_t e_ijkbcd = orbital_energies[i/2] + orbital_energies[j/2] + orbital_energies[k/2] - orbital_energies[b/2] - orbital_energies[c/2] - orbital_energies[d/2];
+        contrib += - (1.0) / (4.0) * S_ijkbcd * T_ijkbcd / e_ijkbcd;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_3, block_sum);
+    }
+}
+
 
 
 __global__ void compute_mp4_E3_4_kernel(const real_t* __restrict__ eri_mo,
@@ -2204,6 +2399,70 @@ __global__ void compute_mp4_E3_4_kernel(const real_t* __restrict__ eri_mo,
         size_t t = gid;
         int c_ = (int)(t % num_spin_vir); t /= num_spin_vir;
         int b_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int a_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int l = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j  = (int)(t % num_spin_occ);
+
+        int a = a_ + num_spin_occ;
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+
+        // S_jklabc
+        real_t S_jklabc = 0.0;
+
+        // sum over m
+        for(int m = 0; m < num_spin_occ; ++m){
+
+            real_t eri_jkam = antisym_eri(eri_mo, num_basis, j, k, a, m);
+            real_t eri_lmbc = antisym_eri(eri_mo, num_basis, l, m, b, c);
+            real_t e_lmbc = orbital_energies[l/2] + orbital_energies[m/2] - orbital_energies[b/2] - orbital_energies[c/2];
+
+            S_jklabc += eri_jkam * eri_lmbc / e_lmbc;
+        }
+
+        // T_jklabc
+        real_t T_jklabc = 0.0;
+
+        // sum over i
+        for(int i = 0; i < num_spin_occ; ++i){
+
+            real_t eri_abij = antisym_eri(eri_mo, num_basis, a, b, i, j);
+            real_t eri_ickl = antisym_eri(eri_mo, num_basis, i, c, k, l);
+            real_t e_ijab = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[b/2];
+
+            T_jklabc += eri_abij * eri_ickl / e_ijab;
+        }
+
+        real_t e_jklabc = orbital_energies[j/2] + orbital_energies[k/2] + orbital_energies[l/2] - orbital_energies[a/2] - orbital_energies[b/2] - orbital_energies[c/2];
+        contrib += (1.0) * S_jklabc * T_jklabc / e_jklabc;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_4, block_sum);
+    }
+}
+
+
+__global__ void compute_mp4_E3_4_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_b,
+                                            const int vir_c,
+                                          real_t* __restrict__ d_mp4_energy_E3_4)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir;// * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int c_ = vir_c;//(int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = vir_b;//(int)(t % num_spin_vir); t /= num_spin_vir;
         int a_ = (int)(t % num_spin_vir); t /= num_spin_vir;
         int l = (int)(t % num_spin_occ); t /= num_spin_occ;
         int k = (int)(t % num_spin_occ); t /= num_spin_occ;
@@ -2314,6 +2573,70 @@ __global__ void compute_mp4_E3_5_kernel(const real_t* __restrict__ eri_mo,
 
 
 
+__global__ void compute_mp4_E3_5_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_c,
+                                            const int vir_d,
+                                          real_t* __restrict__ d_mp4_energy_E3_5)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir; // * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int d_ = vir_d;//(int)(t % num_spin_vir); t /= num_spin_vir;
+        int c_ = vir_c;//(int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int i  = (int)(t % num_spin_occ);
+
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+        int d = d_ + num_spin_occ;
+
+        // S_ijkbcd
+        real_t S_ijkbcd = 0.0;
+
+        // sum over l
+        for(int l = 0; l < num_spin_occ; ++l){
+
+            real_t eri_ikbl = antisym_eri(eri_mo, num_basis, i, k, b, l);
+            real_t eri_jlcd = antisym_eri(eri_mo, num_basis, j, l, c, d);
+            real_t e_jlcd = orbital_energies[j/2] + orbital_energies[l/2] - orbital_energies[c/2] - orbital_energies[d/2];
+
+            S_ijkbcd += eri_ikbl * eri_jlcd / e_jlcd;
+        }
+
+        // T_ijkbcd
+        real_t T_ijkbcd = 0.0;
+
+        // sum over a
+        for(int a_ = 0; a_ < num_spin_vir; ++a_){
+            int a = a_ + num_spin_occ;
+
+            real_t eri_abij = antisym_eri(eri_mo, num_basis, a, b, i, j);
+            real_t eri_cdak = antisym_eri(eri_mo, num_basis, c, d, a, k);
+            real_t e_ijab = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[b/2];
+
+            T_ijkbcd += eri_abij * eri_cdak / e_ijab;
+        }
+
+        real_t e_ijkbcd = orbital_energies[i/2] + orbital_energies[j/2] + orbital_energies[k/2] - orbital_energies[b/2] - orbital_energies[c/2] - orbital_energies[d/2];
+        contrib += (1.0) / (2.0) * S_ijkbcd * T_ijkbcd / e_ijkbcd;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_5, block_sum);
+    }
+}
+
 
 
 
@@ -2379,6 +2702,69 @@ __global__ void compute_mp4_E3_6_kernel(const real_t* __restrict__ eri_mo,
 }
 
 
+__global__ void compute_mp4_E3_6_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_b,
+                                            const int vir_c,
+                                          real_t* __restrict__ d_mp4_energy_E3_6)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir; // * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int c_ =  vir_c; // (int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ =  vir_b; // (int)(t % num_spin_vir); t /= num_spin_vir;
+        int a_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int l = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j  = (int)(t % num_spin_occ);
+
+        int a = a_ + num_spin_occ;
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+
+        // S_jklabc
+        real_t S_jklabc = 0.0;
+
+        // sum over m
+        for(int m = 0; m < num_spin_occ; ++m){
+
+            real_t eri_jkam = antisym_eri(eri_mo, num_basis, j, k, a, m);
+            real_t eri_lmbc = antisym_eri(eri_mo, num_basis, l, m, b, c);
+            real_t e_lmbc = orbital_energies[l/2] + orbital_energies[m/2] - orbital_energies[b/2] - orbital_energies[c/2];
+
+            S_jklabc += eri_jkam * eri_lmbc / e_lmbc;
+        }
+
+        // T_jklabc
+        real_t T_jklabc = 0.0;
+
+        // sum over i
+        for(int i = 0; i < num_spin_occ; ++i){
+
+            real_t eri_bcij = antisym_eri(eri_mo, num_basis, b, c, i, j);
+            real_t eri_iakl = antisym_eri(eri_mo, num_basis, i, a, k, l);
+            real_t e_ijbc = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[b/2] - orbital_energies[c/2];
+
+            T_jklabc += eri_bcij * eri_iakl / e_ijbc;
+        }
+
+        real_t e_jklabc = orbital_energies[j/2] + orbital_energies[k/2] + orbital_energies[l/2] - orbital_energies[a/2] - orbital_energies[b/2] - orbital_energies[c/2];
+        contrib += (1.0) / (2.0) * S_jklabc * T_jklabc / e_jklabc;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_6, block_sum);
+    }
+}
+
 
 __global__ void compute_mp4_E3_7_kernel(const real_t* __restrict__ eri_mo,
                                           const real_t* __restrict__ orbital_energies,
@@ -2442,6 +2828,69 @@ __global__ void compute_mp4_E3_7_kernel(const real_t* __restrict__ eri_mo,
 }
 
 
+__global__ void compute_mp4_E3_7_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_b,
+                                            const int vir_c,
+                                          real_t* __restrict__ d_mp4_energy_E3_7)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir; // * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int c_ = vir_c; // (int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = vir_b; // (int)(t % num_spin_vir); t /= num_spin_vir;
+        int a_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int l = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j  = (int)(t % num_spin_occ);
+
+        int a = a_ + num_spin_occ;
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+
+        // S_jklabc
+        real_t S_jklabc = 0.0;
+
+        // sum over m
+        for(int m = 0; m < num_spin_occ; ++m){
+
+            real_t eri_klam = antisym_eri(eri_mo, num_basis, k, l, a, m);
+            real_t eri_jmbc = antisym_eri(eri_mo, num_basis, j, m, b, c);
+            real_t e_jmbc = orbital_energies[j/2] + orbital_energies[m/2] - orbital_energies[b/2] - orbital_energies[c/2];
+
+            S_jklabc += eri_klam * eri_jmbc / e_jmbc;
+        }
+
+        // T_jklabc
+        real_t T_jklabc = 0.0;
+
+        // sum over i
+        for(int i = 0; i < num_spin_occ; ++i){
+
+            real_t eri_bcij = antisym_eri(eri_mo, num_basis, b, c, i, j);
+            real_t eri_iakl = antisym_eri(eri_mo, num_basis, i, a, k, l);
+            real_t e_ijbc = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[b/2] - orbital_energies[c/2];
+
+            T_jklabc += eri_bcij * eri_iakl / e_ijbc;
+        }
+
+        real_t e_jklabc = orbital_energies[j/2] + orbital_energies[k/2] + orbital_energies[l/2] - orbital_energies[a/2] - orbital_energies[b/2] - orbital_energies[c/2];
+        contrib += (1.0) / (4.0) * S_jklabc * T_jklabc / e_jklabc;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_7, block_sum);
+    }
+}
+
 
 __global__ void compute_mp4_E3_8_kernel(const real_t* __restrict__ eri_mo,
                                           const real_t* __restrict__ orbital_energies,
@@ -2459,6 +2908,72 @@ __global__ void compute_mp4_E3_8_kernel(const real_t* __restrict__ eri_mo,
         size_t t = gid;
         int d_ = (int)(t % num_spin_vir); t /= num_spin_vir;
         int c_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int i  = (int)(t % num_spin_occ);
+
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+        int d = d_ + num_spin_occ;
+
+        // S_ijkbcd
+        real_t S_ijkbcd = 0.0;
+
+        // sum over e
+        for(int e_ = 0; e_ < num_spin_vir; ++e_){
+            int e = e_ + num_spin_occ;
+
+            real_t eri_iebc = antisym_eri(eri_mo, num_basis, i, e, b, c);
+            real_t eri_jkde = antisym_eri(eri_mo, num_basis, j, k, d, e);
+            real_t e_jkde = orbital_energies[j/2] + orbital_energies[k/2] - orbital_energies[d/2] - orbital_energies[e/2];
+
+            S_ijkbcd += eri_iebc * eri_jkde / e_jkde;
+        }
+
+        // T_ijkbcd
+        real_t T_ijkbcd = 0.0;
+
+        // sum over a
+        for(int a_ = 0; a_ < num_spin_vir; ++a_){
+            int a = a_ + num_spin_occ;
+
+            real_t eri_adij = antisym_eri(eri_mo, num_basis, a, d, i, j);
+            real_t eri_bcak = antisym_eri(eri_mo, num_basis, b, c, a, k);
+            real_t e_ijad = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[d/2];
+
+            T_ijkbcd += eri_adij * eri_bcak / e_ijad;
+        }
+
+        real_t e_ijkbcd = orbital_energies[i/2] + orbital_energies[j/2] + orbital_energies[k/2] - orbital_energies[b/2] - orbital_energies[c/2] - orbital_energies[d/2];
+        contrib += (1.0) / (2.0) * S_ijkbcd * T_ijkbcd / e_ijkbcd;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_8, block_sum);
+    }
+}
+
+
+__global__ void compute_mp4_E3_8_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_c,
+                                            const int vir_d,
+                                          real_t* __restrict__ d_mp4_energy_E3_8)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir; // * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int d_ = vir_d; // (int)(t % num_spin_vir); t /= num_spin_vir;
+        int c_ = vir_c; // (int)(t % num_spin_vir); t /= num_spin_vir;
         int b_ = (int)(t % num_spin_vir); t /= num_spin_vir;
         int k = (int)(t % num_spin_occ); t /= num_spin_occ;
         int j = (int)(t % num_spin_occ); t /= num_spin_occ;
@@ -2571,6 +3086,71 @@ __global__ void compute_mp4_E3_9_kernel(const real_t* __restrict__ eri_mo,
 }
 
 
+__global__ void compute_mp4_E3_9_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_c,
+                                            const int vir_d,
+                                          real_t* __restrict__ d_mp4_energy_E3_9)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir; // * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int d_ = vir_d; // (int)(t % num_spin_vir); t /= num_spin_vir;
+        int c_ = vir_c; // (int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int i  = (int)(t % num_spin_occ);
+
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+        int d = d_ + num_spin_occ;
+
+        // S_ijkbcd
+        real_t S_ijkbcd = 0.0;
+
+        // sum over l
+        for(int l = 0; l < num_spin_occ; ++l){
+
+            real_t eri_ikbl = antisym_eri(eri_mo, num_basis, i, k, b, l);
+            real_t eri_jlcd = antisym_eri(eri_mo, num_basis, j, l, c, d);
+            real_t e_jlcd = orbital_energies[j/2] + orbital_energies[l/2] - orbital_energies[c/2] - orbital_energies[d/2];
+
+            S_ijkbcd += eri_ikbl * eri_jlcd / e_jlcd;
+        }
+
+        // T_ijkbcd
+        real_t T_ijkbcd = 0.0;
+
+        // sum over a
+        for(int a_ = 0; a_ < num_spin_vir; ++a_){
+            int a = a_ + num_spin_occ;
+
+            real_t eri_acij = antisym_eri(eri_mo, num_basis, a, c, i, j);
+            real_t eri_bdak = antisym_eri(eri_mo, num_basis, b, d, a, k);
+            real_t e_ijac = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[c/2];
+
+            T_ijkbcd += eri_acij * eri_bdak / e_ijac;
+        }
+
+        real_t e_ijkbcd = orbital_energies[i/2] + orbital_energies[j/2] + orbital_energies[k/2] - orbital_energies[b/2] - orbital_energies[c/2] - orbital_energies[d/2];
+        contrib += - (1.0) * S_ijkbcd * T_ijkbcd / e_ijkbcd;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_9, block_sum);
+    }
+}
+
+
 
 __global__ void compute_mp4_E3_10_kernel(const real_t* __restrict__ eri_mo,
                                           const real_t* __restrict__ orbital_energies,
@@ -2635,6 +3215,71 @@ __global__ void compute_mp4_E3_10_kernel(const real_t* __restrict__ eri_mo,
     }
 }
 
+
+__global__ void compute_mp4_E3_10_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_c,
+                                            const int vir_d,
+                                          real_t* __restrict__ d_mp4_energy_E3_10)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir; // * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int d_ = vir_d; // (int)(t % num_spin_vir); t /= num_spin_vir;
+        int c_ = vir_c; // (int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int i  = (int)(t % num_spin_occ);
+
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+        int d = d_ + num_spin_occ;
+
+        // S_ijkbcd
+        real_t S_ijkbcd = 0.0;
+
+        // sum over e
+        for(int e_ = 0; e_ < num_spin_vir; ++e_){
+            int e = e_ + num_spin_occ;
+
+            real_t eri_iebc = antisym_eri(eri_mo, num_basis, i, e, b, c);
+            real_t eri_jkde = antisym_eri(eri_mo, num_basis, j, k, d, e);
+            real_t e_jkde = orbital_energies[j/2] + orbital_energies[k/2] - orbital_energies[d/2] - orbital_energies[e/2];
+
+            S_ijkbcd += eri_iebc * eri_jkde / e_jkde;
+        }
+
+        // T_ijkbcd
+        real_t T_ijkbcd = 0.0;
+
+        // sum over a
+        for(int a_ = 0; a_ < num_spin_vir; ++a_){
+            int a = a_ + num_spin_occ;
+
+            real_t eri_abij = antisym_eri(eri_mo, num_basis, a, b, i, j);
+            real_t eri_cdak = antisym_eri(eri_mo, num_basis, c, d, a, k);
+            real_t e_ijab = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[b/2];
+
+            T_ijkbcd += eri_abij * eri_cdak / e_ijab;
+        }
+
+        real_t e_ijkbcd = orbital_energies[i/2] + orbital_energies[j/2] + orbital_energies[k/2] - orbital_energies[b/2] - orbital_energies[c/2] - orbital_energies[d/2];
+        contrib += (1.0) * S_ijkbcd * T_ijkbcd / e_ijkbcd;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_10, block_sum);
+    }
+}
 
 
 __global__ void compute_mp4_E3_11_kernel(const real_t* __restrict__ eri_mo,
@@ -2701,6 +3346,74 @@ __global__ void compute_mp4_E3_11_kernel(const real_t* __restrict__ eri_mo,
 }
 
 
+__global__ void compute_mp4_E3_11_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_c,
+                                            const int vir_d,
+                                          real_t* __restrict__ d_mp4_energy_E3_11)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir; // * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int d_ = vir_d; // (int)(t % num_spin_vir); t /= num_spin_vir;
+        int c_ = vir_c; // (int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int i  = (int)(t % num_spin_occ);
+
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+        int d = d_ + num_spin_occ;
+
+        // S_ijkbcd
+        real_t S_ijkbcd = 0.0;
+
+        // sum over e
+        for(int e_ = 0; e_ < num_spin_vir; ++e_){
+            int e = e_ + num_spin_occ;
+
+            real_t eri_kebc = antisym_eri(eri_mo, num_basis, k, e, b, c);
+            real_t eri_ijde = antisym_eri(eri_mo, num_basis, i, j, d, e);
+            real_t e_ijde = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[d/2] - orbital_energies[e/2];
+
+            S_ijkbcd += eri_kebc * eri_ijde / e_ijde;
+        }
+
+        // T_ijkbcd
+        real_t T_ijkbcd = 0.0;
+
+        // sum over a
+        for(int a_ = 0; a_ < num_spin_vir; ++a_){
+            int a = a_ + num_spin_occ;
+
+            real_t eri_abij = antisym_eri(eri_mo, num_basis, a, b, i, j);
+            real_t eri_cdak = antisym_eri(eri_mo, num_basis, c, d, a, k);
+            real_t e_ijab = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[b/2];
+
+            T_ijkbcd += eri_abij * eri_cdak / e_ijab;
+        }
+
+        real_t e_ijkbcd = orbital_energies[i/2] + orbital_energies[j/2] + orbital_energies[k/2] - orbital_energies[b/2] - orbital_energies[c/2] - orbital_energies[d/2];
+        contrib += (1.0) / (2.0) * S_ijkbcd * T_ijkbcd / e_ijkbcd;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_11, block_sum);
+    }
+}
+
+
+
+
 __global__ void compute_mp4_E3_12_kernel(const real_t* __restrict__ eri_mo,
                                           const real_t* __restrict__ orbital_energies,
                                           const int num_basis,
@@ -2717,6 +3430,72 @@ __global__ void compute_mp4_E3_12_kernel(const real_t* __restrict__ eri_mo,
         size_t t = gid;
         int d_ = (int)(t % num_spin_vir); t /= num_spin_vir;
         int c_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int i  = (int)(t % num_spin_occ);
+
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+        int d = d_ + num_spin_occ;
+
+        // S_ijkbcd
+        real_t S_ijkbcd = 0.0;
+
+        // sum over l
+        for(int l = 0; l < num_spin_occ; ++l){
+
+            real_t eri_ijbl = antisym_eri(eri_mo, num_basis, i, j, b, l);
+            real_t eri_klcd = antisym_eri(eri_mo, num_basis, k, l, c, d);
+            real_t e_klcd = orbital_energies[k/2] + orbital_energies[l/2] - orbital_energies[c/2] - orbital_energies[d/2];
+
+            S_ijkbcd += eri_ijbl * eri_klcd / e_klcd;
+        }
+
+        // T_ijkbcd
+        real_t T_ijkbcd = 0.0;
+
+        // sum over a
+        for(int a_ = 0; a_ < num_spin_vir; ++a_){
+            int a = a_ + num_spin_occ;
+
+            real_t eri_acij = antisym_eri(eri_mo, num_basis, a, c, i, j);
+            real_t eri_bdak = antisym_eri(eri_mo, num_basis, b, d, a, k);
+            real_t e_ijac = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[c/2];
+
+            T_ijkbcd += eri_acij * eri_bdak / e_ijac;
+        }
+
+        real_t e_ijkbcd = orbital_energies[i/2] + orbital_energies[j/2] + orbital_energies[k/2] - orbital_energies[b/2] - orbital_energies[c/2] - orbital_energies[d/2];
+        contrib += (1.0) / (2.0) * S_ijkbcd * T_ijkbcd / e_ijkbcd;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_12, block_sum);
+    }
+}
+
+
+
+__global__ void compute_mp4_E3_12_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_c,
+                                            const int vir_d,
+                                          real_t* __restrict__ d_mp4_energy_E3_12)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir; // * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int d_ = vir_d; //(int)(t % num_spin_vir); t /= num_spin_vir;
+        int c_ = vir_c; //(int)(t % num_spin_vir); t /= num_spin_vir;
         int b_ = (int)(t % num_spin_vir); t /= num_spin_vir;
         int k = (int)(t % num_spin_occ); t /= num_spin_occ;
         int j = (int)(t % num_spin_occ); t /= num_spin_occ;
@@ -2828,6 +3607,70 @@ __global__ void compute_mp4_E3_13_kernel(const real_t* __restrict__ eri_mo,
 
 
 
+__global__ void compute_mp4_E3_13_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_b,
+                                            const int vir_c,
+                                          real_t* __restrict__ d_mp4_energy_E3_13)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir;// * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int c_ = vir_c; //(int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = vir_b; //(int)(t % num_spin_vir); t /= num_spin_vir;
+        int a_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int l = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j  = (int)(t % num_spin_occ);
+
+        int a = a_ + num_spin_occ;
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+
+        // S_jklabc
+        real_t S_jklabc = 0.0;
+
+        // sum over m
+        for(int m = 0; m < num_spin_occ; ++m){
+
+            real_t eri_klam = antisym_eri(eri_mo, num_basis, k, l, a, m);
+            real_t eri_jmbc = antisym_eri(eri_mo, num_basis, j, m, b, c);
+            real_t e_jmbc = orbital_energies[j/2] + orbital_energies[m/2] - orbital_energies[b/2] - orbital_energies[c/2];
+
+            S_jklabc += eri_klam * eri_jmbc / e_jmbc;
+        }
+
+        // T_jklabc
+        real_t T_jklabc = 0.0;
+
+        // sum over i
+        for(int i = 0; i < num_spin_occ; ++i){
+
+            real_t eri_abij = antisym_eri(eri_mo, num_basis, a, b, i, j);
+            real_t eri_ickl = antisym_eri(eri_mo, num_basis, i, c, k, l);
+            real_t e_ijab = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[b/2];
+
+            T_jklabc += eri_abij * eri_ickl / e_ijab;
+        }
+
+        real_t e_jklabc = orbital_energies[j/2] + orbital_energies[k/2] + orbital_energies[l/2] - orbital_energies[a/2] - orbital_energies[b/2] - orbital_energies[c/2];
+        contrib += (1.0) / (2.0) * S_jklabc * T_jklabc / e_jklabc;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_13, block_sum);
+    }
+}
+
+
 
 __global__ void compute_mp4_E3_14_kernel(const real_t* __restrict__ eri_mo,
                                           const real_t* __restrict__ orbital_energies,
@@ -2845,6 +3688,72 @@ __global__ void compute_mp4_E3_14_kernel(const real_t* __restrict__ eri_mo,
         size_t t = gid;
         int c_ = (int)(t % num_spin_vir); t /= num_spin_vir;
         int b_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int a_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int l = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j  = (int)(t % num_spin_occ);
+
+        int a = a_ + num_spin_occ;
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+
+        // S_jklabc
+        real_t S_jklabc = 0.0;
+
+        // sum over d
+        for(int d_ = 0; d_ < num_spin_vir; ++d_){
+            int d = d_ + num_spin_occ;
+
+            real_t eri_kdab = antisym_eri(eri_mo, num_basis, k, d, a, b);
+            real_t eri_jlcd = antisym_eri(eri_mo, num_basis, j, l, c, d);
+            real_t e_jlcd = orbital_energies[j/2] + orbital_energies[l/2] - orbital_energies[c/2] - orbital_energies[d/2];
+
+            S_jklabc += eri_kdab * eri_jlcd / e_jlcd;
+        }
+
+
+        // T_jklabc
+        real_t T_jklabc = 0.0;
+
+        // sum over i
+        for(int i = 0; i < num_spin_occ; ++i){
+
+            real_t eri_acij = antisym_eri(eri_mo, num_basis, a, c, i, j);
+            real_t eri_ibkl = antisym_eri(eri_mo, num_basis, i, b, k, l);
+            real_t e_ijac = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[c/2];
+
+            T_jklabc += eri_acij * eri_ibkl / e_ijac;
+        }
+
+        real_t e_jklabc = orbital_energies[j/2] + orbital_energies[k/2] + orbital_energies[l/2] - orbital_energies[a/2] - orbital_energies[b/2] - orbital_energies[c/2];
+        contrib += - (1.0) * S_jklabc * T_jklabc / e_jklabc;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_14, block_sum);
+    }
+}
+
+
+__global__ void compute_mp4_E3_14_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_b,
+                                            const int vir_c,
+                                          real_t* __restrict__ d_mp4_energy_E3_14)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir;// * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int c_ = vir_c; //(int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = vir_b; //(int)(t % num_spin_vir); t /= num_spin_vir;
         int a_ = (int)(t % num_spin_vir); t /= num_spin_vir;
         int l = (int)(t % num_spin_occ); t /= num_spin_occ;
         int k = (int)(t % num_spin_occ); t /= num_spin_occ;
@@ -2961,6 +3870,73 @@ __global__ void compute_mp4_E3_15_kernel(const real_t* __restrict__ eri_mo,
 
 
 
+__global__ void compute_mp4_E3_15_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_c,
+                                            const int vir_d,
+                                          real_t* __restrict__ d_mp4_energy_E3_15)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir;// * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int d_ = vir_d; //(int)(t % num_spin_vir); t /= num_spin_vir;
+        int c_ = vir_c; //(int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int i  = (int)(t % num_spin_occ);
+
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+        int d = d_ + num_spin_occ;
+
+        // S_ijkbcd
+        real_t S_ijkbcd = 0.0;
+
+        // sum over e
+        for(int e_ = 0; e_ < num_spin_vir; ++e_){
+            int e = e_ + num_spin_occ;
+
+            real_t eri_kebc = antisym_eri(eri_mo, num_basis, k, e, b, c);
+            real_t eri_ijde = antisym_eri(eri_mo, num_basis, i, j, d, e);
+            real_t e_ijde = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[d/2] - orbital_energies[e/2];
+
+            S_ijkbcd += eri_kebc * eri_ijde / e_ijde;
+        }
+
+
+        // T_ijkbcd
+        real_t T_ijkbcd = 0.0;
+
+        // sum over a
+        for(int a_ = 0; a_ < num_spin_vir; ++a_){
+            int a = a_ + num_spin_occ;
+
+            real_t eri_adij = antisym_eri(eri_mo, num_basis, a, d, i, j);
+            real_t eri_bcak = antisym_eri(eri_mo, num_basis, b, c, a, k);
+            real_t e_ijad = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[d/2];
+
+            T_ijkbcd += eri_adij * eri_bcak / e_ijad;
+        }
+
+        real_t e_ijkbcd = orbital_energies[i/2] + orbital_energies[j/2] + orbital_energies[k/2] - orbital_energies[b/2] - orbital_energies[c/2] - orbital_energies[d/2];
+        contrib += (1.0) / (4.0) * S_ijkbcd * T_ijkbcd / e_ijkbcd;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_15, block_sum);
+    }
+}
+
+
 
 __global__ void compute_mp4_E3_16_kernel(const real_t* __restrict__ eri_mo,
                                           const real_t* __restrict__ orbital_energies,
@@ -3026,6 +4002,73 @@ __global__ void compute_mp4_E3_16_kernel(const real_t* __restrict__ eri_mo,
     }
 }
 
+
+
+__global__ void compute_mp4_E3_16_vir2_kernel(const real_t* __restrict__ eri_mo,
+                                          const real_t* __restrict__ orbital_energies,
+                                          const int num_basis,
+                                          const int num_spin_occ,
+                                          const int num_spin_vir,
+                                            const int vir_b,
+                                            const int vir_c,
+                                          real_t* __restrict__ d_mp4_energy_E3_16)
+{
+    size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir;// * num_spin_vir * num_spin_vir;
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    double contrib = 0.0;
+    if(gid < total){
+
+        size_t t = gid;
+        int c_ = vir_c; //(int)(t % num_spin_vir); t /= num_spin_vir;
+        int b_ = vir_b; //(int)(t % num_spin_vir); t /= num_spin_vir;
+        int a_ = (int)(t % num_spin_vir); t /= num_spin_vir;
+        int l = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int k = (int)(t % num_spin_occ); t /= num_spin_occ;
+        int j  = (int)(t % num_spin_occ);
+
+        int a = a_ + num_spin_occ;
+        int b = b_ + num_spin_occ;
+        int c = c_ + num_spin_occ;
+
+        // S_jklabc
+        real_t S_jklabc = 0.0;
+
+        // sum over d
+        for(int d_ = 0; d_ < num_spin_vir; ++d_){
+            int d = d_ + num_spin_occ;
+
+            real_t eri_kdab = antisym_eri(eri_mo, num_basis, k, d, a, b);
+            real_t eri_jlcd = antisym_eri(eri_mo, num_basis, j, l, c, d);
+            real_t e_jlcd = orbital_energies[j/2] + orbital_energies[l/2] - orbital_energies[c/2] - orbital_energies[d/2];
+
+            S_jklabc += eri_kdab * eri_jlcd / e_jlcd;
+        }
+
+
+        // T_jklabc
+        real_t T_jklabc = 0.0;
+
+        // sum over i
+        for(int i = 0; i < num_spin_occ; ++i){
+
+            real_t eri_abij = antisym_eri(eri_mo, num_basis, a, b, i, j);
+            real_t eri_ickl = antisym_eri(eri_mo, num_basis, i, c, k, l);
+            real_t e_ijab = orbital_energies[i/2] + orbital_energies[j/2] - orbital_energies[a/2] - orbital_energies[b/2];
+
+            T_jklabc += eri_abij * eri_ickl / e_ijab;
+        }
+
+
+        real_t e_jklabc = orbital_energies[j/2] + orbital_energies[k/2] + orbital_energies[l/2] - orbital_energies[a/2] - orbital_energies[b/2] - orbital_energies[c/2];
+        contrib += (1.0) / (2.0) * S_jklabc * T_jklabc / e_jklabc;
+    }
+
+    double block_sum = block_reduce_sum(contrib);
+    if(threadIdx.x == 0){
+        atomicAdd(d_mp4_energy_E3_16, block_sum);
+    }
+}
 
 
 
@@ -3305,14 +4348,23 @@ __global__ void compute_mp4_E4_4_kernel(const real_t* __restrict__ eri_mo,
 
 
 // define the kernel functions as function pointers for mp4 terms
-using mp4_term_kernel_t = void (*)(const real_t*, const real_t*, const int, const int, const int num_spin_vir, real_t* __restrict__);
+using mp4_term_kernel_t = void (*)(const real_t*, const real_t*, const int, const int, const int, real_t* __restrict__);
+using mp4_term_vir2_kernel_t = void (*)(const real_t*, const real_t*, const int, const int, const int, const int, const int, real_t* __restrict__);
 
-const int num_mp4_terms = 36; // 4+12+16+4 = 36 terms
-const mp4_term_kernel_t mp4_term_kernels[num_mp4_terms] = {
+const int num_mp4_terms_single   = 4;
+const int num_mp4_terms_double   = 12;
+const int num_mp4_terms_triple   = 16;
+const int num_mp4_terms_quadrule = 4;
+
+const mp4_term_kernel_t mp4_term_kernels_single[num_mp4_terms_single] = {
     compute_mp4_E1_1_kernel,
     compute_mp4_E1_2_kernel,
     compute_mp4_E1_3_kernel,
-    compute_mp4_E1_4_kernel,
+    compute_mp4_E1_4_kernel
+};
+
+
+const mp4_term_kernel_t mp4_term_kernels_double[num_mp4_terms_double] = {
     compute_mp4_E2_1_kernel,
     compute_mp4_E2_2_kernel,
     compute_mp4_E2_3_kernel,
@@ -3324,23 +4376,31 @@ const mp4_term_kernel_t mp4_term_kernels[num_mp4_terms] = {
     compute_mp4_E2_9_kernel,
     compute_mp4_E2_10_kernel,
     compute_mp4_E2_11_kernel,
-    compute_mp4_E2_12_kernel,
-    compute_mp4_E3_1_kernel,
-    compute_mp4_E3_2_kernel,
-    compute_mp4_E3_3_kernel,
-    compute_mp4_E3_4_kernel,
-    compute_mp4_E3_5_kernel,
-    compute_mp4_E3_6_kernel,
-    compute_mp4_E3_7_kernel,
-    compute_mp4_E3_8_kernel,
-    compute_mp4_E3_9_kernel,
-    compute_mp4_E3_10_kernel,
-    compute_mp4_E3_11_kernel,
-    compute_mp4_E3_12_kernel,
-    compute_mp4_E3_13_kernel,
-    compute_mp4_E3_14_kernel,
-    compute_mp4_E3_15_kernel,
-    compute_mp4_E3_16_kernel,
+    compute_mp4_E2_12_kernel
+};
+
+
+const mp4_term_vir2_kernel_t mp4_term_kernels_triple[num_mp4_terms_triple] = {
+    compute_mp4_E3_1_vir2_kernel,
+    compute_mp4_E3_2_vir2_kernel,
+    compute_mp4_E3_3_vir2_kernel,
+    compute_mp4_E3_4_vir2_kernel,
+    compute_mp4_E3_5_vir2_kernel,
+    compute_mp4_E3_6_vir2_kernel,
+    compute_mp4_E3_7_vir2_kernel,
+    compute_mp4_E3_8_vir2_kernel,
+    compute_mp4_E3_9_vir2_kernel,
+    compute_mp4_E3_10_vir2_kernel,
+    compute_mp4_E3_11_vir2_kernel,
+    compute_mp4_E3_12_vir2_kernel,
+    compute_mp4_E3_13_vir2_kernel,
+    compute_mp4_E3_14_vir2_kernel,
+    compute_mp4_E3_15_vir2_kernel,
+    compute_mp4_E3_16_vir2_kernel,
+};
+
+
+const mp4_term_kernel_t mp4_term_kernels_quadrule[num_mp4_terms_quadrule] = {
     compute_mp4_E4_1_kernel,
     compute_mp4_E4_2_kernel,
     compute_mp4_E4_3_kernel,
@@ -3395,7 +4455,7 @@ void get_mp4_term_num_block_thread_shmem(int term_index, const int num_spin_occ,
         case 30: // E3_15
         case 31: // E3_16
             num_threads = default_num_threads;
-            total_threads = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir * num_spin_vir * num_spin_vir;
+            total_threads = (size_t)num_spin_occ * num_spin_occ * num_spin_occ * num_spin_vir;// * num_spin_vir * num_spin_vir;
             num_blocks = (int)((total_threads + num_threads - 1) / num_threads);
             shared_mem_size = (size_t)num_threads * sizeof(double);
             return;
@@ -3563,95 +4623,164 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
     // ------------------------------------------------------------
     // 5) compute MP4 energy
     // ------------------------------------------------------------
-    real_t* d_mp4_energy;
-    cudaMalloc((void**)&d_mp4_energy, sizeof(real_t) * num_mp4_terms); // Allocate space for all MP4 terms
-    if(d_mp4_energy == nullptr) {
-        THROW_EXCEPTION("Failed to allocate device memory for MP4 energy.");
-    }
-    cudaMemset(d_mp4_energy, 0.0, sizeof(real_t)*num_mp4_terms);
-    cudaDeviceSynchronize();
+    int num_spin_occ = num_occ * 2;
+    int num_spin_vir = (num_basis - num_occ) * 2;
 
 
-#ifdef USE_CUDA_STREAMS
+    real_t h_mp4_energy[4]; // single, double, triple, quadruple
+    memset(h_mp4_energy, 0, sizeof(real_t)*4);
+   
+    { // single excitation terms
+        std::string str = "Launch kernels of MP4 single excitation terms... ";
+        PROFILE_ELAPSED_TIME(str);
+        int num_threads;
+        int num_blocks;
+        size_t shmem;
 
-    // Create cuda streams for overlapping computation
-    std::vector<cudaStream_t> streams(num_mp4_terms);
-    for(int i = 0; i < num_mp4_terms; ++i) {
-        cudaStreamCreate(&streams[i]);
-        if(!streams[i]) {
-            THROW_EXCEPTION("cudaStreamCreate failed for stream " + std::to_string(i));
+        int kernel_offset = 0;
+
+        real_t* d_contrib;
+        cudaMalloc((void**)&d_contrib, sizeof(real_t));
+        cudaMemset(d_contrib, 0.0, sizeof(real_t));        
+
+        // Launch the kernel for single excitation terms
+        for(int i=0; i<num_mp4_terms_single; i++){
+            // Get the number of blocks, threads, and shared memory size for single excitation terms
+            get_mp4_term_num_block_thread_shmem(kernel_offset + i, num_spin_occ, num_spin_vir, num_threads, num_blocks, shmem);
+
+            mp4_term_kernel_t kernel = mp4_term_kernels_single[i];
+            kernel<<<num_blocks, num_threads, shmem>>>(d_eri_mo, d_orbital_energies, num_basis, num_spin_occ, num_spin_vir, d_contrib);
+            cudaDeviceSynchronize();
+
+            real_t h_contrib;
+            cudaMemcpy(&h_contrib, d_contrib, sizeof(real_t), cudaMemcpyDeviceToHost);
+
+            std::cout << "  E1 " << i+1 << " contribution: " << h_contrib << " Hartree" << std::endl;
+
+            h_mp4_energy[0] += h_contrib;
         }
-    }
 
-    for(int i=0; i<num_mp4_terms; i++){
-        std::string str = "Launch kernel of MP4 energy term " + std::to_string(i+1) + "/" + std::to_string(num_mp4_terms) + "... ";
+        std::cout << "Total MP4 Single excitation energy: " << h_mp4_energy[0] << " Hartree" << std::endl;
+    }
+    { // double excitation terms
+        std::string str = "Launch kernels of MP4 double excitation terms... ";
         PROFILE_ELAPSED_TIME(str);
-        int num_spin_occ = num_occ * 2;
-        int num_spin_vir = (num_basis - num_occ) * 2;
         int num_threads;
         int num_blocks;
         size_t shmem;
-        
-        // Get the number of blocks, threads, and shared memory size for the i-th MP4 term
-        get_mp4_term_num_block_thread_shmem(i, num_spin_occ, num_spin_vir, num_threads, num_blocks, shmem);
 
-        // Launch the kernel for the i-th MP4 term
-        mp4_term_kernel_t kernel = mp4_term_kernels[i];
-        kernel<<<num_blocks, num_threads, shmem, streams[i]>>>(d_eri_mo, d_orbital_energies, num_basis, num_spin_occ, num_spin_vir, &d_mp4_energy[i]);
+        int kernel_offset = num_mp4_terms_single;
+
+        real_t* d_contrib;
+        cudaMalloc((void**)&d_contrib, sizeof(real_t));
+        cudaMemset(d_contrib, 0.0, sizeof(real_t));        
+
+        // Launch the kernel for double excitation terms
+        for(int i=0; i<num_mp4_terms_double; i++){
+            
+            // Get the number of blocks, threads, and shared memory size for double excitation terms
+            get_mp4_term_num_block_thread_shmem(kernel_offset + i, num_spin_occ, num_spin_vir, num_threads, num_blocks, shmem);
+
+            mp4_term_kernel_t kernel = mp4_term_kernels_double[i];
+            kernel<<<num_blocks, num_threads, shmem>>>(d_eri_mo, d_orbital_energies, num_basis, num_spin_occ, num_spin_vir, d_contrib);
+            cudaDeviceSynchronize();
+
+            real_t h_contrib;
+            cudaMemcpy(&h_contrib, d_contrib, sizeof(real_t), cudaMemcpyDeviceToHost);
+
+            std::cout << "  E2 " << i+1 << " contribution: " << h_contrib << " Hartree" << std::endl;
+
+            h_mp4_energy[1] += h_contrib;
+        }
+
+        std::cout << "Total MP4 Double excitation energy: " << h_mp4_energy[1] << " Hartree" << std::endl;
     }
-
-
-    real_t h_mp4_energy[num_mp4_terms];
-    cudaMemcpy(h_mp4_energy, d_mp4_energy, sizeof(real_t)*num_mp4_terms, cudaMemcpyDeviceToHost);
-    cudaDeviceSynchronize();
-
-    for(int i = 0; i < num_mp4_terms; ++i) {
-        cudaStreamDestroy(streams[i]);
-    }
-
-    for(int i=0; i<num_mp4_terms; i++){
-        std::cout << "MP4 term " << (i+1) << ": " << h_mp4_energy[i] << " Hartree" << std::endl;
-    }
-
-#else
-    real_t h_mp4_energy[num_mp4_terms];
-    for(int i=0; i<num_mp4_terms; i++){
-        std::string str = "Launch kernel of MP4 energy term " + std::to_string(i+1) + "/" + std::to_string(num_mp4_terms) + "... ";
+    { // triple excitation terms
+        std::string str = "Launch kernels of MP4 triple excitation terms... ";
         PROFILE_ELAPSED_TIME(str);
-        int num_spin_occ = num_occ * 2;
-        int num_spin_vir = (num_basis - num_occ) * 2;
         int num_threads;
         int num_blocks;
         size_t shmem;
-        
-        // Get the number of blocks, threads, and shared memory size for the i-th MP4 term
-        get_mp4_term_num_block_thread_shmem(i, num_spin_occ, num_spin_vir, num_threads, num_blocks, shmem);
 
-        // Launch the kernel for the i-th MP4 term
-        mp4_term_kernel_t kernel = mp4_term_kernels[i];
-        kernel<<<num_blocks, num_threads, shmem>>>(d_eri_mo, d_orbital_energies, num_basis, num_spin_occ, num_spin_vir, &d_mp4_energy[i]);
+        int kernel_offset = num_mp4_terms_single + num_mp4_terms_double;
 
-        cudaDeviceSynchronize();
-        cudaMemcpy(&h_mp4_energy[i], &d_mp4_energy[i], sizeof(real_t), cudaMemcpyDeviceToHost);
+        real_t* d_contrib;
+        cudaMalloc((void**)&d_contrib, sizeof(real_t));
+        cudaMemset(d_contrib, 0.0, sizeof(real_t));        
 
-        std::cout << "MP4 term " << (i+1) << ": " << h_mp4_energy[i] << " Hartree" << std::endl;
+        // Launch the kernel for triple excitation terms
+        for(int i=0; i<num_mp4_terms_triple; i++){
+            // Get the number of blocks, threads, and shared memory size for triple excitation terms
+            get_mp4_term_num_block_thread_shmem(kernel_offset + i, num_spin_occ, num_spin_vir, num_threads, num_blocks, shmem);
+
+            mp4_term_vir2_kernel_t kernel = mp4_term_kernels_triple[i];
+            for(int v1=0; v1<num_spin_vir; v1++){
+                for(int v2=0; v2<num_spin_vir; v2++){
+                    kernel<<<num_blocks, num_threads, shmem>>>(d_eri_mo, d_orbital_energies, num_basis, num_spin_occ, num_spin_vir, v1, v2, d_contrib);
+                }
+            }
+            cudaDeviceSynchronize();
+
+            real_t h_contrib;
+            cudaMemcpy(&h_contrib, d_contrib, sizeof(real_t), cudaMemcpyDeviceToHost);
+
+            std::cout << "  E3 " << i+1 << " contribution: " << h_contrib << " Hartree" << std::endl;
+
+            h_mp4_energy[2] += h_contrib;
+        }
+
+        std::cout << "Total MP4 Triple excitation energy: " << h_mp4_energy[2] << " Hartree" << std::endl;
+    }
+    { // quadruple excitation terms
+        std::string str = "Launch kernels of MP4 quadruple excitation terms... ";
+        PROFILE_ELAPSED_TIME(str);
+        int num_threads;
+        int num_blocks;
+        size_t shmem;
+
+        int kernel_offset = num_mp4_terms_single + num_mp4_terms_double + num_mp4_terms_triple;
+
+        real_t* d_contrib;
+        cudaMalloc((void**)&d_contrib, sizeof(real_t));
+        cudaMemset(d_contrib, 0.0, sizeof(real_t));        
+
+        // Launch the kernel for quadruple excitation terms
+        for(int i=0; i<num_mp4_terms_quadrule; i++){
+            // Get the number of blocks, threads, and shared memory size for quadruple excitation terms
+            get_mp4_term_num_block_thread_shmem(kernel_offset + i, num_spin_occ, num_spin_vir, num_threads, num_blocks, shmem);
+
+            mp4_term_kernel_t kernel = mp4_term_kernels_quadrule[i];
+            kernel<<<num_blocks, num_threads, shmem>>>(d_eri_mo, d_orbital_energies, num_basis, num_spin_occ, num_spin_vir, d_contrib);
+            cudaDeviceSynchronize();
+
+            real_t h_contrib;
+            cudaMemcpy(&h_contrib, d_contrib, sizeof(real_t), cudaMemcpyDeviceToHost);
+
+            std::cout << "  E4 " << i+1 << " contribution: " << h_contrib << " Hartree" << std::endl;
+
+            h_mp4_energy[3] += h_contrib;
+        }
+
+        std::cout << "Total MP4 Quadruple excitation energy: " << h_mp4_energy[3] << " Hartree" << std::endl;
     }
 
+    real_t mp4_corr_energy = 0.0;
+    std::cout << "  E_S = " << h_mp4_energy[0] << " Hartree" << std::endl;
+    std::cout << "  E_D = " << h_mp4_energy[1] << " Hartree" << std::endl;
+    std::cout << "  E_T = " << h_mp4_energy[2] << " Hartree" << std::endl;
+    std::cout << "  E_Q = " << h_mp4_energy[3] << " Hartree" << std::endl;
 
-#endif
+    for(int i=0; i<4; i++){
+        mp4_corr_energy += h_mp4_energy[i];
+    }
+    //std::cout << "E_MP4 = E_S + E_D + E_T + E_Q = " << mp4_corr_energy << " Hartree" << std::endl;
 
 
 
-    cudaFree(d_mp4_energy);
     cudaFree(d_eri_mo);
 
 
 
-
-    real_t mp4_corr_energy = 0.0;
-    for(int i=0; i<num_mp4_terms; i++){
-        mp4_corr_energy += h_mp4_energy[i];
-    }
 
     std::cout << "MP4 correlation energy: " << mp4_corr_energy << " Hartree" << std::endl;
     real_t mp4_total_energy = mp3_energy + mp4_corr_energy;
