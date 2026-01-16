@@ -171,33 +171,9 @@ void RHF::guess_initial_fock_matrix(const real_t* density_matrix_a, const real_t
     }else{
         throw std::runtime_error("Invalid initial guess method: " + initail_guess_method_);
     }
-/*
-    { // nan check
-        if(density_matrix_a != nullptr && density_matrix_b != nullptr){
-            for(size_t i=0; i<num_basis; i++){
-                if(std::isnan(density_matrix_a[i]) || std::isnan(density_matrix_b[i])){
-                    THROW_EXCEPTION("Density matrix contains NaN value at index " + std::to_string(i) + ".");
-                }
-            }
-        }
-
-    }
-*/
 
     // Execute the initial guess method
     initial_guess->guess();
-/*
-    { // nan check
-        fock_matrix.toHost();
-        for(size_t i=0; i<num_basis; i++){
-            for(size_t j=0; j<num_basis; j++){
-                if(std::isnan(fock_matrix(i, j))){
-                    THROW_EXCEPTION("Fock matrix contains NaN value at (" + std::to_string(i) + ", " + std::to_string(j) + ").");
-                }
-            }
-        }
-    }
-*/
 
 }
 
@@ -205,7 +181,7 @@ void RHF::guess_initial_fock_matrix(const real_t* density_matrix_a, const real_t
  * @brief Function to calculate the coefficient matrix
  * @details This function calculates the coefficient matrix using the eigenvectors of the Fock matrix.
  */
-void RHF::compute_coefficient_matrix() {
+void RHF::compute_coefficient_matrix_impl() {
     PROFILE_FUNCTION();
 
     // compute coefficient matrix C
@@ -220,22 +196,6 @@ void RHF::compute_coefficient_matrix() {
         num_basis,
         orbital_energies.device_ptr()
     );
-/*
-    { // nan check
-        coefficient_matrix.toHost();
-        orbital_energies.toHost();
-        for(size_t i=0; i<num_basis; i++){
-            if(std::isnan(orbital_energies[i])){
-                THROW_EXCEPTION("Orbital energy contains NaN value at index " + std::to_string(i) + ".");
-            }
-            for(size_t j=0; j<num_basis; j++){
-                if(std::isnan(coefficient_matrix(i, j))){
-                    THROW_EXCEPTION("Coefficient matrix contains NaN value at (" + std::to_string(i) + ", " + std::to_string(j) + ").");
-                }
-            }
-        }
-    }
-*/
 
     if (verbose) {
         std::cout << "Orbital energies:" << std::endl;

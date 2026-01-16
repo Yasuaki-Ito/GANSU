@@ -149,7 +149,7 @@ void UHF::precompute_eri_matrix(){
  * @brief Function to calculate the coefficient matrix
  * @details This function calculates the coefficient matrix using the eigenvectors of the Fock matrix.
  */
-void UHF::compute_coefficient_matrix() {
+void UHF::compute_coefficient_matrix_impl() {
     PROFILE_FUNCTION();
  
     // compute coefficient matrix C

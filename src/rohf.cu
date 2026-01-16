@@ -162,7 +162,7 @@ void ROHF::guess_initial_fock_matrix(const real_t* density_matrix_a, const real_
  * @brief Function to calculate the coefficient matrix
  * @details This function calculates the coefficient matrix using the eigenvectors of the Fock matrix.
  */
-void ROHF::compute_coefficient_matrix() {
+void ROHF::compute_coefficient_matrix_impl() {
     PROFILE_FUNCTION();
     // compute coefficient matrix C
     // The function computeEigenvectors performs the following operations:

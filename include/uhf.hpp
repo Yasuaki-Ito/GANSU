@@ -56,7 +56,7 @@ public:
     void compute_fock_matrix() override;
     void compute_density_matrix() override;
     void guess_initial_fock_matrix(const real_t* density_matrix_a=nullptr, const real_t* density_matrix_b=nullptr, bool force_density=false) override;
-    void compute_coefficient_matrix() override;
+    void compute_coefficient_matrix_impl() override;
     void compute_energy() override;
     void update_fock_matrix() override;
 

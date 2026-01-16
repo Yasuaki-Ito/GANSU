@@ -16,8 +16,8 @@ __global__ void mp3_moeri_3h3p_kernel(const double* __restrict__ eri_mo, const d
 
 
 
-/*
 
+/*
 
 
 

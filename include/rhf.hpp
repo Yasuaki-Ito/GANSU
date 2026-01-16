@@ -59,7 +59,7 @@ public:
     void compute_fock_matrix() override;
     void compute_density_matrix() override;
     void guess_initial_fock_matrix(const real_t* density_matrix_a=nullptr, const real_t* density_matrix_b=nullptr, bool force_density=false) override;
-    void compute_coefficient_matrix() override;
+    void compute_coefficient_matrix_impl() override;
     void compute_energy() override;
     void update_fock_matrix() override;
 
@@ -657,17 +657,6 @@ public:
             d_T_tmp_.device_ptr(),
             d_V_tmp_.device_ptr()
         );
-
-        { // nan check
-            fock_matrix.toHost();
-            for(size_t i=0; i<num_basis_; i++){
-                for(size_t j=0; j<num_basis_; j++){
-                    if(std::isnan(fock_matrix(i, j))){
-                        THROW_EXCEPTION("Fock matrix contains NaN at (" + std::to_string(i) + ", " + std::to_string(j) + ")");
-                    }
-                }
-            }
-        }
 
         if(verbose){
             // copy the fock matrix to the host memory

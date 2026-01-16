@@ -236,6 +236,21 @@ public:
      */
     real_t get_post_hf_energy() const { return post_hf_energy_; } ///< Get the post-HF energy
 
+    /**
+     * @brief Get whether the coefficient matrix has been computed
+     */
+    bool get_hasMatrixC() const { return hasMatrixC_; }
+
+
+    /**
+     * @brief Function to compute the coefficient matrix and set hasMatrixC_ to true
+     * @details This function computes the coefficient matrix by calling compute_coefficient_matrix()
+     * and sets hasMatrixC_ to true.
+    */
+    void compute_coefficient_matrix(){
+        compute_coefficient_matrix_impl();
+        hasMatrixC_ = true;
+    }
 protected:
     long long solve_time_in_milliseconds_; ///< Time to solve the HF equation
 
@@ -269,6 +284,8 @@ protected:
     DeviceHostMatrix<real_t> transform_matrix; ///< Transformation matrix
 
     real_t nuclear_repulsion_energy_; ///< Nuclear repulsion energy
+
+    bool hasMatrixC_ = false; ///< Flag indicating whether the coefficient matrix has been computed. Once computed, it is set to true.
 
     // Post-HF methods
     PostHFMethod post_hf_method_; ///< Post-HF method
@@ -320,7 +337,10 @@ protected:
      * @details This function computes the coefficient matrix.
      * @details This function must be implemented in the derived class.
     */
-    virtual void compute_coefficient_matrix()=0;
+    virtual void compute_coefficient_matrix_impl()=0;
+
+
+
 
     /**
      * @brief Virtual function to compute the energy
