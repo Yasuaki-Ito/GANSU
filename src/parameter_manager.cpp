@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -81,7 +81,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
     };
 
     if(set_default_values){
-        set_default_values_to_unspecfied_parameters();
+        set_default_values_to_unspecified_parameters();
     }
 }
 
@@ -96,10 +96,10 @@ bool ParameterManager::contains(const std::string& key) const {
 
 bool ParameterManager::is_valid_key(const std::string& key) const {
     std::string key_lower = toLowerCase(key);
-    return default_parameters_.find(key_lower) != parameters_.end();
+    return default_parameters_.find(key_lower) != default_parameters_.end();
 }
 
-void ParameterManager::set_default_values_to_unspecfied_parameters() {
+void ParameterManager::set_default_values_to_unspecified_parameters() {
     for (const auto& pair : default_parameters_) {
         if (!contains(pair.first)) {
             parameters_[pair.first] = pair.second;

@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -190,9 +190,9 @@ public:
     const DeviceHostMemory<real_t>& get_boys_grid() const { return boys_grid; }
 
     /**
-     * @brief Get cgto_nomalization_factors
+     * @brief Get cgto_normalization_factors
      */
-    const DeviceHostMemory<real_t>& get_cgto_nomalization_factors() const { return cgto_nomalization_factors; }
+    const DeviceHostMemory<real_t>& get_cgto_normalization_factors() const { return cgto_normalization_factors; }
 
     /**
      * @brief Get the Schwartz screening threshold
@@ -278,7 +278,7 @@ protected:
     DeviceHostMemory<real_t> boys_grid; ///< grid values for the Boys function
     DeviceHostMatrix<real_t> overlap_matrix; ///< Overlap matrix
     DeviceHostMatrix<real_t> core_hamiltonian_matrix; ///< Core Hamiltonian matrix (kinetic energy + nuclear attraction)
-    DeviceHostMemory<real_t> cgto_nomalization_factors; ///< Normalization factors of the contracted Gauss functions
+    DeviceHostMemory<real_t> cgto_normalization_factors; ///< Normalization factors of the contracted Gauss functions
 
 
     DeviceHostMatrix<real_t> transform_matrix; ///< Transformation matrix

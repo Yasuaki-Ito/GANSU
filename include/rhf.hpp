@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -145,7 +145,7 @@ private:
 
     std::unique_ptr<Convergence_RHF> convergence_method_; ///< Convergence_RHF
 
-    const std::string initail_guess_method_; ///< Initial guess method name
+    const std::string initial_guess_method_; ///< Initial guess method name
     const std::string gbsfilename_; ///< Basis set file name (Gaussian basis set file)
 
 };
@@ -502,7 +502,7 @@ public:
         std::cout << "------ [SAD] Computing density matrix for : " << atomic_number_to_element_name(atomic_number) << " ------" << std::endl;
        
         ParameterManager parameters;
-        parameters.set_default_values_to_unspecfied_parameters();
+        parameters.set_default_values_to_unspecified_parameters();
         parameters["gbsfilename"] = hf_.get_gbsfilename();
         parameters["initial_guess"] = "core"; // if "SAD" is used, the initial guess may be recursively called
         parameters["eri_method"] = "stored"; // use stored ERI method for the monatomic molecule
@@ -696,7 +696,7 @@ public:
         const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
         const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
         const DeviceHostMemory<PrimitiveShell>& primitive_shells = hf_.get_primitive_shells();
-        const DeviceHostMemory<real_t>& cgto_nomalization_factors = hf_.get_cgto_nomalization_factors();
+        const DeviceHostMemory<real_t>& cgto_normalization_factors = hf_.get_cgto_normalization_factors();
         const DeviceHostMemory<real_t>& boys_grid = hf_.get_boys_grid();
         DeviceHostMatrix<real_t>& fock_matrix = rhf_.get_fock_matrix();
         const real_t schwarz_screening_threshold = rhf_.get_schwarz_screening_threshold();
@@ -709,7 +709,7 @@ public:
             shell_pair_type_infos,
             primitive_shells.device_ptr(), 
             primitive_shell_pair_indices.device_ptr(),
-            cgto_nomalization_factors.device_ptr(), 
+            cgto_normalization_factors.device_ptr(), 
             boys_grid.device_ptr(), 
             schwarz_upper_bound_factors.device_ptr(),
             schwarz_screening_threshold,

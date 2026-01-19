@@ -1,75 +1,75 @@
 // [s s | gxxxx]
 addToResult_3center(coefAndNorm * NORM_FACT2_4 * (c->exponent*(p*p)*((c->coordinate.x - Rp[0])*(c->coordinate.x - Rp[0]))*(Boys[4]*c->exponent*(p*p)*((c->coordinate.x - Rp[0])*(c->coordinate.x - Rp[0])) + 1.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p)) + sum_exp*(1.5*Boys[2]*c->exponent*(p*p)*((c->coordinate.x - Rp[0])*(c->coordinate.x - Rp[0]))*sum_exp - 1.5*p*(Boys[3]*c->exponent*(p*p)*((c->coordinate.x - Rp[0])*(c->coordinate.x - Rp[0])) + 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*p)) + 0.75*(sum_exp*sum_exp)*(Boys[0]*sum_exp - Boys[1]*p)))/((c->exponent*c->exponent)*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gyyyy]
 addToResult_3center(coefAndNorm * NORM_FACT2_4 * (c->exponent*(p*p)*((c->coordinate.y - Rp[1])*(c->coordinate.y - Rp[1]))*(Boys[4]*c->exponent*(p*p)*((c->coordinate.y - Rp[1])*(c->coordinate.y - Rp[1])) + 1.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p)) + sum_exp*(1.5*Boys[2]*c->exponent*(p*p)*((c->coordinate.y - Rp[1])*(c->coordinate.y - Rp[1]))*sum_exp - 1.5*p*(Boys[3]*c->exponent*(p*p)*((c->coordinate.y - Rp[1])*(c->coordinate.y - Rp[1])) + 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*p)) + 0.75*(sum_exp*sum_exp)*(Boys[0]*sum_exp - Boys[1]*p)))/((c->exponent*c->exponent)*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+1, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+1, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gzzzz]
 addToResult_3center(coefAndNorm * NORM_FACT2_4 * (c->exponent*(p*p)*((c->coordinate.z - Rp[2])*(c->coordinate.z - Rp[2]))*(Boys[4]*c->exponent*(p*p)*((c->coordinate.z - Rp[2])*(c->coordinate.z - Rp[2])) + 1.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p)) + sum_exp*(1.5*Boys[2]*c->exponent*(p*p)*((c->coordinate.z - Rp[2])*(c->coordinate.z - Rp[2]))*sum_exp - 1.5*p*(Boys[3]*c->exponent*(p*p)*((c->coordinate.z - Rp[2])*(c->coordinate.z - Rp[2])) + 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*p)) + 0.75*(sum_exp*sum_exp)*(Boys[0]*sum_exp - Boys[1]*p)))/((c->exponent*c->exponent)*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+2, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+2, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gxxxy]
 addToResult_3center(coefAndNorm * NORM_FACT2_3 * (p*p)*(c->coordinate.x - Rp[0])*(c->coordinate.y - Rp[1])*(Boys[4]*c->exponent*(p*p)*((c->coordinate.x - Rp[0])*(c->coordinate.x - Rp[0])) + 1.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p))/(c->exponent*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+3, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+3, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gxxxz]
 addToResult_3center(coefAndNorm * NORM_FACT2_3 * (p*p)*(c->coordinate.x - Rp[0])*(c->coordinate.z - Rp[2])*(Boys[4]*c->exponent*(p*p)*((c->coordinate.x - Rp[0])*(c->coordinate.x - Rp[0])) + 1.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p))/(c->exponent*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+4, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+4, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gyyyz]
 addToResult_3center(coefAndNorm * NORM_FACT2_3 * (p*p)*(c->coordinate.y - Rp[1])*(c->coordinate.z - Rp[2])*(Boys[4]*c->exponent*(p*p)*((c->coordinate.y - Rp[1])*(c->coordinate.y - Rp[1])) + 1.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p))/(c->exponent*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+5, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+5, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gxyyy]
 addToResult_3center(coefAndNorm * NORM_FACT2_3 * (p*p)*(c->coordinate.x - Rp[0])*(c->coordinate.y - Rp[1])*(Boys[4]*c->exponent*(p*p)*((c->coordinate.y - Rp[1])*(c->coordinate.y - Rp[1])) + 1.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p))/(c->exponent*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+6, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+6, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gyzzz]
 addToResult_3center(coefAndNorm * NORM_FACT2_3 * (p*p)*(c->coordinate.y - Rp[1])*(c->coordinate.z - Rp[2])*(Boys[4]*c->exponent*(p*p)*((c->coordinate.z - Rp[2])*(c->coordinate.z - Rp[2])) + 1.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p))/(c->exponent*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+7, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+7, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gxzzz]
 addToResult_3center(coefAndNorm * NORM_FACT2_3 * (p*p)*(c->coordinate.x - Rp[0])*(c->coordinate.z - Rp[2])*(Boys[4]*c->exponent*(p*p)*((c->coordinate.z - Rp[2])*(c->coordinate.z - Rp[2])) + 1.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p))/(c->exponent*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+8, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+8, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gxxyy]
 addToResult_3center(coefAndNorm * NORM_FACT2_2 * G_NORMALIZATION_CONSTANT_2_2_INV * (c->exponent*(p*p)*((c->coordinate.x - Rp[0])*(c->coordinate.x - Rp[0]))*(Boys[4]*c->exponent*(p*p)*((c->coordinate.y - Rp[1])*(c->coordinate.y - Rp[1])) + 0.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p)) + sum_exp*(0.5*Boys[2]*c->exponent*(p*p)*((c->coordinate.y - Rp[1])*(c->coordinate.y - Rp[1]))*sum_exp - 0.5*p*(Boys[3]*c->exponent*(p*p)*((c->coordinate.y - Rp[1])*(c->coordinate.y - Rp[1])) + 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*p)) + 0.25*(sum_exp*sum_exp)*(Boys[0]*sum_exp - Boys[1]*p)))/((c->exponent*c->exponent)*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+9, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+9, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gxxzz]
 addToResult_3center(coefAndNorm * NORM_FACT2_2 * G_NORMALIZATION_CONSTANT_2_2_INV * (c->exponent*(p*p)*((c->coordinate.x - Rp[0])*(c->coordinate.x - Rp[0]))*(Boys[4]*c->exponent*(p*p)*((c->coordinate.z - Rp[2])*(c->coordinate.z - Rp[2])) + 0.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p)) + sum_exp*(0.5*Boys[2]*c->exponent*(p*p)*((c->coordinate.z - Rp[2])*(c->coordinate.z - Rp[2]))*sum_exp - 0.5*p*(Boys[3]*c->exponent*(p*p)*((c->coordinate.z - Rp[2])*(c->coordinate.z - Rp[2])) + 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*p)) + 0.25*(sum_exp*sum_exp)*(Boys[0]*sum_exp - Boys[1]*p)))/((c->exponent*c->exponent)*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+10, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+10, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gyyzz]
 addToResult_3center(coefAndNorm * NORM_FACT2_2 * G_NORMALIZATION_CONSTANT_2_2_INV * (c->exponent*(p*p)*((c->coordinate.y - Rp[1])*(c->coordinate.y - Rp[1]))*(Boys[4]*c->exponent*(p*p)*((c->coordinate.z - Rp[2])*(c->coordinate.z - Rp[2])) + 0.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p)) + sum_exp*(0.5*Boys[2]*c->exponent*(p*p)*((c->coordinate.z - Rp[2])*(c->coordinate.z - Rp[2]))*sum_exp - 0.5*p*(Boys[3]*c->exponent*(p*p)*((c->coordinate.z - Rp[2])*(c->coordinate.z - Rp[2])) + 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*p)) + 0.25*(sum_exp*sum_exp)*(Boys[0]*sum_exp - Boys[1]*p)))/((c->exponent*c->exponent)*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+11, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+11, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gxxyz]
 addToResult_3center(coefAndNorm * NORM_FACT2_2 * (p*p)*(c->coordinate.y - Rp[1])*(c->coordinate.z - Rp[2])*(Boys[4]*c->exponent*(p*p)*((c->coordinate.x - Rp[0])*(c->coordinate.x - Rp[0])) + 0.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p))/(c->exponent*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+12, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+12, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gxyyz]
 addToResult_3center(coefAndNorm * NORM_FACT2_2 * (p*p)*(c->coordinate.x - Rp[0])*(c->coordinate.z - Rp[2])*(Boys[4]*c->exponent*(p*p)*((c->coordinate.y - Rp[1])*(c->coordinate.y - Rp[1])) + 0.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p))/(c->exponent*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+13, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+13, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 
 // [s s | gxyzz]
 addToResult_3center(coefAndNorm * NORM_FACT2_2 * (p*p)*(c->coordinate.x - Rp[0])*(c->coordinate.y - Rp[1])*(Boys[4]*c->exponent*(p*p)*((c->coordinate.z - Rp[2])*(c->coordinate.z - Rp[2])) + 0.5*sum_exp*(Boys[2]*sum_exp - Boys[3]*p))/(c->exponent*(sum_exp*sum_exp*sum_exp*sum_exp)) ,
-		g_result, a->basis_index, b->basis_index, c->basis_index+14, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index+14, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 

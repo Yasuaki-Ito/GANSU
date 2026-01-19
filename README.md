@@ -227,7 +227,7 @@ If the molecule is large, it is recommended to use the RI approximation (density
 
 GANSU (GPU Accelerated Numerical Simulation Utility)
 
-Copyright (c) 2025, Hiroshima University and Fujitsu Limited All rights reserved.
+Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited All rights reserved.
 
 This software is licensed under the BSD 3-Clause License.
 You may obtain a copy of the license in the LICENSE file

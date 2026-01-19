@@ -1,300 +1,300 @@
 // [dxx | fxxx]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_3 * (Rab[0])*(-0.5*(a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0]))*(2*Boys[4]*b->exponent*sum_exponent - 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) - 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 1.0*a->exponent*b->exponent*sum_exponent*(0.5*Boys[3]*sum_exponent - 1.0*Boys[4]*a->exponent*b->exponent*((Rab[0])*(Rab[0]))) + 0.5*b->exponent*sum_exponent*(Boys[3]*a->exponent*sum_exponent + a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[0])*(Rab[0]))) + sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)) + 0.25*sum_exponent*(-4.0*Boys[2]*b->exponent*(sum_exponent*sum_exponent) + 2.0*a->exponent*(2*Boys[3]*b->exponent*sum_exponent - 2.0*Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) - 1.0*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + 4.0*sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))) + 1.0*sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxx | fyyy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_3 * (Rab[1])*((a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 1.0*sum_exponent*(-a->exponent*(Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))) + sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxx | fzzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_3 * (Rab[2])*((a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 1.0*sum_exponent*(-a->exponent*(Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))) + sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxx | fxxy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * 0.5*(Rab[1])*(-(a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0]))*(2*Boys[4]*b->exponent*sum_exponent - 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) - 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 2.0*a->exponent*b->exponent*sum_exponent*(0.5*Boys[3]*sum_exponent - 1.0*Boys[4]*a->exponent*b->exponent*((Rab[0])*(Rab[0]))) + 1.0*sum_exponent*(-a->exponent*(Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index, b->basis_index+3, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index+3, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxx | fxxz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * 0.5*(Rab[2])*(-(a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0]))*(2*Boys[4]*b->exponent*sum_exponent - 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) - 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 2.0*a->exponent*b->exponent*sum_exponent*(0.5*Boys[3]*sum_exponent - 1.0*Boys[4]*a->exponent*b->exponent*((Rab[0])*(Rab[0]))) + 1.0*sum_exponent*(-a->exponent*(Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index, b->basis_index+4, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index+4, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxx | fyyz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * (Rab[2])*((a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 0.5*sum_exponent*(-a->exponent*(Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index, b->basis_index+5, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index+5, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxx | fxyy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * 0.5*(Rab[0])*(2.0*(a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + b->exponent*sum_exponent*(-2*Boys[4]*(a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1])) + sum_exponent*(-1.0*Boys[2]*sum_exponent + Boys[3]*a->exponent)) + 2.0*sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index, b->basis_index+6, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index+6, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxx | fyzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * (Rab[1])*((a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index, b->basis_index+7, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index+7, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxx | fxzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * 0.5*(Rab[0])*(2.0*(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + b->exponent*sum_exponent*(-2*Boys[4]*(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2])) + sum_exponent*(-1.0*Boys[2]*sum_exponent + Boys[3]*a->exponent)) + 2.0*sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index, b->basis_index+8, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index+8, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxx | fxyz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(a->exponent*a->exponent)*(Rab[0])*(Rab[1])*(Rab[2])*(-2*Boys[4]*b->exponent*sum_exponent + 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[0])*(Rab[0])) + 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index, b->basis_index+9, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index+9, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyy | fxxx]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_3 * (Rab[0])*((a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 1.0*sum_exponent*(-a->exponent*(Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))) + sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+1, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+1, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyy | fyyy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_3 * (Rab[1])*(-0.5*(a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1]))*(2*Boys[4]*b->exponent*sum_exponent - 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) - 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 1.0*a->exponent*b->exponent*sum_exponent*(0.5*Boys[3]*sum_exponent - 1.0*Boys[4]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) + 0.5*b->exponent*sum_exponent*(Boys[3]*a->exponent*sum_exponent + a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) + sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)) + 0.25*sum_exponent*(-4.0*Boys[2]*b->exponent*(sum_exponent*sum_exponent) + 2.0*a->exponent*(2*Boys[3]*b->exponent*sum_exponent - 2.0*Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) - 1.0*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + 4.0*sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))) + 1.0*sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+1, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+1, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyy | fzzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_3 * (Rab[2])*((a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 1.0*sum_exponent*(-a->exponent*(Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))) + sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+1, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+1, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyy | fxxy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * 0.5*(Rab[1])*(-(a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0]))*(2*Boys[4]*b->exponent*sum_exponent - 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) - 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 2.0*sum_exponent*(-0.5*Boys[2]*b->exponent*(sum_exponent*sum_exponent) + 0.25*a->exponent*(2*Boys[3]*b->exponent*sum_exponent - 2.0*Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) - 1.0*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + 0.5*sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+1, b->basis_index+3, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+1, b->basis_index+3, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyy | fxxz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * (Rab[2])*((a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 0.5*sum_exponent*(-a->exponent*(Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+1, b->basis_index+4, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+1, b->basis_index+4, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyy | fyyz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * 0.5*(Rab[2])*(-(a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1]))*(2*Boys[4]*b->exponent*sum_exponent - 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) - 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 2.0*a->exponent*b->exponent*sum_exponent*(0.5*Boys[3]*sum_exponent - 1.0*Boys[4]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) + 1.0*sum_exponent*(-a->exponent*(Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+1, b->basis_index+5, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+1, b->basis_index+5, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyy | fxyy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * 0.5*(Rab[0])*(-(a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1]))*(2*Boys[4]*b->exponent*sum_exponent - 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) - 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 2.0*a->exponent*b->exponent*sum_exponent*(0.5*Boys[3]*sum_exponent - 1.0*Boys[4]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) + 2.0*sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+1, b->basis_index+6, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+1, b->basis_index+6, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyy | fyzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * 0.5*(Rab[1])*(2.0*(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + b->exponent*sum_exponent*(-2*Boys[4]*(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2])) + sum_exponent*(-1.0*Boys[2]*sum_exponent + Boys[3]*a->exponent)) + 2.0*sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+1, b->basis_index+7, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+1, b->basis_index+7, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyy | fxzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * (Rab[0])*((a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+1, b->basis_index+8, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+1, b->basis_index+8, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyy | fxyz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(a->exponent*a->exponent)*(Rab[0])*(Rab[1])*(Rab[2])*(-2*Boys[4]*b->exponent*sum_exponent + 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[1])*(Rab[1])) + 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+1, b->basis_index+9, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+1, b->basis_index+9, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dzz | fxxx]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_3 * (Rab[0])*((a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 1.0*sum_exponent*(-a->exponent*(Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))) + sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+2, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+2, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dzz | fyyy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_3 * (Rab[1])*((a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 1.0*sum_exponent*(-a->exponent*(Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))) + sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+2, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+2, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dzz | fzzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_3 * (Rab[2])*(-0.5*(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2]))*(2*Boys[4]*b->exponent*sum_exponent - 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) - 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 1.0*a->exponent*b->exponent*sum_exponent*(0.5*Boys[3]*sum_exponent - 1.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + 0.5*b->exponent*sum_exponent*(Boys[3]*a->exponent*sum_exponent + a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)) + 0.25*sum_exponent*(-4.0*Boys[2]*b->exponent*(sum_exponent*sum_exponent) + 2.0*a->exponent*(2*Boys[3]*b->exponent*sum_exponent - 2.0*Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) - 1.0*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + 4.0*sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))) + 1.0*sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+2, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+2, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dzz | fxxy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * (Rab[1])*((a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 0.5*sum_exponent*(-a->exponent*(Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+2, b->basis_index+3, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+2, b->basis_index+3, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dzz | fxxz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * 0.5*(Rab[2])*(-(a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0]))*(2*Boys[4]*b->exponent*sum_exponent - 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) - 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 2.0*sum_exponent*(-0.5*Boys[2]*b->exponent*(sum_exponent*sum_exponent) + 0.25*a->exponent*(2*Boys[3]*b->exponent*sum_exponent - 2.0*Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) - 1.0*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + 0.5*sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+2, b->basis_index+4, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+2, b->basis_index+4, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dzz | fyyz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * 0.5*(Rab[2])*(-(a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1]))*(2*Boys[4]*b->exponent*sum_exponent - 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) - 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 2.0*sum_exponent*(-0.5*Boys[2]*b->exponent*(sum_exponent*sum_exponent) + 0.25*a->exponent*(2*Boys[3]*b->exponent*sum_exponent - 2.0*Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) - 1.0*sum_exponent*(Boys[2]*sum_exponent - Boys[3]*b->exponent)) + 0.5*sum_exponent*(Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[1]*sum_exponent - Boys[2]*b->exponent))))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+2, b->basis_index+5, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+2, b->basis_index+5, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dzz | fxyy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * (Rab[0])*((a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1]))*(Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+2, b->basis_index+6, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+2, b->basis_index+6, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dzz | fyzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * 0.5*(Rab[1])*(-(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2]))*(2*Boys[4]*b->exponent*sum_exponent - 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) - 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 2.0*a->exponent*b->exponent*sum_exponent*(0.5*Boys[3]*sum_exponent - 1.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + 2.0*sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+2, b->basis_index+7, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+2, b->basis_index+7, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dzz | fxzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * NORM_FACT2_2 * 0.5*(Rab[0])*(-(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2]))*(2*Boys[4]*b->exponent*sum_exponent - 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) - 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent)) + 2.0*a->exponent*b->exponent*sum_exponent*(0.5*Boys[3]*sum_exponent - 1.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + 2.0*sum_exponent*(0.5*Boys[3]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2]))*sum_exponent + 0.5*a->exponent*(-Boys[4]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*b->exponent)) + 0.25*(sum_exponent*sum_exponent)*(Boys[1]*sum_exponent - Boys[2]*b->exponent)))/(b->exponent*(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent)) ,
-		g_result, a->basis_index+2, b->basis_index+8, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+2, b->basis_index+8, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dzz | fxyz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(a->exponent*a->exponent)*(Rab[0])*(Rab[1])*(Rab[2])*(-2*Boys[4]*b->exponent*sum_exponent + 2.0*Boys[5]*a->exponent*(b->exponent*b->exponent)*((Rab[2])*(Rab[2])) + 1.0*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*b->exponent))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+2, b->basis_index+9, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+2, b->basis_index+9, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxy | fxxx]
 addToResult_2center(coefAndNorm * NORM_FACT2_3 * 0.5*(Rab[1])*(-1.0*a->exponent*b->exponent*((Rab[0])*(Rab[0]))*(Boys[4]*a->exponent*sum_exponent + a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[0])*(Rab[0]))) + sum_exponent*(-Boys[3]*sum_exponent + Boys[4]*a->exponent)) + sum_exponent*(-Boys[4]*(a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)) + 2.0*sum_exponent*(-0.5*Boys[2]*(sum_exponent*sum_exponent) + 1.0*Boys[3]*a->exponent*b->exponent*((Rab[0])*(Rab[0]))*sum_exponent + 0.5*a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[0])*(Rab[0])))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+3, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+3, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxy | fyyy]
 addToResult_2center(coefAndNorm * NORM_FACT2_3 * 0.5*(Rab[0])*(-1.0*a->exponent*b->exponent*((Rab[1])*(Rab[1]))*(Boys[4]*a->exponent*sum_exponent + a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) + sum_exponent*(-Boys[3]*sum_exponent + Boys[4]*a->exponent)) + sum_exponent*(-Boys[4]*(a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)) + 2.0*sum_exponent*(-0.5*Boys[2]*(sum_exponent*sum_exponent) + 1.0*Boys[3]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))*sum_exponent + 0.5*a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[1])*(Rab[1])))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+3, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+3, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxy | fzzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_3 * a->exponent*b->exponent*(Rab[0])*(Rab[1])*(Rab[2])*(Boys[5]*(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2])) + 1.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*a->exponent))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+3, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+3, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxy | fxxy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(Rab[0])*(0.5*a->exponent*sum_exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) - a->exponent*(a->exponent*b->exponent*((Rab[0])*(Rab[0]))*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) + 2.0*sum_exponent*(-0.25*Boys[3]*sum_exponent + 0.5*Boys[4]*a->exponent*b->exponent*((Rab[1])*(Rab[1])))) + 2.0*sum_exponent*(-0.25*Boys[2]*(sum_exponent*sum_exponent) + 0.5*Boys[3]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))*sum_exponent + 0.25*a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[1])*(Rab[1])))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+3, b->basis_index+3, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+3, b->basis_index+3, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxy | fxxz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*a->exponent*b->exponent*(Rab[0])*(Rab[1])*(Rab[2])*(-Boys[4]*a->exponent*sum_exponent - a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[0])*(Rab[0]))) + sum_exponent*(Boys[3]*sum_exponent - Boys[4]*a->exponent))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+3, b->basis_index+4, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+3, b->basis_index+4, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxy | fyyz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*a->exponent*b->exponent*(Rab[0])*(Rab[1])*(Rab[2])*(-Boys[4]*a->exponent*sum_exponent - a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) + sum_exponent*(Boys[3]*sum_exponent - Boys[4]*a->exponent))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+3, b->basis_index+5, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+3, b->basis_index+5, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxy | fxyy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(Rab[1])*(-1.0*a->exponent*b->exponent*((Rab[0])*(Rab[0]))*(Boys[4]*a->exponent*sum_exponent + a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) + sum_exponent*(-Boys[3]*sum_exponent + Boys[4]*a->exponent)) + 0.5*sum_exponent*(Boys[3]*a->exponent*sum_exponent + a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) + sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+3, b->basis_index+6, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+3, b->basis_index+6, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxy | fyzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(Rab[0])*(2.0*a->exponent*b->exponent*((Rab[1])*(Rab[1]))*(Boys[5]*(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*a->exponent)) + sum_exponent*(-Boys[4]*(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+3, b->basis_index+7, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+3, b->basis_index+7, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxy | fxzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(Rab[1])*(2.0*a->exponent*b->exponent*((Rab[0])*(Rab[0]))*(Boys[5]*(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*a->exponent)) + sum_exponent*(-Boys[4]*(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+3, b->basis_index+8, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+3, b->basis_index+8, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxy | fxyz]
 addToResult_2center(coefAndNorm * 0.5*a->exponent*(Rab[2])*(-a->exponent*b->exponent*((Rab[0])*(Rab[0]))*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) + 2.0*sum_exponent*(0.25*Boys[3]*sum_exponent - 0.5*Boys[4]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+3, b->basis_index+9, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+3, b->basis_index+9, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxz | fxxx]
 addToResult_2center(coefAndNorm * NORM_FACT2_3 * 0.5*(Rab[2])*(-1.0*a->exponent*b->exponent*((Rab[0])*(Rab[0]))*(Boys[4]*a->exponent*sum_exponent + a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[0])*(Rab[0]))) + sum_exponent*(-Boys[3]*sum_exponent + Boys[4]*a->exponent)) + sum_exponent*(-Boys[4]*(a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)) + 2.0*sum_exponent*(-0.5*Boys[2]*(sum_exponent*sum_exponent) + 1.0*Boys[3]*a->exponent*b->exponent*((Rab[0])*(Rab[0]))*sum_exponent + 0.5*a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[0])*(Rab[0])))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+4, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+4, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxz | fyyy]
 addToResult_2center(coefAndNorm * NORM_FACT2_3 * a->exponent*b->exponent*(Rab[0])*(Rab[1])*(Rab[2])*(Boys[5]*(a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1])) + 1.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*a->exponent))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+4, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+4, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxz | fzzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_3 * 0.5*(Rab[0])*(-1.0*a->exponent*b->exponent*((Rab[2])*(Rab[2]))*(Boys[4]*a->exponent*sum_exponent + a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + sum_exponent*(-Boys[3]*sum_exponent + Boys[4]*a->exponent)) + sum_exponent*(-Boys[4]*(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)) + 2.0*sum_exponent*(-0.5*Boys[2]*(sum_exponent*sum_exponent) + 1.0*Boys[3]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))*sum_exponent + 0.5*a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2])))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+4, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+4, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxz | fxxy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*a->exponent*b->exponent*(Rab[0])*(Rab[1])*(Rab[2])*(-Boys[4]*a->exponent*sum_exponent - a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[0])*(Rab[0]))) + sum_exponent*(Boys[3]*sum_exponent - Boys[4]*a->exponent))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+4, b->basis_index+3, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+4, b->basis_index+3, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxz | fxxz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(Rab[0])*(0.5*a->exponent*sum_exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) - a->exponent*(a->exponent*b->exponent*((Rab[0])*(Rab[0]))*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + 2.0*sum_exponent*(-0.25*Boys[3]*sum_exponent + 0.5*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2])))) + 2.0*sum_exponent*(-0.25*Boys[2]*(sum_exponent*sum_exponent) + 0.5*Boys[3]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))*sum_exponent + 0.25*a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2])))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+4, b->basis_index+4, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+4, b->basis_index+4, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxz | fyyz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(Rab[0])*(-(a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1]))*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + 2.0*sum_exponent*(-0.25*Boys[2]*(sum_exponent*sum_exponent) + 0.5*Boys[3]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))*sum_exponent + 0.25*a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2])))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+4, b->basis_index+5, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+4, b->basis_index+5, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxz | fxyy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(Rab[2])*(2.0*a->exponent*b->exponent*((Rab[0])*(Rab[0]))*(Boys[5]*(a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*a->exponent)) + sum_exponent*(-Boys[4]*(a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+4, b->basis_index+6, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+4, b->basis_index+6, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxz | fyzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * -0.5*a->exponent*b->exponent*(Rab[0])*(Rab[1])*(Rab[2])*(Boys[4]*a->exponent*sum_exponent + a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) - sum_exponent*(Boys[3]*sum_exponent - Boys[4]*a->exponent))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+4, b->basis_index+7, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+4, b->basis_index+7, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxz | fxzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(Rab[2])*(-1.0*a->exponent*b->exponent*((Rab[0])*(Rab[0]))*(Boys[4]*a->exponent*sum_exponent + a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + sum_exponent*(-Boys[3]*sum_exponent + Boys[4]*a->exponent)) + 0.5*sum_exponent*(Boys[3]*a->exponent*sum_exponent + a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+4, b->basis_index+8, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+4, b->basis_index+8, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dxz | fxyz]
 addToResult_2center(coefAndNorm * 0.5*a->exponent*(Rab[1])*(-a->exponent*b->exponent*((Rab[0])*(Rab[0]))*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + 0.5*sum_exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+4, b->basis_index+9, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+4, b->basis_index+9, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyz | fxxx]
 addToResult_2center(coefAndNorm * NORM_FACT2_3 * a->exponent*b->exponent*(Rab[0])*(Rab[1])*(Rab[2])*(Boys[5]*(a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0])) + 1.5*sum_exponent*(Boys[3]*sum_exponent - Boys[4]*a->exponent))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+5, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+5, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyz | fyyy]
 addToResult_2center(coefAndNorm * NORM_FACT2_3 * 0.5*(Rab[2])*(-1.0*a->exponent*b->exponent*((Rab[1])*(Rab[1]))*(Boys[4]*a->exponent*sum_exponent + a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) + sum_exponent*(-Boys[3]*sum_exponent + Boys[4]*a->exponent)) + sum_exponent*(-Boys[4]*(a->exponent*a->exponent)*b->exponent*((Rab[1])*(Rab[1])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)) + 2.0*sum_exponent*(-0.5*Boys[2]*(sum_exponent*sum_exponent) + 1.0*Boys[3]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))*sum_exponent + 0.5*a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[1])*(Rab[1])))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+5, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+5, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyz | fzzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_3 * 0.5*(Rab[1])*(-1.0*a->exponent*b->exponent*((Rab[2])*(Rab[2]))*(Boys[4]*a->exponent*sum_exponent + a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + sum_exponent*(-Boys[3]*sum_exponent + Boys[4]*a->exponent)) + sum_exponent*(-Boys[4]*(a->exponent*a->exponent)*b->exponent*((Rab[2])*(Rab[2])) + 0.5*sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)) + 2.0*sum_exponent*(-0.5*Boys[2]*(sum_exponent*sum_exponent) + 1.0*Boys[3]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))*sum_exponent + 0.5*a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2])))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+5, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+5, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyz | fxxy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(Rab[2])*(-(a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0]))*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) + 2.0*sum_exponent*(-0.25*Boys[2]*(sum_exponent*sum_exponent) + 0.5*Boys[3]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))*sum_exponent + 0.25*a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[1])*(Rab[1])))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+5, b->basis_index+3, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+5, b->basis_index+3, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyz | fxxz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(Rab[1])*(-(a->exponent*a->exponent)*b->exponent*((Rab[0])*(Rab[0]))*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + 2.0*sum_exponent*(-0.25*Boys[2]*(sum_exponent*sum_exponent) + 0.5*Boys[3]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))*sum_exponent + 0.25*a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2])))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+5, b->basis_index+4, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+5, b->basis_index+4, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyz | fyyz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(Rab[1])*(0.5*a->exponent*sum_exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) - a->exponent*(a->exponent*b->exponent*((Rab[1])*(Rab[1]))*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + 2.0*sum_exponent*(-0.25*Boys[3]*sum_exponent + 0.5*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2])))) + 2.0*sum_exponent*(-0.25*Boys[2]*(sum_exponent*sum_exponent) + 0.5*Boys[3]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))*sum_exponent + 0.25*a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2])))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+5, b->basis_index+5, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+5, b->basis_index+5, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyz | fxyy]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * -0.5*a->exponent*b->exponent*(Rab[0])*(Rab[1])*(Rab[2])*(Boys[4]*a->exponent*sum_exponent + a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[1])*(Rab[1]))) - sum_exponent*(Boys[3]*sum_exponent - Boys[4]*a->exponent))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+5, b->basis_index+6, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+5, b->basis_index+6, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyz | fyzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * 0.5*(Rab[2])*(-1.0*a->exponent*b->exponent*((Rab[1])*(Rab[1]))*(Boys[4]*a->exponent*sum_exponent + a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + sum_exponent*(-Boys[3]*sum_exponent + Boys[4]*a->exponent)) + 0.5*sum_exponent*(Boys[3]*a->exponent*sum_exponent + a->exponent*(Boys[3]*sum_exponent - 2.0*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) + sum_exponent*(-Boys[2]*sum_exponent + Boys[3]*a->exponent)))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+5, b->basis_index+7, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+5, b->basis_index+7, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyz | fxzz]
 addToResult_2center(coefAndNorm * NORM_FACT2_2 * -0.5*a->exponent*b->exponent*(Rab[0])*(Rab[1])*(Rab[2])*(Boys[4]*a->exponent*sum_exponent + a->exponent*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) - sum_exponent*(Boys[3]*sum_exponent - Boys[4]*a->exponent))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+5, b->basis_index+8, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+5, b->basis_index+8, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [dyz | fxyz]
 addToResult_2center(coefAndNorm * -0.5*a->exponent*(Rab[0])*(a->exponent*b->exponent*((Rab[1])*(Rab[1]))*(Boys[4]*sum_exponent - 2.0*Boys[5]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))) - 2.0*sum_exponent*(0.25*Boys[3]*sum_exponent - 0.5*Boys[4]*a->exponent*b->exponent*((Rab[2])*(Rab[2]))))/(sum_exponent*sum_exponent*sum_exponent*sum_exponent*sum_exponent) ,
-		g_result, a->basis_index+5, b->basis_index+9, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index+5, b->basis_index+9, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 

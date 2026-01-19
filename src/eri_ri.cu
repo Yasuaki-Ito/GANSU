@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -462,7 +462,7 @@ void calc_RI_RMP2_energy_kernel4(int nocc, int nocc_block, int nvir, int nocc_st
 
 
 
-int search_maximime_k(int mocc, int mvir) {
+int search_maximum_k(int mocc, int mvir) {
     size_t free_mem_bytes, total_mem_bytes;
     cudaMemGetInfo(&free_mem_bytes, &total_mem_bytes);
     
@@ -475,7 +475,7 @@ int search_maximime_k(int mocc, int mvir) {
 
 
 void search_k_and_cudamalloc_4cERI(int mocc, int mvir, int &k, double **d_iajb, cudaStream_t &stream) {
-    k = search_maximime_k(mocc, mvir);
+    k = search_maximum_k(mocc, mvir);
     // k = (int)(k*mvir / 32) * 32;
     // k = 10;
 

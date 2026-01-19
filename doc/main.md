@@ -191,9 +191,9 @@ Parameters in the recipe file are overwritten by the command-line options.
 [![BSD 3-Clause](https://img.shields.io/badge/License-BSD_3--Clause-orange)](https://opensource.org/licenses/BSD-3-Clause)
 
 
-GANSU: GPU Acclerated Numerical Simulation Utility
+GANSU: GPU Accelerated Numerical Simulation Utility
 
-Copyright (c) 2025, Hiroshima University and Fujitsu Limited All rights reserved.
+Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited All rights reserved.
 
 This software is licensed under the BSD 3-Clause License.
 You may obtain a copy of the license in the LICENSE file

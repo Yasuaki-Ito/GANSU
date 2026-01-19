@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -61,7 +61,7 @@ ROHF::ROHF(const Molecular& molecular, const ParameterManager& parameters) :
     num_virtual(num_basis - num_open - num_closed),
     ROH_parameter_name(parameters.get<std::string>("rohf_parameter_name")),
     ROHF_parameters(ROHF_Parameters::sets.at(ROH_parameter_name)),
-    initail_guess_method_(parameters.get<std::string>("initial_guess")),
+    initial_guess_method_(parameters.get<std::string>("initial_guess")),
     gbsfilename_(parameters.get<std::string>("gbsfilename"))
 {
     // check the number of alpha and beta electrons and the number of basis functions
@@ -134,24 +134,24 @@ void ROHF::guess_initial_fock_matrix(const real_t* density_matrix_a, const real_
 
     std::unique_ptr<InitialGuess_ROHF> initial_guess; // the life time is only here since initial guess is performed only once
 
-    if(force_density == true || initail_guess_method_ == "density"){ // Initialized by the precomputed density matrix
+    if(force_density == true || initial_guess_method_ == "density"){ // Initialized by the precomputed density matrix
         if(density_matrix_a == nullptr || density_matrix_b == nullptr){
-            std::cerr << "The density matrix is not provided even though ``density'' is set to ``initail_guess_method'' or force_density=true. The core Hamiltonian matrix is used instead." << std::endl;
+            std::cerr << "The density matrix is not provided even though ``density'' is set to ``initial_guess_method'' or force_density=true. The core Hamiltonian matrix is used instead." << std::endl;
             initial_guess = std::make_unique<InitialGuess_ROHF_Core>(*this);
         }else{
             initial_guess = std::make_unique<InitialGuess_ROHF_Density>(*this, density_matrix_a, density_matrix_b);
         }
-    }else if(initail_guess_method_ == "core"){ // core Hamiltonian matrix
+    }else if(initial_guess_method_ == "core"){ // core Hamiltonian matrix
         initial_guess = std::make_unique<InitialGuess_ROHF_Core>(*this);
-    }else if(initail_guess_method_ == "gwh"){ // Generalized Wolfsberg-Helmholz (GWH) method
+    }else if(initial_guess_method_ == "gwh"){ // Generalized Wolfsberg-Helmholz (GWH) method
         initial_guess = std::make_unique<InitialGuess_ROHF_GWH>(*this);
-    }else if(initail_guess_method_ == "sad"){ // Superposition of Atomic Densities (SAD) method
+    }else if(initial_guess_method_ == "sad"){ // Superposition of Atomic Densities (SAD) method
         if(gbsfilename_.empty()){
             THROW_EXCEPTION("The basis set file is not specified for SAD initial guess method. Please specify the basis set file name by -gbsfilename option.");
         }
         initial_guess = std::make_unique<InitialGuess_ROHF_SAD>(*this);
     }else{
-        THROW_EXCEPTION("Invalid initial guess method: " + initail_guess_method_);
+        THROW_EXCEPTION("Invalid initial guess method: " + initial_guess_method_);
     }
 
     // Execute the initial guess method
@@ -372,7 +372,7 @@ void ROHF::export_density_matrix(real_t* density_matrix_a, real_t* density_matri
     std::cout << "[Calculation Summary]" << std::endl;
     std::cout << "Method: Restricted Open-shell Hartree-Fock (ROHF)" << std::endl;
     std::cout << "Schwarz screening threshold: " << schwarz_screening_threshold << std::endl;
-    std::cout << "Initial guess method: " << initail_guess_method_ << std::endl;
+    std::cout << "Initial guess method: " << initial_guess_method_ << std::endl;
     std::cout << "Convergence algorithm: " << convergence_method_->get_algorithm_name() << std::endl;
     std::cout << "Number of iterations: " << iter_ << std::endl;
     std::cout << "Convergence criterion: " << convergence_energy_threshold << std::endl;

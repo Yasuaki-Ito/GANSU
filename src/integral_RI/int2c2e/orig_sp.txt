@@ -1,15 +1,15 @@
 // [s | px]
 addToResult_2center(coefAndNorm * Boys[1]*a->exponent*(Rab[0])/sum_exponent ,
-		g_result, a->basis_index, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [s | py]
 addToResult_2center(coefAndNorm * Boys[1]*a->exponent*(Rab[1])/sum_exponent ,
-		g_result, a->basis_index, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index+1, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 
 // [s | pz]
 addToResult_2center(coefAndNorm * Boys[1]*a->exponent*(Rab[2])/sum_exponent ,
-		g_result, a->basis_index, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index+2, num_auxiliary_basis, is_prim_id_not_equal, d_auxiliary_cgto_normalization_factors
 );
 

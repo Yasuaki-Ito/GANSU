@@ -1,5 +1,5 @@
 // [s s | s]
 addToResult_3center(coefAndNorm * Boys[0] ,
-		g_result, a->basis_index, b->basis_index, c->basis_index, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors
+		g_result, a->basis_index, b->basis_index, c->basis_index, num_basis, num_auxiliary_basis, is_prim_id_not_equal, d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
 );
 

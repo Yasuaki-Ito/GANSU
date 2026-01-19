@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -205,7 +205,7 @@ protected:
 
     const std::vector<ShellTypeInfo> auxiliary_shell_type_infos_; ///< Shell type info in the primitive shell list
     DeviceHostMemory<PrimitiveShell> auxiliary_primitive_shells_; ///< Primitive shells
-    DeviceHostMemory<real_t> auxiliary_cgto_nomalization_factors_; ///< Normalization factors of the contracted Gauss functions
+    DeviceHostMemory<real_t> auxiliary_cgto_normalization_factors_; ///< Normalization factors of the contracted Gauss functions
 
     DeviceHostMatrix<real_t> intermediate_matrix_B_; ///< intermediate matrix B (num_auxiliary_basis_ x (num_basis_x num_basis_))
 

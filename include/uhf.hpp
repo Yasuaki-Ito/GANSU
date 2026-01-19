@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -150,7 +150,7 @@ private:
 
     std::unique_ptr<Convergence_UHF> convergence_method_; ///< Convergence_UHF
 
-    const std::string initail_guess_method_; ///< Initial guess method name
+    const std::string initial_guess_method_; ///< Initial guess method name
     const std::string gbsfilename_; ///< Basis set file name (Gaussian basis set file)
 
 };
@@ -222,10 +222,10 @@ public:
      * @details This function constructs the Convergence_UHF_Damping class.
      * @details The UHF is given as an argument.
      */
-    Convergence_UHF_Damping(UHF& hf) 
-        : Convergence_UHF(hf), 
+    Convergence_UHF_Damping(UHF& hf)
+        : Convergence_UHF(hf),
         damping_factor_(0.0),
-//        use_optimized_(true),
+        use_optimized_(true),
         first_iteration_(true),
         prev_density_matrix_a(hf.get_num_basis(), hf.get_num_basis()),
         prev_density_matrix_b(hf.get_num_basis(), hf.get_num_basis()),
@@ -245,7 +245,7 @@ public:
             cudaMemcpy(prev_density_matrix_a.device_ptr(), hf_.get_density_matrix_a().device_ptr(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyDeviceToDevice);
             cudaMemcpy(prev_density_matrix_b.device_ptr(), hf_.get_density_matrix_b().device_ptr(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyDeviceToDevice);
             cudaMemcpy(prev_fock_matrix_a.device_ptr(), hf_.get_fock_matrix_a().device_ptr(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyDeviceToDevice);
-            cudaMemcpy(prev_fock_matrix_a.device_ptr(), hf_.get_fock_matrix_b().device_ptr(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(prev_fock_matrix_b.device_ptr(), hf_.get_fock_matrix_b().device_ptr(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyDeviceToDevice);
             return;
         }else{
             /*
@@ -604,7 +604,7 @@ public:
         std::cout << "------ [SAD] Computing density matrix for : " << atomic_number_to_element_name(atomic_number) << " ------" << std::endl;
 
         ParameterManager parameters;
-        parameters.set_default_values_to_unspecfied_parameters();
+        parameters.set_default_values_to_unspecified_parameters();
         parameters["gbsfilename"] = hf_.get_gbsfilename();
         parameters["initial_guess"] = "core"; // if "SAD" is used, the initial guess may be recursively called
         parameters["eri_method"] = "stored"; // use stored ERI method for the monatomic molecule

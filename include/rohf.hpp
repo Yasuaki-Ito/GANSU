@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -166,7 +166,7 @@ private:
 
     std::unique_ptr<Convergence_ROHF> convergence_method_; ///< Convergence_ROHF
 
-    const std::string initail_guess_method_; ///< Initial guess method name
+    const std::string initial_guess_method_; ///< Initial guess method name
     const std::string gbsfilename_; ///< Basis set file name (Gaussian basis set file)
 
 };
@@ -258,7 +258,7 @@ public:
     void get_new_fock_matrix() override {
         if (first_iteration_) { // First iteration: no damping, just store the density matrix and the Fock matrix
             first_iteration_ = false;
-            cudaMemcpy(prev_fock_matrix.device_ptr(), hf_.get_fock_matrix().device_ptr(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(prev_density_matrix.device_ptr(), hf_.get_density_matrix().device_ptr(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyDeviceToDevice);
             cudaMemcpy(prev_fock_matrix.device_ptr(), hf_.get_fock_matrix().device_ptr(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyDeviceToDevice);
             return;
         }else{
@@ -537,7 +537,7 @@ public:
         std::cout << "------ [SAD] Computing density matrix for : " << atomic_number_to_element_name(atomic_number) << " ------" << std::endl;
 
         ParameterManager parameters;
-        parameters.set_default_values_to_unspecfied_parameters();
+        parameters.set_default_values_to_unspecified_parameters();
         parameters["gbsfilename"] = hf_.get_gbsfilename();
         parameters["initial_guess"] = "core"; // if "SAD" is used, the initial guess may be recursively called
         parameters["eri_method"] = "stored"; // use stored ERI method for the monatomic molecule

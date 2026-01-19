@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -73,10 +73,10 @@ public:
         }
 
         // Set default values for unspecified parameters
-        parameters.set_default_values_to_unspecfied_parameters();
+        parameters.set_default_values_to_unspecified_parameters();
 
 
-        // Check the emvironment
+        // Check the environment
         {
             gpu::cusolverManager cusolver;
             gpu::cublasManager cublas;
@@ -105,7 +105,7 @@ public:
         }
     }
 
-    static real_t buildOtimizer(const ParameterManager& arg_parameters){
+    static real_t buildOptimizer(const ParameterManager& arg_parameters){
         ParameterManager parameters; // Create a new ParameterManager without setting default values
 
         // Load the parameters if the parameter file is given
@@ -137,10 +137,10 @@ public:
         }
 
         // Set default values for unspecified parameters
-        parameters.set_default_values_to_unspecfied_parameters();
+        parameters.set_default_values_to_unspecified_parameters();
 
 
-        // Check the emvironment
+        // Check the environment
         {
             gpu::cusolverManager cusolver;
             gpu::cublasManager cublas;

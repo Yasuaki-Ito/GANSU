@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -41,7 +41,7 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
     coefficient_matrix(num_basis, num_basis),
     density_matrix(num_basis, num_basis),
     orbital_energies(num_basis),
-    initail_guess_method_(parameters.get<std::string>("initial_guess")),
+    initial_guess_method_(parameters.get<std::string>("initial_guess")),
     gbsfilename_(parameters.get<std::string>("gbsfilename")),
     fock_matrix(num_basis, num_basis)
 {
@@ -152,24 +152,24 @@ void RHF::guess_initial_fock_matrix(const real_t* density_matrix_a, const real_t
 
     std::unique_ptr<InitialGuess_RHF> initial_guess; // the life time is only here since initial guess is performed only once
 
-    if(force_density == true || initail_guess_method_ == "density"){ // Inititialized by precomputed density matrices
+    if(force_density == true || initial_guess_method_ == "density"){ // Initialized by precomputed density matrices
         if(density_matrix_a == nullptr || density_matrix_b == nullptr){
-            std::cerr << "The density matrix is not provided even though ``density'' is set to ``initail_guess_method'' or forced_density = true. The core Hamiltonian matrix is used instead." << std::endl;
+            std::cerr << "The density matrix is not provided even though ``density'' is set to ``initial_guess_method'' or forced_density = true. The core Hamiltonian matrix is used instead." << std::endl;
             initial_guess = std::make_unique<InitialGuess_RHF_Core>(*this);
         }else{
             initial_guess = std::make_unique<InitialGuess_RHF_Density>(*this, density_matrix_a, density_matrix_b);
         }
-    }else if(initail_guess_method_ == "core"){ // core Hamiltonian matrix
+    }else if(initial_guess_method_ == "core"){ // core Hamiltonian matrix
         initial_guess = std::make_unique<InitialGuess_RHF_Core>(*this);
-    }else if(initail_guess_method_ == "gwh"){ // Generalized Wolfsberg-Helmholz (GWH) method
+    }else if(initial_guess_method_ == "gwh"){ // Generalized Wolfsberg-Helmholz (GWH) method
         initial_guess = std::make_unique<InitialGuess_RHF_GWH>(*this);
-    }else if(initail_guess_method_ == "sad"){ // Superposition of Atomic Densities (SAD) method
+    }else if(initial_guess_method_ == "sad"){ // Superposition of Atomic Densities (SAD) method
         if(gbsfilename_.empty()){
             THROW_EXCEPTION("The basis set file is not specified for SAD initial guess method. Please specify the basis set file name by -gbsfilename option.");
         }
         initial_guess = std::make_unique<InitialGuess_RHF_SAD>(*this);
     }else{
-        throw std::runtime_error("Invalid initial guess method: " + initail_guess_method_);
+        throw std::runtime_error("Invalid initial guess method: " + initial_guess_method_);
     }
 
     // Execute the initial guess method
@@ -374,7 +374,7 @@ void RHF::report() {
     std::cout << "[Calculation Summary]" << std::endl;
     std::cout << "Method: Restricted Hartree-Fock (RHF)" << std::endl;
     std::cout << "Schwarz screening threshold: " << schwarz_screening_threshold << std::endl;
-    std::cout << "Initial guess method: " << initail_guess_method_ << std::endl;
+    std::cout << "Initial guess method: " << initial_guess_method_ << std::endl;
     std::cout << "Convergence algorithm: " << convergence_method_->get_algorithm_name() << std::endl;
     std::cout << "Number of iterations: " << iter_ << std::endl;
     std::cout << "Convergence criterion: " << convergence_energy_threshold << std::endl;
@@ -433,7 +433,7 @@ void RHF::export_molden_file(const std::string& filename) {
         ofs << i+1 << " " << 0 << std::endl;
         BasisRange basis_range = get_atom_to_basis_range()[i];
         for(size_t j=basis_range.start_index; j<basis_range.end_index; j++){
-            if(num_primitives[j] == 0){ // skip non-representive basis functions (e.g. py,pz, etc.)
+            if(num_primitives[j] == 0){ // skip non-representative basis functions (e.g. py,pz, etc.)
                 continue;
             }  
             ofs << " " << shell_type_to_shell_name(shell_types[j]) << " " << num_primitives[j] << " " << "1.00" << std::endl;
@@ -499,7 +499,7 @@ void RHF::export_molden_file(const std::string& filename) {
         ofs << i+1 << " " << 0 << std::endl;
         BasisRange basis_range = get_atom_to_basis_range()[i];
         for(size_t j=basis_range.start_index; j<basis_range.end_index; j++){
-            if(num_primitives[j] == 0){ // skip non-representive basis functions (e.g. py,pz, etc.)
+            if(num_primitives[j] == 0){ // skip non-representative basis functions (e.g. py,pz, etc.)
                 continue;
             }  
             ofs << " " << shell_type_to_shell_name(shell_types[j]) << " " << num_primitives[j] << " " << "1.00" << std::endl;

@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -56,7 +56,7 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     shell_pair_type_infos(shell_type_infos.size()*(shell_type_infos.size()+1)/2),
     atom_to_basis_range(molecular.get_atom_to_basis_range()), // construct the list directly from std::vector
     boys_grid(30720,true), // 30720 is the number of grid points for, true means that the host memory is allocated in advance
-    cgto_nomalization_factors(molecular.get_cgto_normalization_factors()), // construct the list directly from std::vector
+    cgto_normalization_factors(molecular.get_cgto_normalization_factors()), // construct the list directly from std::vector
     overlap_matrix(num_basis, num_basis), // host memory is not allocated in advance
     core_hamiltonian_matrix(num_basis, num_basis), // host memory is not allocated in advance
     transform_matrix(num_basis, num_basis), // host memory is not allocated in advance
@@ -75,22 +75,22 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     // Set the post-HF method
     std::string post_hf_method_str = parameters.get<std::string>("post_hf_method");
     if(post_hf_method_str == "none"){
-        std::cout << "Messege: Post-HF method is not selected." << std::endl;
+        std::cout << "Message: Post-HF method is not selected." << std::endl;
         post_hf_method_ = PostHFMethod::None;
     }else if(post_hf_method_str == "mp2"){
-        std::cout << "Messege: Post-HF method is MP2." << std::endl;
+        std::cout << "Message: Post-HF method is MP2." << std::endl;
         post_hf_method_ = PostHFMethod::MP2;
     }else if(post_hf_method_str == "mp3"){
-        std::cout << "Messege: Post-HF method is MP3." << std::endl;
+        std::cout << "Message: Post-HF method is MP3." << std::endl;
         post_hf_method_ = PostHFMethod::MP3;
     }else if(post_hf_method_str == "mp4"){
-        std::cout << "Messege: Post-HF method is MP4." << std::endl;
+        std::cout << "Message: Post-HF method is MP4." << std::endl;
         post_hf_method_ = PostHFMethod::MP4;
     }else if(post_hf_method_str == "ccsd"){
-        std::cout << "Messege: Post-HF method is CCSD." << std::endl;
+        std::cout << "Message: Post-HF method is CCSD." << std::endl;
         post_hf_method_ = PostHFMethod::CCSD;
     }else if(post_hf_method_str == "ccsd_t"){
-        std::cout << "Messege: Post-HF method is CCSD(T)." << std::endl;
+        std::cout << "Message: Post-HF method is CCSD(T)." << std::endl;
         post_hf_method_ = PostHFMethod::CCSD_T;
     }else{
         throw std::runtime_error("Error: Unknown post-HF method: " + post_hf_method_str);
@@ -99,7 +99,7 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
 
     // print all the values of boys function for the test (temporary implementation)
     if(verbose){
-        std::cout << "Messege: grid values for the Boys function is load from the header file." << std::endl;
+        std::cout << "Message: grid values for the Boys function is load from the header file." << std::endl;
     }
     for(size_t i=0; i<30720; i++){
         //std::cout << i << ": " << h_boys_grid[i] << std::endl;
@@ -124,7 +124,7 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     boys_grid.toDevice(); // copy the grid values to the device memory
     atoms.toDevice(); // copy the list of atoms to the device memory
     primitive_shells.toDevice(); // copy the list of primitive shells to the device memory
-    cgto_nomalization_factors.toDevice(); // copy the list of cgto normalization factors to the device memory
+    cgto_normalization_factors.toDevice(); // copy the list of cgto normalization factors to the device memory
 
 }
 
@@ -154,7 +154,7 @@ void HF::compute_core_hamiltonian_matrix() {
     PROFILE_FUNCTION();
 
     // compute the core Hamiltonian matrix
-    gpu::computeCoreHamiltonianMatrix(shell_type_infos, atoms.device_ptr(), primitive_shells.device_ptr(), boys_grid.device_ptr(), cgto_nomalization_factors.device_ptr(), overlap_matrix.device_ptr(), core_hamiltonian_matrix.device_ptr(),atoms.size(), num_basis, verbose);
+    gpu::computeCoreHamiltonianMatrix(shell_type_infos, atoms.device_ptr(), primitive_shells.device_ptr(), boys_grid.device_ptr(), cgto_normalization_factors.device_ptr(), overlap_matrix.device_ptr(), core_hamiltonian_matrix.device_ptr(),atoms.size(), num_basis, verbose);
 
     // print the overlap and core Hamiltonian matrix
     if(verbose){

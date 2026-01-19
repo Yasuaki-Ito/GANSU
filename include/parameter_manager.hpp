@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -130,12 +130,12 @@ public:
      * @throws std::out_of_range If the key is not found.
      * @throws std::invalid_argument If the value cannot be converted to the specified type.
      */
-    template <typename T> 
+    template <typename T>
     T get(const std::string& key) const {
         std::string key_lower = toLowerCase(key);
-        auto it = parameters_.find(key);
+        auto it = parameters_.find(key_lower);
         if (it == parameters_.end()) {
-            THROW_EXCEPTION("Parameter not found: " + key);
+            THROW_EXCEPTION("Parameter not found: " + key_lower);
         }
 
         T result;
@@ -181,7 +181,7 @@ public:
      * 
      * This method sets default values for any parameters that are not already present in the parameter map.
      */
-    void set_default_values_to_unspecfied_parameters();
+    void set_default_values_to_unspecified_parameters();
 
 private:
     /**

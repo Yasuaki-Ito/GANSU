@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -73,8 +73,8 @@ public:
     /**
      * @brief Add a primitive Gauss function to the contracted Gauss function
      */
-    void add_primitive_gauss(const real_t exponent, const real_t coefficitne){
-        PrimitiveGauss primitive_gauss = {exponent, coefficitne};
+    void add_primitive_gauss(const real_t exponent, const real_t coefficient){
+        PrimitiveGauss primitive_gauss = {exponent, coefficient};
         primitives.push_back(primitive_gauss);
     }
 
@@ -141,9 +141,9 @@ private:
     std::string type; // S, P, D, ...
     std::vector<PrimitiveGauss> primitives;
 
-    real_t factrial2(int n) const {
+    real_t factorial2(int n) const {
         if(n <= 1) return 1;
-        return n * factrial2(n-2);
+        return n * factorial2(n-2);
     }
 
     /**
@@ -154,7 +154,7 @@ private:
      * @details The normalization factor is given by \f$ \left( \frac{2 \alpha}{\pi} \right)^{1/4} \left( \frac{(4 \alpha)^i}{(2i-1)!!} \right)^{1/2} \f$.
      */
     real_t get_normalize_factor_1d(const real_t alpha, const int i) const {
-        return std::pow(2.0 * alpha / M_PI, 1.0/4.0) * std::sqrt( std::pow(4.0 * alpha, i) / factrial2(2*i-1) );
+        return std::pow(2.0 * alpha / M_PI, 1.0/4.0) * std::sqrt( std::pow(4.0 * alpha, i) / factorial2(2*i-1) );
     }
 };
 

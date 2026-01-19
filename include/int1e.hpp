@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Acclerated Numerical Simulation Utility
+ * GANSU: GPU Accelerated Numerical Simulation Utility
  *
- * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -285,11 +285,11 @@ void compute_nuclear_attraction_integral(real_t* g_nucattr, const PrimitiveShell
 
 
 // define the kernel functions as function pointers for one electron integrals
-using overlap_kinect_kernel_t     = void (*)(real_t*, real_t*, const PrimitiveShell*, const real_t*, const ShellTypeInfo, const ShellTypeInfo, const size_t, const int);
+using overlap_kinetic_kernel_t     = void (*)(real_t*, real_t*, const PrimitiveShell*, const real_t*, const ShellTypeInfo, const ShellTypeInfo, const size_t, const int);
 using nuclear_attraction_kernel_t = void (*)(real_t*, const PrimitiveShell*, const real_t*, const Atom*, const int, const ShellTypeInfo, const ShellTypeInfo, const size_t, const int, const real_t*);
 
 
-inline overlap_kinect_kernel_t get_overlap_kinetic_kernel(int a, int b){
+inline overlap_kinetic_kernel_t get_overlap_kinetic_kernel(int a, int b){
     int flag=0;
 
     if(flag){
