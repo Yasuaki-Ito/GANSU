@@ -8,3 +8,4 @@ doc/html
 bin/
 CLAUDE.md
 .claude/
+.gitignore
