@@ -35,7 +35,7 @@
 namespace gansu{
 
 
-// protoype of functions
+// prototype of functions
 std::pair<std::vector<double>, std::vector<double>> read_density_from_sad(const std::string& element, const std::string& basis_path, int& num_basis_out);
 
 /**

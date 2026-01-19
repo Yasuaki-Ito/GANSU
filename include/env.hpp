@@ -14,7 +14,7 @@
 
 /**
  * @file env.hpp
- * @brief Display the environment information (e.g., versons of CUDA, cuBLAS, and cuSOLVER)
+ * @brief Display the environment information (e.g., versions of CUDA, cuBLAS, and cuSOLVER)
  */
 
 #pragma once

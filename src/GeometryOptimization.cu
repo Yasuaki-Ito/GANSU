@@ -44,7 +44,7 @@ int main(int argc, char* argv[]){
     ParameterManager parameters;
     parameters.parse_command_line_args(argc, argv); // Parse the command line arguments
 
-    real_t energy = HFBuilder::buildOtimizer(parameters);
+    real_t energy = HFBuilder::buildOptimizer(parameters);
 
     std::cout << "Geometry optimization is completed." << std::endl;
     std::cout << "Final energy: " << energy << std::endl;

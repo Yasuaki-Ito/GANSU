@@ -27,7 +27,7 @@ public:
     Optimizer() = default;
     virtual ~Optimizer() = default;
 
-    // Optimeze the structure of the molecule
+    // Optimize the structure of the molecule
     virtual void optimize(const std::vector<Atom>& initial_atoms) = 0;
     
 };

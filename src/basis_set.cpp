@@ -40,7 +40,7 @@ BasisSet BasisSet::construct_from_gbs(const std::string& filename){
 
     ElementBasisSet current_element_basis_set;
 
-    // Read lines until the first charactor of the line is an alphabet.
+    // Read lines until the first character of the line is an alphabet.
     while(std::getline(ifs, line)){
         if(std::isalpha(line[0])){
             // unread the line
