@@ -81,7 +81,7 @@ void mu2i_(short norbs, short nocc, short nvir, short naux, double* d_C, double*
     const double alpha = 1.0;
     const double beta = 0.0;
 
-    cudaMemset(d_B_p_mu_a, 0, norbs * norbs * naux * sizeof(double));
+    cudaMemset(d_B_p_mu_a, 0, norbs * nvir * naux * sizeof(double));
 	
 
     cublasDgemm(
@@ -107,7 +107,7 @@ void mu2i_dgemm(short norbs, short nocc, short nvir, short naux, double* d_C, do
     const double alpha = 1.0;
     const double beta = 0.0;
 
-    cudaMemset(d_B_p_i_a, 0, norbs * norbs * naux * sizeof(double));
+    cudaMemset(d_B_p_i_a, 0, norbs * nvir * naux * sizeof(double));
 
     int row = naux * norbs, col = nvir;
     cublasDgeam(
@@ -174,7 +174,7 @@ void transform_intermediate_matrix(short norbs, short nocc, short nvir, short na
     const double alpha = 1.0;
     const double beta = 0.0;
 
-    cudaMemset(d_B_p_mu_a, 0, norbs * norbs * naux * sizeof(double));
+    cudaMemset(d_B_p_mu_a, 0, norbs * nvir * naux * sizeof(double));
 	
 
     cublasDgemm(
@@ -200,7 +200,7 @@ void mu2i_dgemm(short norbs, short nocc, short nvir, short naux, double* d_C, do
     const double alpha = 1.0;
     const double beta = 0.0;
 
-    cudaMemset(d_B_p_i_a, 0, norbs * norbs * naux * sizeof(double));
+    cudaMemset(d_B_p_i_a, 0, norbs * nvir * naux * sizeof(double));
 
     int row = naux * norbs, col = nvir;
     cublasDgeam(
@@ -512,7 +512,7 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
 
 
     real_t* d_tmp;
-    cudaMalloc((void**)&d_tmp, sizeof(double) * num_auxiliary_basis*num_basis_*num_basis_);
+    cudaMalloc((void**)&d_tmp, sizeof(double) * num_basis_ * nvir * num_auxiliary_basis);
 
     double *d_energy;
     cudaMalloc((void**)&d_energy, sizeof(double));
