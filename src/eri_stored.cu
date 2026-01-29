@@ -3095,7 +3095,7 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
 
 
         //debug: print t_ia and t_ijab amplitudes
-        ///*
+        /*
         real_t* h_t_ia_old = new real_t[num_spin_occ * num_spin_vir];
         real_t* h_t_ijab_old = new real_t[num_spin_occ * num_spin_occ * num_spin_vir * num_spin_vir];
         cudaMemcpy(h_t_ia_old, t_ia_old, sizeof(real_t) * num_spin_occ * num_spin_vir, cudaMemcpyDeviceToHost);
@@ -3125,7 +3125,7 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
    
         delete[] h_t_ia_old;
         delete[] h_t_ijab_old;
-        //*/
+        */
 
 
         compute_t_amplitude(d_eri_mo, d_orbital_energies, num_basis, num_spin_occ, num_spin_vir,
