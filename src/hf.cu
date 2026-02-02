@@ -463,6 +463,8 @@ void HF::report(){
         std::cout << "Number of primitive auxiliary basis functions: " << auxiliary_primitive_shells.size() << std::endl;
     }
 
+    // report memory statistics
+    CudaMemoryManager<double>::report_memory_statistics();
 
     if(is_export_molden_){
         export_molden_file("output.molden"); // Export the molecular orbitals to a molden file
