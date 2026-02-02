@@ -1,0 +1,10 @@
+real_t val;
+
+// [s s | s]
+if ( !((g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(b->basis_index)]) < schwarz_screening_threshold) && (!is_prim_id_neq || g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(a->basis_index)]) < schwarz_screening_threshold))) {
+	val = coefAndNorm * Boys[0] ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+	atomicAdd(&d_W_diff[(a->basis_index) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(b->basis_index)]);
+	if(is_prim_id_neq) atomicAdd(&d_W_diff[(b->basis_index) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(a->basis_index)]);
+}
+

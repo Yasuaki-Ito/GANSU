@@ -297,5 +297,49 @@ protected:
 
 
 
+/**
+ * @brief ERI_RI class for the electron repulsion integrals (ERIs) using the Resolution of Identity (RI) method
+ */
+class ERI_RI_Direct: public ERI {
+public:
+
+    ERI_RI_Direct(const HF& hf, const Molecular& auxiliary_molecular); ///< Constructor
+    
+    ERI_RI_Direct(const ERI_RI_Direct&) = delete; ///< copy constructor is deleted
+    virtual ~ERI_RI_Direct() = default; ///< destructor
+    
+    void precomputation() override;
+
+    DeviceHostMemory<PrimitiveShell>& get_auxiliary_primitive_shells() { return auxiliary_primitive_shells_; } ///< Get the auxiliary primitive shells
+    int get_num_auxiliary_basis() { return num_auxiliary_basis_; }
+
+    std::string get_algorithm_name() override { return "Direct-RI"; } ///< Get the algorithm name
+
+
+
+protected:
+    const HF& hf_; ///< HF. This excludes MOs.
+    const int num_basis_;
+    const int num_auxiliary_basis_;
+
+    const std::vector<ShellTypeInfo> auxiliary_shell_type_infos_; ///< Shell type info in the primitive shell list
+    DeviceHostMemory<PrimitiveShell> auxiliary_primitive_shells_; ///< Primitive shells
+    DeviceHostMemory<real_t> auxiliary_cgto_normalization_factors_; ///< Normalization factors of the contracted Gauss functions
+
+    // Suzuki.
+    DeviceHostMemory<real_t> schwarz_upper_bound_factors;
+    DeviceHostMemory<real_t> auxiliary_schwarz_upper_bound_factors;
+
+    //suzuki
+    DeviceHostMemory<real_t> two_center_eris;
+    DeviceHostMemory<real_t> two_center_eris_inverse;
+    DeviceHostMemory<size_t2> primitive_shell_pair_indices;
+
+    // 初回用
+    // DeviceHostMemory<real_t> schwarz_upper_bound_factors_for_K_computation;
+    // DeviceHostMemory<size_t2> primitive_shell_pair_indices_for_K_computation;
+};
+
+
 
 } // namespace gansu

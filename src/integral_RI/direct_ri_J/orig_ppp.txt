@@ -1,0 +1,191 @@
+real_t val;
+
+// [px px | px]
+val = coefAndNorm *  d_t[c->basis_index] * 0.25*(2.0*(a->coordinate.x - b->coordinate.x)*sum_exp*(Boys[1]*sum_exp + 2.0*p*(c->coordinate.x - Rp[0])*(Boys[1]*(a->coordinate.x - Rp[0])*sum_exp - Boys[2]*c->exponent*(c->coordinate.x - Rp[0]))) - 4.0*(c->coordinate.x - Rp[0])*(-c->exponent*p*(c->coordinate.x - Rp[0])*(Boys[2]*(a->coordinate.x - Rp[0])*sum_exp - Boys[3]*c->exponent*(c->coordinate.x - Rp[0])) + p*(a->coordinate.x - Rp[0])*sum_exp*(Boys[1]*(a->coordinate.x - Rp[0])*sum_exp - Boys[2]*c->exponent*(c->coordinate.x - Rp[0])) + 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*c->exponent)) + 4.0*sum_exp*(-Boys[1]*(a->coordinate.x - Rp[0])*sum_exp + Boys[2]*c->exponent*(c->coordinate.x - Rp[0])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+atomicAdd(&d_J[(a->basis_index)*num_basis + b->basis_index], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index)*num_basis + a->basis_index], val);
+
+
+// [px px | py]
+val = coefAndNorm *  d_t[c->basis_index+1] * (c->coordinate.y - Rp[1])*(c->exponent*p*(c->coordinate.x - Rp[0])*(Boys[2]*(a->coordinate.x - Rp[0])*sum_exp - Boys[3]*c->exponent*(c->coordinate.x - Rp[0])) + p*(a->coordinate.x - b->coordinate.x)*sum_exp*(Boys[1]*(a->coordinate.x - Rp[0])*sum_exp - Boys[2]*c->exponent*(c->coordinate.x - Rp[0])) - p*(a->coordinate.x - Rp[0])*sum_exp*(Boys[1]*(a->coordinate.x - Rp[0])*sum_exp - Boys[2]*c->exponent*(c->coordinate.x - Rp[0])) - 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*c->exponent))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index+1];
+atomicAdd(&d_J[(a->basis_index)*num_basis + b->basis_index], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index)*num_basis + a->basis_index], val);
+
+
+// [px px | pz]
+val = coefAndNorm *  d_t[c->basis_index+2] * (c->coordinate.z - Rp[2])*(c->exponent*p*(c->coordinate.x - Rp[0])*(Boys[2]*(a->coordinate.x - Rp[0])*sum_exp - Boys[3]*c->exponent*(c->coordinate.x - Rp[0])) + p*(a->coordinate.x - b->coordinate.x)*sum_exp*(Boys[1]*(a->coordinate.x - Rp[0])*sum_exp - Boys[2]*c->exponent*(c->coordinate.x - Rp[0])) - p*(a->coordinate.x - Rp[0])*sum_exp*(Boys[1]*(a->coordinate.x - Rp[0])*sum_exp - Boys[2]*c->exponent*(c->coordinate.x - Rp[0])) - 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*c->exponent))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index+2];
+atomicAdd(&d_J[(a->basis_index)*num_basis + b->basis_index], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index)*num_basis + a->basis_index], val);
+
+
+// [px py | px]
+val = coefAndNorm *  d_t[c->basis_index] * 0.25*(-4.0*p*(c->coordinate.x - Rp[0])*(-c->exponent*(c->coordinate.x - Rp[0])*(Boys[2]*(a->coordinate.y - Rp[1])*sum_exp - Boys[3]*c->exponent*(c->coordinate.y - Rp[1])) + (a->coordinate.x - Rp[0])*sum_exp*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1]))) + 2.0*(a->coordinate.y - b->coordinate.y)*sum_exp*(Boys[1]*sum_exp + 2.0*p*(c->coordinate.x - Rp[0])*(Boys[1]*(a->coordinate.x - Rp[0])*sum_exp - Boys[2]*c->exponent*(c->coordinate.x - Rp[0]))) + 2.0*sum_exp*(-Boys[1]*(a->coordinate.y - Rp[1])*sum_exp + Boys[2]*c->exponent*(c->coordinate.y - Rp[1])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index+1] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+atomicAdd(&d_J[(a->basis_index)*num_basis + b->basis_index+1], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+1)*num_basis + a->basis_index], val);
+
+
+// [px py | py]
+val = coefAndNorm *  d_t[c->basis_index+1] * 0.5*(2.0*p*(a->coordinate.y - b->coordinate.y)*(c->coordinate.y - Rp[1])*sum_exp*(Boys[1]*(a->coordinate.x - Rp[0])*sum_exp - Boys[2]*c->exponent*(c->coordinate.x - Rp[0])) - 2.0*p*(c->coordinate.y - Rp[1])*(-c->exponent*(c->coordinate.x - Rp[0])*(Boys[2]*(a->coordinate.y - Rp[1])*sum_exp - Boys[3]*c->exponent*(c->coordinate.y - Rp[1])) + (a->coordinate.x - Rp[0])*sum_exp*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1]))) + sum_exp*(-Boys[1]*(a->coordinate.x - Rp[0])*sum_exp + Boys[2]*c->exponent*(c->coordinate.x - Rp[0])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index+1] * d_auxiliary_cgto_normalization_factors[c->basis_index+1];
+atomicAdd(&d_J[(a->basis_index)*num_basis + b->basis_index+1], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+1)*num_basis + a->basis_index], val);
+
+
+// [px py | pz]
+val = coefAndNorm *  d_t[c->basis_index+2] * p*(c->coordinate.z - Rp[2])*(-c->exponent*(c->coordinate.x - Rp[0])*(-Boys[2]*(a->coordinate.y - Rp[1])*sum_exp + Boys[3]*c->exponent*(c->coordinate.y - Rp[1])) + (a->coordinate.x - Rp[0])*sum_exp*(-Boys[1]*(a->coordinate.y - Rp[1])*sum_exp + Boys[2]*c->exponent*(c->coordinate.y - Rp[1])) + (a->coordinate.y - b->coordinate.y)*sum_exp*(Boys[1]*(a->coordinate.x - Rp[0])*sum_exp - Boys[2]*c->exponent*(c->coordinate.x - Rp[0])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index+1] * d_auxiliary_cgto_normalization_factors[c->basis_index+2];
+atomicAdd(&d_J[(a->basis_index)*num_basis + b->basis_index+1], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+1)*num_basis + a->basis_index], val);
+
+
+// [px pz | px]
+val = coefAndNorm *  d_t[c->basis_index] * 0.25*(-4.0*p*(c->coordinate.x - Rp[0])*(-c->exponent*(c->coordinate.x - Rp[0])*(Boys[2]*(a->coordinate.z - Rp[2])*sum_exp - Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.x - Rp[0])*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2]))) + 2.0*(a->coordinate.z - b->coordinate.z)*sum_exp*(Boys[1]*sum_exp + 2.0*p*(c->coordinate.x - Rp[0])*(Boys[1]*(a->coordinate.x - Rp[0])*sum_exp - Boys[2]*c->exponent*(c->coordinate.x - Rp[0]))) + 2.0*sum_exp*(-Boys[1]*(a->coordinate.z - Rp[2])*sum_exp + Boys[2]*c->exponent*(c->coordinate.z - Rp[2])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index+2] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+atomicAdd(&d_J[(a->basis_index)*num_basis + b->basis_index+2], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+2)*num_basis + a->basis_index], val);
+
+
+// [px pz | py]
+val = coefAndNorm *  d_t[c->basis_index+1] * p*(c->coordinate.y - Rp[1])*(-c->exponent*(c->coordinate.x - Rp[0])*(-Boys[2]*(a->coordinate.z - Rp[2])*sum_exp + Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.x - Rp[0])*sum_exp*(-Boys[1]*(a->coordinate.z - Rp[2])*sum_exp + Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.z - b->coordinate.z)*sum_exp*(Boys[1]*(a->coordinate.x - Rp[0])*sum_exp - Boys[2]*c->exponent*(c->coordinate.x - Rp[0])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index+2] * d_auxiliary_cgto_normalization_factors[c->basis_index+1];
+atomicAdd(&d_J[(a->basis_index)*num_basis + b->basis_index+2], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+2)*num_basis + a->basis_index], val);
+
+
+// [px pz | pz]
+val = coefAndNorm *  d_t[c->basis_index+2] * 0.5*(2.0*p*(a->coordinate.z - b->coordinate.z)*(c->coordinate.z - Rp[2])*sum_exp*(Boys[1]*(a->coordinate.x - Rp[0])*sum_exp - Boys[2]*c->exponent*(c->coordinate.x - Rp[0])) - 2.0*p*(c->coordinate.z - Rp[2])*(-c->exponent*(c->coordinate.x - Rp[0])*(Boys[2]*(a->coordinate.z - Rp[2])*sum_exp - Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.x - Rp[0])*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2]))) + sum_exp*(-Boys[1]*(a->coordinate.x - Rp[0])*sum_exp + Boys[2]*c->exponent*(c->coordinate.x - Rp[0])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index+2] * d_auxiliary_cgto_normalization_factors[c->basis_index+2];
+atomicAdd(&d_J[(a->basis_index)*num_basis + b->basis_index+2], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+2)*num_basis + a->basis_index], val);
+
+
+// [py px | px]
+val = coefAndNorm *  d_t[c->basis_index] * 0.5*(2.0*p*(a->coordinate.x - b->coordinate.x)*(c->coordinate.x - Rp[0])*sum_exp*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1])) - 2.0*p*(c->coordinate.x - Rp[0])*(-c->exponent*(c->coordinate.x - Rp[0])*(Boys[2]*(a->coordinate.y - Rp[1])*sum_exp - Boys[3]*c->exponent*(c->coordinate.y - Rp[1])) + (a->coordinate.x - Rp[0])*sum_exp*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1]))) + sum_exp*(-Boys[1]*(a->coordinate.y - Rp[1])*sum_exp + Boys[2]*c->exponent*(c->coordinate.y - Rp[1])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+1] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+atomicAdd(&d_J[(a->basis_index+1)*num_basis + b->basis_index], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index)*num_basis + a->basis_index+1], val);
+
+
+// [py px | py]
+val = coefAndNorm *  d_t[c->basis_index+1] * 0.25*(-4.0*p*(c->coordinate.y - Rp[1])*(-c->exponent*(c->coordinate.x - Rp[0])*(Boys[2]*(a->coordinate.y - Rp[1])*sum_exp - Boys[3]*c->exponent*(c->coordinate.y - Rp[1])) + (a->coordinate.x - Rp[0])*sum_exp*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1]))) + 2.0*(a->coordinate.x - b->coordinate.x)*sum_exp*(Boys[1]*sum_exp + 2.0*p*(c->coordinate.y - Rp[1])*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1]))) + 2.0*sum_exp*(-Boys[1]*(a->coordinate.x - Rp[0])*sum_exp + Boys[2]*c->exponent*(c->coordinate.x - Rp[0])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+1] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index+1];
+atomicAdd(&d_J[(a->basis_index+1)*num_basis + b->basis_index], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index)*num_basis + a->basis_index+1], val);
+
+
+// [py px | pz]
+val = coefAndNorm *  d_t[c->basis_index+2] * p*(c->coordinate.z - Rp[2])*(-c->exponent*(c->coordinate.x - Rp[0])*(-Boys[2]*(a->coordinate.y - Rp[1])*sum_exp + Boys[3]*c->exponent*(c->coordinate.y - Rp[1])) + (a->coordinate.x - b->coordinate.x)*sum_exp*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1])) + (a->coordinate.x - Rp[0])*sum_exp*(-Boys[1]*(a->coordinate.y - Rp[1])*sum_exp + Boys[2]*c->exponent*(c->coordinate.y - Rp[1])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+1] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index+2];
+atomicAdd(&d_J[(a->basis_index+1)*num_basis + b->basis_index], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index)*num_basis + a->basis_index+1], val);
+
+
+// [py py | px]
+val = coefAndNorm *  d_t[c->basis_index] * (c->coordinate.x - Rp[0])*(c->exponent*p*(c->coordinate.y - Rp[1])*(Boys[2]*(a->coordinate.y - Rp[1])*sum_exp - Boys[3]*c->exponent*(c->coordinate.y - Rp[1])) + p*(a->coordinate.y - b->coordinate.y)*sum_exp*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1])) - p*(a->coordinate.y - Rp[1])*sum_exp*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1])) - 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*c->exponent))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+1] * d_cgto_normalization_factors[b->basis_index+1] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+atomicAdd(&d_J[(a->basis_index+1)*num_basis + b->basis_index+1], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+1)*num_basis + a->basis_index+1], val);
+
+
+// [py py | py]
+val = coefAndNorm *  d_t[c->basis_index+1] * 0.25*(2.0*(a->coordinate.y - b->coordinate.y)*sum_exp*(Boys[1]*sum_exp + 2.0*p*(c->coordinate.y - Rp[1])*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1]))) - 4.0*(c->coordinate.y - Rp[1])*(-c->exponent*p*(c->coordinate.y - Rp[1])*(Boys[2]*(a->coordinate.y - Rp[1])*sum_exp - Boys[3]*c->exponent*(c->coordinate.y - Rp[1])) + p*(a->coordinate.y - Rp[1])*sum_exp*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1])) + 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*c->exponent)) + 4.0*sum_exp*(-Boys[1]*(a->coordinate.y - Rp[1])*sum_exp + Boys[2]*c->exponent*(c->coordinate.y - Rp[1])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+1] * d_cgto_normalization_factors[b->basis_index+1] * d_auxiliary_cgto_normalization_factors[c->basis_index+1];
+atomicAdd(&d_J[(a->basis_index+1)*num_basis + b->basis_index+1], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+1)*num_basis + a->basis_index+1], val);
+
+
+// [py py | pz]
+val = coefAndNorm *  d_t[c->basis_index+2] * (c->coordinate.z - Rp[2])*(c->exponent*p*(c->coordinate.y - Rp[1])*(Boys[2]*(a->coordinate.y - Rp[1])*sum_exp - Boys[3]*c->exponent*(c->coordinate.y - Rp[1])) + p*(a->coordinate.y - b->coordinate.y)*sum_exp*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1])) - p*(a->coordinate.y - Rp[1])*sum_exp*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1])) - 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*c->exponent))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+1] * d_cgto_normalization_factors[b->basis_index+1] * d_auxiliary_cgto_normalization_factors[c->basis_index+2];
+atomicAdd(&d_J[(a->basis_index+1)*num_basis + b->basis_index+1], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+1)*num_basis + a->basis_index+1], val);
+
+
+// [py pz | px]
+val = coefAndNorm *  d_t[c->basis_index] * p*(c->coordinate.x - Rp[0])*(-c->exponent*(c->coordinate.y - Rp[1])*(-Boys[2]*(a->coordinate.z - Rp[2])*sum_exp + Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.y - Rp[1])*sum_exp*(-Boys[1]*(a->coordinate.z - Rp[2])*sum_exp + Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.z - b->coordinate.z)*sum_exp*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+1] * d_cgto_normalization_factors[b->basis_index+2] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+atomicAdd(&d_J[(a->basis_index+1)*num_basis + b->basis_index+2], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+2)*num_basis + a->basis_index+1], val);
+
+
+// [py pz | py]
+val = coefAndNorm *  d_t[c->basis_index+1] * 0.25*(-4.0*p*(c->coordinate.y - Rp[1])*(-c->exponent*(c->coordinate.y - Rp[1])*(Boys[2]*(a->coordinate.z - Rp[2])*sum_exp - Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.y - Rp[1])*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2]))) + 2.0*(a->coordinate.z - b->coordinate.z)*sum_exp*(Boys[1]*sum_exp + 2.0*p*(c->coordinate.y - Rp[1])*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1]))) + 2.0*sum_exp*(-Boys[1]*(a->coordinate.z - Rp[2])*sum_exp + Boys[2]*c->exponent*(c->coordinate.z - Rp[2])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+1] * d_cgto_normalization_factors[b->basis_index+2] * d_auxiliary_cgto_normalization_factors[c->basis_index+1];
+atomicAdd(&d_J[(a->basis_index+1)*num_basis + b->basis_index+2], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+2)*num_basis + a->basis_index+1], val);
+
+
+// [py pz | pz]
+val = coefAndNorm *  d_t[c->basis_index+2] * 0.5*(2.0*p*(a->coordinate.z - b->coordinate.z)*(c->coordinate.z - Rp[2])*sum_exp*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1])) - 2.0*p*(c->coordinate.z - Rp[2])*(-c->exponent*(c->coordinate.y - Rp[1])*(Boys[2]*(a->coordinate.z - Rp[2])*sum_exp - Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.y - Rp[1])*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2]))) + sum_exp*(-Boys[1]*(a->coordinate.y - Rp[1])*sum_exp + Boys[2]*c->exponent*(c->coordinate.y - Rp[1])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+1] * d_cgto_normalization_factors[b->basis_index+2] * d_auxiliary_cgto_normalization_factors[c->basis_index+2];
+atomicAdd(&d_J[(a->basis_index+1)*num_basis + b->basis_index+2], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+2)*num_basis + a->basis_index+1], val);
+
+
+// [pz px | px]
+val = coefAndNorm *  d_t[c->basis_index] * 0.5*(2.0*p*(a->coordinate.x - b->coordinate.x)*(c->coordinate.x - Rp[0])*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) - 2.0*p*(c->coordinate.x - Rp[0])*(-c->exponent*(c->coordinate.x - Rp[0])*(Boys[2]*(a->coordinate.z - Rp[2])*sum_exp - Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.x - Rp[0])*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2]))) + sum_exp*(-Boys[1]*(a->coordinate.z - Rp[2])*sum_exp + Boys[2]*c->exponent*(c->coordinate.z - Rp[2])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+2] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+atomicAdd(&d_J[(a->basis_index+2)*num_basis + b->basis_index], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index)*num_basis + a->basis_index+2], val);
+
+
+// [pz px | py]
+val = coefAndNorm *  d_t[c->basis_index+1] * p*(c->coordinate.y - Rp[1])*(-c->exponent*(c->coordinate.x - Rp[0])*(-Boys[2]*(a->coordinate.z - Rp[2])*sum_exp + Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.x - b->coordinate.x)*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.x - Rp[0])*sum_exp*(-Boys[1]*(a->coordinate.z - Rp[2])*sum_exp + Boys[2]*c->exponent*(c->coordinate.z - Rp[2])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+2] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index+1];
+atomicAdd(&d_J[(a->basis_index+2)*num_basis + b->basis_index], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index)*num_basis + a->basis_index+2], val);
+
+
+// [pz px | pz]
+val = coefAndNorm *  d_t[c->basis_index+2] * 0.25*(-4.0*p*(c->coordinate.z - Rp[2])*(-c->exponent*(c->coordinate.x - Rp[0])*(Boys[2]*(a->coordinate.z - Rp[2])*sum_exp - Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.x - Rp[0])*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2]))) + 2.0*(a->coordinate.x - b->coordinate.x)*sum_exp*(Boys[1]*sum_exp + 2.0*p*(c->coordinate.z - Rp[2])*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2]))) + 2.0*sum_exp*(-Boys[1]*(a->coordinate.x - Rp[0])*sum_exp + Boys[2]*c->exponent*(c->coordinate.x - Rp[0])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+2] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index+2];
+atomicAdd(&d_J[(a->basis_index+2)*num_basis + b->basis_index], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index)*num_basis + a->basis_index+2], val);
+
+
+// [pz py | px]
+val = coefAndNorm *  d_t[c->basis_index] * p*(c->coordinate.x - Rp[0])*(-c->exponent*(c->coordinate.y - Rp[1])*(-Boys[2]*(a->coordinate.z - Rp[2])*sum_exp + Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.y - b->coordinate.y)*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.y - Rp[1])*sum_exp*(-Boys[1]*(a->coordinate.z - Rp[2])*sum_exp + Boys[2]*c->exponent*(c->coordinate.z - Rp[2])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+2] * d_cgto_normalization_factors[b->basis_index+1] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+atomicAdd(&d_J[(a->basis_index+2)*num_basis + b->basis_index+1], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+1)*num_basis + a->basis_index+2], val);
+
+
+// [pz py | py]
+val = coefAndNorm *  d_t[c->basis_index+1] * 0.5*(2.0*p*(a->coordinate.y - b->coordinate.y)*(c->coordinate.y - Rp[1])*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) - 2.0*p*(c->coordinate.y - Rp[1])*(-c->exponent*(c->coordinate.y - Rp[1])*(Boys[2]*(a->coordinate.z - Rp[2])*sum_exp - Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.y - Rp[1])*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2]))) + sum_exp*(-Boys[1]*(a->coordinate.z - Rp[2])*sum_exp + Boys[2]*c->exponent*(c->coordinate.z - Rp[2])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+2] * d_cgto_normalization_factors[b->basis_index+1] * d_auxiliary_cgto_normalization_factors[c->basis_index+1];
+atomicAdd(&d_J[(a->basis_index+2)*num_basis + b->basis_index+1], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+1)*num_basis + a->basis_index+2], val);
+
+
+// [pz py | pz]
+val = coefAndNorm *  d_t[c->basis_index+2] * 0.25*(-4.0*p*(c->coordinate.z - Rp[2])*(-c->exponent*(c->coordinate.y - Rp[1])*(Boys[2]*(a->coordinate.z - Rp[2])*sum_exp - Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + (a->coordinate.y - Rp[1])*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2]))) + 2.0*(a->coordinate.y - b->coordinate.y)*sum_exp*(Boys[1]*sum_exp + 2.0*p*(c->coordinate.z - Rp[2])*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2]))) + 2.0*sum_exp*(-Boys[1]*(a->coordinate.y - Rp[1])*sum_exp + Boys[2]*c->exponent*(c->coordinate.y - Rp[1])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+2] * d_cgto_normalization_factors[b->basis_index+1] * d_auxiliary_cgto_normalization_factors[c->basis_index+2];
+atomicAdd(&d_J[(a->basis_index+2)*num_basis + b->basis_index+1], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+1)*num_basis + a->basis_index+2], val);
+
+
+// [pz pz | px]
+val = coefAndNorm *  d_t[c->basis_index] * (c->coordinate.x - Rp[0])*(c->exponent*p*(c->coordinate.z - Rp[2])*(Boys[2]*(a->coordinate.z - Rp[2])*sum_exp - Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + p*(a->coordinate.z - b->coordinate.z)*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) - p*(a->coordinate.z - Rp[2])*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) - 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*c->exponent))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+2] * d_cgto_normalization_factors[b->basis_index+2] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+atomicAdd(&d_J[(a->basis_index+2)*num_basis + b->basis_index+2], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+2)*num_basis + a->basis_index+2], val);
+
+
+// [pz pz | py]
+val = coefAndNorm *  d_t[c->basis_index+1] * (c->coordinate.y - Rp[1])*(c->exponent*p*(c->coordinate.z - Rp[2])*(Boys[2]*(a->coordinate.z - Rp[2])*sum_exp - Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + p*(a->coordinate.z - b->coordinate.z)*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) - p*(a->coordinate.z - Rp[2])*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) - 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*c->exponent))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+2] * d_cgto_normalization_factors[b->basis_index+2] * d_auxiliary_cgto_normalization_factors[c->basis_index+1];
+atomicAdd(&d_J[(a->basis_index+2)*num_basis + b->basis_index+2], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+2)*num_basis + a->basis_index+2], val);
+
+
+// [pz pz | pz]
+val = coefAndNorm *  d_t[c->basis_index+2] * 0.25*(2.0*(a->coordinate.z - b->coordinate.z)*sum_exp*(Boys[1]*sum_exp + 2.0*p*(c->coordinate.z - Rp[2])*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2]))) - 4.0*(c->coordinate.z - Rp[2])*(-c->exponent*p*(c->coordinate.z - Rp[2])*(Boys[2]*(a->coordinate.z - Rp[2])*sum_exp - Boys[3]*c->exponent*(c->coordinate.z - Rp[2])) + p*(a->coordinate.z - Rp[2])*sum_exp*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) + 0.5*sum_exp*(Boys[1]*sum_exp - Boys[2]*c->exponent)) + 4.0*sum_exp*(-Boys[1]*(a->coordinate.z - Rp[2])*sum_exp + Boys[2]*c->exponent*(c->coordinate.z - Rp[2])))/(sum_exp*sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+2] * d_cgto_normalization_factors[b->basis_index+2] * d_auxiliary_cgto_normalization_factors[c->basis_index+2];
+atomicAdd(&d_J[(a->basis_index+2)*num_basis + b->basis_index+2], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index+2)*num_basis + a->basis_index+2], val);
+
+

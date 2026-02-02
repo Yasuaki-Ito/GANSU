@@ -1,0 +1,23 @@
+real_t val;
+
+// [s s | px]
+val = coefAndNorm * Boys[1]*p*(-c->coordinate.x + Rp[0])/sum_exp ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+val *= (is_prim_id_neq) ? (d_density_matrix[(a->basis_index)*num_basis + b->basis_index] + d_density_matrix[(b->basis_index)*num_basis + a->basis_index]) : d_density_matrix[(a->basis_index)*num_basis + b->basis_index];
+atomicAdd(&d_c[c->basis_index], val);
+
+
+// [s s | py]
+val = coefAndNorm * Boys[1]*p*(-c->coordinate.y + Rp[1])/sum_exp ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index+1];
+val *= (is_prim_id_neq) ? (d_density_matrix[(a->basis_index)*num_basis + b->basis_index] + d_density_matrix[(b->basis_index)*num_basis + a->basis_index]) : d_density_matrix[(a->basis_index)*num_basis + b->basis_index];
+atomicAdd(&d_c[c->basis_index+1], val);
+
+
+// [s s | pz]
+val = coefAndNorm * Boys[1]*p*(-c->coordinate.z + Rp[2])/sum_exp ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index+2];
+val *= (is_prim_id_neq) ? (d_density_matrix[(a->basis_index)*num_basis + b->basis_index] + d_density_matrix[(b->basis_index)*num_basis + a->basis_index]) : d_density_matrix[(a->basis_index)*num_basis + b->basis_index];
+atomicAdd(&d_c[c->basis_index+2], val);
+
+

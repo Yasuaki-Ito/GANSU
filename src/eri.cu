@@ -37,6 +37,17 @@ __global__ void generatePrimitiveShellPairIndices(size_t2* d_indices_array, size
     d_indices_array[id] = index1to2(id, is_symmetric, num_basis);
 }
 
+
+__global__ void generatePrimitiveShellPairIndices(size_t2* d_indices_array, size_t num_threads, bool is_symmetric, size_t num_basis, bool if_full_range, size_t start_index_a, size_t start_index_b){
+    const size_t id = (size_t)blockDim.x * blockIdx.x + threadIdx.x;
+    if (id >= num_threads) return;
+    d_indices_array[id] = index1to2(id, is_symmetric, num_basis);
+
+
+    d_indices_array[id].x += start_index_a;
+    d_indices_array[id].y += start_index_b;
+}
+
 __global__ void initializePrimitiveShellPairIndices(int2* d_indices_array, int num_threads, bool is_symmetric, int num_basis) {
     const int id = blockDim.x * blockIdx.x + threadIdx.x;
     if (id >= num_threads) return;
@@ -368,6 +379,111 @@ void ERI_Hash::precomputation() {
         // Hash memoryのポインタを渡す
         verbose
     );
+}
+
+
+
+ERI_RI_Direct::ERI_RI_Direct(const HF& hf, const Molecular& auxiliary_molecular): 
+    hf_(hf),
+    num_basis_(hf.get_num_basis()),
+    num_auxiliary_basis_(auxiliary_molecular.get_num_basis()),
+    auxiliary_shell_type_infos_(auxiliary_molecular.get_shell_type_infos()),
+    auxiliary_primitive_shells_(auxiliary_molecular.get_primitive_shells()),
+    auxiliary_cgto_normalization_factors_(auxiliary_molecular.get_cgto_normalization_factors()),
+    schwarz_upper_bound_factors(hf.get_num_primitive_shell_pairs()),
+    auxiliary_schwarz_upper_bound_factors(auxiliary_molecular.get_primitive_shells().size()),
+    two_center_eris(num_auxiliary_basis_ * num_auxiliary_basis_), 
+    two_center_eris_inverse(num_auxiliary_basis_ * num_auxiliary_basis_), 
+    primitive_shell_pair_indices(hf_.get_primitive_shells().size() * (hf_.get_primitive_shells().size() + 1) / 2)
+{
+    // to device memory
+    auxiliary_primitive_shells_.toDevice();
+    auxiliary_cgto_normalization_factors_.toDevice();
+}
+
+
+void ERI_RI_Direct::precomputation() {
+    // compute the intermediate matrix B of the auxiliary basis functions
+    const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
+    const DeviceHostMemory<PrimitiveShell>& primitive_shells = hf_.get_primitive_shells();
+    const DeviceHostMemory<real_t>& cgto_normalization_factors = hf_.get_cgto_normalization_factors();
+    const DeviceHostMemory<real_t>& boys_grid = hf_.get_boys_grid();
+    const int verbose = hf_.get_verbose();
+
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
+    const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
+
+    const int threads_per_block = 1024;
+
+    // K 計算用のソートに使用
+    const size_t num_primitive_shells = primitive_shells.size();
+
+    gpu::computeSchwarzUpperBounds(
+        shell_type_infos,
+        shell_pair_type_infos,
+        primitive_shells.device_ptr(), 
+        boys_grid.device_ptr(), 
+        cgto_normalization_factors.device_ptr(), 
+        schwarz_upper_bound_factors.device_ptr(),   // schwarz_upper_bound_factorsに√(pq|pq)の値がはいっている
+        verbose
+    );
+
+
+    // shell-pair sort
+    int pair_idx = 0;
+    for(int s0 = 0; s0 < shell_type_infos.size(); s0++){
+        for(int s1 = s0; s1 < shell_type_infos.size(); s1++){
+            const int num_blocks = (shell_pair_type_infos[pair_idx].count + threads_per_block - 1) / threads_per_block; // the number of blocks
+            generatePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&primitive_shell_pair_indices.device_ptr()[shell_pair_type_infos[pair_idx].start_index], shell_pair_type_infos[pair_idx].count, s0 == s1, shell_type_infos[s1].count, true, shell_type_infos[s0].start_index, shell_type_infos[s1].start_index);
+
+            thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);  
+            thrust::device_ptr<real_t> keys_end(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index] + shell_pair_type_infos[pair_idx].count);
+            thrust::device_ptr<size_t2> values_begin(&primitive_shell_pair_indices.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);
+
+            thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+
+            pair_idx++;
+        }
+    }
+    cudaDeviceSynchronize();
+
+    
+    
+    // compute upper bounds of  aux-shell
+    gpu::computeAuxiliarySchwarzUpperBounds(
+        auxiliary_shell_type_infos_, 
+        auxiliary_primitive_shells_.device_ptr(), 
+        boys_grid.device_ptr(), 
+        auxiliary_cgto_normalization_factors_.device_ptr(), 
+        auxiliary_schwarz_upper_bound_factors.device_ptr(),   // auxiliary_schwarz_upper_bound_factorsに√(pq|pq)の値がはいっている
+        verbose
+    );
+
+    for(const auto& s : auxiliary_shell_type_infos_){
+        thrust::device_ptr<real_t> keys_begin(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index]);  
+        thrust::device_ptr<real_t> keys_end(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index] + s.count);
+        thrust::device_ptr<PrimitiveShell> values_begin(&auxiliary_primitive_shells_.device_ptr()[s.start_index]);
+
+        thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+    }
+
+
+
+    gpu::computeTwoCenterERIs(
+        auxiliary_shell_type_infos_, 
+        auxiliary_primitive_shells_.device_ptr(), 
+        auxiliary_cgto_normalization_factors_.device_ptr(), 
+        two_center_eris.device_ptr(),
+        num_auxiliary_basis_,
+        boys_grid.device_ptr(),
+        auxiliary_schwarz_upper_bound_factors.device_ptr(),
+        schwarz_screening_threshold,
+        verbose
+    );
+
+
+    gpu::choleskyDecomposition(two_center_eris.device_ptr(), num_auxiliary_basis_);
+    gpu::computeInverseByDtrsm(two_center_eris.device_ptr(), two_center_eris_inverse.device_ptr(), num_auxiliary_basis_);
 }
 
 

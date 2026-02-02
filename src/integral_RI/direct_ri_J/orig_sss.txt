@@ -1,0 +1,9 @@
+real_t val;
+
+// [s s | s]
+val = coefAndNorm *  d_t[c->basis_index] * Boys[0] ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+atomicAdd(&d_J[(a->basis_index)*num_basis + b->basis_index], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index)*num_basis + a->basis_index], val);
+
+

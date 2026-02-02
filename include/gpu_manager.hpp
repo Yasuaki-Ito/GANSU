@@ -99,6 +99,10 @@ void constructERIHash(const std::vector<ShellTypeInfo>& shell_type_infos, const 
 void computeFockMatrix_Hash_RHF(const real_t* d_density_matrix, const real_t* d_core_hamiltonian_matrix, /* Hash memoryへのポインタ, */ real_t* d_fock_matrix, const int num_basis, const int verbose);
 
 
+void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_t* d_coefficient_matrix, const real_t* d_L_inv,  real_t* d_decomposed_two_center_eris, const real_t* d_core_hamiltonian_matrix,  real_t* d_fock_matrix,  real_t* d_coefficient_matrix_prev, real_t* h_Z_tensor_prev, const std::vector<ShellTypeInfo>& shell_type_infos,  const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,  const PrimitiveShell* h_primitive_shells,  const PrimitiveShell* d_primitive_shells,  const real_t* d_cgto_normalization_factors,  const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,  const PrimitiveShell* d_auxiliary_primitive_shells,  const real_t* d_auxiliary_cgto_normalization_factors,  const size_t2* d_primitive_shell_pair_indices, const int num_basis, const int num_auxiliary_basis, const int num_electrons, const int num_primitive_shells, const real_t* d_boys_grid, const double schwarz_screening_threshold,  const real_t* d_schwarz_upper_bound_factors, const real_t* d_auxiliary_schwarz_upper_bound_factors,const bool verbose);
+void computeInverseByDtrsm(real_t* two_center_eris, real_t* two_center_eris_inverse, int num_auxiliary_basis);
+
+
 /**
  * @brief class for managing cuSOLVER.
  * @details This class provides methods for eigenvalue decomposition using cuSOLVER.

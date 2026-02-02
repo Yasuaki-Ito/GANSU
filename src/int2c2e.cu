@@ -553,7 +553,7 @@ __global__ void MD_int2c2e_1T1SP(real_t* g_result, const PrimitiveShell* g_pshel
     //各ERIを計算
     //事前計算⇒実際のERI計算の順に実行
     //p軌道の場合lmn_aが0:px, 1:py, 2:pz軌道のように対応付け
-    //d以上はconstant配列のloop_to_ang_RIを参照
+    //d以上はconstant配列のloop_to_angを参照
 
     
     
@@ -571,12 +571,12 @@ __global__ void MD_int2c2e_1T1SP(real_t* g_result, const PrimitiveShell* g_pshel
 
     // 方位量子数l,m,nの値をループ変数から導出
     for(int lmn_a=0; lmn_a<comb_max(orbital_A); lmn_a++){
-        int l1=loop_to_ang_RI[orbital_A][lmn_a][0]; int m1=loop_to_ang_RI[orbital_A][lmn_a][1]; int n1=loop_to_ang_RI[orbital_A][lmn_a][2];
+        int l1=loop_to_ang[orbital_A][lmn_a][0]; int m1=loop_to_ang[orbital_A][lmn_a][1]; int n1=loop_to_ang[orbital_A][lmn_a][2];
         Norm_A = calcNorm(alpha, l1, m1, n1);
 
 
         for(int lmn_b=0; lmn_b<comb_max(orbital_B); lmn_b++){                  
-            int l2=loop_to_ang_RI[orbital_B][lmn_b][0]; int m2=loop_to_ang_RI[orbital_B][lmn_b][1]; int n2=loop_to_ang_RI[orbital_B][lmn_b][2];
+            int l2=loop_to_ang[orbital_B][lmn_b][0]; int m2=loop_to_ang[orbital_B][lmn_b][1]; int n2=loop_to_ang[orbital_B][lmn_b][2];
             Norm_B = calcNorm(beta, l2, m2, n2);
 
 

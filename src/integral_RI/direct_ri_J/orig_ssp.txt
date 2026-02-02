@@ -1,0 +1,23 @@
+real_t val;
+
+// [s s | px]
+val = coefAndNorm *  d_t[c->basis_index] * Boys[1]*p*(-c->coordinate.x + Rp[0])/sum_exp ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+atomicAdd(&d_J[(a->basis_index)*num_basis + b->basis_index], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index)*num_basis + a->basis_index], val);
+
+
+// [s s | py]
+val = coefAndNorm *  d_t[c->basis_index+1] * Boys[1]*p*(-c->coordinate.y + Rp[1])/sum_exp ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index+1];
+atomicAdd(&d_J[(a->basis_index)*num_basis + b->basis_index], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index)*num_basis + a->basis_index], val);
+
+
+// [s s | pz]
+val = coefAndNorm *  d_t[c->basis_index+2] * Boys[1]*p*(-c->coordinate.z + Rp[2])/sum_exp ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index+2];
+atomicAdd(&d_J[(a->basis_index)*num_basis + b->basis_index], val);
+if(is_prim_id_neq) atomicAdd(&d_J[(b->basis_index)*num_basis + a->basis_index], val);
+
+

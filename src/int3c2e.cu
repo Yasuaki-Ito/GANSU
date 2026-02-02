@@ -1223,7 +1223,6 @@ __global__ void MD_int3c2e_1T1SP(real_t* g_result, const PrimitiveShell* g_pshel
     //各ERIを計算
     //事前計算⇒実際のERI計算の順に実行
     //p軌道の場合lmn_aが0:px, 1:py, 2:pz軌道のように対応付け
-    //d以上はconstant配列のloop_to_ang_RIを参照
 
     
     
@@ -1243,16 +1242,16 @@ __global__ void MD_int3c2e_1T1SP(real_t* g_result, const PrimitiveShell* g_pshel
 
     // 方位量子数l,m,nの値をループ変数から導出
     for(int lmn_a=0; lmn_a<comb_max(orbital_A); lmn_a++){
-        int l1=loop_to_ang_RI[orbital_A][lmn_a][0]; int m1=loop_to_ang_RI[orbital_A][lmn_a][1]; int n1=loop_to_ang_RI[orbital_A][lmn_a][2];
+        int l1=loop_to_ang[orbital_A][lmn_a][0]; int m1=loop_to_ang[orbital_A][lmn_a][1]; int n1=loop_to_ang[orbital_A][lmn_a][2];
         Norm_A = calcNorm(alpha, l1, m1, n1);
 
         for(int lmn_b=0; lmn_b<comb_max(orbital_B); lmn_b++){                  
-            int l2=loop_to_ang_RI[orbital_B][lmn_b][0]; int m2=loop_to_ang_RI[orbital_B][lmn_b][1]; int n2=loop_to_ang_RI[orbital_B][lmn_b][2];
+            int l2=loop_to_ang[orbital_B][lmn_b][0]; int m2=loop_to_ang[orbital_B][lmn_b][1]; int n2=loop_to_ang[orbital_B][lmn_b][2];
             Norm_B = calcNorm(beta, l2, m2, n2);
 
 
             for(int lmn_c=0; lmn_c<comb_max(orbital_C); lmn_c++){
-                int l3=loop_to_ang_RI[orbital_C][lmn_c][0]; int m3=loop_to_ang_RI[orbital_C][lmn_c][1]; int n3=loop_to_ang_RI[orbital_C][lmn_c][2];
+                int l3=loop_to_ang[orbital_C][lmn_c][0]; int m3=loop_to_ang[orbital_C][lmn_c][1]; int n3=loop_to_ang[orbital_C][lmn_c][2];
                 Norm_C = calcNorm(gamma, l3, m3, n3);
 
 
@@ -1350,6 +1349,4548 @@ __global__ void MD_int3c2e_1T1SP(real_t* g_result, const PrimitiveShell* g_pshel
                         is_prim_id_not_equal, 
 						d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors
                     );
+                }
+            }
+        }
+    }
+    return;
+}
+
+
+
+
+
+
+
+	/*----------------------------------------------- int3c2e kernels for Direct-RI-RHF computation -----------------------------------------------*/
+
+	/* (ss|s) */
+	__global__ void compute_RI_Direct_c_kernel_sss(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[1];
+		getIncrementalBoys(0, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 0, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_c/orig_sss.txt"
+	}
+		
+
+	/* (ss|p) */
+	__global__ void compute_RI_Direct_c_kernel_ssp(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[2];
+		getIncrementalBoys(1, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 0, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_c/orig_ssp.txt"
+	}
+		
+
+	/* (ss|d) */
+	__global__ void compute_RI_Direct_c_kernel_ssd(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[3];
+		getIncrementalBoys(2, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 0, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_c/orig_ssd.txt"
+	}
+		
+
+	/* (ss|f) */
+	__global__ void compute_RI_Direct_c_kernel_ssf(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 0, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_c/orig_ssf.txt"
+	}
+		
+
+	/* (sp|s) */
+	__global__ void compute_RI_Direct_c_kernel_sps(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[2];
+		getIncrementalBoys(1, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 1, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_c/orig_sps.txt"
+	}
+		
+
+	/* (sp|p) */
+	__global__ void compute_RI_Direct_c_kernel_spp(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[3];
+		getIncrementalBoys(2, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 1, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_c/orig_spp.txt"
+	}
+		
+
+	/* (sp|d) */
+	__global__ void compute_RI_Direct_c_kernel_spd(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 1, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_c/orig_spd.txt"
+	}
+		
+
+	/* (sp|f) */
+	__global__ void compute_RI_Direct_c_kernel_spf(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 1, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_c/orig_spf.txt"
+	}
+		
+
+	/* (sd|s) */
+	__global__ void compute_RI_Direct_c_kernel_sds(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[3];
+		getIncrementalBoys(2, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 2, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_c/orig_sds.txt"
+		#endif
+	}
+		
+
+	/* (sd|p) */
+	__global__ void compute_RI_Direct_c_kernel_sdp(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 2, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_c/orig_sdp.txt"
+		#endif
+	}
+		
+
+	/* (sd|d) */
+	__global__ void compute_RI_Direct_c_kernel_sdd(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 2, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_c/orig_sdd.txt"
+		#endif
+	}
+		
+
+	/* (sd|f) */
+	__global__ void compute_RI_Direct_c_kernel_sdf(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[6];
+		getIncrementalBoys(5, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 2, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_c/orig_sdf.txt"
+		#endif
+	}
+		
+
+	/* (pp|s) */
+	__global__ void compute_RI_Direct_c_kernel_pps(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[3];
+		getIncrementalBoys(2, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 1, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_c/orig_pps.txt"
+	}
+		
+
+	/* (pp|p) */
+	__global__ void compute_RI_Direct_c_kernel_ppp(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 1, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_c/orig_ppp.txt"
+	}
+		
+
+	/* (pp|d) */
+	__global__ void compute_RI_Direct_c_kernel_ppd(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 1, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_c/orig_ppd.txt"
+	}
+		
+
+	/* (pp|f) */
+	__global__ void compute_RI_Direct_c_kernel_ppf(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[6];
+		getIncrementalBoys(5, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 1, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_c/orig_ppf.txt"
+	}
+		
+
+	/* (pd|s) */
+	__global__ void compute_RI_Direct_c_kernel_pds(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 2, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_c/orig_pds.txt"
+		#endif
+	}
+		
+
+	/* (pd|p) */
+	__global__ void compute_RI_Direct_c_kernel_pdp(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 2, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_c/orig_pdp.txt"
+		#endif
+	}
+		
+
+	/* (pd|d) */
+	__global__ void compute_RI_Direct_c_kernel_pdd(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[6];
+		getIncrementalBoys(5, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 2, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_c/orig_pdd.txt"
+		#endif
+	}
+		
+
+	/* (pd|f) */
+	__global__ void compute_RI_Direct_c_kernel_pdf(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[7];
+		getIncrementalBoys(6, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 2, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_c/orig_pdf.txt"
+		#endif
+	}
+		
+
+	/* (dd|s) */
+	__global__ void compute_RI_Direct_c_kernel_dds(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 2, 2, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_c/orig_dds.txt"
+		#endif
+	}
+		
+
+	/* (dd|p) */
+	__global__ void compute_RI_Direct_c_kernel_ddp(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[6];
+		getIncrementalBoys(5, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 2, 2, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_c/orig_ddp.txt"
+		#endif
+	}
+		
+
+	/* (dd|d) */
+	__global__ void compute_RI_Direct_c_kernel_ddd(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[7];
+		getIncrementalBoys(6, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 2, 2, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_c/orig_ddd.txt"
+		#endif
+	}
+		
+
+	/* (dd|f) */
+	__global__ void compute_RI_Direct_c_kernel_ddf(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[8];
+		getIncrementalBoys(7, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 2, 2, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_c/orig_ddf.txt"
+		#endif
+	}
+		
+
+
+
+
+	/* (ss|s) */
+	__global__ void compute_RI_Direct_J_kernel_sss(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[1];
+		getIncrementalBoys(0, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 0, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_J/orig_sss.txt"
+	}
+		
+
+	/* (ss|p) */
+	__global__ void compute_RI_Direct_J_kernel_ssp(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[2];
+		getIncrementalBoys(1, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 0, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_J/orig_ssp.txt"
+	}
+		
+
+	/* (ss|d) */
+	__global__ void compute_RI_Direct_J_kernel_ssd(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[3];
+		getIncrementalBoys(2, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 0, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_J/orig_ssd.txt"
+	}
+		
+
+	/* (ss|f) */
+	__global__ void compute_RI_Direct_J_kernel_ssf(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 0, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_J/orig_ssf.txt"
+	}
+		
+
+	/* (sp|s) */
+	__global__ void compute_RI_Direct_J_kernel_sps(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[2];
+		getIncrementalBoys(1, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 1, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_J/orig_sps.txt"
+	}
+		
+
+	/* (sp|p) */
+	__global__ void compute_RI_Direct_J_kernel_spp(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[3];
+		getIncrementalBoys(2, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 1, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_J/orig_spp.txt"
+	}
+		
+
+	/* (sp|d) */
+	__global__ void compute_RI_Direct_J_kernel_spd(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 1, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_J/orig_spd.txt"
+	}
+		
+
+	/* (sp|f) */
+	__global__ void compute_RI_Direct_J_kernel_spf(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 1, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_J/orig_spf.txt"
+	}
+		
+
+	/* (sd|s) */
+	__global__ void compute_RI_Direct_J_kernel_sds(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[3];
+		getIncrementalBoys(2, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 2, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_J/orig_sds.txt"
+		#endif
+	}
+		
+
+	/* (sd|p) */
+	__global__ void compute_RI_Direct_J_kernel_sdp(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 2, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_J/orig_sdp.txt"
+		#endif
+	}
+		
+
+	/* (sd|d) */
+	__global__ void compute_RI_Direct_J_kernel_sdd(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 2, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_J/orig_sdd.txt"
+		#endif
+	}
+		
+
+	/* (sd|f) */
+	__global__ void compute_RI_Direct_J_kernel_sdf(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[6];
+		getIncrementalBoys(5, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 2, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_J/orig_sdf.txt"
+		#endif
+	}
+		
+
+	/* (pp|s) */
+	__global__ void compute_RI_Direct_J_kernel_pps(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[3];
+		getIncrementalBoys(2, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 1, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_J/orig_pps.txt"
+	}
+		
+
+	/* (pp|p) */
+	__global__ void compute_RI_Direct_J_kernel_ppp(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 1, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_J/orig_ppp.txt"
+	}
+		
+
+	/* (pp|d) */
+	__global__ void compute_RI_Direct_J_kernel_ppd(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 1, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_J/orig_ppd.txt"
+	}
+		
+
+	/* (pp|f) */
+	__global__ void compute_RI_Direct_J_kernel_ppf(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[6];
+		getIncrementalBoys(5, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 1, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#include "./integral_RI/direct_ri_J/orig_ppf.txt"
+	}
+		
+
+	/* (pd|s) */
+	__global__ void compute_RI_Direct_J_kernel_pds(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 2, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_J/orig_pds.txt"
+		#endif
+	}
+		
+
+	/* (pd|p) */
+	__global__ void compute_RI_Direct_J_kernel_pdp(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 2, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_J/orig_pdp.txt"
+		#endif
+	}
+		
+
+	/* (pd|d) */
+	__global__ void compute_RI_Direct_J_kernel_pdd(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[6];
+		getIncrementalBoys(5, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 2, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_J/orig_pdd.txt"
+		#endif
+	}
+		
+
+	/* (pd|f) */
+	__global__ void compute_RI_Direct_J_kernel_pdf(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[7];
+		getIncrementalBoys(6, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 2, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_J/orig_pdf.txt"
+		#endif
+	}
+		
+
+	/* (dd|s) */
+	__global__ void compute_RI_Direct_J_kernel_dds(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 2, 2, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_J/orig_dds.txt"
+		#endif
+	}
+		
+
+	/* (dd|p) */
+	__global__ void compute_RI_Direct_J_kernel_ddp(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[6];
+		getIncrementalBoys(5, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 2, 2, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_J/orig_ddp.txt"
+		#endif
+	}
+		
+
+	/* (dd|d) */
+	__global__ void compute_RI_Direct_J_kernel_ddd(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[7];
+		getIncrementalBoys(6, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 2, 2, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_J/orig_ddd.txt"
+		#endif
+	}
+		
+
+	/* (dd|f) */
+	__global__ void compute_RI_Direct_J_kernel_ddf(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[8];
+		getIncrementalBoys(7, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 2, 2, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include "./integral_RI/direct_ri_J/orig_ddf.txt"
+		#endif
+	}
+    
+
+
+
+
+
+	/* (ss|s) */
+	__global__ void compute_RI_Direct_W_kernel_sss(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[1];
+		getIncrementalBoys(0, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 0, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		
+		#include "./integral_RI/direct_ri_w/orig_sss.txt"
+	}
+		
+
+	/* (ss|p) */
+	__global__ void compute_RI_Direct_W_kernel_ssp(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[2];
+		getIncrementalBoys(1, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 0, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		
+		#include "./integral_RI/direct_ri_w/orig_ssp.txt"
+	}
+		
+
+	/* (ss|d) */
+	__global__ void compute_RI_Direct_W_kernel_ssd(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[3];
+		getIncrementalBoys(2, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 0, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		
+		#include "./integral_RI/direct_ri_w/orig_ssd.txt"
+	}
+		
+
+	/* (ss|f) */
+	__global__ void compute_RI_Direct_W_kernel_ssf(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 0, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		
+		#include "./integral_RI/direct_ri_w/orig_ssf.txt"
+	}
+		
+
+	/* (sp|s) */
+	__global__ void compute_RI_Direct_W_kernel_sps(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[2];
+		getIncrementalBoys(1, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 1, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		
+		#include "./integral_RI/direct_ri_w/orig_sps.txt"
+	}
+		
+
+	/* (sp|p) */
+	__global__ void compute_RI_Direct_W_kernel_spp(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[3];
+		getIncrementalBoys(2, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 1, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		
+		#include "./integral_RI/direct_ri_w/orig_spp.txt"
+	}
+		
+
+	/* (sp|d) */
+	__global__ void compute_RI_Direct_W_kernel_spd(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 1, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		
+		#include "./integral_RI/direct_ri_w/orig_spd.txt"
+	}
+		
+
+	/* (sp|f) */
+	__global__ void compute_RI_Direct_W_kernel_spf(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 1, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		
+		#include "./integral_RI/direct_ri_w/orig_spf.txt"
+	}
+
+	/* (sd|s) */
+	__global__ void compute_RI_Direct_W_kernel_sds(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[3];
+		getIncrementalBoys(2, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 2, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include  "./integral_RI/direct_ri_w/orig_sds.txt"
+		#endif
+	}
+		
+
+	/* (sd|p) */
+	__global__ void compute_RI_Direct_W_kernel_sdp(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 2, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include  "./integral_RI/direct_ri_w/orig_sdp.txt"
+		#endif
+	}
+		
+
+	/* (sd|d) */
+	__global__ void compute_RI_Direct_W_kernel_sdd(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 2, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include  "./integral_RI/direct_ri_w/orig_sdd.txt"
+		#endif
+	}
+		
+
+	/* (sd|f) */
+	__global__ void compute_RI_Direct_W_kernel_sdf(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[6];
+		getIncrementalBoys(5, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 0, 2, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include  "./integral_RI/direct_ri_w/orig_sdf.txt"
+		#endif
+	}
+		
+
+	/* (pp|s) */
+	__global__ void compute_RI_Direct_W_kernel_pps(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[3];
+		getIncrementalBoys(2, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 1, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		
+		#include "./integral_RI/direct_ri_w/orig_pps.txt"
+	}
+		
+
+	/* (pp|p) */
+	__global__ void compute_RI_Direct_W_kernel_ppp(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 1, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		
+		#include "./integral_RI/direct_ri_w/orig_ppp.txt"
+	}
+		
+
+	/* (pp|d) */
+	__global__ void compute_RI_Direct_W_kernel_ppd(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 1, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		
+		#include "./integral_RI/direct_ri_w/orig_ppd.txt"
+	}
+		
+
+	/* (pp|f) */
+	__global__ void compute_RI_Direct_W_kernel_ppf(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[6];
+		getIncrementalBoys(5, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 1, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		
+		#include "./integral_RI/direct_ri_w/orig_ppf.txt"
+	}
+		
+
+	/* (pd|s) */
+	__global__ void compute_RI_Direct_W_kernel_pds(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[4];
+		getIncrementalBoys(3, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 2, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include  "./integral_RI/direct_ri_w/orig_pds.txt"
+		#endif
+	}
+		
+
+	/* (pd|p) */
+	__global__ void compute_RI_Direct_W_kernel_pdp(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 2, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include  "./integral_RI/direct_ri_w/orig_pdp.txt"
+		#endif
+	}
+		
+
+	/* (pd|d) */
+	__global__ void compute_RI_Direct_W_kernel_pdd(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[6];
+		getIncrementalBoys(5, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 2, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include  "./integral_RI/direct_ri_w/orig_pdd.txt"
+		#endif
+	}
+		
+
+	/* (pd|f) */
+	__global__ void compute_RI_Direct_W_kernel_pdf(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[7];
+		getIncrementalBoys(6, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 1, 2, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include  "./integral_RI/direct_ri_w/orig_pdf.txt"
+		#endif
+	}
+		
+
+	/* (dd|s) */
+	__global__ void compute_RI_Direct_W_kernel_dds(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[5];
+		getIncrementalBoys(4, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 2, 2, 0) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include  "./integral_RI/direct_ri_w/orig_dds.txt"
+		#endif
+	}
+		
+
+	/* (dd|p) */
+	__global__ void compute_RI_Direct_W_kernel_ddp(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[6];
+		getIncrementalBoys(5, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 2, 2, 1) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include  "./integral_RI/direct_ri_w/orig_ddp.txt"
+		#endif
+	}
+		
+
+	/* (dd|d) */
+	__global__ void compute_RI_Direct_W_kernel_ddd(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[7];
+		getIncrementalBoys(6, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 2, 2, 2) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include  "./integral_RI/direct_ri_w/orig_ddd.txt"
+		#endif
+	}
+		
+
+	/* (dd|f) */
+	__global__ void compute_RI_Direct_W_kernel_ddf(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+													const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+													ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+													int64_t num_tasks, int num_basis, 
+													const size_t2* d_primitive_shell_pair_indices,
+													const double* g_upper_bound_factors, 
+													const double* g_auxiliary_upper_bound_factors, 
+													const double schwarz_screening_threshold, 
+													int num_auxiliary_basis, 
+													int iter,
+													const double* g_boys_grid){
+
+		// 通し番号indexの計算
+		const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+		if (id >= num_tasks) return;
+
+
+		// Obtain primitive shells [ab|c]
+		const size_t2 abc = index1to2(id, false, shell_s2.count);
+		const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+		const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+		const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+		bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+		const PrimitiveShell *a = &g_pshell[primitive_index_a];
+		const PrimitiveShell *b = &g_pshell[primitive_index_b];
+		const PrimitiveShell *c = &g_pshell_aux[primitive_index_c];
+
+
+		real_t max_coefficient_value = 0.0;
+		real_t tmp;
+		for(int lmn_b=0; lmn_b<comb_max(b->shell_type); lmn_b++){
+			tmp = fabs(d_C_diff_vector[(b->basis_index + lmn_b)]);
+			if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+		}
+
+		if (is_prim_id_neq) {
+			for(int lmn_a=0; lmn_a<comb_max(a->shell_type); lmn_a++){
+				tmp = fabs(d_C_diff_vector[(a->basis_index + lmn_a)]);
+				if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+			}
+		}
+		if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+		double p = a->exponent + b->exponent;
+		double sum_exp = p + c->exponent;
+		double Rp[3]  = {(a->exponent*a->coordinate.x + b->exponent*b->coordinate.x)/p, (a->exponent*a->coordinate.y + b->exponent*b->coordinate.y)/p, (a->exponent*a->coordinate.z + b->exponent*b->coordinate.z)/p};
+		double Rab[3] = {(a->coordinate.x - b->coordinate.x), (a->coordinate.y - b->coordinate.y), (a->coordinate.z - b->coordinate.z)};
+		double Rpa[3] = {(Rp[0] - a->coordinate.x), (Rp[1] - a->coordinate.y), (Rp[2] - a->coordinate.z)};
+		double Rpc[3] = {(Rp[0] - c->coordinate.x), (Rp[1] - c->coordinate.y), (Rp[2] - c->coordinate.z)};
+		double Boys[8];
+		getIncrementalBoys(7, p*c->exponent/(p+c->exponent)*((Rpc[0])*(Rpc[0]) + (Rpc[1])*(Rpc[1]) + (Rpc[2])*(Rpc[2])), g_boys_grid, Boys);
+		double coefAndNorm = a->coefficient * b->coefficient* c->coefficient * calcNormsWOFact2_3center(a->exponent, b->exponent, c->exponent, 2, 2, 3) * TWO_TIMES_PI_TO_THE_2_POINT_5_TH_POWER/(p*c->exponent*sqrt(p+c->exponent)) * exp(-(a->exponent*b->exponent)*((a->coordinate.x-b->coordinate.x)*(a->coordinate.x-b->coordinate.x) + (a->coordinate.y-b->coordinate.y)*(a->coordinate.y-b->coordinate.y) + (a->coordinate.z-b->coordinate.z)*(a->coordinate.z-b->coordinate.z))/p); 
+
+		#if defined(COMPUTE_D_BASIS)
+		#include  "./integral_RI/direct_ri_w/orig_ddf.txt"
+		#endif
+	}
+
+
+
+
+
+
+
+
+
+
+
+__global__ void compute_RI_Direct_c_kernel(real_t* d_c, const real_t* d_density_matrix, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+										    const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+											ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+											int64_t num_tasks, int num_basis, 
+											const size_t2* d_primitive_shell_pair_indices,
+											const double* g_upper_bound_factors, 
+											const double* g_auxiliary_upper_bound_factors, 
+											const double schwarz_screening_threshold, 
+											int num_auxiliary_basis, 
+											const double* g_boys_grid){
+{
+    // 通し番号indexの計算
+    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (id >= num_tasks) return;
+
+    const double size_Rmid=1377;
+
+    //使い捨ての中間体R_mid
+    double R_mid[3*1377];
+
+    //解を格納する配列R
+    double R[2925];
+
+    //thread内で結果を保持するメモリ
+    double thread_val=0.0;
+
+    const size_t2 abc = index1to2(id, false, shell_s2.count);
+    
+
+
+    // Obtain primitive shells [ab|c]
+	const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+	const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+    const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+
+	// screening (suzuki)
+	if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+    const PrimitiveShell a = g_pshell[primitive_index_a];
+    const PrimitiveShell b = g_pshell[primitive_index_b];
+    const PrimitiveShell c = g_pshell_aux[primitive_index_c];
+
+
+    bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+    
+    //使用データを取得，レジスタに書き込み
+
+    //指数部
+    const double alpha = a.exponent;
+    const double beta  = b.exponent;
+    const double gamma = c.exponent;
+    const double p = alpha+beta;
+    const double xi = p*gamma / (p+gamma);
+
+    //係数部
+    const double coef_a = a.coefficient;
+    const double coef_b = b.coefficient;
+    const double coef_c = c.coefficient;
+
+    //座標
+    const double pos_A[3] = {a.coordinate.x, a.coordinate.y, a.coordinate.z};
+    const double pos_B[3] = {b.coordinate.x, b.coordinate.y, b.coordinate.z};
+    const double pos_C[3] = {c.coordinate.x, c.coordinate.y, c.coordinate.z};
+    const double pos_P[3] = {(alpha*pos_A[0]+beta*pos_B[0])/(alpha+beta), (alpha*pos_A[1]+beta*pos_B[1])/(alpha+beta), (alpha*pos_A[2]+beta*pos_B[2])/(alpha+beta)};
+
+
+    //角運動量の総和
+    const int orbital_A = a.shell_type;
+    const int orbital_B = b.shell_type;
+    const int orbital_C = c.shell_type;
+
+
+    //軌道間距離の二乗
+    const double dist = ((pos_P[0]-pos_C[0])*(pos_P[0]-pos_C[0]) + (pos_P[1]-pos_C[1])*(pos_P[1]-pos_C[1]) + (pos_P[2]-pos_C[2])*(pos_P[2]-pos_C[2]));
+
+
+    const int K = orbital_A + orbital_B + orbital_C;
+    
+    double Boys[25];
+    getIncrementalBoys(K, xi*dist, g_boys_grid, Boys);
+
+    //Boys関数の値を計算(Single)
+    for(int i=0; i <= K; i++){
+        Boys[i] *= (right2left_binary_woif((-2*xi), i));
+    }
+
+    //各ERIを計算
+    //事前計算⇒実際のERI計算の順に実行
+    //p軌道の場合lmn_aが0:px, 1:py, 2:pz軌道のように対応付け
+    //d以上はconstant配列のloop_to_angを参照
+
+    
+    
+    double Norm_A, Norm_B, Norm_C;
+    double Norm;
+
+    int t,u,v;
+    int t_max;
+    int u_max;
+    int v_max;
+    int tau_max;
+    int nu_max;
+    int phi_max;
+
+    // int tid=0;
+
+
+    // 方位量子数l,m,nの値をループ変数から導出
+    for(int lmn_a=0; lmn_a<comb_max(orbital_A); lmn_a++){
+        int l1=loop_to_ang[orbital_A][lmn_a][0]; int m1=loop_to_ang[orbital_A][lmn_a][1]; int n1=loop_to_ang[orbital_A][lmn_a][2];
+        Norm_A = calcNorm(alpha, l1, m1, n1);
+
+        for(int lmn_b=0; lmn_b<comb_max(orbital_B); lmn_b++){                  
+            int l2=loop_to_ang[orbital_B][lmn_b][0]; int m2=loop_to_ang[orbital_B][lmn_b][1]; int n2=loop_to_ang[orbital_B][lmn_b][2];
+            Norm_B = calcNorm(beta, l2, m2, n2);
+
+
+            for(int lmn_c=0; lmn_c<comb_max(orbital_C); lmn_c++){
+                int l3=loop_to_ang[orbital_C][lmn_c][0]; int m3=loop_to_ang[orbital_C][lmn_c][1]; int n3=loop_to_ang[orbital_C][lmn_c][2];
+                Norm_C = calcNorm(gamma, l3, m3, n3);
+
+
+				Norm = Norm_A * Norm_B * Norm_C;
+				// 前回のループの計算結果をクリア
+				thread_val=0.0;
+				// 事前計算部
+				//初期値：Boysとして計算済
+				//Step 0: Boys関数評価
+				R[0]=Boys[0];
+				for(int i=0; i <= K; i++){
+					R_mid[i]=Boys[i];
+				}
+                    
+				// ループ変数の設定
+				t_max = l1+l2+1;
+				u_max = m1+m2+1;
+				v_max = n1+n2+1;
+				tau_max = l3+1;
+				nu_max = m3+1;
+				phi_max = n3+1;
+
+				for(int k=1; k <= K; k++){//Step 1~Kの計算
+					// t+u+v=kとなる全ペアに対して適切な計算
+					// 0~K-kまでそれぞれ必要⇒ループでやる
+	
+        
+					for(int z=0; z<=(K+1)*comb_max(k); z++){
+                        
+						int i = z/comb_max(k);
+	
+						if(i <= K-k){
+							t=tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][0];
+							u=tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][1];
+							v=tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][2];
+	
+							if((t <= (t_max+tau_max-2)) && (u <= (u_max+nu_max-2)) && (v <= (v_max+phi_max-2))){
+								if(t >= 1){
+									R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_Rmid)] = (pos_P[0] - pos_C[0])*R_mid[calc_Idx_Rmid(k-1,u,v,i+1,comb_max(k-1),size_Rmid)] + (t-1)*R_mid[calc_Idx_Rmid(k-2,u,v,i+1,comb_max(k-2),size_Rmid)];
+								}
+								else if(u >= 1){
+									R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_Rmid)] = (pos_P[1] - pos_C[1])*R_mid[calc_Idx_Rmid(k-1,u-1,v,i+1,comb_max(k-1),size_Rmid)] + (u-1)*R_mid[calc_Idx_Rmid(k-2,u-2,v,i+1,comb_max(k-2),size_Rmid)];
+								}
+								else{
+									R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_Rmid)] = (pos_P[2] - pos_C[2])*R_mid[calc_Idx_Rmid(k-1,u,v-1,i+1,comb_max(k-1),size_Rmid)] + (v-1)*R_mid[calc_Idx_Rmid(k-2,u,v-2,i+1,comb_max(k-2),size_Rmid)];
+								}
+							}
+						}
+					}//step kの全計算が終了
+        
+
+                        //必要な結果を配列Rに書き込み
+                        for(int i=0; i<=comb_max(k); i++){
+                            R[static_cast<int>(k*(k+1)*(k+2)/6) + i] = R_mid[(k%3)*static_cast<int>(size_Rmid) + i];
+                        }
+
+                    }
+                    //事前計算完了
+                    
+					double my_val = 0.0;
+                    // ERI計算部
+					double Et, Eu, Ev, Etau, Enu, Ephi;
+                    for(int t=0; t<l1+l2+1; t++){
+                        Et =  MD_Et_NonRecursion(l1, l2, t, alpha, beta, (pos_A[0]-pos_B[0]));
+                        for(int u=0; u<m1+m2+1; u++){
+                            Eu = MD_Et_NonRecursion(m1, m2, u, alpha, beta, (pos_A[1]-pos_B[1]));
+                            for(int v=0; v<n1+n2+1; v++){
+                                Ev = MD_Et_NonRecursion(n1, n2, v, alpha, beta, (pos_A[2]-pos_B[2]));
+                                for(int tau=0; tau<l3+1; tau++){
+                                    Etau = MD_Et_NonRecursion(l3, 0, tau, gamma, 0.0, 0.0);
+                                    for(int nu=0; nu<m3+1; nu++){
+                                        Enu = MD_Et_NonRecursion(m3, 0, nu, gamma, 0.0, 0.0);
+                                        for(int phi=0; phi<n3+1; phi++){
+                                            Ephi = MD_Et_NonRecursion(n3, 0, phi, gamma, 0.0, 0.0);
+                                            int k=t+u+v+tau+nu+phi;
+                                            my_val +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                                            // my_val +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, Boys);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+					thread_val = Norm * my_val*2 * M_PI_2_5 /(p*gamma * sqrt((p+gamma))) * coef_a*coef_b*coef_c * d_cgto_normalization_factors[a.basis_index + lmn_a] * d_cgto_normalization_factors[b.basis_index + lmn_b] * d_auxiliary_cgto_normalization_factors[c.basis_index + lmn_c];
+
+                    // 書き込み部
+                    thread_val *= (is_prim_id_neq) ? (d_density_matrix[(a.basis_index+lmn_a)*num_basis + b.basis_index+lmn_b] + d_density_matrix[(b.basis_index+lmn_b)*num_basis + a.basis_index+lmn_a])
+                                                         : d_density_matrix[(a.basis_index+lmn_a)*num_basis + b.basis_index+lmn_b];
+                    
+                    atomicAdd(&d_c[c.basis_index+lmn_c], thread_val);
+                }
+            }
+        }
+    }
+    return;
+}
+
+
+
+__global__ void compute_RI_Direct_J_kernel(real_t* d_J, const real_t* d_t, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+										    const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+											ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+											int64_t num_tasks, int num_basis, 
+											const size_t2* d_primitive_shell_pair_indices,
+											const double* g_upper_bound_factors, 
+											const double* g_auxiliary_upper_bound_factors, 
+											const double schwarz_screening_threshold, 
+											int num_auxiliary_basis, 
+											const double* g_boys_grid){
+{
+    // 通し番号indexの計算
+    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+
+
+    if (id >= num_tasks) return;
+
+    const double size_Rmid=1377;
+
+    //使い捨ての中間体R_mid
+    double R_mid[3*1377];
+
+    //解を格納する配列R
+    double R[2925];
+
+    //thread内で結果を保持するメモリ
+    double thread_val=0.0;
+
+    const size_t2 abc = index1to2(id, false, shell_s2.count);
+    
+
+
+    // Obtain primitive shells [ab|c]
+	const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+	const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+    const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+	// screening (suzuki)
+	if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+    const PrimitiveShell a = g_pshell[primitive_index_a];
+    const PrimitiveShell b = g_pshell[primitive_index_b];
+    const PrimitiveShell c = g_pshell_aux[primitive_index_c];
+
+
+    bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+    
+    //使用データを取得，レジスタに書き込み
+
+    //指数部
+    const double alpha = a.exponent;
+    const double beta  = b.exponent;
+    const double gamma = c.exponent;
+    const double p = alpha+beta;
+    const double xi = p*gamma / (p+gamma);
+
+    //係数部
+    const double coef_a = a.coefficient;
+    const double coef_b = b.coefficient;
+    const double coef_c = c.coefficient;
+
+    //座標
+    const double pos_A[3] = {a.coordinate.x, a.coordinate.y, a.coordinate.z};
+    const double pos_B[3] = {b.coordinate.x, b.coordinate.y, b.coordinate.z};
+    const double pos_C[3] = {c.coordinate.x, c.coordinate.y, c.coordinate.z};
+    const double pos_P[3] = {(alpha*pos_A[0]+beta*pos_B[0])/(alpha+beta), (alpha*pos_A[1]+beta*pos_B[1])/(alpha+beta), (alpha*pos_A[2]+beta*pos_B[2])/(alpha+beta)};
+
+
+    //角運動量の総和
+    const int orbital_A = a.shell_type;
+    const int orbital_B = b.shell_type;
+    const int orbital_C = c.shell_type;
+
+
+    //軌道間距離の二乗
+    const double dist = ((pos_P[0]-pos_C[0])*(pos_P[0]-pos_C[0]) + (pos_P[1]-pos_C[1])*(pos_P[1]-pos_C[1]) + (pos_P[2]-pos_C[2])*(pos_P[2]-pos_C[2]));
+
+
+    const int K = orbital_A + orbital_B + orbital_C;
+    
+    double Boys[25];
+    getIncrementalBoys(K, xi*dist, g_boys_grid, Boys);
+
+    //Boys関数の値を計算(Single)
+    for(int i=0; i <= K; i++){
+        Boys[i] *= (right2left_binary_woif((-2*xi), i));
+    }
+
+    //各ERIを計算
+    //事前計算⇒実際のERI計算の順に実行
+    //p軌道の場合lmn_aが0:px, 1:py, 2:pz軌道のように対応付け
+    //d以上はconstant配列のloop_to_angを参照
+
+    
+    
+    double Norm_A, Norm_B, Norm_C;
+    double Norm;
+
+    int t,u,v;
+    int t_max;
+    int u_max;
+    int v_max;
+    int tau_max;
+    int nu_max;
+    int phi_max;
+
+    // int tid=0;
+
+
+    // 方位量子数l,m,nの値をループ変数から導出
+    for(int lmn_a=0; lmn_a<comb_max(orbital_A); lmn_a++){
+        int l1=loop_to_ang[orbital_A][lmn_a][0]; int m1=loop_to_ang[orbital_A][lmn_a][1]; int n1=loop_to_ang[orbital_A][lmn_a][2];
+        Norm_A = calcNorm(alpha, l1, m1, n1);
+
+        for(int lmn_b=0; lmn_b<comb_max(orbital_B); lmn_b++){                  
+            int l2=loop_to_ang[orbital_B][lmn_b][0]; int m2=loop_to_ang[orbital_B][lmn_b][1]; int n2=loop_to_ang[orbital_B][lmn_b][2];
+            Norm_B = calcNorm(beta, l2, m2, n2);
+
+
+            for(int lmn_c=0; lmn_c<comb_max(orbital_C); lmn_c++){
+                int l3=loop_to_ang[orbital_C][lmn_c][0]; int m3=loop_to_ang[orbital_C][lmn_c][1]; int n3=loop_to_ang[orbital_C][lmn_c][2];
+                Norm_C = calcNorm(gamma, l3, m3, n3);
+
+
+				Norm = Norm_A * Norm_B * Norm_C;
+				// 前回のループの計算結果をクリア
+				thread_val=0.0;
+				// 事前計算部
+				//初期値：Boysとして計算済
+				//Step 0: Boys関数評価
+				R[0]=Boys[0];
+				for(int i=0; i <= K; i++){
+					R_mid[i]=Boys[i];
+				}
+                    
+				// ループ変数の設定
+				t_max = l1+l2+1;
+				u_max = m1+m2+1;
+				v_max = n1+n2+1;
+				tau_max = l3+1;
+				nu_max = m3+1;
+				phi_max = n3+1;
+
+				for(int k=1; k <= K; k++){//Step 1~Kの計算
+					// t+u+v=kとなる全ペアに対して適切な計算
+					// 0~K-kまでそれぞれ必要⇒ループでやる
+	
+        
+					for(int z=0; z<=(K+1)*comb_max(k); z++){
+                        
+						int i = z/comb_max(k);
+	
+						if(i <= K-k){
+							t=tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][0];
+							u=tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][1];
+							v=tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][2];
+	
+							if((t <= (t_max+tau_max-2)) && (u <= (u_max+nu_max-2)) && (v <= (v_max+phi_max-2))){
+								if(t >= 1){
+									R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_Rmid)] = (pos_P[0] - pos_C[0])*R_mid[calc_Idx_Rmid(k-1,u,v,i+1,comb_max(k-1),size_Rmid)] + (t-1)*R_mid[calc_Idx_Rmid(k-2,u,v,i+1,comb_max(k-2),size_Rmid)];
+								}
+								else if(u >= 1){
+									R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_Rmid)] = (pos_P[1] - pos_C[1])*R_mid[calc_Idx_Rmid(k-1,u-1,v,i+1,comb_max(k-1),size_Rmid)] + (u-1)*R_mid[calc_Idx_Rmid(k-2,u-2,v,i+1,comb_max(k-2),size_Rmid)];
+								}
+								else{
+									R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_Rmid)] = (pos_P[2] - pos_C[2])*R_mid[calc_Idx_Rmid(k-1,u,v-1,i+1,comb_max(k-1),size_Rmid)] + (v-1)*R_mid[calc_Idx_Rmid(k-2,u,v-2,i+1,comb_max(k-2),size_Rmid)];
+								}
+							}
+						}
+					}//step kの全計算が終了
+        
+
+                        //必要な結果を配列Rに書き込み
+                        for(int i=0; i<=comb_max(k); i++){
+                            R[static_cast<int>(k*(k+1)*(k+2)/6) + i] = R_mid[(k%3)*static_cast<int>(size_Rmid) + i];
+                        }
+
+                    }
+                    //事前計算完了
+                    
+					double my_val = 0.0;
+                    // ERI計算部
+					double Et, Eu, Ev, Etau, Enu, Ephi;
+                    for(int t=0; t<l1+l2+1; t++){
+                        Et =  MD_Et_NonRecursion(l1, l2, t, alpha, beta, (pos_A[0]-pos_B[0]));
+                        for(int u=0; u<m1+m2+1; u++){
+                            Eu = MD_Et_NonRecursion(m1, m2, u, alpha, beta, (pos_A[1]-pos_B[1]));
+                            for(int v=0; v<n1+n2+1; v++){
+                                Ev = MD_Et_NonRecursion(n1, n2, v, alpha, beta, (pos_A[2]-pos_B[2]));
+                                for(int tau=0; tau<l3+1; tau++){
+                                    Etau = MD_Et_NonRecursion(l3, 0, tau, gamma, 0.0, 0.0);
+                                    for(int nu=0; nu<m3+1; nu++){
+                                        Enu = MD_Et_NonRecursion(m3, 0, nu, gamma, 0.0, 0.0);
+                                        for(int phi=0; phi<n3+1; phi++){
+                                            Ephi = MD_Et_NonRecursion(n3, 0, phi, gamma, 0.0, 0.0);
+                                            int k=t+u+v+tau+nu+phi;
+                                            my_val +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                                            // my_val +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, Boys);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+					thread_val = Norm * my_val*2 * M_PI_2_5 /(p*gamma * sqrt((p+gamma)))  *coef_a*coef_b*coef_c * d_cgto_normalization_factors[a.basis_index + lmn_a] * d_cgto_normalization_factors[b.basis_index + lmn_b] * d_auxiliary_cgto_normalization_factors[c.basis_index + lmn_c];
+
+                    // 書き込み部
+                    thread_val *= d_t[c.basis_index+lmn_c];
+
+                    atomicAdd(&d_J[(a.basis_index+lmn_a)*num_basis + b.basis_index+lmn_b], thread_val);
+                    if(is_prim_id_neq) atomicAdd(&d_J[(b.basis_index+lmn_b)*num_basis + a.basis_index+lmn_a], thread_val);
+                }
+            }
+        }
+    }
+    return;
+}
+
+
+
+
+
+
+
+
+__global__ void compute_RI_Direct_W_kernel(real_t* d_W_diff, real_t* d_C_diff_vector, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, 
+										    const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, 
+											ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, 
+											int64_t num_tasks, int num_basis, 
+											const size_t2* d_primitive_shell_pair_indices,
+											const double* g_upper_bound_factors, 
+                                            // const double* g_upper_bound_factors_unsorted, 
+											const double* g_auxiliary_upper_bound_factors, 
+											const double schwarz_screening_threshold, 
+											int num_auxiliary_basis, 
+                                            int iter,
+											const double* g_boys_grid){
+{
+    // __shared__ int sh_head_idx[2];
+
+    // __shared__ real_t sh_val[128];
+
+
+    // 通し番号indexの計算
+    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+
+
+    if (id >= num_tasks) return;
+
+    const double size_Rmid=1377;
+
+    //使い捨ての中間体R_mid
+    double R_mid[3*1377];
+
+    //解を格納する配列R
+    double R[2925];
+
+    //thread内で結果を保持するメモリ
+    double thread_val=0.0;
+
+    
+
+    const size_t2 abc = index1to2(id, false, shell_s2.count);
+    
+
+
+    // Obtain primitive shells [ab|c]
+	const size_t primitive_index_a = d_primitive_shell_pair_indices[abc.x].x;
+	const size_t primitive_index_b = d_primitive_shell_pair_indices[abc.x].y;
+    const size_t primitive_index_c = abc.y + shell_s2.start_index;
+
+    bool is_prim_id_neq = (primitive_index_a != primitive_index_b);
+
+
+
+    const PrimitiveShell a = g_pshell[primitive_index_a];
+    const PrimitiveShell b = g_pshell[primitive_index_b];
+    const PrimitiveShell c = g_pshell_aux[primitive_index_c];
+
+
+
+
+
+
+    
+    //使用データを取得，レジスタに書き込み
+
+    //指数部
+    const double alpha = a.exponent;
+    const double beta  = b.exponent;
+    const double gamma = c.exponent;
+    const double p = alpha+beta;
+    const double xi = p*gamma / (p+gamma);
+
+    //係数部
+    const double coef_a = a.coefficient;
+    const double coef_b = b.coefficient;
+    const double coef_c = c.coefficient;
+
+    //座標
+    const double pos_A[3] = {a.coordinate.x, a.coordinate.y, a.coordinate.z};
+    const double pos_B[3] = {b.coordinate.x, b.coordinate.y, b.coordinate.z};
+    const double pos_C[3] = {c.coordinate.x, c.coordinate.y, c.coordinate.z};
+    const double pos_P[3] = {(alpha*pos_A[0]+beta*pos_B[0])/(alpha+beta), (alpha*pos_A[1]+beta*pos_B[1])/(alpha+beta), (alpha*pos_A[2]+beta*pos_B[2])/(alpha+beta)};
+
+
+    //角運動量の総和
+    const int orbital_A = a.shell_type;
+    const int orbital_B = b.shell_type;
+    const int orbital_C = c.shell_type;
+
+
+    real_t max_coefficient_value = 0.0;
+    real_t tmp;
+    for(int lmn_b=0; lmn_b<comb_max(orbital_B); lmn_b++){   
+        tmp = fabs(d_C_diff_vector[(b.basis_index + lmn_b)]);
+        if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+    }
+
+    if (is_prim_id_neq) {
+        for(int lmn_a=0; lmn_a<comb_max(orbital_A); lmn_a++){
+            tmp = fabs(d_C_diff_vector[(a.basis_index + lmn_a)]);
+            if(max_coefficient_value < tmp) max_coefficient_value = tmp;
+        }
+    }
+    if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * max_coefficient_value < schwarz_screening_threshold) return;
+
+
+
+	// screening (suzuki)
+	// if (g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) return;
+
+
+
+    //軌道間距離の二乗
+    const double dist = ((pos_P[0]-pos_C[0])*(pos_P[0]-pos_C[0]) + (pos_P[1]-pos_C[1])*(pos_P[1]-pos_C[1]) + (pos_P[2]-pos_C[2])*(pos_P[2]-pos_C[2]));
+
+
+    const int K = orbital_A + orbital_B + orbital_C;
+    
+    double Boys[25];
+    getIncrementalBoys(K, xi*dist, g_boys_grid, Boys);
+
+    //Boys関数の値を計算(Single)
+    for(int i=0; i <= K; i++){
+        Boys[i] *= (right2left_binary_woif((-2*xi), i));
+    }
+
+    //各ERIを計算
+    //事前計算⇒実際のERI計算の順に実行
+    //p軌道の場合lmn_aが0:px, 1:py, 2:pz軌道のように対応付け
+    //d以上はconstant配列のloop_to_angを参照
+
+    
+    
+    double Norm_A, Norm_B, Norm_C;
+    double Norm;
+
+    int t,u,v;
+    int t_max;
+    int u_max;
+    int v_max;
+    int tau_max;
+    int nu_max;
+    int phi_max;
+
+    // int tid=0;
+
+
+    // 方位量子数l,m,nの値をループ変数から導出
+
+    for(int lmn_a=0; lmn_a<comb_max(orbital_A); lmn_a++){
+        int l1=loop_to_ang[orbital_A][lmn_a][0]; int m1=loop_to_ang[orbital_A][lmn_a][1]; int n1=loop_to_ang[orbital_A][lmn_a][2];
+        Norm_A = calcNorm(alpha, l1, m1, n1);
+
+        for(int lmn_b=0; lmn_b<comb_max(orbital_B); lmn_b++){                  
+            int l2=loop_to_ang[orbital_B][lmn_b][0]; int m2=loop_to_ang[orbital_B][lmn_b][1]; int n2=loop_to_ang[orbital_B][lmn_b][2];
+            Norm_B = calcNorm(beta, l2, m2, n2);
+
+
+            if ((g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(b.basis_index + lmn_b)]) < schwarz_screening_threshold) && (!is_prim_id_neq || g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(a.basis_index + lmn_a)]) < schwarz_screening_threshold)) continue;
+            // if ((g_upper_bound_factors_unsorted[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] < schwarz_screening_threshold) && (!is_prim_id_neq || g_upper_bound_factors_unsorted[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c]  < schwarz_screening_threshold)) continue;
+
+            // if (is_prim_id_neq && g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(a.basis_index + lmn_a)]) < schwarz_screening_threshold) continue;
+
+
+            for(int lmn_c=0; lmn_c<comb_max(orbital_C); lmn_c++){
+                int l3=loop_to_ang[orbital_C][lmn_c][0]; int m3=loop_to_ang[orbital_C][lmn_c][1]; int n3=loop_to_ang[orbital_C][lmn_c][2];
+                Norm_C = calcNorm(gamma, l3, m3, n3);
+
+
+
+
+				Norm = Norm_A * Norm_B * Norm_C;
+				// 前回のループの計算結果をクリア
+				thread_val=0.0;
+				// 事前計算部
+				//初期値：Boysとして計算済
+				//Step 0: Boys関数評価
+				R[0]=Boys[0];
+				for(int i=0; i <= K; i++){
+					R_mid[i]=Boys[i];
+				}
+                    
+				// ループ変数の設定
+				t_max = l1+l2+1;
+				u_max = m1+m2+1;
+				v_max = n1+n2+1;
+				tau_max = l3+1;
+				nu_max = m3+1;
+				phi_max = n3+1;
+
+				for(int k=1; k <= K; k++){//Step 1~Kの計算
+					// t+u+v=kとなる全ペアに対して適切な計算
+					// 0~K-kまでそれぞれ必要⇒ループでやる
+	
+        
+					for(int z=0; z<=(K+1)*comb_max(k); z++){
+                        
+						int i = z/comb_max(k);
+	
+						if(i <= K-k){
+							t=tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][0];
+							u=tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][1];
+							v=tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][2];
+	
+							if((t <= (t_max+tau_max-2)) && (u <= (u_max+nu_max-2)) && (v <= (v_max+phi_max-2))){
+								if(t >= 1){
+									R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_Rmid)] = (pos_P[0] - pos_C[0])*R_mid[calc_Idx_Rmid(k-1,u,v,i+1,comb_max(k-1),size_Rmid)] + (t-1)*R_mid[calc_Idx_Rmid(k-2,u,v,i+1,comb_max(k-2),size_Rmid)];
+								}
+								else if(u >= 1){
+									R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_Rmid)] = (pos_P[1] - pos_C[1])*R_mid[calc_Idx_Rmid(k-1,u-1,v,i+1,comb_max(k-1),size_Rmid)] + (u-1)*R_mid[calc_Idx_Rmid(k-2,u-2,v,i+1,comb_max(k-2),size_Rmid)];
+								}
+								else{
+									R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_Rmid)] = (pos_P[2] - pos_C[2])*R_mid[calc_Idx_Rmid(k-1,u,v-1,i+1,comb_max(k-1),size_Rmid)] + (v-1)*R_mid[calc_Idx_Rmid(k-2,u,v-2,i+1,comb_max(k-2),size_Rmid)];
+								}
+							}
+						}
+					}//step kの全計算が終了
+        
+
+                        //必要な結果を配列Rに書き込み
+                        for(int i=0; i<=comb_max(k); i++){
+                            R[static_cast<int>(k*(k+1)*(k+2)/6) + i] = R_mid[(k%3)*static_cast<int>(size_Rmid) + i];
+                        }
+
+                    }
+                    //事前計算完了
+                    
+					double my_val = 0.0;
+                    // ERI計算部
+					double Et, Eu, Ev, Etau, Enu, Ephi;
+                    for(int t=0; t<l1+l2+1; t++){
+                        Et =  MD_Et_NonRecursion(l1, l2, t, alpha, beta, (pos_A[0]-pos_B[0]));
+                        for(int u=0; u<m1+m2+1; u++){
+                            Eu = MD_Et_NonRecursion(m1, m2, u, alpha, beta, (pos_A[1]-pos_B[1]));
+                            for(int v=0; v<n1+n2+1; v++){
+                                Ev = MD_Et_NonRecursion(n1, n2, v, alpha, beta, (pos_A[2]-pos_B[2]));
+                                for(int tau=0; tau<l3+1; tau++){
+                                    Etau = MD_Et_NonRecursion(l3, 0, tau, gamma, 0.0, 0.0);
+                                    for(int nu=0; nu<m3+1; nu++){
+                                        Enu = MD_Et_NonRecursion(m3, 0, nu, gamma, 0.0, 0.0);
+                                        for(int phi=0; phi<n3+1; phi++){
+                                            Ephi = MD_Et_NonRecursion(n3, 0, phi, gamma, 0.0, 0.0);
+                                            int k=t+u+v+tau+nu+phi;
+                                            my_val +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                                            // my_val +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, Boys);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+					thread_val = Norm * my_val*2 * M_PI_2_5 /(p*gamma * sqrt((p+gamma))) * coef_a*coef_b*coef_c 
+                               * d_cgto_normalization_factors[a.basis_index + lmn_a] * d_cgto_normalization_factors[b.basis_index + lmn_b] * d_auxiliary_cgto_normalization_factors[c.basis_index + lmn_c];
+
+
+
+                    // Global Memoryへ書き込み
+                    // 汎用カーネルでは全要素判定(case1)
+                    atomicAdd(&d_W_diff[(a.basis_index+lmn_a) * num_auxiliary_basis + c.basis_index+lmn_c], thread_val * d_C_diff_vector[(b.basis_index + lmn_b)]);
+
+
+                    if(is_prim_id_neq) {
+                        atomicAdd(&d_W_diff[(b.basis_index+lmn_b) * num_auxiliary_basis + c.basis_index+lmn_c], thread_val * d_C_diff_vector[(a.basis_index + lmn_a)]);
+                    }
+
+                    
                 }
             }
         }

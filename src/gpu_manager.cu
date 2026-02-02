@@ -2526,4 +2526,655 @@ void computeFockMatrix_Hash_RHF(
 }
 
 
+
+
+
+
+// before = |after - before|
+__global__ void calcDiffMatrix(const real_t* d_matrix_after, real_t* d_matrix_before, int size) {
+    size_t id = blockIdx.x*blockDim.x + threadIdx.x;
+    if(id >= size * size) return;
+
+    d_matrix_before[id] = d_matrix_after[id] - d_matrix_before[id];
+}
+
+__global__ void makeIdentityMatrix(real_t* d_I, int size) {
+    size_t id = threadIdx.x + blockIdx.x * blockDim.x;
+    if (id >= size * size) return;
+
+    int row = id % size;
+    int col = id / size;
+    d_I[id] = (row == col) ? 1.0 : 0.0;
+}
+
+void computeInverseByDtrsm(real_t* two_center_eris, real_t* two_center_eris_inverse, int num_auxiliary_basis){
+    cublasHandle_t cublasHandle = GPUHandle::cublas();
+
+    const int num_threads = 1024;
+    const int num_blocks = (num_auxiliary_basis * num_auxiliary_basis + num_threads - 1) / num_threads;
+    makeIdentityMatrix<<<num_blocks, num_threads>>>(two_center_eris_inverse, num_auxiliary_basis);
+    cudaDeviceSynchronize();
+
+    const real_t alpha = 1.0;
+
+    cublasDtrsm(
+        cublasHandle,
+        CUBLAS_SIDE_LEFT,        
+        CUBLAS_FILL_MODE_UPPER, 
+        CUBLAS_OP_N,            
+        CUBLAS_DIAG_NON_UNIT,   
+        num_auxiliary_basis,                   
+        num_auxiliary_basis,                   
+        &alpha,
+        two_center_eris, num_auxiliary_basis,                  
+        two_center_eris_inverse, num_auxiliary_basis                  
+    );
+}
+
+
+
+
+void compute_RI_Direct_c_array(
+    const std::vector<ShellTypeInfo>& shell_type_infos, 
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, 
+    const PrimitiveShell* d_primitive_shells, 
+    const real_t* d_cgto_nomalization_factors, 
+    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos, 
+    const PrimitiveShell* d_auxiliary_primitive_shells, 
+    const real_t* d_auxiliary_cgto_nomalization_factors, 
+    real_t* d_c, 
+    const real_t* d_density_matrix,
+    const size_t2* d_primitive_shell_pair_indices,
+    const int num_basis,
+    const int num_auxiliary_basis,
+    const real_t* d_boys_grid,
+    const double schwarz_screening_threshold, 
+    const real_t* d_schwarz_upper_bound_factors,
+    const real_t* d_auxiliary_schwarz_upper_bound_factors,
+    const bool verbose)
+{
+const int threads_per_block = 128;
+    const int shell_type_count = shell_type_infos.size();
+    const int auxiliary_shell_type_count = auxiliary_shell_type_infos.size();
+
+
+    // Call the kernel functions from (ss|s),... (e.g. (ss|s), (ss|p), (sp|s), (sp|p), (pp|s), (pp|p) for s and p shells)
+
+    // list shell-triples for sorted shell-type (s0, s1, s2)
+    std::vector<std::tuple<int, int, int>> shell_triples;
+    for (int a = 0; a < shell_type_count; ++a) {
+        for (int b = a; b < shell_type_count; ++b) {
+            for (int c = 0; c < auxiliary_shell_type_count; ++c) {
+                shell_triples.emplace_back(a, b, c);
+            }
+        }
+    }
+    // sort by sum (a + b + c) in descending order
+    std::sort(shell_triples.begin(), shell_triples.end(),
+        [](const auto& lhs, const auto& rhs) {
+            int sum_lhs = std::get<0>(lhs) + std::get<1>(lhs) + std::get<2>(lhs);
+            int sum_rhs = std::get<0>(rhs) + std::get<1>(rhs) + std::get<2>(rhs);
+            return sum_lhs > sum_rhs;  // 降順
+        });
+
+
+    // make multi stream
+    const int num_kernels = shell_triples.size();
+    std::vector<cudaStream_t> streams(num_kernels);
+
+    // for-loop for sorted shell-type (s0, s1, s2, s3)
+    int stream_id = 0;
+    for(const auto& triple: shell_triples) {
+        int s0, s1, s2;
+        std::tie(s0, s1, s2) = triple;
+
+        const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+        const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+        const ShellTypeInfo shell_s2 = auxiliary_shell_type_infos[s2];
+
+        const int num_tasks = ( (s0==s1) ? (shell_s0.count*(shell_s0.count+1)/2) : (shell_s0.count*shell_s1.count) ) * shell_s2.count; // the number of pairs of primitive shells = the number of threads
+        const int num_blocks = (num_tasks + threads_per_block - 1) / threads_per_block; // the number of blocks
+        
+        direct_ri_c_J_kernel_t c_kernel;
+
+        if(s0==0 && s1==0 && s2==0) c_kernel = compute_RI_Direct_c_kernel_sss;
+        else if(s0==0 && s1==0 && s2==1) c_kernel = compute_RI_Direct_c_kernel_ssp;
+        else if(s0==0 && s1==0 && s2==2) c_kernel = compute_RI_Direct_c_kernel_ssd;
+        else if(s0==0 && s1==0 && s2==3) c_kernel = compute_RI_Direct_c_kernel_ssf;
+        else if(s0==0 && s1==1 && s2==0) c_kernel = compute_RI_Direct_c_kernel_sps;
+        else if(s0==0 && s1==1 && s2==1) c_kernel = compute_RI_Direct_c_kernel_spp;
+        else if(s0==0 && s1==1 && s2==2) c_kernel = compute_RI_Direct_c_kernel_spd;
+        else if(s0==0 && s1==1 && s2==3) c_kernel = compute_RI_Direct_c_kernel_spf;
+        else if(s0==1 && s1==1 && s2==0) c_kernel = compute_RI_Direct_c_kernel_pps;
+        else if(s0==1 && s1==1 && s2==1) c_kernel = compute_RI_Direct_c_kernel_ppp;
+        else if(s0==1 && s1==1 && s2==2) c_kernel = compute_RI_Direct_c_kernel_ppd;
+        else if(s0==1 && s1==1 && s2==3) c_kernel = compute_RI_Direct_c_kernel_ppf;
+        #if defined(COMPUTE_D_BASIS)
+        else if(s0==0 && s1==2 && s2==0) c_kernel = compute_RI_Direct_c_kernel_sds;
+        else if(s0==0 && s1==2 && s2==1) c_kernel = compute_RI_Direct_c_kernel_sdp;
+        else if(s0==0 && s1==2 && s2==2) c_kernel = compute_RI_Direct_c_kernel_sdd;
+        else if(s0==0 && s1==2 && s2==3) c_kernel = compute_RI_Direct_c_kernel_sdf;
+        else if(s0==1 && s1==2 && s2==0) c_kernel = compute_RI_Direct_c_kernel_pds;
+        else if(s0==1 && s1==2 && s2==1) c_kernel = compute_RI_Direct_c_kernel_pdp;
+        else if(s0==1 && s1==2 && s2==2) c_kernel = compute_RI_Direct_c_kernel_pdd;
+        else if(s0==1 && s1==2 && s2==3) c_kernel = compute_RI_Direct_c_kernel_pdf;
+        else if(s0==2 && s1==2 && s2==0) c_kernel = compute_RI_Direct_c_kernel_dds;
+        else if(s0==2 && s1==2 && s2==1) c_kernel = compute_RI_Direct_c_kernel_ddp;
+        else if(s0==2 && s1==2 && s2==2) c_kernel = compute_RI_Direct_c_kernel_ddd;
+        else if(s0==2 && s1==2 && s2==3) c_kernel = compute_RI_Direct_c_kernel_ddf;
+        #endif
+        else c_kernel = compute_RI_Direct_c_kernel;
+
+        // c_kernel = compute_RI_Direct_c_kernel;
+
+
+        c_kernel<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(d_c, d_density_matrix, d_primitive_shells, d_auxiliary_primitive_shells, 
+                                                                                d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors, 
+                                                                                shell_s0, shell_s1, shell_s2, 
+                                                                                num_tasks, num_basis, 
+                                                                                &d_primitive_shell_pair_indices[shell_pair_type_infos[calcIdx_triangular_(s0, s1, shell_type_count)].start_index],
+                                                                                &d_schwarz_upper_bound_factors[shell_pair_type_infos[calcIdx_triangular_(s0, s1, shell_type_count)].start_index],
+                                                                                d_auxiliary_schwarz_upper_bound_factors,
+                                                                                schwarz_screening_threshold,
+                                                                                num_auxiliary_basis,
+                                                                                d_boys_grid);
+    }
+
+    // syncronize streams
+    cudaDeviceSynchronize();
+
+    // destory streams
+    for (int i = 0; i < num_kernels; i++) {
+        cudaStreamDestroy(streams[i]);
+    }
+}
+
+void compute_RI_Direct_J_matrix(
+    const std::vector<ShellTypeInfo>& shell_type_infos, 
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, 
+    const PrimitiveShell* d_primitive_shells, 
+    const real_t* d_cgto_nomalization_factors, 
+    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos, 
+    const PrimitiveShell* d_auxiliary_primitive_shells, 
+    const real_t* d_auxiliary_cgto_nomalization_factors, 
+    real_t* d_J, 
+    const real_t* d_t,
+    const size_t2* d_primitive_shell_pair_indices,
+    const int num_basis,
+    const int num_auxiliary_basis,
+    const real_t* d_boys_grid,
+    const double schwarz_screening_threshold, 
+    const real_t* d_schwarz_upper_bound_factors,
+    const real_t* d_auxiliary_schwarz_upper_bound_factors,
+    const bool verbose)
+{
+const int threads_per_block = 128;
+    const int shell_type_count = shell_type_infos.size();
+    const int auxiliary_shell_type_count = auxiliary_shell_type_infos.size();
+
+
+    // Call the kernel functions from (ss|s),... (e.g. (ss|s), (ss|p), (sp|s), (sp|p), (pp|s), (pp|p) for s and p shells)
+
+    // list shell-triples for sorted shell-type (s0, s1, s2)
+    std::vector<std::tuple<int, int, int>> shell_triples;
+    for (int a = 0; a < shell_type_count; ++a) {
+        for (int b = a; b < shell_type_count; ++b) {
+            for (int c = 0; c < auxiliary_shell_type_count; ++c) {
+                shell_triples.emplace_back(a, b, c);
+            }
+        }
+    }
+    // sort by sum (a + b + c) in descending order
+    std::sort(shell_triples.begin(), shell_triples.end(),
+        [](const auto& lhs, const auto& rhs) {
+            int sum_lhs = std::get<0>(lhs) + std::get<1>(lhs) + std::get<2>(lhs);
+            int sum_rhs = std::get<0>(rhs) + std::get<1>(rhs) + std::get<2>(rhs);
+            return sum_lhs > sum_rhs;  // 降順
+        });
+
+
+    // make multi stream
+    const int num_kernels = shell_triples.size();
+    std::vector<cudaStream_t> streams(num_kernels);
+
+    // for-loop for sorted shell-type (s0, s1, s2, s3)
+    int stream_id = 0;
+    for(const auto& triple: shell_triples) {
+        int s0, s1, s2;
+        std::tie(s0, s1, s2) = triple;
+
+        const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+        const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+        const ShellTypeInfo shell_s2 = auxiliary_shell_type_infos[s2];
+
+        const int num_tasks = ( (s0==s1) ? (shell_s0.count*(shell_s0.count+1)/2) : (shell_s0.count*shell_s1.count) ) * shell_s2.count; // the number of pairs of primitive shells = the number of threads
+        const int num_blocks = (num_tasks + threads_per_block - 1) / threads_per_block; // the number of blocks
+        
+        direct_ri_c_J_kernel_t J_kernel;
+
+        if(s0==0 && s1==0 && s2==0) J_kernel = compute_RI_Direct_J_kernel_sss;
+        else if(s0==0 && s1==0 && s2==1) J_kernel = compute_RI_Direct_J_kernel_ssp;
+        else if(s0==0 && s1==0 && s2==2) J_kernel = compute_RI_Direct_J_kernel_ssd;
+        else if(s0==0 && s1==0 && s2==3) J_kernel = compute_RI_Direct_J_kernel_ssf;
+        else if(s0==0 && s1==1 && s2==0) J_kernel = compute_RI_Direct_J_kernel_sps;
+        else if(s0==0 && s1==1 && s2==1) J_kernel = compute_RI_Direct_J_kernel_spp;
+        else if(s0==0 && s1==1 && s2==2) J_kernel = compute_RI_Direct_J_kernel_spd;
+        else if(s0==0 && s1==1 && s2==3) J_kernel = compute_RI_Direct_J_kernel_spf;
+        else if(s0==1 && s1==1 && s2==0) J_kernel = compute_RI_Direct_J_kernel_pps;
+        else if(s0==1 && s1==1 && s2==1) J_kernel = compute_RI_Direct_J_kernel_ppp;
+        else if(s0==1 && s1==1 && s2==2) J_kernel = compute_RI_Direct_J_kernel_ppd;
+        else if(s0==1 && s1==1 && s2==3) J_kernel = compute_RI_Direct_J_kernel_ppf;
+        #if defined(COMPUTE_D_BASIS)
+        else if(s0==0 && s1==2 && s2==0) J_kernel = compute_RI_Direct_J_kernel_sds;
+        else if(s0==0 && s1==2 && s2==1) J_kernel = compute_RI_Direct_J_kernel_sdp;
+        else if(s0==0 && s1==2 && s2==2) J_kernel = compute_RI_Direct_J_kernel_sdd;
+        else if(s0==0 && s1==2 && s2==3) J_kernel = compute_RI_Direct_J_kernel_sdf;
+        else if(s0==1 && s1==2 && s2==0) J_kernel = compute_RI_Direct_J_kernel_pds;
+        else if(s0==1 && s1==2 && s2==1) J_kernel = compute_RI_Direct_J_kernel_pdp;
+        else if(s0==1 && s1==2 && s2==2) J_kernel = compute_RI_Direct_J_kernel_pdd;
+        else if(s0==1 && s1==2 && s2==3) J_kernel = compute_RI_Direct_J_kernel_pdf;
+        else if(s0==2 && s1==2 && s2==0) J_kernel = compute_RI_Direct_J_kernel_dds;
+        else if(s0==2 && s1==2 && s2==1) J_kernel = compute_RI_Direct_J_kernel_ddp;
+        else if(s0==2 && s1==2 && s2==2) J_kernel = compute_RI_Direct_J_kernel_ddd;
+        else if(s0==2 && s1==2 && s2==3) J_kernel = compute_RI_Direct_J_kernel_ddf;
+        #endif
+        else J_kernel = compute_RI_Direct_J_kernel;
+
+        // J_kernel = compute_RI_Direct_J_kernel;
+
+        J_kernel<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(d_J, d_t, d_primitive_shells, d_auxiliary_primitive_shells, 
+                                                                                d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors, 
+                                                                                shell_s0, shell_s1, shell_s2, 
+                                                                                num_tasks, num_basis, 
+                                                                                &d_primitive_shell_pair_indices[shell_pair_type_infos[calcIdx_triangular_(s0, s1, shell_type_count)].start_index],
+                                                                                &d_schwarz_upper_bound_factors[shell_pair_type_infos[calcIdx_triangular_(s0, s1, shell_type_count)].start_index],
+                                                                                d_auxiliary_schwarz_upper_bound_factors,
+                                                                                schwarz_screening_threshold,
+                                                                                num_auxiliary_basis,
+                                                                                d_boys_grid);
+    }
+
+    // syncronize streams
+    cudaDeviceSynchronize();
+
+    // destory streams
+    for (int i = 0; i < num_kernels; i++) {
+        cudaStreamDestroy(streams[i]);
+    }
+}
+
+
+
+void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_t* d_coefficient_matrix,
+                                    const real_t* d_L_inv, 
+                                    real_t* d_decomposed_two_center_eris,
+                                    const real_t* d_core_hamiltonian_matrix, 
+                                    real_t* d_fock_matrix, 
+                                    real_t* d_coefficient_matrix_prev,
+                                    real_t* h_Z_tensor_prev,
+                                    const std::vector<ShellTypeInfo>& shell_type_infos, 
+                                    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, 
+                                    const PrimitiveShell* h_primitive_shells, 
+                                    const PrimitiveShell* d_primitive_shells, 
+                                    const real_t* d_cgto_normalization_factors, 
+                                    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos, 
+                                    const PrimitiveShell* d_auxiliary_primitive_shells, 
+                                    const real_t* d_auxiliary_cgto_normalization_factors, 
+                                    const size_t2* d_primitive_shell_pair_indices,
+                                    const int num_basis,
+                                    const int num_auxiliary_basis,
+                                    const int num_electrons,
+                                    const int num_primitive_shells,
+                                    const real_t* d_boys_grid,
+                                    const double schwarz_screening_threshold, 
+                                    const real_t* d_schwarz_upper_bound_factors,
+                                    const real_t* d_auxiliary_schwarz_upper_bound_factors,
+                                    const bool verbose){
+
+
+    //cublasManager cublas;
+    cublasHandle_t cublasHandle = GPUHandle::cublas();
+
+
+    cudaError_t err;
+
+    // the following is used in the two kernels. So, if necessary, it should be changed for each kernel.
+    const int num_threads = 256;
+    const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+
+    ////////////////////////////////// compute J-matrix //////////////////////////////////
+    real_t* d_J = nullptr;
+    err = cudaMalloc(&d_J, sizeof(real_t)*num_basis*num_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for J matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+    cudaMemset(d_J, 0.0, sizeof(real_t)*num_basis*num_basis);
+
+
+
+    // compute c_q = \sum_{a b} D_{a b} (q|ab)
+    real_t *d_c = nullptr;
+    err = cudaMalloc(&d_c, sizeof(real_t)*num_auxiliary_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for c vector: ") + std::string(cudaGetErrorString(err)));
+    }
+    cudaMemset(d_c, 0.0, sizeof(real_t)*num_auxiliary_basis);
+
+
+    // cublas関数ように、column-majorにしておく
+    transposeMatrixInPlace(d_decomposed_two_center_eris, num_auxiliary_basis);
+
+
+    // cを求める
+    compute_RI_Direct_c_array(shell_type_infos,
+                              shell_pair_type_infos,
+                              d_primitive_shells,
+                              d_cgto_normalization_factors,
+                              auxiliary_shell_type_infos,
+                              d_auxiliary_primitive_shells,
+                              d_auxiliary_cgto_normalization_factors,
+                              d_c,
+                              d_density_matrix,
+                              d_primitive_shell_pair_indices,
+                              num_basis,
+                              num_auxiliary_basis,
+                              d_boys_grid,
+                              schwarz_screening_threshold,
+                              d_schwarz_upper_bound_factors,
+                              d_auxiliary_schwarz_upper_bound_factors,
+                              verbose);
+    cudaDeviceSynchronize();
+
+
+
+
+
+    // Ly=cをyについて解く   
+    cublasDtrsv(
+        cublasHandle,
+        CUBLAS_FILL_MODE_LOWER, 
+        CUBLAS_OP_N,            
+        CUBLAS_DIAG_NON_UNIT,   
+        num_auxiliary_basis,                   
+        d_decomposed_two_center_eris, num_auxiliary_basis,                  
+        d_c, 1               
+    );
+
+    // L^T t = y をtについて解く
+    cublasDtrsv(
+        cublasHandle,       
+        CUBLAS_FILL_MODE_LOWER, 
+        CUBLAS_OP_T,            
+        CUBLAS_DIAG_NON_UNIT,   
+        num_auxiliary_basis,                                     
+        d_decomposed_two_center_eris, num_auxiliary_basis,                  
+        d_c, 1                
+    );
+
+
+
+    // Jmu nu = ()
+    compute_RI_Direct_J_matrix(shell_type_infos,
+                              shell_pair_type_infos,
+                              d_primitive_shells,
+                              d_cgto_normalization_factors,
+                              auxiliary_shell_type_infos,
+                              d_auxiliary_primitive_shells,
+                              d_auxiliary_cgto_normalization_factors,
+                              d_J,
+                              d_c,
+                              d_primitive_shell_pair_indices,
+                              num_basis,
+                              num_auxiliary_basis,
+                              d_boys_grid,
+                              schwarz_screening_threshold,
+                              d_schwarz_upper_bound_factors,
+                              d_auxiliary_schwarz_upper_bound_factors,
+                              verbose);
+    cudaDeviceSynchronize();
+
+    cudaFree(d_c);
+
+
+    transposeMatrixInPlace(d_decomposed_two_center_eris, num_auxiliary_basis);
+
+
+    ////////////////////////////////// compute K-matrix //////////////////////////////////
+    real_t* d_K = nullptr;
+    err = cudaMalloc(&d_K, sizeof(real_t)*num_basis*num_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for K matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+    cudaMemset(d_K, 0.0, sizeof(real_t)*num_basis*num_basis);
+
+
+    real_t* d_Z = nullptr;
+    err = cudaMalloc(&d_Z, sizeof(real_t)*num_basis*num_auxiliary_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for Z matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+
+    real_t* d_Z_prev = nullptr;
+    err = cudaMalloc(&d_Z_prev, sizeof(real_t)*num_basis*num_auxiliary_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for Z_prev matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+
+
+    real_t* d_W_diff = nullptr;
+    err = cudaMalloc(&d_W_diff, sizeof(real_t)*num_basis*num_auxiliary_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for W matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+
+
+    //Cとの差分を求める
+    real_t* d_coefficient_matrix_diff;
+    cudaMalloc((void**)&d_coefficient_matrix_diff, sizeof(real_t) * num_basis * num_basis);
+    cudaMemcpy(d_coefficient_matrix_diff, d_coefficient_matrix_prev, sizeof(real_t) * num_basis * num_basis, cudaMemcpyDeviceToDevice);
+    calcDiffMatrix<<< ((num_basis * num_basis) + 1024 - 1) / 1024, 1024>>>(d_coefficient_matrix, d_coefficient_matrix_diff, num_basis); //d_coefficient_matrix_diff = |C_new - C_prev|
+    
+    
+    transposeMatrixInPlace(d_coefficient_matrix_diff, num_basis);
+    transposeMatrixInPlace(d_coefficient_matrix_prev, num_basis);
+
+
+
+    const double alpha = 1.0, gamma = 2.0;
+
+    const int row = num_basis, col = num_auxiliary_basis;
+
+
+    cudaStream_t stream_main, stream_sub;
+    cudaStreamCreateWithFlags(&stream_main, cudaStreamNonBlocking);
+    cudaStreamCreateWithFlags(&stream_sub, cudaStreamNonBlocking);
+
+
+
+
+    const int threads_per_block = 128;
+    const int shell_type_count = shell_type_infos.size();
+    const int auxiliary_shell_type_count = auxiliary_shell_type_infos.size();
+
+    // list shell-triples for sorted shell-type (s0, s1, s2)
+    std::vector<std::tuple<int, int, int>> shell_triples;
+    for (int a = 0; a < shell_type_count; ++a) {
+        for (int b = a; b < shell_type_count; ++b) {
+            for (int c = 0; c < auxiliary_shell_type_count; ++c) {
+                shell_triples.emplace_back(a, b, c);
+            }
+        }
+    }
+    // sort by sum (a + b + c) in descending order
+    std::sort(shell_triples.begin(), shell_triples.end(),
+        [](const auto& lhs, const auto& rhs) {
+            int sum_lhs = std::get<0>(lhs) + std::get<1>(lhs) + std::get<2>(lhs);
+            int sum_rhs = std::get<0>(rhs) + std::get<1>(rhs) + std::get<2>(rhs);
+            return sum_lhs > sum_rhs;  // 降順
+        });
+
+
+    // make multi stream
+    const int num_kernels = shell_triples.size();
+    std::vector<cudaStream_t> streams(num_kernels);
+    for(auto& stream : streams) cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+    
+
+
+
+
+    cublasSetStream(cublasHandle, stream_main);
+    for(int iter = 0; iter < num_electrons/2; iter++) {
+        cudaMemset(d_W_diff, 0.0, sizeof(real_t)*num_basis*num_auxiliary_basis);
+        
+        // d_schwarz_upper_bound_factors
+        cudaDeviceSynchronize();
+
+        // for-loop for sorted shell-type (s0, s1, s2, s3)
+        int stream_id = 0;
+        for(const auto& triple: shell_triples) {
+            int s0, s1, s2;
+            std::tie(s0, s1, s2) = triple;
+
+
+            int bra_id = calcIdx_triangular_(s0, s1, shell_type_count);
+
+
+
+            const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+            const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+            const ShellTypeInfo shell_s2 = auxiliary_shell_type_infos[s2];
+
+            const int num_tasks = ( (s0==s1) ? (shell_s0.count*(shell_s0.count+1)/2) : (shell_s0.count*shell_s1.count) ) * shell_s2.count; // the number of pairs of primitive shells = the number of threads
+            const int num_blocks = (num_tasks + threads_per_block - 1) / threads_per_block; // the number of blocks
+            
+            direct_ri_w_kernel_t W_kernel;
+
+            if(s0==0 && s1==0 && s2==0) W_kernel = compute_RI_Direct_W_kernel_sss;
+            else if(s0==0 && s1==0 && s2==1) W_kernel = compute_RI_Direct_W_kernel_ssp;
+            else if(s0==0 && s1==0 && s2==2) W_kernel = compute_RI_Direct_W_kernel_ssd;
+            else if(s0==0 && s1==0 && s2==3) W_kernel = compute_RI_Direct_W_kernel_ssf;
+            else if(s0==0 && s1==1 && s2==0) W_kernel = compute_RI_Direct_W_kernel_sps;
+            else if(s0==0 && s1==1 && s2==1) W_kernel = compute_RI_Direct_W_kernel_spp;
+            else if(s0==0 && s1==1 && s2==2) W_kernel = compute_RI_Direct_W_kernel_spd;
+            else if(s0==0 && s1==1 && s2==3) W_kernel = compute_RI_Direct_W_kernel_spf;
+            else if(s0==1 && s1==1 && s2==0) W_kernel = compute_RI_Direct_W_kernel_pps;
+            else if(s0==1 && s1==1 && s2==1) W_kernel = compute_RI_Direct_W_kernel_ppp;
+            else if(s0==1 && s1==1 && s2==2) W_kernel = compute_RI_Direct_W_kernel_ppd;
+            else if(s0==1 && s1==1 && s2==3) W_kernel = compute_RI_Direct_W_kernel_ppf;
+            #if defined(COMPUTE_D_BASIS)            
+            else if(s0==0 && s1==2 && s2==0) W_kernel = compute_RI_Direct_W_kernel_sds;
+            else if(s0==0 && s1==2 && s2==1) W_kernel = compute_RI_Direct_W_kernel_sdp;
+            else if(s0==0 && s1==2 && s2==2) W_kernel = compute_RI_Direct_W_kernel_sdd;
+            else if(s0==0 && s1==2 && s2==3) W_kernel = compute_RI_Direct_W_kernel_sdf;
+            else if(s0==1 && s1==2 && s2==0) W_kernel = compute_RI_Direct_W_kernel_pds;
+            else if(s0==1 && s1==2 && s2==1) W_kernel = compute_RI_Direct_W_kernel_pdp;
+            else if(s0==1 && s1==2 && s2==2) W_kernel = compute_RI_Direct_W_kernel_pdd;
+            else if(s0==1 && s1==2 && s2==3) W_kernel = compute_RI_Direct_W_kernel_pdf;
+            else if(s0==2 && s1==2 && s2==0) W_kernel = compute_RI_Direct_W_kernel_dds;
+            else if(s0==2 && s1==2 && s2==1) W_kernel = compute_RI_Direct_W_kernel_ddp;
+            else if(s0==2 && s1==2 && s2==2) W_kernel = compute_RI_Direct_W_kernel_ddd;
+            else if(s0==2 && s1==2 && s2==3) W_kernel = compute_RI_Direct_W_kernel_ddf;
+            #endif
+            else W_kernel = compute_RI_Direct_W_kernel;
+            // W_kernel = compute_RI_Direct_W_kernel;
+
+            W_kernel<<<num_blocks, threads_per_block, 0, streams[stream_id]>>>(d_W_diff, &d_coefficient_matrix_diff[iter * num_basis], d_primitive_shells, d_auxiliary_primitive_shells, 
+                                                                                                    d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors, 
+                                                                                                    shell_s0, shell_s1, shell_s2, 
+                                                                                                    num_tasks, num_basis, 
+                                                                                                    &d_primitive_shell_pair_indices[shell_pair_type_infos[bra_id].start_index],
+                                                                                                    &d_schwarz_upper_bound_factors[shell_pair_type_infos[bra_id].start_index],
+                                                                                                    d_auxiliary_schwarz_upper_bound_factors,
+                                                                                                    schwarz_screening_threshold,
+                                                                                                    num_auxiliary_basis,
+                                                                                                    iter,
+                                                                                                    d_boys_grid);
+
+            stream_id++;
+        }
+
+
+    
+
+
+        cudaMemcpyAsync(d_Z_prev, &h_Z_tensor_prev[(size_t)iter * num_basis * num_auxiliary_basis], sizeof(real_t) * num_basis * num_auxiliary_basis, cudaMemcpyHostToDevice, stream_sub);
+
+        cudaDeviceSynchronize();
+
+
+
+        cublasDgemm(
+            cublasHandle,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            num_auxiliary_basis,
+            num_basis,
+            num_auxiliary_basis,
+            &alpha,
+            d_L_inv, num_auxiliary_basis,
+            d_W_diff, num_auxiliary_basis,
+            &alpha,
+            d_Z_prev, num_auxiliary_basis
+        );
+        
+
+
+
+
+        cudaDeviceSynchronize();
+
+
+
+
+        cublasDgemm(
+            cublasHandle,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            row,
+            row,
+            col,
+            &gamma,
+            d_Z_prev, col,
+            d_Z_prev, col,
+            &alpha,
+            d_K, row
+        );
+
+
+
+        cudaMemcpyAsync(&h_Z_tensor_prev[(size_t)iter * num_basis * num_auxiliary_basis], d_Z_prev, sizeof(real_t) * num_basis*num_auxiliary_basis, cudaMemcpyDeviceToHost, stream_sub);
+        
+        cudaDeviceSynchronize();
+    }
+    cublasSetStream(cublasHandle, 0);
+  
+
+
+    for(auto& stream : streams) cudaStreamDestroy(stream);
+
+
+    cudaMemcpyAsync(d_coefficient_matrix_prev, d_coefficient_matrix, sizeof(real_t) * num_basis * num_basis, cudaMemcpyDeviceToDevice, stream_sub);
+    // cudaMemcpyAsync(d_K_matrix_prev, d_K, sizeof(real_t) * num_basis * num_basis, cudaMemcpyDeviceToDevice, stream_sub);
+
+    // ////////////////////////////////// compute Fock matrix //////////////////////////////////
+
+    // // F = H + J - (1/2)*K
+    computeFockMatrix_RI_RHF_kernel<<<num_blocks, num_threads, 0, stream_main>>>(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, num_basis);
+
+    cudaDeviceSynchronize();
+
+    cudaStreamDestroy(stream_main);
+    cudaStreamDestroy(stream_sub);
+    
+    // free the memory
+    cudaFree(d_J);
+    cudaFree(d_K);
+    cudaFree(d_Z);
+    cudaFree(d_W_diff);
+    cudaFree(d_Z_prev);  
+
+    cudaFree(d_coefficient_matrix_diff);
+}
+
 } // namespace gansu::gpu

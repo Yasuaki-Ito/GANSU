@@ -1,0 +1,74 @@
+real_t val;
+
+// [px px | s]
+if ( !((g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(b->basis_index)]) < schwarz_screening_threshold) && (!is_prim_id_neq || g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(a->basis_index)]) < schwarz_screening_threshold))) {
+	val = coefAndNorm * (-c->exponent*p*(c->coordinate.x - Rp[0])*(Boys[1]*(a->coordinate.x - Rp[0])*sum_exp - Boys[2]*c->exponent*(c->coordinate.x - Rp[0])) + p*(b->coordinate.x - Rp[0])*sum_exp*(Boys[0]*(a->coordinate.x - Rp[0])*sum_exp - Boys[1]*c->exponent*(c->coordinate.x - Rp[0])) + 0.5*sum_exp*(Boys[0]*sum_exp - Boys[1]*c->exponent))/(p*(sum_exp*sum_exp)) ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+	atomicAdd(&d_W_diff[(a->basis_index) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(b->basis_index)]);
+	if(is_prim_id_neq) atomicAdd(&d_W_diff[(b->basis_index) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(a->basis_index)]);
+}
+
+// [px py | s]
+if ( !((g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(b->basis_index+1)]) < schwarz_screening_threshold) && (!is_prim_id_neq || g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(a->basis_index)]) < schwarz_screening_threshold))) {
+	val = coefAndNorm * (-c->exponent*(c->coordinate.x - Rp[0])*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1])) + sum_exp*((a->coordinate.x - Rp[0])*(Boys[0]*(a->coordinate.y - Rp[1])*sum_exp - Boys[1]*c->exponent*(c->coordinate.y - Rp[1])) - (a->coordinate.y - b->coordinate.y)*(Boys[0]*(a->coordinate.x - Rp[0])*sum_exp - Boys[1]*c->exponent*(c->coordinate.x - Rp[0]))))/(sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index+1] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+	atomicAdd(&d_W_diff[(a->basis_index) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(b->basis_index+1)]);
+	if(is_prim_id_neq) atomicAdd(&d_W_diff[(b->basis_index+1) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(a->basis_index)]);
+}
+
+// [px pz | s]
+if ( !((g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(b->basis_index+2)]) < schwarz_screening_threshold) && (!is_prim_id_neq || g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(a->basis_index)]) < schwarz_screening_threshold))) {
+	val = coefAndNorm * (-c->exponent*(c->coordinate.x - Rp[0])*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) + sum_exp*((a->coordinate.x - Rp[0])*(Boys[0]*(a->coordinate.z - Rp[2])*sum_exp - Boys[1]*c->exponent*(c->coordinate.z - Rp[2])) - (a->coordinate.z - b->coordinate.z)*(Boys[0]*(a->coordinate.x - Rp[0])*sum_exp - Boys[1]*c->exponent*(c->coordinate.x - Rp[0]))))/(sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index+2] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+	atomicAdd(&d_W_diff[(a->basis_index) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(b->basis_index+2)]);
+	if(is_prim_id_neq) atomicAdd(&d_W_diff[(b->basis_index+2) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(a->basis_index)]);
+}
+
+// [py px | s]
+if ( !((g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(b->basis_index)]) < schwarz_screening_threshold) && (!is_prim_id_neq || g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(a->basis_index+1)]) < schwarz_screening_threshold))) {
+	val = coefAndNorm * (-c->exponent*(c->coordinate.x - Rp[0])*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1])) + (b->coordinate.x - Rp[0])*sum_exp*(Boys[0]*(a->coordinate.y - Rp[1])*sum_exp - Boys[1]*c->exponent*(c->coordinate.y - Rp[1])))/(sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+1] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+	atomicAdd(&d_W_diff[(a->basis_index+1) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(b->basis_index)]);
+	if(is_prim_id_neq) atomicAdd(&d_W_diff[(b->basis_index) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(a->basis_index+1)]);
+}
+
+// [py py | s]
+if ( !((g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(b->basis_index+1)]) < schwarz_screening_threshold) && (!is_prim_id_neq || g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(a->basis_index+1)]) < schwarz_screening_threshold))) {
+	val = coefAndNorm * (-c->exponent*p*(c->coordinate.y - Rp[1])*(Boys[1]*(a->coordinate.y - Rp[1])*sum_exp - Boys[2]*c->exponent*(c->coordinate.y - Rp[1])) + p*(b->coordinate.y - Rp[1])*sum_exp*(Boys[0]*(a->coordinate.y - Rp[1])*sum_exp - Boys[1]*c->exponent*(c->coordinate.y - Rp[1])) + 0.5*sum_exp*(Boys[0]*sum_exp - Boys[1]*c->exponent))/(p*(sum_exp*sum_exp)) ;
+	val *= d_cgto_normalization_factors[a->basis_index+1] * d_cgto_normalization_factors[b->basis_index+1] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+	atomicAdd(&d_W_diff[(a->basis_index+1) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(b->basis_index+1)]);
+	if(is_prim_id_neq) atomicAdd(&d_W_diff[(b->basis_index+1) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(a->basis_index+1)]);
+}
+
+// [py pz | s]
+if ( !((g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(b->basis_index+2)]) < schwarz_screening_threshold) && (!is_prim_id_neq || g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(a->basis_index+1)]) < schwarz_screening_threshold))) {
+	val = coefAndNorm * (-c->exponent*(c->coordinate.y - Rp[1])*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) + sum_exp*((a->coordinate.y - Rp[1])*(Boys[0]*(a->coordinate.z - Rp[2])*sum_exp - Boys[1]*c->exponent*(c->coordinate.z - Rp[2])) - (a->coordinate.z - b->coordinate.z)*(Boys[0]*(a->coordinate.y - Rp[1])*sum_exp - Boys[1]*c->exponent*(c->coordinate.y - Rp[1]))))/(sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+1] * d_cgto_normalization_factors[b->basis_index+2] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+	atomicAdd(&d_W_diff[(a->basis_index+1) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(b->basis_index+2)]);
+	if(is_prim_id_neq) atomicAdd(&d_W_diff[(b->basis_index+2) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(a->basis_index+1)]);
+}
+
+// [pz px | s]
+if ( !((g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(b->basis_index)]) < schwarz_screening_threshold) && (!is_prim_id_neq || g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(a->basis_index+2)]) < schwarz_screening_threshold))) {
+	val = coefAndNorm * (-c->exponent*(c->coordinate.x - Rp[0])*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) + (b->coordinate.x - Rp[0])*sum_exp*(Boys[0]*(a->coordinate.z - Rp[2])*sum_exp - Boys[1]*c->exponent*(c->coordinate.z - Rp[2])))/(sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+2] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+	atomicAdd(&d_W_diff[(a->basis_index+2) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(b->basis_index)]);
+	if(is_prim_id_neq) atomicAdd(&d_W_diff[(b->basis_index) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(a->basis_index+2)]);
+}
+
+// [pz py | s]
+if ( !((g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(b->basis_index+1)]) < schwarz_screening_threshold) && (!is_prim_id_neq || g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(a->basis_index+2)]) < schwarz_screening_threshold))) {
+	val = coefAndNorm * (-c->exponent*(c->coordinate.y - Rp[1])*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) + (b->coordinate.y - Rp[1])*sum_exp*(Boys[0]*(a->coordinate.z - Rp[2])*sum_exp - Boys[1]*c->exponent*(c->coordinate.z - Rp[2])))/(sum_exp*sum_exp) ;
+	val *= d_cgto_normalization_factors[a->basis_index+2] * d_cgto_normalization_factors[b->basis_index+1] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+	atomicAdd(&d_W_diff[(a->basis_index+2) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(b->basis_index+1)]);
+	if(is_prim_id_neq) atomicAdd(&d_W_diff[(b->basis_index+1) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(a->basis_index+2)]);
+}
+
+// [pz pz | s]
+if ( !((g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(b->basis_index+2)]) < schwarz_screening_threshold) && (!is_prim_id_neq || g_upper_bound_factors[abc.x] * g_auxiliary_upper_bound_factors[primitive_index_c] * fabs(d_C_diff_vector[(a->basis_index+2)]) < schwarz_screening_threshold))) {
+	val = coefAndNorm * (-c->exponent*p*(c->coordinate.z - Rp[2])*(Boys[1]*(a->coordinate.z - Rp[2])*sum_exp - Boys[2]*c->exponent*(c->coordinate.z - Rp[2])) + p*(b->coordinate.z - Rp[2])*sum_exp*(Boys[0]*(a->coordinate.z - Rp[2])*sum_exp - Boys[1]*c->exponent*(c->coordinate.z - Rp[2])) + 0.5*sum_exp*(Boys[0]*sum_exp - Boys[1]*c->exponent))/(p*(sum_exp*sum_exp)) ;
+	val *= d_cgto_normalization_factors[a->basis_index+2] * d_cgto_normalization_factors[b->basis_index+2] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+	atomicAdd(&d_W_diff[(a->basis_index+2) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(b->basis_index+2)]);
+	if(is_prim_id_neq) atomicAdd(&d_W_diff[(b->basis_index+2) * num_auxiliary_basis + c->basis_index], val * d_C_diff_vector[(a->basis_index+2)]);
+}
+

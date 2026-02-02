@@ -1,0 +1,9 @@
+real_t val;
+
+// [s s | s]
+val = coefAndNorm * Boys[0] ;
+	val *= d_cgto_normalization_factors[a->basis_index] * d_cgto_normalization_factors[b->basis_index] * d_auxiliary_cgto_normalization_factors[c->basis_index];
+val *= (is_prim_id_neq) ? (d_density_matrix[(a->basis_index)*num_basis + b->basis_index] + d_density_matrix[(b->basis_index)*num_basis + a->basis_index]) : d_density_matrix[(a->basis_index)*num_basis + b->basis_index];
+atomicAdd(&d_c[c->basis_index], val);
+
+
