@@ -15,6 +15,7 @@
 
 #include "eri.hpp"
 #include "utils_cuda.hpp"
+#include "device_host_memory.hpp"
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
 
@@ -173,7 +174,7 @@ void ERI_RI::precomputation() {
 
     const size_t num_primitive_shell_pairs = primitive_shells.size() * (primitive_shells.size() + 1) / 2;
     size_t2* d_primitive_shell_pair_indices;
-    cudaMalloc((void**)&d_primitive_shell_pair_indices, sizeof(size_t2) * num_primitive_shell_pairs);
+    tracked_cudaMalloc((void**)&d_primitive_shell_pair_indices, sizeof(size_t2) * num_primitive_shell_pairs);
 
     int pair_idx = 0;
     const int threads_per_block = 1024;
@@ -235,7 +236,7 @@ void ERI_RI::precomputation() {
         );    
 
 
-    cudaFree(d_primitive_shell_pair_indices);
+    tracked_cudaFree(d_primitive_shell_pair_indices);
     /*
     if(1){
         // copy the intermediate matrix B to the host memory
@@ -267,18 +268,18 @@ ERI_Direct::ERI_Direct(const HF& hf):
     num_fock_replicas_(8)
 {
     // for distributed atomicAdd operations
-    cudaMalloc(&fock_matrix_replicas_, sizeof(real_t) * num_basis_ * num_basis_ * num_fock_replicas_);
+    tracked_cudaMalloc(&fock_matrix_replicas_, sizeof(real_t) * num_basis_ * num_basis_ * num_fock_replicas_);
     //cudaMemset(fock_matrix_replicas_, 0.0, sizeof(real_t) * num_basis_ * num_basis_ * num_fock_replicas_);
 }
 
 ERI_Direct::~ERI_Direct() {
-    for (auto p : global_counters_) { if (p) cudaFree(p); }
-    for (auto p : min_skipped_columns_) { if (p) cudaFree(p); }
+    for (auto p : global_counters_) { if (p) tracked_cudaFree(p); }
+    for (auto p : min_skipped_columns_) { if (p) tracked_cudaFree(p); }
     global_counters_.clear();
     min_skipped_columns_.clear();
 
     if (fock_matrix_replicas_) {
-        cudaFree(fock_matrix_replicas_);
+        tracked_cudaFree(fock_matrix_replicas_);
         fock_matrix_replicas_ = nullptr;
     }
 }
@@ -319,8 +320,8 @@ void ERI_Direct::precomputation()
         shell_s1 = shell_type_infos[s1];
         num_bra = (s0 == s1) ? shell_s0.count * (shell_s0.count + 1) / 2 : shell_s0.count * shell_s1.count;
         num_bra_groups = (num_bra + task_group_size - 1) / task_group_size;
-        cudaMalloc(&global_counters_[idx], sizeof(int) * num_bra_groups);
-        cudaMalloc(&min_skipped_columns_[idx], sizeof(int) * num_bra_groups);
+        tracked_cudaMalloc(&global_counters_[idx], sizeof(int) * num_bra_groups);
+        tracked_cudaMalloc(&min_skipped_columns_[idx], sizeof(int) * num_bra_groups);
     }
 
     gpu::computeSchwarzUpperBounds(

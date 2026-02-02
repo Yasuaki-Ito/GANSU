@@ -3,6 +3,7 @@
 #include <assert.h>
 #include "rhf.hpp"
 #include "eri_stored.hpp"
+#include "device_host_memory.hpp"
 
 namespace gansu {
 
@@ -738,9 +739,9 @@ real_t mp4_from_aoeri_via_full_moeri(const real_t* d_eri_ao, const real_t* d_coe
     // ------------------------------------------------------------
     double* d_eri_mo = nullptr;
     size_t bytes_mo = (size_t)N * (size_t)N * sizeof(double);
-    cudaMalloc((void**)&d_eri_mo, bytes_mo);
+    tracked_cudaMalloc((void**)&d_eri_mo, bytes_mo);
     if(!d_eri_mo){
-        THROW_EXCEPTION("cudaMalloc failed for d_eri_mo.");
+        THROW_EXCEPTION("tracked_cudaMalloc failed for d_eri_mo.");
     }
 
 
@@ -764,7 +765,7 @@ real_t mp4_from_aoeri_via_full_moeri(const real_t* d_eri_ao, const real_t* d_coe
     // 3) MP2 energy from full MO ERI
     // ------------------------------------------------------------
     real_t* d_mp2_energy;
-    cudaMalloc((void**)&d_mp2_energy, sizeof(real_t));
+    tracked_cudaMalloc((void**)&d_mp2_energy, sizeof(real_t));
     if(d_mp2_energy == nullptr) {
         THROW_EXCEPTION("Failed to allocate device memory for MP2 energy.");
     }
@@ -786,7 +787,7 @@ real_t mp4_from_aoeri_via_full_moeri(const real_t* d_eri_ao, const real_t* d_coe
     real_t h_mp2_energy;
     cudaMemcpy(&h_mp2_energy, d_mp2_energy, sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
-    cudaFree(d_mp2_energy);
+    tracked_cudaFree(d_mp2_energy);
     std::cout << "MP2 energy: " << h_mp2_energy << " Hartree" << std::endl;
 
 
@@ -795,7 +796,7 @@ real_t mp4_from_aoeri_via_full_moeri(const real_t* d_eri_ao, const real_t* d_coe
     // 4) MP3 energy from full MO ERI
     // ------------------------------------------------------------
     real_t* d_mp3_energy;
-    cudaMalloc((void**)&d_mp3_energy, sizeof(real_t) * 3); // Allocate space for 3 terms
+    tracked_cudaMalloc((void**)&d_mp3_energy, sizeof(real_t) * 3); // Allocate space for 3 terms
     if(d_mp3_energy == nullptr) {
         THROW_EXCEPTION("Failed to allocate device memory for MP3 energy.");
     }
@@ -850,8 +851,8 @@ real_t mp4_from_aoeri_via_full_moeri(const real_t* d_eri_ao, const real_t* d_coe
     cudaMemcpy(h_mp3_energy, d_mp3_energy, sizeof(real_t)*3, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
     
-    cudaFree(d_mp3_energy);
-    cudaFree(d_eri_mo);
+    tracked_cudaFree(d_mp3_energy);
+    tracked_cudaFree(d_eri_mo);
 
     std::cout << "4h2p term: " << h_mp3_energy[0] << " Hartree" << std::endl;
     std::cout << "2h4p term: " << h_mp3_energy[1] << " Hartree" << std::endl;
@@ -864,7 +865,7 @@ real_t mp4_from_aoeri_via_full_moeri(const real_t* d_eri_ao, const real_t* d_coe
     // 5) compute MP4 energy
     // ------------------------------------------------------------
     real_t* d_mp4_energy;
-    cudaMalloc((void**)&d_mp4_energy, sizeof(real_t) * 5); // Allocate space for 5 kernels
+    tracked_cudaMalloc((void**)&d_mp4_energy, sizeof(real_t) * 5); // Allocate space for 5 kernels
     if(d_mp4_energy == nullptr) {
         THROW_EXCEPTION("Failed to allocate device memory for MP4 energy.");
     }
@@ -929,8 +930,8 @@ real_t mp4_from_aoeri_via_full_moeri(const real_t* d_eri_ao, const real_t* d_coe
     real_t h_mp4_energy[5];
     cudaMemcpy(h_mp4_energy, d_mp4_energy, sizeof(real_t)*5, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
-    cudaFree(d_mp4_energy);
-    cudaFree(d_eri_mo);
+    tracked_cudaFree(d_mp4_energy);
+    tracked_cudaFree(d_eri_mo);
     std::cout << "2h6p term: " << h_mp4_energy[0] << " Hartree" << std::endl;
     std::cout << "3h5p term: " << h_mp4_energy[1] << " Hartree" << std::endl;
     std::cout << "4h4p term: " << h_mp4_energy[2] << " Hartree" << std::endl;
@@ -4499,9 +4500,9 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
     // ------------------------------------------------------------
     double* d_eri_mo = nullptr;
     size_t bytes_mo = (size_t)N * (size_t)N * sizeof(double);
-    cudaMalloc((void**)&d_eri_mo, bytes_mo);
+    tracked_cudaMalloc((void**)&d_eri_mo, bytes_mo);
     if(!d_eri_mo){
-        THROW_EXCEPTION("cudaMalloc failed for d_eri_mo.");
+        THROW_EXCEPTION("tracked_cudaMalloc failed for d_eri_mo.");
     }
 
 
@@ -4525,7 +4526,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
     // 3) MP2 energy from full MO ERI
     // ------------------------------------------------------------
     real_t* d_mp2_energy;
-    cudaMalloc((void**)&d_mp2_energy, sizeof(real_t));
+    tracked_cudaMalloc((void**)&d_mp2_energy, sizeof(real_t));
     if(d_mp2_energy == nullptr) {
         THROW_EXCEPTION("Failed to allocate device memory for MP2 energy.");
     }
@@ -4547,7 +4548,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
     real_t h_mp2_energy;
     cudaMemcpy(&h_mp2_energy, d_mp2_energy, sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
-    cudaFree(d_mp2_energy);
+    tracked_cudaFree(d_mp2_energy);
     std::cout << "MP2 energy: " << h_mp2_energy << " Hartree" << std::endl;
 
 
@@ -4556,7 +4557,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
     // 4) MP3 energy from full MO ERI
     // ------------------------------------------------------------
     real_t* d_mp3_energy;
-    cudaMalloc((void**)&d_mp3_energy, sizeof(real_t) * 3); // Allocate space for 3 terms
+    tracked_cudaMalloc((void**)&d_mp3_energy, sizeof(real_t) * 3); // Allocate space for 3 terms
     if(d_mp3_energy == nullptr) {
         THROW_EXCEPTION("Failed to allocate device memory for MP3 energy.");
     }
@@ -4611,7 +4612,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
     cudaMemcpy(h_mp3_energy, d_mp3_energy, sizeof(real_t)*3, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
     
-    cudaFree(d_mp3_energy);
+    tracked_cudaFree(d_mp3_energy);
 
     std::cout << "4h2p term: " << h_mp3_energy[0] << " Hartree" << std::endl;
     std::cout << "2h4p term: " << h_mp3_energy[1] << " Hartree" << std::endl;
@@ -4640,7 +4641,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
         int kernel_offset = 0;
 
         real_t* d_contrib;
-        cudaMalloc((void**)&d_contrib, sizeof(real_t));
+        tracked_cudaMalloc((void**)&d_contrib, sizeof(real_t));
         cudaMemset(d_contrib, 0.0, sizeof(real_t));        
 
         // Launch the kernel for single excitation terms
@@ -4672,7 +4673,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
         int kernel_offset = num_mp4_terms_single;
 
         real_t* d_contrib;
-        cudaMalloc((void**)&d_contrib, sizeof(real_t));
+        tracked_cudaMalloc((void**)&d_contrib, sizeof(real_t));
         cudaMemset(d_contrib, 0.0, sizeof(real_t));        
 
         // Launch the kernel for double excitation terms
@@ -4705,7 +4706,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
         int kernel_offset = num_mp4_terms_single + num_mp4_terms_double;
 
         real_t* d_contrib;
-        cudaMalloc((void**)&d_contrib, sizeof(real_t));
+        tracked_cudaMalloc((void**)&d_contrib, sizeof(real_t));
         cudaMemset(d_contrib, 0.0, sizeof(real_t));        
 
         // Launch the kernel for triple excitation terms
@@ -4741,7 +4742,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
         int kernel_offset = num_mp4_terms_single + num_mp4_terms_double + num_mp4_terms_triple;
 
         real_t* d_contrib;
-        cudaMalloc((void**)&d_contrib, sizeof(real_t));
+        tracked_cudaMalloc((void**)&d_contrib, sizeof(real_t));
         cudaMemset(d_contrib, 0.0, sizeof(real_t));        
 
         // Launch the kernel for quadruple excitation terms
@@ -4777,7 +4778,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
 
 
 
-    cudaFree(d_eri_mo);
+    tracked_cudaFree(d_eri_mo);
 
 
 

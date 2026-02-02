@@ -22,6 +22,7 @@
 
 
 #include "rhf.hpp"
+#include "device_host_memory.hpp"
 
 namespace gansu{
 
@@ -479,7 +480,7 @@ void search_k_and_cudamalloc_4cERI(int mocc, int mvir, int &k, double **d_iajb, 
     // k = (int)(k*mvir / 32) * 32;
     // k = 10;
 
-    while(cudaMallocAsync((void**)d_iajb, sizeof(double) * k * mvir * mocc * mvir, stream) != cudaSuccess){
+    while(tracked_cudaMallocAsync((void**)d_iajb, sizeof(double) * k * mvir * mocc * mvir, stream) != cudaSuccess){
         k *= 0.9;
     }
 
@@ -512,10 +513,10 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
 
 
     real_t* d_tmp;
-    cudaMalloc((void**)&d_tmp, sizeof(double) * num_basis_ * nvir * num_auxiliary_basis);
+    tracked_cudaMalloc((void**)&d_tmp, sizeof(double) * num_basis_ * nvir * num_auxiliary_basis);
 
     double *d_energy;
-    cudaMalloc((void**)&d_energy, sizeof(double));
+    tracked_cudaMalloc((void**)&d_energy, sizeof(double));
     cudaMemset(d_energy, 0.0, sizeof(double));
 
 
@@ -541,7 +542,7 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
     search_k_and_cudamalloc_4cERI(nocc, nvir, nocc_block, &d_iajb, streams[0]);
 
     transform_intermediate_matrix(num_basis_, nocc, nvir, num_auxiliary_basis, d_C, d_intermediate_matrix_B, d_tmp);
-    cudaFree(d_tmp);
+    tracked_cudaFree(d_tmp);
 
 
 
@@ -611,7 +612,7 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
     cudaEventRecord(events[1], streams[0]);
     cudaEventSynchronize(events[1]);
 
-    cudaFree(d_iajb);            
+    tracked_cudaFree(d_iajb);            
     cublasDestroy(handle);
 
 
@@ -634,7 +635,7 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
 
 
     printf("(nocc, nvir, naux) = (%d, %d, %d)\n",nocc, nvir, num_auxiliary_basis);
-    cudaFree(d_energy);
+    tracked_cudaFree(d_energy);
 
 
     for (int i = 0; i < 4; i++) cudaStreamDestroy(streams[i]);

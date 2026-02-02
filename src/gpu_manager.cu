@@ -21,6 +21,7 @@
 #include "int2c2e.hpp"
 #include "int3c2e.hpp"
 #include "int2e_direct.hpp"
+#include "device_host_memory.hpp" // For tracked_gansu::tracked_cudaMalloc/tracked_cudaFree
 
 #include <vector>    // std::vector
 #include <tuple>     // std::tuple
@@ -72,7 +73,7 @@ int eigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_
         &workspaceInBytesOnDevice, &workspaceInBytesOnHost
     );
     // workspace allocation
-    err = cudaMalloc(&d_workspace, workspaceInBytesOnDevice);
+    err = gansu::tracked_cudaMalloc(&d_workspace, workspaceInBytesOnDevice);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for workspace: ") + std::string(cudaGetErrorString(err)));
     }
@@ -83,14 +84,14 @@ int eigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_
 
     // allocate return value for the error status        
     int* d_info;
-    err = cudaMalloc(&d_info, sizeof(int));
+    err = gansu::tracked_cudaMalloc(&d_info, sizeof(int));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for error status: ") + std::string(cudaGetErrorString(err)));
     }
 
     // temporary matrix allocation for d_matrix since the eigenvectors will be stored in the same memory of d_matrix
     real_t* d_temp_matrix;
-    err = cudaMalloc(&d_temp_matrix, size * size * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_matrix, size * size * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -123,10 +124,10 @@ int eigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_
 
 
     // free the temporary memory
-    cudaFree(d_temp_matrix);
-    cudaFree(d_workspace);
-    cudaFree(h_workspace);
-    cudaFree(d_info);
+    gansu::tracked_cudaFree(d_temp_matrix);
+    gansu::tracked_cudaFree(d_workspace);
+    cudaFreeHost(h_workspace);
+    gansu::tracked_cudaFree(d_info);
 
     return h_info; // 0 if successful
 }
@@ -324,7 +325,7 @@ void makeDiagonalMatrix(const real_t* d_vector, real_t* d_matrix, const int size
     cudaError_t err;
 
     double* d_trace;
-    err = cudaMalloc(&d_trace, sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_trace, sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for trace: ") + std::string(cudaGetErrorString(err)));
     }
@@ -337,7 +338,7 @@ void makeDiagonalMatrix(const real_t* d_vector, real_t* d_matrix, const int size
     getMatrixTrace<<<num_blocks, num_threads_per_block>>>(d_matrix, d_trace, size);
     cudaMemcpy(&h_trace, d_trace, sizeof(real_t), cudaMemcpyDeviceToHost);
 
-    cudaFree(d_trace);
+    gansu::tracked_cudaFree(d_trace);
     return h_trace;
 }
 
@@ -547,21 +548,21 @@ void computeCoefficientMatrix(const real_t* d_fock_matrix, const real_t* d_trans
 
     cudaError_t err;
 
-    err = cudaMalloc(&d_tempMatrix, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_tempMatrix, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_tempSymFockMatrix, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_tempSymFockMatrix, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary symmetrized Fock matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_tempEigenvectors, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_tempEigenvectors, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary eigenvectors: ") + std::string(cudaGetErrorString(err)));
     }
 
     if (d_orbital_energies == nullptr){
-        err = cudaMalloc(&d_tempEigenvalues, num_basis * sizeof(real_t));
+        err = gansu::tracked_cudaMalloc(&d_tempEigenvalues, num_basis * sizeof(real_t));
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary eigenvalues: ") + std::string(cudaGetErrorString(err)));
         }
@@ -596,12 +597,12 @@ void computeCoefficientMatrix(const real_t* d_fock_matrix, const real_t* d_trans
     );
 
     // free the temporary memory
-    cudaFree(d_tempMatrix);
-    cudaFree(d_tempSymFockMatrix);
-    cudaFree(d_tempEigenvectors);
+    gansu::tracked_cudaFree(d_tempMatrix);
+    gansu::tracked_cudaFree(d_tempSymFockMatrix);
+    gansu::tracked_cudaFree(d_tempEigenvectors);
 
     if (d_orbital_energies == nullptr){
-        cudaFree(d_tempEigenvalues);
+        gansu::tracked_cudaFree(d_tempEigenvalues);
     }
 }
 
@@ -750,23 +751,23 @@ void computeFockMatrix_ROHF(const real_t* d_density_matrix_closed, const real_t*
 
     cudaError_t err;
 
-    err = cudaMalloc(&d_temp_F_MO_closed, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_F_MO_closed, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary Fock matrix for closed-shell orbitals: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_temp_F_MO_open, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_F_MO_open, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary Fock matrix for open-shell orbitals: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_temp_R_MO, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_R_MO, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary unified Fock matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_temp_matrix1, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_matrix1, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix 1: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_temp_matrix2, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_matrix2, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix 2: ") + std::string(cudaGetErrorString(err)));
     }
@@ -814,11 +815,11 @@ void computeFockMatrix_ROHF(const real_t* d_density_matrix_closed, const real_t*
     }
 
     // free the temporary memory
-    cudaFree(d_temp_F_MO_closed);
-    cudaFree(d_temp_F_MO_open);
-    cudaFree(d_temp_R_MO);
-    cudaFree(d_temp_matrix1);
-    cudaFree(d_temp_matrix2);
+    gansu::tracked_cudaFree(d_temp_F_MO_closed);
+    gansu::tracked_cudaFree(d_temp_F_MO_open);
+    gansu::tracked_cudaFree(d_temp_R_MO);
+    gansu::tracked_cudaFree(d_temp_matrix1);
+    gansu::tracked_cudaFree(d_temp_matrix2);
 
 }
 
@@ -911,15 +912,15 @@ real_t computeOptimalDampingFactor_RHF(const real_t* d_fock_matrix, const real_t
 
     cudaError_t err;
 
-    err = cudaMalloc(&d_tempDiffFockMatrix, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_tempDiffFockMatrix, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary difference Fock matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_tempDiffDensityMatrix, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_tempDiffDensityMatrix, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary difference density matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_tempMatrix, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_tempMatrix, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -958,9 +959,9 @@ real_t computeOptimalDampingFactor_RHF(const real_t* d_fock_matrix, const real_t
     }
 
     // free the temporary memory
-    cudaFree(d_tempDiffFockMatrix);
-    cudaFree(d_tempDiffDensityMatrix);
-    cudaFree(d_tempMatrix);
+    gansu::tracked_cudaFree(d_tempDiffFockMatrix);
+    gansu::tracked_cudaFree(d_tempDiffDensityMatrix);
+    gansu::tracked_cudaFree(d_tempMatrix);
 
 
     return alpha;
@@ -996,7 +997,7 @@ void damping(real_t* d_matrix_old, real_t* d_matrix_new, const real_t alpha, int
 
     cudaError_t err;
 
-    err = cudaMalloc(&d_tempMatrix, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_tempMatrix, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1006,7 +1007,7 @@ void damping(real_t* d_matrix_old, real_t* d_matrix_new, const real_t alpha, int
     cudaMemcpy(d_matrix_old, d_tempMatrix, num_basis * num_basis * sizeof(real_t), cudaMemcpyDeviceToDevice);
     cudaMemcpy(d_matrix_new, d_tempMatrix, num_basis * num_basis * sizeof(real_t), cudaMemcpyDeviceToDevice);
 
-    cudaFree(d_tempMatrix);
+    gansu::tracked_cudaFree(d_tempMatrix);
 }
 
 
@@ -1028,15 +1029,15 @@ void computeDIISErrorMatrix(const real_t* d_overlap_matrix, const real_t* d_tran
 
     cudaError_t err;
 
-    err = cudaMalloc(&d_tempFPS, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_tempFPS, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary FPS matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_tempSPF, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_tempSPF, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary SPF matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_tempMatrix1, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_tempMatrix1, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix 1: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1060,9 +1061,9 @@ void computeDIISErrorMatrix(const real_t* d_overlap_matrix, const real_t* d_tran
         matrixMatrixProduct(d_tempFPS, d_transform_matrix, d_diis_error_matrix, num_basis, false, true);
     }
 
-    cudaFree(d_tempMatrix1);
-    cudaFree(d_tempFPS);
-    cudaFree(d_tempSPF);
+    gansu::tracked_cudaFree(d_tempMatrix1);
+    gansu::tracked_cudaFree(d_tempFPS);
+    gansu::tracked_cudaFree(d_tempSPF);
 
 }
 
@@ -1093,7 +1094,7 @@ void computeFockMatrixDIIS(real_t* d_error_matrices, real_t* d_fock_matrices, re
 
     cudaError_t err;
 
-    err = cudaMalloc(&d_DIIS_matrix, num_size * num_size * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_DIIS_matrix, num_size * num_size * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for DIIS matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1119,7 +1120,7 @@ void computeFockMatrixDIIS(real_t* d_error_matrices, real_t* d_fock_matrices, re
         THROW_EXCEPTION("Failed to allocate host memory for DIIS right-hand side vector.");
     }
     real_t* d_DIIS_rhs;
-    err = cudaMalloc(&d_DIIS_rhs, num_size * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_DIIS_rhs, num_size * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for DIIS right-hand side vector: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1141,7 +1142,7 @@ void computeFockMatrixDIIS(real_t* d_error_matrices, real_t* d_fock_matrices, re
 
     // allocate the workspace
     real_t* d_work;
-    err = cudaMalloc(&d_work, work_size * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_work, work_size * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for workspace: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1149,11 +1150,11 @@ void computeFockMatrixDIIS(real_t* d_error_matrices, real_t* d_fock_matrices, re
     // pivot array and info
     int* d_pivot = nullptr;
     int* d_info = nullptr;
-    err = cudaMalloc(&d_pivot, num_size * sizeof(int));
+    err = gansu::tracked_cudaMalloc(&d_pivot, num_size * sizeof(int));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for pivot array: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_info, sizeof(int));
+    err = gansu::tracked_cudaMalloc(&d_info, sizeof(int));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for info array: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1176,11 +1177,11 @@ void computeFockMatrixDIIS(real_t* d_error_matrices, real_t* d_fock_matrices, re
     }
 
     // free the memory
-    cudaFree(d_DIIS_matrix);
-    cudaFree(d_DIIS_rhs);
-    cudaFree(d_work);
-    cudaFree(d_pivot);
-    cudaFree(d_info);
+    gansu::tracked_cudaFree(d_DIIS_matrix);
+    gansu::tracked_cudaFree(d_DIIS_rhs);
+    gansu::tracked_cudaFree(d_work);
+    gansu::tracked_cudaFree(d_pivot);
+    gansu::tracked_cudaFree(d_info);
 
     delete[] h_DIIS_matrix;
     delete[] h_DIIS_rhs;
@@ -1207,7 +1208,7 @@ void computeFockMatrixDIIS(real_t* d_error_matrices, real_t* d_fock_matrices, re
     // allocate temporary memory
     real_t* d_temp_FockMatrix = nullptr;
     real_t* h_temp_FockMatrix = new real_t[num_basis * num_basis];
-    err = cudaMalloc(&d_temp_FockMatrix, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_FockMatrix, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary Fock matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1221,7 +1222,7 @@ void computeFockMatrixDIIS(real_t* d_error_matrices, real_t* d_fock_matrices, re
     computeCoefficientMatrix(d_temp_FockMatrix, d_transform_matrix, d_coefficient_matrix, num_basis);
 
     // free the temporary memory
-    cudaFree(d_temp_FockMatrix);
+    gansu::tracked_cudaFree(d_temp_FockMatrix);
 
 }
 
@@ -1245,18 +1246,18 @@ void invertMatrix(double* d_A, const int N) {
 
     cudaError_t err;
     
-    err = cudaMalloc(&d_ipiv, N * sizeof(int));
+    err = gansu::tracked_cudaMalloc(&d_ipiv, N * sizeof(int));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for pivot array: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_info, sizeof(int));
+    err = gansu::tracked_cudaMalloc(&d_info, sizeof(int));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for info array: ") + std::string(cudaGetErrorString(err)));
     }
 
     // Get workspace size for LU decomposition
     cusolverDnDgetrf_bufferSize(cusolverHandle, N, N, d_A, N, &lwork);
-    err = cudaMalloc(&d_work, lwork * sizeof(double));
+    err = gansu::tracked_cudaMalloc(&d_work, lwork * sizeof(double));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for workspace: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1266,7 +1267,7 @@ void invertMatrix(double* d_A, const int N) {
 
     // Allocate and initialize an identity matrix on the device
     double *d_I;
-    err = cudaMalloc(&d_I, N * N * sizeof(double));
+    err = gansu::tracked_cudaMalloc(&d_I, N * N * sizeof(double));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for identity matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1283,10 +1284,10 @@ void invertMatrix(double* d_A, const int N) {
     cudaMemcpy(d_A, d_I, N * N * sizeof(double), cudaMemcpyDeviceToDevice);
 
     // Cleanup
-    cudaFree(d_ipiv);
-    cudaFree(d_info);
-    cudaFree(d_work);
-    cudaFree(d_I);
+    gansu::tracked_cudaFree(d_ipiv);
+    gansu::tracked_cudaFree(d_info);
+    gansu::tracked_cudaFree(d_work);
+    gansu::tracked_cudaFree(d_I);
 }
 
 
@@ -1312,14 +1313,14 @@ void choleskyDecomposition(double* d_A, const int N) {
     cudaError_t err;
 
     // Allocate device memory for error info
-    err = cudaMalloc(&d_info, sizeof(int));
+    err = gansu::tracked_cudaMalloc(&d_info, sizeof(int));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for info array: ") + std::string(cudaGetErrorString(err)));
     }
 
     // Get workspace size
     cusolverDnDpotrf_bufferSize(cusolverHandle, CUBLAS_FILL_MODE_UPPER, N, d_A, N, &lwork);
-    err = cudaMalloc(&d_work, lwork * sizeof(double));
+    err = gansu::tracked_cudaMalloc(&d_work, lwork * sizeof(double));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for workspace: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1335,8 +1336,8 @@ void choleskyDecomposition(double* d_A, const int N) {
 
 
     // Cleanup
-    cudaFree(d_work);
-    cudaFree(d_info);
+    gansu::tracked_cudaFree(d_work);
+    gansu::tracked_cudaFree(d_info);
 }
 
 
@@ -1359,7 +1360,7 @@ void solve_lower_triangular(double* d_A, double* d_B, int row, int col){
     cudaError_t err;
 
     double *d_tmp;
-    err = cudaMalloc((void**)&d_tmp, sizeof(double) * row * col);
+    err = gansu::tracked_cudaMalloc((void**)&d_tmp, sizeof(double) * row * col);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1406,7 +1407,7 @@ void solve_lower_triangular(double* d_A, double* d_B, int row, int col){
         d_B, col
     );
 
-    cudaFree(d_tmp);
+    gansu::tracked_cudaFree(d_tmp);
 }
 
 
@@ -1460,7 +1461,7 @@ void compute_RI_IntermediateMatrixB(
 
     // Allocate device memory for the two-center ERIs
     real_t* d_two_center_eri;
-    err = cudaMalloc(&d_two_center_eri, num_auxiliary_basis * num_auxiliary_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_two_center_eri, num_auxiliary_basis * num_auxiliary_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for two-center ERIs: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1484,7 +1485,7 @@ void compute_RI_IntermediateMatrixB(
 
     // Allocate device memory for the three-center ERIs
     real_t* d_three_center_eri;
-    err = cudaMalloc(&d_three_center_eri, (size_t)num_basis * (size_t)num_basis * (size_t)num_auxiliary_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_three_center_eri, (size_t)num_basis * (size_t)num_basis * (size_t)num_auxiliary_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for three-center ERIs: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1515,8 +1516,8 @@ void compute_RI_IntermediateMatrixB(
     cudaMemcpy(d_intermediate_matrix_B, d_three_center_eri, sizeof(real_t) * num_auxiliary_basis*num_basis*num_basis, cudaMemcpyDeviceToDevice);
 
 
-    cudaFree(d_two_center_eri);
-    cudaFree(d_three_center_eri);
+    gansu::tracked_cudaFree(d_two_center_eri);
+    gansu::tracked_cudaFree(d_three_center_eri);
 
 }
 
@@ -1599,11 +1600,11 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
     ////////////////////////////////// compute J-matrix //////////////////////////////////
     real_t* d_J = nullptr;
     real_t* d_density_matrix = nullptr;
-    err = cudaMalloc(&d_J, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_J, sizeof(real_t)*num_basis*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for J matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_density_matrix, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_density_matrix, sizeof(real_t)*num_basis*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for density matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1613,7 +1614,7 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
 
     // W = B D (Matrix(M_aux x M^2 matrix) * Vector (M^2 x 1) )
     real_t* d_W = nullptr;
-    err = cudaMalloc(&d_W, sizeof(real_t)*num_auxiliary_basis);
+    err = gansu::tracked_cudaMalloc(&d_W, sizeof(real_t)*num_auxiliary_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for W vector: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1628,24 +1629,24 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
 
 
     // free the memory
-    cudaFree(d_W);
-    cudaFree(d_density_matrix);
+    gansu::tracked_cudaFree(d_W);
+    gansu::tracked_cudaFree(d_density_matrix);
 
     ////////////////////////////////// compute K-matrix //////////////////////////////////
     real_t* d_T = nullptr;
     real_t* d_V = nullptr;
-    err = cudaMalloc(&d_T, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_T, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for T matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_V, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_V, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for V matrix: ") + std::string(cudaGetErrorString(err)));
     }
 
     ////////////// compute Ka-matrix //////////////
     real_t* d_Ka = nullptr;
-    err = cudaMalloc(&d_Ka, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_Ka, sizeof(real_t)*num_basis*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for Ka matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1667,7 +1668,7 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
 
     ////////////// compute Kb-matrix //////////////
     real_t* d_Kb = nullptr;
-    err = cudaMalloc(&d_Kb, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_Kb, sizeof(real_t)*num_basis*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for Kb matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1691,8 +1692,8 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
 
 
     // free the memory
-    cudaFree(d_T);
-    cudaFree(d_V);
+    gansu::tracked_cudaFree(d_T);
+    gansu::tracked_cudaFree(d_V);
 
     ////////////////////////////////// compute Fock matrix //////////////////////////////////
 
@@ -1703,9 +1704,9 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
 
 
     // free the memory
-    cudaFree(d_J);
-    cudaFree(d_Ka);
-    cudaFree(d_Kb);
+    gansu::tracked_cudaFree(d_J);
+    gansu::tracked_cudaFree(d_Ka);
+    gansu::tracked_cudaFree(d_Kb);
 }
 
 
@@ -1721,23 +1722,23 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
     real_t* d_temp_R_MO = nullptr; /// unified Fock matrix R_MO
     real_t* d_temp_matrix1 = nullptr;
     real_t* d_temp_matrix2 = nullptr;
-    err = cudaMalloc(&d_temp_F_MO_closed, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_F_MO_closed, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for closed-shell Fock matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_temp_F_MO_open, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_F_MO_open, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for open-shell Fock matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_temp_R_MO, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_R_MO, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for unified Fock matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_temp_matrix1, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_matrix1, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix 1: ") + std::string(cudaGetErrorString(err)));
     }
-    err = cudaMalloc(&d_temp_matrix2, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_matrix2, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix 2: ") + std::string(cudaGetErrorString(err)));
     }
@@ -1751,11 +1752,11 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
         ////////////////////////////////// compute J-matrix //////////////////////////////////
         real_t* d_J = nullptr;
         real_t* d_density_matrix = nullptr;
-        err = cudaMalloc(&d_J, sizeof(real_t)*num_basis*num_basis);
+        err = gansu::tracked_cudaMalloc(&d_J, sizeof(real_t)*num_basis*num_basis);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for J matrix: ") + std::string(cudaGetErrorString(err)));
         }
-        err = cudaMalloc(&d_density_matrix, sizeof(real_t)*num_basis*num_basis);
+        err = gansu::tracked_cudaMalloc(&d_density_matrix, sizeof(real_t)*num_basis*num_basis);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for density matrix: ") + std::string(cudaGetErrorString(err)));
         }
@@ -1765,7 +1766,7 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
 
         // W = B D (Matrix(M_aux x M^2 matrix) * Vector (M^2 x 1) )
         real_t* d_W = nullptr;
-        err = cudaMalloc(&d_W, sizeof(real_t)*num_auxiliary_basis);
+        err = gansu::tracked_cudaMalloc(&d_W, sizeof(real_t)*num_auxiliary_basis);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for W vector: ") + std::string(cudaGetErrorString(err)));
         }
@@ -1780,23 +1781,23 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
 
 
         // free the memory
-        cudaFree(d_W);
+        gansu::tracked_cudaFree(d_W);
 
         ////////////////////////////////// compute Kclosed-matrix //////////////////////////////////
         real_t* d_T = nullptr;
         real_t* d_V = nullptr;
-        err = cudaMalloc(&d_T, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
+        err = gansu::tracked_cudaMalloc(&d_T, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for T matrix: ") + std::string(cudaGetErrorString(err)));
         }
-        err = cudaMalloc(&d_V, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
+        err = gansu::tracked_cudaMalloc(&d_V, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for V matrix: ") + std::string(cudaGetErrorString(err)));
         }
 
         ////////////// compute Kclosed-matrix //////////////
         real_t* d_Kclosed = nullptr;
-        err = cudaMalloc(&d_Kclosed, sizeof(real_t)*num_basis*num_basis);
+        err = gansu::tracked_cudaMalloc(&d_Kclosed, sizeof(real_t)*num_basis*num_basis);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for Kclosed matrix: ") + std::string(cudaGetErrorString(err)));
         }
@@ -1819,7 +1820,7 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
     
         ////////////// compute Kopen-matrix //////////////
         real_t* d_Kopen = nullptr;
-        err = cudaMalloc(&d_Kopen, sizeof(real_t)*num_basis*num_basis);
+        err = gansu::tracked_cudaMalloc(&d_Kopen, sizeof(real_t)*num_basis*num_basis);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for Kopen matrix: ") + std::string(cudaGetErrorString(err)));
         }
@@ -1844,8 +1845,8 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
 
     
         // free the memory
-        cudaFree(d_T);
-        cudaFree(d_V);
+        gansu::tracked_cudaFree(d_T);
+        gansu::tracked_cudaFree(d_V);
         
 
 
@@ -1857,10 +1858,10 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
 
 
         // free the memory
-        cudaFree(d_J);
-        cudaFree(d_Kclosed);
-        cudaFree(d_Kopen);
-        cudaFree(d_density_matrix);
+        gansu::tracked_cudaFree(d_J);
+        gansu::tracked_cudaFree(d_Kclosed);
+        gansu::tracked_cudaFree(d_Kopen);
+        gansu::tracked_cudaFree(d_density_matrix);
     }
 
 
@@ -1894,11 +1895,11 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
     }
 
     // free the temporary memory
-    cudaFree(d_temp_F_MO_closed);
-    cudaFree(d_temp_F_MO_open);
-    cudaFree(d_temp_R_MO);
-    cudaFree(d_temp_matrix1);
-    cudaFree(d_temp_matrix2);
+    gansu::tracked_cudaFree(d_temp_F_MO_closed);
+    gansu::tracked_cudaFree(d_temp_F_MO_open);
+    gansu::tracked_cudaFree(d_temp_R_MO);
+    gansu::tracked_cudaFree(d_temp_matrix1);
+    gansu::tracked_cudaFree(d_temp_matrix2);
 
 }
 
@@ -2329,7 +2330,7 @@ void computeMullikenPopulation_RHF(
     cudaError_t err;
 
     real_t* d_mulliken_population = nullptr;
-    err = cudaMalloc(&d_mulliken_population, num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_mulliken_population, num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for Mulliken population: ") + std::string(cudaGetErrorString(err)));
     }
@@ -2348,7 +2349,7 @@ void computeMullikenPopulation_RHF(
     cudaMemcpy(mulliken_population_basis, d_mulliken_population, num_basis * sizeof(real_t), cudaMemcpyDeviceToHost);
 
     // Free the memory for the temporary matrix
-    cudaFree(d_mulliken_population);
+    gansu::tracked_cudaFree(d_mulliken_population);
 }
 
 void computeMullikenPopulation_UHF(
@@ -2362,7 +2363,7 @@ void computeMullikenPopulation_UHF(
     cudaError_t err;
 
     real_t* d_mulliken_population = nullptr;
-    err = cudaMalloc(&d_mulliken_population, num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_mulliken_population, num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for Mulliken population: ") + std::string(cudaGetErrorString(err)));
     }
@@ -2382,7 +2383,7 @@ void computeMullikenPopulation_UHF(
     cudaMemcpy(mulliken_population_basis, d_mulliken_population, num_basis * sizeof(real_t), cudaMemcpyDeviceToHost);
 
     // Free the memory for the temporary matrix
-    cudaFree(d_mulliken_population);
+    gansu::tracked_cudaFree(d_mulliken_population);
 }
 
 
@@ -2396,7 +2397,7 @@ void computeDensityOverlapMatrix(
     cudaError_t err;
 
     real_t* d_result_matrix = nullptr;
-    err = cudaMalloc(&d_result_matrix, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_result_matrix, num_basis * num_basis * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for Density-Overlap-Matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -2408,7 +2409,7 @@ void computeDensityOverlapMatrix(
     cudaMemcpy(result_matrix, d_result_matrix, num_basis * num_basis * sizeof(real_t), cudaMemcpyDeviceToHost);
 
     // Free the memory for the temporary matrix
-    cudaFree(d_result_matrix);
+    gansu::tracked_cudaFree(d_result_matrix);
 }
 
 void computeSqrtOverlapDensitySqrtOverlapMatrix(
@@ -2424,12 +2425,12 @@ void computeSqrtOverlapDensitySqrtOverlapMatrix(
 
     // Eigen decomposition of the overlap matrix S = U * diag(eigval) * U^T
     real_t* d_eigval = nullptr;
-    err = cudaMalloc(&d_eigval, sizeof(real_t)*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_eigval, sizeof(real_t)*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for eigen values: ") + std::string(cudaGetErrorString(err)));
     }
     real_t* d_eigvec = nullptr;
-    err = cudaMalloc(&d_eigvec, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_eigvec, sizeof(real_t)*num_basis*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for eigen vectors: ") + std::string(cudaGetErrorString(err)));
     }
@@ -2442,7 +2443,7 @@ void computeSqrtOverlapDensitySqrtOverlapMatrix(
 
     // Make diag(eigval)^(1/2) matrix
     real_t* d_sqrt_eigval_matrix = nullptr;
-    err = cudaMalloc(&d_sqrt_eigval_matrix, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_sqrt_eigval_matrix, sizeof(real_t)*num_basis*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for sqrt eigen value matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -2450,7 +2451,7 @@ void computeSqrtOverlapDensitySqrtOverlapMatrix(
 
     // temp_matrix = U * diag(eigval)^(1/2) * U^T
     real_t* d_temp_matrix = nullptr;
-    err = cudaMalloc(&d_temp_matrix, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_temp_matrix, sizeof(real_t)*num_basis*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -2458,7 +2459,7 @@ void computeSqrtOverlapDensitySqrtOverlapMatrix(
     gpu::matrixMatrixProduct(d_eigvec, d_sqrt_eigval_matrix, d_temp_matrix, num_basis, false, false);
     // S_sqrt = temp_matrix * U^T
     real_t* d_S_sqrt = nullptr;
-    err = cudaMalloc(&d_S_sqrt, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_S_sqrt, sizeof(real_t)*num_basis*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for S_sqrt matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -2466,7 +2467,7 @@ void computeSqrtOverlapDensitySqrtOverlapMatrix(
 
     // result_matrix = S^(1/2) * D * S^(1/2)
     real_t* d_result_matrix = nullptr;
-    err = cudaMalloc(&d_result_matrix, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_result_matrix, sizeof(real_t)*num_basis*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for result matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -2477,12 +2478,12 @@ void computeSqrtOverlapDensitySqrtOverlapMatrix(
     cudaMemcpy(result_matrix, d_result_matrix, sizeof(real_t)*num_basis*num_basis, cudaMemcpyDeviceToHost);
 
     // Free the memory for the temporary matrices
-    cudaFree(d_eigval);
-    cudaFree(d_eigvec);
-    cudaFree(d_sqrt_eigval_matrix);
-    cudaFree(d_temp_matrix);
-    cudaFree(d_S_sqrt);
-    cudaFree(d_result_matrix);
+    gansu::tracked_cudaFree(d_eigval);
+    gansu::tracked_cudaFree(d_eigvec);
+    gansu::tracked_cudaFree(d_sqrt_eigval_matrix);
+    gansu::tracked_cudaFree(d_temp_matrix);
+    gansu::tracked_cudaFree(d_S_sqrt);
+    gansu::tracked_cudaFree(d_result_matrix);
 
 }
 
@@ -2844,7 +2845,7 @@ void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_
 
     ////////////////////////////////// compute J-matrix //////////////////////////////////
     real_t* d_J = nullptr;
-    err = cudaMalloc(&d_J, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_J, sizeof(real_t)*num_basis*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for J matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -2854,7 +2855,7 @@ void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_
 
     // compute c_q = \sum_{a b} D_{a b} (q|ab)
     real_t *d_c = nullptr;
-    err = cudaMalloc(&d_c, sizeof(real_t)*num_auxiliary_basis);
+    err = gansu::tracked_cudaMalloc(&d_c, sizeof(real_t)*num_auxiliary_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for c vector: ") + std::string(cudaGetErrorString(err)));
     }
@@ -2933,7 +2934,7 @@ void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_
                               verbose);
     cudaDeviceSynchronize();
 
-    cudaFree(d_c);
+    gansu::tracked_cudaFree(d_c);
 
 
     transposeMatrixInPlace(d_decomposed_two_center_eris, num_auxiliary_basis);
@@ -2941,7 +2942,7 @@ void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_
 
     ////////////////////////////////// compute K-matrix //////////////////////////////////
     real_t* d_K = nullptr;
-    err = cudaMalloc(&d_K, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_K, sizeof(real_t)*num_basis*num_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for K matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -2949,20 +2950,20 @@ void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_
 
 
     real_t* d_Z = nullptr;
-    err = cudaMalloc(&d_Z, sizeof(real_t)*num_basis*num_auxiliary_basis);
+    err = gansu::tracked_cudaMalloc(&d_Z, sizeof(real_t)*num_basis*num_auxiliary_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for Z matrix: ") + std::string(cudaGetErrorString(err)));
     }
 
     real_t* d_Z_prev = nullptr;
-    err = cudaMalloc(&d_Z_prev, sizeof(real_t)*num_basis*num_auxiliary_basis);
+    err = gansu::tracked_cudaMalloc(&d_Z_prev, sizeof(real_t)*num_basis*num_auxiliary_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for Z_prev matrix: ") + std::string(cudaGetErrorString(err)));
     }
 
 
     real_t* d_W_diff = nullptr;
-    err = cudaMalloc(&d_W_diff, sizeof(real_t)*num_basis*num_auxiliary_basis);
+    err = gansu::tracked_cudaMalloc(&d_W_diff, sizeof(real_t)*num_basis*num_auxiliary_basis);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for W matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -2970,7 +2971,7 @@ void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_
 
     //Cとの差分を求める
     real_t* d_coefficient_matrix_diff;
-    cudaMalloc((void**)&d_coefficient_matrix_diff, sizeof(real_t) * num_basis * num_basis);
+    gansu::tracked_cudaMalloc((void**)&d_coefficient_matrix_diff, sizeof(real_t) * num_basis * num_basis);
     cudaMemcpy(d_coefficient_matrix_diff, d_coefficient_matrix_prev, sizeof(real_t) * num_basis * num_basis, cudaMemcpyDeviceToDevice);
     calcDiffMatrix<<< ((num_basis * num_basis) + 1024 - 1) / 1024, 1024>>>(d_coefficient_matrix, d_coefficient_matrix_diff, num_basis); //d_coefficient_matrix_diff = |C_new - C_prev|
     
@@ -3168,13 +3169,13 @@ void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_
     cudaStreamDestroy(stream_sub);
     
     // free the memory
-    cudaFree(d_J);
-    cudaFree(d_K);
-    cudaFree(d_Z);
-    cudaFree(d_W_diff);
-    cudaFree(d_Z_prev);  
+    gansu::tracked_cudaFree(d_J);
+    gansu::tracked_cudaFree(d_K);
+    gansu::tracked_cudaFree(d_Z);
+    gansu::tracked_cudaFree(d_W_diff);
+    gansu::tracked_cudaFree(d_Z_prev);  
 
-    cudaFree(d_coefficient_matrix_diff);
+    gansu::tracked_cudaFree(d_coefficient_matrix_diff);
 }
 
 } // namespace gansu::gpu

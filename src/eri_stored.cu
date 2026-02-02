@@ -20,6 +20,7 @@
 #include "rhf.hpp"
 #include "diis.hpp"
 #include "eri_stored.hpp"
+#include "device_host_memory.hpp"
 
 namespace gansu {
 
@@ -123,14 +124,14 @@ void transform_ao_eri_to_mo_eri_full(
     double* d_D = nullptr;
     double* d_T = nullptr;
 
-    cudaMalloc((void**)&d_D, (size_t)N * N * sizeof(double));
+    tracked_cudaMalloc((void**)&d_D, (size_t)N * N * sizeof(double));
     if(!d_D){
-        THROW_EXCEPTION("cudaMalloc failed for d_D.");
+        THROW_EXCEPTION("tracked_cudaMalloc failed for d_D.");
     }
-    cudaMalloc((void**)&d_T, (size_t)N * N * sizeof(double));
+    tracked_cudaMalloc((void**)&d_T, (size_t)N * N * sizeof(double));
     if(!d_T){
-        cudaFree(d_D);
-        THROW_EXCEPTION("cudaMalloc failed for d_T.");
+        tracked_cudaFree(d_D);
+        THROW_EXCEPTION("tracked_cudaMalloc failed for d_T.");
     }
 
     // ------------------------------------------------------------------
@@ -175,8 +176,8 @@ void transform_ao_eri_to_mo_eri_full(
         false      // overwrite C
     );
 
-    cudaFree(d_D);
-    cudaFree(d_T);
+    tracked_cudaFree(d_D);
+    tracked_cudaFree(d_T);
 }
 
 
@@ -283,9 +284,9 @@ double mp2_from_aoeri_via_full_moeri(
     // ------------------------------------------------------------
     double* d_eri_mo = nullptr;
     size_t bytes_mo = (size_t)N * (size_t)N * sizeof(double);
-    cudaMalloc((void**)&d_eri_mo, bytes_mo);
+    tracked_cudaMalloc((void**)&d_eri_mo, bytes_mo);
     if(!d_eri_mo){
-        THROW_EXCEPTION("cudaMalloc failed for d_eri_mo.");
+        THROW_EXCEPTION("tracked_cudaMalloc failed for d_eri_mo.");
     }
 
     // ------------------------------------------------------------
@@ -335,7 +336,7 @@ double mp2_from_aoeri_via_full_moeri(
     size_t total = (size_t)occ * (size_t)occ * (size_t)vir * (size_t)vir;
 
     double* d_E = nullptr;
-    cudaMalloc((void**)&d_E, sizeof(double));
+    tracked_cudaMalloc((void**)&d_E, sizeof(double));
     cudaMemset(d_E, 0, sizeof(double));
 
     int threads = 128;
@@ -358,8 +359,8 @@ double mp2_from_aoeri_via_full_moeri(
     // ------------------------------------------------------------
     // 4) cleanup
     // ------------------------------------------------------------
-    cudaFree(d_E);
-    cudaFree(d_eri_mo);
+    tracked_cudaFree(d_E);
+    tracked_cudaFree(d_eri_mo);
 
     return h_E;
 }
@@ -415,7 +416,7 @@ real_t mp2_naive(const real_t* d_eri, const real_t* d_coefficient_matrix, const 
     size_t shmem = (size_t)num_threads * sizeof(double);
 
     real_t* d_mp2_energy;
-    cudaMalloc((void**)&d_mp2_energy, sizeof(real_t));
+    tracked_cudaMalloc((void**)&d_mp2_energy, sizeof(real_t));
     if(d_mp2_energy == nullptr) {
         THROW_EXCEPTION("Failed to allocate device memory for MP2 energy.");
     }
@@ -425,7 +426,7 @@ real_t mp2_naive(const real_t* d_eri, const real_t* d_coefficient_matrix, const 
 
     real_t h_mp2_energy;
     cudaMemcpy(&h_mp2_energy, d_mp2_energy, sizeof(real_t), cudaMemcpyDeviceToHost);
-    cudaFree(d_mp2_energy);
+    tracked_cudaFree(d_mp2_energy);
 
     return h_mp2_energy;
 
@@ -643,7 +644,7 @@ real_t mp3_naive(const real_t* d_eri, const real_t* d_coefficient_matrix, const 
 
 
     real_t* d_mp3_energy;
-    cudaMalloc((void**)&d_mp3_energy, sizeof(real_t) * 3); // Allocate space for 3 terms
+    tracked_cudaMalloc((void**)&d_mp3_energy, sizeof(real_t) * 3); // Allocate space for 3 terms
     if(d_mp3_energy == nullptr) {
         THROW_EXCEPTION("Failed to allocate device memory for MP3 energy.");
     }
@@ -695,7 +696,7 @@ real_t mp3_naive(const real_t* d_eri, const real_t* d_coefficient_matrix, const 
 
     real_t h_mp3_energy[3];
     cudaMemcpy(h_mp3_energy, d_mp3_energy, sizeof(real_t)*3, cudaMemcpyDeviceToHost);
-    cudaFree(d_mp3_energy);
+    tracked_cudaFree(d_mp3_energy);
 
 
     std::cout << "4h2p term: " << h_mp3_energy[0] << " Hartree" << std::endl;
@@ -850,9 +851,9 @@ real_t mp3_from_aoeri_via_full_moeri(const real_t* d_eri_ao, const real_t* d_coe
     // ------------------------------------------------------------
     double* d_eri_mo = nullptr;
     size_t bytes_mo = (size_t)N * (size_t)N * sizeof(double);
-    cudaMalloc((void**)&d_eri_mo, bytes_mo);
+    tracked_cudaMalloc((void**)&d_eri_mo, bytes_mo);
     if(!d_eri_mo){
-        THROW_EXCEPTION("cudaMalloc failed for d_eri_mo.");
+        THROW_EXCEPTION("tracked_cudaMalloc failed for d_eri_mo.");
     }
 
 
@@ -876,7 +877,7 @@ real_t mp3_from_aoeri_via_full_moeri(const real_t* d_eri_ao, const real_t* d_coe
     // 3) MP2 energy from full MO ERI
     // ------------------------------------------------------------
     real_t* d_mp2_energy;
-    cudaMalloc((void**)&d_mp2_energy, sizeof(real_t));
+    tracked_cudaMalloc((void**)&d_mp2_energy, sizeof(real_t));
     if(d_mp2_energy == nullptr) {
         THROW_EXCEPTION("Failed to allocate device memory for MP2 energy.");
     }
@@ -898,7 +899,7 @@ real_t mp3_from_aoeri_via_full_moeri(const real_t* d_eri_ao, const real_t* d_coe
     real_t h_mp2_energy;
     cudaMemcpy(&h_mp2_energy, d_mp2_energy, sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
-    cudaFree(d_mp2_energy);
+    tracked_cudaFree(d_mp2_energy);
     std::cout << "MP2 energy: " << h_mp2_energy << " Hartree" << std::endl;
 
 
@@ -907,7 +908,7 @@ real_t mp3_from_aoeri_via_full_moeri(const real_t* d_eri_ao, const real_t* d_coe
     // 4) MP3 energy from full MO ERI
     // ------------------------------------------------------------
     real_t* d_mp3_energy;
-    cudaMalloc((void**)&d_mp3_energy, sizeof(real_t) * 3); // Allocate space for 3 terms
+    tracked_cudaMalloc((void**)&d_mp3_energy, sizeof(real_t) * 3); // Allocate space for 3 terms
     if(d_mp3_energy == nullptr) {
         THROW_EXCEPTION("Failed to allocate device memory for MP3 energy.");
     }
@@ -962,8 +963,8 @@ real_t mp3_from_aoeri_via_full_moeri(const real_t* d_eri_ao, const real_t* d_coe
     cudaMemcpy(h_mp3_energy, d_mp3_energy, sizeof(real_t)*3, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
     
-    cudaFree(d_mp3_energy);
-    cudaFree(d_eri_mo);
+    tracked_cudaFree(d_mp3_energy);
+    tracked_cudaFree(d_eri_mo);
 
     std::cout << "4h2p term: " << h_mp3_energy[0] << " Hartree" << std::endl;
     std::cout << "2h4p term: " << h_mp3_energy[1] << " Hartree" << std::endl;
@@ -1881,9 +1882,9 @@ real_t compute_t_amplitude_diff(const real_t* __restrict__ t_ia_new, const real_
 {
     real_t h_max_norm = 0.0;
     real_t* d_max_norm = nullptr;
-    cudaMalloc((void**)&d_max_norm, sizeof(real_t));
+    tracked_cudaMalloc((void**)&d_max_norm, sizeof(real_t));
     if(!d_max_norm){
-        THROW_EXCEPTION("cudaMalloc failed for d_max_norm.");
+        THROW_EXCEPTION("tracked_cudaMalloc failed for d_max_norm.");
     }
     cudaMemset(d_max_norm, 0.0, sizeof(real_t));
 
@@ -1896,7 +1897,7 @@ real_t compute_t_amplitude_diff(const real_t* __restrict__ t_ia_new, const real_
     cudaDeviceSynchronize();
 
     cudaMemcpy(&h_max_norm, d_max_norm, sizeof(real_t), cudaMemcpyDeviceToHost);
-    cudaFree(d_max_norm);
+    tracked_cudaFree(d_max_norm);
 
     return h_max_norm;
 
@@ -1946,9 +1947,9 @@ real_t compute_t_amplitude_rms(const real_t* __restrict__ t_ia_new, const real_t
 {
     real_t h_rms = 0.0;
     real_t* d_rms = nullptr;
-    cudaMalloc((void**)&d_rms, sizeof(real_t));
+    tracked_cudaMalloc((void**)&d_rms, sizeof(real_t));
     if(!d_rms){
-        THROW_EXCEPTION("cudaMalloc failed for d_rms.");
+        THROW_EXCEPTION("tracked_cudaMalloc failed for d_rms.");
     }
     cudaMemset(d_rms, 0.0, sizeof(real_t));
 
@@ -1961,7 +1962,7 @@ real_t compute_t_amplitude_rms(const real_t* __restrict__ t_ia_new, const real_t
     cudaDeviceSynchronize();
 
     cudaMemcpy(&h_rms, d_rms, sizeof(real_t), cudaMemcpyDeviceToHost);
-    cudaFree(d_rms);
+    tracked_cudaFree(d_rms);
 
     return sqrt(h_rms);
 }
@@ -2055,9 +2056,9 @@ real_t compute_ccsd_energy(const real_t* __restrict__ d_eri_mo,
 {
     real_t h_ccsd_energy = 0.0;
     real_t* d_ccsd_energy = nullptr;
-    cudaMalloc((void**)&d_ccsd_energy, sizeof(real_t));
+    tracked_cudaMalloc((void**)&d_ccsd_energy, sizeof(real_t));
     if(!d_ccsd_energy){
-        THROW_EXCEPTION("cudaMalloc failed for d_ccsd_energy.");
+        THROW_EXCEPTION("tracked_cudaMalloc failed for d_ccsd_energy.");
     }
     cudaMemset(d_ccsd_energy, 0.0, sizeof(real_t));
 
@@ -2069,7 +2070,7 @@ real_t compute_ccsd_energy(const real_t* __restrict__ d_eri_mo,
     cudaDeviceSynchronize();
 
     cudaMemcpy(&h_ccsd_energy, d_ccsd_energy, sizeof(real_t), cudaMemcpyDeviceToHost);
-    cudaFree(d_ccsd_energy);
+    tracked_cudaFree(d_ccsd_energy);
 
     return h_ccsd_energy;
 }
@@ -2084,16 +2085,16 @@ void allocate_ccsd_intermediates(const int num_spin_occ, const int num_spin_vir,
                                         real_t** W_mbej)
 {
     // intermediates
-    cudaMalloc((void**)F_ae, sizeof(real_t) * num_spin_vir * num_spin_vir);
-    cudaMalloc((void**)F_mi, sizeof(real_t) * num_spin_occ * num_spin_occ);
-    cudaMalloc((void**)F_me, sizeof(real_t) * num_spin_occ * num_spin_vir);
-    cudaMalloc((void**)W_mnij, sizeof(real_t) * num_spin_occ * num_spin_occ * num_spin_occ * num_spin_occ);
-    cudaMalloc((void**)W_abef, sizeof(real_t) * num_spin_vir * num_spin_vir * num_spin_vir * num_spin_vir);
-    cudaMalloc((void**)W_mbej, sizeof(real_t) * num_spin_occ * num_spin_vir * num_spin_vir * num_spin_occ);
+    tracked_cudaMalloc((void**)F_ae, sizeof(real_t) * num_spin_vir * num_spin_vir);
+    tracked_cudaMalloc((void**)F_mi, sizeof(real_t) * num_spin_occ * num_spin_occ);
+    tracked_cudaMalloc((void**)F_me, sizeof(real_t) * num_spin_occ * num_spin_vir);
+    tracked_cudaMalloc((void**)W_mnij, sizeof(real_t) * num_spin_occ * num_spin_occ * num_spin_occ * num_spin_occ);
+    tracked_cudaMalloc((void**)W_abef, sizeof(real_t) * num_spin_vir * num_spin_vir * num_spin_vir * num_spin_vir);
+    tracked_cudaMalloc((void**)W_mbej, sizeof(real_t) * num_spin_occ * num_spin_vir * num_spin_vir * num_spin_occ);
 
     // error checks
     if(!(*F_ae) || !(*F_mi) || !(*F_me) || !(*W_mnij) || !(*W_abef) || !(*W_mbej)){
-        THROW_EXCEPTION("cudaMalloc failed for CCSD intermediates.");
+        THROW_EXCEPTION("tracked_cudaMalloc failed for CCSD intermediates.");
     }
 }
 
@@ -2111,10 +2112,10 @@ void allocate_ccsd_amplitudes(const int num_spin_occ, const int num_spin_vir,
     real_t* t1t2_new_buffer = nullptr;
     real_t* t1t2_old_buffer = nullptr;
 
-    cudaMalloc((void**)&t1t2_new_buffer, sizeof(real_t) * (num_t1 + num_t2));
-    cudaMalloc((void**)&t1t2_old_buffer, sizeof(real_t) * (num_t1 + num_t2));
+    tracked_cudaMalloc((void**)&t1t2_new_buffer, sizeof(real_t) * (num_t1 + num_t2));
+    tracked_cudaMalloc((void**)&t1t2_old_buffer, sizeof(real_t) * (num_t1 + num_t2));
     if(!t1t2_new_buffer || !t1t2_old_buffer){
-        THROW_EXCEPTION("cudaMalloc failed for CCSD amplitudes buffer.");
+        THROW_EXCEPTION("tracked_cudaMalloc failed for CCSD amplitudes buffer.");
     }
     *t_ia_new = t1t2_new_buffer;
     *t_ijab_new = t1t2_new_buffer + num_t1;
@@ -2130,12 +2131,12 @@ void deallocate_ccsd_intermediates(real_t* __restrict__ F_ae,
                                                 real_t* __restrict__ W_abef,
                                                 real_t* __restrict__ W_mbej)
 {
-    cudaFree(F_ae);
-    cudaFree(F_mi);
-    cudaFree(F_me);
-    cudaFree(W_mnij);
-    cudaFree(W_abef);
-    cudaFree(W_mbej);
+    tracked_cudaFree(F_ae);
+    tracked_cudaFree(F_mi);
+    tracked_cudaFree(F_me);
+    tracked_cudaFree(W_mnij);
+    tracked_cudaFree(W_abef);
+    tracked_cudaFree(W_mbej);
 }
 
 
@@ -2145,8 +2146,8 @@ void deallocate_ccsd_amplitudes(real_t* __restrict__ t_ia_new,
                                 real_t* __restrict__ t_ijab_old)
 {
     // t_ijab_new and t_ijab_old are part of t_ia_new and t_ia_old buffers, so no need to free them separately    
-    cudaFree(t_ia_new); // free both t_ia_new and t_ijab_new as they are in the same buffer
-    cudaFree(t_ia_old); // free both t_ia_old and t_ijab_old as they are in the same buffer
+    tracked_cudaFree(t_ia_new); // free both t_ia_new and t_ijab_new as they are in the same buffer
+    tracked_cudaFree(t_ia_old); // free both t_ia_old and t_ijab_old as they are in the same buffer
 }
 
 __global__ void initialize_ccsd_amplitudes_kernel(const real_t* __restrict__ d_eri_mo,
@@ -2891,9 +2892,9 @@ real_t compute_ccsd_t_energy(const real_t* __restrict__ d_eri_mo,
     // Compute CCSD(T) energy
     real_t h_E_CCSD_T = 0.0;
     real_t* d_E_CCSD_T = nullptr;
-    cudaMalloc((void**)&d_E_CCSD_T, sizeof(real_t));
+    tracked_cudaMalloc((void**)&d_E_CCSD_T, sizeof(real_t));
     if(!d_E_CCSD_T){
-        THROW_EXCEPTION("cudaMalloc failed for d_E_CCSD_T.");
+        THROW_EXCEPTION("tracked_cudaMalloc failed for d_E_CCSD_T.");
     }
     cudaMemset(d_E_CCSD_T, 0.0, sizeof(real_t));
 
@@ -2941,7 +2942,7 @@ real_t compute_ccsd_t_energy(const real_t* __restrict__ d_eri_mo,
 
     
     cudaMemcpy(&h_E_CCSD_T, d_E_CCSD_T, sizeof(real_t), cudaMemcpyDeviceToHost);
-    cudaFree(d_E_CCSD_T);
+    tracked_cudaFree(d_E_CCSD_T);
 
     return h_E_CCSD_T;
 }
@@ -2967,9 +2968,9 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
     // ------------------------------------------------------------
     double* d_eri_mo = nullptr;
     size_t bytes_mo = (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(double);
-    cudaMalloc((void**)&d_eri_mo, bytes_mo);
+    tracked_cudaMalloc((void**)&d_eri_mo, bytes_mo);
     if(!d_eri_mo){
-        THROW_EXCEPTION("cudaMalloc failed for d_eri_mo.");
+        THROW_EXCEPTION("tracked_cudaMalloc failed for d_eri_mo.");
     }
 
 
@@ -3227,7 +3228,7 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
 
 
     deallocate_ccsd_amplitudes(t_ia_new, t_ia_old, t_ijab_new, t_ijab_old);
-    cudaFree(d_eri_mo);
+    tracked_cudaFree(d_eri_mo);
 
     return E_CCSD_new;
 }

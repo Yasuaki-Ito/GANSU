@@ -28,6 +28,7 @@
 #include <mutex>
 #include <iomanip>
 #include <sstream>
+#include <unordered_map>
 
 #include "utils.hpp" // THROW_EXCEPTION
 
@@ -78,8 +79,7 @@ public:
         if (device_ptr_) {
             cudaFree(device_ptr_);
             // Update memory statistics
-            std::lock_guard<std::mutex> lock(memory_stats_mutex_);
-            current_allocated_bytes_ -= device_bytes_;
+            track_deallocation(device_bytes_);
         }
         if (host_ptr_) {
             cudaFreeHost(host_ptr_);
@@ -190,7 +190,6 @@ public:
         return peak_allocated_bytes_;
     }
 
-protected:
     /**
      * @brief Updates memory statistics when memory is allocated.
      * @param bytes Number of bytes allocated.
@@ -201,6 +200,17 @@ protected:
         total_allocated_bytes_ += bytes;
         if (current_allocated_bytes_ > peak_allocated_bytes_) {
             peak_allocated_bytes_ = current_allocated_bytes_;
+        }
+    }
+
+    /**
+     * @brief Updates memory statistics when memory is deallocated.
+     * @param bytes Number of bytes deallocated.
+     */
+    static void track_deallocation(size_t bytes) {
+        std::lock_guard<std::mutex> lock(memory_stats_mutex_);
+        if (current_allocated_bytes_ >= bytes) {
+            current_allocated_bytes_ -= bytes;
         }
     }
 
@@ -223,6 +233,8 @@ protected:
         oss << std::fixed << std::setprecision(2) << size << " " << units[unit_index];
         return oss.str();
     }
+
+protected:
 };
 
 template <typename T>
@@ -687,7 +699,165 @@ protected:
     }
 
  };
- 
- 
- 
+
+
+// ========== Memory Tracking Wrapper Functions ==========
+
+/**
+ * @brief Global map to track allocated memory sizes
+ *
+ * This map stores the size of each allocated memory block, keyed by the pointer address.
+ * This is necessary because cudaFree doesn't provide size information.
+ */
+inline std::unordered_map<void*, size_t> g_allocated_memory_map;
+inline std::mutex g_allocated_memory_map_mutex;
+
+/**
+ * @brief Wrapper for cudaMalloc with memory statistics tracking.
+ *
+ * This function allocates device memory and automatically tracks the allocation
+ * in the global memory statistics.
+ *
+ * @tparam T The type of the pointer
+ * @param ptr Pointer to the device pointer
+ * @param size Number of bytes to allocate
+ * @return cudaError_t Error code from cudaMalloc
+ */
+template<typename T>
+inline cudaError_t tracked_cudaMalloc(T** ptr, size_t size) {
+    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(ptr), size);
+
+    if (err == cudaSuccess) {
+        // Track allocation in map
+        {
+            std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
+            g_allocated_memory_map[*ptr] = size;
+        }
+
+        // Update memory statistics
+        CudaMemoryManager<T>::track_allocation(size);
+    } else {
+        // Print detailed error message with current memory statistics
+        size_t current_mem = CudaMemoryManager<T>::get_current_allocated_bytes();
+        std::cerr << "tracked_cudaMalloc failed: " << cudaGetErrorString(err) << "\n"
+                  << "  Attempted to allocate: " << CudaMemoryManager<T>::format_bytes(size) << "\n"
+                  << "  Current allocated:     " << CudaMemoryManager<T>::format_bytes(current_mem) << "\n"
+                  << "  Total would be:        " << CudaMemoryManager<T>::format_bytes(current_mem + size) << std::endl;
+    }
+
+    return err;
+}
+
+/**
+ * @brief Wrapper for cudaFree with memory statistics tracking.
+ *
+ * This function frees device memory and automatically updates the global
+ * memory statistics.
+ *
+ * @param ptr Pointer to the device memory to free
+ * @return cudaError_t Error code from cudaFree
+ */
+inline cudaError_t tracked_cudaFree(void* ptr) {
+    if (ptr == nullptr) {
+        return cudaSuccess;
+    }
+
+    // Get the size of the allocation
+    size_t size = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
+        auto it = g_allocated_memory_map.find(ptr);
+        if (it != g_allocated_memory_map.end()) {
+            size = it->second;
+            g_allocated_memory_map.erase(it);
+        }
+    }
+
+    // Free the memory
+    cudaError_t err = cudaFree(ptr);
+
+    // Update statistics if free was successful and size was tracked
+    if (err == cudaSuccess && size > 0) {
+        CudaMemoryManager<double>::track_deallocation(size);
+    }
+
+    return err;
+}
+
+/**
+ * @brief Wrapper for cudaMallocAsync with memory statistics tracking.
+ *
+ * This function allocates device memory asynchronously and automatically tracks
+ * the allocation in the global memory statistics.
+ *
+ * @tparam T The type of the pointer
+ * @param ptr Pointer to the device pointer
+ * @param size Number of bytes to allocate
+ * @param stream CUDA stream for asynchronous allocation
+ * @return cudaError_t Error code from cudaMallocAsync
+ */
+template<typename T>
+inline cudaError_t tracked_cudaMallocAsync(T** ptr, size_t size, cudaStream_t stream) {
+    cudaError_t err = cudaMallocAsync(reinterpret_cast<void**>(ptr), size, stream);
+
+    if (err == cudaSuccess) {
+        // Track allocation in map
+        {
+            std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
+            g_allocated_memory_map[*ptr] = size;
+        }
+
+        // Update memory statistics
+        CudaMemoryManager<T>::track_allocation(size);
+    } else {
+        // Print detailed error message with current memory statistics
+        size_t current_mem = CudaMemoryManager<T>::get_current_allocated_bytes();
+        std::cerr << "tracked_cudaMallocAsync failed: " << cudaGetErrorString(err) << "\n"
+                  << "  Attempted to allocate: " << CudaMemoryManager<T>::format_bytes(size) << "\n"
+                  << "  Current allocated:     " << CudaMemoryManager<T>::format_bytes(current_mem) << "\n"
+                  << "  Total would be:        " << CudaMemoryManager<T>::format_bytes(current_mem + size) << std::endl;
+    }
+
+    return err;
+}
+
+/**
+ * @brief Wrapper for cudaFreeAsync with memory statistics tracking.
+ *
+ * This function frees device memory asynchronously and automatically updates
+ * the global memory statistics.
+ *
+ * @param ptr Pointer to the device memory to free
+ * @param stream CUDA stream for asynchronous deallocation
+ * @return cudaError_t Error code from cudaFreeAsync
+ */
+inline cudaError_t tracked_cudaFreeAsync(void* ptr, cudaStream_t stream) {
+    if (ptr == nullptr) {
+        return cudaSuccess;
+    }
+
+    // Get the size of the allocation
+    size_t size = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
+        auto it = g_allocated_memory_map.find(ptr);
+        if (it != g_allocated_memory_map.end()) {
+            size = it->second;
+            g_allocated_memory_map.erase(it);
+        }
+    }
+
+    // Free the memory asynchronously
+    cudaError_t err = cudaFreeAsync(ptr, stream);
+
+    // Update statistics if free was successful and size was tracked
+    if (err == cudaSuccess && size > 0) {
+        CudaMemoryManager<double>::track_deallocation(size);
+    }
+
+    return err;
+}
+
+
+
 } // namespace gansu
