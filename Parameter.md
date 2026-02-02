@@ -157,6 +157,7 @@ If any of the following conditions are met, an exception is thrown:
 * stored - Two-electron repulsion integrals are stored in the device memory
 * RI - Resolution of the Identity (RI) approximation is used for the two-electron repulsion integrals (ERIs)
 * Direct - Direct calculation of the two-electron repulsion integrals (ERIs) without any approximation (Direct-SCF)
+* Direct_RI - Resolution of the Identity (RI) approximation, but three-center ERIs are directly computed without storing
 
 #### post_hf_method - Post-Hartree-Fock method to use (MP2, CCSD, CCSD(T))
 * default: none
