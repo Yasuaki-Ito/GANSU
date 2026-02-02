@@ -62,6 +62,7 @@ public:
     void compute_coefficient_matrix_impl() override;
     void compute_energy() override;
     void update_fock_matrix() override;
+    void compute_Energy_Gradient() override;
 
     real_t get_energy() const override { return energy_; }
     real_t get_total_spin() override { return 0.0; } // always 0 for RHF

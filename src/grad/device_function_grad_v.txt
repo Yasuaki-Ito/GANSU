@@ -1,0 +1,201 @@
+inline __device__ double compute_grad_Ax(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+                                         const double alpha, const double beta,
+                                         const double Dx, const double Dy, const double Dz, 
+                                         const double3& P, const Coordinate& atom_pos, double* R)
+{
+    double Et_result, Eu_result, Ev_result;
+    double temp = 0.0;
+    for(int t=0; t<l1+l2+2; t++){
+        Et_result = (alpha/(alpha+beta))*MD_Et_NonRecursion(l1, l2, t-1, alpha, beta, Dx) + Et_grad_NonRecursion(l1, l2, t, alpha, beta, Dx);
+        for(int u=0; u<m1+m2+1; u++){
+            Eu_result = MD_Et_NonRecursion(m1, m2, u, alpha, beta, Dy);
+            for(int v=0; v<n1+n2+1; v++){
+                Ev_result = MD_Et_NonRecursion(n1, n2, v, alpha, beta, Dz);
+                // temp += Et_result * Eu_result * Ev_result * R_GPU_Recursion(0, t, u, v, P, atom_pos, R);
+                int k = t + u + v;
+                temp += Et_result * Eu_result * Ev_result * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u,v,0,0,0)];
+            }
+        }
+    }
+    return temp;
+}
+
+inline __device__ double compute_grad_Ay(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+                                         const double alpha, const double beta,
+                                         const double Dx, const double Dy, const double Dz, 
+                                         const double3& P, const Coordinate& atom_pos, double* R)
+{
+    double Et_result, Eu_result, Ev_result;
+    double temp = 0.0;
+    for(int t=0; t<l1+l2+1; t++){
+        Et_result = MD_Et_NonRecursion(l1, l2, t, alpha, beta, Dx);
+        for(int u=0; u<m1+m2+2; u++){
+            Eu_result = (alpha/(alpha+beta))*MD_Et_NonRecursion(m1, m2, u-1, alpha, beta, Dy) + Et_grad_NonRecursion(m1, m2, u, alpha, beta, Dy);
+            for(int v=0; v<n1+n2+1; v++){
+                Ev_result = MD_Et_NonRecursion(n1, n2, v, alpha, beta, Dz);
+                // temp += Et_result * Eu_result * Ev_result * R_GPU_Recursion(0, t, u, v, P, atom_pos, R);
+                int k = t + u + v;
+                temp += Et_result * Eu_result * Ev_result * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u,v,0,0,0)];
+            }
+        }
+    }
+    return temp;
+}
+
+inline __device__ double compute_grad_Az(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+                                         const double alpha, const double beta,
+                                         const double Dx, const double Dy, const double Dz, 
+                                         const double3& P, const Coordinate& atom_pos, double* R)
+{
+    double Et_result, Eu_result, Ev_result;
+    double temp = 0.0;
+    for(int t=0; t<l1+l2+1; t++){
+        Et_result = MD_Et_NonRecursion(l1, l2, t, alpha, beta, Dx);
+        for(int u=0; u<m1+m2+1; u++){
+            Eu_result = MD_Et_NonRecursion(m1, m2, u, alpha, beta, Dy);
+            for(int v=0; v<n1+n2+2; v++){
+                Ev_result = (alpha/(alpha+beta))*MD_Et_NonRecursion(n1, n2, v-1, alpha, beta, Dz) + Et_grad_NonRecursion(n1, n2, v, alpha, beta, Dz);
+                // temp += Et_result * Eu_result * Ev_result * R_GPU_Recursion(0, t, u, v, P, atom_pos, R);
+                int k = t + u + v;
+                temp += Et_result * Eu_result * Ev_result * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u,v,0,0,0)];
+            }
+        }
+    }
+    return temp;
+}
+
+
+inline __device__ double compute_grad_Bx(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+                                         const double alpha, const double beta,
+                                         const double Dx, const double Dy, const double Dz, 
+                                         const double3& P, const Coordinate& atom_pos, double* R)
+{
+    double Et_result, Eu_result, Ev_result;
+    double temp = 0.0;
+    for(int t=0; t<l1+l2+2; t++){
+        Et_result = (beta/(alpha+beta))*MD_Et_NonRecursion(l1, l2, t-1, alpha, beta, Dx) - Et_grad_NonRecursion(l1, l2, t, alpha, beta, Dx);
+        for(int u=0; u<m1+m2+1; u++){
+            Eu_result = MD_Et_NonRecursion(m1, m2, u, alpha, beta, Dy);
+            for(int v=0; v<n1+n2+1; v++){
+                Ev_result = MD_Et_NonRecursion(n1, n2, v, alpha, beta, Dz);
+                // temp += Et_result * Eu_result * Ev_result * R_GPU_Recursion(0, t, u, v, P, atom_pos, R);
+                int k = t + u + v;
+                temp += Et_result * Eu_result * Ev_result * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u,v,0,0,0)];
+            }
+        }
+    }
+    return temp;
+}
+
+inline __device__ double compute_grad_By(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+                                         const double alpha, const double beta,
+                                         const double Dx, const double Dy, const double Dz, 
+                                         const double3& P, const Coordinate& atom_pos, double* R)
+{
+    double Et_result, Eu_result, Ev_result;
+    double temp = 0.0;
+    for(int t=0; t<l1+l2+1; t++){
+        Et_result = MD_Et_NonRecursion(l1, l2, t, alpha, beta, Dx);
+        for(int u=0; u<m1+m2+2; u++){
+            Eu_result = (beta/(alpha+beta))*MD_Et_NonRecursion(m1, m2, u-1, alpha, beta, Dy) - Et_grad_NonRecursion(m1, m2, u, alpha, beta, Dy);
+            for(int v=0; v<n1+n2+1; v++){
+                Ev_result = MD_Et_NonRecursion(n1, n2, v, alpha, beta, Dz);
+                // temp += Et_result * Eu_result * Ev_result * R_GPU_Recursion(0, t, u, v, P, atom_pos, R);
+                int k = t + u + v;
+                temp += Et_result * Eu_result * Ev_result * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u,v,0,0,0)];
+            }
+        }
+    }
+    return temp;
+}
+
+inline __device__ double compute_grad_Bz(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+                                         const double alpha, const double beta,
+                                         const double Dx, const double Dy, const double Dz, 
+                                         const double3& P, const Coordinate& atom_pos, double* R)
+{
+    double Et_result, Eu_result, Ev_result;
+    double temp = 0.0;
+    for(int t=0; t<l1+l2+1; t++){
+        Et_result = MD_Et_NonRecursion(l1, l2, t, alpha, beta, Dx);
+        for(int u=0; u<m1+m2+1; u++){
+            Eu_result = MD_Et_NonRecursion(m1, m2, u, alpha, beta, Dy);
+            for(int v=0; v<n1+n2+2; v++){
+                Ev_result = (beta/(alpha+beta))*MD_Et_NonRecursion(n1, n2, v-1, alpha, beta, Dz) - Et_grad_NonRecursion(n1, n2, v, alpha, beta, Dz);
+                // temp += Et_result * Eu_result * Ev_result * R_GPU_Recursion(0, t, u, v, P, atom_pos, R);
+                int k = t + u + v;
+                temp += Et_result * Eu_result * Ev_result * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u,v,0,0,0)];
+            }
+        }
+    }
+    return temp;
+}
+
+
+
+
+inline __device__ double compute_grad_Cx(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+                                         const double alpha, const double beta,
+                                         const double Dx, const double Dy, const double Dz, 
+                                         const double3& P, const Coordinate& atom_pos, double* R)
+{
+    double Et, Eu, Ev;
+    double temp = 0.0;
+    for(int t=0; t<l1+l2+1; t++){
+        Et = MD_Et_NonRecursion(l1, l2, t, alpha, beta, Dx);
+        for(int u=0; u<m1+m2+1; u++){
+            Eu = MD_Et_NonRecursion(m1, m2, u, alpha, beta, Dy);
+            for(int v=0; v<n1+n2+1; v++){
+                Ev = MD_Et_NonRecursion(n1, n2, v, alpha, beta, Dz);
+                // temp += Et * Eu * Ev * R_GPU_Recursion(0, t+1, u, v, P, atom_pos, R);
+                int k = t + u + v + 1;
+                temp += Et * Eu * Ev * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u,v,0,0,0)];
+            }
+        }
+    }
+    return temp;
+}
+
+inline __device__ double compute_grad_Cy(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+                                         const double alpha, const double beta,
+                                         const double Dx, const double Dy, const double Dz, 
+                                         const double3& P, const Coordinate& atom_pos, double* R)
+{
+    double Et, Eu, Ev;
+    double temp = 0.0;
+    for(int t=0; t<l1+l2+1; t++){
+        Et = MD_Et_NonRecursion(l1, l2, t, alpha, beta, Dx);
+        for(int u=0; u<m1+m2+1; u++){
+            Eu = MD_Et_NonRecursion(m1, m2, u, alpha, beta, Dy);
+            for(int v=0; v<n1+n2+1; v++){
+                Ev = MD_Et_NonRecursion(n1, n2, v, alpha, beta, Dz);
+                // temp += Et * Eu * Ev * R_GPU_Recursion(0, t, u+1, v, P, atom_pos, R);
+                int k = t + u + v + 1;
+                temp += Et * Eu * Ev * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+1,v,0,0,0)];
+            }
+        }
+    }
+    return temp;
+}
+
+inline __device__ double compute_grad_Cz(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+                                         const double alpha, const double beta,
+                                         const double Dx, const double Dy, const double Dz, 
+                                         const double3& P, const Coordinate& atom_pos, double* R)
+{
+    double Et, Eu, Ev;
+    double temp = 0.0;
+    for(int t=0; t<l1+l2+1; t++){
+        Et = MD_Et_NonRecursion(l1, l2, t, alpha, beta, Dx);
+        for(int u=0; u<m1+m2+1; u++){
+            Eu = MD_Et_NonRecursion(m1, m2, u, alpha, beta, Dy);
+            for(int v=0; v<n1+n2+1; v++){
+                Ev = MD_Et_NonRecursion(n1, n2, v, alpha, beta, Dz);
+                // temp += Et * Eu * Ev * R_GPU_Recursion(0, t, u, v+1, P, atom_pos, R);
+                int k = t + u + v + 1;
+                temp += Et * Eu * Ev * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u,v+1,0,0,0)];
+            }
+        }
+    }
+    return temp;
+}

@@ -1,0 +1,479 @@
+inline __device__ double compute_two_grad_Ax(
+    const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
+    const double alpha, const double beta, const double gamma, const double delta,
+    const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
+    const double p, const double q, const double3& P, const double3& Q, double* R)
+{
+    double Et, Eu, Ev, Etau, Enu, Ephi;
+    double temp = 0.0;
+
+    for(int t=0; t<A_ang.x+B_ang.x+2; t++){
+        Et = (alpha/p) * MD_Et_NonRecursion(A_ang.x, B_ang.x, t-1, alpha, beta, AB_Dx) + Et_grad_NonRecursion(A_ang.x, B_ang.x, t, alpha, beta, AB_Dx);
+
+        for(int u=0; u<A_ang.y+B_ang.y+1; u++){
+            Eu = MD_Et_NonRecursion(A_ang.y, B_ang.y, u, alpha, beta, AB_Dy);
+
+            for(int v=0; v<A_ang.z+B_ang.z+1; v++){
+                Ev = MD_Et_NonRecursion(A_ang.z, B_ang.z, v, alpha, beta, AB_Dz);
+
+                for(int tau=0; tau<C_ang.x+D_ang.x+1; tau++){
+                    Etau = MD_Et_NonRecursion(C_ang.x, D_ang.x, tau, gamma, delta, CD_Dx);
+
+                    for(int nu=0; nu<C_ang.y+D_ang.y+1; nu++){
+                        Enu = MD_Et_NonRecursion(C_ang.y, D_ang.y, nu, gamma, delta, CD_Dy);
+
+                        for(int phi=0; phi<C_ang.z+D_ang.z+1; phi++){
+                            Ephi = MD_Et_NonRecursion(C_ang.z, D_ang.z, phi, gamma, delta, CD_Dz);
+
+                            int k=t+u+v+tau+nu+phi;
+                            temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                            // temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, R); // RはBoysのこと
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return temp;
+}
+
+
+inline __device__ double compute_two_grad_Ay(
+    const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
+    const double alpha, const double beta, const double gamma, const double delta,
+    const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
+    const double p, const double q, const double3& P, const double3& Q, double* R)
+{
+    double Et, Eu, Ev, Etau, Enu, Ephi;
+    double temp = 0.0;
+
+    for(int t=0; t<A_ang.x+B_ang.x+1; t++){
+        Et = MD_Et_NonRecursion(A_ang.x, B_ang.x, t, alpha, beta, AB_Dx);
+
+        for(int u=0; u<A_ang.y+B_ang.y+2; u++){
+            Eu = (alpha/p) * MD_Et_NonRecursion(A_ang.y, B_ang.y, u-1, alpha, beta, AB_Dy) + Et_grad_NonRecursion(A_ang.y, B_ang.y, u, alpha, beta, AB_Dy);
+
+            for(int v=0; v<A_ang.z+B_ang.z+1; v++){
+                Ev = MD_Et_NonRecursion(A_ang.z, B_ang.z, v, alpha, beta, AB_Dz);
+
+                for(int tau=0; tau<C_ang.x+D_ang.x+1; tau++){
+                    Etau = MD_Et_NonRecursion(C_ang.x, D_ang.x, tau, gamma, delta, CD_Dx);
+
+                    for(int nu=0; nu<C_ang.y+D_ang.y+1; nu++){
+                        Enu = MD_Et_NonRecursion(C_ang.y, D_ang.y, nu, gamma, delta, CD_Dy);
+
+                        for(int phi=0; phi<C_ang.z+D_ang.z+1; phi++){
+                            Ephi = MD_Et_NonRecursion(C_ang.z, D_ang.z, phi, gamma, delta, CD_Dz);
+
+                            int k=t+u+v+tau+nu+phi;
+                            temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                            // temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, R); // RはBoysのこと
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return temp;
+}
+
+
+inline __device__ double compute_two_grad_Az(
+    const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
+    const double alpha, const double beta, const double gamma, const double delta,
+    const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
+    const double p, const double q, const double3& P, const double3& Q, double* R)
+{
+    double Et, Eu, Ev, Etau, Enu, Ephi;
+    double temp = 0.0;
+
+    for(int t=0; t<A_ang.x+B_ang.x+1; t++){
+        Et = MD_Et_NonRecursion(A_ang.x, B_ang.x, t, alpha, beta, AB_Dx);
+
+        for(int u=0; u<A_ang.y+B_ang.y+1; u++){
+            Eu = MD_Et_NonRecursion(A_ang.y, B_ang.y, u, alpha, beta, AB_Dy);
+
+            for(int v=0; v<A_ang.z+B_ang.z+2; v++){
+                Ev = (alpha/p) * MD_Et_NonRecursion(A_ang.z, B_ang.z, v-1, alpha, beta, AB_Dz) + Et_grad_NonRecursion(A_ang.z, B_ang.z, v, alpha, beta, AB_Dz);
+
+                for(int tau=0; tau<C_ang.x+D_ang.x+1; tau++){
+                    Etau = MD_Et_NonRecursion(C_ang.x, D_ang.x, tau, gamma, delta, CD_Dx);
+
+                    for(int nu=0; nu<C_ang.y+D_ang.y+1; nu++){
+                        Enu = MD_Et_NonRecursion(C_ang.y, D_ang.y, nu, gamma, delta, CD_Dy);
+
+                        for(int phi=0; phi<C_ang.z+D_ang.z+1; phi++){
+                            Ephi = MD_Et_NonRecursion(C_ang.z, D_ang.z, phi, gamma, delta, CD_Dz);
+
+                            int k=t+u+v+tau+nu+phi;
+                            temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                            // temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, R); // RはBoysのこと
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return temp;
+}
+
+
+inline __device__ double compute_two_grad_Bx(
+    const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
+    const double alpha, const double beta, const double gamma, const double delta,
+    const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
+    const double p, const double q, const double3& P, const double3& Q, double* R)
+{
+    double Et, Eu, Ev, Etau, Enu, Ephi;
+    double temp = 0.0;
+
+    for(int t=0; t<A_ang.x+B_ang.x+2; t++){
+        Et = (beta/p) * MD_Et_NonRecursion(A_ang.x, B_ang.x, t-1, alpha, beta, AB_Dx) - Et_grad_NonRecursion(A_ang.x, B_ang.x, t, alpha, beta, AB_Dx);
+
+        for(int u=0; u<A_ang.y+B_ang.y+1; u++){
+            Eu = MD_Et_NonRecursion(A_ang.y, B_ang.y, u, alpha, beta, AB_Dy);
+
+            for(int v=0; v<A_ang.z+B_ang.z+1; v++){
+                Ev = MD_Et_NonRecursion(A_ang.z, B_ang.z, v, alpha, beta, AB_Dz);
+
+                for(int tau=0; tau<C_ang.x+D_ang.x+1; tau++){
+                    Etau = MD_Et_NonRecursion(C_ang.x, D_ang.x, tau, gamma, delta, CD_Dx);
+
+                    for(int nu=0; nu<C_ang.y+D_ang.y+1; nu++){
+                        Enu = MD_Et_NonRecursion(C_ang.y, D_ang.y, nu, gamma, delta, CD_Dy);
+
+                        for(int phi=0; phi<C_ang.z+D_ang.z+1; phi++){
+                            Ephi = MD_Et_NonRecursion(C_ang.z, D_ang.z, phi, gamma, delta, CD_Dz);
+
+                            int k=t+u+v+tau+nu+phi;
+                            temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                            // temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, R); // RはBoysのこと
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return temp;
+}
+
+
+inline __device__ double compute_two_grad_By(
+    const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
+    const double alpha, const double beta, const double gamma, const double delta,
+    const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
+    const double p, const double q, const double3& P, const double3& Q, double* R)
+{
+    double Et, Eu, Ev, Etau, Enu, Ephi;
+    double temp = 0.0;
+
+    for(int t=0; t<A_ang.x+B_ang.x+1; t++){
+        Et = MD_Et_NonRecursion(A_ang.x, B_ang.x, t, alpha, beta, AB_Dx);
+
+        for(int u=0; u<A_ang.y+B_ang.y+2; u++){
+            Eu = (beta/p) * MD_Et_NonRecursion(A_ang.y, B_ang.y, u-1, alpha, beta, AB_Dy) - Et_grad_NonRecursion(A_ang.y, B_ang.y, u, alpha, beta, AB_Dy);
+
+            for(int v=0; v<A_ang.z+B_ang.z+1; v++){
+                Ev = MD_Et_NonRecursion(A_ang.z, B_ang.z, v, alpha, beta, AB_Dz);
+
+                for(int tau=0; tau<C_ang.x+D_ang.x+1; tau++){
+                    Etau = MD_Et_NonRecursion(C_ang.x, D_ang.x, tau, gamma, delta, CD_Dx);
+
+                    for(int nu=0; nu<C_ang.y+D_ang.y+1; nu++){
+                        Enu = MD_Et_NonRecursion(C_ang.y, D_ang.y, nu, gamma, delta, CD_Dy);
+
+                        for(int phi=0; phi<C_ang.z+D_ang.z+1; phi++){
+                            Ephi = MD_Et_NonRecursion(C_ang.z, D_ang.z, phi, gamma, delta, CD_Dz);
+
+                            int k=t+u+v+tau+nu+phi;
+                            temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                            // temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, R); // RはBoysのこと
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return temp;
+}
+
+
+inline __device__ double compute_two_grad_Bz(
+    const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
+    const double alpha, const double beta, const double gamma, const double delta,
+    const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
+    const double p, const double q, const double3& P, const double3& Q, double* R)
+{
+    double Et, Eu, Ev, Etau, Enu, Ephi;
+    double temp = 0.0;
+
+    for(int t=0; t<A_ang.x+B_ang.x+1; t++){
+        Et = MD_Et_NonRecursion(A_ang.x, B_ang.x, t, alpha, beta, AB_Dx);
+
+        for(int u=0; u<A_ang.y+B_ang.y+1; u++){
+            Eu = MD_Et_NonRecursion(A_ang.y, B_ang.y, u, alpha, beta, AB_Dy);
+
+            for(int v=0; v<A_ang.z+B_ang.z+2; v++){
+                Ev = (beta/p) * MD_Et_NonRecursion(A_ang.z, B_ang.z, v-1, alpha, beta, AB_Dz) - Et_grad_NonRecursion(A_ang.z, B_ang.z, v, alpha, beta, AB_Dz);
+
+                for(int tau=0; tau<C_ang.x+D_ang.x+1; tau++){
+                    Etau = MD_Et_NonRecursion(C_ang.x, D_ang.x, tau, gamma, delta, CD_Dx);
+
+                    for(int nu=0; nu<C_ang.y+D_ang.y+1; nu++){
+                        Enu = MD_Et_NonRecursion(C_ang.y, D_ang.y, nu, gamma, delta, CD_Dy);
+
+                        for(int phi=0; phi<C_ang.z+D_ang.z+1; phi++){
+                            Ephi = MD_Et_NonRecursion(C_ang.z, D_ang.z, phi, gamma, delta, CD_Dz);
+
+                            int k=t+u+v+tau+nu+phi;
+                            temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                            // temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, R); // RはBoysのこと
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return temp;
+}
+
+
+inline __device__ double compute_two_grad_Cx(
+    const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
+    const double alpha, const double beta, const double gamma, const double delta,
+    const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
+    const double p, const double q, const double3& P, const double3& Q, double* R)
+{
+    double Et, Eu, Ev, Etau, Enu, Ephi;
+    double temp = 0.0;
+
+    for(int t=0; t<A_ang.x+B_ang.x+1; t++){
+        Et = MD_Et_NonRecursion(A_ang.x, B_ang.x, t, alpha, beta, AB_Dx);
+
+        for(int u=0; u<A_ang.y+B_ang.y+1; u++){
+            Eu = MD_Et_NonRecursion(A_ang.y, B_ang.y, u, alpha, beta, AB_Dy);
+
+            for(int v=0; v<A_ang.z+B_ang.z+1; v++){
+                Ev = MD_Et_NonRecursion(A_ang.z, B_ang.z, v, alpha, beta, AB_Dz);
+
+                for(int tau=0; tau<C_ang.x+D_ang.x+2; tau++){
+                    Etau = (alpha/p) * MD_Et_NonRecursion(C_ang.x, D_ang.x, tau-1, gamma, delta, CD_Dx) + Et_grad_NonRecursion(C_ang.x, D_ang.x, tau, gamma, delta, CD_Dx);
+
+                    for(int nu=0; nu<C_ang.y+D_ang.y+1; nu++){
+                        Enu = MD_Et_NonRecursion(C_ang.y, D_ang.y, nu, gamma, delta, CD_Dy);
+
+                        for(int phi=0; phi<C_ang.z+D_ang.z+1; phi++){
+                            Ephi = MD_Et_NonRecursion(C_ang.z, D_ang.z, phi, gamma, delta, CD_Dz);
+
+                            int k=t+u+v+tau+nu+phi;
+                            temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                            // temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, R); // RはBoysのこと
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return temp;
+}
+
+
+inline __device__ double compute_two_grad_Cy(
+    const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
+    const double alpha, const double beta, const double gamma, const double delta,
+    const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
+    const double p, const double q, const double3& P, const double3& Q, double* R)
+{
+    double Et, Eu, Ev, Etau, Enu, Ephi;
+    double temp = 0.0;
+
+    for(int t=0; t<A_ang.x+B_ang.x+1; t++){
+        Et = MD_Et_NonRecursion(A_ang.x, B_ang.x, t, alpha, beta, AB_Dx);
+
+        for(int u=0; u<A_ang.y+B_ang.y+1; u++){
+            Eu = MD_Et_NonRecursion(A_ang.y, B_ang.y, u, alpha, beta, AB_Dy);
+
+            for(int v=0; v<A_ang.z+B_ang.z+1; v++){
+                Ev = MD_Et_NonRecursion(A_ang.z, B_ang.z, v, alpha, beta, AB_Dz);
+
+                for(int tau=0; tau<C_ang.x+D_ang.x+1; tau++){
+                    Etau = MD_Et_NonRecursion(C_ang.x, D_ang.x, tau, gamma, delta, CD_Dx);
+
+                    for(int nu=0; nu<C_ang.y+D_ang.y+2; nu++){
+                        Enu = (alpha/p) * MD_Et_NonRecursion(C_ang.y, D_ang.y, nu-1, gamma, delta, CD_Dy) + Et_grad_NonRecursion(C_ang.y, D_ang.y, nu, gamma, delta, CD_Dy);
+
+                        for(int phi=0; phi<C_ang.z+D_ang.z+1; phi++){
+                            Ephi = MD_Et_NonRecursion(C_ang.z, D_ang.z, phi, gamma, delta, CD_Dz);
+
+                            int k=t+u+v+tau+nu+phi;
+                            temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                            // temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, R); // RはBoysのこと
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return temp;
+}
+
+
+inline __device__ double compute_two_grad_Cz(
+    const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
+    const double alpha, const double beta, const double gamma, const double delta,
+    const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
+    const double p, const double q, const double3& P, const double3& Q, double* R)
+{
+    double Et, Eu, Ev, Etau, Enu, Ephi;
+    double temp = 0.0;
+
+    for(int t=0; t<A_ang.x+B_ang.x+1; t++){
+        Et = MD_Et_NonRecursion(A_ang.x, B_ang.x, t, alpha, beta, AB_Dx);
+
+        for(int u=0; u<A_ang.y+B_ang.y+1; u++){
+            Eu = MD_Et_NonRecursion(A_ang.y, B_ang.y, u, alpha, beta, AB_Dy);
+
+            for(int v=0; v<A_ang.z+B_ang.z+1; v++){
+                Ev = MD_Et_NonRecursion(A_ang.z, B_ang.z, v, alpha, beta, AB_Dz);
+
+                for(int tau=0; tau<C_ang.x+D_ang.x+1; tau++){
+                    Etau = MD_Et_NonRecursion(C_ang.x, D_ang.x, tau, gamma, delta, CD_Dx);
+
+                    for(int nu=0; nu<C_ang.y+D_ang.y+1; nu++){
+                        Enu = MD_Et_NonRecursion(C_ang.y, D_ang.y, nu, gamma, delta, CD_Dy);
+
+                        for(int phi=0; phi<C_ang.z+D_ang.z+2; phi++){
+                            Ephi = (alpha/p) * MD_Et_NonRecursion(C_ang.z, D_ang.z, phi-1, gamma, delta, CD_Dz) + Et_grad_NonRecursion(C_ang.z, D_ang.z, phi, gamma, delta, CD_Dz);
+
+                            int k=t+u+v+tau+nu+phi;
+                            temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                            // temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, R); // RはBoysのこと
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return temp;
+}
+
+
+inline __device__ double compute_two_grad_Dx(
+    const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
+    const double alpha, const double beta, const double gamma, const double delta,
+    const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
+    const double p, const double q, const double3& P, const double3& Q, double* R)
+{
+    double Et, Eu, Ev, Etau, Enu, Ephi;
+    double temp = 0.0;
+
+    for(int t=0; t<A_ang.x+B_ang.x+1; t++){
+        Et = MD_Et_NonRecursion(A_ang.x, B_ang.x, t, alpha, beta, AB_Dx);
+
+        for(int u=0; u<A_ang.y+B_ang.y+1; u++){
+            Eu = MD_Et_NonRecursion(A_ang.y, B_ang.y, u, alpha, beta, AB_Dy);
+
+            for(int v=0; v<A_ang.z+B_ang.z+1; v++){
+                Ev = MD_Et_NonRecursion(A_ang.z, B_ang.z, v, alpha, beta, AB_Dz);
+
+                for(int tau=0; tau<C_ang.x+D_ang.x+2; tau++){
+                    Etau = (beta/p) * MD_Et_NonRecursion(C_ang.x, D_ang.x, tau-1, gamma, delta, CD_Dx) - Et_grad_NonRecursion(C_ang.x, D_ang.x, tau, gamma, delta, CD_Dx);
+
+                    for(int nu=0; nu<C_ang.y+D_ang.y+1; nu++){
+                        Enu = MD_Et_NonRecursion(C_ang.y, D_ang.y, nu, gamma, delta, CD_Dy);
+
+                        for(int phi=0; phi<C_ang.z+D_ang.z+1; phi++){
+                            Ephi = MD_Et_NonRecursion(C_ang.z, D_ang.z, phi, gamma, delta, CD_Dz);
+
+                            int k=t+u+v+tau+nu+phi;
+                            temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                            // temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, R); // RはBoysのこと
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return temp;
+}
+
+
+inline __device__ double compute_two_grad_Dy(
+    const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
+    const double alpha, const double beta, const double gamma, const double delta,
+    const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
+    const double p, const double q, const double3& P, const double3& Q, double* R)
+{
+    double Et, Eu, Ev, Etau, Enu, Ephi;
+    double temp = 0.0;
+
+    for(int t=0; t<A_ang.x+B_ang.x+1; t++){
+        Et = MD_Et_NonRecursion(A_ang.x, B_ang.x, t, alpha, beta, AB_Dx);
+
+        for(int u=0; u<A_ang.y+B_ang.y+1; u++){
+            Eu = MD_Et_NonRecursion(A_ang.y, B_ang.y, u, alpha, beta, AB_Dy);
+
+            for(int v=0; v<A_ang.z+B_ang.z+1; v++){
+                Ev = MD_Et_NonRecursion(A_ang.z, B_ang.z, v, alpha, beta, AB_Dz);
+
+                for(int tau=0; tau<C_ang.x+D_ang.x+1; tau++){
+                    Etau = MD_Et_NonRecursion(C_ang.x, D_ang.x, tau, gamma, delta, CD_Dx);
+
+                    for(int nu=0; nu<C_ang.y+D_ang.y+2; nu++){
+                        Enu = (beta/p) * MD_Et_NonRecursion(C_ang.y, D_ang.y, nu-1, gamma, delta, CD_Dy) - Et_grad_NonRecursion(C_ang.y, D_ang.y, nu, gamma, delta, CD_Dy);
+
+                        for(int phi=0; phi<C_ang.z+D_ang.z+1; phi++){
+                            Ephi = MD_Et_NonRecursion(C_ang.z, D_ang.z, phi, gamma, delta, CD_Dz);
+
+                            int k=t+u+v+tau+nu+phi;
+                            temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                            // temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, R); // RはBoysのこと
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return temp;
+}
+
+
+inline __device__ double compute_two_grad_Dz(
+    const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
+    const double alpha, const double beta, const double gamma, const double delta,
+    const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
+    const double p, const double q, const double3& P, const double3& Q, double* R)
+{
+    double Et, Eu, Ev, Etau, Enu, Ephi;
+    double temp = 0.0;
+
+    for(int t=0; t<A_ang.x+B_ang.x+1; t++){
+        Et = MD_Et_NonRecursion(A_ang.x, B_ang.x, t, alpha, beta, AB_Dx);
+
+        for(int u=0; u<A_ang.y+B_ang.y+1; u++){
+            Eu = MD_Et_NonRecursion(A_ang.y, B_ang.y, u, alpha, beta, AB_Dy);
+
+            for(int v=0; v<A_ang.z+B_ang.z+1; v++){
+                Ev = MD_Et_NonRecursion(A_ang.z, B_ang.z, v, alpha, beta, AB_Dz);
+
+                for(int tau=0; tau<C_ang.x+D_ang.x+1; tau++){
+                    Etau = MD_Et_NonRecursion(C_ang.x, D_ang.x, tau, gamma, delta, CD_Dx);
+
+                    for(int nu=0; nu<C_ang.y+D_ang.y+1; nu++){
+                        Enu = MD_Et_NonRecursion(C_ang.y, D_ang.y, nu, gamma, delta, CD_Dy);
+
+                        for(int phi=0; phi<C_ang.z+D_ang.z+2; phi++){
+                            Ephi = (beta/p) * MD_Et_NonRecursion(C_ang.z, D_ang.z, phi-1, gamma, delta, CD_Dz) - Et_grad_NonRecursion(C_ang.z, D_ang.z, phi, gamma, delta, CD_Dz);
+
+                            int k=t+u+v+tau+nu+phi;
+                            temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                            // temp +=  Et * Eu * Ev * Etau * Enu * Ephi * (1 - 2*((tau+nu+phi)&1)) * R_GPU_Recursion(0, t+tau, u+nu, v+phi, P, Q, R); // RはBoysのこと
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return temp;
+}
+

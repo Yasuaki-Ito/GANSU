@@ -62,6 +62,7 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     transform_matrix(num_basis, num_basis), // host memory is not allocated in advance
     verbose(parameters.get<int>("verbose")),
     max_iter(parameters.get<int>("maxiter")),
+    int1e_method(parameters.get<std::string>("int1e_method")),
     convergence_energy_threshold(parameters.get<double>("convergence_energy_threshold")),
     schwarz_screening_threshold(parameters.get<double>("schwarz_screening_threshold")),
     geometry_optimization(parameters.get<int>("geometry_optimization")),
@@ -154,7 +155,7 @@ void HF::compute_core_hamiltonian_matrix() {
     PROFILE_FUNCTION();
 
     // compute the core Hamiltonian matrix
-    gpu::computeCoreHamiltonianMatrix(shell_type_infos, atoms.device_ptr(), primitive_shells.device_ptr(), boys_grid.device_ptr(), cgto_normalization_factors.device_ptr(), overlap_matrix.device_ptr(), core_hamiltonian_matrix.device_ptr(),atoms.size(), num_basis, verbose);
+    gpu::computeCoreHamiltonianMatrix(shell_type_infos, atoms.device_ptr(), primitive_shells.device_ptr(), boys_grid.device_ptr(), cgto_normalization_factors.device_ptr(), overlap_matrix.device_ptr(), core_hamiltonian_matrix.device_ptr(),atoms.size(), num_basis, int1e_method, verbose);
 
     // print the overlap and core Hamiltonian matrix
     if(verbose){

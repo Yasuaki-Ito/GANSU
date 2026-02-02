@@ -2998,7 +2998,11 @@ __device__ double (*MD_EtArray[])(double, double, double, double, double) = {
 
 // MD法におけるEに関して，(i,l,t)の対応するデバイス関数を選択
 __device__ inline double MD_Et_NonRecursion(int i, int l, int t, double alpha, double beta, double dist){
-    return MD_EtArray[4*i*(10+i) + (i+l)*(i+l+1)/2 + t](alpha, beta, alpha+beta, dist, exp(-alpha*beta/(alpha+beta)*dist*dist));
+    if( i<0 || l<0 || t<0 || i+l<t){ // 範囲外の処理
+        return 0.0;
+    }else{
+    	return MD_EtArray[4*i*(10+i) + (i+l)*(i+l+1)/2 + t](alpha, beta, alpha+beta, dist, exp(-alpha*beta/(alpha+beta)*dist*dist));
+	}
 }
 
 

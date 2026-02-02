@@ -81,6 +81,15 @@
         THROW_EXCEPTION("Invalid eri_method: " + eri_method);
     }
 
+    // Set an algorithm for int1e calculation (default: ERI_Stored_RHF)
+    const std::string int1e_method = parameters.get<std::string>("int1e_method");
+    if(int1e_method == "md"){
+        std::cout << "[INT1E] One electron integrals are computed using the MD method." << std::endl;
+    }else if(int1e_method == "os"){
+        std::cout << "[INT1E] One electron integrals are computed using the OS method." << std::endl;
+    }else{ //Default hybrid
+        std::cout << "[INT1E] One electron integrals are computed using the Hybrid method." << std::endl;
+    }
 }
  
  /**
@@ -340,6 +349,17 @@ void UHF::export_density_matrix(real_t* density_matrix_a, real_t* density_matrix
     memcpy(density_matrix_a, this->density_matrix_a.host_ptr(), num_basis*num_basis*sizeof(real_t));
     memcpy(density_matrix_b, this->density_matrix_b.host_ptr(), num_basis*num_basis*sizeof(real_t));
 
+}
+
+
+/**
+ * @brief Compute the gradient of the total electronic energy
+ * @details This function calculates the gradient of the total electronic energy with respect to nuclear coordinates.
+ */
+void UHF::compute_Energy_Gradient() {
+    PROFILE_FUNCTION();
+    // Compute the gradient of the total electronic energy
+    // gpu::computeEnergyGradient_UHF(shell_type_infos, shell_pair_type_infos, atoms.device_ptr(), density_matrix.device_ptr(), coefficient_matrix.device_ptr(), orbital_energies.device_ptr(), primitive_shells.device_ptr(), boys_grid.device_ptr(), cgto_normalization_factors.device_ptr(), atoms.size(), num_basis, num_electrons, verbose);
 }
 
 

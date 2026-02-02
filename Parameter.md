@@ -17,6 +17,7 @@
 | beta_to_alpha | Number of shifted electrons from beta-spin to alpha-spin | int | 0 |
 | maxiter | Maximum number of SCF iterations | int | 100 |
 | convergence_energy_threshold | Energy convergence threshold | double | 1.0e-6 |
+| int1e_method | Method to use for one-electron integrals (overlap integrals, kinetic integrals, and nuclear attraction integrals) | string | hybrid |
 | eri_method | Method to use for two-electron repulsion integrals | string | stored |
 | post_hf_method | Post-Hartree-Fock method to use (MP2, CCSD, CCSD(T)) | string | none |
 | schwarz_screening_threshold | Schwarz screening threshold | double | 1.0e-12 |
@@ -133,6 +134,7 @@ If any of the following conditions are met, an exception is thrown:
 | --- | --- | --- | --- |
 | maxiter | Maximum number of SCF iterations | int | 100 |
 | convergence_energy_threshold | Energy convergence threshold | double | 1.0e-6 |
+| int1e_method | Method to use for one-electron integrals | string | hybrid |
 | eri_method | Method to use for two-electron repulsion integrals | string | stored |
 | schwarz_screening_threshold | Schwarz screening threshold | double | 1.0e-12 |
 | initial_guess | Method to use for initial guess | string | core |
@@ -151,6 +153,11 @@ If any of the following conditions are met, an exception is thrown:
 #### convergence_energy_threshold - Energy convergence threshold
 * default:  1.0e-6
 * Energy convergence threshold for the SCF iterations
+
+#### int1e_method - Method to use for one-electrion integrals (overlap integrals, kinetic energy integrals, and nuclear attraction integrals)
+* default: hybrid
+* md: McMurchie-Davidson algorithm
+* os: Obara-Saika algorithm
 
 #### eri_method - Method to use for two-electron repulsion integrals
 * default: stored

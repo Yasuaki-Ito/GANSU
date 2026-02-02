@@ -15,6 +15,10 @@ cmake_minimum_required(VERSION 3.31)
 project(GANSU LANGUAGES CUDA CXX)
 
 
+# Uncomment the following line if f- or g-orbital basis functions are present.
+# add_definitions(-DENABLE_F_INT1E)
+# add_definitions(-DENABLE_G_INT1E)
+
 # Uncomment the following line to enable to support D-type basis functions for RI approximations (density fitting)
 # Note: Build time will take several hours (5-6 hours)
 #
@@ -47,6 +51,14 @@ add_library(int2c2e STATIC src/int2c2e.cu)
 add_library(int3c2e STATIC src/int3c2e.cu)
 add_library(int2e_direct STATIC src/int2e_direct.cu)
 
+
+add_library(grad_w STATIC src/grad/grad_w.cu)
+add_library(grad_s STATIC src/grad/grad_s.cu)
+add_library(grad_k STATIC src/grad/grad_k.cu)
+add_library(grad_v STATIC src/grad/grad_v.cu)
+add_library(grad_g STATIC src/grad/grad_g.cu)
+
+
 set(SOURCES
     src/basis_set.cpp
     src/parseXYZ.cpp
@@ -77,6 +89,11 @@ target_link_libraries(gansu
         int2c2e
         int3c2e
         int2e_direct
+        grad_w
+        grad_s
+        grad_k
+        grad_v
+        grad_g
     )
 
 

@@ -66,6 +66,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"mayer", "0"},                             // int (bool)
         {"wiberg", "0"},                            // int (bool)
         {"export_molden", "0"},                     // int (bool)
+        {"int1e_method", "hybrid"}                  // string
     };
 
 

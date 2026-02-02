@@ -149,6 +149,7 @@ struct PrimitiveShell {
 struct Atom {
     int atomic_number; ///< atomic number
     Coordinate coordinate; ///< coordinate=(x, y, z)
+    int atom_index; ///< Index of the atom in the molecule
 };
 
 /**

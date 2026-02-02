@@ -1,7 +1,7 @@
 /*
- * GANSU: GPU Accelerated Numerical Simulation Utility
+ * GANSU: GPU Acclerated Numerical Simulation Utility
  *
- * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
+ * Copyright (c) 2025, Hiroshima University and Fujitsu Limited
  * All rights reserved.
  *
  * This software is licensed under the BSD 3-Clause License.
@@ -15,11 +15,14 @@
 
 #include <cuda.h>
 #include <cmath>
+#include <assert.h>
 
 #include "boys.hpp"
 #include "types.hpp"
 #include "utils_cuda.hpp"
 
+// #include "int1e.hpp"
+#include "compile_flag_int1e.hpp"
 #include "int2e.hpp"
 #include "Et_functions.hpp"
 
@@ -39,14 +42,6 @@
 
 namespace gansu::gpu{
 
-// 二条階乗を返す関数
-__device__ int factorial2gpu(int i){
-    if(i<1){
-        return 1;
-    }else{
-        return i*factorial2gpu(i-2);
-    }
-}
 
 // 2点間の距離を求める関数（2乗済み）
 __device__ double calc_dist_GPU(const Coordinate& coord1, const Coordinate& coord2){
@@ -64,35 +59,15 @@ __device__ double calc_Norms(double alpha, double beta, int ijk, int lmn){
 }
 
 
-//__global__ void Matrix_Symmetrization(double* matrix, int n){
-//    __shared__ double sh_mem[32][33];
-//
-//    if(blockIdx.y > blockIdx.x) return;
-//
-//    int src_block = blockIdx.y*32*n + blockIdx.x*32;
-//    int dst_block = blockIdx.x*32*n + blockIdx.y*32;
-//
-//    if(blockIdx.x*32+threadIdx.x < n || blockIdx.y*32+threadIdx.y < n){
-//    //if(blockIdx.x*32+threadIdx.x < n && blockIdx.y*32+threadIdx.y < n){
-//        sh_mem[threadIdx.y][threadIdx.x] = matrix[src_block + threadIdx.y*n+threadIdx.x];
-//    }
-//    __syncthreads();
-//
-//    if (blockIdx.y==blockIdx.x && threadIdx.y <= threadIdx.x || (dst_block + threadIdx.y*n+threadIdx.x >=n*n) ) return;
-//
-//    matrix[dst_block + threadIdx.y*n+threadIdx.x] = sh_mem[threadIdx.x][threadIdx.y];
-//}
-
-__global__ void matrixSymmetrization(double* g_matrix, const int num_basis) 
+__global__ void matrixSymmetrization(real_t* g_matrix, const int num_basis) 
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int mu = idx / num_basis;
     const int nu = idx % num_basis;
-
+ 
     if (mu < nu) {
         g_matrix[num_basis * nu + mu] = g_matrix[num_basis * mu + nu];
     }
-
 }
 
 
@@ -101,99 +76,67 @@ __device__ int calc_result_index(int y, int x, int sumCGTO){
 }
 
 
-// MD method
-#include "MD_kernel.txt"
-// OS method
-#include "OS_kernel.txt"
+// Definition of kernels for calculating one-electron integrals (up to d orbitals)
+#include "./one_integral/d_int1e_kernel.txt"
+
+
+// If the F or G orbit swas enabled when compiling, include the following.
+#if INT1E_MAX_L >= 3
+    // f kernels
+    #include "./one_integral/f_int1e_kernel.txt"
+#else
+    __global__ void overlap_kinetic_MDsf(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_MDpf(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_MDdf(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_MDff(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void nuclear_attraction_MDsf(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_MDpf(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_MDdf(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_MDff(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    
+    __global__ void overlap_kinetic_OSsf(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_OSpf(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_OSdf(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_OSff(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void nuclear_attraction_OSsf(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_OSpf(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_OSdf(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_OSff(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    
+#endif
+
+// If the G orbit was enabled when compiling, include the following.
+#if INT1E_MAX_L >= 4
+    // g kernels
+    #include "./one_integral/g_int1e_kernel.txt"
+#else
+    __global__ void overlap_kinetic_MDsg(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_MDpg(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_MDdg(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_MDfg(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_MDgg(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void nuclear_attraction_MDsg(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_MDpg(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_MDdg(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_MDfg(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_MDgg(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+
+    __global__ void overlap_kinetic_OSsg(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_OSpg(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_OSdg(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_OSfg(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void overlap_kinetic_OSgg(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis) {}
+    __global__ void nuclear_attraction_OSsg(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_OSpg(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_OSdg(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_OSfg(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+    __global__ void nuclear_attraction_OSgg(real_t* g_nucattr, const PrimitiveShell *g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis, const real_t* g_boys_grid) {}
+
+#endif
 
 
 
-
-
-// すべての行列要素にatomicAddを行う（汎用カーネルで使用）
-__device__ void AddToResult(double result, double *g_V, int y, int x, int sumCGTO, bool flag){
-    atomicAdd(&g_V[y*sumCGTO + x], result);
-    if(flag){
-        atomicAdd(&g_V[x*sumCGTO + y], result);
-    }
-}
-
-
-// // normに球面調和に関わるマジックナンバーをかける
-// __device__ inline double normalizationFactor(int l, int m, int n) {
-//     int total = l + m + n;
-
-//     if (total == 2) { // d-type
-//         if(l == 2 || m == 2 || n == 2){
-//             return D_NORMALIZATION_CONSTANT_2_INV;
-//         }else{
-//             return D_NORMALIZATION_CONSTANT_1_INV;
-//         }
-
-//     } else if (total == 3) { // f-type
-//         if (l == 3 || m == 3 || n == 3)
-//             return F_NORMALIZATION_CONSTANT_3_INV;
-//         else if (l == 2 || m == 2 || n == 2)
-//             return F_NORMALIZATION_CONSTANT_2_INV;
-//         else
-//             return F_NORMALIZATION_CONSTANT_1_INV;
-
-//     } else if (total == 4) { // g-type
-//         if (l == 4 || m == 4 || n == 4) // i.e., (4, 0, 0)
-//             return G_NORMALIZATION_CONSTANT_4;
-//         else if (l == 3 || m == 3 || n == 3) // i.e., (3, 1, 0)
-//             return G_NORMALIZATION_CONSTANT_3_INV;
-//         else if (l == 0 || m == 0 || n == 0) // i.e., (2, 2, 0)
-//             return G_NORMALIZATION_CONSTANT_2_2_INV;
-//         else
-//             return G_NORMALIZATION_CONSTANT_2_INV;
-//     }
-
-//     // それ以外は補正なし（1.0を掛けるのと同じ）
-//     return 1.0;
-// }
-
-
-
-// MD法のRの再帰関係をトリプルバッファリングで計算
-inline 
-__device__ void compute_R_TripleBuffer(real_t* R, real_t* R_mid, const real_t* Boys, const double3& P, const Coordinate& coord, const int K, const int t_max, const int u_max, const int v_max){
-    //Step 0: Boys関数評価
-    R[0]=Boys[0];
-    for(int i=0; i <= K; i++){
-        R_mid[i]=Boys[i];
-    } 
-
-    //Step 1~Kの計算
-    for(int k=1; k <= K; k++){
-        for(int z=0; z<=(K+1)*comb_max(k); z++){
-            int i = z/comb_max(k);
-            if(i <= K-k){
-                int t = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][0];
-                int u = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][1];
-                int v = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][2];
-                if((t <= t_max) && (u <= u_max) && (v <= v_max)){
-                    if(t >= 1){
-                        R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_one_Rmid)] = (P.x-coord.x)*R_mid[calc_Idx_Rmid(k-1,u,v,i+1,comb_max(k-1),size_one_Rmid)] + (t-1)*R_mid[calc_Idx_Rmid(k-2,u,v,i+1,comb_max(k-2),size_one_Rmid)];
-                    }
-                    else if(u >= 1){
-                        R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_one_Rmid)] = (P.y-coord.y)*R_mid[calc_Idx_Rmid(k-1,u-1,v,i+1,comb_max(k-1),size_one_Rmid)] + (u-1)*R_mid[calc_Idx_Rmid(k-2,u-2,v,i+1,comb_max(k-2),size_one_Rmid)];
-                    }
-                    else{
-                        R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_one_Rmid)] = (P.z-coord.z)*R_mid[calc_Idx_Rmid(k-1,u,v-1,i+1,comb_max(k-1),size_one_Rmid)] + (v-1)*R_mid[calc_Idx_Rmid(k-2,u,v-2,i+1,comb_max(k-2),size_one_Rmid)];
-                    }
-                }
-            }
-        }
-
-        //必要な結果を配列Rに書き込み
-        for(int i=0; i<=comb_max(k); i++){
-            R[static_cast<int>(k*(k+1)*(k+2)/6) + i] = R_mid[(k%3)*static_cast<int>(size_one_Rmid) + i];
-        }
-    }
-}
-
-
+// 運動エネルギー積分を計算する汎用カーネル
 __global__
 void compute_kinetic_energy_integral(real_t* g_overlap, real_t* g_kinetic, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, 
                                         const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t num_threads, const int num_basis)
@@ -228,13 +171,11 @@ void compute_kinetic_energy_integral(real_t* g_overlap, real_t* g_kinetic, const
         int m1=loop_to_ang[a.shell_type][lmn_a][1]; 
         int n1=loop_to_ang[a.shell_type][lmn_a][2];
         Norm_A = calcNorm(a.exponent, l1, m1, n1);
-        // Norm_A *= normalizationFactor(l1, m1, n1);
         for(int lmn_b=0; lmn_b<comb_max(b.shell_type); lmn_b++){                  
             int l2=loop_to_ang[b.shell_type][lmn_b][0]; 
             int m2=loop_to_ang[b.shell_type][lmn_b][1]; 
             int n2=loop_to_ang[b.shell_type][lmn_b][2];
             Norm_B = calcNorm(b.exponent, l2, m2, n2);
-            // Norm_B *= normalizationFactor(l2, m2, n2);
 
             result_S = coefandNorm * Norm_A * Norm_B * Et_GPU(l1, l2, 0, a.exponent, b.exponent, Dx) * Et_GPU(m1, m2, 0, a.exponent, b.exponent, Dy) * Et_GPU(n1, n2, 0, a.exponent, b.exponent, Dz);
 
@@ -243,21 +184,6 @@ void compute_kinetic_energy_integral(real_t* g_overlap, real_t* g_kinetic, const
                     Et_GPU(l1, l2, 0, a.exponent, b.exponent, Dx)*( (-2.0)*b.exponent*b.exponent*Et_GPU(m1, m2+2, 0, a.exponent, b.exponent, Dy) + b.exponent*(2*m2+1)*Et_GPU(m1, m2, 0, a.exponent, b.exponent, Dy) - ((m2*(m2-1))/2)*Et_GPU(m1, m2-2, 0, a.exponent, b.exponent, Dy) )*Et_GPU(n1, n2, 0, a.exponent, b.exponent, Dz) +
                     Et_GPU(l1, l2, 0, a.exponent, b.exponent, Dx)*Et_GPU(m1, m2, 0, a.exponent, b.exponent, Dy)*( (-2.0)*b.exponent*b.exponent*Et_GPU(n1, n2+2, 0, a.exponent, b.exponent, Dz) + b.exponent*(2*n2+1)*Et_GPU(n1, n2, 0, a.exponent, b.exponent, Dz) - ((n2*(n2-1))/2)*Et_GPU(n1, n2-2, 0, a.exponent, b.exponent, Dz))
             );
-
-            // AddToResult(
-            //     result_S, 
-            //     g_overlap, 
-            //     size_a+lmn_a, size_b+lmn_b, 
-            //     num_basis, 
-            //     primitive_index_a != primitive_index_b
-            // );
-            // AddToResult(
-            //     result_K, 
-            //     g_kinetic, 
-            //     size_a+lmn_a, size_b+lmn_b, 
-            //     num_basis, 
-            //     primitive_index_a != primitive_index_b
-            // );
 
             if( (a.shell_type == b.shell_type) && (size_a==size_b) && (lmn_a > lmn_b)) continue;
 
@@ -268,7 +194,44 @@ void compute_kinetic_energy_integral(real_t* g_overlap, real_t* g_kinetic, const
 }
 
 
+// MD法のRの再帰関係をトリプルバッファリングで計算（汎用カーネルで使用）
+inline 
+__device__ void compute_R_TripleBuffer(real_t* R, real_t* R_mid, const real_t* Boys, const double3& P, const Coordinate& coord, const int K, const int t_max, const int u_max, const int v_max){
+    //Step 0: Boys関数評価
+    R[0]=Boys[0];
+    for(int i=0; i <= K; i++){
+        R_mid[i]=Boys[i];
+    } 
 
+    for(int k=1; k <= K; k++){
+        for(int z=0; z<=(K+1)*comb_max(k); z++){
+            int i = z/comb_max(k);
+            if(i <= K-k){
+                int t = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][0];
+                int u = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][1];
+                int v = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][2];
+                if((t <= t_max) && (u <= u_max) && (v <= v_max)){
+                    if(t >= 1){
+                        R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_one_Rmid)] = (P.x-coord.x)*R_mid[calc_Idx_Rmid(k-1,u,v,i+1,comb_max(k-1),size_one_Rmid)] + (t-1)*R_mid[calc_Idx_Rmid(k-2,u,v,i+1,comb_max(k-2),size_one_Rmid)];
+                    }
+                    else if(u >= 1){
+                        R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_one_Rmid)] = (P.y-coord.y)*R_mid[calc_Idx_Rmid(k-1,u-1,v,i+1,comb_max(k-1),size_one_Rmid)] + (u-1)*R_mid[calc_Idx_Rmid(k-2,u-2,v,i+1,comb_max(k-2),size_one_Rmid)];
+                    }
+                    else{
+                        R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_one_Rmid)] = (P.z-coord.z)*R_mid[calc_Idx_Rmid(k-1,u,v-1,i+1,comb_max(k-1),size_one_Rmid)] + (v-1)*R_mid[calc_Idx_Rmid(k-2,u,v-2,i+1,comb_max(k-2),size_one_Rmid)];
+                    }
+                }
+            }
+        }
+
+        for(int i=0; i<=comb_max(k); i++){
+            R[static_cast<int>(k*(k+1)*(k+2)/6) + i] = R_mid[(k%3)*static_cast<int>(size_one_Rmid) + i];
+        }
+    }
+}
+
+
+// 核引力積分を計算する汎用カーネル
 __global__
 void compute_nuclear_attraction_integral(real_t* g_nucattr, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, 
                                         const Atom* g_atom, const int num_atoms, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, 
@@ -321,55 +284,18 @@ void compute_nuclear_attraction_integral(real_t* g_nucattr, const PrimitiveShell
             int m1=loop_to_ang[a.shell_type][lmn_a][1]; 
             int n1=loop_to_ang[a.shell_type][lmn_a][2];
             Norm_A = calcNorm(a.exponent, l1, m1, n1);
-            // Norm_A *= normalizationFactor(l1, m1, n1);
             for(int lmn_b=0; lmn_b<comb_max(b.shell_type); lmn_b++){                 
                 int l2=loop_to_ang[b.shell_type][lmn_b][0]; 
                 int m2=loop_to_ang[b.shell_type][lmn_b][1]; 
                 int n2=loop_to_ang[b.shell_type][lmn_b][2];
                 Norm_B = calcNorm(b.exponent, l2, m2, n2);
-                // Norm_B *= normalizationFactor(l2, m2, n2);
 
                 if( (a.shell_type == b.shell_type) && (size_a==size_b) && (lmn_a > lmn_b)) continue;
 
                 compute_R_TripleBuffer(R, R_mid, Boys, P, g_atom[atom_index].coordinate, K, l1+l2, m1+m2, n1+n2);
 
-                // //Step 0: Boys関数評価
-                // R[0]=Boys[0];
-                // for(int i=0; i <= K; i++){
-                //     R_mid[i]=Boys[i];
-                // } 
-
-                // //Step 1~Kの計算
-                // for(int k=1; k <= K; k++){
-                //     for(int z=0; z<=(K+1)*comb_max(k); z++){
-                //         int i = z/comb_max(k);
-                //         if(i <= K-k){
-                //             int t = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][0];
-                //             int u = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][1];
-                //             int v = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][2];
-                //             if((t <= l1+l2) && (u <= m1+m2) && (v <= n1+n2)){
-                //                 if(t >= 1){
-                //                     R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_one_Rmid)] = (P.x-g_atom[atom_index].coordinate.x)*R_mid[calc_Idx_Rmid(k-1,u,v,i+1,comb_max(k-1),size_one_Rmid)] + (t-1)*R_mid[calc_Idx_Rmid(k-2,u,v,i+1,comb_max(k-2),size_one_Rmid)];
-                //                 }
-                //                 else if(u >= 1){
-                //                     R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_one_Rmid)] = (P.y-g_atom[atom_index].coordinate.y)*R_mid[calc_Idx_Rmid(k-1,u-1,v,i+1,comb_max(k-1),size_one_Rmid)] + (u-1)*R_mid[calc_Idx_Rmid(k-2,u-2,v,i+1,comb_max(k-2),size_one_Rmid)];
-                //                 }
-                //                 else{
-                //                     R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_one_Rmid)] = (P.z-g_atom[atom_index].coordinate.z)*R_mid[calc_Idx_Rmid(k-1,u,v-1,i+1,comb_max(k-1),size_one_Rmid)] + (v-1)*R_mid[calc_Idx_Rmid(k-2,u,v-2,i+1,comb_max(k-2),size_one_Rmid)];
-                //                 }
-                //             }
-                //         }
-                //     }
-
-                //     //必要な結果を配列Rに書き込み
-                //     for(int i=0; i<=comb_max(k); i++){
-                //         R[static_cast<int>(k*(k+1)*(k+2)/6) + i] = R_mid[(k%3)*static_cast<int>(size_one_Rmid) + i];
-                //     }
-                // }
-
                 result_V = 0.0;
 
-                // Rの事前計算終了
                 temp = 0.0;
                 for(int t = 0; t < l1+l2+1; t++){
                     Et = Et_GPU(l1, l2, t, a.exponent, b.exponent, Dx);
@@ -383,15 +309,6 @@ void compute_nuclear_attraction_integral(real_t* g_nucattr, const PrimitiveShell
                     }
                 }
                 result_V = (-g_atom[atom_index].atomic_number) * coefandNorm * Norm_A * Norm_B * temp;
-
-
-                // AddToResult(
-                //     result_V, 
-                //     g_nucattr, 
-                //     size_a+lmn_a, size_b+lmn_b, 
-                //     num_basis, 
-                //     primitive_index_a != primitive_index_b
-                // );
 
                 atomicAdd(&g_nucattr[calc_result_index(size_a+lmn_a, size_b+lmn_b, num_basis)], result_V*(1.0+int((size_a==size_b) && (primitive_index_a!=primitive_index_b))));
             }
