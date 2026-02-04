@@ -110,6 +110,9 @@ long long int calcIdx4Dim(size_t i, size_t j, size_t k, size_t l, size_t nao)
     return nao * nao * nao * i + nao * nao * j + nao * k + l;
 }
 
+__global__ void get_schwarz_upper_bound_factors_general_for_SAD_K_computation(const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t head, const size_t num_bra, const size_t num_primitive_shells, const double* g_boys_grid, double* g_max_upper_bound_factors,ShellPairSorter* g_max_upper_bound_factors_for_SAD_K_computation);
+
+
 inline __device__
 double calcNorm(double exp, int l, int m, int n){
     return static_cast<double>(1 << (l+m+n)) / static_cast<double>(sqrt(static_cast<double>(factorial2_gpu(2.0*l-1.0) * factorial2_gpu(2.0*m-1.0) * factorial2_gpu(2.0*n-1.0)))) * PI3_4 * pow(exp, (2.0*(l+m+n)+3.0)/4.0);

@@ -241,6 +241,7 @@ public:
      */
     bool get_hasMatrixC() const { return hasMatrixC_; }
 
+    void switchHasMatrixC() { hasMatrixC_ = true; }
 
     /**
      * @brief Function to compute the coefficient matrix and set hasMatrixC_ to true
@@ -257,6 +258,13 @@ public:
      * @return Algorithm name as a string
     */
     const std::string get_int1e_algorithm_name() const{ return int1e_method;}; ///< Get the algorithm name
+
+
+    /**
+     * @brief Get the algorithm name for initial_guess
+     * @return Algorithm name as a string
+    */
+    const std::string get_initial_guess_algorithm_name() const{ return initial_guess_method_;}; ///< Get the algorithm name
 
 protected:
     long long solve_time_in_milliseconds_; ///< Time to solve the HF equation
@@ -308,6 +316,9 @@ protected:
 
     // for int1e (hybrid, MD, OS)
     const std::string int1e_method; // int1e method
+
+    // for int1e (hybrid, MD, OS)
+    const std::string initial_guess_method_; // int1e method
 
     // Analysis flags
     const bool is_mulliken_analysis_; ///< Mulliken population analysis flag

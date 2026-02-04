@@ -336,8 +336,8 @@ protected:
     DeviceHostMemory<size_t2> primitive_shell_pair_indices;
 
     // 初回用
-    // DeviceHostMemory<real_t> schwarz_upper_bound_factors_for_K_computation;
-    // DeviceHostMemory<size_t2> primitive_shell_pair_indices_for_K_computation;
+    DeviceHostMemory<real_t> schwarz_upper_bound_factors_for_SAD_K_computation;
+    DeviceHostMemory<size_t2> primitive_shell_pair_indices_for_SAD_K_computation;
 };
 
 

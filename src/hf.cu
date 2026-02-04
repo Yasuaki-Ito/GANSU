@@ -63,6 +63,7 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     verbose(parameters.get<int>("verbose")),
     max_iter(parameters.get<int>("maxiter")),
     int1e_method(parameters.get<std::string>("int1e_method")),
+    initial_guess_method_(parameters.get<std::string>("initial_guess")),
     convergence_energy_threshold(parameters.get<double>("convergence_energy_threshold")),
     schwarz_screening_threshold(parameters.get<double>("schwarz_screening_threshold")),
     geometry_optimization(parameters.get<int>("geometry_optimization")),

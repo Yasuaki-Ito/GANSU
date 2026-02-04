@@ -15,7 +15,6 @@
 
 #include "eri.hpp"
 #include "utils_cuda.hpp"
-#include "device_host_memory.hpp"
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
 
@@ -174,7 +173,7 @@ void ERI_RI::precomputation() {
 
     const size_t num_primitive_shell_pairs = primitive_shells.size() * (primitive_shells.size() + 1) / 2;
     size_t2* d_primitive_shell_pair_indices;
-    tracked_cudaMalloc((void**)&d_primitive_shell_pair_indices, sizeof(size_t2) * num_primitive_shell_pairs);
+    cudaMalloc((void**)&d_primitive_shell_pair_indices, sizeof(size_t2) * num_primitive_shell_pairs);
 
     int pair_idx = 0;
     const int threads_per_block = 1024;
@@ -236,7 +235,7 @@ void ERI_RI::precomputation() {
         );    
 
 
-    tracked_cudaFree(d_primitive_shell_pair_indices);
+    cudaFree(d_primitive_shell_pair_indices);
     /*
     if(1){
         // copy the intermediate matrix B to the host memory
@@ -268,18 +267,18 @@ ERI_Direct::ERI_Direct(const HF& hf):
     num_fock_replicas_(8)
 {
     // for distributed atomicAdd operations
-    tracked_cudaMalloc(&fock_matrix_replicas_, sizeof(real_t) * num_basis_ * num_basis_ * num_fock_replicas_);
+    cudaMalloc(&fock_matrix_replicas_, sizeof(real_t) * num_basis_ * num_basis_ * num_fock_replicas_);
     //cudaMemset(fock_matrix_replicas_, 0.0, sizeof(real_t) * num_basis_ * num_basis_ * num_fock_replicas_);
 }
 
 ERI_Direct::~ERI_Direct() {
-    for (auto p : global_counters_) { if (p) tracked_cudaFree(p); }
-    for (auto p : min_skipped_columns_) { if (p) tracked_cudaFree(p); }
+    for (auto p : global_counters_) { if (p) cudaFree(p); }
+    for (auto p : min_skipped_columns_) { if (p) cudaFree(p); }
     global_counters_.clear();
     min_skipped_columns_.clear();
 
     if (fock_matrix_replicas_) {
-        tracked_cudaFree(fock_matrix_replicas_);
+        cudaFree(fock_matrix_replicas_);
         fock_matrix_replicas_ = nullptr;
     }
 }
@@ -320,8 +319,8 @@ void ERI_Direct::precomputation()
         shell_s1 = shell_type_infos[s1];
         num_bra = (s0 == s1) ? shell_s0.count * (shell_s0.count + 1) / 2 : shell_s0.count * shell_s1.count;
         num_bra_groups = (num_bra + task_group_size - 1) / task_group_size;
-        tracked_cudaMalloc(&global_counters_[idx], sizeof(int) * num_bra_groups);
-        tracked_cudaMalloc(&min_skipped_columns_[idx], sizeof(int) * num_bra_groups);
+        cudaMalloc(&global_counters_[idx], sizeof(int) * num_bra_groups);
+        cudaMalloc(&min_skipped_columns_[idx], sizeof(int) * num_bra_groups);
     }
 
     gpu::computeSchwarzUpperBounds(
@@ -384,6 +383,37 @@ void ERI_Hash::precomputation() {
 
 
 
+
+
+
+
+
+
+
+
+
+
+// full_range
+// All of CGTO Idx pair {a,b} satisfying a < b
+__global__ void generatePrimitiveShellPairIndices_for_SAD_K_computation(size_t2* d_primitive_shell_pair_indices_for_SAD_K_computation, const PrimitiveShell* d_primitive_shells, int num_primitive_shells, size_t num_threads){
+    const size_t id = (size_t)blockDim.x * blockIdx.x + threadIdx.x;
+    if (id >= num_threads) return;
+    
+    size_t2 res = index1to2(id, false, num_primitive_shells);
+
+    d_primitive_shell_pair_indices_for_SAD_K_computation[id] = res;
+}
+
+
+__global__ void copySchwarzUpperBoundFactors_for_SAD_K_computation(real_t* d_schwarz_upper_bound_factors_for_SAD_K_computation, ShellPairSorter* d_shell_pair_sorter_for_SAD_K_computation, const size_t num_primitive_shells) {
+    const size_t id = (size_t)blockDim.x * blockIdx.x + threadIdx.x;
+    if (id >= num_primitive_shells * num_primitive_shells) return;
+
+    d_schwarz_upper_bound_factors_for_SAD_K_computation[id] = d_shell_pair_sorter_for_SAD_K_computation[id].schwarz_upper_bound_ab;
+}
+
+
+
 ERI_RI_Direct::ERI_RI_Direct(const HF& hf, const Molecular& auxiliary_molecular): 
     hf_(hf),
     num_basis_(hf.get_num_basis()),
@@ -395,7 +425,9 @@ ERI_RI_Direct::ERI_RI_Direct(const HF& hf, const Molecular& auxiliary_molecular)
     auxiliary_schwarz_upper_bound_factors(auxiliary_molecular.get_primitive_shells().size()),
     two_center_eris(num_auxiliary_basis_ * num_auxiliary_basis_), 
     two_center_eris_inverse(num_auxiliary_basis_ * num_auxiliary_basis_), 
-    primitive_shell_pair_indices(hf_.get_primitive_shells().size() * (hf_.get_primitive_shells().size() + 1) / 2)
+    primitive_shell_pair_indices(hf_.get_primitive_shells().size() * (hf_.get_primitive_shells().size() + 1) / 2),
+    schwarz_upper_bound_factors_for_SAD_K_computation((hf_.get_initial_guess_algorithm_name() == "sad") ? hf_.get_primitive_shells().size() * hf_.get_primitive_shells().size() : 0),
+    primitive_shell_pair_indices_for_SAD_K_computation((hf_.get_initial_guess_algorithm_name() == "sad") ? hf_.get_primitive_shells().size() * hf_.get_primitive_shells().size() : 0)
 {
     // to device memory
     auxiliary_primitive_shells_.toDevice();
@@ -419,15 +451,54 @@ void ERI_RI_Direct::precomputation() {
     // K 計算用のソートに使用
     const size_t num_primitive_shells = primitive_shells.size();
 
-    gpu::computeSchwarzUpperBounds(
-        shell_type_infos,
-        shell_pair_type_infos,
-        primitive_shells.device_ptr(), 
-        boys_grid.device_ptr(), 
-        cgto_normalization_factors.device_ptr(), 
-        schwarz_upper_bound_factors.device_ptr(),   // schwarz_upper_bound_factorsに√(pq|pq)の値がはいっている
-        verbose
-    );
+
+    // K計算用のペア配列生成
+    if(schwarz_upper_bound_factors_for_SAD_K_computation.size() > 0){
+        size_t num_tasks = num_primitive_shells*num_primitive_shells;
+        size_t num_blocks = (num_tasks + threads_per_block - 1) / threads_per_block;
+        generatePrimitiveShellPairIndices_for_SAD_K_computation<<<num_blocks, threads_per_block>>>(primitive_shell_pair_indices_for_SAD_K_computation.device_ptr(), primitive_shells.device_ptr(), num_primitive_shells, num_tasks);
+    
+        // Sort用構造体配列
+        ShellPairSorter* d_shell_pair_sorter_for_SAD_K_computation;
+        if(schwarz_upper_bound_factors_for_SAD_K_computation.size() > 0) cudaMalloc((void**)&d_shell_pair_sorter_for_SAD_K_computation, sizeof(ShellPairSorter)*num_tasks);
+
+
+        // compute upper bounds of primitive-shell-pair
+        // 通常のshell pairの上界計算も行う
+        gpu::computeSchwarzUpperBounds_for_SAD_K_computation(
+            shell_type_infos,
+            shell_pair_type_infos,
+            primitive_shells.device_ptr(), 
+            boys_grid.device_ptr(), 
+            cgto_normalization_factors.device_ptr(), 
+            schwarz_upper_bound_factors.device_ptr(),   // schwarz_upper_bound_factorsに√(pq|pq)の値がはいっている
+            d_shell_pair_sorter_for_SAD_K_computation,
+            num_primitive_shells,
+            verbose
+        );
+
+        // K計算用のshell-pair配列ソート
+        thrust::device_ptr<ShellPairSorter> keys_begin(d_shell_pair_sorter_for_SAD_K_computation);  
+        thrust::device_ptr<ShellPairSorter> keys_end(d_shell_pair_sorter_for_SAD_K_computation + num_tasks);
+        thrust::device_ptr<size_t2> values_begin(primitive_shell_pair_indices_for_SAD_K_computation.device_ptr());
+        thrust::sort_by_key(keys_begin, keys_end, values_begin);
+
+        copySchwarzUpperBoundFactors_for_SAD_K_computation<<<num_blocks, threads_per_block>>>(schwarz_upper_bound_factors_for_SAD_K_computation.device_ptr(), d_shell_pair_sorter_for_SAD_K_computation, num_primitive_shells);
+
+        primitive_shell_pair_indices_for_SAD_K_computation.toHost();
+        cudaFree(d_shell_pair_sorter_for_SAD_K_computation);
+    }else{
+        gpu::computeSchwarzUpperBounds(
+            shell_type_infos,
+            shell_pair_type_infos,
+            primitive_shells.device_ptr(), 
+            boys_grid.device_ptr(), 
+            cgto_normalization_factors.device_ptr(), 
+            schwarz_upper_bound_factors.device_ptr(),   // schwarz_upper_bound_factorsに√(pq|pq)の値がはいっている
+            verbose
+        );
+    }
+
 
 
     // shell-pair sort
@@ -447,6 +518,12 @@ void ERI_RI_Direct::precomputation() {
         }
     }
     cudaDeviceSynchronize();
+
+
+
+
+
+
 
     
     

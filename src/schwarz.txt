@@ -17,16 +17,7 @@
 #define PP_TYPES 9
 
 #include "int2c2e.hpp"
-    // 順序合わせたやつ
-__constant__ int loop_to_ang_RI_[7][28][3] = {
-    {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}},
-    {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}},
-    {{2, 0, 0}, {0, 2, 0}, {0, 0, 2}, {1, 1, 0}, {1, 0, 1}, {0, 1, 1}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}},
-    {{3,0,0}, {0,3,0}, {0,0,3}, {2,1,0}, {2,0,1}, {0,2,1}, {1,2,0}, {0,1,2}, {1,0,2}, {1,1,1}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}},
-    {{4, 0, 0}, {0, 4, 0}, {0, 0, 4}, {3,1,0}, {3,0,1}, {0,3,1}, {1,3,0}, {0,1,3}, {1,0,3}, {2,2,0}, {2,0,2}, {0,2,2}, {2,1,1}, {1,2,1}, {1,1,2}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}},
-    {{5, 0, 0}, {4, 1, 0}, {3, 2, 0}, {2, 3, 0}, {1, 4, 0}, {0, 5, 0}, {4, 0, 1}, {3, 1, 1}, {2, 2, 1}, {1, 3, 1}, {0, 4, 1}, {3, 0, 2}, {2, 1, 2}, {1, 2, 2}, {0, 3, 2}, {2, 0, 3}, {1, 1, 3}, {0, 2, 3}, {1, 0, 4}, {0, 1, 4}, {0, 0, 5}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}},
-    {{6, 0, 0}, {5, 1, 0}, {4, 2, 0}, {3, 3, 0}, {2, 4, 0}, {1, 5, 0}, {0, 6, 0}, {5, 0, 1}, {4, 1, 1}, {3, 2, 1}, {2, 3, 1}, {1, 4, 1}, {0, 5, 1}, {4, 0, 2}, {3, 1, 2}, {2, 2, 2}, {1, 3, 2}, {0, 4, 2}, {3, 0, 3}, {2, 1, 3}, {1, 2, 3}, {0, 3, 3}, {2, 0, 4}, {1, 1, 4}, {0, 2, 4}, {1, 0, 5}, {0, 1, 5}, {0, 0, 6}}
-};
+
 
 __device__
 double calculate_upper_bound_factor_ss(
@@ -560,7 +551,7 @@ void get_schwarz_upper_bound_factors_aux_general(
 
     // 方位量子数l,m,nの値をループ変数から導出
     for(int lmn_a=0; lmn_a<comb_max(orbital_A); lmn_a++){
-        int l1=loop_to_ang_RI_[orbital_A][lmn_a][0]; int m1=loop_to_ang_RI_[orbital_A][lmn_a][1]; int n1=loop_to_ang_RI_[orbital_A][lmn_a][2];
+        int l1=loop_to_ang[orbital_A][lmn_a][0]; int m1=loop_to_ang[orbital_A][lmn_a][1]; int n1=loop_to_ang[orbital_A][lmn_a][2];
         Norm_A = calcNorm(alpha, l1, m1, n1);
 
         int lmn_b = lmn_a;
@@ -662,4 +653,257 @@ void get_schwarz_upper_bound_factors_aux_general(
 
     g_max_upper_bound_factors_aux[head + id] = __dsqrt_rn(max_upper_bound_factor);
     // g_max_upper_bound_factors_aux[head + id] = max_upper_bound_factor;
+}
+
+
+
+
+
+__global__
+void get_schwarz_upper_bound_factors_general_for_SAD_K_computation(
+    const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, 
+    const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, 
+    const size_t head, const size_t num_bra, const size_t num_primitive_shells, const double* g_boys_grid, 
+    double* g_max_upper_bound_factors,
+    ShellPairSorter* g_max_upper_bound_factors_for_SAD_K_computation)
+{
+    double max_upper_bound_factor = 0.0;
+
+    // 通し番号indexの計算
+    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= num_bra) return;
+
+    const double size_Rmid=1377;
+    double R_mid[3*1377];   //使い捨ての中間体R_mid
+    double R[2925];         //解を格納する配列R
+    double thread_val=0.0;  //thread内で結果を保持するメモリ
+    
+    //// Compute 4D index from thread id
+    //const size_t2 abcd = index1to2(id, true);
+    //const size_t2 ab = index1to2(abcd.x, shell_s0.start_index == shell_s1.start_index, shell_s1.count);
+    //const size_t2 cd = index1to2(abcd.y, shell_s2.start_index == shell_s3.start_index, shell_s3.count);
+    size_t2 ab;
+    if (shell_s0.start_index == shell_s1.start_index) { // same shell type
+        ab = index1to2(id, true);
+    }
+    else {
+        ab = index1to2(id, false, shell_s1.count);      // different shell type
+    }
+
+    // Obtain primitive shells [ab|cd]
+    const size_t primitive_index_a = ab.x+shell_s0.start_index;
+    const size_t primitive_index_b = ab.y+shell_s1.start_index;
+    const size_t primitive_index_c = primitive_index_a;
+    const size_t primitive_index_d = primitive_index_b;
+
+    const PrimitiveShell a = g_shell[primitive_index_a];
+    const PrimitiveShell b = g_shell[primitive_index_b];
+    const PrimitiveShell c = g_shell[primitive_index_c];
+    const PrimitiveShell d = g_shell[primitive_index_d];
+        
+    // Obtain basis index (ij|kl)
+    //const size_t size_a = a.basis_index;
+    //const size_t size_b = b.basis_index;
+    //const size_t size_c = c.basis_index;
+    //const size_t size_d = d.basis_index;
+
+    //bool is_bra_symmetric = (primitive_index_a == primitive_index_b);
+    //bool is_ket_symmetric = (primitive_index_c == primitive_index_d);
+    //bool is_braket_symmetric = (primitive_index_a == primitive_index_c && primitive_index_b == primitive_index_d);
+    
+    //使用データを取得，レジスタに書き込み
+
+    //指数部
+    const double alpha = a.exponent;
+    const double beta  = b.exponent;
+    const double p = alpha+beta;
+    const double q = alpha+beta;
+    const double xi = p*q / (p+q);
+
+    //係数部
+    const double coef_a = a.coefficient;
+    const double coef_b = b.coefficient;
+    const double coef_c = c.coefficient;
+    const double coef_d = d.coefficient;
+
+    //座標
+    const double pos_A[3] = {a.coordinate.x, a.coordinate.y, a.coordinate.z};
+    const double pos_B[3] = {b.coordinate.x, b.coordinate.y, b.coordinate.z};
+    const double pos_C[3] = {c.coordinate.x, c.coordinate.y, c.coordinate.z};
+    const double pos_D[3] = {d.coordinate.x, d.coordinate.y, d.coordinate.z};
+
+    const double pos_P[3] = {(alpha*pos_A[0]+beta*pos_B[0])/(alpha+beta), (alpha*pos_A[1]+beta*pos_B[1])/(alpha+beta), (alpha*pos_A[2]+beta*pos_B[2])/(alpha+beta)};
+    const double pos_Q[3] = {(alpha*pos_C[0]+beta*pos_D[0])/(alpha+beta), (alpha*pos_C[1]+beta*pos_D[1])/(alpha+beta), (alpha*pos_C[2]+beta*pos_D[2])/(alpha+beta)};
+
+    //角運動量の総和
+    const int orbital_A = a.shell_type;
+    const int orbital_B = b.shell_type;
+    const int orbital_C = c.shell_type;
+    const int orbital_D = d.shell_type;
+
+    //軌道間距離の二乗
+    const double dist = ((pos_P[0]-pos_Q[0])*(pos_P[0]-pos_Q[0]) + (pos_P[1]-pos_Q[1])*(pos_P[1]-pos_Q[1]) + (pos_P[2]-pos_Q[2])*(pos_P[2]-pos_Q[2]));
+
+
+    const int K=orbital_A + orbital_B + orbital_C + orbital_D;
+    
+    double Boys[25];
+    getIncrementalBoys(K, xi*dist, g_boys_grid, Boys);
+
+    //Boys関数の値を計算(Single)
+    for(int i=0; i <= K; i++){
+        Boys[i] *= (right2left_binary_woif((-2*xi), i));
+    }
+
+    //各ERIを計算
+    //事前計算⇒実際のERI計算の順に実行
+    //p軌道の場合lmn_aが0:px, 1:py, 2:pz軌道のように対応付け
+    //d以上はconstant配列のloop_to_angを参照
+
+    
+    
+    double Norm_A, Norm_B;//, Norm_C, Norm_D;
+    double Norm;
+
+    int t,u,v,tau,nu,phi;
+    int t_max;
+    int u_max;
+    int v_max;
+    int tau_max;
+    int nu_max;
+    int phi_max;
+
+    int tid=0;
+    
+    int iter_max;
+
+    // 方位量子数l,m,nの値をループ変数から導出
+    for(int lmn_a=0; lmn_a<comb_max(orbital_A); lmn_a++){
+        int l1=loop_to_ang[orbital_A][lmn_a][0]; int m1=loop_to_ang[orbital_A][lmn_a][1]; int n1=loop_to_ang[orbital_A][lmn_a][2];
+        Norm_A = calcNorm(alpha, l1, m1, n1);
+        for(int lmn_b=0; lmn_b<comb_max(orbital_B); lmn_b++){                  
+            int l2=loop_to_ang[orbital_B][lmn_b][0]; int m2=loop_to_ang[orbital_B][lmn_b][1]; int n2=loop_to_ang[orbital_B][lmn_b][2];
+            Norm_B = calcNorm(beta, l2, m2, n2);
+            //for(int lmn_c=0; lmn_c<comb_max(orbital_C); lmn_c++){
+            //    int l3=loop_to_ang[orbital_C][lmn_c][0]; int m3=loop_to_ang[orbital_C][lmn_c][1]; int n3=loop_to_ang[orbital_C][lmn_c][2];
+            //    Norm_C = calcNorm(alpha, l3, m3, n3);
+            //    for(int lmn_d=0; lmn_d<comb_max(orbital_D); lmn_d++){
+            //        int l4=loop_to_ang[orbital_D][lmn_d][0]; int m4=loop_to_ang[orbital_D][lmn_d][1]; int n4=loop_to_ang[orbital_D][lmn_d][2];
+            //        Norm_D = calcNorm(beta, l4, m4, n4);
+            //        Norm = Norm_A * Norm_B * Norm_C * Norm_D;
+
+            int l3 = l1; int m3 = m1; int n3 = n1;
+            int l4 = l2; int m4 = m2; int n4 = n2;
+            Norm = Norm_A * Norm_B * Norm_A * Norm_B;
+
+
+            // 前回のループの計算結果をクリア
+            thread_val=0.0;
+            // 事前計算部
+            //初期値：Boysとして計算済
+            //Step 0: Boys関数評価
+            R[0]=Boys[0];
+            for(int i=0; i <= K; i++){
+                R_mid[i]=Boys[i];
+            }
+            
+            // ループ変数の設定
+            t_max = l1+l2+1;
+            u_max = m1+m2+1;
+            v_max = n1+n2+1;
+            tau_max = l3+l4+1;
+            nu_max = m3+m4+1;
+            phi_max = n3+n4+1;
+
+            for(int k=1; k <= K; k++){//Step 1~Kの計算
+                // t+u+v=kとなる全ペアに対して適切な計算
+                // 0~K-kまでそれぞれ必要⇒ループでやる
+
+
+                for(int z=0; z<=(K+1)*comb_max(k); z++){
+                
+                    int i = z/comb_max(k);
+
+                    if(i <= K-k){
+                        t=tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][0];
+                        u=tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][1];
+                        v=tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][2];
+
+
+                        if((t <= (t_max+tau_max-2)) && (u <= (u_max+nu_max-2)) && (v <= (v_max+phi_max-2))){
+                            if(t >= 1){
+                                R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_Rmid)] = (pos_P[0] - pos_Q[0])*R_mid[calc_Idx_Rmid(k-1,u,v,i+1,comb_max(k-1),size_Rmid)] + (t-1)*R_mid[calc_Idx_Rmid(k-2,u,v,i+1,comb_max(k-2),size_Rmid)];
+                            }
+                            else if(u >= 1){
+                                R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_Rmid)] = (pos_P[1] - pos_Q[1])*R_mid[calc_Idx_Rmid(k-1,u-1,v,i+1,comb_max(k-1),size_Rmid)] + (u-1)*R_mid[calc_Idx_Rmid(k-2,u-2,v,i+1,comb_max(k-2),size_Rmid)];
+                            }
+                            else{
+                                R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_Rmid)] = (pos_P[2] - pos_Q[2])*R_mid[calc_Idx_Rmid(k-1,u,v-1,i+1,comb_max(k-1),size_Rmid)] + (v-1)*R_mid[calc_Idx_Rmid(k-2,u,v-2,i+1,comb_max(k-2),size_Rmid)];
+                            }
+                        }
+                    }
+                }//step kの全計算が終了
+
+
+                //必要な結果を配列Rに書き込み
+                for(int i=0; i<=comb_max(k); i++){
+                    R[static_cast<int>(k*(k+1)*(k+2)/6) + i] = R_mid[(k%3)*static_cast<int>(size_Rmid) + i];
+
+                }
+
+            }
+            //事前計算完了
+            
+
+            // ERI計算部
+            iter_max=t_max*u_max*v_max*tau_max*nu_max*phi_max + 1;
+            for(int i=0; i<iter_max; i++){
+                // MD法6重ループを管理する6変数を各Threadに割り当て
+                tid=i;
+                phi = tid % phi_max;
+                tid /= phi_max;
+                nu = tid % nu_max;
+                tid /= nu_max;
+                tau = tid % tau_max;
+                tid /= tau_max;
+                v = tid % v_max;
+                tid /= v_max;
+                u = tid % u_max;
+                tid /= u_max;
+                t=tid;
+
+
+                double my_val = 0.0;
+
+                ////特定の(t,u,v,tau,nu,phi)に対応する結果をmy_valとして持つ
+                if(t <= t_max-1 && u<=u_max-1 && v<=v_max-1 && tau<=tau_max-1 && nu<=nu_max-1 && phi<=phi_max-1){
+                    int k=t+u+v+tau+nu+phi;
+                    my_val = MD_Et_NonRecursion(l1, l2, t, alpha, beta, (pos_A[0]-pos_B[0])) * MD_Et_NonRecursion(m1, m2, u, alpha, beta, (pos_A[1]-pos_B[1])) * MD_Et_NonRecursion(n1, n2, v, alpha, beta, (pos_A[2]-pos_B[2])) * MD_Et_NonRecursion(l3, l4, tau, alpha, beta, (pos_C[0]-pos_D[0])) * MD_Et_NonRecursion(m3, m4, nu, alpha, beta, (pos_C[1]-pos_D[1])) * MD_Et_NonRecursion(n3, n4, phi, alpha, beta, (pos_C[2]-pos_D[2])) * (1 - 2*((tau+nu+phi)&1)) * R[k*(k+1)*(k+2)/6 + calc_Idx_Rmid(k,u+nu,v+phi,0,0,0)];
+                    // thread_valに足しこんでMD法の結果を得る
+                    thread_val += my_val*2 * M_PI_2_5 /(p*q * sqrt((p+q)))  *coef_a*coef_b*coef_c*coef_d;
+                } 
+            }
+
+            const double upper_bound_factor = Norm * thread_val;
+            if (fabs(max_upper_bound_factor) < fabs(upper_bound_factor)) {
+                max_upper_bound_factor = upper_bound_factor;
+            }
+                //}
+            //}
+        }
+    }
+
+    max_upper_bound_factor = __dsqrt_rn(max_upper_bound_factor);
+    g_max_upper_bound_factors[head + id] = max_upper_bound_factor;
+
+
+
+    // K計算用
+    g_max_upper_bound_factors_for_SAD_K_computation[primitive_index_a * num_primitive_shells + primitive_index_b] = ShellPairSorter{a.shell_type,
+                                                                                                                                         (int)b.basis_index,
+                                                                                                                                         max_upper_bound_factor};
+
+    if(primitive_index_a != primitive_index_b) g_max_upper_bound_factors_for_SAD_K_computation[primitive_index_b * num_primitive_shells + primitive_index_a] = ShellPairSorter{b.shell_type,
+                                                                                                                                                                                    (int)a.basis_index,
+                                                                                                                                                                                    max_upper_bound_factor};
 }

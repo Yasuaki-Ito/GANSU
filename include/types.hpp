@@ -267,5 +267,23 @@ const std::vector<std::vector<std::vector<int>>> AngularMomentums = {
     }
 };
 
+struct ShellPairSorter {
+    int shell_type_a;
+    int basis_index_b;
+    double schwarz_upper_bound_ab;
+
+    #ifdef __CUDACC__ 
+    __host__ __device__
+    #endif
+    bool operator<(const ShellPairSorter& other) const {
+        if (basis_index_b < other.basis_index_b) return true;
+        if (basis_index_b > other.basis_index_b) return false;
+
+        if (shell_type_a < other.shell_type_a) return true;
+        if (shell_type_a > other.shell_type_a) return false;
+
+        return schwarz_upper_bound_ab > other.schwarz_upper_bound_ab;
+    }
+};
 
 } // namespace gansu

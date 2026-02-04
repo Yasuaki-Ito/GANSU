@@ -408,6 +408,7 @@ public:
             hf_.get_coefficient_matrix().device_ptr(),
             hf_.get_num_basis()
         );
+        hf_.switchHasMatrixC();
 
         hf_.compute_density_matrix(); // compute the density matrix from the coefficient matrix
         hf_.compute_fock_matrix(); // compute the Fock matrix from the density matrix
@@ -436,6 +437,7 @@ public:
             hf_.get_coefficient_matrix().device_ptr(),
             hf_.get_num_basis()
         );
+        hf_.switchHasMatrixC();
 
         hf_.compute_density_matrix(); // compute the density matrix from the coefficient matrix
         hf_.compute_fock_matrix(); // compute the Fock matrix from the density matrix
@@ -795,15 +797,6 @@ public:
     ~ERI_RI_Direct_RHF() = default; ///< destructor
 
     void compute_fock_matrix() override {
-        if(rhf_.get_hasMatrixC() == false){
-            // 初回
-            std::cout << "compute_fock_matrix() first time" << std::endl;
-        }else{
-            // ２回目以降
-            std::cout << "compute_fock_matrix() second time or later" << std::endl;
-        }
-
-
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
         const DeviceHostMatrix<real_t>& core_hamiltonian_matrix = rhf_.get_core_hamiltonian_matrix();
         const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
@@ -821,16 +814,13 @@ public:
         const int num_electrons = rhf_.get_num_electrons();
 
 
-
-        gpu::computeFockMatrix_RI_Direct_RHF(
+        if(rhf_.get_hasMatrixC() == false){
+        gpu::computeInitialFockMatrix_RI_Direct_RHF(
             density_matrix.device_ptr(),
             coefficient_matrix.device_ptr(),
             two_center_eris_inverse.device_ptr(),
-            two_center_eris.device_ptr(),
             core_hamiltonian_matrix.device_ptr(),
             fock_matrix.device_ptr(),
-            coefficient_matrix_prev.device_ptr(),
-            h_Z_tensor,
             shell_type_infos,
             shell_pair_type_infos,
             primitive_shells.host_ptr(),
@@ -840,6 +830,8 @@ public:
             auxiliary_primitive_shells_.device_ptr(),
             auxiliary_cgto_normalization_factors_.device_ptr(),
             primitive_shell_pair_indices.device_ptr(),
+            primitive_shell_pair_indices_for_SAD_K_computation.host_ptr(),
+            primitive_shell_pair_indices_for_SAD_K_computation.device_ptr(),
             num_basis_,
             num_auxiliary_basis_,
             num_electrons,
@@ -848,8 +840,41 @@ public:
             rhf_.get_schwarz_screening_threshold(),
             schwarz_upper_bound_factors.device_ptr(),
             auxiliary_schwarz_upper_bound_factors.device_ptr(),
-            verbose
+            verbose,
+            two_center_eris.device_ptr()
         );
+
+
+        }else{
+            gpu::computeFockMatrix_RI_Direct_RHF(
+                density_matrix.device_ptr(),
+                coefficient_matrix.device_ptr(),
+                two_center_eris_inverse.device_ptr(),
+                two_center_eris.device_ptr(),
+                core_hamiltonian_matrix.device_ptr(),
+                fock_matrix.device_ptr(),
+                coefficient_matrix_prev.device_ptr(),
+                h_Z_tensor,
+                shell_type_infos,
+                shell_pair_type_infos,
+                primitive_shells.host_ptr(),
+                primitive_shells.device_ptr(),
+                cgto_normalization_factors.device_ptr(),
+                auxiliary_shell_type_infos_,
+                auxiliary_primitive_shells_.device_ptr(),
+                auxiliary_cgto_normalization_factors_.device_ptr(),
+                primitive_shell_pair_indices.device_ptr(),
+                num_basis_,
+                num_auxiliary_basis_,
+                num_electrons,
+                primitive_shells.size(),
+                boys_grid.device_ptr(),
+                rhf_.get_schwarz_screening_threshold(),
+                schwarz_upper_bound_factors.device_ptr(),
+                auxiliary_schwarz_upper_bound_factors.device_ptr(),
+                verbose
+            );
+        }
 
 
         { // nan check

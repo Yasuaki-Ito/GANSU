@@ -3460,4 +3460,355 @@ void computeEnergyGradient_RHF(const std::vector<ShellTypeInfo>& shell_type_info
 
 
 
+
+
+
+void compute_RI_Direct_Z_matrix(
+    const std::vector<ShellTypeInfo>& shell_type_infos, 
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, 
+    const PrimitiveShell* d_primitive_shells, 
+    const real_t* d_cgto_nomalization_factors, 
+    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos, 
+    const PrimitiveShell* d_auxiliary_primitive_shells, 
+    const real_t* d_auxiliary_cgto_nomalization_factors, 
+    real_t* d_Z, 
+    const real_t* d_C,
+    const real_t* d_L_inv,
+    const size_t2* d_primitive_shell_pair_indices,
+    const int num_basis,
+    const int num_auxiliary_basis,
+    const real_t* d_boys_grid,
+    const double schwarz_screening_threshold, 
+    const real_t* d_schwarz_upper_bound_factors,
+    const real_t* d_auxiliary_schwarz_upper_bound_factors,
+    int iter,
+    const bool verbose)
+{
+const int threads_per_block = 128;
+    const int shell_type_count = shell_type_infos.size();
+    const int auxiliary_shell_type_count = auxiliary_shell_type_infos.size();
+
+
+    // Call the kernel functions from (ss|s),... (e.g. (ss|s), (ss|p), (sp|s), (sp|p), (pp|s), (pp|p) for s and p shells)
+
+    // list shell-triples for sorted shell-type (s0, s1, s2)
+    std::vector<std::tuple<int, int, int>> shell_triples;
+    for (int a = 0; a < shell_type_count; ++a) {
+        for (int b = a; b < shell_type_count; ++b) {
+            for (int c = 0; c < auxiliary_shell_type_count; ++c) {
+                shell_triples.emplace_back(a, b, c);
+            }
+        }
+    }
+    // sort by sum (a + b + c) in descending order
+    std::sort(shell_triples.begin(), shell_triples.end(),
+        [](const auto& lhs, const auto& rhs) {
+            int sum_lhs = std::get<0>(lhs) + std::get<1>(lhs) + std::get<2>(lhs);
+            int sum_rhs = std::get<0>(rhs) + std::get<1>(rhs) + std::get<2>(rhs);
+            return sum_lhs > sum_rhs;  // 降順
+        });
+
+
+    // make multi stream
+    const int num_kernels = shell_triples.size();
+    std::vector<cudaStream_t> streams(num_kernels);
+
+    // for-loop for sorted shell-type (s0, s1, s2, s3)
+    int stream_id = 0;
+    for(const auto& triple: shell_triples) {
+        int s0, s1, s2;
+        std::tie(s0, s1, s2) = triple;
+
+        const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+        const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+        const ShellTypeInfo shell_s2 = auxiliary_shell_type_infos[s2];
+
+        const int num_tasks = ( (s0==s1) ? (shell_s0.count*(shell_s0.count+1)/2) : (shell_s0.count*shell_s1.count) ) * shell_s2.count; // the number of pairs of primitive shells = the number of threads
+        const int num_blocks = (num_tasks + threads_per_block - 1) / threads_per_block; // the number of blocks
+        
+        compute_RI_Direct_Z_kernel<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(d_Z, d_C, d_L_inv, d_primitive_shells, d_auxiliary_primitive_shells, 
+                                                                                                d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors, 
+                                                                                                shell_s0, shell_s1, shell_s2, 
+                                                                                                num_tasks, num_basis, 
+                                                                                                &d_primitive_shell_pair_indices[shell_pair_type_infos[calcIdx_triangular_(s0, s1, shell_type_count)].start_index],
+                                                                                                &d_schwarz_upper_bound_factors[shell_pair_type_infos[calcIdx_triangular_(s0, s1, shell_type_count)].start_index],
+                                                                                                d_auxiliary_schwarz_upper_bound_factors,
+                                                                                                schwarz_screening_threshold,
+                                                                                                num_auxiliary_basis,
+                                                                                                iter,
+                                                                                                d_boys_grid);
+    }
+
+    // syncronize streams
+    cudaDeviceSynchronize();
+
+    // destory streams
+    for (int i = 0; i < num_kernels; i++) {
+        cudaStreamDestroy(streams[i]);
+    }
+}
+
+
+__global__ void addMatrix(real_t* d_K, real_t* d_K_iter, int num_elements) {
+    size_t id = threadIdx.x + blockIdx.x * blockDim.x;
+    if (id >= num_elements) return;
+
+    d_K[id] += 2.0*d_K_iter[id];
+}
+
+
+void computeInitialFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_t* d_C,
+                                    const real_t* d_L_inv, 
+                                    const real_t* d_core_hamiltonian_matrix, 
+                                    real_t* d_fock_matrix, 
+                                    const std::vector<ShellTypeInfo>& shell_type_infos, 
+                                    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, 
+                                    const PrimitiveShell* h_primitive_shells, 
+                                    const PrimitiveShell* d_primitive_shells, 
+                                    const real_t* d_cgto_normalization_factors, 
+                                    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos, 
+                                    const PrimitiveShell* d_auxiliary_primitive_shells, 
+                                    const real_t* d_auxiliary_cgto_normalization_factors, 
+                                    const size_t2* d_primitive_shell_pair_indices,
+                                    size_t2* h_primitive_shell_pair_indices_for_SAD_K_computation,
+                                    const size_t2* d_primitive_shell_pair_indices_for_SAD_K_computation,
+                                    const int num_basis,
+                                    const int num_auxiliary_basis,
+                                    const int num_electrons,
+                                    const int num_primitive_shells,
+                                    const real_t* d_boys_grid,
+                                    const double schwarz_screening_threshold, 
+                                    const real_t* d_schwarz_upper_bound_factors,
+                                    const real_t* d_auxiliary_schwarz_upper_bound_factors,
+                                    const bool verbose,
+                                    real_t* d_decomposed_two_center_eris){
+    //cublasManager cublas;
+    cublasHandle_t cublasHandle = GPUHandle::cublas();
+
+
+
+    cudaError_t err;
+
+    // the following is used in the two kernels. So, if necessary, it should be changed for each kernel.
+    const int num_threads = 256;
+    const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+
+    ////////////////////////////////// compute J-matrix //////////////////////////////////
+    real_t* d_J = nullptr;
+    err = cudaMalloc(&d_J, sizeof(real_t)*num_basis*num_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for J matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+    cudaMemset(d_J, 0.0, sizeof(real_t)*num_basis*num_basis);
+
+
+    // compute c_q = \sum_{a b} D_{a b} (q|ab)
+    real_t *d_c = nullptr;
+    err = cudaMalloc(&d_c, sizeof(real_t)*num_auxiliary_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for c vector: ") + std::string(cudaGetErrorString(err)));
+    }
+    cudaMemset(d_c, 0.0, sizeof(real_t)*num_auxiliary_basis);
+
+
+    // cublas関数ように、column-majorにしておく
+    transposeMatrixInPlace(d_decomposed_two_center_eris, num_auxiliary_basis);
+
+
+    // cを求める
+    compute_RI_Direct_c_array(shell_type_infos,
+                              shell_pair_type_infos,
+                              d_primitive_shells,
+                              d_cgto_normalization_factors,
+                              auxiliary_shell_type_infos,
+                              d_auxiliary_primitive_shells,
+                              d_auxiliary_cgto_normalization_factors,
+                              d_c,
+                              d_density_matrix,
+                              d_primitive_shell_pair_indices,
+                              num_basis,
+                              num_auxiliary_basis,
+                              d_boys_grid,
+                              schwarz_screening_threshold,
+                              d_schwarz_upper_bound_factors,
+                              d_auxiliary_schwarz_upper_bound_factors,
+                              verbose);
+    cudaDeviceSynchronize();
+
+
+
+
+
+    // Ly=cをyについて解く   
+    cublasDtrsv(
+        cublasHandle,
+        CUBLAS_FILL_MODE_LOWER, 
+        CUBLAS_OP_N,            
+        CUBLAS_DIAG_NON_UNIT,   
+        num_auxiliary_basis,                   
+        d_decomposed_two_center_eris, num_auxiliary_basis,                  
+        d_c, 1               
+    );
+
+    // L^T t = y をtについて解く
+    cublasDtrsv(
+        cublasHandle,       
+        CUBLAS_FILL_MODE_LOWER, 
+        CUBLAS_OP_T,            
+        CUBLAS_DIAG_NON_UNIT,   
+        num_auxiliary_basis,                                     
+        d_decomposed_two_center_eris, num_auxiliary_basis,                  
+        d_c, 1                
+    );
+
+
+
+    // Jmu nu = ()
+    compute_RI_Direct_J_matrix(shell_type_infos,
+                              shell_pair_type_infos,
+                              d_primitive_shells,
+                              d_cgto_normalization_factors,
+                              auxiliary_shell_type_infos,
+                              d_auxiliary_primitive_shells,
+                              d_auxiliary_cgto_normalization_factors,
+                              d_J,
+                              d_c,
+                              d_primitive_shell_pair_indices,
+                              num_basis,
+                              num_auxiliary_basis,
+                              d_boys_grid,
+                              schwarz_screening_threshold,
+                              d_schwarz_upper_bound_factors,
+                              d_auxiliary_schwarz_upper_bound_factors,
+                              verbose);
+    cudaDeviceSynchronize();
+
+    cudaFree(d_c);
+
+
+    transposeMatrixInPlace(d_decomposed_two_center_eris, num_auxiliary_basis);
+
+
+
+    ////////////////////////////////// compute K-matrix //////////////////////////////////
+    real_t* d_K = nullptr;
+    err = cudaMalloc(&d_K, sizeof(real_t)*num_basis*num_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for K matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+    cudaMemset(d_K, 0.0, sizeof(real_t)*num_basis*num_basis);
+
+    real_t* d_K_iter = nullptr;
+    err = cudaMalloc(&d_K_iter, sizeof(real_t)*num_basis*num_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for K matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+
+
+    real_t* d_Z = nullptr;
+    err = cudaMalloc(&d_Z, sizeof(real_t)*num_basis*num_auxiliary_basis);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for Z matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+
+    const double alpha = 1.0, beta = 0.0;
+
+    const int row = num_basis, col = num_auxiliary_basis;
+
+    for(int iter = 0; iter < num_electrons/2; iter++) {
+        // printf("Iter [%d / %d]-----------------\n",iter, num_electrons/2);
+        cudaMemset(d_Z, 0.0, sizeof(real_t)*num_basis*num_auxiliary_basis);
+
+        // printf("    3-center\n");
+        compute_RI_Direct_Z_matrix(shell_type_infos,
+                        shell_pair_type_infos,
+                        d_primitive_shells,
+                        d_cgto_normalization_factors,
+                        auxiliary_shell_type_infos,
+                        d_auxiliary_primitive_shells,
+                        d_auxiliary_cgto_normalization_factors,
+                        d_Z,
+                        d_C,
+                        d_L_inv,
+                        d_primitive_shell_pair_indices,
+                        num_basis,
+                        num_auxiliary_basis,
+                        d_boys_grid,
+                        schwarz_screening_threshold,
+                        d_schwarz_upper_bound_factors,
+                        d_auxiliary_schwarz_upper_bound_factors,
+                        iter,
+                        verbose);
+
+        // cudaDeviceSynchronize();
+    
+        // printf("    DGEMM\n");
+        cublasDgemm(
+            cublasHandle,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            row,
+            row,
+            col,
+            &alpha,
+            d_Z, col,
+            d_Z, col,
+            &beta,
+            d_K_iter, row
+        );
+
+        // printf("    Add\n");
+        addMatrix<<< num_blocks, num_threads >>>(d_K, d_K_iter, num_basis*num_basis);
+        // addMatrix<<< num_blocks, num_threads >>>(d_K, d_Z, num_basis, num_auxiliary_basis);
+        // cudaDeviceSynchronize();
+    }
+
+
+
+    // ////////////////////////////////// compute Fock matrix //////////////////////////////////
+
+    // // F = H + J - (1/2)*K
+    computeFockMatrix_RI_RHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, num_basis);
+    // cudaMemcpy(d_fock_matrix, d_J, sizeof(real_t)*num_basis*num_basis, cudaMemcpyDeviceToDevice);
+
+    // free the memory
+    cudaFree(d_J);
+    cudaFree(d_K);
+    cudaFree(d_K_iter);
+    cudaFree(d_Z);
+}
+
+
+
+
+
+
+
+void computeSchwarzUpperBounds_for_SAD_K_computation(
+    const std::vector<ShellTypeInfo>& shell_type_infos, 
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+    const PrimitiveShell* d_primitive_shells, 
+    const real_t* d_boys_grid, 
+    const real_t* d_cgto_normalization_factors, 
+    real_t* d_upper_bound_factors, 
+    ShellPairSorter* d_upper_bound_factors_for_SAD_K_computation, 
+    const size_t num_primitive_shells, 
+    const bool verbose)
+{
+    const int threads_per_block = 256; // the number of threads per block
+    const int shell_type_count = shell_type_infos.size();
+
+    for (int s0 = 0; s0 < shell_type_count; ++s0) {
+        for (int s1 = s0; s1 < shell_type_count; ++s1) {
+            const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+            const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+            const size_t head = shell_pair_type_infos[get_index_2to1_horizontal(s0, s1, shell_type_count)].start_index;
+            const size_t num_bra = shell_pair_type_infos[get_index_2to1_horizontal(s0, s1, shell_type_count)].count;
+            const size_t num_blocks = (num_bra + threads_per_block - 1) / threads_per_block; // the number of blocks
+
+            gpu::get_schwarz_upper_bound_factors_general_for_SAD_K_computation<<<num_blocks, threads_per_block>>>(d_primitive_shells, d_cgto_normalization_factors, shell_s0, shell_s1, head, num_bra, num_primitive_shells, d_boys_grid, d_upper_bound_factors, d_upper_bound_factors_for_SAD_K_computation);
+        }
+    }
+}
+
 } // namespace gansu::gpu
