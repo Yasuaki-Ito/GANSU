@@ -120,6 +120,14 @@ public:
         THROW_EXCEPTION("CCSD(T) energy computation is not supported for the selected ERI method.");
     }
 
+    /**
+     * @brief Compute FCI energy
+        * @return FCI energy
+        * @details This function computes the FCI energy.
+        */
+    virtual real_t compute_fci_energy(){
+        THROW_EXCEPTION("FCI energy computation is not supported for the selected ERI method.");
+    }
 
 };
 
@@ -148,6 +156,7 @@ public:
 
     bool supports_post_hf_method(PostHFMethod method) const override {
         if( method == PostHFMethod::None // always supported
+            || method == PostHFMethod::FCI  // The stored ERI method supports FCI
             || method == PostHFMethod::MP2  // The stored ERI method supports MP2
             || method == PostHFMethod::MP3  // The stored ERI method supports MP3
             || method == PostHFMethod::MP4  // The stored ERI method supports MP4

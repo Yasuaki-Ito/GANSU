@@ -73,6 +73,7 @@ set(SOURCES
     src/eri.cu
     src/eri_ri.cu
     src/eri_stored.cu
+    src/eri_stored_fci.cu
     src/eri_stored_mp4.cu
     src/utils.cpp
 )

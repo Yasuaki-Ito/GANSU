@@ -19,7 +19,7 @@
 | convergence_energy_threshold | Energy convergence threshold | double | 1.0e-6 |
 | int1e_method | Method to use for one-electron integrals | string | hybrid |
 | eri_method | Method to use for two-electron repulsion integrals | string | stored |
-| post_hf_method | Post-Hartree-Fock method to use (MP2, CCSD, CCSD(T)) | string | none |
+| post_hf_method | Post-Hartree-Fock method to use (FCI, MP2, CCSD, CCSD(T)) | string | none |
 | schwarz_screening_threshold | Schwarz screening threshold | double | 1.0e-12 |
 | initial_guess | Method to use for initial guess | string | core |
 | convergence_method | Method to use for convergence | string | DIIS |
@@ -166,9 +166,10 @@ If any of the following conditions are met, an exception is thrown:
 * Direct - Direct calculation of the two-electron repulsion integrals (ERIs) without any approximation (Direct-SCF)
 * Direct_RI - Resolution of the Identity (RI) approximation, but three-center ERIs are directly computed without storing
 
-#### post_hf_method - Post-Hartree-Fock method to use (MP2, CCSD, CCSD(T))
+#### post_hf_method - Post-Hartree-Fock method to use (FCI, MP2, CCSD, CCSD(T))
 * default: none
 * none - No post-Hartree-Fock method is applied
+* FCI - Full Configuration Interaction method (FCI)
 * MP2 - Møller-Plesset perturbation theory of second order (MP2)
 * MP3 - Møller-Plesset perturbation theory of third order (MP3)
 * CCSD - Coupled Cluster with Single and Double excitations (CCSD)

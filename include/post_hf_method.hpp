@@ -18,6 +18,7 @@ namespace gansu {
 
 enum class PostHFMethod {
     None,
+    FCI,
     MP2,
     MP3,
     MP4,

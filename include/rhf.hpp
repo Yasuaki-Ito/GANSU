@@ -594,6 +594,7 @@ public:
     real_t compute_mp4_energy() override;
     real_t compute_ccsd_energy() override;
     real_t compute_ccsd_t_energy() override;
+    real_t compute_fci_energy() override;
 
 
     void compute_fock_matrix() override {

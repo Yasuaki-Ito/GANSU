@@ -139,6 +139,8 @@ void RHF::post_process_after_scf() {
     if(post_hf_method == PostHFMethod::None){
         post_hf_energy_ = 0.0;
         return; // do nothing
+    }else if(post_hf_method == PostHFMethod::FCI){
+        post_hf_energy_ = eri_method_->compute_fci_energy();
     }else if(post_hf_method == PostHFMethod::MP2){
         post_hf_energy_ = eri_method_->compute_mp2_energy();
     }else if(post_hf_method == PostHFMethod::MP3){
@@ -413,7 +415,9 @@ void RHF::report() {
         std::cout << std::endl;
         std::cout << "[Calculation Summary (Post-HF)]" << std::endl;
         std::cout << "Post-HF method: ";
-        if(get_post_hf_method() == PostHFMethod::MP2){
+        if(get_post_hf_method() == PostHFMethod::FCI){
+            std::cout << "FCI" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::MP2){
             std::cout << "MP2" << std::endl;
         }else if(get_post_hf_method() == PostHFMethod::MP3){
             std::cout << "MP3" << std::endl;
