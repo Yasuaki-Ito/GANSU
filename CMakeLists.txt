@@ -75,12 +75,14 @@ set(SOURCES
     src/eri_stored.cu
     src/eri_stored_fci.cu
     src/eri_stored_mp4.cu
+    src/davidson_solver.cu
+    src/test_operators.cu
     src/utils.cpp
 )
 
 add_library(gansu STATIC ${SOURCES})
-target_compile_definitions(gansu PRIVATE PROFILE_ENABLED) # add option -DPROFILE_ENABLED 
-target_compile_definitions(gansu PRIVATE CONSOLE_COLOR_ENABLED) # add option -DCONSOLE_COLOR_ENABLED 
+target_compile_definitions(gansu PRIVATE PROFILE_ENABLED) # add option -DPROFILE_ENABLED
+target_compile_definitions(gansu PRIVATE CONSOLE_COLOR_ENABLED) # add option -DCONSOLE_COLOR_ENABLED
 target_link_libraries(gansu
         cublas
         cusolver
@@ -119,3 +121,9 @@ target_link_libraries(HF_main
 #         int1e
 #         int2e
 #     )
+
+# Add test directory (optional, can be enabled/disabled)
+option(BUILD_TESTS "Build the test suite" OFF)
+if(BUILD_TESTS)
+    add_subdirectory(test)
+endif()
