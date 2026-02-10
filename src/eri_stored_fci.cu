@@ -27,6 +27,7 @@
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
 #include "utils.hpp"
+#include "fci.hpp"
 
 namespace gansu {
 
@@ -539,6 +540,7 @@ real_t ERI_Stored_RHF::compute_fci_energy() {
     const real_t* d_C = coefficient_matrix.device_ptr();
     const real_t* d_eri_ao = eri_matrix_.device_ptr();
 
+
     std::cout << "\n=== Full-CI Calculation ===" << std::endl;
     std::cout << "Number of basis functions (spatial orbitals): " << num_basis << std::endl;
     std::cout << "Number of electrons: " << rhf_.get_num_electrons() << std::endl;
@@ -569,6 +571,7 @@ real_t ERI_Stored_RHF::compute_fci_energy() {
     // h1_MO = C^T * temp
     gpu::matrixMatrixProduct(d_C, d_temp, d_h1_mo, num_basis, true, false, false);
     tracked_cudaFree(d_temp);
+    
 
     // ------------------------------------------------------------------
     // Step 3: Count determinants
@@ -588,28 +591,13 @@ real_t ERI_Stored_RHF::compute_fci_energy() {
     }
 
     // ------------------------------------------------------------------
-    // Step 4: Create FCI Hamiltonian operator
+    // Step 4: Solve FCI problem    
     // ------------------------------------------------------------------
-    FCIHamiltonianOperator fci_op(d_h1_mo, d_eri_mo, num_basis, num_occ, num_occ);
+    
+    double E_fci_electronic = 0.0;
+    real_t nuclearE = rhf_.get_nuclear_repulsion_energy();
+    E_fci_electronic = fci(d_h1_mo, d_eri_mo, num_basis, num_occ*2, num_alpha_det, num_det, nuclearE);
 
-    // ------------------------------------------------------------------
-    // Step 5: Solve with Davidson
-    // ------------------------------------------------------------------
-    DavidsonConfig config;
-    config.num_eigenvalues = 1;
-    config.convergence_threshold = 1e-8;
-    config.max_iterations = 200;
-    config.max_subspace_size = std::min(30, fci_op.dimension());
-    config.verbose = 1;
-
-    DavidsonSolver solver(fci_op, config);
-    bool converged = solver.solve();
-
-    if (!converged) {
-        std::cout << "Warning: FCI Davidson solver did not converge!" << std::endl;
-    }
-
-    real_t E_fci_electronic = solver.get_eigenvalues()[0];
     real_t E_hf_electronic  = rhf_.get_energy();
     real_t E_corr = E_fci_electronic - E_hf_electronic;
 
