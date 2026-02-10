@@ -270,20 +270,19 @@ __global__ void propgate1e_kernel(int nelec, int norb, int nstring,
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= nstring) return;
 
-    // スレッドローカルな変数を scratch メモリブロックからオフセットで取得
-    // 各スレッドに割り当てられる scratch 領域のトータルサイズ
+    
     const int per_thread_scratch_size = (nvir * 2 + nvir * nelec); // in int units
     int* scratch_base_for_this_thread = &d_scratch[id * per_thread_scratch_size];
 
     int* vir = scratch_base_for_this_thread;
     int* where_vir = scratch_base_for_this_thread + nvir;
-    // str1buf は nvir * nelec の長さを持ち、nvir 個の nelec 長の配列として利用される
+    
     int* str1buf = scratch_base_for_this_thread + nvir * 2;
 
     int parity_occ_orb = 1;
-    int* str0 = &occslst[id * nelec]; // occslst は既にあるデバイスメモリのポインタ
+    int* str0 = &occslst[id * nelec]; 
     int a, idx;
-    int i_idx, j_idx, n_idx; // ループ変数名が重複しないよう変更
+    int i_idx, j_idx, n_idx; 
 
     // -----------------
     // compute vir[]
@@ -316,7 +315,7 @@ __global__ void propgate1e_kernel(int nelec, int norb, int nstring,
     // fill link_index (initial entries)
     // -----------------
     for (i_idx = 0; i_idx < nelec; ++i_idx) {
-        // C言語版の linktab[(id*nlink+i) * 3 + X] に相当
+        
         a = str0[i_idx];
         a = a * (a + 1) / 2 + a;
         d_link_index[(id * nlink + i_idx) * 3 + 0] = a; //str0[i_idx];
@@ -327,32 +326,30 @@ __global__ void propgate1e_kernel(int nelec, int norb, int nstring,
     // -----------------
     // loop over electrons
     // -----------------
-    for (n_idx = 0; n_idx < nelec; ++n_idx) { // C言語版の n に相当
+    for (n_idx = 0; n_idx < nelec; ++n_idx) { 
 
-        for (i_idx = 0; i_idx < nvir; ++i_idx) { // C言語版の i に相当
-            // str1buf から i_idx 番目の nelec 長配列の先頭を取得
+        for (i_idx = 0; i_idx < nvir; ++i_idx) { 
+            
             int* s1 = str1buf + i_idx * nelec;
 
-            // memcpy(str1s[i], str0, nelec * sizeof(int)); に相当
-            // 各要素をコピー
             for (int k_idx = 0; k_idx < nelec; ++k_idx) {
                 s1[k_idx] = str0[k_idx];
             }
             s1[n_idx] = vir[i_idx];
 
-            // qsort(str1s[i], nelec, sizeof(int), compare_int64); に相当
+            // qsort(str1s[i], nelec, sizeof(int), compare_int64); 
             sort_small(s1, nelec);
         }
 
-        for (i_idx = 0; i_idx < nvir; ++i_idx) { // C言語版の i に相当
-            int* s1 = str1buf + i_idx * nelec; // 再び s1 を取得
+        for (i_idx = 0; i_idx < nvir; ++i_idx) { 
+            int* s1 = str1buf + i_idx * nelec; 
 
             int comp = (vir[i_idx] > str0[n_idx]) ? 1 : 0;
             int sum = where_vir[i_idx] + comp + 1;
             int parity = (sum % 2 == 0 ? -1 : 1) * parity_occ_orb;
 
-            int s_index = -1; // C言語版では 1 で初期化されているが、見つからない可能性を考慮し -1
-            // memcmp(str1s[i], &occslst[k *nelec], nelec * sizeof(int)) == 0) に相当
+            int s_index = -1; 
+            // memcmp(str1s[i], &occslst[k *nelec], nelec * sizeof(int)) == 0) 
             for (int k_idx = 0; k_idx < nstring; ++k_idx) {
                 bool eq = true;
                 for (int x_idx = 0; x_idx < nelec; ++x_idx) {
@@ -396,19 +393,20 @@ void gen_linkstr_index(int nelec, int norb, int nstring, int* d_occslst,  int* d
     int nlink = nelec + nelec * nvir;
     int  *d_scratch;
     int threads = 128;
+    
     int blocks = (nstring + threads - 1) / threads;
     const int per_thread_scratch_size = (nvir * 2 + nvir * nelec); // in int units
     int total_scratch_bytes = nstring * per_thread_scratch_size * sizeof(int);
 
     tracked_cudaMalloc((void **)&d_scratch, total_scratch_bytes);
     
-    // d_scratch の内容をゼロクリアしておくと、デバッグ時に未初期化データの影響を受けにくい
+    
     cudaMemset(d_scratch, 0, total_scratch_bytes);
     
     propgate1e_kernel<<<blocks, threads>>>(nelec, norb, nstring,
         d_link_index,  d_occslst,  d_link_nnorb, nvir, nlink, d_scratch);
 
-    //cudaGetLastError(); // カーネルローンチ後のエラーをチェック
+    //cudaGetLastError(); 
     tracked_cudaFree(d_scratch);
 }
 
@@ -545,10 +543,6 @@ __global__ void cab_kernel(const double* __restrict__ d_ci0,
                 int8_t signb = d_link_nnorb[2*(j*na+str0)+1];
                 int str1a = d_link_nnorb[2*(j*na+stra_id)];
                 int8_t signa = d_link_nnorb[2*(j*na+stra_id)+1];
-                // int8_t signb = d_sign[j * na + str0];
-                // uint16_t str1b = d_addr[j * na + str0];
-                // int8_t signa = d_sign[j * na + stra_id];
-                // uint16_t str1a = d_addr[j * na + stra_id];
                 
                 double val_a = signa * d_ci0[str1a * na + str0];
                 double val_b = signb * d_ci0[ci0_base_stra + str1b];
@@ -773,9 +767,7 @@ double fci(double* d_Gmo1e, double* d_Gmo, int norb, int nelec, int na, long lon
         using gansu::tracked_cudaFree;
         int neleca = nelec/2;
         
-        //int na = combinations(norb, neleca);
         int nroots = 1;
-        //int np = na * na;
         int norb_sq = norb * norb;
         int norb_t = norb_sq * norb;
         int nnorb = norb * (norb + 1) / 2;
@@ -787,40 +779,34 @@ double fci(double* d_Gmo1e, double* d_Gmo, int norb, int nelec, int na, long lon
 
         int index = 0;
         range(orb_list, norb);
-        
         gen_occs_iter_ci_new(occslst, &index, orb_list, neleca, norb);
+
         // Allocate device memory and setup jdiag/kdiag
         double *d_jdiag, *d_kdiag,  *d_hdiag;
 
-        //cudaMalloc((void**)&d_jdiag, norb_sq * sizeof(double));
         tracked_cudaMalloc(&d_jdiag, norb_sq * sizeof(double));
         tracked_cudaMalloc(&d_kdiag, norb_sq * sizeof(double));
         tracked_cudaMalloc(&d_hdiag, np * sizeof(double)); 
 
         jkcopy_kernel<<<norb_sq, 1>>>(d_Gmo, d_jdiag, d_kdiag, norb, norb_sq, norb_t);
 
-        //auto p = &tracked_cudaMalloc<int>;
         // Compute hdiag
         int* d_occslst;
         tracked_cudaMalloc((void**)&d_occslst, na * neleca * sizeof(int));
-        //tracked_cudaMalloc(&d_occslst, na * neleca * sizeof(int));
         cudaMemcpy(d_occslst, occslst, na * neleca * sizeof(int), cudaMemcpyHostToDevice);
-
         int nthread = 256;
         int nblock = (np + nthread - 1) / nthread;
-        
         FCImake_hdiag_uhf_kernel<<<nblock, nthread>>>(d_hdiag, np, d_Gmo1e, d_jdiag, d_kdiag, norb, na, neleca, d_occslst);
 
         // Generate link index
         int nlinka = neleca + neleca * (norb - neleca);
-        int *link_index = (int*)calloc(na * nlinka * 3, sizeof(int));
         int *d_clink, *d_link_nnorb;
-        
         tracked_cudaMalloc(&d_clink, nlinka * na * 3 * sizeof(int));
         tracked_cudaMalloc(&d_link_nnorb, nnorb * na * 2 * sizeof(int));
-        
+        cudaMemset(d_clink, 0, nlinka * na * 3 * sizeof(int));
+        cudaMemset(d_link_nnorb, 0, nnorb * na * 2 * sizeof(int));
         gen_linkstr_index(neleca, norb, na,  d_occslst,  d_clink, d_link_nnorb);
-        
+
         int max_space = 12;
         int heff_size = max_space + nroots;
         double *e = (double*)calloc(heff_size, sizeof(double));
@@ -885,7 +871,7 @@ double fci(double* d_Gmo1e, double* d_Gmo, int norb, int nelec, int na, long lon
         cublasDestroy(handle);
         cusolverDnDestroy(cusolverH);
 
-        free(link_index);
+   
         free(v);
         free(v_last);
         free(e);
