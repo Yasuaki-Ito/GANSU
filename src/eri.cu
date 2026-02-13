@@ -48,13 +48,23 @@ __global__ void generatePrimitiveShellPairIndices(size_t2* d_indices_array, size
     d_indices_array[id].y += start_index_b;
 }
 
-__global__ void initializePrimitiveShellPairIndices(int2* d_indices_array, int num_threads, bool is_symmetric, int num_basis) {
+//__global__ void initializePrimitiveShellPairIndices(int2* d_indices_array, int num_threads, bool is_symmetric, int num_basis) {
+//    const int id = blockDim.x * blockIdx.x + threadIdx.x;
+//    if (id >= num_threads) return;
+//    size_t2 index_pair = index1to2(id, is_symmetric, num_basis);
+//    d_indices_array[id] = make_int2(static_cast<int>(index_pair.x), static_cast<int>(index_pair.y));
+//}
+__global__ void initializePrimitiveShellPairIndices(
+    int2* d_indices_array, int num_threads, bool is_symmetric, 
+    //int num_shells)
+    int num_shells, const size_t start_index_a, const size_t start_index_b)
+    {
     const int id = blockDim.x * blockIdx.x + threadIdx.x;
     if (id >= num_threads) return;
-    size_t2 index_pair = index1to2(id, is_symmetric, num_basis);
-    d_indices_array[id] = make_int2(static_cast<int>(index_pair.x), static_cast<int>(index_pair.y));
+    size_t2 index_pair = index1to2(id, is_symmetric, num_shells);
+    //d_indices_array[id] = make_int2(static_cast<int>(index_pair.x), static_cast<int>(index_pair.y));
+    d_indices_array[id] = make_int2(static_cast<int>(index_pair.x + start_index_a), static_cast<int>(index_pair.y + start_index_b));
 }
-
 
 
 ERI_Stored::ERI_Stored(const HF& hf): 
@@ -129,6 +139,7 @@ ERI_RI::ERI_RI(const HF& hf, const Molecular& auxiliary_molecular):
         hf_(hf),
         num_basis_(hf.get_num_basis()),
         num_auxiliary_basis_(auxiliary_molecular.get_num_basis()),
+        num_occ_(hf.get_num_electrons() / 2),
         auxiliary_shell_type_infos_(auxiliary_molecular.get_shell_type_infos()),
         auxiliary_primitive_shells_(auxiliary_molecular.get_primitive_shells()),
         auxiliary_cgto_normalization_factors_(auxiliary_molecular.get_cgto_normalization_factors()),
@@ -136,14 +147,27 @@ ERI_RI::ERI_RI(const HF& hf, const Molecular& auxiliary_molecular):
         d_J_(num_basis_, num_basis_),
         d_K_(num_basis_, num_basis_),
         d_W_tmp_(num_auxiliary_basis_),
-        d_T_tmp_(num_auxiliary_basis_, num_basis_*num_basis_),
-        d_V_tmp_(num_auxiliary_basis_, num_basis_*num_basis_),
+        //d_T_tmp_(num_auxiliary_basis_, num_basis_*num_basis_),
+        //d_V_tmp_(num_auxiliary_basis_, num_basis_*num_basis_),
+        d_tmp1_(
+            num_auxiliary_basis_,
+            hf_.get_hasMatrixC()
+                ? num_basis_ * num_occ_
+                : num_basis_ * num_basis_
+        ),
+        d_tmp2_(
+            hf_.get_hasMatrixC() ? num_basis_ : num_auxiliary_basis_,
+            hf_.get_hasMatrixC()
+                ? num_auxiliary_basis_ * num_occ_
+                : num_basis_ * num_basis_
+        ),
         schwarz_upper_bound_factors(hf.get_num_primitive_shell_pairs()),
         auxiliary_schwarz_upper_bound_factors(auxiliary_molecular.get_primitive_shells().size())
 {
     // to device memory
     auxiliary_primitive_shells_.toDevice();
     auxiliary_cgto_normalization_factors_.toDevice();
+    std::cout << "get_hasMatrixC: " << hf_.get_hasMatrixC() << std::endl;
 }
 
 
@@ -264,7 +288,10 @@ ERI_Direct::ERI_Direct(const HF& hf):
     num_basis_(hf.get_num_basis()),
     schwarz_upper_bound_factors(hf.get_num_primitive_shell_pairs()),
     primitive_shell_pair_indices(hf.get_num_primitive_shell_pairs()),
-    num_fock_replicas_(8)
+    num_fock_replicas_(8),
+    density_matrix_diff_(num_basis_, num_basis_),
+    density_matrix_diff_shell_(hf.get_num_primitive_shells(), hf.get_num_primitive_shells()),
+    fock_matrix_prev_(num_basis_, num_basis_)
 {
     // for distributed atomicAdd operations
     cudaMalloc(&fock_matrix_replicas_, sizeof(real_t) * num_basis_ * num_basis_ * num_fock_replicas_);
@@ -343,7 +370,8 @@ void ERI_Direct::precomputation()
     for(int s0 = 0; s0 < shell_type_infos.size(); s0++){
         for(int s1 = s0; s1 < shell_type_infos.size(); s1++){
             const int num_blocks = (shell_pair_type_infos[pair_idx].count + threads_per_block - 1) / threads_per_block; // the number of blocks
-            initializePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index], shell_pair_type_infos[pair_idx].count, s0 == s1, shell_type_infos[s1].count);
+            //initializePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index], shell_pair_type_infos[pair_idx].count, s0 == s1, shell_type_infos[s1].count);
+            initializePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index], shell_pair_type_infos[pair_idx].count, s0 == s1, shell_type_infos[s1].count, shell_type_infos[s0].start_index, shell_type_infos[s1].start_index);
             thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);  
             thrust::device_ptr<real_t> keys_end(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index] + shell_pair_type_infos[pair_idx].count);
             thrust::device_ptr<int2> values_begin(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index]);

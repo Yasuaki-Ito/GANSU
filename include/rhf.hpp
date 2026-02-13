@@ -644,23 +644,44 @@ public:
 
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
+        const DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
         const DeviceHostMatrix<real_t>& core_hamiltonian_matrix = rhf_.get_core_hamiltonian_matrix();
         DeviceHostMatrix<real_t>& fock_matrix = rhf_.get_fock_matrix();
         const int verbose = rhf_.get_verbose();
 
-        gpu::computeFockMatrix_RI_RHF(
-            density_matrix.device_ptr(),
-            core_hamiltonian_matrix.device_ptr(),
-            intermediate_matrix_B_.device_ptr(),
-            fock_matrix.device_ptr(),
-            num_basis_,
-            num_auxiliary_basis_, 
-            d_J_.device_ptr(),
-            d_K_.device_ptr(),
-            d_W_tmp_.device_ptr(),
-            d_T_tmp_.device_ptr(),
-            d_V_tmp_.device_ptr()
-        );
+        //if (false) {
+        if (rhf_.get_hasMatrixC()) {
+            gpu::computeFockMatrix_RI_RHF_with_coefficient_matrix(
+                coefficient_matrix.device_ptr(),
+                density_matrix.device_ptr(),
+                core_hamiltonian_matrix.device_ptr(),
+                intermediate_matrix_B_.device_ptr(),
+                fock_matrix.device_ptr(),
+                num_basis_,
+                num_auxiliary_basis_, 
+                num_occ_,
+                d_J_.device_ptr(),
+                d_K_.device_ptr(),
+                d_W_tmp_.device_ptr(),
+                d_tmp1_.device_ptr(),
+                d_tmp2_.device_ptr()
+            );
+        } else {
+            gpu::computeFockMatrix_RI_RHF_with_density_matrix(
+                density_matrix.device_ptr(),
+                core_hamiltonian_matrix.device_ptr(),
+                intermediate_matrix_B_.device_ptr(),
+                fock_matrix.device_ptr(),
+                num_basis_,
+                num_auxiliary_basis_, 
+                d_J_.device_ptr(),
+                d_K_.device_ptr(),
+                d_W_tmp_.device_ptr(),
+                d_tmp1_.device_ptr(),
+                d_tmp2_.device_ptr()
+            );
+        }
+
 
         if(verbose){
             // copy the fock matrix to the host memory
@@ -706,8 +727,29 @@ public:
         const real_t schwarz_screening_threshold = rhf_.get_schwarz_screening_threshold();
         const int verbose = rhf_.get_verbose();
 
+        //gpu::computeFockMatrix_Direct_RHF(
+        //    density_matrix.device_ptr(),
+        //    core_hamiltonian_matrix.device_ptr(),
+        //    shell_type_infos, 
+        //    shell_pair_type_infos,
+        //    primitive_shells.device_ptr(), 
+        //    primitive_shell_pair_indices.device_ptr(),
+        //    cgto_normalization_factors.device_ptr(), 
+        //    boys_grid.device_ptr(), 
+        //    schwarz_upper_bound_factors.device_ptr(),
+        //    schwarz_screening_threshold,
+        //    fock_matrix.device_ptr(),
+        //    num_basis_,
+        //    global_counters_,
+        //    min_skipped_columns_,
+        //    fock_matrix_replicas_,
+        //    num_fock_replicas_,
+        //    verbose
+        //);
         gpu::computeFockMatrix_Direct_RHF(
             density_matrix.device_ptr(),
+            density_matrix_diff_.device_ptr(),
+            density_matrix_diff_shell_.device_ptr(),
             core_hamiltonian_matrix.device_ptr(),
             shell_type_infos, 
             shell_pair_type_infos,
@@ -718,6 +760,7 @@ public:
             schwarz_upper_bound_factors.device_ptr(),
             schwarz_screening_threshold,
             fock_matrix.device_ptr(),
+            fock_matrix_prev_.device_ptr(),
             num_basis_,
             global_counters_,
             min_skipped_columns_,

@@ -112,6 +112,11 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     }
 
     // for Schwarz screening in Stored ERI and Direct SCF
+    int sum = 0;
+    for (const auto& x : shell_type_infos) {
+        sum += x.count;
+    }
+    num_primitive_shells = sum;
     num_primitive_shell_pairs = gpu::makeShellPairTypeInfo(shell_type_infos, shell_pair_type_infos);
 
 

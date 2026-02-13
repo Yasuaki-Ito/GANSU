@@ -205,6 +205,11 @@ public:
     const std::vector<ShellPairTypeInfo>& get_shell_pair_type_infos() const { return shell_pair_type_infos; }
 
     /**
+     * @brief Get num_primitive_shells
+     */
+    size_t get_num_primitive_shells() const { return num_primitive_shells; }
+
+    /**
      * @brief Get num_primitive_shell_pairs
      */
     size_t get_num_primitive_shell_pairs() const { return num_primitive_shell_pairs; }
@@ -309,6 +314,7 @@ protected:
 
     // for Diect SCF
     std::vector<ShellPairTypeInfo> shell_pair_type_infos;
+    size_t num_primitive_shells;
     size_t num_primitive_shell_pairs;
 
     // for ERI (stored, RI, direct)

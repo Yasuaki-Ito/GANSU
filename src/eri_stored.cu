@@ -22,6 +22,10 @@
 #include "eri_stored.hpp"
 #include "device_host_memory.hpp"
 
+#include "ao2mo.cuh"
+
+#define FULLMASK 0xffffffff
+
 namespace gansu {
 
 // Atomic max for double precision (since CUDA does not provide atomicMax for double)
@@ -469,6 +473,105 @@ __global__ void mp2_moeri_kernel(const double* __restrict__ eri_mo,
 }
 
 
+
+//*
+__global__ void mp2_stored_kernel_ovov(
+    double* g_energy_second, 
+    const double* g_eri_mo, const double* g_eps, 
+    const int num_occupied, const int num_virtual)
+{
+    __shared__ double s_tmp;
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        s_tmp = 0;
+    }
+    __syncthreads();
+
+    double tmp = 0.0;
+    //const int num_orbitals = num_occupied + num_virtual;
+    const size_t seq = (((size_t)blockDim.x * blockDim.y) * blockIdx.x) + blockDim.x * threadIdx.y + threadIdx.x;
+    if (seq < (size_t)num_occupied * num_virtual * (size_t)num_occupied * num_virtual) {
+        const int ia = seq / (num_occupied * num_virtual);
+        const int jb = seq % (num_occupied * num_virtual);
+        const int i = ia / num_virtual;
+        const int a = ia % num_virtual;
+        const int j = jb / num_virtual;
+        const int b = jb % num_virtual;
+
+        const double iajb = g_eri_mo[ovov2seq(i, a, j, b, num_occupied, num_virtual)];
+        const double jaib = g_eri_mo[ovov2seq(j, a, i, b, num_occupied, num_virtual)];
+        tmp = iajb * (2 * iajb - jaib) / (g_eps[i] + g_eps[j] - g_eps[num_occupied + a] - g_eps[num_occupied + b]);
+    }
+
+    for (int offset = 16; offset > 0; offset /= 2) {
+        tmp += __shfl_down_sync(FULLMASK, tmp, offset);
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(&s_tmp, tmp);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        atomicAdd(g_energy_second, s_tmp);
+    }
+}
+/**/
+
+
+double mp2_from_aoeri_via_required_moeri(
+    double* d_eri_ao,
+    const double* d_coefficient_matrix,
+    const double* d_orbital_energies,
+    int num_orbitals, int num_occupied)
+{
+    double* d_eri_tmp;
+    tracked_cudaMalloc(&d_eri_tmp, sizeof(double) * num_occupied * (size_t)num_orbitals * num_orbitals * num_orbitals);
+    if(!d_eri_tmp){ THROW_EXCEPTION("cudaMalloc failed for d_eri_tmp."); }
+    const int num_virtual = num_orbitals - num_occupied;
+
+    {
+        std::string str = "Computing AO -> MO (ia|jb) integral transformation... ";
+        PROFILE_ELAPSED_TIME(str);
+
+        // AO ERIs (d_eri_ao) will be overwritten with (ia|jb) MO ERIs (d_eri_mo_ovov)
+        transform_eri_ao2mo_dgemm_ovov(d_eri_ao, d_eri_tmp, d_coefficient_matrix, num_occupied, num_virtual);
+        cudaDeviceSynchronize();
+    }
+    double* d_eri_mo_ovov = d_eri_ao;
+    tracked_cudaFree(d_eri_tmp);
+
+    size_t total = (size_t)num_occupied * num_virtual * num_occupied * num_virtual;
+
+    double* d_E = nullptr;
+    tracked_cudaMalloc((void**)&d_E, sizeof(double));
+    cudaMemset(d_E, 0, sizeof(double));
+
+    const int num_threads_per_warp = 32;
+    const int num_warps_per_block = 32;
+    const int num_threads_per_block = num_threads_per_warp * num_warps_per_block;
+    const size_t num_blocks = (total + num_threads_per_block - 1) / num_threads_per_block;
+    dim3 blocks(num_blocks);
+    dim3 threads(num_threads_per_warp, num_warps_per_block);
+
+    {
+        std::string str = "Computing MP2 energy from (ia|jb) MO ERI... ";
+        PROFILE_ELAPSED_TIME(str);
+
+        mp2_stored_kernel_ovov<<<blocks, threads>>>(d_E, d_eri_mo_ovov, d_orbital_energies, num_occupied, num_virtual);
+        cudaDeviceSynchronize();
+    }
+
+    double h_E = 0.0;
+    cudaMemcpy(&h_E, d_E, sizeof(double), cudaMemcpyDeviceToHost);
+    std::cout << "h_E: " << std::setprecision(12) << h_E << std::endl;
+
+    tracked_cudaFree(d_E);
+
+    return h_E;
+}
+
+
+
+
+
 /////////////////////////// MP2 energy calculation 
 
 
@@ -484,13 +587,15 @@ real_t ERI_Stored_RHF::compute_mp2_energy() {
     DeviceHostMemory<real_t>& orbital_energies = rhf_.get_orbital_energies();
     const real_t* d_C = coefficient_matrix.device_ptr();
     const real_t* d_eps = orbital_energies.device_ptr();
-    const real_t* d_eri = eri_matrix_.device_ptr();
+    //const real_t* d_eri = eri_matrix_.device_ptr();
+    real_t* d_eri = eri_matrix_.device_ptr();
 
 
 
 
 //    real_t E_MP2 = mp2_naive(d_eri, d_C, d_eps, num_basis, num_occ);
-    real_t E_MP2 = mp2_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ);
+    //real_t E_MP2 = mp2_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ);
+    real_t E_MP2 = mp2_from_aoeri_via_required_moeri(d_eri, d_C, d_eps, num_basis, num_occ);
 
 //    if(fabs(E_MP2_naive - E_MP2_stored) > 1e-8){
 //        std::cerr << "Warning: MP2 energy mismatch between naive and stored MOERI methods." << std::endl;
@@ -974,6 +1079,481 @@ real_t mp3_from_aoeri_via_full_moeri(const real_t* d_eri_ao, const real_t* d_coe
     return h_mp2_energy + h_mp3_energy[0] + h_mp3_energy[1] + h_mp3_energy[2];
 }
 
+
+
+
+
+
+double mp2_from_full_moeri(
+    const double* d_eri_mo,   // device, size nao^4, row-major (mu nu | la si)
+    const double* d_C,        // device, size nao*nao, row-major (mu,p)
+    const double* d_eps,      // device, size nao
+    int nao,
+    int occ)
+{
+    int vir = nao - occ;
+    size_t total = (size_t)occ * (size_t)occ * (size_t)vir * (size_t)vir;
+
+    double* d_E = nullptr;
+    tracked_cudaMalloc((void**)&d_E, sizeof(double));
+    cudaMemset(d_E, 0, sizeof(double));
+
+    int threads = 1024;
+    size_t blocks  = (size_t)((total + threads - 1) / threads);
+    size_t shmem = (size_t)threads * sizeof(double);
+
+    {
+        std::string str = "Computing MP2 energy from full MO ERI... ";
+        PROFILE_ELAPSED_TIME(str);
+
+        mp2_from_moeri_kernel<<<blocks, threads, shmem>>>(d_eri_mo, d_eps, nao, occ, d_E);
+        cudaDeviceSynchronize();
+    }
+
+    double h_E = 0.0;
+    cudaMemcpy(&h_E, d_E, sizeof(double), cudaMemcpyDeviceToHost);
+    std::cout << "h_E: " << std::setprecision(12) << h_E << std::endl;
+
+    tracked_cudaFree(d_E);
+
+    return h_E;
+}
+
+
+
+__device__
+size_t q2s(int mu, int nu, int la, int si, int num_orbitals)
+{
+    return ((size_t)num_orbitals * num_orbitals * num_orbitals) * mu + \
+           (num_orbitals * num_orbitals) * nu + \
+           (num_orbitals) * la + si;
+}
+
+__device__
+size_t ovov2s(int i, int a, int j, int b, int num_occ, int num_vir)
+{
+    return ((size_t)num_occ * num_vir * num_vir) * i + \
+           (num_occ * num_vir) * (a - num_occ) + \
+           (num_vir) * j + (b - num_occ);
+}
+
+__device__
+size_t oovv2s(int i, int j, int a, int b, int num_occ, int num_vir)
+{
+    return ((size_t)num_vir * num_vir * num_occ) * i + \
+           (num_vir * num_vir) * j + \
+           (num_vir) * (a - num_occ) + \
+           (b - num_occ);
+}
+
+__device__
+size_t vvoo2s(int c, int d, int i, int j, int num_occ, int num_vir)
+{
+    return ((size_t)num_occ * num_occ * num_vir) * (c - num_occ) + \
+           (num_occ * num_occ) * (d - num_occ) + \
+           (num_occ) * i + j;
+}
+
+__device__
+size_t oooo2s(int i, int j, int k, int l, int num_occ)
+{
+    return ((size_t)num_occ * num_occ * num_occ) * i + \
+           (num_occ * num_occ) * j + \
+           (num_occ) * k + l;
+}
+
+__device__
+size_t vvvv2s(int a, int b, int c, int d, int num_occ, int num_vir)
+{
+    return ((size_t)num_vir * num_vir * num_vir) * (a - num_occ) + \
+           (num_vir * num_vir) * (b - num_occ) + \
+           (num_vir) * (c - num_occ) + (d - num_occ);
+}
+
+
+
+__global__
+void tensorize_oooo(
+    double* g_int2e, double* g_oooo, const int num_occ, const int num_vir)
+{
+    const long long ijkl = ((long long)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const long long num_oooo = (long long)num_occ * num_occ * num_occ * num_occ;
+    if (ijkl >= num_oooo) {
+        return;
+    }
+
+    const int ij = ijkl / (num_occ * num_occ);
+    const int kl = ijkl % (num_occ * num_occ);
+    const int i = ij / num_occ;
+    const int j = ij % num_occ;
+    const int k = kl / num_occ;
+    const int l = kl % num_occ;
+
+    const int num_orbitals = num_occ + num_vir;
+
+    g_oooo[oooo2s(i, j, k, l, num_occ)] = g_int2e[q2s(i, k, j, l, num_orbitals)];
+}
+
+
+__global__
+void tensorize_vvvv(
+    double* g_int2e, double* g_vvvv, const int num_occ, const int num_vir)
+{
+    const long long abcd = ((long long)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const long long num_vvvv = (long long)num_vir * num_vir * num_vir * num_vir;
+    if (abcd >= num_vvvv) {
+        return;
+    }
+
+    const int ab = abcd / (num_vir * num_vir);
+    const int cd = abcd % (num_vir * num_vir);
+    const int a = ab / num_vir + num_occ;
+    const int b = ab % num_vir + num_occ;
+    const int c = cd / num_vir + num_occ;
+    const int d = cd % num_vir + num_occ;
+
+    const int num_orbitals = num_occ + num_vir;
+
+    g_vvvv[vvvv2s(a, b, c, d, num_occ, num_vir)] = g_int2e[q2s(a, c, b, d, num_orbitals)];
+}
+
+
+__global__
+void tensorize_ovov(
+    double* g_int2e, const double* g_eps, double* g_s_ovov, double* g_t_ovov, 
+    const int num_occ, const int num_vir)
+{
+    const long long iajb = ((long long)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const long long num_unique_elements = (long long)num_occ * num_vir * num_occ * num_vir;
+    if (iajb >= num_unique_elements) {
+        return;
+    }
+
+    const int ia = iajb / (num_occ * num_vir);
+    const int jb = iajb % (num_occ * num_vir);
+    const int i = ia / num_vir;
+    const int a = ia % num_vir + num_occ;
+    const int j = jb / num_vir;
+    const int b = jb % num_vir + num_occ;
+
+    const int num_orbitals = num_occ + num_vir;
+    const double int2e_iajb = g_int2e[q2s(i, a, j, b, num_orbitals)];
+    const double int2e_ibja = g_int2e[q2s(i, b, j, a, num_orbitals)];
+    const double eps_ijab = g_eps[i] + g_eps[j] - g_eps[a] - g_eps[b];
+
+    g_s_ovov[ovov2s(i, a, j, b, num_occ, num_vir)] = int2e_iajb / eps_ijab;
+    g_t_ovov[ovov2s(i, a, j, b, num_occ, num_vir)] = (2 * int2e_iajb - int2e_ibja) / eps_ijab;
+}
+
+
+__global__
+void kalb2klab(double* d_ovov, double* d_oovv, const int num_occ, const int num_vir)
+{
+    const long long kalb = ((long long)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const long long num_ovov = (long long)num_occ * num_vir * num_occ * num_vir;
+    if (kalb >= num_ovov) {
+        return;
+    }
+
+    const int ka = kalb / (num_occ * num_vir);
+    const int lb = kalb % (num_occ * num_vir);
+    const int k = ka / num_vir;
+    const int a = ka % num_vir + num_occ;
+    const int l = lb / num_vir;
+    const int b = lb % num_vir + num_occ;
+
+    d_oovv[oovv2s(k, l, a, b, num_occ, num_vir)] = d_ovov[ovov2s(k, a, l, b, num_occ, num_vir)];
+}
+
+__global__
+void icjd2cdij(double* d_ovov, double* d_vvoo, const int num_occ, const int num_vir)
+{
+    const long long icjd = ((long long)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const long long num_ovov = (long long)num_occ * num_vir * num_occ * num_vir;
+    if (icjd >= num_ovov) {
+        return;
+    }
+
+    const int ic = icjd / (num_occ * num_vir);
+    const int jd = icjd % (num_occ * num_vir);
+    const int i = ic / num_vir;
+    const int c = ic % num_vir + num_occ;
+    const int j = jd / num_vir;
+    const int d = jd % num_vir + num_occ;
+
+    d_vvoo[vvoo2s(c, d, i, j, num_occ, num_vir)] = d_ovov[ovov2s(i, c, j, d, num_occ, num_vir)];
+}
+
+__global__
+void kaic2iakc(double* d_ovov_in, double* d_ovov_out, const int num_occ, const int num_vir)
+{
+    const long long kaic = ((long long)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const long long num_ovov = (long long)num_occ * num_vir * num_occ * num_vir;
+    if (kaic >= num_ovov) {
+        return;
+    }
+
+    const int ka = kaic / (num_occ * num_vir);
+    const int ic = kaic % (num_occ * num_vir);
+    const int k = ka / num_vir;
+    const int a = ka % num_vir + num_occ;
+    const int i = ic / num_vir;
+    const int c = ic % num_vir + num_occ;
+
+    d_ovov_out[ovov2s(i, a, k, c, num_occ, num_vir)] = d_ovov_in[ovov2s(k, a, i, c, num_occ, num_vir)];
+}
+
+
+
+__global__
+void kbjc2kcjb(double* d_ovov_in, double* d_ovov_out, const int num_occ, const int num_vir)
+{
+    const long long kbjc = ((long long)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const long long num_ovov = (long long)num_occ * num_vir * num_occ * num_vir;
+    if (kbjc >= num_ovov) {
+        return;
+    }
+
+    const int kb = kbjc / (num_occ * num_vir);
+    const int jc = kbjc % (num_occ * num_vir);
+    const int k = kb / num_vir;
+    const int b = kb % num_vir + num_occ;
+    const int j = jc / num_vir;
+    const int c = jc % num_vir + num_occ;
+
+    d_ovov_out[ovov2s(k, c, j, b, num_occ, num_vir)] = d_ovov_in[ovov2s(k, b, j, c, num_occ, num_vir)];
+}
+
+
+
+
+__global__
+void contract_iajb_tensors(   // 4h2p, 2h4p, 3h3p
+    const int num_orbitals, const int num_occ, const int num_vir, double* g_int2e, 
+    double* g_s_ovov, double* g_mm1, double* g_mm2, double* g_mm3, double* g_mm4, double* g_E_3rd)
+{
+    __shared__ double s_E_3rd;
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        s_E_3rd = 0;
+    }
+    __syncthreads();
+
+    const long long ijab = ((long long)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const long long num_oovv = (long long)num_occ * num_occ * num_vir * num_vir;
+    if (ijab >= num_oovv) {
+        return;
+    }
+
+    const int ij = ijab / (num_vir * num_vir);
+    const int ab = ijab % (num_vir * num_vir);
+    const int i = ij / num_occ;
+    const int j = ij % num_occ;
+    const int a = ab / num_vir + num_occ;
+    const int b = ab % num_vir + num_occ;
+
+    const double s_iajb = g_s_ovov[ovov2s(i, a, j, b, num_occ, num_vir)];
+    const double e_ijab = g_int2e[q2s(i, j, a, b, num_orbitals)];
+    const double e_iajb = g_int2e[q2s(i, a, j, b, num_orbitals)];
+
+    double energy = 0.0;
+    energy += s_iajb * (g_mm1[oovv2s(i, j, a, b, num_occ, num_vir)] + g_mm2[vvoo2s(a, b, i, j, num_occ, num_vir)]);
+    energy += (2 * e_iajb - e_ijab) * g_mm3[ovov2s(i, a, j, b, num_occ, num_vir)];
+    energy += (-3) * e_ijab * g_mm4[ovov2s(i, a, j, b, num_occ, num_vir)];
+
+    for (int offset = 16; offset > 0; offset /= 2) {
+        energy += __shfl_down_sync(FULLMASK, energy, offset);
+    }
+
+    if (threadIdx.x == 0) {
+        atomicAdd(&s_E_3rd, energy);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        atomicAdd(g_E_3rd, s_E_3rd);
+    }
+}
+
+
+
+
+//*
+real_t mp3_from_aoeri_via_full_moeri_dgemm(
+    real_t* d_eri_ao, const real_t* d_coefficient_matrix, 
+    const real_t* d_orbital_energies, const int num_basis, const int num_occ) 
+{
+    cudaDeviceProp prop;
+    int device = 0;
+    cudaGetDeviceProperties(&prop, device);
+
+    double* d_groundE_3rd;
+    double* h_groundE_3rd;
+    tracked_cudaMalloc(&d_groundE_3rd, sizeof(double));
+    cudaMallocHost(&h_groundE_3rd, sizeof(double));
+    cudaMemset(d_groundE_3rd, 0, sizeof(double));
+
+    const int num_vir = num_basis - num_occ;
+    printf("#orbitals_occ: %d, #orbitals_vir: %d\n", num_occ, num_vir);
+
+    // Full MO ERI transformation
+    double* d_eri_mo = nullptr;
+    const size_t num_basis_2 = num_basis * num_basis;
+    tracked_cudaMalloc((void**)&d_eri_mo, sizeof(double) * num_basis_2 * num_basis_2);
+    if (!d_eri_mo) {
+        THROW_EXCEPTION("cudaMalloc failed for d_eri_mo.");
+    }
+    transform_eri_ao2mo_dgemm_full(d_eri_ao, d_eri_mo, d_coefficient_matrix, num_basis);
+    cudaDeviceSynchronize();
+
+    // MP2 energy from full MO ERI
+    real_t E_MP2 = mp2_from_full_moeri(d_eri_mo, d_coefficient_matrix, d_orbital_energies, num_basis, num_occ);
+    printf("MP2 energy from full MO ERI: %.12f\n", E_MP2);
+    //return E_MP2;
+
+
+    const long long num_oooo = (long long)num_occ * num_occ * num_occ * num_occ;
+    const long long num_vvvv = (long long)num_vir * num_vir * num_vir * num_vir;
+    const long long num_ovov = (long long)num_occ * num_vir * num_occ * num_vir;
+    const long long num_oovv = (long long)num_occ * num_occ * num_vir * num_vir;
+    //printf("num_oooo: %lld\n", num_oooo);
+    //printf("num_vvvv: %lld\n", num_vvvv);
+    //printf("num_ovov: %lld\n", num_ovov);
+    //printf("num_oovv: %lld\n", num_oovv);
+
+    double* d_oooo;
+    double* d_vvvv;
+    double* d_s_ovov;
+    double* d_t_ovov;
+    double* d_t_tmp;
+    double* d_mm1;
+    double* d_mm2;
+    double* d_mm3;
+    double* d_mm4;
+    tracked_cudaMalloc(&d_oooo, sizeof(double) * num_oooo);
+    tracked_cudaMalloc(&d_vvvv, sizeof(double) * num_vvvv);
+    tracked_cudaMalloc(&d_s_ovov, sizeof(double) * num_ovov);
+    tracked_cudaMalloc(&d_t_ovov, sizeof(double) * num_ovov);
+    tracked_cudaMalloc(&d_t_tmp, sizeof(double) * num_ovov);
+    tracked_cudaMalloc(&d_mm1, sizeof(double) * num_oovv);
+    tracked_cudaMalloc(&d_mm2, sizeof(double) * num_oovv);
+    tracked_cudaMalloc(&d_mm3, sizeof(double) * num_ovov);
+    tracked_cudaMalloc(&d_mm4, sizeof(double) * num_ovov);
+    double* d_s_tmp1 = d_t_ovov;
+    double* d_s_tmp2 = d_t_tmp;
+
+    constexpr int num_threads_per_warp = 32;
+    constexpr int num_warps_per_block = 32;
+    constexpr int num_threads_per_block = num_threads_per_warp * num_warps_per_block;
+
+    const long long num_blocks_oooo = (num_oooo + num_threads_per_block - 1) / num_threads_per_block;
+    const long long num_blocks_vvvv = (num_vvvv + num_threads_per_block - 1) / num_threads_per_block;
+    const long long num_blocks_ovov = (num_ovov + num_threads_per_block - 1) / num_threads_per_block;
+    const long long num_blocks_oovv = (num_oovv + num_threads_per_block - 1) / num_threads_per_block;
+
+    if (num_blocks_oooo > prop.maxGridSize[0] ||
+        num_blocks_vvvv > prop.maxGridSize[0] ||
+        num_blocks_ovov > prop.maxGridSize[0] ||
+        num_blocks_oovv > prop.maxGridSize[0]) {
+        printf("Error: Too many blocks for the grid size.\n");
+        return 0;
+    }
+
+    dim3 blocks_oooo(num_blocks_oooo);
+    dim3 blocks_vvvv(num_blocks_vvvv);
+    dim3 blocks_ovov(num_blocks_ovov);
+    dim3 blocks_oovv(num_blocks_oovv);
+    dim3 threads(num_threads_per_warp, num_warps_per_block);
+
+    float time_tensor, time_dgemm, time_ijab;
+    cudaEvent_t begin, end;
+    cudaEventCreate(&begin);
+    cudaEventCreate(&end);
+
+    cudaEventRecord(begin);
+    tensorize_oooo<<<blocks_oooo, threads>>>(d_eri_mo, d_oooo, num_occ, num_vir);
+    tensorize_vvvv<<<blocks_vvvv, threads>>>(d_eri_mo, d_vvvv, num_occ, num_vir);
+    tensorize_ovov<<<blocks_ovov, threads>>>(d_eri_mo, d_orbital_energies, d_s_ovov, d_t_ovov, num_occ, num_vir);
+    cudaEventRecord(end);
+    cudaEventSynchronize(end);
+    cudaEventElapsedTime(&time_tensor, begin, end);
+    printf("tensorize: %.2f [msec]\n", time_tensor);
+
+    const double alpha = 1.0;
+    const double beta = 0.0;
+    const int num_oo = num_occ * num_occ;
+    const int num_vv = num_vir * num_vir;
+    const int num_ov = num_occ * num_vir;
+    cublasHandle_t cublasH = NULL;
+    cublasCreate(&cublasH);
+
+    cudaEventRecord(begin);
+
+    kalb2klab<<<blocks_ovov, threads>>>(d_t_ovov, d_t_tmp, num_occ, num_vir);
+    cudaDeviceSynchronize();
+    cublasDgemm(cublasH, CUBLAS_OP_N, CUBLAS_OP_N, num_vv, num_oo, num_oo, 
+                &alpha, d_t_tmp, num_vv, d_oooo, num_oo, &beta, d_mm1, num_vv);
+
+    icjd2cdij<<<blocks_ovov, threads>>>(d_t_ovov, d_t_tmp, num_occ, num_vir);
+    cudaDeviceSynchronize();
+    cublasDgemm(cublasH, CUBLAS_OP_N, CUBLAS_OP_N, num_oo, num_vv, num_vv, 
+                &alpha, d_t_tmp, num_oo, d_vvvv, num_vv, &beta, d_mm2, num_oo);
+
+    cublasDgemm(cublasH, CUBLAS_OP_N, CUBLAS_OP_T, num_ov, num_ov, num_ov, 
+                &alpha, d_t_ovov, num_ov, d_t_ovov, num_ov, &beta, d_mm3, num_ov);
+    
+    kaic2iakc<<<blocks_ovov, threads>>>(d_s_ovov, d_s_tmp1, num_occ, num_vir);
+    kbjc2kcjb<<<blocks_ovov, threads>>>(d_s_ovov, d_s_tmp2, num_occ, num_vir);
+    cudaDeviceSynchronize();
+    cublasDgemm(cublasH, CUBLAS_OP_N, CUBLAS_OP_N, num_ov, num_ov, num_ov, 
+                &alpha, d_s_tmp2, num_ov, d_s_tmp1, num_ov, &beta, d_mm4, num_ov);
+
+    cudaEventRecord(end);
+    cudaEventSynchronize(end);
+    cudaEventElapsedTime(&time_dgemm, begin, end);
+    printf("dgemm: %.2f [msec]\n", time_dgemm);
+
+    cudaEventRecord(begin);
+    contract_iajb_tensors<<<blocks_ovov, threads>>>(num_basis, num_occ, num_vir, d_eri_mo, d_s_ovov, d_mm1, d_mm2, d_mm3, d_mm4, d_groundE_3rd);
+    cudaEventRecord(end);
+    cudaEventSynchronize(end);
+    cudaEventElapsedTime(&time_ijab, begin, end);
+
+    printf("three terms (2h2p): %.2f [msec]\n", time_ijab);
+    printf("mp3 total: %.2f [msec]\n", (time_tensor + time_dgemm + time_ijab));
+    printf("mp3 correlation energy: %.4f [sec]\n", (time_tensor + time_dgemm + time_ijab) * 1e-3);
+    cudaEventDestroy(begin);
+    cudaEventDestroy(end);
+
+    cudaMemcpy(h_groundE_3rd, d_groundE_3rd, sizeof(double), cudaMemcpyDeviceToHost);
+    const double correlationE_3rd = *h_groundE_3rd;
+    printf("3rd perturbation energy: %.12f [hartree]\n", correlationE_3rd);
+
+    tracked_cudaFree(d_groundE_3rd);
+    cudaFreeHost(h_groundE_3rd);
+
+    tracked_cudaFree(d_oooo);
+    tracked_cudaFree(d_vvvv);
+    tracked_cudaFree(d_s_ovov);
+    tracked_cudaFree(d_t_ovov);
+    tracked_cudaFree(d_t_tmp);
+    tracked_cudaFree(d_mm1);
+    tracked_cudaFree(d_mm2);
+    tracked_cudaFree(d_mm3);
+    tracked_cudaFree(d_mm4);
+
+    tracked_cudaFree(d_eri_mo);
+
+    return E_MP2 + correlationE_3rd;
+}
+/**/
+
+
+
+
+
+
+
+
 //////////////////////////////////////////////////////////////////////////////////////// MP3 energy calculation
 
 real_t ERI_Stored_RHF::compute_mp3_energy() {
@@ -989,10 +1569,12 @@ real_t ERI_Stored_RHF::compute_mp3_energy() {
     DeviceHostMemory<real_t>& orbital_energies = rhf_.get_orbital_energies();
     const real_t* d_C = coefficient_matrix.device_ptr();
     const real_t* d_eps = orbital_energies.device_ptr();
-    const real_t* d_eri = eri_matrix_.device_ptr();
+    //const real_t* d_eri = eri_matrix_.device_ptr();
+    real_t* d_eri = eri_matrix_.device_ptr();
 
     //real_t E_MP3_naive = mp3_naive(d_eri, d_C, d_eps, num_basis, num_occ);
-    real_t E_MP3 = mp3_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ);
+    //real_t E_MP3 = mp3_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ);
+    real_t E_MP3 = mp3_from_aoeri_via_full_moeri_dgemm(d_eri, d_C, d_eps, num_basis, num_occ);
 
 //    if(fabs(E_MP3 - E_MP3_stored) > 1e-8){
 //        std::cerr << "Warning: MP3 energy mismatch between naive and stored MOERI methods." << std::endl;

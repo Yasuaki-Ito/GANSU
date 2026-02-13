@@ -30,7 +30,9 @@ namespace gansu::gpu{
 
 
 __global__ void composeFockMatrix(
-    real_t* g_fock_matrix, real_t* g_fock_matrix_replicas, const real_t* g_int1e, const int num_basis, const int num_fock_replicas)
+    real_t* g_fock_matrix, real_t* g_fock_matrix_replicas, 
+    const real_t* g_int1e, const int num_basis, 
+    const int num_fock_replicas, bool is_first_call)
 {
     const int num_utm_elements = num_basis * (num_basis + 1) / 2;
     const int idx_linear = blockDim.x * blockIdx.x + threadIdx.x;
@@ -45,13 +47,47 @@ __global__ void composeFockMatrix(
     for (int i = 0; i < num_fock_replicas; ++i) {
         fock_value += g_fock_matrix_replicas[stride * i + (num_basis * mu + nu)];
     }
-    fock_value += g_int1e[num_basis * mu + nu];
-    g_fock_matrix[num_basis * mu + nu] = fock_value;
+    //fock_value += g_int1e[num_basis * mu + nu];
+    if (is_first_call) {
+        fock_value += g_int1e[num_basis * mu + nu];
+    }
+    //g_fock_matrix[num_basis * mu + nu] = fock_value;
+    g_fock_matrix[num_basis * mu + nu] += fock_value;
     if (mu != nu) {
-        g_fock_matrix[num_basis * nu + mu] = fock_value;
+        //g_fock_matrix[num_basis * nu + mu] = fock_value;
+        g_fock_matrix[num_basis * nu + mu] += fock_value;
     }
 }
 
+__device__ inline real_t get_max_density_diff(
+    const real_t* g_density_matrix_diff, 
+    const int mu, const int nu, const int la, const int si, 
+    const int num_basis)
+{
+    double max_value = 0.0;
+    max_value = fmax(fabs(g_density_matrix_diff[num_basis * mu + nu]), max_value);
+    max_value = fmax(fabs(g_density_matrix_diff[num_basis * la + si]), max_value);
+    max_value = fmax(fabs(g_density_matrix_diff[num_basis * mu + la]), max_value);
+    max_value = fmax(fabs(g_density_matrix_diff[num_basis * nu + si]), max_value);
+    max_value = fmax(fabs(g_density_matrix_diff[num_basis * mu + si]), max_value);
+    max_value = fmax(fabs(g_density_matrix_diff[num_basis * nu + la]), max_value);
+    return max_value;
+}
+
+__device__ inline real_t get_max_density_diff_shell(
+    const real_t* g_density_matrix_diff_shell, 
+    const int al, const int be, const int ga, const int de, 
+    const int num_primitive_shells)
+{
+    real_t max_value = 0.0;
+    max_value = fmax(fabs(g_density_matrix_diff_shell[num_primitive_shells * ga + de]), max_value);
+    max_value = fmax(fabs(g_density_matrix_diff_shell[num_primitive_shells * al + be]), max_value);
+    max_value = fmax(fabs(g_density_matrix_diff_shell[num_primitive_shells * be + de]), max_value);
+    max_value = fmax(fabs(g_density_matrix_diff_shell[num_primitive_shells * al + ga]), max_value);
+    max_value = fmax(fabs(g_density_matrix_diff_shell[num_primitive_shells * al + de]), max_value);
+    max_value = fmax(fabs(g_density_matrix_diff_shell[num_primitive_shells * be + ga]), max_value);
+    return max_value;
+}
 
 __global__ void ssss2e_dynamic(
     real_t* g_fock_matrix_replicas, 
@@ -63,22 +99,33 @@ __global__ void ssss2e_dynamic(
     const real_t schwarz_screening_threshold, 
     const real_t* g_schwarz_upper_bound_factors, 
     const int num_basis, 
+    const int num_primitive_shells,
     const real_t* g_boys_grid, 
     const real_t* g_density_matrix, 
+    const real_t* g_density_matrix_diff_shell, 
     int* g_counter, int* g_min_skipped_column,
     const size_t head_bra, const size_t head_ket, 
     const size_t num_bra, const size_t num_ket, 
     const int num_fock_replicas)
+    //int* g_num_screened_shell_quartets)
 {
     int ab, cd;
     int bra_group_idx = 0;
     int ket_group_idx;
     __shared__ int s_ket_group_idx;
     __shared__ bool s_significant_flag;
+    __shared__ real_t s_schwarz_upper_bound;
     int primitive_shell_index_a, primitive_shell_index_b;
     int primitive_shell_index_c, primitive_shell_index_d;
     bool is_bra_asymmetric, is_ket_asymmetric, is_braket_asymmetric;
     const int num_bra_groups = (num_bra + TASK_GROUP_SIZE - 1) / TASK_GROUP_SIZE;
+
+    if (threadIdx.x == 0) {
+        s_ket_group_idx = 0;
+        s_schwarz_upper_bound = 0.0;
+        //s_significant_flag = false;
+    }
+    __syncthreads();
 
     while (bra_group_idx < num_bra_groups && bra_group_idx < g_min_skipped_column[bra_group_idx]) {
         ab = (TASK_GROUP_SIZE * bra_group_idx) + (threadIdx.x / TASK_GROUP_SIZE);
@@ -87,7 +134,9 @@ __global__ void ssss2e_dynamic(
                 s_significant_flag = false;
                 ket_group_idx = bra_group_idx + atomicAdd(g_counter + bra_group_idx, 1);
                 if (ket_group_idx < g_min_skipped_column[bra_group_idx]) {
-                    if (g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx] < schwarz_screening_threshold) {
+                    //if (g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx] < schwarz_screening_threshold) {
+                    s_schwarz_upper_bound = g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx];
+                    if (s_schwarz_upper_bound < schwarz_screening_threshold) {
                         atomicMin(g_min_skipped_column + bra_group_idx, ket_group_idx);
                         //s_significant_flag = false;
                     }
@@ -105,10 +154,23 @@ __global__ void ssss2e_dynamic(
             if (s_significant_flag) {
                 cd = (TASK_GROUP_SIZE * s_ket_group_idx) + (threadIdx.x % TASK_GROUP_SIZE);
                 if (ab <= cd && cd < num_ket) {
-                    primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x + shell_s0.start_index;
-                    primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y + shell_s1.start_index;
-                    primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x + shell_s2.start_index;
-                    primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y + shell_s3.start_index;
+                    //primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x + shell_s0.start_index;
+                    //primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y + shell_s1.start_index;
+                    //primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x + shell_s2.start_index;
+                    //primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y + shell_s3.start_index;
+                    primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x;
+                    primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y;
+                    primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x;
+                    primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y;
+
+                    //real_t max_density_diff = get_max_density_diff(g_density_matrix, g_primitive_shells[primitive_shell_index_a].basis_index, g_primitive_shells[primitive_shell_index_b].basis_index, g_primitive_shells[primitive_shell_index_c].basis_index, g_primitive_shells[primitive_shell_index_d].basis_index, num_basis);
+
+                    real_t max_density_diff = get_max_density_diff_shell(g_density_matrix_diff_shell, primitive_shell_index_a, primitive_shell_index_b, primitive_shell_index_c, primitive_shell_index_d, num_primitive_shells);
+                    if (max_density_diff * s_schwarz_upper_bound < schwarz_screening_threshold) {
+                        //atomicAdd(g_num_screened_shell_quartets, 1);
+                        continue;
+                    }
+
                     is_bra_asymmetric = (primitive_shell_index_a != primitive_shell_index_b);
                     is_ket_asymmetric = (primitive_shell_index_c != primitive_shell_index_d);
                     is_braket_asymmetric = ((primitive_shell_index_a != primitive_shell_index_c) || (primitive_shell_index_b != primitive_shell_index_d));
@@ -142,8 +204,10 @@ __global__ void sssp2e_dynamic(
     const real_t schwarz_screening_threshold, 
     const real_t* g_schwarz_upper_bound_factors, 
     const int num_basis, 
+    const int num_primitive_shells,
     const real_t* g_boys_grid, 
     const real_t* g_density_matrix, 
+    const real_t* g_density_matrix_diff_shell, 
     int* g_counter, int* g_min_skipped_column,
     const size_t head_bra, const size_t head_ket, 
     const size_t num_bra, const size_t num_ket, 
@@ -155,10 +219,18 @@ __global__ void sssp2e_dynamic(
     int ket_group_idx;
     __shared__ int s_ket_group_idx;
     __shared__ bool s_significant_flag;
+    __shared__ real_t s_schwarz_upper_bound;
     int primitive_shell_index_a, primitive_shell_index_b;
     int primitive_shell_index_c, primitive_shell_index_d;
     bool is_bra_asymmetric; //is_ket_asymmetric, is_braket_asymmetric;
     const int num_bra_groups = (num_bra + TASK_GROUP_SIZE - 1) / TASK_GROUP_SIZE;
+
+    if (threadIdx.x == 0) {
+        s_ket_group_idx = 0;
+        s_schwarz_upper_bound = 0.0;
+        //s_significant_flag = false;
+    }
+    __syncthreads();
 
     while (bra_group_idx < num_bra_groups && 0 < g_min_skipped_column[bra_group_idx]) {
         ab = (TASK_GROUP_SIZE * bra_group_idx) + (threadIdx.x / TASK_GROUP_SIZE);
@@ -167,7 +239,9 @@ __global__ void sssp2e_dynamic(
                 s_significant_flag = false;
                 ket_group_idx = atomicAdd(g_counter + bra_group_idx, 1);
                 if (ket_group_idx < g_min_skipped_column[bra_group_idx]) {
-                    if (g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx] < schwarz_screening_threshold) {
+                    //if (g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx] < schwarz_screening_threshold) {
+                    s_schwarz_upper_bound = g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx];
+                    if (s_schwarz_upper_bound < schwarz_screening_threshold) {
                         atomicMin(g_min_skipped_column + bra_group_idx, ket_group_idx);
                         //s_significant_flag = false;
                     }
@@ -185,10 +259,20 @@ __global__ void sssp2e_dynamic(
             if (s_significant_flag) {
                 cd = (TASK_GROUP_SIZE * s_ket_group_idx) + (threadIdx.x % TASK_GROUP_SIZE);
                 if (ab < num_bra && cd < num_ket) {
-                    primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x + shell_s0.start_index;
-                    primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y + shell_s1.start_index;
-                    primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x + shell_s2.start_index;
-                    primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y + shell_s3.start_index;
+                    //primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x + shell_s0.start_index;
+                    //primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y + shell_s1.start_index;
+                    //primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x + shell_s2.start_index;
+                    //primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y + shell_s3.start_index;
+                    primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x;
+                    primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y;
+                    primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x;
+                    primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y;
+
+                    real_t max_density_diff = get_max_density_diff_shell(g_density_matrix_diff_shell, primitive_shell_index_a, primitive_shell_index_b, primitive_shell_index_c, primitive_shell_index_d, num_primitive_shells);
+                    if (max_density_diff * s_schwarz_upper_bound < schwarz_screening_threshold) {
+                        continue;
+                    }
+
                     is_bra_asymmetric = (primitive_shell_index_a != primitive_shell_index_b);
                     //is_ket_asymmetric = (primitive_shell_index_c != primitive_shell_index_d);
                     //is_braket_asymmetric = ((primitive_shell_index_a != primitive_shell_index_c) || (primitive_shell_index_b != primitive_shell_index_d));
@@ -223,8 +307,10 @@ __global__ void sspp2e_dynamic(
     const real_t schwarz_screening_threshold, 
     const real_t* g_schwarz_upper_bound_factors, 
     const int num_basis, 
+    const int num_primitive_shells,
     const real_t* g_boys_grid, 
     const real_t* g_density_matrix, 
+    const real_t* g_density_matrix_diff_shell, 
     int* g_counter, int* g_min_skipped_column,
     const size_t head_bra, const size_t head_ket, 
     const size_t num_bra, const size_t num_ket, 
@@ -236,19 +322,30 @@ __global__ void sspp2e_dynamic(
     int ket_group_idx;
     __shared__ int s_ket_group_idx;
     __shared__ bool s_significant_flag;
+    __shared__ real_t s_schwarz_upper_bound;
     int primitive_shell_index_a, primitive_shell_index_b;
     int primitive_shell_index_c, primitive_shell_index_d;
     bool is_bra_asymmetric, is_ket_asymmetric; //is_braket_asymmetric;
     const int num_bra_groups = (num_bra + TASK_GROUP_SIZE - 1) / TASK_GROUP_SIZE;
 
+    if (threadIdx.x == 0) {
+        s_ket_group_idx = 0;
+        s_schwarz_upper_bound = 0.0;
+        //s_significant_flag = false;
+    }
+    __syncthreads();
+
     while (bra_group_idx < num_bra_groups && 0 < g_min_skipped_column[bra_group_idx]) {
         ab = (TASK_GROUP_SIZE * bra_group_idx) + (threadIdx.x / TASK_GROUP_SIZE);
         while (true) {
             if (threadIdx.x == 0) {
+                //s_ket_group_idx = 0;
                 s_significant_flag = false;
                 ket_group_idx = atomicAdd(g_counter + bra_group_idx, 1);
                 if (ket_group_idx < g_min_skipped_column[bra_group_idx]) {
-                    if (g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx] < schwarz_screening_threshold) {
+                    //if (g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx] < schwarz_screening_threshold) {
+                    s_schwarz_upper_bound = g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx];
+                    if (s_schwarz_upper_bound < schwarz_screening_threshold) {
                         atomicMin(g_min_skipped_column + bra_group_idx, ket_group_idx);
                         //s_significant_flag = false;
                     }
@@ -266,10 +363,20 @@ __global__ void sspp2e_dynamic(
             if (s_significant_flag) {
                 cd = (TASK_GROUP_SIZE * s_ket_group_idx) + (threadIdx.x % TASK_GROUP_SIZE);
                 if (ab < num_bra && cd < num_ket) {
-                    primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x + shell_s0.start_index;
-                    primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y + shell_s1.start_index;
-                    primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x + shell_s2.start_index;
-                    primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y + shell_s3.start_index;
+                    //primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x + shell_s0.start_index;
+                    //primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y + shell_s1.start_index;
+                    //primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x + shell_s2.start_index;
+                    //primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y + shell_s3.start_index;
+                    primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x;
+                    primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y;
+                    primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x;
+                    primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y;
+
+                    real_t max_density_diff = get_max_density_diff_shell(g_density_matrix_diff_shell, primitive_shell_index_a, primitive_shell_index_b, primitive_shell_index_c, primitive_shell_index_d, num_primitive_shells);
+                    if (max_density_diff * s_schwarz_upper_bound < schwarz_screening_threshold) {
+                        continue;
+                    }
+
                     is_bra_asymmetric = (primitive_shell_index_a != primitive_shell_index_b);
                     is_ket_asymmetric = (primitive_shell_index_c != primitive_shell_index_d);
                     //is_braket_asymmetric = ((primitive_shell_index_a != primitive_shell_index_c) || (primitive_shell_index_b != primitive_shell_index_d));
@@ -303,8 +410,10 @@ __global__ void spsp2e_dynamic(
     const real_t schwarz_screening_threshold, 
     const real_t* g_schwarz_upper_bound_factors, 
     const int num_basis, 
+    const int num_primitive_shells,
     const real_t* g_boys_grid, 
     const real_t* g_density_matrix, 
+    const real_t* g_density_matrix_diff_shell, 
     int* g_counter, int* g_min_skipped_column,
     const size_t head_bra, const size_t head_ket, 
     const size_t num_bra, const size_t num_ket, 
@@ -316,10 +425,18 @@ __global__ void spsp2e_dynamic(
     int ket_group_idx;
     __shared__ int s_ket_group_idx;
     __shared__ bool s_significant_flag;
+    __shared__ real_t s_schwarz_upper_bound;
     int primitive_shell_index_a, primitive_shell_index_b;
     int primitive_shell_index_c, primitive_shell_index_d;
     bool /*is_bra_asymmetric, is_ket_asymmetric, */is_braket_asymmetric;
     const int num_bra_groups = (num_bra + TASK_GROUP_SIZE - 1) / TASK_GROUP_SIZE;
+
+    if (threadIdx.x == 0) {
+        s_ket_group_idx = 0;
+        s_schwarz_upper_bound = 0.0;
+        //s_significant_flag = false;
+    }
+    __syncthreads();
 
     while (bra_group_idx < num_bra_groups && bra_group_idx < g_min_skipped_column[bra_group_idx]) {
         ab = (TASK_GROUP_SIZE * bra_group_idx) + (threadIdx.x / TASK_GROUP_SIZE);
@@ -328,7 +445,9 @@ __global__ void spsp2e_dynamic(
                 s_significant_flag = false;
                 ket_group_idx = bra_group_idx + atomicAdd(g_counter + bra_group_idx, 1);
                 if (ket_group_idx < g_min_skipped_column[bra_group_idx]) {
-                    if (g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx] < schwarz_screening_threshold) {
+                    //if (g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx] < schwarz_screening_threshold) {
+                    s_schwarz_upper_bound = g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx];
+                    if (s_schwarz_upper_bound < schwarz_screening_threshold) {
                         atomicMin(g_min_skipped_column + bra_group_idx, ket_group_idx);
                         //s_significant_flag = false;
                     }
@@ -346,10 +465,20 @@ __global__ void spsp2e_dynamic(
             if (s_significant_flag) {
                 cd = (TASK_GROUP_SIZE * s_ket_group_idx) + (threadIdx.x % TASK_GROUP_SIZE);
                 if (ab <= cd && cd < num_ket) {
-                    primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x + shell_s0.start_index;
-                    primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y + shell_s1.start_index;
-                    primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x + shell_s2.start_index;
-                    primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y + shell_s3.start_index;
+                    //primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x + shell_s0.start_index;
+                    //primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y + shell_s1.start_index;
+                    //primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x + shell_s2.start_index;
+                    //primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y + shell_s3.start_index;
+                    primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x;
+                    primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y;
+                    primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x;
+                    primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y;
+
+                    real_t max_density_diff = get_max_density_diff_shell(g_density_matrix_diff_shell, primitive_shell_index_a, primitive_shell_index_b, primitive_shell_index_c, primitive_shell_index_d, num_primitive_shells);
+                    if (max_density_diff * s_schwarz_upper_bound < schwarz_screening_threshold) {
+                        continue;
+                    }
+
                     //is_bra_asymmetric = (primitive_shell_index_a != primitive_shell_index_b);
                     //is_ket_asymmetric = (primitive_shell_index_c != primitive_shell_index_d);
                     is_braket_asymmetric = ((primitive_shell_index_a != primitive_shell_index_c) || (primitive_shell_index_b != primitive_shell_index_d));
@@ -384,8 +513,10 @@ __global__ void sppp2e_dynamic(
     const real_t schwarz_screening_threshold, 
     const real_t* g_schwarz_upper_bound_factors, 
     const int num_basis, 
+    const int num_primitive_shells,
     const real_t* g_boys_grid, 
     const real_t* g_density_matrix, 
+    const real_t* g_density_matrix_diff_shell, 
     int* g_counter, int* g_min_skipped_column,
     const size_t head_bra, const size_t head_ket, 
     const size_t num_bra, const size_t num_ket, 
@@ -397,11 +528,19 @@ __global__ void sppp2e_dynamic(
     int ket_group_idx;
     __shared__ int s_ket_group_idx;
     __shared__ bool s_significant_flag;
+    __shared__ real_t s_schwarz_upper_bound;
     int primitive_shell_index_a, primitive_shell_index_b;
     int primitive_shell_index_c, primitive_shell_index_d;
     //bool is_bra_asymmetric, is_ket_asymmetric, is_braket_asymmetric;
     bool is_ket_asymmetric;
     const int num_bra_groups = (num_bra + TASK_GROUP_SIZE - 1) / TASK_GROUP_SIZE;
+
+    if (threadIdx.x == 0) {
+        s_ket_group_idx = 0;
+        s_schwarz_upper_bound = 0.0;
+        //s_significant_flag = false;
+    }
+    __syncthreads();
 
     while (bra_group_idx < num_bra_groups && 0 < g_min_skipped_column[bra_group_idx]) {
         ab = (TASK_GROUP_SIZE * bra_group_idx) + (threadIdx.x / TASK_GROUP_SIZE);
@@ -410,7 +549,9 @@ __global__ void sppp2e_dynamic(
                 s_significant_flag = false;
                 ket_group_idx = atomicAdd(g_counter + bra_group_idx, 1);
                 if (ket_group_idx < g_min_skipped_column[bra_group_idx]) {
-                    if (g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx] < schwarz_screening_threshold) {
+                    //if (g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx] < schwarz_screening_threshold) {
+                    s_schwarz_upper_bound = g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx];
+                    if (s_schwarz_upper_bound < schwarz_screening_threshold) {
                         atomicMin(g_min_skipped_column + bra_group_idx, ket_group_idx);
                         //s_significant_flag = false;
                     }
@@ -428,10 +569,20 @@ __global__ void sppp2e_dynamic(
             if (s_significant_flag) {
                 cd = (TASK_GROUP_SIZE * s_ket_group_idx) + (threadIdx.x % TASK_GROUP_SIZE);
                 if (ab < num_bra && cd < num_ket) {
-                    primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x + shell_s0.start_index;
-                    primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y + shell_s1.start_index;
-                    primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x + shell_s2.start_index;
-                    primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y + shell_s3.start_index;
+                    //primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x + shell_s0.start_index;
+                    //primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y + shell_s1.start_index;
+                    //primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x + shell_s2.start_index;
+                    //primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y + shell_s3.start_index;
+                    primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x;
+                    primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y;
+                    primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x;
+                    primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y;
+
+                    real_t max_density_diff = get_max_density_diff_shell(g_density_matrix_diff_shell, primitive_shell_index_a, primitive_shell_index_b, primitive_shell_index_c, primitive_shell_index_d, num_primitive_shells);
+                    if (max_density_diff * s_schwarz_upper_bound < schwarz_screening_threshold) {
+                        continue;
+                    }
+
                     //is_bra_asymmetric = (primitive_shell_index_a != primitive_shell_index_b);
                     is_ket_asymmetric = (primitive_shell_index_c != primitive_shell_index_d);
                     //is_braket_asymmetric = ((primitive_shell_index_a != primitive_shell_index_c) || (primitive_shell_index_b != primitive_shell_index_d));
@@ -466,8 +617,10 @@ __global__ void pppp2e_dynamic(
     const real_t schwarz_screening_threshold, 
     const real_t* g_schwarz_upper_bound_factors, 
     const int num_basis, 
+    const int num_primitive_shells,
     const real_t* g_boys_grid, 
     const real_t* g_density_matrix, 
+    const real_t* g_density_matrix_diff_shell, 
     int* g_counter, int* g_min_skipped_column,
     const size_t head_bra, const size_t head_ket, 
     const size_t num_bra, const size_t num_ket, 
@@ -478,10 +631,18 @@ __global__ void pppp2e_dynamic(
     int ket_group_idx;      // column index of task groups
     __shared__ int s_ket_group_idx;
     __shared__ bool s_significant_flag;
+    __shared__ real_t s_schwarz_upper_bound;
     int primitive_shell_index_a, primitive_shell_index_b;
     int primitive_shell_index_c, primitive_shell_index_d;
     bool is_bra_asymmetric, is_ket_asymmetric, is_braket_asymmetric;
     const int num_bra_groups = (num_bra + TASK_GROUP_SIZE - 1) / TASK_GROUP_SIZE;
+
+    if (threadIdx.x == 0) {
+        s_ket_group_idx = 0;
+        s_schwarz_upper_bound = 0.0;
+        //s_significant_flag = false;
+    }
+    __syncthreads();
 
     while (bra_group_idx < num_bra_groups && bra_group_idx < g_min_skipped_column[bra_group_idx]) {
         ab = (TASK_GROUP_SIZE * bra_group_idx) + (threadIdx.x / TASK_GROUP_SIZE);
@@ -490,7 +651,9 @@ __global__ void pppp2e_dynamic(
                 s_significant_flag = false;
                 ket_group_idx = bra_group_idx + atomicAdd(g_counter + bra_group_idx, 1);
                 if (ket_group_idx < g_min_skipped_column[bra_group_idx]) {
-                    if (g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx] < schwarz_screening_threshold) {
+                    //if (g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx] < schwarz_screening_threshold) {
+                    s_schwarz_upper_bound = g_schwarz_upper_bound_factors[head_bra + TASK_GROUP_SIZE * bra_group_idx] * g_schwarz_upper_bound_factors[head_ket + TASK_GROUP_SIZE * ket_group_idx];
+                    if (s_schwarz_upper_bound < schwarz_screening_threshold) {
                         atomicMin(g_min_skipped_column + bra_group_idx, ket_group_idx);
                         //s_significant_flag = false;
                     }
@@ -508,10 +671,20 @@ __global__ void pppp2e_dynamic(
             if (s_significant_flag) {
                 cd = (TASK_GROUP_SIZE * s_ket_group_idx) + (threadIdx.x % TASK_GROUP_SIZE);
                 if (ab <= cd && cd < num_ket) {
-                    primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x + shell_s0.start_index;
-                    primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y + shell_s1.start_index;
-                    primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x + shell_s2.start_index;
-                    primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y + shell_s3.start_index;
+                    //primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x + shell_s0.start_index;
+                    //primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y + shell_s1.start_index;
+                    //primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x + shell_s2.start_index;
+                    //primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y + shell_s3.start_index;
+                    primitive_shell_index_a = g_primitive_shell_pair_indices[head_bra + ab].x;
+                    primitive_shell_index_b = g_primitive_shell_pair_indices[head_bra + ab].y;
+                    primitive_shell_index_c = g_primitive_shell_pair_indices[head_ket + cd].x;
+                    primitive_shell_index_d = g_primitive_shell_pair_indices[head_ket + cd].y;
+
+                    real_t max_density_diff = get_max_density_diff_shell(g_density_matrix_diff_shell, primitive_shell_index_a, primitive_shell_index_b, primitive_shell_index_c, primitive_shell_index_d, num_primitive_shells);
+                    if (max_density_diff * s_schwarz_upper_bound < schwarz_screening_threshold) {
+                        continue;
+                    }
+
                     is_bra_asymmetric = (primitive_shell_index_a != primitive_shell_index_b);
                     is_ket_asymmetric = (primitive_shell_index_c != primitive_shell_index_d);
                     is_braket_asymmetric = (ab != cd);
@@ -542,7 +715,7 @@ __global__ void pppp2e_dynamic(
 
 
 
-
+/*
 __global__ void ssss2e_direct(
     real_t* g_fock_matrix, 
     const PrimitiveShell* g_primitive_shells, 
@@ -596,7 +769,6 @@ __global__ void ssss2e_direct(
 }
 
 
-//*
 __global__ void sssp2e_direct(
     real_t* g_fock_matrix, 
     const PrimitiveShell* g_primitive_shells, 
@@ -646,7 +818,6 @@ __global__ void sssp2e_direct(
               g_fock_matrix + num_basis * num_basis * (threadIdx.x % num_fock_replicas), 
               num_basis, g_boys_grid, g_density_matrix, g_cgto_normalization_factors);
 }
-/**/
 
 
 __global__ void sspp2e_direct(
@@ -802,7 +973,6 @@ __global__ void sppp2e_direct(
 }
 
 
-//*
 __global__ void pppp2e_direct(
     real_t* g_fock_matrix, 
     const PrimitiveShell* g_primitive_shells, 
@@ -984,10 +1154,14 @@ __global__ void MD_direct_SCF_1T1SP(
     }
 
     // Obtain primitive shells [ab|cd]
-    const size_t primitive_index_a = ab.x + shell_s0.start_index;
-    const size_t primitive_index_b = ab.y + shell_s1.start_index;
-    const size_t primitive_index_c = cd.x + shell_s2.start_index;
-    const size_t primitive_index_d = cd.y + shell_s3.start_index;
+    //const size_t primitive_index_a = ab.x + shell_s0.start_index;
+    //const size_t primitive_index_b = ab.y + shell_s1.start_index;
+    //const size_t primitive_index_c = cd.x + shell_s2.start_index;
+    //const size_t primitive_index_d = cd.y + shell_s3.start_index;
+    const size_t primitive_index_a = ab.x;
+    const size_t primitive_index_b = ab.y;
+    const size_t primitive_index_c = cd.x;
+    const size_t primitive_index_d = cd.y;
 
     const PrimitiveShell a = g_shell[primitive_index_a];
     const PrimitiveShell b = g_shell[primitive_index_b];

@@ -53,7 +53,7 @@ void ssss2e(double* g_int2e, const PrimitiveShell* g_shell, const real_t* g_cgto
     const size_t num_threads, const real_t swartz_screening_threshold, const double* g_upper_bound_factors,
     const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket)
 {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_threads) return;
 
     // Compute 4D index from thread id
@@ -104,7 +104,7 @@ void sssp2e(double* g_int2e, const PrimitiveShell* g_shell, const real_t* g_cgto
     const size_t num_threads, const real_t swartz_screening_threshold, const double* g_upper_bound_factors,
     const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket)
 {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_threads) return;
 
     // Compute 4D index from thread id
@@ -257,7 +257,7 @@ void sppp2e(double* g_int2e, const PrimitiveShell* g_shell, const real_t* g_cgto
     const size_t num_threads, const real_t swartz_screening_threshold, const double* g_upper_bound_factors,
     const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket)
 {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_threads) return;
 
     // Compute 4D index from thread id
@@ -307,7 +307,7 @@ void pppp2e(double* g_int2e, const PrimitiveShell* g_shell, const real_t* g_cgto
     const size_t num_threads, const real_t swartz_screening_threshold, const double* g_upper_bound_factors,
     const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket)
 {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_threads) return;
 
     // Compute 4D index from thread id

@@ -234,6 +234,10 @@ void matrixSubtraction(const double* d_matrix_A, const double* d_matrix_B, doubl
     weightedMatrixSum(d_matrix_A, d_matrix_B, d_matrix_C, 1.0, -1.0, size);
 }
 
+void matrixSubtractionInPlace(const double* d_matrix_A, double* d_matrix_B, double* d_matrix_C, const int size) {
+    weightedMatrixSum(d_matrix_A, d_matrix_B, d_matrix_C, 1.0, -1.0, size);
+}
+
 /**
  * @brief Computes the inner product of two vectors using cuBLAS.
  * @param d_vector_A Device pointer to the vector A
@@ -1539,8 +1543,19 @@ void computeIntermediateMatrixB(
 
 
 
-
-void computeFockMatrix_RI_RHF(const real_t* d_density_matrix, const real_t* d_core_hamiltonian_matrix, const real_t* d_intermediate_matrix_B, real_t* d_fock_matrix, const int num_basis, const int num_auxiliary_basis, real_t* d_J, real_t* d_K, real_t* d_W, real_t* d_T, real_t* d_V){
+//* With density matrix
+void computeFockMatrix_RI_RHF_with_density_matrix(
+    const real_t* d_density_matrix, 
+    const real_t* d_core_hamiltonian_matrix, 
+    const real_t* d_intermediate_matrix_B, 
+    real_t* d_fock_matrix, 
+    const int num_basis, 
+    const int num_auxiliary_basis, 
+    real_t* d_J, 
+    real_t* d_K, 
+    real_t* d_W, 
+    real_t* d_T, 
+    real_t* d_V){
     //cublasManager cublas;
     cublasHandle_t cublasHandle = GPUHandle::cublas();
 
@@ -1587,6 +1602,97 @@ void computeFockMatrix_RI_RHF(const real_t* d_density_matrix, const real_t* d_co
     computeFockMatrix_RI_RHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, num_basis);
     cudaDeviceSynchronize();
 }
+/**/
+
+
+
+
+
+
+//* With coefficient matrix
+__global__ void packThreeDimensionalTensorX(
+    const real_t* d_X_in, real_t* d_X_out, 
+    const int num_basis, const int num_auxiliary_basis, const int num_occ)
+{
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t total_size = (size_t)num_auxiliary_basis * num_basis * num_occ;
+
+    if (idx >= total_size) {
+        return;
+    }
+
+    const int p = idx / (num_basis * num_occ);
+    const int mu = (idx % (num_basis * num_occ)) / num_occ;
+    const int k = (idx % (num_basis * num_occ)) % num_occ;
+
+    d_X_out[((size_t)num_auxiliary_basis * num_occ) * mu + num_occ * p + k] = d_X_in[idx];
+}
+
+
+void computeFockMatrix_RI_RHF_with_coefficient_matrix(
+    const real_t* d_coefficient_matrix, 
+    const real_t* d_density_matrix, 
+    const real_t* d_core_hamiltonian_matrix, 
+    const real_t* d_intermediate_matrix_B, 
+    real_t* d_fock_matrix, 
+    const int num_basis, 
+    const int num_auxiliary_basis, 
+    const int num_occ, 
+    real_t* d_J, 
+    real_t* d_K, 
+    real_t* d_W, 
+    real_t* d_X, 
+    real_t* d_X_packed)
+{
+    cublasHandle_t cublasHandle = GPUHandle::cublas();
+
+    double alpha = 1.0;
+    double beta = 0.0;
+    const int num_threads = 256;
+    const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+
+    ////////////////////////////////// compute J-matrix //////////////////////////////////
+    cublasDgemv(cublasHandle, CUBLAS_OP_T, num_basis*num_basis, num_auxiliary_basis, &alpha, d_intermediate_matrix_B, num_basis*num_basis, d_density_matrix, 1, &beta, d_W, 1);
+    // J = sum(W[i] * B[i])
+    weighted_sum_matrices_kernel<<<num_blocks, num_threads>>>(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
+
+    ////////////////////////////////// compute K-matrix //////////////////////////////////
+    cudaMemset(d_K, 0, sizeof(real_t) * num_basis * num_basis);
+    cublasDgemmStridedBatched(
+        cublasHandle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        num_occ, num_basis, num_basis,
+        &alpha,
+        d_coefficient_matrix, num_basis, 0,
+        d_intermediate_matrix_B, num_basis, num_basis * num_basis,
+        &beta,
+        d_X, num_occ, num_basis * num_occ,
+        num_auxiliary_basis
+    );
+    packThreeDimensionalTensorX<<<(num_auxiliary_basis * num_basis * num_occ + num_threads - 1) / num_threads, num_threads>>>(d_X, d_X_packed, num_basis, num_auxiliary_basis, num_occ);
+    alpha = 2.0;
+    cublasDgemm(
+        cublasHandle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_basis, num_basis, num_occ * num_auxiliary_basis,
+        &alpha,
+        d_X_packed, num_occ * num_auxiliary_basis,
+        d_X_packed, num_occ * num_auxiliary_basis,
+        &beta,
+        d_K, num_basis
+    );
+
+    ////////////////////////////////// compute Fock matrix //////////////////////////////////
+    // F = H + J - (1/2)*K
+    computeFockMatrix_RI_RHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, num_basis);
+    cudaDeviceSynchronize();
+}
+/**/
+
+
+
+
+
 
 void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_density_matrix_b, const real_t* d_core_hamiltonian_matrix, const real_t* d_intermediate_matrix_B, real_t* d_fock_matrix_a, real_t* d_fock_matrix_b, const int num_basis, const int num_auxiliary_basis){
     //cublasManager cublas;
@@ -2186,6 +2292,7 @@ __global__ void computeFockMatrix_DFT_kernel(const double* d_core_hamiltonian_ma
 
 
 
+/*
 void computeFockMatrix_Direct_RHF(
     const real_t* d_density_matrix,
     const real_t* d_core_hamiltonian_matrix,
@@ -2318,6 +2425,254 @@ void computeFockMatrix_Direct_RHF(
 
     cudaDeviceSynchronize();
 }
+/**/
+
+
+
+
+
+//*
+__global__ void densityMatrixDifferenceShellPairsKernel(
+    real_t* g_density_matrix_diff_shell, 
+    const real_t* g_density_matrix_diff, 
+    const PrimitiveShell* g_primitive_shells, 
+    const int2* g_primitive_shell_pair_indices, 
+    const int num_primitive_shells, 
+    const int num_basis)
+{
+    const int serial = blockDim.x * blockIdx.x + threadIdx.x;
+    if (serial >= (num_primitive_shells * (num_primitive_shells + 1) / 2)) {
+        return;
+    }
+    //const int shell_index_a = serial / num_primitive_shells;
+    //const int shell_index_b = serial % num_primitive_shells;
+    const int2 shell_pair_index = g_primitive_shell_pair_indices[serial];
+    const int shell_index_a = shell_pair_index.x;
+    const int shell_index_b = shell_pair_index.y;
+    const PrimitiveShell a = g_primitive_shells[shell_index_a];
+    const PrimitiveShell b = g_primitive_shells[shell_index_b];
+
+    const int shell_size_a = (a.shell_type == 0) ? 1 : 3;
+    const int shell_size_b = (b.shell_type == 0) ? 1 : 3;
+
+    //real_t diff_abs;
+    real_t max_value = 0.0;
+    for (int i = 0; i < shell_size_a; ++i) {
+        for (int j = 0; j < shell_size_b; ++j) {
+            const int mu = a.basis_index + i;
+            const int nu = b.basis_index + j;
+            //diff_abs = fabs(g_density_matrix_diff[num_basis * mu + nu]);
+            //if (diff_abs > max_value) {
+            //    max_value = diff_abs;
+            //}
+            //const real_t density_diff = g_density_matrix_diff[(mu < nu) ? (num_basis * mu + nu) : (num_basis * nu + mu)];
+            const real_t density_diff = g_density_matrix_diff[num_basis * mu + nu];
+            max_value = fmax(max_value, fabs(density_diff));
+        }
+    }
+    g_density_matrix_diff_shell[num_primitive_shells * shell_index_a + shell_index_b] = max_value;
+    if (shell_index_a != shell_index_b) {
+        g_density_matrix_diff_shell[num_primitive_shells * shell_index_b + shell_index_a] = max_value;
+    }
+}
+
+void makeDensityMatrixDifferenceShellPairs(
+    real_t* d_density_matrix_diff_shell, 
+    const real_t* d_density_matrix_diff, 
+    const PrimitiveShell* d_primitive_shells, 
+    const int2* d_primitive_shell_pair_indices, 
+    const int num_primitive_shells, 
+    const int num_basis)
+{
+    const int threads_per_block = 256;
+    const int num_primitive_shell_pairs = num_primitive_shells * (num_primitive_shells + 1) / 2;
+    const int num_blocks = (num_primitive_shell_pairs + threads_per_block - 1) / threads_per_block;
+    densityMatrixDifferenceShellPairsKernel<<<num_blocks, threads_per_block>>>(d_density_matrix_diff_shell, d_density_matrix_diff, d_primitive_shells, d_primitive_shell_pair_indices, num_primitive_shells, num_basis);
+    cudaDeviceSynchronize();
+}
+
+void computeFockMatrix_Direct_RHF(
+    const real_t* d_density_matrix,
+    real_t* d_density_matrix_diff,
+    real_t* d_density_matrix_diff_shell,
+    const real_t* d_core_hamiltonian_matrix,
+    const std::vector<ShellTypeInfo>& shell_type_infos, 
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+    const PrimitiveShell* d_primitive_shells, 
+    const int2* d_primitive_shell_pair_indices,
+    const real_t* d_cgto_normalization_factors, 
+    const real_t* d_boys_grid, 
+    const real_t* d_schwarz_upper_bound_factors,
+    const real_t schwarz_screening_threshold,
+    real_t* d_fock_matrix,
+    real_t* d_fock_matrix_prev,
+    const int num_basis,
+    std::vector<int*>& d_global_counters,
+    std::vector<int*>& d_min_skipped_columns,
+    real_t* d_fock_matrix_replicas,
+    const int num_fock_replicas,
+    const int verbose)
+{
+    static bool is_first_call = true;
+    if (is_first_call) {
+        cudaMemset(d_fock_matrix_prev, 0, sizeof(real_t) * num_basis * num_basis);
+        cudaMemset(d_density_matrix_diff, 0, sizeof(real_t) * num_basis * num_basis);
+    }
+    // D_diff = D_new - D_old
+    matrixSubtractionInPlace(d_density_matrix, d_density_matrix_diff, d_density_matrix_diff, num_basis);
+    int num_primitive_shells = 0;
+    for (const auto& x : shell_type_infos) {
+        num_primitive_shells += x.count;
+    }
+    makeDensityMatrixDifferenceShellPairs(d_density_matrix_diff_shell, d_density_matrix_diff, d_primitive_shells, d_primitive_shell_pair_indices, num_primitive_shells, num_basis);
+    cudaDeviceSynchronize();
+
+    //int h_num_screened_shell_quartets = 0;
+    //int* d_num_screened_shell_quartets;
+    //cudaMalloc(&d_num_screened_shell_quartets, sizeof(int));
+    //cudaMemset(d_num_screened_shell_quartets, 0, sizeof(int));
+
+    // compute the electron repulsion integrals
+    const int num_threads_per_block = 256;
+    const int shell_type_count = shell_type_infos.size();
+    cudaMemset(d_fock_matrix_replicas, 0, sizeof(real_t) * num_basis * num_basis * num_fock_replicas);
+
+    // list shell-quadruples for sorted shell-type (s0, s1, s2, s3)
+    std::vector<std::tuple<int, int, int, int>> shell_quadruples;
+    for (int a = 0; a < shell_type_count; ++a) {
+        for (int b = a; b < shell_type_count; ++b) {
+            for (int c = 0; c < shell_type_count; ++c) {
+                for (int d = c; d < shell_type_count; ++d) {
+                    if (a < c || (a == c && b <= d)) {
+                        shell_quadruples.emplace_back(a, b, c, d);
+                    }
+                }
+            }
+        }
+    }
+    // reverse the order of the shell_quadruples to make it sorted by (s0, s1, s2, s3)
+    // e.g. (pp|pp), (sp|pp), (sp|sp), (ss|pp), (ss|sp), (ss|ss) for s and p shells
+    //std::reverse(shell_quadruples.begin(), shell_quadruples.end());
+
+    // make multi stream
+    const int num_kernels = shell_quadruples.size();
+    std::vector<cudaStream_t> streams(num_kernels);
+    for (int i = 0; i < num_kernels; i++) {
+        cudaError_t err = cudaStreamCreate(&streams[i]);
+        if (err != cudaSuccess) {
+            THROW_EXCEPTION(std::string("Failed to create CUDA stream: ") + std::string(cudaGetErrorString(err)));
+        }
+    }
+
+    // for-loop for sorted shell-type (s0, s1, s2, s3)
+    int kernel_idx = 0;
+    const int task_group_size = 16;
+    const int num_cuda_blocks = 256;
+    for (const auto& quadruple: shell_quadruples) {
+        int s0, s1, s2, s3;
+        std::tie(s0, s1, s2, s3) = quadruple;
+
+        const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+        const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+        const ShellTypeInfo shell_s2 = shell_type_infos[s2];
+        const ShellTypeInfo shell_s3 = shell_type_infos[s3];
+
+        const size_t num_bra = (s0==s1) ? shell_s0.count*(shell_s0.count+1)/2 : shell_s0.count*shell_s1.count;
+        const size_t num_ket = (s2==s3) ? shell_s2.count*(shell_s2.count+1)/2 : shell_s2.count*shell_s3.count;
+        const size_t num_braket = ((s0==s2) && (s1==s3)) ? num_bra*(num_bra+1)/2 : num_bra*num_ket; // equal to the number of threads
+        const size_t num_blocks = (num_braket + num_threads_per_block - 1) / num_threads_per_block; // the number of blocks
+        const size_t head_bra = shell_pair_type_infos[get_index_2to1_horizontal(s0, s1, shell_type_count)].start_index;
+        const size_t head_ket = shell_pair_type_infos[get_index_2to1_horizontal(s2, s3, shell_type_count)].start_index;
+
+        if (s0 <= 1 && s1 <= 1 && s2 <= 1 && s3 <= 1) {
+            // initialzie global counters and minimum skipped columns for dynamic screening
+            const int num_bra_groups = (num_bra + task_group_size - 1) / task_group_size;
+            const int num_ket_groups = (num_ket + task_group_size - 1) / task_group_size;
+            const int num_init_blocks = (num_bra_groups + num_threads_per_block - 1) / num_threads_per_block;
+            //cudaMemset(d_global_counters[kernel_idx], 0, sizeof(int) * num_bra_groups);
+            cudaMemsetAsync(d_global_counters[kernel_idx], 0, sizeof(int) * num_bra_groups, streams[kernel_idx]);
+            initializeMinSkippedColumns<<<num_init_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>(d_min_skipped_columns[kernel_idx], num_bra_groups, num_ket_groups);
+
+            //if (s0 == 0 && s1 == 0 && s2 == 0 && s3 == 0) {
+            if (false) {
+                //ssss2e_dynamic_test<<<num_cuda_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
+                //    (d_fock_matrix_replicas, d_primitive_shells, d_primitive_shell_pair_indices, 
+                //     d_cgto_normalization_factors, shell_s0, shell_s1, shell_s2, shell_s3, 
+                //     schwarz_screening_threshold, d_schwarz_upper_bound_factors, 
+                //     num_basis, num_primitive_shells, 
+                //     d_boys_grid, d_density_matrix_diff, d_density_matrix_diff_shell, 
+                //     d_global_counters[kernel_idx], d_min_skipped_columns[kernel_idx],
+                //     head_bra, head_ket, num_bra, num_ket, num_fock_replicas, d_num_screened_shell_quartets);
+            }
+            else {
+                //gpu::get_eri_kernel_direct(s0, s1, s2, s3)<<<num_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
+                //    (d_fock_matrix_replicas, d_primitive_shells, d_primitive_shell_pair_indices, 
+                //     d_cgto_normalization_factors, shell_s0, shell_s1, shell_s2, shell_s3, 
+                //     num_braket, schwarz_screening_threshold, d_schwarz_upper_bound_factors, 
+                //     num_basis, d_boys_grid, d_density_matrix, head_bra, head_ket, num_fock_replicas);
+                gpu::get_eri_kernel_dynamic(s0, s1, s2, s3)<<<num_cuda_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
+                    (d_fock_matrix_replicas, d_primitive_shells, d_primitive_shell_pair_indices, 
+                     d_cgto_normalization_factors, shell_s0, shell_s1, shell_s2, shell_s3, 
+                     schwarz_screening_threshold, d_schwarz_upper_bound_factors, 
+                     num_basis, num_primitive_shells, 
+                     d_boys_grid, d_density_matrix_diff, d_density_matrix_diff_shell, 
+                     d_global_counters[kernel_idx], d_min_skipped_columns[kernel_idx],
+                     head_bra, head_ket, num_bra, num_ket, num_fock_replicas);
+                }
+        }
+        else {
+            MD_direct_SCF_1T1SP<<<num_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
+                (d_fock_matrix_replicas, d_density_matrix_diff, d_primitive_shells, num_fock_replicas, 
+                 d_cgto_normalization_factors, shell_s0, shell_s1, shell_s2, shell_s3, 
+                 num_braket, schwarz_screening_threshold, d_schwarz_upper_bound_factors, 
+                 d_primitive_shell_pair_indices, num_basis, d_boys_grid, head_bra, head_ket);
+        }
+        kernel_idx++;
+    
+        if (verbose) {
+            std::cout << "(" << shell_type_to_shell_name(s0) << shell_type_to_shell_name(s1) << "|" << shell_type_to_shell_name(s2) << shell_type_to_shell_name(s3) << "): ";
+            std::cout << "|" << shell_type_to_shell_name(s0) << "|=" << shell_s0.count << ", ";
+            std::cout << "|" << shell_type_to_shell_name(s1) << "|=" << shell_s1.count << ", ";
+            std::cout << "|" << shell_type_to_shell_name(s2) << "|=" << shell_s1.count << ", ";
+            std::cout << "|" << shell_type_to_shell_name(s3) << "|=" << shell_s1.count << ", ";
+            std::cout << "|bra|= " << num_bra << ", " ;
+            std::cout << "|ket|= " << num_ket << ", " ;
+            std::cout << "|braket|= " << num_braket << ", " ;
+            std::cout << "num_blocks: " << num_blocks << std::endl;
+        }
+    }
+    // syncronize streams
+    cudaDeviceSynchronize();
+
+    // destory streams
+    for (int i = 0; i < num_kernels; i++) {
+        cudaStreamDestroy(streams[i]);
+    }
+
+    const int num_blocks_fock = ((num_basis * (num_basis + 1) / 2) + num_threads_per_block - 1) / num_threads_per_block;
+    //composeFockMatrix<<<num_blocks_fock, num_threads_per_block>>>(d_fock_matrix, d_fock_matrix_replicas, d_core_hamiltonian_matrix, num_basis, num_fock_replicas, is_first_call);
+    composeFockMatrix<<<num_blocks_fock, num_threads_per_block>>>(d_fock_matrix_prev, d_fock_matrix_replicas, d_core_hamiltonian_matrix, num_basis, num_fock_replicas, is_first_call);
+    cudaMemcpy(d_fock_matrix, d_fock_matrix_prev, sizeof(real_t) * num_basis * num_basis, cudaMemcpyDeviceToDevice);
+
+    //cudaDeviceSynchronize();
+    // update D_old = D_new for the next iteration
+    cudaMemcpy(d_density_matrix_diff, d_density_matrix, sizeof(real_t) * num_basis * num_basis, cudaMemcpyDeviceToDevice);
+
+    if (is_first_call) {
+        is_first_call = false;
+    }
+
+    //cudaMemcpy(&h_num_screened_shell_quartets, d_num_screened_shell_quartets, sizeof(int), cudaMemcpyDeviceToHost);
+    //std::cout << "Number of screened shell quartets: " << h_num_screened_shell_quartets << std::endl;
+}
+/**/
+
+
+
+
+
+
+
 
 
 void computeMullikenPopulation_RHF(
