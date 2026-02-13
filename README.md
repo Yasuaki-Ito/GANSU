@@ -237,6 +237,7 @@ located in the root directory of this source tree or at:
 https://opensource.org/licenses/BSD-3-Clause
 
 ## Publications
+  1. Satoki Tsuji, Yasuaki Ito, Nobuya Yokogawa, Kanta Suzuki, Koji Nakano, Victor Parque and Akihiko Kasagi, A GPU Implementation of the Second- and Third-Order Møller-Plesset Perturbation Theory, in Proc. of International Symposium on Computing and Networking Workshops, pp. 90-96, Yamagata, Yamagata, November 2025. ([DOI](https://doi.ieeecomputersociety.org/10.1109/CANDARW68385.2025.00023))
   1. Hong Gao, Yasuaki Ito, Koji Nakano, Satoshi Imamura, Akihiko Kasagi and Satoki Tsuji, Fully GPU-Accelerated Full Configuration Interaction for Exact Molecular Ground-state Energy Calculation, in Proc. of International Symposium on Computing and Networking, pp. 48-57, Yamagata, Yamagata, November 2025. ([DOI](https://doi.ieeecomputersociety.org/10.1109/CANDAR68384.2025.00014))
   1. Kanta Suzuki, Yasuaki Ito, Nobuya Yokogawa, Satoki Tsuji, Koji Nakano, Victor Parque and Akihiko Kasagi, GPU Acceleration of RI-RMP2 Correlation Energy Computation, in Proc. of International Symposium on Computing and Networking, pp. 174-180, Yamagata, Yamagata, November 2025. ([DOI](https://doi.ieeecomputersociety.org/10.1109/CANDAR68384.2025.00031))
   1. Satoki Tsuji, Yasuaki Ito, Haruto Fujii, Nobuya Yokogawa, Kanta Suzuki, Koji Nakano, Victor Parque, Akihiko Kasagi, GPU-Accelerated Fock Matrix Computation with Efficient Reduction, Applied Sciences, vol. 15, no. 9, 4779, April 2025. ([DOI](https://doi.org/10.3390/app15094779))
