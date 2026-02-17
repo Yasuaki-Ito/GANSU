@@ -75,6 +75,7 @@ set(SOURCES
     src/eri_stored.cu
     src/eri_stored_fci.cu
     src/eri_stored_mp4.cu
+    src/eri_stored_ump.cu
     src/davidson_solver.cu
     src/fci.cu
     src/test_operators.cu

@@ -110,7 +110,7 @@ static inline cublasStatus_t dgeam_transpose_row_major(
 
 // two normal dgemms and two stridedbatched dgemms
 //*
-void transform_eri_ao2mo_dgemm_full(
+inline void transform_eri_ao2mo_dgemm_full(
     double* d_eri_ao, double* d_eri_mo, 
     const double* d_coefficient_matrix, const int num_basis)
 {
@@ -187,10 +187,19 @@ __device__ inline size_t ovov2seq(
 
 
 
+__device__ inline size_t ovov2seq_aabb(
+    const int i, const int a, const int j, const int b, 
+    const int num_occupied_al, const int num_virtual_al, 
+    const int num_occupied_be, const int num_virtual_be) 
+{
+    return (((size_t(i) * num_virtual_al + a) * num_occupied_be + j) * num_virtual_be + b);
+}
 
-// for mp2
+
+
+// for rmp2 and ump2 (same spin)
 //*
-void transform_eri_ao2mo_dgemm_ovov(
+inline void transform_eri_ao2mo_dgemm_ovov(
     double* d_eri_ao, double* d_eri_mo, 
     const double* d_coefficient_matrix, 
     const int num_occ, const int num_vir)
@@ -267,7 +276,84 @@ void transform_eri_ao2mo_dgemm_ovov(
 
 
 
+// for ump2 (opposite spin)
+//*
+inline void transform_eri_ao2mo_dgemm_ovov_os(
+    double* d_eri_ao, double* d_eri_mo, 
+    const double* d_coefficient_matrix_al, 
+    const double* d_coefficient_matrix_be, 
+    const int num_occ_al, const int num_vir_al,
+    const int num_occ_be, const int num_vir_be)
+{
+    const size_t num_basis = num_occ_al + num_vir_al;
+    const size_t num_basis_2 = num_basis * num_basis;
+    const size_t num_basis_3 = num_basis_2 * num_basis;
 
+    const double alpha = 1.0;
+    const double beta = 0.0;
+    cublasHandle_t cublasH = NULL;
+    cublasCreate(&cublasH);
+
+    dgemm_device_row_major(
+        cublasH, 
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_occ_al, num_basis_3, num_basis,
+        &alpha, 
+        d_coefficient_matrix_al, num_basis, 
+        d_eri_ao, num_basis_3, 
+        &beta, 
+        d_eri_mo, num_basis_3
+    );
+    dgeam_transpose_row_major(
+        cublasH, 
+        num_occ_al * num_basis, 
+        num_basis * num_basis, 
+        d_eri_mo, 
+        d_eri_ao);
+    dgemm_device_row_major(
+        cublasH, 
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_occ_be, num_basis_2 * num_occ_al, num_basis,
+        &alpha, 
+        d_coefficient_matrix_be, num_basis, 
+        d_eri_ao, num_basis_2 * num_occ_al, 
+        &beta, 
+        d_eri_mo, num_basis_2 * num_occ_al
+    );
+
+    dgemm_strided_batched_device_row_major(
+        cublasH,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_vir_be, num_occ_al * num_basis, num_basis,
+        &alpha,
+        d_coefficient_matrix_be + num_occ_be, num_basis, 0,
+        d_eri_mo, num_occ_al * num_basis, num_basis_2 * num_occ_al,
+        &beta,
+        d_eri_ao, num_occ_al * num_basis, num_vir_be * num_occ_al * num_basis,
+        num_occ_be
+    );
+    dgeam_transpose_row_major(
+        cublasH, 
+        num_occ_be * num_vir_be, 
+        num_occ_al * num_basis, 
+        d_eri_ao, 
+        d_eri_mo);
+    dgemm_strided_batched_device_row_major(
+        cublasH,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_vir_al, num_occ_be * num_vir_be, num_basis,
+        &alpha,
+        d_coefficient_matrix_al + num_occ_al, num_basis, 0,
+        d_eri_mo, num_occ_be * num_vir_be, num_basis * num_occ_be * num_vir_be,
+        &beta,
+        d_eri_ao, num_occ_be * num_vir_be, num_vir_al * num_occ_be * num_vir_be,
+        num_occ_al
+    );
+
+    cudaDeviceSynchronize();
+    cublasDestroy(cublasH);
+}
+/**/
 
 
 

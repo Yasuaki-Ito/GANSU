@@ -120,6 +120,24 @@ void UHF::precompute_eri_matrix(){
 
 
 
+void UHF::post_process_after_scf() {
+    PROFILE_FUNCTION();
+
+    PostHFMethod post_hf_method = get_post_hf_method();
+    if(post_hf_method == PostHFMethod::None){
+        post_hf_energy_ = 0.0;
+        return; // do nothing
+    }else if(post_hf_method == PostHFMethod::MP2){
+        post_hf_energy_ = eri_method_->compute_mp2_energy();
+    //}else if(post_hf_method == PostHFMethod::MP3){
+    //    post_hf_energy_ = eri_method_->compute_mp3_energy();
+    }else{
+        THROW_EXCEPTION("Invalid post-HF method.");
+    }
+}
+
+
+
  /**
   * @brief Function to guess the initial Fock matrix
   * @details This function calculates the initial Fock matrix using the core Hamiltonian matrix.
@@ -435,6 +453,25 @@ void UHF::compute_Energy_Gradient() {
     std::cout << "Total Energy: " << std::setprecision(17) << get_total_energy() << " [hartree]" << std::endl;
     std::cout << "Computing time: " << std::setprecision(5) << get_solve_time_in_milliseconds() << " [ms]" << std::endl;
     std::cout << "Total Spin <S^2>: " << std::setprecision(17) << get_total_spin() << std::endl;
+
+    if(get_post_hf_method() != PostHFMethod::None){
+        std::cout << std::endl;
+        std::cout << "[Calculation Summary (Post-HF)]" << std::endl;
+        std::cout << "Post-HF method: ";
+        if(get_post_hf_method() == PostHFMethod::FCI){
+            std::cout << "FCI" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::MP2){
+            std::cout << "MP2" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::MP3){
+            std::cout << "MP3" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::CCSD){
+            std::cout << "CCSD" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::CCSD_T){
+            std::cout << "CCSD(T)" << std::endl;
+        }
+        std::cout << "Post-HF energy correction: " << std::setprecision(17) << get_post_hf_energy() << " [hartree]" << std::endl;
+        std::cout << "Total Energy (including post-HF correction): " << std::setprecision(17) << get_total_energy() + get_post_hf_energy() << " [hartree]" << std::endl;
+    }
 }
 
 

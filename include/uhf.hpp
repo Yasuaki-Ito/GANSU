@@ -115,6 +115,18 @@ public:
     DeviceHostMatrix<real_t>& get_fock_matrix_b() { return fock_matrix_b; }
 
     /**
+     * @brief Get the reference to the orbital energies (alpha spin)
+     * @return Reference to the orbital energies (alpha spin)
+     */
+    DeviceHostMemory<real_t>& get_orbital_energies_a() { return orbital_energies_a; }
+
+    /**
+     * @brief Get the reference to the orbital energies (beta spin)
+     * @return Reference to the orbital energies (beta spin)
+     */
+    DeviceHostMemory<real_t>& get_orbital_energies_b() { return orbital_energies_b; }
+
+    /**
      * @brief Export the density matrix
      * @param density_matrix_a Density matrix (alpha spin) if UHF, otherwise the density matrix
      * @param density_matrix_b Density matrix (beta spin) if UHF, otherwise no use
@@ -136,6 +148,13 @@ public:
      * @param filename File name
      */
     void export_molden_file(const std::string& filename) override;
+
+    /**
+     * @brief Post process after SCF convergence
+     * @details This function performs post-HF calculations after the SCF convergence, in which the selected post-HF method is applied.
+     * @details This function overrides the virtual function in the base class HF.
+     */
+    void post_process_after_scf() override;
 
 private:
     real_t energy_; ///< Energy
@@ -482,6 +501,61 @@ public:
 */
     }
 
+
+    ///**
+    // * @brief Break the symmetry of the density matrix
+    // * @details A small opposite HOMO-LUMO rotation is applied to alpha/beta coefficients.
+    // *          This preserves orthonormality and is more stable than zeroing rows/columns.
+    // */
+    //void break_symmetry(){
+    //    const int num_basis = hf_.get_num_basis();
+    //    const int num_alpha = hf_.get_num_alpha_spins();
+    //    const int num_beta  = hf_.get_num_beta_spins();
+  
+    //    // Need at least one occupied and one virtual orbital for each spin.
+    //    if (num_basis < 2 || num_alpha <= 0 || num_beta <= 0 || num_alpha >= num_basis || num_beta >=
+    //num_basis){
+    //        return;
+    //    }
+  
+    //    hf_.get_coefficient_matrix_a().toHost();
+    //    hf_.get_coefficient_matrix_b().toHost();
+  
+    //    // Small angle avoids over-perturbing the initial guess while breaking spin symmetry.
+    //    constexpr real_t theta = static_cast<real_t>(0.03);
+    //    const real_t c = std::cos(theta);
+    //    const real_t s = std::sin(theta);
+  
+    //    auto rotate_homo_lumo = [&](real_t* coeff, const int occ, const real_t sign) {
+    //        const int homo = occ - 1;
+    //        const int lumo = occ;
+  
+    //        std::vector<real_t> homo_vec(num_basis);
+    //        std::vector<real_t> lumo_vec(num_basis);
+  
+    //        for (int i = 0; i < num_basis; ++i) {
+    //            homo_vec[i] = coeff[homo * num_basis + i];
+    //            lumo_vec[i] = coeff[lumo * num_basis + i];
+    //        }
+  
+    //        for (int i = 0; i < num_basis; ++i) {
+    //            coeff[homo * num_basis + i] = c * homo_vec[i] + sign * s * lumo_vec[i];
+    //            coeff[lumo * num_basis + i] = -sign * s * homo_vec[i] + c * lumo_vec[i];
+    //        }
+    //    };
+  
+    //    // Apply opposite rotations to alpha and beta channels.
+    //    rotate_homo_lumo(hf_.get_coefficient_matrix_a().host_ptr(), num_alpha,
+    //static_cast<real_t>(+1.0));
+    //    rotate_homo_lumo(hf_.get_coefficient_matrix_b().host_ptr(), num_beta,
+    //static_cast<real_t>(-1.0));
+  
+    //    hf_.get_coefficient_matrix_a().toDevice();
+    //    hf_.get_coefficient_matrix_b().toDevice();
+    //}
+
+
+
 protected:
     UHF& hf_;
 };
@@ -730,6 +804,9 @@ public:
 
     ERI_Stored_UHF(const ERI_Stored_UHF&) = delete; ///< copy constructor is deleted
     ~ERI_Stored_UHF() = default; ///< destructor
+
+    real_t compute_mp2_energy() override;
+    //real_t compute_mp3_energy() override;
 
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix_a = uhf_.get_density_matrix_a();
