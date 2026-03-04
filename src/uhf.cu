@@ -440,6 +440,32 @@ void UHF::compute_Energy_Gradient() {
 
 
 
+    // Orbital energies
+    {
+        std::cout << std::endl;
+        std::cout << "[Orbital Energies (Alpha)]" << std::endl;
+        const int N = num_basis;
+        std::vector<real_t> eps_a(N), eps_b(N);
+        cudaMemcpy(eps_a.data(), orbital_energies_a.device_ptr(), N * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(eps_b.data(), orbital_energies_b.device_ptr(), N * sizeof(real_t), cudaMemcpyDeviceToHost);
+        std::ios::fmtflags old_flags = std::cout.flags();
+        std::streamsize old_prec = std::cout.precision();
+        for (int i = 0; i < N; ++i) {
+            std::cout << "  MO " << std::setw(4) << (i + 1)
+                      << (i < num_alpha_spins ? " (occ) " : " (vir) ")
+                      << std::fixed << std::setprecision(6) << eps_a[i] << " hartree" << std::endl;
+        }
+        std::cout << std::endl;
+        std::cout << "[Orbital Energies (Beta)]" << std::endl;
+        for (int i = 0; i < N; ++i) {
+            std::cout << "  MO " << std::setw(4) << (i + 1)
+                      << (i < num_beta_spins ? " (occ) " : " (vir) ")
+                      << std::fixed << std::setprecision(6) << eps_b[i] << " hartree" << std::endl;
+        }
+        std::cout.flags(old_flags);
+        std::cout.precision(old_prec);
+    }
+
     std::cout << std::endl;
     std::cout << "[Calculation Summary]" << std::endl;
     std::cout << "Method: Unrestricted Hartree-Fock (UHF)" << std::endl;
