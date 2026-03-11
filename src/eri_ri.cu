@@ -28,21 +28,21 @@ namespace gansu{
 
 // // #threads = M * Mvir * Maux
 __global__
-void nu2a_(short norbs, short nocc, short nvir, short naux, double* d_C, double* d_B_p_mu_nu, double* d_B_p_mu_a)
+void nu2a_(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_B_p_mu_nu, double* d_B_p_mu_a)
 {
     long long seq = blockDim.x * (long long)blockIdx.x + threadIdx.x;
     if (seq >= (long long)norbs * nvir * naux) {
         return;
     }
 
-    const short p = seq / (norbs * nvir);
+    const int p = seq / (norbs * nvir);
     seq %= (norbs * nvir);
 
     const int a = seq % nvir;
     const int mu = seq / nvir;
 
     double tmp = 0.0;
-    for (short nu = 0; nu < norbs; ++nu) {
+    for (int nu = 0; nu < norbs; ++nu) {
         tmp += d_C[norbs * nu + (a + nocc)] * d_B_p_mu_nu[p*(norbs*norbs) + mu*norbs + nu];
     }
     d_B_p_mu_a[p*(norbs*nvir) + mu*nvir + a] = tmp;
@@ -51,28 +51,28 @@ void nu2a_(short norbs, short nocc, short nvir, short naux, double* d_C, double*
 
 // #threads = Mocc * Mvir * Maux
 __global__
-void mu2i_(short norbs, short nocc, short nvir, short naux, double* d_C, double* d_B_p_mu_a, double* d_B_p_i_a)
+void mu2i_(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_B_p_mu_a, double* d_B_p_i_a)
 {
     long long seq = blockDim.x * (long long)blockIdx.x + threadIdx.x;
     if (seq >= (long long)nocc * nvir * naux) {
         return;
     }
 
-    const short p = seq / (nocc * nvir);
+    const int p = seq / (nocc * nvir);
     seq %= (nocc * nvir);
 
     const int a = seq % nvir;
     const int i = seq / nvir;
 
     double tmp = 0.0;
-    for (short mu = 0; mu < norbs; ++mu) {
+    for (int mu = 0; mu < norbs; ++mu) {
         tmp += d_C[norbs * mu + i] * d_B_p_mu_a[p*(norbs*nvir) + mu*nvir + a];
     }
     d_B_p_i_a[p*(nocc*nvir) + i*nvir + a] = tmp;
 }
 
 
- void nu2a_dgemm(short norbs, short nocc, short nvir, short naux, double* d_C, double* d_B_p_mu_nu, double* d_B_p_mu_a, cublasHandle_t &handle){
+ void nu2a_dgemm(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_B_p_mu_nu, double* d_B_p_mu_a, cublasHandle_t &handle){
     // cublasManager cublas;
     // cublasHandle_t handle;
     // cublasCreate(&handle);
@@ -82,7 +82,7 @@ void mu2i_(short norbs, short nocc, short nvir, short naux, double* d_C, double*
     const double alpha = 1.0;
     const double beta = 0.0;
 
-    cudaMemset(d_B_p_mu_a, 0, norbs * nvir * naux * sizeof(double));
+    cudaMemset(d_B_p_mu_a, 0, norbs * (size_t)nvir * naux * sizeof(double));
 	
 
     cublasDgemm(
@@ -100,7 +100,7 @@ void mu2i_(short norbs, short nocc, short nvir, short naux, double* d_C, double*
 }
 
 
-void mu2i_dgemm(short norbs, short nocc, short nvir, short naux, double* d_C, double* d_B_p_mu_a, double* d_B_p_i_a, cublasHandle_t &handle){
+void mu2i_dgemm(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_B_p_mu_a, double* d_B_p_i_a, cublasHandle_t &handle){
     // cublasManager cublas;
     // cublasHandle_t handle;
     // cublasCreate(&handle);
@@ -108,7 +108,7 @@ void mu2i_dgemm(short norbs, short nocc, short nvir, short naux, double* d_C, do
     const double alpha = 1.0;
     const double beta = 0.0;
 
-    cudaMemset(d_B_p_i_a, 0, norbs * nvir * naux * sizeof(double));
+    cudaMemset(d_B_p_i_a, 0, norbs * (size_t)nvir * naux * sizeof(double));
 
     int row = naux * norbs, col = nvir;
     cublasDgeam(
@@ -123,7 +123,7 @@ void mu2i_dgemm(short norbs, short nocc, short nvir, short naux, double* d_C, do
         d_B_p_i_a, row
     );
 
-    cudaMemset(d_B_p_mu_a, 0, norbs * norbs * naux * sizeof(double));
+    cudaMemset(d_B_p_mu_a, 0, norbs * (size_t)norbs * naux * sizeof(double));
 
     cublasDgemm(
         handle, 
@@ -155,7 +155,7 @@ void mu2i_dgemm(short norbs, short nocc, short nvir, short naux, double* d_C, do
 
 
 
-void transform_intermediate_matrix(short norbs, short nocc, short nvir, short naux, double* d_C, double* d_B, double* d_tmp, cublasHandle_t &handle){
+void transform_intermediate_matrix(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_B, double* d_tmp, cublasHandle_t &handle){
     nu2a_dgemm(norbs, nocc, nvir, naux, d_C, d_B, d_tmp, handle);
     mu2i_dgemm(norbs, nocc, nvir, naux, d_C, d_tmp, d_B, handle);
 }
@@ -165,7 +165,7 @@ void transform_intermediate_matrix(short norbs, short nocc, short nvir, short na
 
 
 
- void nu2a_dgemm(short norbs, short nocc, short nvir, short naux, double* d_C, double* d_B_p_mu_nu, double* d_B_p_mu_a){
+ void nu2a_dgemm(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_B_p_mu_nu, double* d_B_p_mu_a){
     // cublasManager cublas;
     cublasHandle_t handle;
     cublasCreate(&handle);
@@ -175,7 +175,7 @@ void transform_intermediate_matrix(short norbs, short nocc, short nvir, short na
     const double alpha = 1.0;
     const double beta = 0.0;
 
-    cudaMemset(d_B_p_mu_a, 0, norbs * nvir * naux * sizeof(double));
+    cudaMemset(d_B_p_mu_a, 0, norbs * (size_t)nvir * naux * sizeof(double));
 	
 
     cublasDgemm(
@@ -193,7 +193,7 @@ void transform_intermediate_matrix(short norbs, short nocc, short nvir, short na
 }
 
 
-void mu2i_dgemm(short norbs, short nocc, short nvir, short naux, double* d_C, double* d_B_p_mu_a, double* d_B_p_i_a){
+void mu2i_dgemm(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_B_p_mu_a, double* d_B_p_i_a){
     // cublasManager cublas;
     cublasHandle_t handle;
     cublasCreate(&handle);
@@ -201,7 +201,7 @@ void mu2i_dgemm(short norbs, short nocc, short nvir, short naux, double* d_C, do
     const double alpha = 1.0;
     const double beta = 0.0;
 
-    cudaMemset(d_B_p_i_a, 0, norbs * nvir * naux * sizeof(double));
+    cudaMemset(d_B_p_i_a, 0, norbs * (size_t)nvir * naux * sizeof(double));
 
     int row = naux * norbs, col = nvir;
     cublasDgeam(
@@ -216,7 +216,7 @@ void mu2i_dgemm(short norbs, short nocc, short nvir, short naux, double* d_C, do
         d_B_p_i_a, row
     );
 
-    cudaMemset(d_B_p_mu_a, 0, norbs * norbs * naux * sizeof(double));
+    cudaMemset(d_B_p_mu_a, 0, norbs * (size_t)norbs * naux * sizeof(double));
 
     cublasDgemm(
         handle, 
@@ -248,7 +248,7 @@ void mu2i_dgemm(short norbs, short nocc, short nvir, short naux, double* d_C, do
 
 
 
-void transform_intermediate_matrix(short norbs, short nocc, short nvir, short naux, double* d_C, double* d_B, double* d_tmp){
+void transform_intermediate_matrix(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_B, double* d_tmp){
     nu2a_dgemm(norbs, nocc, nvir, naux, d_C, d_B, d_tmp);
     mu2i_dgemm(norbs, nocc, nvir, naux, d_C, d_tmp, d_B);
 }
@@ -268,7 +268,7 @@ __device__ inline size_t2 index1to2_upper_wo_trace(const uint64_t index, const i
 }
 
 
-
+/*
 __device__ 
 inline uint64_t calc_i(uint64_t id, int s, int k) {   // s:nocc_stride, k: nocc_block
     return ((uint64_t)1.0 + sqrt(1.0 + 4.0*(2.0*id + s*(s-1)))) / 2.0;
@@ -284,7 +284,23 @@ __device__
 inline uint64_t calc_j(uint64_t id, int i, int s){
     return id - calc_exclusive_prefix_num_j(i,s);
 }
+/**/
 
+__device__ 
+inline uint64_t calc_i(uint64_t id, int s, int k) {   // s:nocc_stride, k: nocc_block
+    return ((uint64_t)1.0 + sqrt(1.0 + 4.0*(2.0*id + (size_t)s*(s-1)))) / 2.0;
+}
+
+
+__device__ 
+inline uint64_t calc_exclusive_prefix_num_j(int i, int s){
+    return ((size_t)i*(i-1) - (size_t)s*(s-1)) / 2.0;
+}
+
+__device__
+inline uint64_t calc_j(uint64_t id, int i, int s){
+    return id - calc_exclusive_prefix_num_j(i,s);
+}
 
 
 
@@ -308,8 +324,8 @@ void calc_RI_RMP2_energy_kernel1(int nocc, int nocc_block, int nvir, int nocc_st
     if (i >= nocc) return;
 
 
-    double iajb = d_iajb[(i-nocc_stride)*nvir*nocc*nvir + ab.x*nocc*nvir + j*nvir + ab.y];
-    double ibja = d_iajb[(i-nocc_stride)*nvir*nocc*nvir + ab.y*nocc*nvir + j*nvir + ab.x];        
+    double iajb = d_iajb[(i-nocc_stride)*(size_t)nvir*nocc*nvir + (size_t)ab.x*nocc*nvir + j*nvir + ab.y];
+    double ibja = d_iajb[(i-nocc_stride)*(size_t)nvir*nocc*nvir + (size_t)ab.y*nocc*nvir + j*nvir + ab.x];        
     double val = 4.0 * ((iajb-ibja)*(iajb-ibja) + iajb*ibja) / (d_eps[i] + d_eps[j] - d_eps[ab.x+nocc] - d_eps[ab.y+nocc]);
 
     // warp-wide reduction
@@ -353,7 +369,7 @@ void calc_RI_RMP2_energy_kernel2(int nocc, int nocc_block, int nvir, int nocc_st
     const size_t j = calc_j(id, i, nocc_stride);
     if (i >= nocc) return;
 
-    double iaja = d_iajb[(i-nocc_stride)*nvir*nocc*nvir + a*nocc*nvir + j*nvir + a];     
+    double iaja = d_iajb[(i-nocc_stride)*(size_t)nvir*nocc*nvir + a*(size_t)nocc*nvir + j*nvir + a];     
     double val = 2.0*iaja*iaja / (d_eps[i] + d_eps[j] - 2.0*d_eps[a+nocc]);
 
     // warp-wide reduction
@@ -396,7 +412,7 @@ void calc_RI_RMP2_energy_kernel3(int nocc, int nocc_block, int nvir, int nocc_st
     const size_t i = id / (nvir * (nvir-1) / 2);  // このiは0~k-1
     if (i + nocc_stride >= nocc) return;
 
-    double iaib = d_iajb[i*nvir*nocc*nvir + a*nocc*nvir + (i+nocc_stride)*nvir + b];     
+    double iaib = d_iajb[i*nvir*(size_t)nocc*nvir + a*(size_t)nocc*nvir + (i+nocc_stride)*nvir + b];     
     double val = 2.0*iaib*iaib / (2.0*d_eps[i+nocc_stride] - d_eps[a+nocc] - d_eps[b+nocc]);
 
     // warp-wide reduction
@@ -435,7 +451,7 @@ void calc_RI_RMP2_energy_kernel4(int nocc, int nocc_block, int nvir, int nocc_st
     const size_t i = id / nvir;  // このiは0~k-1
     if (i + nocc_stride >= nocc) return;
 
-    double iaia = d_iajb[i*nvir*nocc*nvir + a*nocc*nvir + (i+nocc_stride)*nvir + a];     
+    double iaia = d_iajb[i*nvir*(size_t)nocc*nvir + a*(size_t)nocc*nvir + (i+nocc_stride)*nvir + a];     
     double val = 0.5*iaia*iaia / (d_eps[i+nocc_stride] - d_eps[a+nocc]);
     // printf("[iter %d] (%d %d) 0.5*%f**2 / (E[%d](%f) - E[%d](%f)) = %f\n", nocc_stride/nocc_block,i,a,iaia, i+nocc_stride, d_eps[i+nocc_stride], a+nocc,d_eps[a+nocc], val);
 
@@ -462,18 +478,13 @@ void calc_RI_RMP2_energy_kernel4(int nocc, int nocc_block, int nvir, int nocc_st
 
 
 
-
+/*
 int search_maximum_k(int mocc, int mvir) {
     size_t free_mem_bytes, total_mem_bytes;
     cudaMemGetInfo(&free_mem_bytes, &total_mem_bytes);
     
     return std::min(free_mem_bytes/(mocc * mvir * mvir * sizeof(double)), (size_t)mocc);    
 }
-
-
-
-
-
 
 void search_k_and_cudamalloc_4cERI(int mocc, int mvir, int &k, double **d_iajb, cudaStream_t &stream) {
     k = search_maximum_k(mocc, mvir);
@@ -485,6 +496,32 @@ void search_k_and_cudamalloc_4cERI(int mocc, int mvir, int &k, double **d_iajb, 
     }
 
     // printf("k = %d\n",k);
+}
+/**/
+
+
+int search_maximum_k(int mocc, int mvir) {
+    size_t free_mem_bytes, total_mem_bytes;
+    cudaMemGetInfo(&free_mem_bytes, &total_mem_bytes);
+    
+    return std::min(free_mem_bytes/(mocc * (size_t)mvir * mvir * sizeof(double)), (size_t)mocc);    
+}
+
+void search_k_and_cudamalloc_4cERI(int mocc, int mvir, int &k, double **d_iajb, cudaStream_t &stream) {
+    k = search_maximum_k(mocc, mvir) * 0.9;
+    // k = (int)(k*mvir / 32) * 32;
+    // k = 10;
+
+    //while(cudaMallocAsync((void**)d_iajb, sizeof(double) * k * mvir * mocc * mvir, stream) != cudaSuccess){
+    //    k *= 0.9;
+    //}
+
+    cudaError_t err = tracked_cudaMalloc((void**)d_iajb, sizeof(double) * k * (size_t)mvir * mocc * mvir);
+    if (err != cudaSuccess) {
+        THROW_EXCEPTION(std::string("Failed to allocate device memory for d_iajb matrix: ") + std::string(cudaGetErrorString(err)));
+    }
+
+    printf("k = %d\n",k);
 }
 
 
@@ -513,7 +550,7 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
 
 
     real_t* d_tmp;
-    tracked_cudaMalloc((void**)&d_tmp, sizeof(double) * num_basis_ * nvir * num_auxiliary_basis);
+    tracked_cudaMalloc((void**)&d_tmp, sizeof(double) * num_basis_ * (size_t)nvir * num_auxiliary_basis);
 
     double *d_energy;
     tracked_cudaMalloc((void**)&d_energy, sizeof(double));
@@ -548,8 +585,8 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
 
 
 
-    size_t num_blocks_3 = ((size_t)(nocc_block * nvir * (nvir - 1.0) / 2) + num_threads - 1) / num_threads, 
-        num_blocks_4 = ((size_t)(nocc_block * nvir) + num_threads - 1) / num_threads;
+    size_t num_blocks_3 = ((size_t)(nocc_block * (size_t)nvir * (nvir - 1.0) / 2) + num_threads - 1) / num_threads, 
+           num_blocks_4 = ((size_t)(nocc_block * (size_t)nvir) + num_threads - 1) / num_threads;
 
 
     // int nocc_block =  std::stoi(std::getenv("NUM"));
@@ -580,8 +617,8 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
 
     cudaEventRecord(events[0], streams[0]);
     for(int i = 0; i < nocc; i+=nocc_block){  // iは資料でいう「stride」
-        num_blocks_list[0].num_blocks = (((size_t)(nocc_block*i + nocc_block*(nocc_block-1)/2) *  nvir*(nvir-1)/2) + num_threads -1) / num_threads;
-        num_blocks_list[1].num_blocks = (((size_t)(nocc_block*i + nocc_block*(nocc_block-1)/2) *  nvir) + num_threads - 1) / num_threads;
+        num_blocks_list[0].num_blocks = (((size_t)(nocc_block*i + (size_t)nocc_block*(nocc_block-1)/2) *  nvir*(nvir-1)/2) + num_threads -1) / num_threads;
+        num_blocks_list[1].num_blocks = (((size_t)(nocc_block*i + (size_t)nocc_block*(nocc_block-1)/2) *  nvir) + num_threads - 1) / num_threads;
 
         cublasDgemm(
             handle, 
