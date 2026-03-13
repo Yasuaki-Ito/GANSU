@@ -263,6 +263,7 @@ public:
                 std::string error_msg = "Failed to allocate host memory: " + std::string(cudaGetErrorString(err));
                 THROW_EXCEPTION(error_msg);
             }
+            memset(this->host_ptr_, 0, this->host_bytes_);
         }
 
         this->device_bytes_ = this->size_ * sizeof(T);
@@ -277,6 +278,9 @@ public:
                       << "  Total would be:        " << this->format_bytes(current_mem + this->device_bytes_);
             THROW_EXCEPTION(error_msg.str());
         }
+
+        // Zero-initialize device memory (required by kernels that use atomicAdd)
+        cudaMemset(this->device_ptr_, 0, this->device_bytes_);
 
         // Track successful allocation
         this->track_allocation(this->device_bytes_);
@@ -728,6 +732,9 @@ inline cudaError_t tracked_cudaMalloc(T** ptr, size_t size) {
     cudaError_t err = cudaMalloc(reinterpret_cast<void**>(ptr), size);
 
     if (err == cudaSuccess) {
+        // Zero-initialize device memory to prevent stale data contamination
+        cudaMemset(*ptr, 0, size);
+
         // Track allocation in map
         {
             std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);

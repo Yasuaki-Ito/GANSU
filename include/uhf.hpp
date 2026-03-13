@@ -450,55 +450,45 @@ public:
      * @details This function breaks the symmetry of the density matrix.
      * @details Copy the density matrix of the alpha spin to the density matrix of the beta spin only for diagonal blocks.
      */
-    void break_symmetry(){ 
+    void break_symmetry(){
 
-        hf_.get_coefficient_matrix_b().toHost();
-        for(int i=0; i<hf_.get_num_basis(); i++){
-            hf_.get_coefficient_matrix_b().host_ptr()[(hf_.get_num_basis()-1) * hf_.get_num_basis() + i] = 0;
-            hf_.get_coefficient_matrix_b().host_ptr()[i * hf_.get_num_basis() + hf_.get_num_basis()-1] = 0;
-        }
-        hf_.get_coefficient_matrix_b().toDevice();
-
-/*
         hf_.get_coefficient_matrix_a().toHost();
         hf_.get_coefficient_matrix_b().toHost();
 
-        std::unique_ptr<real_t[]> homo(new real_t[hf_.get_num_basis()]);
-        std::unique_ptr<real_t[]> lumo(new real_t[hf_.get_num_basis()]);
+        const int N = hf_.get_num_basis();
+        std::unique_ptr<real_t[]> homo(new real_t[N]);
+        std::unique_ptr<real_t[]> lumo(new real_t[N]);
 
-        // alpha-spin
-        const double alpha = 0.25;
-        const double cos_alpha = std::cos(alpha);
-        const double sin_alpha = std::cos(alpha);
+        // alpha-spin: rotate HOMO and LUMO by +theta
+        const double theta = 0.25;
+        const double c = std::cos(theta);
+        const double s = std::sin(theta);
 
-        for(int i=0; i<hf_.get_num_basis(); i++){
-            homo[i] = hf_.get_coefficient_matrix_a().host_ptr()[(hf_.get_num_alpha_spins()-1) * hf_.get_num_basis() + i];
-            lumo[i] = hf_.get_coefficient_matrix_a().host_ptr()[hf_.get_num_alpha_spins() * hf_.get_num_basis() + i];
+        if(hf_.get_num_alpha_spins() < N) {
+            for(int i=0; i<N; i++){
+                homo[i] = hf_.get_coefficient_matrix_a().host_ptr()[(hf_.get_num_alpha_spins()-1) * N + i];
+                lumo[i] = hf_.get_coefficient_matrix_a().host_ptr()[hf_.get_num_alpha_spins() * N + i];
+            }
+            for(int i=0; i<N; i++){
+                hf_.get_coefficient_matrix_a().host_ptr()[(hf_.get_num_alpha_spins()-1) * N + i] =  c * homo[i] + s * lumo[i];
+                hf_.get_coefficient_matrix_a().host_ptr()[hf_.get_num_alpha_spins() * N + i]     = -s * homo[i] + c * lumo[i];
+            }
         }
-        
-        for(int i=0; i<hf_.get_num_basis(); i++){
-            hf_.get_coefficient_matrix_a().host_ptr()[(hf_.get_num_alpha_spins()-1) * hf_.get_num_basis() + i] = cos_alpha * homo[i] + sin_alpha * lumo[i];
-            hf_.get_coefficient_matrix_a().host_ptr()[hf_.get_num_alpha_spins() * hf_.get_num_basis() +  i] = sin_alpha * homo[i] + cos_alpha * lumo[i];
-        }
 
-        // beta-spin
-        const double beta = -alpha;
-        const double cos_beta = std::cos(beta);
-        const double sin_beta = std::cos(beta);
-
-
-        for(int i=0; i<hf_.get_num_basis(); i++){
-            homo[i] = hf_.get_coefficient_matrix_b().host_ptr()[(hf_.get_num_beta_spins()-1) * hf_.get_num_basis() + i];
-            lumo[i] = hf_.get_coefficient_matrix_b().host_ptr()[hf_.get_num_beta_spins() * hf_.get_num_basis() + i];
-        }
-        for(int i=0; i<hf_.get_num_basis(); i++){
-            hf_.get_coefficient_matrix_b().host_ptr()[(hf_.get_num_beta_spins()-1) * hf_.get_num_basis() + i] = cos_beta * homo[i] + sin_beta * lumo[i];
-            hf_.get_coefficient_matrix_b().host_ptr()[hf_.get_num_beta_spins() * hf_.get_num_basis() + i] = sin_beta * homo[i] + cos_beta * lumo[i];
+        // beta-spin: rotate HOMO and LUMO by -theta
+        if(hf_.get_num_beta_spins() > 0 && hf_.get_num_beta_spins() < N) {
+            for(int i=0; i<N; i++){
+                homo[i] = hf_.get_coefficient_matrix_b().host_ptr()[(hf_.get_num_beta_spins()-1) * N + i];
+                lumo[i] = hf_.get_coefficient_matrix_b().host_ptr()[hf_.get_num_beta_spins() * N + i];
+            }
+            for(int i=0; i<N; i++){
+                hf_.get_coefficient_matrix_b().host_ptr()[(hf_.get_num_beta_spins()-1) * N + i] =  c * homo[i] - s * lumo[i];
+                hf_.get_coefficient_matrix_b().host_ptr()[hf_.get_num_beta_spins() * N + i]     =  s * homo[i] + c * lumo[i];
+            }
         }
 
         hf_.get_coefficient_matrix_a().toDevice();
         hf_.get_coefficient_matrix_b().toDevice();
-*/
     }
 
 

@@ -31,6 +31,7 @@ set(TEST_SOURCES
     test_gpu_manager.cu
     test_gpu_kernels.cu
     test_davidson_solver.cu
+    test_validation.cu
 )
 
 # Create test executable

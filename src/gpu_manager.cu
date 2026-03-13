@@ -183,6 +183,129 @@ int eigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_
 }
 
 /**
+ * @brief Computes the product of two rectangular matrices using cuBLAS.
+ *
+ * Computes C = alpha * op(A) * op(B) + beta * C
+ * where op(X) = X if transpose=false, X^T if transpose=true.
+ *
+ * @param d_A  Row-major matrix. Without transpose: M×K. With transpose: K×M.
+ * @param d_B  Row-major matrix. Without transpose: K×N. With transpose: N×K.
+ * @param d_C  Row-major output matrix M×N.
+ * @param M    Number of rows of op(A) and C.
+ * @param N    Number of columns of op(B) and C.
+ * @param K    Number of columns of op(A) / rows of op(B).
+ * @param transpose_A  If true, A is K×M and transposed.
+ * @param transpose_B  If true, B is N×K and transposed.
+ * @param accumulate   If true, C += alpha*op(A)*op(B). If false, C = alpha*op(A)*op(B).
+ * @param alpha        Scalar multiplier (default 1.0).
+ */
+void matrixMatrixProductRect(const double* d_A, const double* d_B, double* d_C,
+                              const int M, const int N, const int K,
+                              const bool transpose_A, const bool transpose_B,
+                              const bool accumulate, const double alpha)
+{
+    cublasHandle_t cublasHandle = GPUHandle::cublas();
+
+    double beta = accumulate ? 1.0 : 0.0;
+
+    // cuBLAS uses column-major. For row-major A(M×K), cuBLAS sees it as
+    // column-major A'(K×M). So we compute C' = B' * A' to get row-major C.
+    // Row-major op(A)[M×K]: stored as M×K. cuBLAS sees K×M column-major.
+    // Row-major op(B)[K×N]: stored as K×N. cuBLAS sees N×K column-major.
+    // We want row-major C[M×N]: cuBLAS sees N×M column-major.
+    // cuBLAS call: C' = B' * A' → (N×M) = (N×K) * (K×M)
+
+    // Leading dimensions in memory (row-major storage):
+    // A stored as (transpose_A ? K×M : M×K) → lda = (transpose_A ? M : K)
+    // B stored as (transpose_B ? N×K : K×N) → ldb = (transpose_B ? K : N)
+    const int lda = transpose_A ? M : K;  // physical row width of A
+    const int ldb = transpose_B ? K : N;  // physical row width of B
+    const int ldc = N;                     // physical row width of C
+
+    // cuBLAS sees row-major as column-major transposed.
+    // For row-major A[M×K] without transpose:
+    //   cuBLAS sees col-major A'[K×M], which is A^T in cuBLAS notation → CUBLAS_OP_T to undo
+    //   But we need op(A)=A, so cuBLAS must apply T to get A from A'.
+    // For row-major A[K×M] with transpose:
+    //   cuBLAS sees col-major A'[M×K], which is A^T in cuBLAS notation → CUBLAS_OP_N gives A^T
+    //
+    // Simpler approach: C = op(A)*op(B) in row-major
+    // ↔ C^T = op(B)^T * op(A)^T in col-major
+    // ↔ cuBLAS(C^T[N×M]) = cuBLAS_op_B * cuBLAS_op_A
+    //
+    // For cuBLAS: we call cublasDgemm with:
+    //   op_cuB = transpose_B ? CUBLAS_OP_T : CUBLAS_OP_N  (for B in C^T = B^T * A^T)
+    //   op_cuA = transpose_A ? CUBLAS_OP_T : CUBLAS_OP_N  (for A in C^T = B^T * A^T)
+    //   But row-major→col-major already gives transpose, so we need to invert:
+    //   cuBLAS_opB for B^T in col-major: if transpose_B=false, B is K×N row-major = N×K col-major,
+    //     we need B^T[N×K] col-major → CUBLAS_OP_T on the N×K col-major → gives K×N which is wrong.
+    //
+    // Let me use the standard row-major trick directly:
+    // C[M×N] = op(A)[M×K] * op(B)[K×N]  in row-major
+    // Equivalent to: C_col[N×M] = op(B)_col[N×K] * op(A)_col[K×M] in col-major
+    //
+    // A is stored row-major. Without transpose: shape M×K, col-major view: K×M.
+    //   op(A) in row-major = A[M×K]. In col-major: we see A'[K×M].
+    //   For op(A)_col[K×M] we need CUBLAS_OP_N on A' → gives K×M. ✓
+    //   → cuBLAS_opA = transpose_A ? CUBLAS_OP_T : CUBLAS_OP_N
+    //
+    // Similarly: cuBLAS_opB = transpose_B ? CUBLAS_OP_T : CUBLAS_OP_N
+
+    const cublasOperation_t cuOpB = transpose_B ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasOperation_t cuOpA = transpose_A ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    // cublasDgemm(handle, opB, opA, N, M, K, &alpha, B, ldb, A, lda, &beta, C, ldc)
+    cublasDgemm(
+        cublasHandle,
+        cuOpB, cuOpA,
+        N, M, K,
+        &alpha,
+        d_B, ldb,
+        d_A, lda,
+        &beta,
+        d_C, ldc
+    );
+}
+
+/**
+ * @brief Strided batched DGEMM for row-major matrices.
+ *
+ * Computes C[i] = alpha * op(A[i]) * op(B[i]) + beta * C[i] for i=0..batchCount-1,
+ * where A[i] = d_A + i*strideA, B[i] = d_B + i*strideB, C[i] = d_C + i*strideC.
+ * Set strideA=0 to broadcast the same A matrix across all batches.
+ */
+void matrixMatrixProductBatched(const double* d_A, const double* d_B, double* d_C,
+                                 const int M, const int N, const int K,
+                                 const long long strideA, const long long strideB, const long long strideC,
+                                 const int batchCount,
+                                 const bool transpose_A, const bool transpose_B,
+                                 const bool accumulate, const double alpha)
+{
+    cublasHandle_t cublasHandle = GPUHandle::cublas();
+    double beta = accumulate ? 1.0 : 0.0;
+
+    const int lda = transpose_A ? M : K;
+    const int ldb = transpose_B ? K : N;
+    const int ldc = N;
+
+    // Row-major → col-major: C^T = op(B)^T * op(A)^T
+    const cublasOperation_t cuOpB = transpose_B ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasOperation_t cuOpA = transpose_A ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    cublasDgemmStridedBatched(
+        cublasHandle,
+        cuOpB, cuOpA,
+        N, M, K,
+        &alpha,
+        d_B, ldb, strideB,
+        d_A, lda, strideA,
+        &beta,
+        d_C, ldc, strideC,
+        batchCount
+    );
+}
+
+/**
  * @brief Computes the weighted sum of two matrices using cuBLAS.
  * @param d_matrix_A Device pointer to the size x size matrix
  * @param d_matrix_B Device pointer to the size x size matrix
@@ -458,6 +581,9 @@ size_t makeShellPairTypeInfo(const std::vector<ShellTypeInfo>& shell_type_infos,
 }
 
 void computeERIMatrix(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors,  real_t* d_eri_matrix, const real_t* d_schwarz_upper_bound_factors, const real_t schwarz_screening_threshold, const int num_basis, const bool verbose) {
+
+    // Zero-initialize ERI matrix (kernels use atomicAdd)
+    cudaMemset(d_eri_matrix, 0, (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
 
     // compute the electron repulsion integrals
     const int threads_per_block = 256; // the number of threads per block
@@ -2511,9 +2637,9 @@ void computeFockMatrix_Direct_RHF(
     std::vector<int*>& d_min_skipped_columns,
     real_t* d_fock_matrix_replicas,
     const int num_fock_replicas,
-    const int verbose)
+    const int verbose,
+    bool& is_first_call)
 {
-    static bool is_first_call = true;
     if (is_first_call) {
         cudaMemset(d_fock_matrix_prev, 0, sizeof(real_t) * num_basis * num_basis);
         cudaMemset(d_density_matrix_diff, 0, sizeof(real_t) * num_basis * num_basis);

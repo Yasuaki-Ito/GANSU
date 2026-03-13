@@ -72,7 +72,12 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
     // Set an algorithm for ERI calculation (default: ERI_Stored_RHF)
     const std::string eri_method = parameters.get<std::string>("eri_method");
     if(eri_method == "stored"){ // ERI matrices are stored in the device memory
-        set_eri_method(std::make_unique<ERI_Stored_RHF>(*this));
+        auto eri_stored = std::make_unique<ERI_Stored_RHF>(*this);
+        // Set CCSD algorithm: 0=spatial-optimized, 1=spatial-naive, 2=spin-orbital
+        if (parameters.contains("ccsd_algorithm")) {
+            eri_stored->set_ccsd_algorithm(parameters.get<int>("ccsd_algorithm"));
+        }
+        set_eri_method(std::move(eri_stored));
     }else if(eri_method == "ri"){ // Resolution of Identity (RI) method
         const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename"); // auxiliary basis set file name
         Molecular auxiliary_molecular(molecular.get_atoms(), auxiliary_gbsfilename); // auxiliary molecular object

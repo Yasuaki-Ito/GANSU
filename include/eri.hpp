@@ -277,6 +277,7 @@ protected:
     DeviceHostMatrix<real_t> density_matrix_diff_;
     DeviceHostMatrix<real_t> density_matrix_diff_shell_;
     DeviceHostMatrix<real_t> fock_matrix_prev_;
+    bool is_first_call_ = true; ///< Reset per SCF solve for density difference tracking
 };
 
 

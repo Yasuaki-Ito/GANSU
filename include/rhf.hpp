@@ -582,7 +582,7 @@ private:
  */
 class ERI_Stored_RHF : public ERI_Stored{
 public:
-    ERI_Stored_RHF(RHF& rhf): 
+    ERI_Stored_RHF(RHF& rhf):
         ERI_Stored(rhf),
         rhf_(rhf){} ///< Constructor
 
@@ -595,6 +595,9 @@ public:
     real_t compute_ccsd_energy() override;
     real_t compute_ccsd_t_energy() override;
     real_t compute_fci_energy() override;
+
+    /// Set CCSD algorithm: 0=spatial-optimized (default), 1=spatial-naive, 2=spin-orbital
+    void set_ccsd_algorithm(int algo) { ccsd_algorithm_ = algo; }
 
 
     void compute_fock_matrix() override {
@@ -626,6 +629,7 @@ public:
 
 protected:
     RHF& rhf_; ///< RHF
+    int ccsd_algorithm_ = 0; ///< 0=spatial-optimized, 1=spatial-naive, 2=spin-orbital
 };
 
 
@@ -766,7 +770,8 @@ public:
             min_skipped_columns_,
             fock_matrix_replicas_,
             num_fock_replicas_,
-            verbose
+            verbose,
+            is_first_call_
         );
 
         if(verbose){

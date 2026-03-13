@@ -12,6 +12,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+#include <algorithm>
 #include <iomanip>
 #include <iostream>
 #include <assert.h>
@@ -185,6 +186,400 @@ void transform_ao_eri_to_mo_eri_full(
 }
 
 
+/**
+ * @brief GPU kernel: extract a sub-block of MO integrals from the full N⁴ tensor.
+ *
+ * Maps physicist's notation v(p,q,r,s) = eri_mo[p*N³ + r*N² + q*N + s]
+ * to a contiguous output array out[i0*sz1*sz2*sz3 + i1*sz2*sz3 + i2*sz3 + i3]
+ * = v(off0+i0, off1+i1, off2+i2, off3+i3).
+ */
+__global__ void extract_subblock_4d(const double* __restrict__ eri_mo,
+                                     double* __restrict__ out,
+                                     int N, int off0, int sz0,
+                                     int off1, int sz1,
+                                     int off2, int sz2,
+                                     int off3, int sz3) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)sz0 * sz1 * sz2 * sz3;
+    if (gid >= total) return;
+
+    int i3 = gid % sz3; size_t rem = gid / sz3;
+    int i2 = rem % sz2; rem /= sz2;
+    int i1 = rem % sz1;
+    int i0 = (int)(rem / sz1);
+
+    int p = off0 + i0, q = off1 + i1, r = off2 + i2, s = off3 + i3;
+    size_t N3 = (size_t)N * N * N;
+    out[gid] = eri_mo[(size_t)p * N3 + (size_t)r * N * N + (size_t)q * N + s];
+}
+
+/**
+ * @brief GPU kernel: extract w_oovv = 2*v(k,l,c,d) - v(k,l,d,c) directly from MO integrals.
+ */
+__global__ void extract_w_oovv_kernel(const double* __restrict__ eri_mo,
+                                       double* __restrict__ w_oovv,
+                                       int N, int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)nocc * nocc * nvir * nvir;
+    if (gid >= total) return;
+
+    int d = gid % nvir; size_t rem = gid / nvir;
+    int c = rem % nvir; rem /= nvir;
+    int l = rem % nocc;
+    int k = (int)(rem / nocc);
+
+    size_t N3 = (size_t)N * N * N;
+    size_t N2 = (size_t)N * N;
+    int oc = nocc + c, od = nocc + d;
+    double v_cd = eri_mo[(size_t)k * N3 + (size_t)oc * N2 + (size_t)l * N + od];
+    double v_dc = eri_mo[(size_t)k * N3 + (size_t)od * N2 + (size_t)l * N + oc];
+    w_oovv[gid] = 2.0 * v_cd - v_dc;
+}
+
+/**
+ * @brief GPU kernel: compute (T) perturbative triples energy on GPU.
+ *
+ * Each thread block processes one (a,b,c) triple (a >= b >= c).
+ * Shared memory layout: wt[6*o3] + zt[6*o3] + r3buf[o3] + red[blockDim.x]
+ * where o3 = nocc^3.
+ */
+__global__ void ccsd_t_energy_kernel(
+    const double* __restrict__ F_sum, int F_cols_int,
+    const double* __restrict__ M_sum, int M_cols_int,
+    const double* __restrict__ v_oovv,
+    const double* __restrict__ t1,
+    const double* __restrict__ eps,
+    int nocc, int nvir,
+    const int* __restrict__ abc_triples,
+    int num_triples,
+    double* __restrict__ block_E_T)
+{
+    int triple_id = blockIdx.x;
+    if (triple_id >= num_triples) return;
+
+    const int a = abc_triples[triple_id * 3];
+    const int b = abc_triples[triple_id * 3 + 1];
+    const int c = abc_triples[triple_id * 3 + 2];
+
+    const int oo = nocc * nocc;
+    const int o3 = oo * nocc;
+    const int vv = nvir * nvir;
+    const size_t F_cols = (size_t)F_cols_int;
+    const size_t M_cols = (size_t)M_cols_int;
+
+    double d3_scale = 1.0;
+    if (a == c) d3_scale = 6.0;
+    else if (a == b || b == c) d3_scale = 2.0;
+
+    int perms[6][3] = {{a,b,c},{a,c,b},{b,a,c},{b,c,a},{c,a,b},{c,b,a}};
+
+    extern __shared__ double smem[];
+    double* wt = smem;                   // 6 * o3
+    double* zt = smem + 6 * o3;          // 6 * o3
+    double* r3buf = smem + 12 * o3;      // o3 (temporary for r3out)
+    double* red = smem + 13 * o3;        // blockDim.x
+
+    // Phase 1 & 2: for each permutation, compute wt[p] and zt[p]
+    for (int p = 0; p < 6; p++) {
+        int aa = perms[p][0], bb = perms[p][1], cc = perms[p][2];
+
+        // Phase 1: compute wt[p] and store wpv in zt[p] temporarily
+        for (int ijk = threadIdx.x; ijk < o3; ijk += blockDim.x) {
+            int k = ijk % nocc;
+            int j = (ijk / nocc) % nocc;
+            int i = ijk / oo;
+
+            // F_sum lookup: F_sum[(i*vv + aa*nvir+bb), (k*nocc+j)*nvir + cc]
+            size_t f_row = (size_t)i * vv + (size_t)aa * nvir + bb;
+            size_t f_col = ((size_t)k * nocc + j) * nvir + cc;
+            double wval = F_sum[f_row * F_cols + f_col];
+
+            // M_sum lookup: M_sum[(aa*oo + j*nocc+i), (k*vv + bb*nvir+cc)]
+            size_t m_row = (size_t)aa * oo + (size_t)j * nocc + i;
+            size_t m_col = (size_t)k * vv + (size_t)bb * nvir + cc;
+            wval += M_sum[m_row * M_cols + m_col];
+
+            // v-term: v_oovv[(i*nocc+j)*vv + aa*nvir+bb] * t1[k*nvir+cc]
+            double vval = v_oovv[((size_t)i * nocc + j) * vv + (size_t)aa * nvir + bb]
+                        * t1[k * nvir + cc];
+
+            wt[p * o3 + ijk] = wval;
+            zt[p * o3 + ijk] = wval + 0.5 * vval; // temporarily store wpv
+        }
+        __syncthreads();
+
+        // Phase 2a: compute r3out from wpv (stored in zt[p]) into temporary buffer
+        // Must not overwrite zt[p] yet — other threads may still read wpv at permuted indices
+        for (int ijk = threadIdx.x; ijk < o3; ijk += blockDim.x) {
+            double wpv_self = zt[p * o3 + ijk];
+            int k = ijk % nocc;
+            int j = (ijk / nocc) % nocc;
+            int i = ijk / oo;
+            int idx1 = (i*nocc+k)*nocc+j;  // ikj
+            int idx2 = (j*nocc+i)*nocc+k;  // jik
+            int idx3 = (j*nocc+k)*nocc+i;  // jki
+            int idx4 = (k*nocc+i)*nocc+j;  // kij
+            int idx5 = (k*nocc+j)*nocc+i;  // kji
+
+            r3buf[ijk] = 4.0*wpv_self + zt[p*o3+idx3] + zt[p*o3+idx4]
+                       - 2.0*zt[p*o3+idx5] - 2.0*zt[p*o3+idx1] - 2.0*zt[p*o3+idx2];
+        }
+        __syncthreads();
+
+        // Phase 2b: write zt[p] = r3out / D (now safe to overwrite)
+        for (int ijk = threadIdx.x; ijk < o3; ijk += blockDim.x) {
+            int k = ijk % nocc;
+            int j = (ijk / nocc) % nocc;
+            int i = ijk / oo;
+            double D = (eps[i] + eps[j] + eps[k]
+                      - eps[nocc+perms[p][0]] - eps[nocc+perms[p][1]] - eps[nocc+perms[p][2]]) * d3_scale;
+            zt[p * o3 + ijk] = r3buf[ijk] / D;
+        }
+        __syncthreads();
+    }
+
+    // Phase 3: compute 36 dot products for energy
+    // E_T += sum_{q,p} sum_r wt[p][idx[comp[q][p]][r]] * zt[q][r]
+    const int comp[6][6] = {
+        {0,1,2,3,4,5}, {1,0,4,5,2,3}, {2,3,0,1,5,4},
+        {4,5,1,0,3,2}, {3,2,5,4,0,1}, {5,4,3,2,1,0}
+    };
+
+    double thread_E = 0.0;
+    for (int q = 0; q < 6; q++) {
+        for (int pp = 0; pp < 6; pp++) {
+            int s = comp[q][pp];
+            for (int r = threadIdx.x; r < o3; r += blockDim.x) {
+                int kr = r % nocc;
+                int jr = (r / nocc) % nocc;
+                int ir = r / oo;
+                int sr;
+                switch(s) {
+                    case 0: sr = r; break;
+                    case 1: sr = (ir*nocc+kr)*nocc+jr; break;
+                    case 2: sr = (jr*nocc+ir)*nocc+kr; break;
+                    case 3: sr = (jr*nocc+kr)*nocc+ir; break;
+                    case 4: sr = (kr*nocc+ir)*nocc+jr; break;
+                    default: sr = (kr*nocc+jr)*nocc+ir; break;
+                }
+                thread_E += wt[pp*o3+sr] * zt[q*o3+r];
+            }
+        }
+    }
+
+    // Block reduction
+    red[threadIdx.x] = thread_E;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride)
+            red[threadIdx.x] += red[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+        block_E_T[triple_id] = red[0];
+}
+
+/**
+ * @brief GPU kernel: permute indices of a 4D tensor of size N×N×N×N.
+ *
+ * For input tensor in[i0][i1][i2][i3], produces output such that
+ * out[j0][j1][j2][j3] = in[i0][i1][i2][i3] where j_{p_k} = i_k.
+ * E.g., (p0,p1,p2,p3) = (1,0,2,3) swaps the first two indices.
+ */
+__global__ void tensor4d_permute_kernel(const double* __restrict__ in,
+                                        double* __restrict__ out,
+                                        int N, int p0, int p1, int p2, int p3) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t N4 = (size_t)N * N * N * N;
+    if (gid >= N4) return;
+
+    int i3 = gid % N; size_t rem = gid / N;
+    int i2 = rem % N; rem /= N;
+    int i1 = rem % N;
+    int i0 = (int)(rem / N);
+
+    int out_i[4];
+    out_i[p0] = i0;
+    out_i[p1] = i1;
+    out_i[p2] = i2;
+    out_i[p3] = i3;
+
+    size_t out_gid = ((size_t)out_i[0]*N + out_i[1])*(size_t)N*N + (size_t)out_i[2]*N + out_i[3];
+    out[out_gid] = in[gid];
+}
+
+/**
+ * @brief GPU kernel: build Wabcd from v_vvvv and ovvv_t1 (DGEMM output).
+ *
+ * Wabcd[a,b,c,d] = v_vvvv[a,b,c,d] - ovvv_t1[(a*vv+d*nvir+c), b] - ovvv_t1[(b*vv+c*nvir+d), a]
+ * Eliminates ovvv_t1 download + Wabcd upload per CCSD iteration.
+ */
+/**
+ * @brief GPU kernel: build tau = t2 + t1⊗t1 directly on GPU.
+ * tau[((i*nocc+j)*nvir+a)*nvir+b] = t2v[same] + t1[i*nvir+a] * t1[j*nvir+b]
+ */
+__global__ void build_tau_kernel(const double* __restrict__ t2v,
+                                  const double* __restrict__ t1,
+                                  double* __restrict__ tau,
+                                  int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int vv = nvir * nvir;
+    const size_t total = (size_t)nocc * nocc * vv;
+    if (gid >= total) return;
+
+    int b = gid % nvir; size_t rem = gid / nvir;
+    int a = rem % nvir; rem /= nvir;
+    int j = rem % nocc;
+    int i = (int)(rem / nocc);
+
+    tau[gid] = t2v[gid] + t1[i * nvir + a] * t1[j * nvir + b];
+}
+
+__global__ void build_Wabcd_kernel(const double* __restrict__ v_vvvv,
+                                    const double* __restrict__ ovvv_t1,
+                                    double* __restrict__ Wabcd,
+                                    int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir;
+    size_t vvv = vv * nvir;
+    size_t vv2 = vv * vv;
+    if (gid >= vv2) return;
+
+    int d = gid % nvir; size_t rem = gid / nvir;
+    int c = rem % nvir; rem /= nvir;
+    int b = rem % nvir;
+    int a = (int)(rem / nvir);
+
+    // ovvv_t1[(x*vv + y*nvir + z), w] = sum_k v_ovvv[k, x, y, z] * t1[k, w]
+    Wabcd[gid] = v_vvvv[gid]
+                 - ovvv_t1[((size_t)a*vv + (size_t)d*nvir + c)*nvir + b]
+                 - ovvv_t1[((size_t)b*vv + (size_t)c*nvir + d)*nvir + a];
+}
+
+/**
+ * @brief GPU kernel: compute Fac = -sum_{kl,d} w_oovv[(kl),(cd)] * tau[T2(k,l,a,d)]
+ *
+ * Both w_oovv and tau are already on GPU — no data transfer needed.
+ */
+__global__ void compute_Fac_kernel(const double* __restrict__ w_oovv,
+                                    const double* __restrict__ tau,
+                                    double* __restrict__ Fac,
+                                    int nocc, int nvir) {
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    if (a >= nvir || c >= nvir) return;
+
+    int oo = nocc * nocc;
+    int vv = nvir * nvir;
+    double val = 0.0;
+    for (int kl = 0; kl < oo; kl++)
+        for (int d = 0; d < nvir; d++)
+            val -= w_oovv[kl*vv + c*nvir + d] * tau[kl*vv + a*nvir + d];
+    Fac[a*nvir + c] = val;
+}
+
+/**
+ * @brief GPU kernel: compute Fkc = sum_{l,d} w_oovv[(k*nocc+l)*vv + c*nvir+d] * t1[l*nvir+d]
+ *
+ * Both w_oovv and t1 are already on GPU — no data transfer needed.
+ */
+__global__ void compute_Fkc_kernel(const double* __restrict__ w_oovv,
+                                    const double* __restrict__ t1,
+                                    double* __restrict__ Fkc,
+                                    int nocc, int nvir) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    if (k >= nocc || c >= nvir) return;
+
+    int vv = nvir * nvir;
+    double val = 0.0;
+    for (int l = 0; l < nocc; l++)
+        for (int d = 0; d < nvir; d++)
+            val += w_oovv[(k*nocc + l)*vv + c*nvir + d] * t1[l*nvir + d];
+    Fkc[k*nvir + c] = val;
+}
+
+/**
+ * @brief 4-stage AO->MO ERI transformation using half-transforms.
+ *
+ * Contracts each AO index with C one at a time via DGEMM:
+ *   Stage 1: (μνλσ) → (pνλσ)  via C^T × ERI
+ *   Stage 2: (pνλσ) → (pqλσ)  via C^T × permuted
+ *   Stage 3: (pqλσ) → (pqrσ)  via C^T × permuted
+ *   Stage 4: (pqrσ) → (pqrs)  via permuted × C
+ *
+ * Cost: O(N^5) vs O(N^6) for the Kronecker product method.
+ * Memory: 2 × N^4 (ping-pong buffers) vs 3 × N^4 (Kronecker: D + T + G).
+ */
+/**
+ * @brief Extract a sub-block of MO integrals from d_eri_mo on GPU.
+ *
+ * Extracts v(off0..off0+sz0-1, off1..off1+sz1-1, off2..off2+sz2-1, off3..off3+sz3-1)
+ * in physicist's notation, stored contiguously in d_out.
+ */
+static void gpu_extract_subblock(const double* d_eri_mo, double* d_out, int N,
+                                  int off0, int sz0, int off1, int sz1,
+                                  int off2, int sz2, int off3, int sz3) {
+    size_t total = (size_t)sz0 * sz1 * sz2 * sz3;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    extract_subblock_4d<<<blocks, threads>>>(d_eri_mo, d_out, N,
+                                              off0, sz0, off1, sz1,
+                                              off2, sz2, off3, sz3);
+}
+
+void transform_ao_eri_to_mo_eri_4stage(
+    const double* d_eri_ao,
+    const double* d_C,
+    int nao,
+    double* d_eri_mo
+){
+    const int N = nao;
+    const size_t N3 = (size_t)N * N * N;
+    const size_t N4 = N3 * N;
+
+    double* d_tmp = nullptr;
+    tracked_cudaMalloc((void**)&d_tmp, N4 * sizeof(double));
+
+    auto permute4d = [&](const double* in, double* out, int p0, int p1, int p2, int p3) {
+        int threads = 256;
+        int blocks = (int)((N4 + threads - 1) / threads);
+        tensor4d_permute_kernel<<<blocks, threads>>>(in, out, N, p0, p1, p2, p3);
+    };
+
+    // Stage 1: half1[p,ν,λ,σ] = sum_μ C^T[p,μ] × eri_ao[μ, ν*N²+λ*N+σ]
+    gpu::matrixMatrixProductRect(d_C, d_eri_ao, d_eri_mo,
+                                N, (int)N3, N,
+                                true, false, false, 1.0);
+
+    // Transpose: [p,ν,λ,σ] → [ν,p,λ,σ]  (swap indices 0,1)
+    permute4d(d_eri_mo, d_tmp, 1, 0, 2, 3);
+
+    // Stage 2: half2[q,p,λ,σ] = sum_ν C^T[q,ν] × tmp[ν, p*N²+λ*N+σ]
+    gpu::matrixMatrixProductRect(d_C, d_tmp, d_eri_mo,
+                                N, (int)N3, N,
+                                true, false, false, 1.0);
+
+    // Transpose: [q,p,λ,σ] → [λ,p,q,σ]  (swap indices 0,2)
+    permute4d(d_eri_mo, d_tmp, 2, 1, 0, 3);
+
+    // Stage 3: half3[r,p,q,σ] = sum_λ C^T[r,λ] × tmp[λ, p*N²+q*N+σ]
+    gpu::matrixMatrixProductRect(d_C, d_tmp, d_eri_mo,
+                                N, (int)N3, N,
+                                true, false, false, 1.0);
+
+    // Transpose: [r,p,q,σ] → [p,q,r,σ]  (cyclic rotate first 3: perm={2,0,1,3})
+    permute4d(d_eri_mo, d_tmp, 2, 0, 1, 3);
+
+    // Stage 4: eri_mo[p*N²+q*N+r, s] = sum_σ tmp[p*N²+q*N+r, σ] × C[σ,s]
+    gpu::matrixMatrixProductRect(d_tmp, d_C, d_eri_mo,
+                                (int)N3, N, N,
+                                false, false, false, 1.0);
+
+    tracked_cudaFree(d_tmp);
+}
 
 
 //// debug for MO ERI
@@ -3532,6 +3927,1380 @@ real_t compute_ccsd_t_energy(const real_t* __restrict__ d_eri_mo,
 
 
 
+// ============================================================
+//  Spatial-orbital closed-shell CCSD implementation
+// ============================================================
+//
+// MO integrals: (pq|rs) in chemist's notation, stored as d_eri_mo[p*N*N*N + q*N*N + r*N + s]
+// where N = num_basis (spatial orbitals).
+//
+// T1 amplitudes: t1[i*nvir + a]  (nocc × nvir)
+// T2 amplitudes: t2[i*nvir*nocc*nvir + a*nocc*nvir + j*nvir + b]  i.e. (ia,jb) ordering
+//   This stores T2(αβ). T2(αα) = t2(ia,jb) - t2(ib,ja).
+//
+// For canonical HF: f_ia = 0, f_ab = eps_a * delta_ab, f_ij = eps_i * delta_ij.
+//
+// References: Stanton, Gauss, Watts, Bartlett, JCP 94, 4334 (1991)
+//             Scuseria, Janssen, Schaefer, JCP 89, 7382 (1988)
+// ============================================================
+
+// Device helper: access MO integral (pq|rs) in chemist's notation
+static __device__ __forceinline__ real_t mo_eri(const real_t* __restrict__ eri, int N,
+                                                 int p, int q, int r, int s)
+{
+    return eri[((size_t)p*N + q)*N*N + (size_t)r*N + s];
+}
+
+
+// ============================================================
+//  Naive spatial-orbital CCSD (no GPU DGEMM, no pre-built sub-blocks)
+//  Kept for benchmarking against the optimized version.
+// ============================================================
+real_t ccsd_spatial_orbital_naive(const real_t* __restrict__ d_eri_ao,
+                            const real_t* __restrict__ d_coefficient_matrix,
+                            const real_t* __restrict__ d_orbital_energies,
+                            const int num_basis, const int num_occ,
+                            const bool computing_ccsd_t, real_t* ccsd_t_energy)
+{
+    const int N = num_basis;
+    const int nocc = num_occ;
+    const int nvir = N - nocc;
+    const size_t NN = (size_t)N * N;
+    const size_t NNN = NN * N;
+    const size_t N4 = NN * NN;
+
+    std::cout << "CCSD spatial-orbital (naive, no GPU optimization): N=" << N
+              << " nocc=" << nocc << " nvir=" << nvir << std::endl;
+
+    // AO->MO transform on GPU, download to host
+    real_t* d_eri_mo = nullptr;
+    tracked_cudaMalloc((void**)&d_eri_mo, N4 * sizeof(real_t));
+    {
+        std::string str = "Computing AO -> MO full integral transformation... ";
+        PROFILE_ELAPSED_TIME(str);
+        transform_ao_eri_to_mo_eri_full(d_eri_ao, d_coefficient_matrix, N, d_eri_mo);
+        cudaDeviceSynchronize();
+    }
+    std::vector<real_t> eri(N4);
+    cudaMemcpy(eri.data(), d_eri_mo, N4 * sizeof(real_t), cudaMemcpyDeviceToHost);
+    tracked_cudaFree(d_eri_mo);
+
+    std::vector<real_t> eps(N);
+    cudaMemcpy(eps.data(), d_orbital_energies, N * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+    auto v = [&](int p, int q, int r, int s) -> real_t {
+        return eri[(size_t)p * NNN + (size_t)r * NN + (size_t)q * N + s];
+    };
+    auto w = [&](int p, int q, int r, int s) -> real_t {
+        return 2.0 * v(p,q,r,s) - v(p,q,s,r);
+    };
+    auto T2 = [&](int i, int j, int a, int b) -> size_t {
+        return ((size_t)i * nocc + j) * nvir * nvir + (size_t)a * nvir + b;
+    };
+
+    const size_t t1Size = (size_t)nocc * nvir;
+    const size_t t2Size = (size_t)nocc * nocc * nvir * nvir;
+
+    std::vector<real_t> Dia(t1Size);
+    for (int i = 0; i < nocc; i++)
+        for (int a = 0; a < nvir; a++)
+            Dia[i*nvir+a] = eps[i] - eps[nocc+a];
+
+    std::vector<real_t> Dijab(t2Size);
+    for (int i = 0; i < nocc; i++)
+        for (int j = 0; j < nocc; j++)
+            for (int a = 0; a < nvir; a++)
+                for (int b = 0; b < nvir; b++)
+                    Dijab[T2(i,j,a,b)] = eps[i] + eps[j] - eps[nocc+a] - eps[nocc+b];
+
+    // MP2 initial guess
+    std::vector<real_t> t1(t1Size, 0.0);
+    std::vector<real_t> t2v(t2Size);
+    for (int i = 0; i < nocc; i++)
+        for (int j = 0; j < nocc; j++)
+            for (int a = 0; a < nvir; a++)
+                for (int b = 0; b < nvir; b++)
+                    t2v[T2(i,j,a,b)] = v(i,j,nocc+a,nocc+b) / Dijab[T2(i,j,a,b)];
+
+    auto energy = [&]() -> real_t {
+        real_t E = 0.0;
+        for (int i = 0; i < nocc; i++)
+            for (int j = 0; j < nocc; j++)
+                for (int a = 0; a < nvir; a++)
+                    for (int b = 0; b < nvir; b++)
+                        E += w(i,j,nocc+a,nocc+b) * (t2v[T2(i,j,a,b)] + t1[i*nvir+a]*t1[j*nvir+b]);
+        return E;
+    };
+
+    real_t Ecc = energy();
+    std::cout << "CCSD iter  0: E = " << std::fixed << std::setprecision(12)
+              << Ecc << " (MP2 initial guess)" << std::endl;
+
+    DIIS diis(8, 2);
+    size_t num_amps = t1Size + t2Size;
+    const int MAX_ITER = 100;
+    const real_t CONV = 1e-10;
+
+    for (int iter = 1; iter <= MAX_ITER; iter++) {
+
+        // ---- F intermediates ----
+        std::vector<real_t> Fkc(nocc * nvir, 0.0);
+        for (int k = 0; k < nocc; k++)
+            for (int c = 0; c < nvir; c++) {
+                real_t val = 0.0;
+                for (int l = 0; l < nocc; l++)
+                    for (int d = 0; d < nvir; d++)
+                        val += w(k,l,nocc+c,nocc+d) * t1[l*nvir+d];
+                Fkc[k*nvir+c] = val;
+            }
+
+        std::vector<real_t> Fki(nocc * nocc, 0.0);
+        for (int k = 0; k < nocc; k++)
+            for (int i = 0; i < nocc; i++) {
+                real_t val = 0.0;
+                for (int l = 0; l < nocc; l++)
+                    for (int c = 0; c < nvir; c++)
+                        for (int d = 0; d < nvir; d++) {
+                            real_t ww = w(k,l,nocc+c,nocc+d);
+                            val += ww * (t2v[T2(i,l,c,d)] + t1[i*nvir+c]*t1[l*nvir+d]);
+                        }
+                Fki[k*nocc+i] = val;
+            }
+
+        std::vector<real_t> Fac(nvir * nvir, 0.0);
+        for (int a = 0; a < nvir; a++)
+            for (int c = 0; c < nvir; c++) {
+                real_t val = 0.0;
+                for (int k = 0; k < nocc; k++)
+                    for (int l = 0; l < nocc; l++)
+                        for (int d = 0; d < nvir; d++) {
+                            real_t ww = w(k,l,nocc+c,nocc+d);
+                            val -= ww * (t2v[T2(k,l,a,d)] + t1[k*nvir+a]*t1[l*nvir+d]);
+                        }
+                Fac[a*nvir+c] = val;
+            }
+
+        // ---- L intermediates ----
+        std::vector<real_t> Lki(nocc * nocc, 0.0);
+        for (int k = 0; k < nocc; k++)
+            for (int i = 0; i < nocc; i++) {
+                real_t val = Fki[k*nocc+i];
+                for (int l = 0; l < nocc; l++)
+                    for (int c = 0; c < nvir; c++)
+                        val += w(l,k,nocc+c,i) * t1[l*nvir+c];
+                Lki[k*nocc+i] = val;
+            }
+
+        std::vector<real_t> Lac(nvir * nvir, 0.0);
+        for (int a = 0; a < nvir; a++)
+            for (int c = 0; c < nvir; c++) {
+                real_t val = Fac[a*nvir+c];
+                for (int k = 0; k < nocc; k++)
+                    for (int d = 0; d < nvir; d++)
+                        val += w(k,nocc+a,nocc+d,nocc+c) * t1[k*nvir+d];
+                Lac[a*nvir+c] = val;
+            }
+
+        // ---- W^{kl}_{ij} ----
+        std::vector<real_t> Wklij((size_t)nocc*nocc*nocc*nocc);
+        for (int k = 0; k < nocc; k++)
+            for (int l = 0; l < nocc; l++)
+                for (int i = 0; i < nocc; i++)
+                    for (int j = 0; j < nocc; j++) {
+                        real_t val = v(k,l,i,j);
+                        for (int c = 0; c < nvir; c++) {
+                            int C = nocc+c;
+                            val += v(l,k,C,i) * t1[j*nvir+c];
+                            val += v(k,l,C,j) * t1[i*nvir+c];
+                        }
+                        for (int c = 0; c < nvir; c++)
+                            for (int d = 0; d < nvir; d++)
+                                val += v(k,l,nocc+c,nocc+d) * (t2v[T2(i,j,c,d)] + t1[i*nvir+c]*t1[j*nvir+d]);
+                        Wklij[((size_t)k*nocc+l)*nocc*nocc + (size_t)i*nocc+j] = val;
+                    }
+
+        // ---- W^{ab}_{cd} ----
+        std::vector<real_t> Wabcd((size_t)nvir*nvir*nvir*nvir);
+        for (int a = 0; a < nvir; a++)
+            for (int b = 0; b < nvir; b++) {
+                int A=nocc+a, B=nocc+b;
+                for (int c = 0; c < nvir; c++)
+                    for (int d = 0; d < nvir; d++) {
+                        int C=nocc+c, D=nocc+d;
+                        real_t val = v(A,B,C,D);
+                        for (int k = 0; k < nocc; k++) {
+                            val -= v(k,A,D,C) * t1[k*nvir+b];
+                            val -= v(k,B,C,D) * t1[k*nvir+a];
+                        }
+                        Wabcd[((size_t)a*nvir+b)*nvir*nvir + (size_t)c*nvir+d] = val;
+                    }
+            }
+
+        // ---- W^{ak}_{ic} ----
+        std::vector<real_t> Wakic((size_t)nvir*nocc*nocc*nvir);
+        for (int a = 0; a < nvir; a++)
+            for (int k = 0; k < nocc; k++)
+                for (int i = 0; i < nocc; i++)
+                    for (int c = 0; c < nvir; c++) {
+                        int A=nocc+a, C=nocc+c;
+                        real_t val = v(A,k,i,C);
+                        for (int l = 0; l < nocc; l++)
+                            val -= v(k,l,C,i) * t1[l*nvir+a];
+                        for (int d = 0; d < nvir; d++)
+                            val += v(k,A,C,nocc+d) * t1[i*nvir+d];
+                        for (int l = 0; l < nocc; l++)
+                            for (int d = 0; d < nvir; d++) {
+                                real_t vlk = v(l,k,nocc+d,C);
+                                val -= 0.5 * vlk * t2v[T2(i,l,d,a)];
+                                val -= vlk * t1[i*nvir+d] * t1[l*nvir+a];
+                                val += 0.5 * w(l,k,nocc+d,C) * t2v[T2(i,l,a,d)];
+                            }
+                        Wakic[((size_t)a*nocc+k)*nocc*nvir + (size_t)i*nvir+c] = val;
+                    }
+
+        // ---- W^{ak}_{ci} ----
+        std::vector<real_t> Wakci((size_t)nvir*nocc*nvir*nocc);
+        for (int a = 0; a < nvir; a++)
+            for (int k = 0; k < nocc; k++)
+                for (int c = 0; c < nvir; c++)
+                    for (int i = 0; i < nocc; i++) {
+                        int A=nocc+a, C=nocc+c;
+                        real_t val = v(A,k,C,i);
+                        for (int l = 0; l < nocc; l++)
+                            val -= v(l,k,C,i) * t1[l*nvir+a];
+                        for (int d = 0; d < nvir; d++)
+                            val += v(k,A,nocc+d,C) * t1[i*nvir+d];
+                        for (int l = 0; l < nocc; l++)
+                            for (int d = 0; d < nvir; d++) {
+                                real_t vlk = v(l,k,C,nocc+d);
+                                val -= 0.5 * vlk * t2v[T2(i,l,d,a)];
+                                val -= vlk * t1[i*nvir+d] * t1[l*nvir+a];
+                            }
+                        Wakci[((size_t)a*nocc+k)*nvir*nocc + (size_t)c*nocc+i] = val;
+                    }
+
+        // ---- T1 update ----
+        std::vector<real_t> newT1(t1Size, 0.0);
+        for (int i = 0; i < nocc; i++)
+            for (int a = 0; a < nvir; a++) {
+                int A = nocc+a;
+                real_t val = 0.0;
+                for (int c = 0; c < nvir; c++)
+                    val += Fac[a*nvir+c] * t1[i*nvir+c];
+                for (int k = 0; k < nocc; k++)
+                    val -= Fki[k*nocc+i] * t1[k*nvir+a];
+                for (int k = 0; k < nocc; k++)
+                    for (int c = 0; c < nvir; c++) {
+                        real_t fc = Fkc[k*nvir+c];
+                        val += fc * (2.0*t2v[T2(k,i,c,a)] - t2v[T2(i,k,c,a)] + t1[i*nvir+c]*t1[k*nvir+a]);
+                    }
+                for (int k = 0; k < nocc; k++)
+                    for (int c = 0; c < nvir; c++)
+                        val += w(A,k,i,nocc+c) * t1[k*nvir+c];
+                for (int k = 0; k < nocc; k++)
+                    for (int c = 0; c < nvir; c++)
+                        for (int d = 0; d < nvir; d++)
+                            val += w(A,k,nocc+c,nocc+d) * (t2v[T2(i,k,c,d)] + t1[i*nvir+c]*t1[k*nvir+d]);
+                for (int k = 0; k < nocc; k++)
+                    for (int l = 0; l < nocc; l++)
+                        for (int c = 0; c < nvir; c++)
+                            val -= w(k,l,i,nocc+c) * (t2v[T2(k,l,a,c)] + t1[k*nvir+a]*t1[l*nvir+c]);
+                newT1[i*nvir+a] = val / Dia[i*nvir+a];
+            }
+
+        // ---- T2 update ----
+        std::vector<real_t> raw(t2Size, 0.0);
+        for (int i = 0; i < nocc; i++)
+            for (int a = 0; a < nvir; a++) {
+                int A = nocc+a;
+                for (int j = 0; j < nocc; j++)
+                    for (int b = 0; b < nvir; b++) {
+                        int B = nocc+b;
+                        real_t val = 0.5 * v(i,j,A,B);
+                        // Wklij * tau
+                        for (int k = 0; k < nocc; k++)
+                            for (int l = 0; l < nocc; l++)
+                                val += 0.5 * Wklij[((size_t)k*nocc+l)*nocc*nocc+(size_t)i*nocc+j]
+                                     * (t2v[T2(k,l,a,b)] + t1[k*nvir+a]*t1[l*nvir+b]);
+                        // Wabcd * tau
+                        for (int c = 0; c < nvir; c++)
+                            for (int d = 0; d < nvir; d++)
+                                val += 0.5 * Wabcd[((size_t)a*nvir+b)*nvir*nvir+(size_t)c*nvir+d]
+                                     * (t2v[T2(i,j,c,d)] + t1[i*nvir+c]*t1[j*nvir+d]);
+                        for (int c = 0; c < nvir; c++)
+                            val += Lac[a*nvir+c] * t2v[T2(i,j,c,b)];
+                        for (int k = 0; k < nocc; k++)
+                            val -= Lki[k*nocc+i] * t2v[T2(k,j,a,b)];
+                        for (int c = 0; c < nvir; c++)
+                            val += v(A,B,i,nocc+c) * t1[j*nvir+c];
+                        for (int k = 0; k < nocc; k++)
+                            for (int c = 0; c < nvir; c++)
+                                val -= v(k,B,i,nocc+c) * t1[k*nvir+a] * t1[j*nvir+c];
+                        for (int k = 0; k < nocc; k++)
+                            val -= v(A,k,i,j) * t1[k*nvir+b];
+                        for (int k = 0; k < nocc; k++)
+                            for (int c = 0; c < nvir; c++)
+                                val -= v(A,k,i,nocc+c) * t1[j*nvir+c] * t1[k*nvir+b];
+                        for (int k = 0; k < nocc; k++)
+                            for (int c = 0; c < nvir; c++) {
+                                real_t w1 = Wakic[((size_t)a*nocc+k)*nocc*nvir + (size_t)i*nvir+c];
+                                real_t w2 = Wakci[((size_t)a*nocc+k)*nvir*nocc + (size_t)c*nocc+i];
+                                real_t w3 = Wakci[((size_t)b*nocc+k)*nvir*nocc + (size_t)c*nocc+i];
+                                val += 2.0 * w1 * t2v[T2(k,j,c,b)];
+                                val -= w2 * t2v[T2(k,j,c,b)];
+                                val -= w1 * t2v[T2(k,j,b,c)];
+                                val -= w3 * t2v[T2(k,j,a,c)];
+                            }
+                        raw[T2(i,j,a,b)] = val;
+                    }
+            }
+
+        std::vector<real_t> newT2(t2Size);
+        for (int i = 0; i < nocc; i++)
+            for (int j = 0; j < nocc; j++)
+                for (int a = 0; a < nvir; a++)
+                    for (int b = 0; b < nvir; b++) {
+                        size_t idx = T2(i,j,a,b);
+                        newT2[idx] = (raw[idx] + raw[T2(j,i,b,a)]) / Dijab[idx];
+                    }
+
+        // ---- DIIS ----
+        std::vector<real_t> ampVec(num_amps);
+        std::vector<real_t> errVec(num_amps);
+        for (size_t k = 0; k < t1Size; k++) { ampVec[k] = newT1[k]; errVec[k] = newT1[k] - t1[k]; }
+        for (size_t k = 0; k < t2Size; k++) { ampVec[t1Size+k] = newT2[k]; errVec[t1Size+k] = newT2[k] - t2v[k]; }
+        diis.push(ampVec, errVec);
+        if (diis.can_extrapolate()) {
+            auto extrap = diis.extrapolate();
+            for (size_t k = 0; k < t1Size; k++) newT1[k] = extrap[k];
+            for (size_t k = 0; k < t2Size; k++) newT2[k] = extrap[t1Size + k];
+        }
+
+        for (size_t k = 0; k < t1Size; k++) t1[k] = newT1[k];
+        for (size_t k = 0; k < t2Size; k++) t2v[k] = newT2[k];
+
+        real_t newEcc = energy();
+        real_t deltaE = newEcc - Ecc;
+        Ecc = newEcc;
+        std::cout << "CCSD iter " << std::setw(2) << iter
+                  << ": E = " << std::fixed << std::setprecision(12) << Ecc
+                  << ", dE = " << std::scientific << std::setprecision(4) << deltaE << std::endl;
+        if (std::abs(deltaE) < CONV) {
+            std::cout << "CCSD converged after " << iter << " iterations" << std::endl;
+            break;
+        }
+    }
+
+    // ---- (T) correction ----
+    if (computing_ccsd_t && ccsd_t_energy) {
+        std::cout << "---- Computing (T) correction (naive spatial orbital) ----" << std::endl;
+        std::string str = "Computing (T) correction energy... ";
+        PROFILE_ELAPSED_TIME(str);
+        const size_t o3 = (size_t)nocc * nocc * nocc;
+        real_t E_T = 0.0;
+        std::vector<std::vector<size_t>> idx(6, std::vector<size_t>(o3));
+        for (int i = 0; i < nocc; i++)
+            for (int j = 0; j < nocc; j++)
+                for (int k = 0; k < nocc; k++) {
+                    size_t ijk = ((size_t)i*nocc+j)*nocc+k;
+                    idx[0][ijk] = ijk;
+                    idx[1][ijk] = ((size_t)i*nocc+k)*nocc+j;
+                    idx[2][ijk] = ((size_t)j*nocc+i)*nocc+k;
+                    idx[3][ijk] = ((size_t)j*nocc+k)*nocc+i;
+                    idx[4][ijk] = ((size_t)k*nocc+i)*nocc+j;
+                    idx[5][ijk] = ((size_t)k*nocc+j)*nocc+i;
+                }
+        int comp[6][6] = {
+            {0,1,2,3,4,5},{1,0,4,5,2,3},{2,3,0,1,5,4},
+            {4,5,1,0,3,2},{3,2,5,4,0,1},{5,4,3,2,1,0}
+        };
+        std::vector<std::vector<real_t>> wt(6, std::vector<real_t>(o3));
+        std::vector<std::vector<real_t>> zt(6, std::vector<real_t>(o3));
+        std::vector<real_t> wpv(o3), r3out(o3);
+        for (int a = 0; a < nvir; a++)
+            for (int b = 0; b <= a; b++)
+                for (int c = 0; c <= b; c++) {
+                    real_t d3_scale = 1.0;
+                    if (a == c) d3_scale = 6.0;
+                    else if (a == b || b == c) d3_scale = 2.0;
+                    int perms[6][3] = {{a,b,c},{a,c,b},{b,a,c},{b,c,a},{c,a,b},{c,b,a}};
+                    for (int p = 0; p < 6; p++) {
+                        int aa=perms[p][0], bb=perms[p][1], cc=perms[p][2];
+                        int AA=nocc+aa, BB=nocc+bb;
+                        for (int i = 0; i < nocc; i++)
+                            for (int j = 0; j < nocc; j++)
+                                for (int k = 0; k < nocc; k++) {
+                                    size_t ijk = ((size_t)i*nocc+j)*nocc+k;
+                                    real_t wval = 0.0;
+                                    for (int f = 0; f < nvir; f++)
+                                        wval += v(i,nocc+f,AA,BB) * t2v[T2(k,j,cc,f)];
+                                    for (int m = 0; m < nocc; m++)
+                                        wval -= v(AA,j,i,m) * t2v[T2(m,k,bb,cc)];
+                                    real_t vval = v(AA,BB,i,j) * t1[k*nvir+cc];
+                                    wpv[ijk] = wval + 0.5 * vval;
+                                    wt[p][ijk] = wval;
+                                }
+                        for (size_t q = 0; q < o3; q++)
+                            r3out[q] = 4.0*wpv[q] + wpv[idx[3][q]] + wpv[idx[4][q]]
+                                     - 2.0*wpv[idx[5][q]] - 2.0*wpv[idx[1][q]] - 2.0*wpv[idx[2][q]];
+                        for (int i = 0; i < nocc; i++)
+                            for (int j = 0; j < nocc; j++)
+                                for (int k = 0; k < nocc; k++) {
+                                    real_t D = (eps[i]+eps[j]+eps[k]-eps[nocc+aa]-eps[nocc+bb]-eps[nocc+cc])*d3_scale;
+                                    zt[p][((size_t)i*nocc+j)*nocc+k] = r3out[((size_t)i*nocc+j)*nocc+k] / D;
+                                }
+                    }
+                    for (int q = 0; q < 6; q++)
+                        for (int p = 0; p < 6; p++) {
+                            int s = comp[q][p];
+                            real_t eterm = 0.0;
+                            for (size_t r = 0; r < o3; r++)
+                                eterm += wt[p][idx[s][r]] * zt[q][r];
+                            E_T += eterm;
+                        }
+                }
+        E_T *= 2.0;
+        *ccsd_t_energy = E_T;
+        std::cout << "(T) correction energy: " << std::fixed << std::setprecision(12) << E_T << std::endl;
+    }
+
+    return Ecc;
+}
+
+
+// ============================================================
+//  Optimized spatial-orbital CCSD (GPU DGEMM + pre-built integral sub-blocks)
+// ============================================================
+// v^{pq}_{rs} = (pr|qs),  w^{pq}_{rs} = 2*(pr|qs) - (ps|qr)
+// P(ia,jb) f = f(i,a,j,b) + f(j,b,i,a)
+
+real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
+                            const real_t* __restrict__ d_coefficient_matrix,
+                            const real_t* __restrict__ d_orbital_energies,
+                            const int num_basis, const int num_occ,
+                            const bool computing_ccsd_t, real_t* ccsd_t_energy)
+{
+    const int N = num_basis;
+    const int nocc = num_occ;
+    const int nvir = N - nocc;
+    const size_t N4 = (size_t)N * N * N * N;
+
+    std::cout << "CCSD spatial-orbital: N=" << N << " nocc=" << nocc
+              << " nvir=" << nvir << std::endl;
+
+    // AO->MO transform on GPU (4-stage half-transform, O(N^5))
+    real_t* d_eri_mo = nullptr;
+    tracked_cudaMalloc((void**)&d_eri_mo, N4 * sizeof(real_t));
+    {
+        std::string str = "Computing AO -> MO 4-stage integral transformation... ";
+        PROFILE_ELAPSED_TIME(str);
+        transform_ao_eri_to_mo_eri_4stage(d_eri_ao, d_coefficient_matrix, N, d_eri_mo);
+        cudaDeviceSynchronize();
+    }
+
+    std::vector<real_t> eps(N);
+    cudaMemcpy(eps.data(), d_orbital_energies, N * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+    // t2[i,j,a,b] index
+    auto T2 = [&](int i, int j, int a, int b) -> size_t {
+        return ((size_t)i * nocc + j) * nvir * nvir + (size_t)a * nvir + b;
+    };
+
+    // Denominators
+    const size_t t1Size = (size_t)nocc * nvir;
+    const size_t t2Size = (size_t)nocc * nocc * nvir * nvir;
+
+    std::vector<real_t> Dia(t1Size);
+    for (int i = 0; i < nocc; i++)
+        for (int a = 0; a < nvir; a++)
+            Dia[i*nvir+a] = eps[i] - eps[nocc+a];
+
+    std::vector<real_t> Dijab(t2Size);
+    for (int i = 0; i < nocc; i++)
+        for (int j = 0; j < nocc; j++)
+            for (int a = 0; a < nvir; a++)
+                for (int b = 0; b < nvir; b++)
+                    Dijab[T2(i,j,a,b)] = eps[i] + eps[j] - eps[nocc+a] - eps[nocc+b];
+
+    DIIS diis(8, 2);
+    size_t num_amps = t1Size + t2Size;
+    const int MAX_ITER = 100;
+    const real_t CONV = 1e-10;
+
+    // Pre-build contiguous integral sub-blocks (constant, computed once)
+    const size_t oo = (size_t)nocc * nocc;
+    const size_t vv = (size_t)nvir * nvir;
+    const size_t vvv = vv * nvir;
+    const size_t vo = (size_t)nvir * nocc;
+    const size_t ov = (size_t)nocc * nvir;
+
+    // ---- GPU sub-block extraction from d_eri_mo (no full N⁴ download) ----
+    // Use a single temporary GPU buffer for CPU-bound sub-blocks
+    const size_t max_cpu_block = std::max({(size_t)nocc*vvv, vv*ov, ov*ov, vo*vo, vo*oo, oo*ov, oo*oo});
+    double* d_extract_tmp = nullptr;
+    tracked_cudaMalloc((void**)&d_extract_tmp, max_cpu_block * sizeof(double));
+
+    // Declare vectors outside profiling scope so they survive
+    std::vector<real_t> v_oovv(oo * vv);
+    std::vector<real_t> w_oovv(oo * vv);
+    std::vector<real_t> v_ovvv((size_t)nocc * vvv);
+    std::vector<real_t> v_voov((size_t)nvir * nocc * nocc * nvir);
+    std::vector<real_t> v_oovo((size_t)nocc * nocc * nvir * nocc);
+    const size_t oooo = oo * oo;
+    std::vector<real_t> v_oooo(oooo);
+    std::vector<real_t> v_vovo(vo * vo);
+    std::vector<real_t> v_vvov(vv * ov);
+    std::vector<real_t> v_ovov(ov * ov);
+    std::vector<real_t> v_vooo(vo * oo);
+    std::vector<real_t> v_ooov(oo * ov);
+    {
+        std::string str = "Extracting MO integral sub-blocks on GPU... ";
+        PROFILE_ELAPSED_TIME(str);
+
+    // --- GPU-extract CPU-needed sub-blocks → download ---
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, 0,nocc, 0,nocc, nocc,nvir, nocc,nvir);
+    cudaMemcpy(v_oovv.data(), d_extract_tmp, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
+
+    {
+        int threads = 256;
+        int blocks = (int)((oo*vv + threads - 1) / threads);
+        extract_w_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_extract_tmp, N, nocc, nvir);
+    }
+    cudaMemcpy(w_oovv.data(), d_extract_tmp, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
+
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, 0,nocc, nocc,nvir, nocc,nvir, nocc,nvir);
+    cudaMemcpy(v_ovvv.data(), d_extract_tmp, (size_t)nocc*vvv*sizeof(double), cudaMemcpyDeviceToHost);
+
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, nocc,nvir, 0,nocc, 0,nocc, nocc,nvir);
+    cudaMemcpy(v_voov.data(), d_extract_tmp, (size_t)nvir*nocc*nocc*nvir*sizeof(double), cudaMemcpyDeviceToHost);
+
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, 0,nocc, 0,nocc, nocc,nvir, 0,nocc);
+    cudaMemcpy(v_oovo.data(), d_extract_tmp, (size_t)nocc*nocc*nvir*nocc*sizeof(double), cudaMemcpyDeviceToHost);
+
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, 0,nocc, 0,nocc, 0,nocc, 0,nocc);
+    cudaMemcpy(v_oooo.data(), d_extract_tmp, oooo*sizeof(double), cudaMemcpyDeviceToHost);
+
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, nocc,nvir, 0,nocc, nocc,nvir, 0,nocc);
+    cudaMemcpy(v_vovo.data(), d_extract_tmp, vo*vo*sizeof(double), cudaMemcpyDeviceToHost);
+
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, nocc,nvir, nocc,nvir, 0,nocc, nocc,nvir);
+    cudaMemcpy(v_vvov.data(), d_extract_tmp, vv*ov*sizeof(double), cudaMemcpyDeviceToHost);
+
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, 0,nocc, nocc,nvir, 0,nocc, nocc,nvir);
+    cudaMemcpy(v_ovov.data(), d_extract_tmp, ov*ov*sizeof(double), cudaMemcpyDeviceToHost);
+
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, nocc,nvir, 0,nocc, 0,nocc, 0,nocc);
+    cudaMemcpy(v_vooo.data(), d_extract_tmp, vo*oo*sizeof(double), cudaMemcpyDeviceToHost);
+
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, 0,nocc, 0,nocc, 0,nocc, nocc,nvir);
+    cudaMemcpy(v_ooov.data(), d_extract_tmp, oo*ov*sizeof(double), cudaMemcpyDeviceToHost);
+
+    cudaDeviceSynchronize();
+    } // end PROFILE_ELAPSED_TIME for sub-block extraction
+
+    tracked_cudaFree(d_extract_tmp);
+
+    // MP2 initial guess: t2(i,j,a,b) = v_oovv[i,j,a,b] / Dijab
+    std::vector<real_t> t1(t1Size, 0.0);
+    std::vector<real_t> t2v(t2Size);
+    for (int i = 0; i < nocc; i++)
+        for (int j = 0; j < nocc; j++)
+            for (int a = 0; a < nvir; a++)
+                for (int b = 0; b < nvir; b++) {
+                    size_t idx = T2(i,j,a,b);
+                    t2v[idx] = v_oovv[((size_t)i*nocc+j)*vv + (size_t)a*nvir+b] / Dijab[idx];
+                }
+
+    // v_ovvv reshaped for Wabcd DGEMM: v_ovvv_T[nvir³, nocc]
+    std::vector<real_t> v_ovvv_T(vvv * nocc);
+    for (int a = 0; a < nvir; a++)
+        for (int c = 0; c < nvir; c++)
+            for (int d = 0; d < nvir; d++)
+                for (int k = 0; k < nocc; k++)
+                    v_ovvv_T[((size_t)a*vv + (size_t)c*nvir + d)*nocc + k] = v_ovvv[(size_t)k*vvv + (size_t)a*vv + (size_t)c*nvir + d];
+
+    // Pre-built w-variants: w = 2*v - v_exchange
+    // w_voov[a,k,i,c] = 2*v_voov[a,k,i,c] - v_vovo[a,k,c,i]
+    std::vector<real_t> w_voov((size_t)nvir * nocc * nocc * nvir);
+    for (int a = 0; a < nvir; a++)
+        for (int k = 0; k < nocc; k++)
+            for (int i = 0; i < nocc; i++)
+                for (int c = 0; c < nvir; c++) {
+                    size_t idx_voov = ((size_t)a*nocc+k)*(size_t)nocc*nvir + (size_t)i*nvir+c;
+                    size_t idx_vovo = ((size_t)a*nocc+k)*vo + (size_t)c*nocc+i;
+                    w_voov[idx_voov] = 2.0 * v_voov[idx_voov] - v_vovo[idx_vovo];
+                }
+
+    // w_ooov[k,l,i,c] = 2*v_ooov[k,l,i,c] - v_oovo[k,l,c,i]
+    std::vector<real_t> w_ooov(oo * ov);
+    for (int k = 0; k < nocc; k++)
+        for (int l = 0; l < nocc; l++)
+            for (int i = 0; i < nocc; i++)
+                for (int c = 0; c < nvir; c++) {
+                    size_t idx_ooov = ((size_t)k*nocc+l)*ov + (size_t)i*nvir+c;
+                    size_t idx_oovo = ((size_t)k*nocc+l)*(size_t)nvir*nocc + (size_t)c*nocc+i;
+                    w_ooov[idx_ooov] = 2.0 * v_ooov[idx_ooov] - v_oovo[idx_oovo];
+                }
+
+    // w_ovvv[(k*nvir+a)*vv + c*nvir+d] = 2*v_ovvv[k,a,c,d] - v_ovvv[k,a,d,c]
+    std::vector<real_t> w_ovvv((size_t)nocc * vvv);
+    for (int k = 0; k < nocc; k++)
+        for (int a = 0; a < nvir; a++)
+            for (int c = 0; c < nvir; c++)
+                for (int d = 0; d < nvir; d++)
+                    w_ovvv[(size_t)k*vvv + (size_t)a*vv + (size_t)c*nvir+d] =
+                        2.0 * v_ovvv[(size_t)k*vvv + (size_t)a*vv + (size_t)c*nvir+d]
+                            - v_ovvv[(size_t)k*vvv + (size_t)a*vv + (size_t)d*nvir+c];
+
+    // Pre-allocate all GPU buffers in a single allocation to reduce cudaMalloc overhead
+    const size_t OV2 = ov * ov;
+    const size_t sz_tau = t2Size, sz_Wabcd = vv*vv, sz_Wklij = oo*oo, sz_raw = t2Size;
+    const size_t sz_w_oovv = oo*vv, sz_v_oovv = oo*vv, sz_Fki = oo;
+    const size_t sz_v_ovvv_T = vvv*nocc, sz_t1 = t1Size, sz_ovvv_t1 = std::max(vvv*std::max((size_t)nvir,(size_t)nocc), t2Size);
+    const size_t sz_v_vvvv = vv*vv, sz_Fac = vv, sz_Fkc = ov;
+    const size_t sz_t2v = t2Size, sz_Lac = vv, sz_Z = vv*ov;
+    const size_t sz_Wex = OV2;  // each of A, B, C1, C2, V_R, W_R, V_R2
+    const size_t sz_v_ovvv = (size_t)nocc * vvv;       // persistent v_ovvv
+    const size_t sz_v_ovvv_perm = (size_t)nocc * vvv;   // persistent v_ovvv_perm
+    const size_t sz_w_ovvv_R = (size_t)nvir * nocc * vv; // persistent w_ovvv_R
+    const size_t total_gpu_doubles = sz_tau + sz_Wabcd + sz_Wklij + sz_raw
+        + sz_w_oovv + sz_v_oovv + sz_Fki + sz_v_ovvv_T + sz_t1 + sz_ovvv_t1
+        + sz_v_vvvv + sz_Fac + sz_Fkc + sz_t2v + sz_Lac + sz_Z
+        + 7 * sz_Wex  // Wex_A, Wex_B, Wex_C1, Wex_C2, V_R, W_R, V_R2
+        + sz_v_ovvv + sz_v_ovvv_perm + sz_w_ovvv_R;
+
+    double *d_gpu_pool = nullptr;
+    tracked_cudaMalloc((void**)&d_gpu_pool, total_gpu_doubles * sizeof(double));
+    double *d_ptr = d_gpu_pool;
+    auto carve = [&](size_t n) -> double* { double *p = d_ptr; d_ptr += n; return p; };
+
+    double *d_tau       = carve(sz_tau);
+    double *d_Wabcd     = carve(sz_Wabcd);
+    double *d_Wklij     = carve(sz_Wklij);
+    double *d_raw       = carve(sz_raw);
+    double *d_w_oovv    = carve(sz_w_oovv);
+    double *d_v_oovv    = carve(sz_v_oovv);
+    double *d_Fki       = carve(sz_Fki);
+    double *d_v_ovvv_T  = carve(sz_v_ovvv_T);
+    double *d_t1        = carve(sz_t1);
+    double *d_ovvv_t1   = carve(sz_ovvv_t1);
+    double *d_v_vvvv    = carve(sz_v_vvvv);
+    double *d_Fac       = carve(sz_Fac);
+    double *d_Fkc       = carve(sz_Fkc);
+    double *d_t2v       = carve(sz_t2v);
+    double *d_Lac       = carve(sz_Lac);
+    double *d_Z         = carve(sz_Z);
+    double *d_Wex_A     = carve(sz_Wex);
+    double *d_Wex_B     = carve(sz_Wex);
+    double *d_Wex_C1    = carve(sz_Wex);
+    double *d_Wex_C2    = carve(sz_Wex);
+    double *d_V_R       = carve(sz_Wex);
+    double *d_W_R       = carve(sz_Wex);
+    double *d_V_R2      = carve(sz_Wex);
+    double *d_v_ovvv    = carve(sz_v_ovvv);       // persistent v_ovvv
+    double *d_v_ovvv_perm = carve(sz_v_ovvv_perm); // persistent v_ovvv_perm
+    double *d_w_ovvv_R  = carve(sz_w_ovvv_R);     // persistent w_ovvv_R
+
+    // Constant reshaped integrals for Wakic/Wakci ld-sum DGEMM
+    // V_R[(l*nvir+d), (k*nvir+c)] = v_oovv[(l*nocc+k)*vv + d*nvir+c]
+    // W_R[(l*nvir+d), (k*nvir+c)] = w_oovv[(l*nocc+k)*vv + d*nvir+c]
+    // V_R2[(l*nvir+d), (k*nvir+c)] = v_oovv[(l*nocc+k)*vv + c*nvir+d]  (c,d swapped for Wakci)
+    {
+        std::vector<real_t> V_R(OV2), W_R(OV2), V_R2(OV2);
+        for (int l = 0; l < nocc; l++)
+            for (int d = 0; d < nvir; d++)
+                for (int k = 0; k < nocc; k++)
+                    for (int c = 0; c < nvir; c++) {
+                        size_t row = l*nvir+d;
+                        size_t col = k*nvir+c;
+                        V_R[row*ov + col] = v_oovv[((size_t)l*nocc+k)*vv + (size_t)d*nvir+c];
+                        W_R[row*ov + col] = w_oovv[((size_t)l*nocc+k)*vv + (size_t)d*nvir+c];
+                        V_R2[row*ov + col] = v_oovv[((size_t)l*nocc+k)*vv + (size_t)c*nvir+d];
+                    }
+        cudaMemcpy(d_V_R, V_R.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_W_R, W_R.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_V_R2, V_R2.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
+    }
+
+    // GPU-direct extraction for GPU-resident sub-blocks (no CPU round-trip)
+    // v_vvvv: v(nocc+a, nocc+b, nocc+c, nocc+d) → d_v_vvvv (largest: nvir⁴)
+    gpu_extract_subblock(d_eri_mo, d_v_vvvv, N, nocc,nvir, nocc,nvir, nocc,nvir, nocc,nvir);
+    // v_oovv and w_oovv → d_v_oovv, d_w_oovv
+    gpu_extract_subblock(d_eri_mo, d_v_oovv, N, 0,nocc, 0,nocc, nocc,nvir, nocc,nvir);
+    {
+        int threads = 256;
+        int blocks_w = (int)((oo*vv + threads - 1) / threads);
+        extract_w_oovv_kernel<<<blocks_w, threads>>>(d_eri_mo, d_w_oovv, N, nocc, nvir);
+    }
+    cudaDeviceSynchronize();
+    // Now d_eri_mo is no longer needed — free it
+    tracked_cudaFree(d_eri_mo);
+    d_eri_mo = nullptr;
+
+    cudaMemcpy(d_v_ovvv_T, v_ovvv_T.data(), vvv * nocc * sizeof(double), cudaMemcpyHostToDevice);
+
+    // Pre-compute v_ovvv_perm (constant — transpose d,c within each (k,a) block)
+    std::vector<real_t> v_ovvv_perm((size_t)nocc * vvv);
+    for (int k = 0; k < nocc; k++)
+        for (int a = 0; a < nvir; a++)
+            for (int c = 0; c < nvir; c++)
+                for (int d = 0; d < nvir; d++)
+                    v_ovvv_perm[(size_t)k*vvv + (size_t)a*vv + (size_t)c*nvir+d] =
+                        v_ovvv[(size_t)k*vvv + (size_t)a*vv + (size_t)d*nvir+c];
+
+    // Pre-compute w_ovvv_perm reshaped as [nvir, nocc*vv] for T1 DGEMM
+    // w_ovvv_R[a, k*vv+c*nvir+d] = w_ovvv[k*vvv + a*vv + d*nvir+c]
+    // This transposes (c,d) in w_ovvv and reshapes for DGEMM: Result[a,i] = w_ovvv_R × tau^T
+    std::vector<real_t> w_ovvv_R((size_t)nvir * nocc * vv);
+    for (int a = 0; a < nvir; a++)
+        for (int k = 0; k < nocc; k++)
+            for (int c = 0; c < nvir; c++)
+                for (int d = 0; d < nvir; d++)
+                    w_ovvv_R[(size_t)a * nocc * vv + (size_t)k * vv + (size_t)c * nvir + d] =
+                        w_ovvv[(size_t)k * vvv + (size_t)a * vv + (size_t)d * nvir + c];
+
+    // Upload constant integral arrays to persistent GPU buffers (once, not per iteration)
+    cudaMemcpy(d_v_ovvv, v_ovvv.data(), sz_v_ovvv * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v_ovvv_perm, v_ovvv_perm.data(), sz_v_ovvv_perm * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_w_ovvv_R, w_ovvv_R.data(), sz_w_ovvv_R * sizeof(double), cudaMemcpyHostToDevice);
+
+    // Energy: E = sum_{ijab} w_oovv[ij,ab] * (t2(i,j,a,b) + t1(i,a)*t1(j,b))
+    auto energy = [&]() -> real_t {
+        real_t E = 0.0;
+        for (int i = 0; i < nocc; i++)
+            for (int j = 0; j < nocc; j++)
+                for (int a = 0; a < nvir; a++)
+                    for (int b = 0; b < nvir; b++) {
+                        E += w_oovv[((size_t)i*nocc+j)*vv + (size_t)a*nvir+b]
+                           * (t2v[T2(i,j,a,b)] + t1[i*nvir+a]*t1[j*nvir+b]);
+                    }
+        return E;
+    };
+
+    real_t Ecc = energy();
+    std::cout << "CCSD iter  0: E = " << std::fixed << std::setprecision(12)
+              << Ecc << " (MP2 initial guess)" << std::endl;
+
+    for (int iter = 1; iter <= MAX_ITER; iter++) {
+
+        // Upload t1 and t2v to GPU, build tau on GPU (avoids CPU tau computation + upload)
+        cudaMemcpy(d_t1, t1.data(), t1Size * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_t2v, t2v.data(), t2Size * sizeof(double), cudaMemcpyHostToDevice);
+        {
+            int threads = 256;
+            int blocks_tau = (int)((t2Size + threads - 1) / threads);
+            build_tau_kernel<<<blocks_tau, threads>>>(d_t2v, d_t1, d_tau, nocc, nvir);
+        }
+
+        // ---- F intermediates (GPU kernels) ----
+        // F^k_c = sum_{ld} w_oovv[kl,cd] * t1(l,d) — GPU kernel, no transfer needed
+        std::vector<real_t> Fkc(nocc * nvir);
+        {
+            dim3 block_fkc(16, 16);
+            dim3 grid_fkc((nocc + 15) / 16, (nvir + 15) / 16);
+            compute_Fkc_kernel<<<grid_fkc, block_fkc>>>(d_w_oovv, d_t1, d_Fkc, nocc, nvir);
+            cudaMemcpy(Fkc.data(), d_Fkc, ov * sizeof(double), cudaMemcpyDeviceToHost);
+        }
+
+        // F^k_i = sum_{lcd} w_oovv[k,(l*vv+cd)] * tau[i,(l*vv+cd)]
+        // DGEMM: Fki(nocc×nocc) = w_oovv(nocc×nocc*vv) × tau^T(nocc*vv×nocc)
+        std::vector<real_t> Fki(nocc * nocc);
+        gpu::matrixMatrixProductRect(d_w_oovv, d_tau, d_Fki,
+                                nocc, nocc, (int)(nocc * vv),
+                                false, true, false, 1.0);
+        cudaMemcpy(Fki.data(), d_Fki, oo * sizeof(double), cudaMemcpyDeviceToHost);
+
+        // F^a_c = -sum_{kld} w_oovv[(kl),(cd)] * tau[T2(k,l,a,d)] — GPU kernel
+        std::vector<real_t> Fac(nvir * nvir);
+        {
+            dim3 block_fac(16, 16);
+            dim3 grid_fac((nvir + 15) / 16, (nvir + 15) / 16);
+            compute_Fac_kernel<<<grid_fac, block_fac>>>(d_w_oovv, d_tau, d_Fac, nocc, nvir);
+            cudaMemcpy(Fac.data(), d_Fac, vv * sizeof(double), cudaMemcpyDeviceToHost);
+        }
+
+        // ---- L intermediates ----
+        // L^k_i = F^k_i + sum_{lc} w(l,k,C,i) * t1(l,c)
+        // w(l,k,C,i) = 2*v(l,k,C,i) - v(l,k,i,C) = 2*v_oovo[(l*nocc+k)*nvir*nocc + c*nocc+i] - v_ooov[(l*nocc+k)*ov + i*nvir+c]
+        std::vector<real_t> Lki(nocc * nocc, 0.0);
+        for (int k = 0; k < nocc; k++)
+            for (int i = 0; i < nocc; i++) {
+                real_t val = Fki[k*nocc+i];
+                for (int l = 0; l < nocc; l++)
+                    for (int c = 0; c < nvir; c++) {
+                        real_t wval = 2.0 * v_oovo[((size_t)l*nocc+k)*(size_t)nvir*nocc + (size_t)c*nocc+i]
+                                         - v_ooov[((size_t)l*nocc+k)*ov + (size_t)i*nvir+c];
+                        val += wval * t1[l*nvir+c];
+                    }
+                Lki[k*nocc+i] = val;
+            }
+
+        // L^a_c = F^a_c + sum_{kd} w_ovvv[k,a,d,c] * t1(k,d)
+        std::vector<real_t> Lac(nvir * nvir, 0.0);
+        for (int a = 0; a < nvir; a++)
+            for (int c = 0; c < nvir; c++) {
+                real_t val = Fac[a*nvir+c];
+                for (int k = 0; k < nocc; k++)
+                    for (int d = 0; d < nvir; d++)
+                        val += w_ovvv[(size_t)k*vvv + (size_t)a*vv + (size_t)d*nvir+c] * t1[k*nvir+d];
+                Lac[a*nvir+c] = val;
+            }
+
+        // ---- W^{kl}_{ij} ----
+        // W^{kl}_{ij} = v^{kl}_{ij} + sum_c v^{lk}_{ci} * t1(j,c) + sum_c v^{kl}_{cj} * t1(i,c)
+        //             + sum_{cd} v_oovv[(kl),(cd)] * tau[(ij),(cd)]
+        // DGEMM for vv contraction: Wklij_base[kl,ij] = v_oovv[kl,cd] × tau^T[cd,ij]
+        std::vector<real_t> Wklij(oo * oo);
+        gpu::matrixMatrixProductRect(d_v_oovv, d_tau, d_Wklij,
+                                (int)oo, (int)oo, (int)vv,
+                                false, true, false, 1.0);
+        cudaMemcpy(Wklij.data(), d_Wklij, oo * oo * sizeof(double), cudaMemcpyDeviceToHost);
+        // Add remaining terms on CPU: v_oooo + t1 terms
+        for (int k = 0; k < nocc; k++)
+            for (int l = 0; l < nocc; l++)
+                for (int i = 0; i < nocc; i++)
+                    for (int j = 0; j < nocc; j++) {
+                        real_t val = v_oooo[((size_t)k*nocc+l)*oo + (size_t)i*nocc+j];
+                        for (int c = 0; c < nvir; c++) {
+                            val += v_oovo[((size_t)l*nocc+k)*(size_t)nvir*nocc + (size_t)c*nocc+i] * t1[j*nvir+c];
+                            val += v_oovo[((size_t)k*nocc+l)*(size_t)nvir*nocc + (size_t)c*nocc+j] * t1[i*nvir+c];
+                        }
+                        Wklij[((size_t)k*nocc+l)*oo + (size_t)i*nocc+j] += val;
+                    }
+
+        // ---- W^{ab}_{cd} ---- (fully on GPU: DGEMM + kernel, no host transfer)
+        // GPU DGEMM: d_ovvv_t1[nvir³, nvir] = v_ovvv_T[nvir³, nocc] × t1[nocc, nvir]
+        // d_t1 already uploaded at top of iteration
+        gpu::matrixMatrixProductRect(d_v_ovvv_T, d_t1, d_ovvv_t1,
+                                (int)vvv, nvir, nocc,
+                                false, false, false, 1.0);
+        // GPU kernel: Wabcd = v_vvvv - ovvv_t1 permutations (no download/upload)
+        {
+            size_t vv2 = vv * vv;
+            int threads = 256;
+            int blocks = (int)((vv2 + threads - 1) / threads);
+            build_Wabcd_kernel<<<blocks, threads>>>(d_v_vvvv, d_ovvv_t1, d_Wabcd, nvir);
+        }
+
+        // ---- W^{ak}_{ic} and W^{ak}_{ci} (two exchange intermediates) ----
+        // d-sum via DGEMM: ovvv_t1_ic[(k*vv + a*nvir+c), i] = sum_d v_ovvv[k,a,c,d] * t1[i,d]
+        // v_ovvv viewed as [nocc*vv, nvir], t1 as [nocc, nvir]
+        // DGEMM: [nocc*vv, nocc] = v_ovvv[nocc*vv, nvir] × t1^T[nvir, nocc]
+        // Use persistent d_v_ovvv buffer (uploaded once before the loop)
+        // Result stored in d_ovvv_t1 as scratch (size sz_ovvv_t1 ≥ nocc*vv*nocc = oo*vv) ✓
+        // This avoids overwriting d_t2v which holds t2v data
+        gpu::matrixMatrixProductRect(d_v_ovvv, d_t1, d_ovvv_t1,
+                                (int)(nocc * vv), nocc, nvir,
+                                false, true, false, 1.0);
+        // Download d-sum result: ovvv_t1_ic[k*vv*nocc + ac*nocc + i]
+        std::vector<real_t> ovvv_t1_ic((size_t)nocc * vv * nocc);
+        cudaMemcpy(ovvv_t1_ic.data(), d_ovvv_t1, (size_t)nocc * vv * nocc * sizeof(double), cudaMemcpyDeviceToHost);
+
+        // ovvv_t1_dc for Wakci: sum_d v_ovvv_perm[k,a,c,d] * t1[i,d]
+        // Use persistent d_v_ovvv_perm buffer (uploaded once before the loop)
+        gpu::matrixMatrixProductRect(d_v_ovvv_perm, d_t1, d_ovvv_t1,
+                                (int)(nocc * vv), nocc, nvir,
+                                false, true, false, 1.0);
+        std::vector<real_t> ovvv_t1_dc((size_t)nocc * vv * nocc);
+        cudaMemcpy(ovvv_t1_dc.data(), d_ovvv_t1, (size_t)nocc * vv * nocc * sizeof(double), cudaMemcpyDeviceToHost);
+
+        // ld-sum terms computed via DGEMM (below)
+        std::vector<real_t> Wakic((size_t)nvir*nocc*nocc*nvir, 0.0);
+        std::vector<real_t> Wakci((size_t)nvir*nocc*nvir*nocc, 0.0);
+
+        // CPU: single-index terms for Wakic and Wakci (d-sum replaced by DGEMM result lookup)
+        for (int a = 0; a < nvir; a++)
+            for (int k = 0; k < nocc; k++) {
+                for (int i = 0; i < nocc; i++)
+                    for (int c = 0; c < nvir; c++) {
+                        real_t val = v_voov[((size_t)a*nocc+k)*(size_t)nocc*nvir + (size_t)i*nvir+c];
+                        for (int l = 0; l < nocc; l++)
+                            val -= v_oovo[((size_t)k*nocc+l)*(size_t)nvir*nocc + (size_t)c*nocc+i] * t1[l*nvir+a];
+                        // d-sum from DGEMM: ovvv_t1_ic[(k*vv + a*nvir+c)*nocc + i]
+                        val += ovvv_t1_ic[((size_t)k*vv + (size_t)a*nvir+c)*nocc + i];
+                        Wakic[((size_t)a*nocc+k)*nocc*nvir + (size_t)i*nvir+c] = val;
+                    }
+                for (int c = 0; c < nvir; c++)
+                    for (int i = 0; i < nocc; i++) {
+                        real_t val = v_vovo[((size_t)a*nocc+k)*vo + (size_t)c*nocc+i];
+                        for (int l = 0; l < nocc; l++)
+                            val -= v_oovo[((size_t)l*nocc+k)*(size_t)nvir*nocc + (size_t)c*nocc+i] * t1[l*nvir+a];
+                        // d-sum from DGEMM: ovvv_t1_dc[(k*vv + a*nvir+c)*nocc + i]
+                        val += ovvv_t1_dc[((size_t)k*vv + (size_t)a*nvir+c)*nocc + i];
+                        Wakci[((size_t)a*nocc+k)*nvir*nocc + (size_t)c*nocc+i] = val;
+                    }
+            }
+
+        // DGEMM for Wakic/Wakci ld-sum terms
+        // eff_t2[T2(i,l,d,a)] = -0.5*t2[i,l,d,a] - t1[i,d]*t1[l,a]
+        // Reshape: eff_t2_R[(l*nvir+d), (i*nvir+a)] = eff_t2[T2(i,l,d,a)]
+        //          t2_C[(l*nvir+d), (i*nvir+a)] = t2[T2(i,l,a,d)]
+        {
+            std::vector<real_t> eff_t2_R(OV2);
+            std::vector<real_t> t2_C(OV2);
+            for (int l = 0; l < nocc; l++)
+                for (int d = 0; d < nvir; d++)
+                    for (int i = 0; i < nocc; i++)
+                        for (int a = 0; a < nvir; a++) {
+                            size_t row = l*nvir+d;
+                            size_t col = i*nvir+a;
+                            eff_t2_R[row*ov + col] = -0.5*t2v[T2(i,l,d,a)] - t1[i*nvir+d]*t1[l*nvir+a];
+                            t2_C[row*ov + col] = t2v[T2(i,l,a,d)];
+                        }
+
+            // Wakic ld-sum: R_AB[ia,kc] = eff_t2_R^T × V_R (terms A+B)
+            // Upload eff_t2_R to d_Wex_B (persists for reuse in Wakci DGEMM below)
+            cudaMemcpy(d_Wex_B, eff_t2_R.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
+            gpu::matrixMatrixProductRect(d_Wex_B, d_V_R, d_Wex_C1,
+                                    (int)ov, (int)ov, (int)ov, true, false, false, 1.0);
+            // Wakic ld-sum: R_C[ia,kc] += 0.5 * t2_C^T × W_R (term C)
+            cudaMemcpy(d_Wex_A, t2_C.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
+            gpu::matrixMatrixProductRect(d_Wex_A, d_W_R, d_Wex_C1,
+                                    (int)ov, (int)ov, (int)ov, true, false, true, 0.5);
+            // Wakci ld-sum: R_Wakci[ia,kc] = eff_t2_R^T × V_R2 (reuse d_Wex_B)
+            gpu::matrixMatrixProductRect(d_Wex_B, d_V_R2, d_Wex_C2,
+                                    (int)ov, (int)ov, (int)ov, true, false, false, 1.0);
+
+            // Download and scatter into Wakic/Wakci
+            std::vector<real_t> R_Wakic(OV2), R_Wakci(OV2);
+            cudaMemcpy(R_Wakic.data(), d_Wex_C1, OV2 * sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(R_Wakci.data(), d_Wex_C2, OV2 * sizeof(double), cudaMemcpyDeviceToHost);
+            for (int a = 0; a < nvir; a++)
+                for (int k = 0; k < nocc; k++)
+                    for (int i = 0; i < nocc; i++)
+                        for (int c = 0; c < nvir; c++) {
+                            Wakic[((size_t)a*nocc+k)*nocc*nvir + (size_t)i*nvir+c] +=
+                                R_Wakic[(size_t)(i*nvir+a)*ov + k*nvir+c];
+                            Wakci[((size_t)a*nocc+k)*nvir*nocc + (size_t)c*nocc+i] +=
+                                R_Wakci[(size_t)(i*nvir+a)*ov + k*nvir+c];
+                        }
+        }
+
+        // ---- T1 update ----
+        // t1(i,a)*D = Ltilde^a_c*t1(i,c) - Ltilde^k_i*t1(k,a)
+        //           + 2*F^k_c*t2(k,i,c,a) - F^k_c*t2(i,k,c,a) + F^k_c*t1(i,c)*t1(k,a)
+        //           + w^{ak}_{ic}*t1(k,c)
+        //           + w^{ak}_{cd}*t2(i,k,c,d) + w^{ak}_{cd}*t1(i,c)*t1(k,d)   -- wait: should be sum
+        //           - w^{kl}_{ic}*t2(k,l,a,c) - w^{kl}_{ic}*t1(k,a)*t1(l,c)
+        // where Ltilde = L - diagonal part (but for canonical HF, f_diag is removed, so Ltilde = L - 0? No...)
+        // Actually Ltilde^a_c = L^a_c for c!=a, Ltilde^a_a = L^a_a (no diagonal subtraction needed since
+        // we compute F without the diagonal Fock contribution, but actually the formula says
+        // "Ftilde^a_c = F^a_c - delta_{ac} * D_i^a" ... hmm.
+        // For canonical HF with the way we defined F (without diagonal Fock), Ltilde = L.
+        // The D_i^a denominator is applied at the end, so Ltilde = L.
+        // T1 w_ovvv DGEMM: Result[a,i] = w_ovvv_R[nvir, nocc*vv] × tau[nocc, nocc*vv]^T
+        // w_ovvv_R[a, k*vv+c*nvir+d] = w_ovvv[k*vvv+a*vv+d*nvir+c] (pre-computed)
+        // Use persistent d_w_ovvv_R buffer (uploaded once before the loop)
+        // d_Fkc reuse as result buffer (size ov = nvir*nocc, sufficient)
+        gpu::matrixMatrixProductRect(d_w_ovvv_R, d_tau, d_Fkc,
+                                nvir, nocc, (int)(nocc * vv),
+                                false, true, false, 1.0);
+        std::vector<real_t> t1_wovvv(ov);
+        cudaMemcpy(t1_wovvv.data(), d_Fkc, ov * sizeof(double), cudaMemcpyDeviceToHost);
+
+        std::vector<real_t> newT1(t1Size, 0.0);
+        for (int i = 0; i < nocc; i++)
+            for (int a = 0; a < nvir; a++) {
+                real_t val = 0.0;
+                // Fac * t1
+                for (int c = 0; c < nvir; c++)
+                    val += Fac[a*nvir+c] * t1[i*nvir+c];
+                // -Fki * t1
+                for (int k = 0; k < nocc; k++)
+                    val -= Fki[k*nocc+i] * t1[k*nvir+a];
+                // 2*F^k_c*t2(ki,ca) - F^k_c*t2(ik,ca) + F^k_c*t1(i,c)*t1(k,a)
+                for (int k = 0; k < nocc; k++)
+                    for (int c = 0; c < nvir; c++) {
+                        real_t fc = Fkc[k*nvir+c];
+                        val += fc * (2.0*t2v[T2(k,i,c,a)] - t2v[T2(i,k,c,a)] + t1[i*nvir+c]*t1[k*nvir+a]);
+                    }
+                // w_voov[a,k,i,c] * t1(k,c)
+                for (int k = 0; k < nocc; k++)
+                    for (int c = 0; c < nvir; c++)
+                        val += w_voov[((size_t)a*nocc+k)*(size_t)nocc*nvir + (size_t)i*nvir+c] * t1[k*nvir+c];
+                // w_ovvv term via DGEMM (computed above)
+                val += t1_wovvv[a*nocc+i];
+                // -w_ooov[k,l,i,c] * (t2(kl,ac) + t1(k,a)*t1(l,c))
+                for (int k = 0; k < nocc; k++)
+                    for (int l = 0; l < nocc; l++)
+                        for (int c = 0; c < nvir; c++)
+                            val -= w_ooov[((size_t)k*nocc+l)*ov + (size_t)i*nvir+c] * (t2v[T2(k,l,a,c)] + t1[k*nvir+a]*t1[l*nvir+c]);
+                newT1[i*nvir+a] = val / Dia[i*nvir+a];
+            }
+
+        // ---- T2 update ----
+        // raw(i,a,j,b) computed, then t2_new(i,j,a,b) = [raw(i,a,j,b) + raw(j,b,i,a)] / D
+        // This is the P(ia,jb) symmetrization.
+        //
+        // raw(i,a,j,b) = 0.5*v^{ij}_{ab}
+        //   + 0.5*sum_{kl} W^{kl}_{ij} * (t2(k,l,a,b) + t1(k,a)*t1(l,b))
+        //   + 0.5*sum_{cd} W^{ab}_{cd} * (t2(i,j,c,d) + t1(i,c)*t1(j,d))
+        //   + Ltilde^a_c * t2(i,j,c,b)
+        //   - Ltilde^k_i * t2(k,j,a,b)
+        //   + v^{ab}_{ic} * t1(j,c)
+        //   - sum_k v^{kb}_{ic} * t1(k,a) * t1(j,c)  -- wait, this should be -v^{kb}_{ic}*t1(k,a)*t1(j,c)
+        //   - v^{ak}_{ij} * t1(k,b)
+        //   - v^{ak}_{ic} * t1(j,c) * t1(k,b)   -- from the formula
+        //   + sum_k 2*W^{ak}_{ic}*t2(k,j,c,b) - W^{ak}_{ci}*t2(k,j,c,b) - W^{ak}_{ic}*t2(k,j,b,c)
+        //   - sum_k W^{bk}_{ci}*t2(k,j,a,c)
+
+        // ---- GPU DGEMM for Wabcd×tau and Wklij×tau ----
+        // d_Wabcd already on GPU from build_Wabcd_kernel above
+        cudaMemcpy(d_Wklij, Wklij.data(), oo * oo * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemset(d_raw, 0, t2Size * sizeof(double));
+
+        // raw[ij,ab] += 0.5 * tau[ij,cd] * Wabcd[ab,cd]^T
+        gpu::matrixMatrixProductRect(d_tau, d_Wabcd, d_raw,
+                                (int)oo, (int)vv, (int)vv,
+                                false, true, true, 0.5);
+
+        // raw[ij,ab] += 0.5 * Wklij^T[ij,kl] * tau[kl,ab]
+        gpu::matrixMatrixProductRect(d_Wklij, d_tau, d_raw,
+                                (int)oo, (int)vv, (int)oo,
+                                true, false, true, 0.5);
+
+        // ---- GPU batched DGEMM for Lac×t2 → d_raw (before download) ----
+        // For each ij: raw[ij,ab] += Lac[a,c] × t2v[ij,cb]
+        // d_t2v already contains t2v from upload at start of iteration
+        cudaMemcpy(d_Lac, Lac.data(), vv * sizeof(double), cudaMemcpyHostToDevice);
+        gpu::matrixMatrixProductBatched(d_Lac, d_t2v, d_raw,
+                                    nvir, nvir, nvir,
+                                    0, (long long)vv, (long long)vv,
+                                    (int)oo,
+                                    false, false, true, 1.0);
+
+        // Download raw (now includes Wabcd×tau + Wklij×tau + Lac×t2)
+        std::vector<real_t> raw(t2Size);
+        cudaMemcpy(raw.data(), d_raw, t2Size * sizeof(double), cudaMemcpyDeviceToHost);
+
+        // ---- W exchange terms via DGEMM ----
+        // Term 1+2: sum_{kc} (2*Wakic[a,k,i,c] - Wakci[a,k,c,i]) * t2[k,j,c,b]
+        //   DGEMM: Weff[ai,kc] × t2_R1[kc,jb]  →  R12[ai,jb]
+        // Term 3: -sum_{kc} Wakic[a,k,i,c] * t2[k,j,b,c]
+        //   DGEMM: -Wakic_R[ai,kc] × t2_R3[kc,jb]  →  R12[ai,jb] (accumulate)
+        // Term 4: -sum_{kc} Wakci[b,k,c,i] * t2[k,j,a,c]
+        //   DGEMM: -Wakci_R[bi,kc] × t2_R4[kc,ja]  →  R4[bi,ja]
+        {
+            std::vector<real_t> Weff(OV2), Wakic_R(OV2), Wakci_R_mat(OV2);
+            std::vector<real_t> t2_R1(OV2), t2_R3(OV2), t2_R4(OV2);
+
+            // Build reshaped W intermediates
+            for (int a = 0; a < nvir; a++)
+                for (int i = 0; i < nocc; i++)
+                    for (int k = 0; k < nocc; k++)
+                        for (int c = 0; c < nvir; c++) {
+                            size_t row = a*nocc+i;
+                            size_t col = k*nvir+c;
+                            real_t wic = Wakic[((size_t)a*nocc+k)*nocc*nvir + (size_t)i*nvir+c];
+                            real_t wci = Wakci[((size_t)a*nocc+k)*nvir*nocc + (size_t)c*nocc+i];
+                            Weff[row*ov + col] = 2.0*wic - wci;
+                            Wakic_R[row*ov + col] = wic;
+                        }
+            for (int b = 0; b < nvir; b++)
+                for (int i = 0; i < nocc; i++)
+                    for (int k = 0; k < nocc; k++)
+                        for (int c = 0; c < nvir; c++)
+                            Wakci_R_mat[(b*nocc+i)*ov + k*nvir+c] =
+                                Wakci[((size_t)b*nocc+k)*nvir*nocc + (size_t)c*nocc+i];
+
+            // Build reshaped t2
+            for (int k = 0; k < nocc; k++)
+                for (int c = 0; c < nvir; c++)
+                    for (int j = 0; j < nocc; j++)
+                        for (int b = 0; b < nvir; b++) {
+                            size_t row = k*nvir+c;
+                            size_t col = j*nvir+b;
+                            t2_R1[row*ov + col] = t2v[T2(k,j,c,b)];
+                            t2_R3[row*ov + col] = t2v[T2(k,j,b,c)];
+                        }
+            for (int k = 0; k < nocc; k++)
+                for (int c = 0; c < nvir; c++)
+                    for (int j = 0; j < nocc; j++)
+                        for (int a = 0; a < nvir; a++)
+                            t2_R4[(k*nvir+c)*ov + j*nvir+a] = t2v[T2(k,j,a,c)];
+
+            // DGEMM 1: R12 = Weff × t2_R1  (terms 1+2)
+            cudaMemcpy(d_Wex_A, Weff.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_Wex_B, t2_R1.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
+            gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C1,
+                                    (int)ov, (int)ov, (int)ov, false, false, false, 1.0);
+            // DGEMM 2: R12 -= Wakic_R × t2_R3  (term 3, accumulate)
+            cudaMemcpy(d_Wex_A, Wakic_R.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_Wex_B, t2_R3.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
+            gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C1,
+                                    (int)ov, (int)ov, (int)ov, false, false, true, -1.0);
+            // DGEMM 3: R4 = -Wakci_R × t2_R4  (term 4)
+            cudaMemcpy(d_Wex_A, Wakci_R_mat.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_Wex_B, t2_R4.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
+            gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C2,
+                                    (int)ov, (int)ov, (int)ov, false, false, false, -1.0);
+
+            // Download results
+            std::vector<real_t> R12(OV2), R4(OV2);
+            cudaMemcpy(R12.data(), d_Wex_C1, OV2 * sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(R4.data(), d_Wex_C2, OV2 * sizeof(double), cudaMemcpyDeviceToHost);
+
+            // Scatter W exchange DGEMM results into raw
+            for (int i = 0; i < nocc; i++)
+                for (int j = 0; j < nocc; j++)
+                    for (int a = 0; a < nvir; a++)
+                        for (int b = 0; b < nvir; b++)
+                            raw[T2(i,j,a,b)] += R12[(a*nocc+i)*ov + j*nvir+b]
+                                               + R4[(b*nocc+i)*ov + j*nvir+a];
+        }
+
+        // ---- GPU DGEMM for Z×t1 → raw contribution ----
+        // Z[(ab)*ov + i*nvir+c] stored as [vv*nocc, nvir] (c is contiguous)
+        // result[(ab*nocc+i), j] = sum_c Z[(ab*nocc+i), c] × t1^T[c, j]
+        // = DGEMM: [vv*nocc, nocc] = Z[vv*nocc, nvir] × t1^T[nvir, nocc]
+        // Then: raw[T2(i,j,a,b)] += result[(a*nvir+b)*nocc + i, j]
+        std::vector<real_t> Z(vv * ov);
+        std::copy(v_vvov.begin(), v_vvov.end(), Z.begin());
+        for (int a = 0; a < nvir; a++)
+            for (int b = 0; b < nvir; b++)
+                for (int i = 0; i < nocc; i++)
+                    for (int c = 0; c < nvir; c++) {
+                        size_t z_idx = ((size_t)a*nvir+b)*ov + (size_t)i*nvir+c;
+                        for (int k = 0; k < nocc; k++) {
+                            Z[z_idx] -= v_ovov[((size_t)k*nvir+b)*ov + (size_t)i*nvir+c] * t1[k*nvir+a];
+                            Z[z_idx] -= v_voov[((size_t)a*nocc+k)*(size_t)nocc*nvir + (size_t)i*nvir+c] * t1[k*nvir+b];
+                        }
+                    }
+
+        // Z×t1 DGEMM: result[vv*nocc, nocc] = Z[vv*nocc, nvir] × t1^T[nvir, nocc]
+        cudaMemcpy(d_Z, Z.data(), vv * ov * sizeof(double), cudaMemcpyHostToDevice);
+        // d_t1 already on GPU; result goes into d_ovvv_t1 (scratch, avoids overwriting d_t2v)
+        gpu::matrixMatrixProductRect(d_Z, d_t1, d_ovvv_t1,
+                                (int)(vv * nocc), nocc, nvir,
+                                false, true, false, 1.0);
+        std::vector<real_t> Zt1_result(vv * oo);
+        cudaMemcpy(Zt1_result.data(), d_ovvv_t1, vv * oo * sizeof(double), cudaMemcpyDeviceToHost);
+
+        // Build Q (small: O(nocc² × vv))
+        std::vector<real_t> Q(vv * oo);
+        for (int a = 0; a < nvir; a++)
+            for (int b = 0; b < nvir; b++)
+                for (int i = 0; i < nocc; i++)
+                    for (int j = 0; j < nocc; j++) {
+                        real_t val = 0.0;
+                        for (int k = 0; k < nocc; k++)
+                            val += v_vooo[((size_t)a*nocc+k)*oo + (size_t)i*nocc+j] * t1[k*nvir+b];
+                        Q[((size_t)a*nvir+b)*oo + (size_t)i*nocc+j] = val;
+                    }
+
+        // Reduced inner loop: only O(nocc) per (i,j,a,b) — Lac×t2 and Z×t1 done via DGEMM
+        for (int i = 0; i < nocc; i++)
+            for (int j = 0; j < nocc; j++)
+                for (int a = 0; a < nvir; a++)
+                    for (int b = 0; b < nvir; b++) {
+                        size_t idx = T2(i,j,a,b);
+                        real_t val = 0.5 * v_oovv[((size_t)i*nocc+j)*vv + (size_t)a*nvir+b];
+
+                        // -Lki * t2 (O(nocc) inner loop — small)
+                        for (int k = 0; k < nocc; k++)
+                            val -= Lki[k*nocc+i] * t2v[T2(k,j,a,b)];
+
+                        // Z×t1 DGEMM result scatter
+                        val += Zt1_result[((size_t)a*nvir+b)*oo + (size_t)i*nocc+j];
+
+                        // -Q[ab,ij]
+                        val -= Q[((size_t)a*nvir+b)*oo + (size_t)i*nocc+j];
+
+                        raw[idx] += val;
+                    }
+
+        // Symmetrize: t2_new(i,j,a,b) = [raw(i,a,j,b) + raw(j,b,i,a)] / D
+        // raw is stored as raw[T2(i,j,a,b)] = raw(i,a,j,b)
+        // so raw(j,b,i,a) = raw[T2(j,i,b,a)]
+        std::vector<real_t> newT2(t2Size);
+        for (int i = 0; i < nocc; i++)
+            for (int j = 0; j < nocc; j++)
+                for (int a = 0; a < nvir; a++)
+                    for (int b = 0; b < nvir; b++) {
+                        size_t idx = T2(i,j,a,b);
+                        newT2[idx] = (raw[idx] + raw[T2(j,i,b,a)]) / Dijab[idx];
+                    }
+
+        // ---- DIIS ----
+        std::vector<real_t> ampVec(num_amps);
+        std::vector<real_t> errVec(num_amps);
+        for (size_t k = 0; k < t1Size; k++) {
+            ampVec[k] = newT1[k];
+            errVec[k] = newT1[k] - t1[k];
+        }
+        for (size_t k = 0; k < t2Size; k++) {
+            ampVec[t1Size + k] = newT2[k];
+            errVec[t1Size + k] = newT2[k] - t2v[k];
+        }
+        diis.push(ampVec, errVec);
+        if (diis.can_extrapolate()) {
+            auto extrap = diis.extrapolate();
+            for (size_t k = 0; k < t1Size; k++) newT1[k] = extrap[k];
+            for (size_t k = 0; k < t2Size; k++) newT2[k] = extrap[t1Size + k];
+        }
+
+        for (size_t k = 0; k < t1Size; k++) t1[k] = newT1[k];
+        for (size_t k = 0; k < t2Size; k++) t2v[k] = newT2[k];
+
+        real_t newEcc = energy();
+        real_t deltaE = newEcc - Ecc;
+        Ecc = newEcc;
+
+        std::cout << "CCSD iter " << std::setw(2) << iter
+                  << ": E = " << std::fixed << std::setprecision(12) << Ecc
+                  << ", dE = " << std::scientific << std::setprecision(4) << deltaE
+                  << std::endl;
+
+        if (std::abs(deltaE) < CONV) {
+            std::cout << "CCSD converged after " << iter << " iterations" << std::endl;
+            break;
+        }
+    }
+
+    // Free pre-allocated GPU buffers
+    tracked_cudaFree(d_gpu_pool);  // single deallocation for all GPU buffers
+
+    // ---- (T) perturbative triples correction (spatial orbital, DGEMM-accelerated) ----
+    // Pre-compute ALL f-sum and m-sum contractions via 2 large DGEMMs:
+    //   F_sum[(i*vv+ab), (kj*nvir+c)] = sum_f V_full[i*vv+ab, f] * t2v[kj*nvir+c, f]
+    //   M_sum[(aa*oo+ji), (k*vv+bc)]  = -v_vooo[aa*oo+ji, m] * t2v_H[m, k*vv+bc]
+    // Then the inner loop over (a,b,c) does only lookups (no contractions).
+    if (computing_ccsd_t && ccsd_t_energy) {
+        std::cout << "---- Computing (T) correction (spatial orbital, DGEMM) ----" << std::endl;
+        std::string str = "Computing (T) correction energy... ";
+        PROFILE_ELAPSED_TIME(str);
+
+        const size_t o3 = (size_t)nocc * nocc * nocc;
+        const size_t ov_sz = (size_t)nocc * nvir;
+        real_t E_T = 0.0;
+
+        // ---- DGEMM 1: F_sum for all f-sums ----
+        // V_full[(i*vv+ab), f] = v_ovvv[i*vvv + f*vv + ab]  (transpose f,ab within each i)
+        // T2_mat[(kj*nvir+c), f] = t2v[kj*vv + c*nvir + f]  (= t2v as-is, since vv=nvir²)
+        // F_sum = V_full × T2_mat^T  →  [nocc*vv × oo*nvir]
+        const size_t F_rows = (size_t)nocc * vv;    // nocc * nvir²
+        const size_t F_cols = oo * nvir;             // nocc² * nvir
+        std::vector<real_t> V_full(F_rows * nvir);
+        for (int i = 0; i < nocc; i++)
+            for (int ab = 0; ab < (int)vv; ab++)
+                for (int f = 0; f < nvir; f++)
+                    V_full[((size_t)i*vv + ab)*nvir + f] = v_ovvv[(size_t)i*vvv + (size_t)f*vv + ab];
+
+        // t2v is already in the right layout for T2_mat: t2v[row*nvir + f] where row = kj*nvir+c
+        // DGEMM: F_sum[F_rows × F_cols] = V_full[F_rows × nvir] × t2v^T[nvir × F_cols]
+        const size_t F_total = F_rows * F_cols;
+        double *d_V_full=nullptr, *d_T2_mat=nullptr, *d_F_sum=nullptr;
+        tracked_cudaMalloc((void**)&d_V_full, F_rows * nvir * sizeof(double));
+        tracked_cudaMalloc((void**)&d_T2_mat, t2Size * sizeof(double));
+        tracked_cudaMalloc((void**)&d_F_sum, F_total * sizeof(double));
+
+        cudaMemcpy(d_V_full, V_full.data(), F_rows * nvir * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_T2_mat, t2v.data(), t2Size * sizeof(double), cudaMemcpyHostToDevice);
+        gpu::matrixMatrixProductRect(d_V_full, d_T2_mat, d_F_sum,
+                                (int)F_rows, (int)F_cols, nvir,
+                                false, true, false, 1.0);
+
+        tracked_cudaFree(d_V_full);
+        // d_F_sum stays on GPU for the kernel
+
+        // ---- DGEMM 2: M_sum for all m-sums ----
+        // G[(aa*oo+ji), m] = v_vooo[(aa*nocc+j)*oo + i*nocc + m]  (= v_vooo as-is)
+        // H[m, k*vv+bc] = t2v[(m*nocc+k)*vv + bc]  (= t2v viewed as [nocc × nocc*vv])
+        // M_sum = -G × H  →  [(nvir*oo) × (nocc*vv)]
+        const size_t M_rows = (size_t)nvir * oo;  // = vo * nocc
+        const size_t M_cols = (size_t)nocc * vv;   // = t2Size / nocc actually = nocc * vv
+        const size_t M_total = M_rows * M_cols;
+
+        double *d_G=nullptr, *d_M_sum=nullptr;
+        tracked_cudaMalloc((void**)&d_G, M_rows * nocc * sizeof(double));
+        tracked_cudaMalloc((void**)&d_M_sum, M_total * sizeof(double));
+
+        cudaMemcpy(d_G, v_vooo.data(), M_rows * nocc * sizeof(double), cudaMemcpyHostToDevice);
+        // d_T2_mat is still valid (t2v as [nocc × nocc*vv])
+        gpu::matrixMatrixProductRect(d_G, d_T2_mat, d_M_sum,
+                                (int)M_rows, (int)M_cols, nocc,
+                                false, false, false, -1.0);
+
+        tracked_cudaFree(d_G);
+        tracked_cudaFree(d_T2_mat);
+        // d_M_sum stays on GPU for the kernel
+
+        // ---- GPU kernel for inner loop ----
+        // Enumerate all (a,b,c) triples with a >= b >= c
+        int num_triples = 0;
+        for (int a = 0; a < nvir; a++)
+            for (int b = 0; b <= a; b++)
+                for (int c = 0; c <= b; c++)
+                    num_triples++;
+
+        std::vector<int> abc_triples(num_triples * 3);
+        {
+            int idx = 0;
+            for (int a = 0; a < nvir; a++)
+                for (int b = 0; b <= a; b++)
+                    for (int c = 0; c <= b; c++) {
+                        abc_triples[idx*3]   = a;
+                        abc_triples[idx*3+1] = b;
+                        abc_triples[idx*3+2] = c;
+                        idx++;
+                    }
+        }
+
+        // Upload auxiliary arrays to GPU
+        double *d_v_oovv_t=nullptr, *d_t1_t=nullptr, *d_eps_t=nullptr;
+        int *d_abc=nullptr;
+        double *d_block_ET=nullptr;
+        tracked_cudaMalloc((void**)&d_v_oovv_t, oo * vv * sizeof(double));
+        tracked_cudaMalloc((void**)&d_t1_t, ov * sizeof(double));
+        tracked_cudaMalloc((void**)&d_eps_t, N * sizeof(double));
+        tracked_cudaMalloc((void**)&d_abc, num_triples * 3 * sizeof(int));
+        tracked_cudaMalloc((void**)&d_block_ET, num_triples * sizeof(double));
+
+        cudaMemcpy(d_v_oovv_t, v_oovv.data(), oo * vv * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_t1_t, t1.data(), ov * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_eps_t, eps.data(), N * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_abc, abc_triples.data(), num_triples * 3 * sizeof(int), cudaMemcpyHostToDevice);
+
+        // Launch kernel: one block per (a,b,c) triple
+        const int blockSize = 128;
+        size_t smem_size = (13 * o3 + blockSize) * sizeof(double);
+        ccsd_t_energy_kernel<<<num_triples, blockSize, smem_size>>>(
+            d_F_sum, (int)F_cols,
+            d_M_sum, (int)M_cols,
+            d_v_oovv_t, d_t1_t, d_eps_t,
+            nocc, nvir,
+            d_abc, num_triples,
+            d_block_ET);
+        cudaDeviceSynchronize();
+
+        // Download partial sums and accumulate
+        std::vector<double> block_ET(num_triples);
+        cudaMemcpy(block_ET.data(), d_block_ET, num_triples * sizeof(double), cudaMemcpyDeviceToHost);
+
+        for (int i = 0; i < num_triples; i++)
+            E_T += block_ET[i];
+
+        // Free GPU memory
+        tracked_cudaFree(d_F_sum);
+        tracked_cudaFree(d_M_sum);
+        tracked_cudaFree(d_v_oovv_t);
+        tracked_cudaFree(d_t1_t);
+        tracked_cudaFree(d_eps_t);
+        tracked_cudaFree(d_abc);
+        tracked_cudaFree(d_block_ET);
+
+        E_T *= 2.0;
+        *ccsd_t_energy = E_T;
+        std::cout << "(T) correction energy: " << std::fixed << std::setprecision(12) << E_T << std::endl;
+    }
+
+    return Ecc;
+}
+
+
+// ============================================================
+//  Legacy spin-orbital CCSD implementation (kept for reference/fallback)
+// ============================================================
 real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const real_t* __restrict__ d_coefficient_matrix, const real_t* __restrict__ d_orbital_energies, const int num_basis, const int num_occ, const bool computing_ccsd_t=false, real_t* ccsd_t_energy=nullptr) {
 
     const int num_spin_mo = num_basis * 2;
@@ -3728,6 +5497,7 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
         // Copy new amplitudes to host for DIIS
         cudaMemcpy(h_t_new.data(), t_ia_new, sizeof(real_t) * num_ccsd_amplitudes, cudaMemcpyDeviceToHost); // t_ia_new and t_ijab_new are in contiguous buffer
         // Compute residuals for DIIS and rms difference
+        rms = 0.0;
         for(size_t idx = 0; idx < num_ccsd_amplitudes; ++idx){
             h_residual[idx] = h_t_new[idx] - h_t_old[idx];
             rms += h_residual[idx] * h_residual[idx];
@@ -3818,13 +5588,14 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
 
 
 
+// ccsd_algorithm: 0 = spatial-orbital optimized (GPU DGEMM + sub-blocks)
+//                 1 = spatial-orbital naive (pure CPU)
+//                 2 = spin-orbital (legacy)
+
 real_t ERI_Stored_RHF::compute_ccsd_energy() {
     PROFILE_FUNCTION();
 
-
-    // CCSD energy calculation 
-
-    const int num_occ = rhf_.get_num_electrons() / 2; // number of occupied orbitals for RHF
+    const int num_occ = rhf_.get_num_electrons() / 2;
     const int num_basis = rhf_.get_num_basis();
     DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
     DeviceHostMemory<real_t>& orbital_energies = rhf_.get_orbital_energies();
@@ -3832,40 +5603,42 @@ real_t ERI_Stored_RHF::compute_ccsd_energy() {
     const real_t* d_eps = orbital_energies.device_ptr();
     const real_t* d_eri = eri_matrix_.device_ptr();
 
-    bool computing_ccsd_t = false;
-
-    real_t E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, computing_ccsd_t);
+    real_t E_CCSD;
+    if (ccsd_algorithm_ == 2) {
+        E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr);
+    } else if (ccsd_algorithm_ == 1) {
+        E_CCSD = ccsd_spatial_orbital_naive(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr);
+    } else {
+        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr);
+    }
 
     std::cout << "CCSD energy: " << E_CCSD << " Hartree" << std::endl;
-
     return E_CCSD;
 }
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////// CCSD(T) implementation
 
-
-
-
-
 real_t ERI_Stored_RHF::compute_ccsd_t_energy() {
     PROFILE_FUNCTION();
 
-    // CCSD energy calculation 
-
-    const int num_occ = rhf_.get_num_electrons() / 2; // number of occupied orbitals for RHF
+    const int num_occ = rhf_.get_num_electrons() / 2;
     const int num_basis = rhf_.get_num_basis();
     DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
     DeviceHostMemory<real_t>& orbital_energies = rhf_.get_orbital_energies();
     const real_t* d_C = coefficient_matrix.device_ptr();
     const real_t* d_eps = orbital_energies.device_ptr();
     const real_t* d_eri = eri_matrix_.device_ptr();
-    
-    bool computing_ccsd_t = true;
+
     real_t ccsd_t_energy = 0.0;
-
-    real_t E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, computing_ccsd_t, &ccsd_t_energy);
-
+    real_t E_CCSD;
+    if (ccsd_algorithm_ == 2) {
+        E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy);
+    } else if (ccsd_algorithm_ == 1) {
+        E_CCSD = ccsd_spatial_orbital_naive(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy);
+    } else {
+        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy);
+    }
 
     std::cout << "CCSD correction energy: " << E_CCSD << " Hartree" << std::endl;
     std::cout << "(T) correction energy: " << ccsd_t_energy << " Hartree" << std::endl;
