@@ -252,7 +252,9 @@ __global__ void ccsd_t_energy_kernel(
     int nocc, int nvir,
     const int* __restrict__ abc_triples,
     int num_triples,
-    double* __restrict__ block_E_T)
+    double* __restrict__ block_E_T,
+    double* __restrict__ g_wt,     // global memory: num_triples * 6 * o3
+    double* __restrict__ g_zt)     // global memory: num_triples * 6 * o3
 {
     int triple_id = blockIdx.x;
     if (triple_id >= num_triples) return;
@@ -273,11 +275,15 @@ __global__ void ccsd_t_energy_kernel(
 
     int perms[6][3] = {{a,b,c},{a,c,b},{b,a,c},{b,c,a},{c,a,b},{c,b,a}};
 
+    // Per-block pointers into global memory
+    const size_t block_offset = (size_t)triple_id * 6 * o3;
+    double* wt = g_wt + block_offset;
+    double* zt = g_zt + block_offset;
+
+    // Shared memory: only r3buf (o3) + reduction buffer (blockDim.x)
     extern __shared__ double smem[];
-    double* wt = smem;                   // 6 * o3
-    double* zt = smem + 6 * o3;          // 6 * o3
-    double* r3buf = smem + 12 * o3;      // o3 (temporary for r3out)
-    double* red = smem + 13 * o3;        // blockDim.x
+    double* r3buf = smem;              // o3
+    double* red   = smem + o3;         // blockDim.x
 
     // Phase 1 & 2: for each permutation, compute wt[p] and zt[p]
     for (int p = 0; p < 6; p++) {
@@ -289,44 +295,40 @@ __global__ void ccsd_t_energy_kernel(
             int j = (ijk / nocc) % nocc;
             int i = ijk / oo;
 
-            // F_sum lookup: F_sum[(i*vv + aa*nvir+bb), (k*nocc+j)*nvir + cc]
             size_t f_row = (size_t)i * vv + (size_t)aa * nvir + bb;
             size_t f_col = ((size_t)k * nocc + j) * nvir + cc;
             double wval = F_sum[f_row * F_cols + f_col];
 
-            // M_sum lookup: M_sum[(aa*oo + j*nocc+i), (k*vv + bb*nvir+cc)]
             size_t m_row = (size_t)aa * oo + (size_t)j * nocc + i;
             size_t m_col = (size_t)k * vv + (size_t)bb * nvir + cc;
             wval += M_sum[m_row * M_cols + m_col];
 
-            // v-term: v_oovv[(i*nocc+j)*vv + aa*nvir+bb] * t1[k*nvir+cc]
             double vval = v_oovv[((size_t)i * nocc + j) * vv + (size_t)aa * nvir + bb]
                         * t1[k * nvir + cc];
 
             wt[p * o3 + ijk] = wval;
-            zt[p * o3 + ijk] = wval + 0.5 * vval; // temporarily store wpv
+            zt[p * o3 + ijk] = wval + 0.5 * vval;
         }
         __syncthreads();
 
-        // Phase 2a: compute r3out from wpv (stored in zt[p]) into temporary buffer
-        // Must not overwrite zt[p] yet — other threads may still read wpv at permuted indices
+        // Phase 2a: compute r3out from wpv (stored in zt[p]) into shared r3buf
         for (int ijk = threadIdx.x; ijk < o3; ijk += blockDim.x) {
             double wpv_self = zt[p * o3 + ijk];
             int k = ijk % nocc;
             int j = (ijk / nocc) % nocc;
             int i = ijk / oo;
-            int idx1 = (i*nocc+k)*nocc+j;  // ikj
-            int idx2 = (j*nocc+i)*nocc+k;  // jik
-            int idx3 = (j*nocc+k)*nocc+i;  // jki
-            int idx4 = (k*nocc+i)*nocc+j;  // kij
-            int idx5 = (k*nocc+j)*nocc+i;  // kji
+            int idx1 = (i*nocc+k)*nocc+j;
+            int idx2 = (j*nocc+i)*nocc+k;
+            int idx3 = (j*nocc+k)*nocc+i;
+            int idx4 = (k*nocc+i)*nocc+j;
+            int idx5 = (k*nocc+j)*nocc+i;
 
             r3buf[ijk] = 4.0*wpv_self + zt[p*o3+idx3] + zt[p*o3+idx4]
                        - 2.0*zt[p*o3+idx5] - 2.0*zt[p*o3+idx1] - 2.0*zt[p*o3+idx2];
         }
         __syncthreads();
 
-        // Phase 2b: write zt[p] = r3out / D (now safe to overwrite)
+        // Phase 2b: write zt[p] = r3out / D
         for (int ijk = threadIdx.x; ijk < o3; ijk += blockDim.x) {
             int k = ijk % nocc;
             int j = (ijk / nocc) % nocc;
@@ -339,7 +341,6 @@ __global__ void ccsd_t_energy_kernel(
     }
 
     // Phase 3: compute 36 dot products for energy
-    // E_T += sum_{q,p} sum_r wt[p][idx[comp[q][p]][r]] * zt[q][r]
     const int comp[6][6] = {
         {0,1,2,3,4,5}, {1,0,4,5,2,3}, {2,3,0,1,5,4},
         {4,5,1,0,3,2}, {3,2,5,4,0,1}, {5,4,3,2,1,0}
@@ -367,7 +368,7 @@ __global__ void ccsd_t_energy_kernel(
         }
     }
 
-    // Block reduction
+    // Block reduction (shared memory)
     red[threadIdx.x] = thread_E;
     __syncthreads();
 
@@ -5261,16 +5262,24 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         cudaMemcpy(d_eps_t, eps.data(), N * sizeof(double), cudaMemcpyHostToDevice);
         cudaMemcpy(d_abc, abc_triples.data(), num_triples * 3 * sizeof(int), cudaMemcpyHostToDevice);
 
+        // Allocate global memory for wt/zt (6 * o3 per triple)
+        const size_t wt_zt_size = (size_t)num_triples * 6 * o3;
+        double *d_g_wt = nullptr, *d_g_zt = nullptr;
+        tracked_cudaMalloc((void**)&d_g_wt, wt_zt_size * sizeof(double));
+        tracked_cudaMalloc((void**)&d_g_zt, wt_zt_size * sizeof(double));
+
         // Launch kernel: one block per (a,b,c) triple
+        // Shared memory: r3buf (o3) + reduction buffer (blockSize)
         const int blockSize = 128;
-        size_t smem_size = (13 * o3 + blockSize) * sizeof(double);
+        size_t smem_size = (o3 + blockSize) * sizeof(double);
         ccsd_t_energy_kernel<<<num_triples, blockSize, smem_size>>>(
             d_F_sum, (int)F_cols,
             d_M_sum, (int)M_cols,
             d_v_oovv_t, d_t1_t, d_eps_t,
             nocc, nvir,
             d_abc, num_triples,
-            d_block_ET);
+            d_block_ET,
+            d_g_wt, d_g_zt);
         cudaDeviceSynchronize();
 
         // Download partial sums and accumulate
@@ -5281,6 +5290,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             E_T += block_ET[i];
 
         // Free GPU memory
+        tracked_cudaFree(d_g_wt);
+        tracked_cudaFree(d_g_zt);
         tracked_cudaFree(d_F_sum);
         tracked_cudaFree(d_M_sum);
         tracked_cudaFree(d_v_oovv_t);
