@@ -112,6 +112,16 @@ public:
     bool get_verbose() const { return verbose; }
 
     /**
+     * @brief Get the run type (energy, gradient, optimize)
+     */
+    const std::string& get_run_type() const { return run_type_; }
+
+    /**
+     * @brief Get the optimizer name (bfgs)
+     */
+    const std::string& get_optimizer() const { return optimizer_; }
+
+    /**
      * @brief Get the nuclear repulsion energy
      */
     real_t get_nuclear_repulsion_energy() const { return nuclear_repulsion_energy_; }
@@ -286,8 +296,8 @@ protected:
     const int max_iter; ///< Maximum number of iterations
     int iter_; ///< Number of iterations
     real_t energy_difference_; ///< Energy difference between the current and the previous iteration
-    const int geometry_optimization; ///< Geometry optimization flag
-    const std::string geometry_optimization_method; ///< Geometry optimization method
+    const std::string run_type_; ///< Run type: "energy", "gradient", "optimize"
+    const std::string optimizer_; ///< Optimizer: "bfgs"
     
     const std::vector<ShellTypeInfo> shell_type_infos; ///< Shell type info in the primitive shell list
     const std::vector<BasisRange> atom_to_basis_range; ///< Basis range for each atom
@@ -455,7 +465,7 @@ public:
      * @details This function evaluates the energy derivatives with respect to each nuclear coordinate (x, y, z) by summing the derivatives of the one-electron and two-electron integrals.
      * @details The result can be used for geometry optimization or force calculations.
      */
-    virtual void compute_Energy_Gradient() = 0;
+    virtual std::vector<double> compute_Energy_Gradient() = 0;
     
 
     /**

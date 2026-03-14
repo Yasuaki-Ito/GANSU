@@ -3832,9 +3832,9 @@ void computeMolucularGradients(double* d_grad_total, double* d_grad_N, double* d
 
 
 // エネルギー微分を計算する関数
-void computeEnergyGradient_RHF(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
-                                const Atom* d_atoms, const real_t* d_density_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, 
-                                const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors, 
+std::vector<double> computeEnergyGradient_RHF(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+                                const Atom* d_atoms, const real_t* d_density_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies,
+                                const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors,
                                 const int num_atoms, const int num_basis, const int num_electron, const bool verbose)
 {
     // メモリサイズ
@@ -3843,22 +3843,8 @@ void computeEnergyGradient_RHF(const std::vector<ShellTypeInfo>& shell_type_info
     const size_t gradients_bytes = n * sizeof(double);  // dx, dy, dz の計算結果を1次元配列に格納
 
     // CPU側のメモリ確保
-    real_t* W_matrix = nullptr;
-    double* grad_N = nullptr;
-    double* grad_S = nullptr;
-    double* grad_K = nullptr;
-    double* grad_V = nullptr;
-    double* grad_G = nullptr;
     double* grad_total = nullptr;
-
-    cudaMallocHost((void**)&W_matrix, wmat_bytes);
-    cudaMallocHost((void**)&grad_N, gradients_bytes);
-    cudaMallocHost((void**)&grad_S, gradients_bytes);
-    cudaMallocHost((void**)&grad_K, gradients_bytes);
-    cudaMallocHost((void**)&grad_V, gradients_bytes);
-    cudaMallocHost((void**)&grad_G, gradients_bytes);
     cudaMallocHost((void**)&grad_total, gradients_bytes);
-
 
     // GPU側のメモリ確保
     real_t* d_W_matrix = nullptr;
@@ -3894,30 +3880,16 @@ void computeEnergyGradient_RHF(const std::vector<ShellTypeInfo>& shell_type_info
     compute_W(d_W_matrix, d_coefficient_matrix, d_orbital_energies, num_basis, num_electron);
 
     // 各分子積分の微分を同時に計算
-    computeMolucularGradients(d_grad_total, d_grad_N, d_grad_S, d_grad_K, d_grad_V, d_grad_G, d_W_matrix, 
-                              shell_type_infos, shell_pair_type_infos, d_atoms, 
+    computeMolucularGradients(d_grad_total, d_grad_N, d_grad_S, d_grad_K, d_grad_V, d_grad_G, d_W_matrix,
+                              shell_type_infos, shell_pair_type_infos, d_atoms,
                               d_density_matrix, d_coefficient_matrix, d_orbital_energies, d_primitive_shells,
                               d_boys_grid, d_cgto_normalization_factors, num_atoms, num_basis, num_electron, verbose);
 
-                              
-    // CPU側へ結果コピー（方向別に）
-    cudaMemcpy(W_matrix, d_W_matrix, wmat_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(grad_N, d_grad_N, gradients_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(grad_S, d_grad_S, gradients_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(grad_K, d_grad_K, gradients_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(grad_V, d_grad_V, gradients_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(grad_G, d_grad_G, gradients_bytes, cudaMemcpyDeviceToHost);
+    // CPU側へ結果コピー
     cudaMemcpy(grad_total, d_grad_total, gradients_bytes, cudaMemcpyDeviceToHost);
 
-
-    // 結果を出力
-    // print_W_Matrix("W matrix", W_matrix, num_basis);
-    // printGradientMatrix("N-Term Gradient", grad_N, num_atoms);
-    // printGradientMatrix("S-Term Gradient", grad_S, num_atoms);
-    // printGradientMatrix("K-Term Gradient", grad_K, num_atoms);
-    // printGradientMatrix("V-Term Gradient", grad_V, num_atoms);
-    // printGradientMatrix("G-Term Gradient", grad_G, num_atoms);
-    // printGradientMatrix("Total Gradient", grad_total, num_atoms);
+    // Copy to std::vector for return
+    std::vector<double> gradient(grad_total, grad_total + n);
 
     // GPUメモリの解放
     cudaFree(d_W_matrix);
@@ -3929,16 +3901,224 @@ void computeEnergyGradient_RHF(const std::vector<ShellTypeInfo>& shell_type_info
     cudaFree(d_grad_total);
 
     // CPUメモリの解放
-    cudaFreeHost(W_matrix);
-    cudaFreeHost(grad_N);
-    cudaFreeHost(grad_S);
-    cudaFreeHost(grad_K);
-    cudaFreeHost(grad_V);
-    cudaFreeHost(grad_G);
     cudaFreeHost(grad_total);
+
+    return gradient;
 }
 
 
+
+// UHF版: 各分子積分の微分を同時に計算
+void computeMolucularGradients_UHF(double* d_grad_total, double* d_grad_N, double* d_grad_S, double* d_grad_K, double* d_grad_V, double* d_grad_G,
+                                    real_t* d_W_total, const real_t* d_D_total,
+                                    const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, const Atom* d_atoms,
+                                    const real_t* d_density_matrix_a, const real_t* d_density_matrix_b,
+                                    const PrimitiveShell* d_primitive_shells,
+                                    const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors,
+                                    const int num_atoms, const int num_basis, const bool verbose)
+{
+    const int threads_per_block = 128;
+    const int shell_type_count = shell_type_infos.size();
+
+    // 2電子部分の微分の前処理
+    std::vector<std::tuple<int, int, int, int>> shell_quadruples;
+    for (int a = 0; a < shell_type_count; ++a) {
+        for (int b = a; b < shell_type_count; ++b) {
+            for (int c = 0; c < shell_type_count; ++c) {
+                for (int d = c; d < shell_type_count; ++d) {
+                    if (a < c || (a == c && b <= d)) {
+                        shell_quadruples.emplace_back(a, b, c, d);
+                    }
+                }
+            }
+        }
+    }
+    std::reverse(shell_quadruples.begin(), shell_quadruples.end());
+
+    // multi streamの作成
+    int stream_id = 0;
+    const int num_kernels = shell_quadruples.size() + 3*((shell_type_count)*(shell_type_count+1)/2) + 1;
+    std::vector<cudaStream_t> streams(num_kernels);
+    for(int i=0; i<num_kernels; i++) {
+        cudaError_t err = cudaStreamCreate(&streams[i]);
+        if (err != cudaSuccess) {
+            THROW_EXCEPTION(std::string("Failed to create CUDA stream: ") + std::string(cudaGetErrorString(err)));
+        }
+    }
+
+    // 2電子部分の微分 (UHF版: alpha/beta密度行列を別々に渡す)
+    for(const auto& quadruple: shell_quadruples) {
+        int s0, s1, s2, s3;
+        std::tie(s0, s1, s2, s3) = quadruple;
+
+        const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+        const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+        const ShellTypeInfo shell_s2 = shell_type_infos[s2];
+        const ShellTypeInfo shell_s3 = shell_type_infos[s3];
+
+        const size_t num_bra = (s0==s1) ? shell_s0.count*(shell_s0.count+1)/2 : shell_s0.count*shell_s1.count;
+        const size_t num_ket = (s2==s3) ? shell_s2.count*(shell_s2.count+1)/2 : shell_s2.count*shell_s3.count;
+        const size_t num_braket = ((s0==s2) && (s1==s3)) ? num_bra*(num_bra+1)/2 : num_bra*num_ket;
+        const int num_blocks = (num_braket + threads_per_block - 1) / threads_per_block;
+
+        get_compute_gradients_repulsion_uhf()<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+            d_grad_G, d_density_matrix_a, d_density_matrix_b,
+            d_primitive_shells, d_cgto_normalization_factors,
+            shell_s0, shell_s1, shell_s2, shell_s3, num_braket, num_basis, d_boys_grid);
+    }
+
+    // 1電子部分の微分 (D_total, W_totalを使用 — RHFカーネルを再利用)
+    for (int s0 = shell_type_count-1; s0 >= 0; s0--) {
+        for (int s1 = shell_type_count-1; s1 >= s0; s1--) {
+            const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+            const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+
+            const int num_shell_pairs = (s0==s1) ? (shell_s0.count*(shell_s0.count+1)/2) : (shell_s0.count*shell_s1.count);
+            const int num_blocks = (num_shell_pairs + threads_per_block - 1) / threads_per_block;
+
+            get_compute_gradients_overlap()<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(d_grad_S, d_W_total, d_primitive_shells, d_cgto_normalization_factors, num_basis, shell_s0, shell_s1, num_shell_pairs);
+            get_compute_gradients_kinetic()<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(d_grad_K, d_D_total, d_primitive_shells, d_cgto_normalization_factors, num_basis, shell_s0, shell_s1, num_shell_pairs);
+            get_compute_gradients_nuclear()<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(d_grad_V, d_D_total, d_primitive_shells, d_cgto_normalization_factors, d_atoms, num_atoms, num_basis, shell_s0, shell_s1, num_shell_pairs, d_boys_grid);
+        }
+    }
+
+    const int NR_blocks = (num_atoms * num_atoms + threads_per_block - 1) / threads_per_block;
+    compute_nuclear_repulsion_gradient_kernel<<<NR_blocks, threads_per_block, 0, streams[stream_id]>>>(d_grad_N, d_atoms, num_atoms);
+
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA error: " << cudaGetErrorString(err) << std::endl;
+        abort();
+    }
+
+    for(int i=0; i<num_kernels; i++) {
+        cudaStreamDestroy(streams[i]);
+    }
+
+    // 微分の影響を合計
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    const double alpha = 1.0;
+
+    cudaMemcpy(d_grad_total, d_grad_N, sizeof(double) * 3*num_atoms, cudaMemcpyDeviceToDevice);
+    cublasDaxpy(handle, 3*num_atoms, &alpha, d_grad_S, 1, d_grad_total, 1);
+    cublasDaxpy(handle, 3*num_atoms, &alpha, d_grad_K, 1, d_grad_total, 1);
+    cublasDaxpy(handle, 3*num_atoms, &alpha, d_grad_V, 1, d_grad_total, 1);
+    cublasDaxpy(handle, 3*num_atoms, &alpha, d_grad_G, 1, d_grad_total, 1);
+
+    cublasDestroy(handle);
+}
+
+
+
+// UHF版エネルギー微分を計算する関数
+std::vector<double> computeEnergyGradient_UHF(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+                                const Atom* d_atoms,
+                                const real_t* d_density_matrix_a, const real_t* d_density_matrix_b,
+                                const real_t* d_coefficient_matrix_a, const real_t* d_coefficient_matrix_b,
+                                const real_t* d_orbital_energies_a, const real_t* d_orbital_energies_b,
+                                const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors,
+                                const int num_atoms, const int num_basis, const int num_alpha, const int num_beta, const bool verbose)
+{
+    const int n = 3*num_atoms;
+    const size_t mat_bytes = num_basis * num_basis * sizeof(real_t);
+    const size_t gradients_bytes = n * sizeof(double);
+
+    // CPU側のメモリ確保
+    double* grad_total = nullptr;
+    cudaMallocHost((void**)&grad_total, gradients_bytes);
+
+    // GPU側のメモリ確保
+    real_t* d_W_a = nullptr;
+    real_t* d_W_b = nullptr;
+    real_t* d_W_total = nullptr;
+    real_t* d_D_total = nullptr;
+    double* d_grad_N = nullptr;
+    double* d_grad_S = nullptr;
+    double* d_grad_K = nullptr;
+    double* d_grad_V = nullptr;
+    double* d_grad_G = nullptr;
+    double* d_grad_total = nullptr;
+
+    cudaMalloc(&d_W_a, mat_bytes);
+    cudaMalloc(&d_W_b, mat_bytes);
+    cudaMalloc(&d_W_total, mat_bytes);
+    cudaMalloc(&d_D_total, mat_bytes);
+    cudaMalloc(&d_grad_N, gradients_bytes);
+    cudaMalloc(&d_grad_S, gradients_bytes);
+    cudaMalloc(&d_grad_K, gradients_bytes);
+    cudaMalloc(&d_grad_V, gradients_bytes);
+    cudaMalloc(&d_grad_G, gradients_bytes);
+    cudaMalloc(&d_grad_total, gradients_bytes);
+
+    cudaMemset(d_W_a, 0, mat_bytes);
+    cudaMemset(d_W_b, 0, mat_bytes);
+    cudaMemset(d_W_total, 0, mat_bytes);
+    cudaMemset(d_grad_N, 0, gradients_bytes);
+    cudaMemset(d_grad_S, 0, gradients_bytes);
+    cudaMemset(d_grad_K, 0, gradients_bytes);
+    cudaMemset(d_grad_V, 0, gradients_bytes);
+    cudaMemset(d_grad_G, 0, gradients_bytes);
+    cudaMemset(d_grad_total, 0, gradients_bytes);
+
+    // コールスタックのサイズを増加
+    size_t stackSize = 64 * 1024;
+    cudaDeviceSetLimit(cudaLimitStackSize, stackSize);
+
+    // D_total = Da + Db
+    cudaMemcpy(d_D_total, d_density_matrix_a, mat_bytes, cudaMemcpyDeviceToDevice);
+    {
+        cublasHandle_t handle;
+        cublasCreate(&handle);
+        const double one = 1.0;
+        cublasDaxpy(handle, num_basis * num_basis, &one, d_density_matrix_b, 1, d_D_total, 1);
+        cublasDestroy(handle);
+    }
+
+    // W_a = 2 * Σ_k Ca_ik * Ca_jk * εa_k (既存カーネルは num_electron/2 でループ、結果に2.0を掛ける)
+    // W_b = 2 * Σ_k Cb_ik * Cb_jk * εb_k
+    // UHFでは W_total = Σ_k Ca_ik*Ca_jk*εa_k + Σ_k Cb_ik*Cb_jk*εb_k = (W_a + W_b) / 2
+    compute_W(d_W_a, d_coefficient_matrix_a, d_orbital_energies_a, num_basis, 2 * num_alpha);
+    compute_W(d_W_b, d_coefficient_matrix_b, d_orbital_energies_b, num_basis, 2 * num_beta);
+    {
+        cublasHandle_t handle;
+        cublasCreate(&handle);
+        const double half = 0.5;
+        // W_total = 0.5 * W_a
+        cudaMemcpy(d_W_total, d_W_a, mat_bytes, cudaMemcpyDeviceToDevice);
+        cublasDscal(handle, num_basis * num_basis, &half, d_W_total, 1);
+        // W_total += 0.5 * W_b
+        cublasDaxpy(handle, num_basis * num_basis, &half, d_W_b, 1, d_W_total, 1);
+        cublasDestroy(handle);
+    }
+
+    // 各分子積分の微分を同時に計算
+    computeMolucularGradients_UHF(d_grad_total, d_grad_N, d_grad_S, d_grad_K, d_grad_V, d_grad_G,
+                                   d_W_total, d_D_total,
+                                   shell_type_infos, shell_pair_type_infos, d_atoms,
+                                   d_density_matrix_a, d_density_matrix_b,
+                                   d_primitive_shells, d_boys_grid, d_cgto_normalization_factors,
+                                   num_atoms, num_basis, verbose);
+
+    // CPU側へ結果コピー
+    cudaMemcpy(grad_total, d_grad_total, gradients_bytes, cudaMemcpyDeviceToHost);
+    std::vector<double> gradient(grad_total, grad_total + n);
+
+    // GPUメモリの解放
+    cudaFree(d_W_a);
+    cudaFree(d_W_b);
+    cudaFree(d_W_total);
+    cudaFree(d_D_total);
+    cudaFree(d_grad_N);
+    cudaFree(d_grad_S);
+    cudaFree(d_grad_K);
+    cudaFree(d_grad_V);
+    cudaFree(d_grad_G);
+    cudaFree(d_grad_total);
+    cudaFreeHost(grad_total);
+
+    return gradient;
+}
 
 
 

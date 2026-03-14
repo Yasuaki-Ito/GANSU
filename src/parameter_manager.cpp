@@ -59,8 +59,8 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"diis_size", "8"},                         // int
         {"diis_include_transform", "0"},            // int(bool)
         {"rohf_parameter_name", "roothaan"},        // string
-        {"geometry_optimization", "0"},             // int (bool)
-        {"geometry_optimization_method", "powell"}, // string
+        {"run_type", "energy"},                      // string (energy, gradient, optimize)
+        {"optimizer", "bfgs"},                       // string (bfgs)
         {"export_sad_cache", "0"},                   // int (bool)
         {"mulliken", "0"},                          // int (bool)
         {"mayer", "0"},                             // int (bool)
@@ -79,6 +79,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"-g", "gbsfilename"},
         {"-ag", "auxiliary_gbsfilename"},
         {"-c", "charge"},
+        {"-r", "run_type"},
     };
 
     if(set_default_values){
@@ -136,17 +137,22 @@ void ParameterManager::parse_command_line_args(int argc, char* argv[]) {
         } else {
             THROW_EXCEPTION("Invalid option format: " + arg);
         }
+        // Check if the next argument is an option (--key or known short option like -m)
+        // rather than a value. This allows values starting with '-' (e.g., "-1" for charge,
+        // "cg-fr" for optimizer) to be correctly consumed as values.
+        auto next_is_option = [&]() -> bool {
+            if (i + 1 >= argc) return true; // no next argument
+            std::string next = argv[i + 1];
+            if (next.rfind("--", 0) == 0) return true; // long option
+            if (next.rfind("-", 0) == 0 && short_to_full_.find(next) != short_to_full_.end()) return true; // known short option
+            return false;
+        };
+
         // Check for a value
-        if(key == "charge"){ // ``charge'' is a special case to accept "-1" as a value
-            if (i + 1 < argc) {
-                value = argv[++i]; // Consume the next argument as the value
-            }else{
-                THROW_EXCEPTION("No value provided for parameter: " + key);
-            }
-        }else if (i + 1 < argc && argv[i + 1][0] != '-') {
+        if (!next_is_option()) {
             value = argv[++i]; // Consume the next argument as the value
         } else {
-            value = "1"; // Default to "true" for flags without values, e.g. "--verbose". "1" is used to treat it as a non-zero integer.
+            value = "1"; // Default to "true" for flags without values, e.g. "--verbose"
         }
 
 

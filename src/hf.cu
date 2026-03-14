@@ -31,6 +31,7 @@
 #include "gpu_manager.hpp"
 
 #include "profiler.hpp"
+#include "geometry_optimizer.hpp"
 
 namespace gansu{
 
@@ -66,14 +67,24 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     initial_guess_method_(parameters.get<std::string>("initial_guess")),
     convergence_energy_threshold(parameters.get<double>("convergence_energy_threshold")),
     schwarz_screening_threshold(parameters.get<double>("schwarz_screening_threshold")),
-    geometry_optimization(parameters.get<int>("geometry_optimization")),
-    geometry_optimization_method(parameters.get<std::string>("geometry_optimization_method")),
+    run_type_(parameters.get<std::string>("run_type")),
+    optimizer_(parameters.get<std::string>("optimizer")),
     post_hf_energy_(0.0),
     is_mulliken_analysis_(parameters.get<bool>("mulliken")),
     is_mayer_bond_order_analysis_(parameters.get<bool>("mayer")),
     is_wiberg_bond_order_analysis_(parameters.get<bool>("wiberg")),
     is_export_molden_(parameters.get<bool>("export_molden"))
 {
+    // Validate run_type
+    if(run_type_ != "energy" && run_type_ != "gradient" && run_type_ != "optimize"){
+        throw std::runtime_error("Invalid run_type: '" + run_type_ + "'. Must be 'energy', 'gradient', or 'optimize'.");
+    }
+
+    // Validate optimizer
+    if(!GeometryOptimizer::is_valid_optimizer(optimizer_)){
+        throw std::runtime_error("Invalid optimizer: '" + optimizer_ + "'. Valid options: bfgs, dfp, sr1, gdiis, cg-fr, cg-pr, cg-hs, cg-dy, sd");
+    }
+
     // Set the post-HF method
     std::string post_hf_method_str = parameters.get<std::string>("post_hf_method");
     if(post_hf_method_str == "none"){
@@ -329,13 +340,15 @@ real_t HF::single_point_energy(const real_t* density_matrix_alpha, const real_t*
         // check convergence
         energy_difference_ = std::abs(energy - prev_energy);
 
-        std::cout << "---- Iteration: " << iter_ << " ----  ";
-        std::cout << "Energy: " << std::setprecision(17) << energy << " ";
-        std::cout << "Total energy: " << std::setprecision(17) << get_total_energy() << " ";
-        if(iter_ > 0){
-            std::cout << "Energy difference: " << std::setprecision(10) << energy_difference_ << " ";
+        if(run_type_ != "optimize"){
+            std::cout << "---- Iteration: " << iter_ << " ----  ";
+            std::cout << "Energy: " << std::setprecision(17) << energy << " ";
+            std::cout << "Total energy: " << std::setprecision(17) << get_total_energy() << " ";
+            if(iter_ > 0){
+                std::cout << "Energy difference: " << std::setprecision(10) << energy_difference_ << " ";
+            }
+            std::cout << std::endl;
         }
-        std::cout << std::endl;
 
         if(energy_difference_ < convergence_energy_threshold){
             break;
@@ -353,94 +366,316 @@ real_t HF::single_point_energy(const real_t* density_matrix_alpha, const real_t*
 
     solve_time_in_milliseconds_ = timer.elapsed_milliseconds();
 
-    GlobalProfiler::report(); // Print the profiling results
+    if(run_type_ != "optimize"){
+        GlobalProfiler::report(); // Print the profiling results
+    }
     
     return get_total_energy();
 }
 
 real_t HF::solve(const real_t* density_matrix_alpha, const real_t* density_matrix_beta, bool force_density){
-    if(geometry_optimization == 0){
-        // Single point energy calculation
-        return single_point_energy(density_matrix_alpha, density_matrix_beta, force_density);
-    }else{
-        std::cout << "[Geometry optimization]" << std::endl;
+    if(run_type_ == "optimize"){
+        std::cout << std::endl;
+        std::cout << "============================================================" << std::endl;
+        std::string opt_upper = optimizer_;
+        std::transform(opt_upper.begin(), opt_upper.end(), opt_upper.begin(), ::toupper);
+        std::cout << "              Geometry Optimization (" << opt_upper << ")                  " << std::endl;
+        std::cout << "============================================================" << std::endl;
 
-        // Geometry optimization calculation
-        const real_t step_size = 0.01; // step size for geometry optimization
-        //const real_t threshold = 1.0e-6; // convergence threshold for geometry optimization
-        const int max_iter = 100; // maximum number of iterations for geometry optimization
+        GlobalProfiler::setSilent(true); // Suppress profiler output during optimization
 
+        const int max_iter = 200;
+        const double grad_threshold = 3.0e-4;    // max gradient component (Hartree/Bohr)
+        const double rms_grad_threshold = 2.0e-4; // RMS gradient (Hartree/Bohr)
+        const double energy_threshold = 1.0e-6;   // energy change (Hartree)
+        const double disp_threshold = 3.0e-4;     // max displacement (Bohr)
+        const double step_max = 0.3;               // trust radius (Bohr)
 
-        // compute the initial energy and store the density matrices
-//        real_t prev_energy = single_point_energy(density_matrix_alpha, density_matrix_beta, false); // compute the initial energy
-        real_t prev_energy = single_point_energy(); // compute the initial energy
-        std::vector<double> prev_density_matrix_alpha(num_basis * num_basis);
-        std::vector<double> prev_density_matrix_beta(num_basis * num_basis);
-        export_density_matrix(prev_density_matrix_alpha.data(), prev_density_matrix_beta.data(), num_basis);
+        // Initial SCF
+        real_t energy = single_point_energy(density_matrix_alpha, density_matrix_beta, force_density);
 
-        for(size_t i=0; i<num_basis; i++){
-            
-            for(size_t j=0; j<num_basis; j++){
-                std::cout << "[Geometry optimization] Density matrix alpha: " << prev_density_matrix_alpha[i*num_basis+j] << std::endl;
-                std::cout << "[Geometry optimization] Density matrix beta: " << prev_density_matrix_beta[i*num_basis+j] << std::endl;
+        atoms.toHost();
+        int num_atoms_val = static_cast<int>(atoms.size());
+        int ndim = 3 * num_atoms_val; // dimension of coordinate/gradient vector
+
+        // Create optimizer
+        auto optimizer = GeometryOptimizer::create(optimizer_, ndim);
+
+        // Initial gradient
+        std::vector<double> grad = compute_Energy_Gradient();
+        if(grad.empty()){
+            std::cout << "Gradient not available for this method. Aborting optimization." << std::endl;
+            return energy;
+        }
+
+        // Extract current coordinates as flat vector
+        auto atoms_to_coords = [&](const std::vector<Atom>& atom_list) -> std::vector<double> {
+            std::vector<double> coords(ndim);
+            for(int i = 0; i < num_atoms_val; i++){
+                coords[3*i + 0] = atom_list[i].coordinate.x;
+                coords[3*i + 1] = atom_list[i].coordinate.y;
+                coords[3*i + 2] = atom_list[i].coordinate.z;
             }
-        }
+            return coords;
+        };
 
-        atoms.toHost(); // copy the atoms to the host memory
-        std::vector<Atom> atom_list(atoms.size()); 
-        for(size_t i=0; i<atoms.size(); i++){        // copy the atoms to the host memory
-            atom_list[i] = atoms[i]; // copy the atoms to the host memory
-        }
-        for(size_t i=0; i<atom_list.size(); i++){
-            std::cout << "[Geometry optimization] Atom: " << atomic_number_to_element_name(atom_list[i].atomic_number) << " (" << atom_list[i].coordinate.x << ", " << atom_list[i].coordinate.y << ", " << atom_list[i].coordinate.z << ")" << std::endl;
-        }
+        auto coords_to_atoms = [&](const std::vector<double>& coords) -> std::vector<Atom> {
+            atoms.toHost();
+            std::vector<Atom> atom_list(num_atoms_val);
+            for(int i = 0; i < num_atoms_val; i++){
+                atom_list[i] = atoms[i];
+                atom_list[i].coordinate.x = coords[3*i + 0];
+                atom_list[i].coordinate.y = coords[3*i + 1];
+                atom_list[i].coordinate.z = coords[3*i + 2];
+            }
+            return atom_list;
+        };
 
-        for(int iter=0; iter<max_iter; iter++){
-            std::cout << "[Geometry optimization] loop: " << iter << " ------------------------------------" << std::endl;
-            bool improved = false;
+        atoms.toHost();
+        std::vector<Atom> current_atoms(num_atoms_val);
+        for(int i = 0; i < num_atoms_val; i++) current_atoms[i] = atoms[i];
+        std::vector<double> coords = atoms_to_coords(current_atoms);
 
-            for(int atom_index=0; atom_index<atom_list.size(); atom_index++){
-                // update the position of the atom
-                for(int dim=0; dim<3; dim++){
-                    for(real_t direction: {+1.0, -1.0}){
-                        Atom atom_moved = atom_list[atom_index];
-                        std::cout << "[Geometry optimization] " << "dimension: " << dim << " direction: " << direction << std::endl;
-                        real_t moved = direction * step_size;
-                        if(dim==0){
-                            atom_moved.coordinate.x += moved;
-                        }else if(dim==1){
-                            atom_moved.coordinate.y += moved;
-                        }else if(dim==2){
-                            atom_moved.coordinate.z += moved;
-                        }
-                        auto atoms_moved = atom_list;
-                        atoms_moved[atom_index] = atom_moved; // update the atom position
-                        update_geometry(atoms_moved); // update the geometry of the atoms
-                        //real_t new_energy = single_point_energy(prev_density_matrix_alpha.data(), prev_density_matrix_beta.data(), true); // compute the new energy by the density matrix initialization 
-                        real_t new_energy = single_point_energy(); // compute the new energy by the density matrix initialization 
+        // --- Project out translational and rotational components from a vector ---
+        auto project_out_tr = [&](std::vector<double>& v, const std::vector<double>& r){
+            int N = num_atoms_val;
+            std::vector<std::vector<double>> basis(6, std::vector<double>(ndim, 0.0));
 
-                        for(auto& atom: atoms_moved){
-                            std::cout << "[Geometry optimization] Atom: " << atomic_number_to_element_name(atom.atomic_number) << " (" << atom.coordinate.x << ", " << atom.coordinate.y << ", " << atom.coordinate.z << ")" << std::endl;
-                        }
-                        std::cout << "[Geometry optimization] Prev energy: " << prev_energy << std::endl;
-                        std::cout << "[Geometry optimization] New energy: " << new_energy << std::endl;
-                        
-                        if(new_energy < prev_energy /* - threshold*/){
-                            std::cout << "[Geometry optimization] Energy improved!" << std::endl;
-                            atom_list = atoms_moved;
-                            prev_energy = new_energy;
-                            export_density_matrix(prev_density_matrix_alpha.data(), prev_density_matrix_beta.data(), num_basis);
-                            improved = true;
-                            break;
-                        }else{
-                            update_geometry(atom_list); // restore the geometry of the atoms
-                        }
+            for(int i = 0; i < N; i++){
+                basis[0][3*i + 0] = 1.0;
+                basis[1][3*i + 1] = 1.0;
+                basis[2][3*i + 2] = 1.0;
+            }
+
+            double cx = 0, cy = 0, cz = 0;
+            for(int i = 0; i < N; i++){
+                cx += r[3*i+0]; cy += r[3*i+1]; cz += r[3*i+2];
+            }
+            cx /= N; cy /= N; cz /= N;
+
+            for(int i = 0; i < N; i++){
+                double x = r[3*i+0] - cx;
+                double y = r[3*i+1] - cy;
+                double z = r[3*i+2] - cz;
+                basis[3][3*i + 1] = -z;
+                basis[3][3*i + 2] =  y;
+                basis[4][3*i + 0] =  z;
+                basis[4][3*i + 2] = -x;
+                basis[5][3*i + 0] = -y;
+                basis[5][3*i + 1] =  x;
+            }
+
+            std::vector<std::vector<double>> ortho_basis;
+            for(int k = 0; k < 6; k++){
+                auto& bk = basis[k];
+                for(const auto& ob : ortho_basis){
+                    double dot = 0.0;
+                    for(int i = 0; i < ndim; i++) dot += bk[i] * ob[i];
+                    for(int i = 0; i < ndim; i++) bk[i] -= dot * ob[i];
+                }
+                double norm = 0.0;
+                for(int i = 0; i < ndim; i++) norm += bk[i] * bk[i];
+                norm = std::sqrt(norm);
+                if(norm < 1.0e-10) continue;
+                for(int i = 0; i < ndim; i++) bk[i] /= norm;
+                ortho_basis.push_back(bk);
+            }
+
+            for(const auto& ek : ortho_basis){
+                double dot = 0.0;
+                for(int i = 0; i < ndim; i++) dot += v[i] * ek[i];
+                for(int i = 0; i < ndim; i++) v[i] -= dot * ek[i];
+            }
+        };
+
+        // Initialize optimizer and project out TR from initial gradient
+        optimizer->initialize(coords, grad);
+        project_out_tr(grad, coords);
+
+        for(int iter = 0; iter < max_iter; iter++){
+            // --- Print status ---
+            double max_grad = 0.0, rms_grad = 0.0;
+            for(int i = 0; i < ndim; i++){
+                double g = std::abs(grad[i]);
+                if(g > max_grad) max_grad = g;
+                rms_grad += grad[i] * grad[i];
+            }
+            rms_grad = std::sqrt(rms_grad / ndim);
+
+            std::cout << std::endl;
+            std::cout << "--- Geometry Optimization Step " << iter << " ---" << std::endl;
+            std::cout << std::fixed << std::setprecision(12);
+            std::cout << "Energy: " << energy << " Hartree" << std::endl;
+            std::cout << std::scientific << std::setprecision(6);
+            std::cout << "Max gradient: " << max_grad << " Hartree/Bohr" << std::endl;
+            std::cout << "RMS gradient: " << rms_grad << " Hartree/Bohr" << std::endl;
+
+            // --- Check gradient convergence ---
+            if(max_grad < grad_threshold && rms_grad < rms_grad_threshold){
+                std::cout << std::endl;
+                std::cout << "============================================================" << std::endl;
+                std::cout << "         Geometry Optimization Converged!                   " << std::endl;
+                std::cout << "============================================================" << std::endl;
+                std::cout << std::fixed << std::setprecision(12);
+                std::cout << "Final energy: " << energy << " Hartree" << std::endl;
+                std::cout << "Iterations: " << iter << std::endl;
+                std::cout << std::endl;
+                std::cout << "Optimized Geometry (Bohr):" << std::endl;
+                for(int i = 0; i < num_atoms_val; i++){
+                    std::cout << std::setw(4) << atomic_number_to_element_name(current_atoms[i].atomic_number)
+                              << std::setw(16) << std::setprecision(10) << std::fixed << coords[3*i+0]
+                              << std::setw(16) << coords[3*i+1]
+                              << std::setw(16) << coords[3*i+2] << std::endl;
+                }
+                std::cout << std::defaultfloat;
+                return energy;
+            }
+
+            // --- Compute search direction ---
+            std::vector<double> p = optimizer->compute_search_direction(coords, grad);
+            project_out_tr(p, coords);
+
+            // --- Apply trust radius (scale p if too large) ---
+            double max_disp = 0.0;
+            for(int i = 0; i < num_atoms_val; i++){
+                double disp = std::sqrt(p[3*i]*p[3*i] + p[3*i+1]*p[3*i+1] + p[3*i+2]*p[3*i+2]);
+                if(disp > max_disp) max_disp = disp;
+            }
+            if(max_disp > step_max){
+                double scale = step_max / max_disp;
+                for(int i = 0; i < ndim; i++) p[i] *= scale;
+                max_disp = step_max;
+            }
+
+            // --- Step: line search or direct step ---
+            double alpha = 1.0;
+            real_t new_energy = energy;
+            std::vector<double> new_coords(ndim);
+
+            if(optimizer->use_line_search()){
+                // Armijo backtracking line search
+                double gp = 0.0;
+                for(int i = 0; i < ndim; i++) gp += grad[i] * p[i];
+
+                const double c1 = 1.0e-4;
+                const int max_ls = 10;
+
+                for(int ls = 0; ls < max_ls; ls++){
+                    for(int i = 0; i < ndim; i++)
+                        new_coords[i] = coords[i] + alpha * p[i];
+                    auto new_atom_list = coords_to_atoms(new_coords);
+                    update_geometry(new_atom_list);
+                    new_energy = single_point_energy();
+
+                    if(new_energy <= energy + c1 * alpha * gp){
+                        break;
                     }
-               }
+                    alpha *= 0.5;
+                    if(ls == max_ls - 1){
+                        std::cout << "Line search: using smallest step (alpha=" << alpha << ")" << std::endl;
+                    }
+                }
+            } else {
+                // Direct step (GDIIS)
+                for(int i = 0; i < ndim; i++)
+                    new_coords[i] = coords[i] + p[i];
+                auto new_atom_list = coords_to_atoms(new_coords);
+                update_geometry(new_atom_list);
+                new_energy = single_point_energy();
             }
-            if(!improved) break;
+
+            double delta_e = new_energy - energy;
+
+            // Recompute max displacement with actual alpha
+            max_disp = 0.0;
+            for(int i = 0; i < num_atoms_val; i++){
+                double dx = new_coords[3*i] - coords[3*i];
+                double dy = new_coords[3*i+1] - coords[3*i+1];
+                double dz = new_coords[3*i+2] - coords[3*i+2];
+                double disp = std::sqrt(dx*dx + dy*dy + dz*dz);
+                if(disp > max_disp) max_disp = disp;
+            }
+
+            std::cout << "Max displacement: " << max_disp << " Bohr" << std::endl;
+            std::cout << "Energy change: " << delta_e << " Hartree" << std::endl;
+
+            // --- Compute new gradient and project out TR ---
+            std::vector<double> new_grad = compute_Energy_Gradient();
+            project_out_tr(new_grad, new_coords);
+
+            // --- Update optimizer state ---
+            std::vector<double> s(ndim), y(ndim);
+            for(int i = 0; i < ndim; i++){
+                s[i] = new_coords[i] - coords[i];
+                y[i] = new_grad[i] - grad[i];
+            }
+            optimizer->step_completed(s, y, new_grad);
+
+            // --- Accept step ---
+            energy = new_energy;
+            coords = new_coords;
+            grad = new_grad;
+            current_atoms = coords_to_atoms(new_coords);
+
+            // --- Check energy/displacement convergence ---
+            if(std::abs(delta_e) < energy_threshold && max_disp < disp_threshold){
+                std::cout << std::endl;
+                std::cout << "============================================================" << std::endl;
+                std::cout << "         Geometry Optimization Converged!                   " << std::endl;
+                std::cout << "============================================================" << std::endl;
+                std::cout << std::fixed << std::setprecision(12);
+                std::cout << "Final energy: " << energy << " Hartree" << std::endl;
+                std::cout << "Iterations: " << iter + 1 << std::endl;
+                std::cout << std::endl;
+                std::cout << "Optimized Geometry (Bohr):" << std::endl;
+                for(int i = 0; i < num_atoms_val; i++){
+                    std::cout << std::setw(4) << atomic_number_to_element_name(current_atoms[i].atomic_number)
+                              << std::setw(16) << std::setprecision(10) << std::fixed << coords[3*i+0]
+                              << std::setw(16) << coords[3*i+1]
+                              << std::setw(16) << coords[3*i+2] << std::endl;
+                }
+                std::cout << std::defaultfloat;
+                return energy;
+            }
         }
-        return prev_energy;
+
+        std::cout << std::endl;
+        std::cout << "WARNING: Geometry optimization did not converge in " << max_iter << " iterations." << std::endl;
+        std::cout << std::fixed << std::setprecision(12);
+        std::cout << "Current energy: " << energy << " Hartree" << std::endl;
+        std::cout << std::defaultfloat;
+        return energy;
+    } else {
+        // energy or gradient mode
+        real_t energy = single_point_energy(density_matrix_alpha, density_matrix_beta, force_density);
+
+        if(run_type_ == "gradient"){
+            std::vector<double> grad = compute_Energy_Gradient();
+            if(!grad.empty()){
+                atoms.toHost();
+                int num_atoms_val = static_cast<int>(atoms.size());
+                std::cout << std::endl;
+                std::cout << "============================================================" << std::endl;
+                std::cout << "                   Energy Gradient                          " << std::endl;
+                std::cout << "============================================================" << std::endl;
+                std::cout << std::scientific << std::setprecision(10);
+                std::cout << std::setw(6) << "Atom"
+                          << std::setw(20) << "dE/dx"
+                          << std::setw(20) << "dE/dy"
+                          << std::setw(20) << "dE/dz" << std::endl;
+                for(int i = 0; i < num_atoms_val; i++){
+                    std::cout << std::setw(4) << atomic_number_to_element_name(atoms[i].atomic_number)
+                              << "  " << std::setw(18) << grad[3*i+0]
+                              << std::setw(20) << grad[3*i+1]
+                              << std::setw(20) << grad[3*i+2] << std::endl;
+                }
+                std::cout << std::defaultfloat;
+            } else {
+                std::cout << "Gradient not available for this method." << std::endl;
+            }
+        }
+
+        return energy;
     }
 }
 
@@ -485,11 +720,9 @@ void HF::report(){
 
 void HF::update_geometry(const std::vector<Atom>& moved_atoms){
     // update the geometry of the atoms
-    atoms.toHost(); // copy the atoms to the host memory
+    atoms.toHost();
     for(size_t i=0; i<atoms.size(); i++){
-        std::cout << "[Geometry optimization] Before Atom: " << atomic_number_to_element_name(atoms[i].atomic_number) << " (" << atoms[i].coordinate.x << ", " << atoms[i].coordinate.y << ", " << atoms[i].coordinate.z << ")" << std::endl;
-        atoms[i] = moved_atoms[i]; // update the atoms in the host memory
-        std::cout << "[Geometry optimization] Moved  Atom: " << atomic_number_to_element_name(atoms[i].atomic_number) << " (" << atoms[i].coordinate.x << ", " << atoms[i].coordinate.y << ", " << atoms[i].coordinate.z << ")" << std::endl;
+        atoms[i] = moved_atoms[i];
     }
     atoms.toDevice();
 
@@ -498,11 +731,7 @@ void HF::update_geometry(const std::vector<Atom>& moved_atoms){
     for(size_t i=0; i<primitive_shells.size(); i++){
         for(int atom_index=0; atom_index<atoms.size(); atom_index++){
             if(primitive_shells[i].atom_index == atom_index){
-                std::cout << "[Geometry optimization] Before Primitive Shell: " << " (" << primitive_shells[i].coordinate.x << ", " << primitive_shells[i].coordinate.y << ", " << primitive_shells[i].coordinate.z << ")" << std::endl;
-
-                primitive_shells[i].coordinate = atoms[atom_index].coordinate; // update the coordinate of the primitive shell
-
-                std::cout << "[Geometry optimization] Moved Primitive Shell: " <<  " (" << primitive_shells[i].coordinate.x << ", " << primitive_shells[i].coordinate.y << ", " << primitive_shells[i].coordinate.z << ")" << std::endl;
+                primitive_shells[i].coordinate = atoms[atom_index].coordinate;
             }
         }
     }

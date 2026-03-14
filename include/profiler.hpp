@@ -59,7 +59,14 @@ public:
      */
     static void displayElapsedTime(const std::string& label = "");
 
+    /**
+     * @brief Suppress console output (timing logs) while still recording times.
+     */
+    static void setSilent(bool silent) { silent_ = silent; }
+    static bool isSilent() { return silent_; }
+
 private:
+    static bool silent_; ///< When true, suppress timing output to console
     static std::chrono::high_resolution_clock::time_point programStartTime; ///< Program start time
     static std::unordered_map<std::string, std::chrono::high_resolution_clock::time_point> startTimes; ///< Start times for each function
     static std::unordered_map<std::string, long long> executionTimes; ///< Accumulated execution times for each function

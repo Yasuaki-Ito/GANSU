@@ -374,10 +374,28 @@ void UHF::export_density_matrix(real_t* density_matrix_a, real_t* density_matrix
  * @brief Compute the gradient of the total electronic energy
  * @details This function calculates the gradient of the total electronic energy with respect to nuclear coordinates.
  */
-void UHF::compute_Energy_Gradient() {
+std::vector<double> UHF::compute_Energy_Gradient() {
     PROFILE_FUNCTION();
-    // Compute the gradient of the total electronic energy
-    // gpu::computeEnergyGradient_UHF(shell_type_infos, shell_pair_type_infos, atoms.device_ptr(), density_matrix.device_ptr(), coefficient_matrix.device_ptr(), orbital_energies.device_ptr(), primitive_shells.device_ptr(), boys_grid.device_ptr(), cgto_normalization_factors.device_ptr(), atoms.size(), num_basis, num_electrons, verbose);
+
+    return gpu::computeEnergyGradient_UHF(
+        shell_type_infos,
+        shell_pair_type_infos,
+        atoms.device_ptr(),
+        density_matrix_a.device_ptr(),
+        density_matrix_b.device_ptr(),
+        coefficient_matrix_a.device_ptr(),
+        coefficient_matrix_b.device_ptr(),
+        orbital_energies_a.device_ptr(),
+        orbital_energies_b.device_ptr(),
+        primitive_shells.device_ptr(),
+        boys_grid.device_ptr(),
+        cgto_normalization_factors.device_ptr(),
+        static_cast<int>(atoms.size()),
+        num_basis,
+        num_alpha_spins,
+        num_beta_spins,
+        verbose
+    );
 }
 
 

@@ -39,8 +39,7 @@ using namespace gansu;
  * @details This function reads the command line arguments and calls the RHF or UHF class.
  */
 int main(int argc, char* argv[]){
-  
-
+  try {
     ParameterManager parameters;
     parameters.parse_command_line_args(argc, argv); // Parse the command line arguments
 
@@ -49,8 +48,6 @@ int main(int argc, char* argv[]){
     hf->solve(); // Solve the HF equation (SCF procedure)
     hf->report(); // Print the HF results
 
-    // hf->compute_Energy_Gradient(); // Calculate the gradient of the stotal electronic energy
-    
     // Export the SAD density matrix to a file
     if (parameters.contains("export_sad_cache")) {
         std::cout << "Exporting SAD cache to 'temp_sad_cache.dat'..." << std::endl;
@@ -58,7 +55,10 @@ int main(int argc, char* argv[]){
         std::cout << "SAD cache exported successfully." << std::endl;
     }
 
-
     return 0;
 
+  } catch (const std::exception& e) {
+    std::cerr << "Error: " << e.what() << std::endl;
+    return 1;
+  }
 }

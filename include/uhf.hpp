@@ -59,7 +59,7 @@ public:
     void compute_coefficient_matrix_impl() override;
     void compute_energy() override;
     void update_fock_matrix() override;
-    void compute_Energy_Gradient() override;
+    std::vector<double> compute_Energy_Gradient() override;
 
     real_t get_energy() const override { return energy_; }
 
@@ -666,7 +666,9 @@ public:
             return {density_matrix_alpha.data(), density_matrix_beta.data()};
         }
 
-        std::cout << "------ [SAD] Computing density matrix for : " << atomic_number_to_element_name(atomic_number) << " ------" << std::endl;
+        if(hf_.get_run_type() != "optimize"){
+            std::cout << "------ [SAD] Computing density matrix for : " << atomic_number_to_element_name(atomic_number) << " ------" << std::endl;
+        }
 
         ParameterManager parameters;
         parameters.set_default_values_to_unspecified_parameters();
@@ -746,7 +748,9 @@ public:
         for(int i=0; i<hf_.get_atoms().size(); i++){
             const std::string element_name = atomic_number_to_element_name(hf_.get_atoms()[i].atomic_number);
 
-            std::cout << " [SAD] Loading density matrix for : " << element_name  << std::endl;
+            if(hf_.get_run_type() != "optimize"){
+                std::cout << " [SAD] Loading density matrix for : " << element_name  << std::endl;
+            }
 
             int atom_num_basis;
             auto [atom_density_matrix_alpha, atom_density_matrix_beta] = read_density_from_sad(element_name, hf_.get_gbsfilename(), atom_num_basis);

@@ -324,10 +324,10 @@ void ROHF::export_density_matrix(real_t* density_matrix_a, real_t* density_matri
  * @brief Compute the gradient of the total electronic energy
  * @details This function calculates the gradient of the total electronic energy with respect to nuclear coordinates.
  */
-void ROHF::compute_Energy_Gradient() {
+std::vector<double> ROHF::compute_Energy_Gradient() {
     PROFILE_FUNCTION();
-    // Compute the gradient of the total electronic energy
-    // gpu::computeEnergyGradient_ROHF(shell_type_infos, shell_pair_type_infos, atoms.device_ptr(), density_matrix.device_ptr(), coefficient_matrix.device_ptr(), orbital_energies.device_ptr(), primitive_shells.device_ptr(), boys_grid.device_ptr(), cgto_normalization_factors.device_ptr(), atoms.size(), num_basis, num_electrons, verbose);
+    // ROHF gradient not yet implemented
+    return {};
 }
 
 /**

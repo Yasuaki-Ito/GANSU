@@ -27,6 +27,12 @@ Parameters excluding file paths are not case-sensitive.
 | diis_size | Number of previous Fock matrices to store | int | 8 |
 | diis_include_transform | Include the transformation matrix in DIIS | bool | false |
 | rohf_parameter_name | ROHF parameter set name | string | Roothaan |
+| run_type | Type of calculation to perform | string | energy |
+| optimizer | Optimization algorithm for geometry optimization | string | bfgs |
+| mulliken | Perform Mulliken population analysis | bool | false |
+| mayer | Perform Mayer bond order analysis | bool | false |
+| wiberg | Perform Wiberg bond order analysis | bool | false |
+| export_molden | Output Molden file | bool | false |
 
 
 
@@ -209,6 +215,59 @@ Otherwise, the two-electron repulsion integrals (ERIs) are set to zero.
 | Binkley-Pople-Dobosh |  \f$1/2\f$     |  \f$1/2\f$     |  \f$1\f$       |  \f$0\f$       |  \f$0\f$       |  \f$1\f$       | 
 | Faegri-Manne |  \f$1/2\f$     |  \f$1/2\f$     |  \f$1\f$       |  \f$0\f$       |  \f$1/2\f$     |  \f$1/2\f$     |
 | Goddard |  \f$1/2\f$     |  \f$1/2\f$     |  \f$1/2\f$     |  \f$0\f$       |  \f$1/2\f$     |  \f$1/2\f$     |
-| Plakhutin-Gorelik-Breslavskaya |  \f$0\f$       |  \f$1\f$       |  \f$1\f$       |  \f$0\f$       |  \f$1\f$       |  \f$0\f$       | 
+| Plakhutin-Gorelik-Breslavskaya |  \f$0\f$       |  \f$1\f$       |  \f$1\f$       |  \f$0\f$       |  \f$1\f$       |  \f$0\f$       |
 
+
+## Geometry optimization parameters
+
+| Parameter | Short | Description | Type | Default |
+| --- | --- | --- | --- | --- |
+| run_type | -r | Type of calculation | string | energy |
+| optimizer | | Optimization algorithm | string | bfgs |
+
+#### run_type - Type of calculation to perform
+
+* default: energy
+* energy - Single-point energy calculation only
+* gradient - Single-point energy calculation followed by energy gradient evaluation
+* optimize - Geometry optimization using analytical energy gradients
+
+#### optimizer - Optimization algorithm for geometry optimization
+
+* default: bfgs
+
+This parameter is used only when `run_type` is set to `optimize`.
+
+##### Quasi-Newton methods
+
+| Value | Algorithm | Description |
+| --- | --- | --- |
+| bfgs | Broyden-Fletcher-Goldfarb-Shanno | Most robust. Maintains positive definiteness. |
+| dfp | Davidon-Fletcher-Powell | Dual of BFGS. Generally less robust. |
+| sr1 | Symmetric Rank-1 | Can capture negative curvature. Useful for transition state searches. |
+
+##### Conjugate gradient methods
+
+| Value | Algorithm | \f$\beta_k\f$ |
+| --- | --- | --- |
+| cg-fr | Fletcher-Reeves | \f$\beta_k = \|\mathbf{g}_{k+1}\|^2 / \|\mathbf{g}_k\|^2\f$ |
+| cg-pr | Polak-Ribière | \f$\beta_k = \mathbf{g}_{k+1}^T(\mathbf{g}_{k+1} - \mathbf{g}_k) / \|\mathbf{g}_k\|^2\f$ |
+| cg-hs | Hestenes-Stiefel | \f$\beta_k = \mathbf{g}_{k+1}^T(\mathbf{g}_{k+1} - \mathbf{g}_k) / \mathbf{d}_k^T(\mathbf{g}_{k+1} - \mathbf{g}_k)\f$ |
+| cg-dy | Dai-Yuan | \f$\beta_k = \|\mathbf{g}_{k+1}\|^2 / \mathbf{d}_k^T(\mathbf{g}_{k+1} - \mathbf{g}_k)\f$ |
+
+##### Other methods
+
+| Value | Algorithm | Description |
+| --- | --- | --- |
+| gdiis | Geometry DIIS | BFGS + DIIS extrapolation. No line search. |
+| sd | Steepest Descent | Simplest method. Slow convergence. For debugging. |
+
+### Convergence criteria
+
+| Criterion | Threshold | Description |
+| --- | --- | --- |
+| Max gradient | \f$3.0 \times 10^{-4}\f$ Hartree/Bohr | Maximum gradient component |
+| RMS gradient | \f$2.0 \times 10^{-4}\f$ Hartree/Bohr | Root mean square of gradient |
+| Energy change | \f$1.0 \times 10^{-6}\f$ Hartree | Absolute energy change between steps |
+| Max displacement | \f$3.0 \times 10^{-4}\f$ Bohr | Maximum atomic displacement |
 
