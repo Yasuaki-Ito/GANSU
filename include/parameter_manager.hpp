@@ -147,7 +147,6 @@ public:
         return result;
     }
 
-
     /**
      * @brief Returns a list of all keys stored in the parameter manager.
      *
@@ -208,6 +207,17 @@ private:
     }
 };
 
+// Specialization for std::string: return raw value without stream extraction
+// (stream extraction fails on empty strings)
+template <>
+inline std::string ParameterManager::get<std::string>(const std::string& key) const {
+    std::string key_lower = toLowerCase(key);
+    auto it = parameters_.find(key_lower);
+    if (it == parameters_.end()) {
+        THROW_EXCEPTION("Parameter not found: " + key_lower);
+    }
+    return it->second;
+}
 
 
 } // namespace gansu

@@ -79,17 +79,21 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
         }
         set_eri_method(std::move(eri_stored));
     }else if(eri_method == "ri"){ // Resolution of Identity (RI) method
-        const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename"); // auxiliary basis set file name
-        Molecular auxiliary_molecular(molecular.get_atoms(), auxiliary_gbsfilename); // auxiliary molecular object
+        const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename");
+        BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);
+        Molecular auxiliary_molecular(molecular.get_atoms(), aux_basis);
+        std::cout << "[RI] Auxiliary basis: " << auxiliary_molecular.get_num_basis() << " functions" << std::endl;
         set_eri_method(std::make_unique<ERI_RI_RHF>(*this, auxiliary_molecular));
     }else if(eri_method == "direct"){
         set_eri_method(std::make_unique<ERI_Direct_RHF>(*this));
     }else if(eri_method == "hash"){
         set_eri_method(std::make_unique<ERI_Hash_RHF>(*this));
     }else if(eri_method == "direct_ri"){
-        const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename"); // auxiliary basis set file name
-        Molecular auxiliary_molecular(molecular.get_atoms(), auxiliary_gbsfilename); // auxiliary molecular object
-        set_eri_method(std::make_unique<ERI_RI_Direct_RHF>(*this,  auxiliary_molecular));
+        const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename");
+        BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);
+        Molecular auxiliary_molecular(molecular.get_atoms(), aux_basis);
+        std::cout << "[RI] Auxiliary basis: " << auxiliary_molecular.get_num_basis() << " functions" << std::endl;
+        set_eri_method(std::make_unique<ERI_RI_Direct_RHF>(*this, auxiliary_molecular));
     }else{
         THROW_EXCEPTION("Invalid ERI method name: " + eri_method);
     }

@@ -10,7 +10,7 @@
 | parameter_file | Parameter recipe file (command line only) | string | |
 | xyzfilename | XYZ file | string | |
 | gbsfilename | Gaussian basis set file | string | |
-| auxiliary_gbsfilename | Path to auxiliary Gaussian basis set file for RI approximation| string | |
+| auxiliary_gbsfilename | Path to auxiliary Gaussian basis set file for RI approximation (auto-generated if omitted) | string | |
 | verbose | Verbose mode | bool | false |
 | method | Method to use (RHF, UHF, ROHF) | string | RHF |
 | charge | Charge of the molecule | int | 0 |
@@ -167,6 +167,17 @@ If any of the following conditions are met, an exception is thrown:
 * RI - Resolution of the Identity (RI) approximation is used for the two-electron repulsion integrals (ERIs)
 * Direct - Direct calculation of the two-electron repulsion integrals (ERIs) without any approximation (Direct-SCF)
 * Direct_RI - Resolution of the Identity (RI) approximation, but three-center ERIs are directly computed without storing
+
+#### auxiliary_gbsfilename - Auxiliary basis set file for RI approximation
+* default: (empty)
+* When `eri_method` is `RI` or `Direct_RI`, an auxiliary basis set is required.
+* If a file path is specified (e.g., `-ag ../auxiliary_basis/cc-pvdz-rifit.gbs`), the auxiliary basis is loaded from the file.
+* If omitted, the auxiliary basis is **automatically generated** from the primary basis using the product basis approach:
+  1. Collect all primitive Gaussian exponents $\{\alpha_i\}$ from the primary basis for each element
+  2. Generate pairwise sums $\alpha_i + \alpha_j$ ($i \le j$)
+  3. Remove near-duplicate exponents (keep only if consecutive exponents differ by a factor of $\ge 2$)
+  4. Create uncontracted auxiliary functions (coefficient = 1.0) for angular momenta $L = 0, 1, \ldots, 2L_{\max}$, where $L_{\max}$ is the maximum angular momentum in the primary basis
+* The auto-generated auxiliary basis provides a quick approximation but is less accurate than purpose-built auxiliary basis sets (e.g., cc-pVDZ-RIFIT). Use explicit auxiliary basis files for production calculations.
 
 #### post_hf_method - Post-Hartree-Fock method to use (FCI, MP2, CCSD, CCSD(T))
 * default: none

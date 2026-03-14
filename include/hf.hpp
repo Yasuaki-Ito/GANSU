@@ -39,6 +39,22 @@ namespace gansu{
 class ERI;
 
 /**
+ * @brief Get or generate an auxiliary basis set for RI approximation
+ * @param molecular Primary molecular object
+ * @param auxiliary_gbsfilename Auxiliary basis set file name (if empty, auto-generate from primary basis)
+ * @return Auxiliary BasisSet
+ */
+inline BasisSet get_auxiliary_basis(const Molecular& molecular, const std::string& auxiliary_gbsfilename) {
+    if (!auxiliary_gbsfilename.empty()) {
+        return BasisSet::construct_from_gbs(auxiliary_gbsfilename);
+    }
+    // Auto-generate auxiliary basis from primary basis
+    std::cout << "[RI] No auxiliary basis set file specified. Auto-generating from primary basis..." << std::endl;
+    BasisSet primary_basis = BasisSet::construct_from_gbs(molecular.get_gbs_filename());
+    return BasisSet::generate_auxiliary_basis(primary_basis);
+}
+
+/**
  * @brief HF class
  * @details This class is a virtual class for the Hartree-Fock method.
  * Computations related only to AO basis are implemented in this class

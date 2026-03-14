@@ -124,4 +124,65 @@ BasisSet BasisSet::construct_from_gbs(const std::string& filename){
 }
 
 
+BasisSet BasisSet::generate_auxiliary_basis(const BasisSet& primary_basis_set, int max_auxiliary_shell_type) {
+    BasisSet aux_basis_set;
+
+    for (const auto& [element_name, element_basis] : primary_basis_set.element_basis_sets) {
+        ElementBasisSet aux_element;
+        aux_element.set_element_name(element_name);
+
+        // Collect all primitive exponents and determine max angular momentum from primary basis
+        std::vector<double> exponents;
+        int max_primary_L = 0;
+        for (size_t i = 0; i < element_basis.get_num_contracted_gausses(); i++) {
+            const auto& cg = element_basis.get_contracted_gauss(i);
+            int L = shell_name_to_shell_type(cg.get_type());
+            if (L > max_primary_L) max_primary_L = L;
+            for (size_t j = 0; j < cg.get_num_primitives(); j++) {
+                exponents.push_back(cg.get_primitive_gauss(j).exponent);
+            }
+        }
+
+        // Auto-determine max auxiliary angular momentum: 2 * L_max_primary
+        // (products of basis functions with l1, l2 produce angular momenta up to l1+l2)
+        int effective_max_L = std::min(2 * max_primary_L, max_auxiliary_shell_type);
+
+        // Generate pairwise sums of exponents (product basis approach)
+        std::vector<double> aux_exponents;
+        for (size_t i = 0; i < exponents.size(); i++) {
+            for (size_t j = i; j < exponents.size(); j++) {
+                aux_exponents.push_back(exponents[i] + exponents[j]);
+            }
+        }
+
+        // Sort and aggressively thin out to avoid ill-conditioning
+        // Keep exponents only if they differ by a factor of >= 2.0 from the previous kept one
+        std::sort(aux_exponents.begin(), aux_exponents.end());
+        std::vector<double> unique_exponents;
+        for (const auto& exp : aux_exponents) {
+            if (unique_exponents.empty() ||
+                exp / unique_exponents.back() >= 2.0) {
+                unique_exponents.push_back(exp);
+            }
+        }
+
+        // Create uncontracted functions for each angular momentum
+        for (int L = 0; L <= effective_max_L; L++) {
+            std::string shell_name = SHELL_TYPE_TO_SHELL_NAME[L];
+            // Capitalize the shell name (s -> S, p -> P, etc.)
+            shell_name[0] = std::toupper(shell_name[0]);
+
+            for (const auto& exp : unique_exponents) {
+                ContractedGauss cg(shell_name);
+                cg.add_primitive_gauss(exp, 1.0); // uncontracted: single primitive with coefficient 1.0
+                aux_element.add_contracted_gauss(cg);
+            }
+        }
+
+        aux_basis_set.add_element_basis_set(aux_element);
+    }
+
+    return aux_basis_set;
+}
+
 }

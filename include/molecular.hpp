@@ -112,10 +112,46 @@ public:
     }
 
     /**
+     * @brief Constructor of the Molecular class from a BasisSet object (without GBS file)
+     * @param atoms List of atoms
+     * @param basis_set Pre-constructed basis set
+     * @param charge Charge of the molecule
+     * @param beta_to_alpha Number of beta_to_alpha electrons
+     */
+    Molecular(const std::vector<Atom> atoms, const BasisSet& basis_set, const int charge=0, const unsigned int beta_to_alpha=0)
+        : atoms_(atoms), gbs_filename_("")
+    {
+        create_basis_set_from_object(basis_set);
+
+        num_electrons_ = 0;
+        for(const auto& atom : atoms_){
+            num_electrons_ += atom.atomic_number;
+        }
+        num_electrons_ -= charge;
+        if(num_electrons_ < 1){
+            THROW_EXCEPTION("The number of electrons is less than one.");
+        }
+
+        num_alpha_spins_ = static_cast<int>((num_electrons_+1)/2) + beta_to_alpha;
+        num_beta_spins_  = static_cast<int>(num_electrons_/2) - beta_to_alpha;
+
+        if(num_beta_spins_ < 0){
+            THROW_EXCEPTION("The number of beta-spin electrons is less than zero.");
+        }
+    }
+
+    /**
      * @brief Create the basis set
      */
     void create_basis_set(const std::string gbs_filename){
         BasisSet basis_set = BasisSet::construct_from_gbs(gbs_filename);
+        create_basis_set_from_object(basis_set);
+    }
+
+    /**
+     * @brief Create basis set from a BasisSet object
+     */
+    void create_basis_set_from_object(const BasisSet& basis_set){
 
         if(atoms_.size() == 0){
             THROW_EXCEPTION("No atoms are given.");

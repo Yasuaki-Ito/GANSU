@@ -91,6 +91,7 @@ constexpr real_t TOL_HF = 1e-6;       // HF total energy tolerance
 constexpr real_t TOL_POSTHF = 2e-6;   // Post-HF correlation energy tolerance (STO-3G)
 constexpr real_t TOL_POSTHF_DZ = 5e-6; // Post-HF tolerance for cc-pVDZ (larger basis)
 constexpr real_t TOL_RI = 2e-3;       // RI approximation tolerance (inherent fitting error)
+constexpr real_t TOL_RI_AUTO = 5e-2;  // Auto-generated auxiliary basis tolerance (less accurate than optimized fitting basis)
 
 
 // ============================================================
@@ -113,6 +114,10 @@ static GansuResult run_gansu(const std::string& xyz,
                               const std::string& auxiliary_basis = "",
                               int ccsd_algorithm = 0)
 {
+    // Clear any sticky CUDA errors from previous tests
+    cudaDeviceSynchronize();
+    cudaGetLastError();
+
     ParameterManager params;
     params["xyzfilename"] = xyz;
     params["gbsfilename"] = basis;
@@ -368,6 +373,36 @@ TEST(ValidationRI, CH4_RHF_ccpVDZ) {
                        AUX_BASIS + "cc-pvdz-rifit.gbs");
     EXPECT_NEAR(r.hf_total_energy, REF_CH4_RHF_ccpVDZ, TOL_RI);
 }
+
+// ============================================================
+//  RI approximation with auto-generated auxiliary basis
+// ============================================================
+
+TEST(ValidationRI_Auto, H2O_RHF_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "none", 0, 0, "core", "ri");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_RI_AUTO);
+}
+
+TEST(ValidationRI_Auto, H2O_RHF_ccpVDZ) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "none", 0, 0, "core", "ri");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_RI_AUTO);
+}
+
+TEST(ValidationRI_Auto, NH3_RHF_STO3G) {
+    auto r = run_gansu(XYZ + "NH3.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "none", 0, 0, "core", "ri");
+    EXPECT_NEAR(r.hf_total_energy, REF_NH3_RHF_STO3G, TOL_RI_AUTO);
+}
+
+TEST(ValidationRI_Auto, CH4_RHF_STO3G) {
+    auto r = run_gansu(XYZ + "CH4.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "none", 0, 0, "core", "ri");
+    EXPECT_NEAR(r.hf_total_energy, REF_CH4_RHF_STO3G, TOL_RI_AUTO);
+}
+
+// ============================================================
 
 TEST(ValidationRI, H2O_MP2_ccpVDZ) {
     auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",

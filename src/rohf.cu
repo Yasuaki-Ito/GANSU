@@ -91,8 +91,10 @@ ROHF::ROHF(const Molecular& molecular, const ParameterManager& parameters) :
     if(eri_method == "stored"){ // stored two-electron integrals
         set_eri_method(std::make_unique<ERI_Stored_ROHF>(*this));
     }else if(eri_method == "ri"){ // RI (Resolution of Identity) method
-        const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename"); // auxiliary basis set file name
-        Molecular auxiliary_molecular(molecular.get_atoms(), auxiliary_gbsfilename); // auxiliary molecular object
+        const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename");
+        BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);
+        Molecular auxiliary_molecular(molecular.get_atoms(), aux_basis);
+        std::cout << "[RI] Auxiliary basis: " << auxiliary_molecular.get_num_basis() << " functions" << std::endl;
         set_eri_method(std::make_unique<ERI_RI_ROHF>(*this, auxiliary_molecular));
     }else{
         THROW_EXCEPTION("Invalid eri_method: " + eri_method);

@@ -27,8 +27,10 @@
 #include <stdexcept> // runtime_error
 #include <iostream> // cout
 #include <unordered_map>
+#include <set>
 #include <utility> // std::pair
 #include <cmath> // std::sqrt, std::pow
+#include <algorithm> // std::sort, std::unique
 
 #include "types.hpp"
 #include "utils.hpp" // Exception
@@ -301,6 +303,17 @@ public:
 
 
     static BasisSet construct_from_gbs(const std::string& filename);
+
+    /**
+     * @brief Generate an auxiliary basis set from the primary basis set
+     * @param primary_basis_set Primary basis set
+     * @param max_auxiliary_shell_type Maximum angular momentum for the auxiliary basis (default: 3, i.e., f-type)
+     * @return Auxiliary basis set
+     * @details For each element, collects all primitive exponents from the primary basis,
+     *          computes pairwise sums (alpha_i + alpha_j), removes near-duplicates,
+     *          and creates uncontracted functions for angular momenta 0 through max_auxiliary_shell_type.
+     */
+    static BasisSet generate_auxiliary_basis(const BasisSet& primary_basis_set, int max_auxiliary_shell_type = 3);
 
     /**
      * @brief Print all the basis set

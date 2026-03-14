@@ -249,10 +249,16 @@ To specify the optimization algorithm:
 Available optimizers: `bfgs` (default), `dfp`, `sr1`, `gdiis`, `cg-fr`, `cg-pr`, `cg-hs`, `cg-dy`, `sd`
 
 ##### Example 5: Fullerene (C60) molecule using RI approximation
-If the molecule is large, it is recommended to use the RI approximation (density fitting) to reduce the memory usage. The auxiliary basis set file is required for the RI approximation.
+If the molecule is large, it is recommended to use the RI approximation (density fitting) to reduce the memory usage.
 
+With an explicit auxiliary basis set file:
 ``` bash
 ./HF_main -x ../xyz/large_molecular/fullerene.xyz -g ../basis/sto-3g.gbs --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs
+```
+
+If no auxiliary basis set file is specified, an auxiliary basis is automatically generated from the primary basis set:
+``` bash
+./HF_main -x ../xyz/large_molecular/fullerene.xyz -g ../basis/sto-3g.gbs --eri_method ri
 ```
 
 
