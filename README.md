@@ -241,39 +241,6 @@ convergence_method = OptimalDamping
 ./HF_main -x ../xyz/optimization/H2_stretched.xyz -g ../basis/sto-3g.gbs -r optimize
 ```
 
-Sample output:
-```
-============================================================
-              Geometry Optimization (BFGS)
-============================================================
-
---- Geometry Optimization Step 0 ---
-Energy: -1.066108670047 Hartree
-Max gradient: 1.485716e-01 Hartree/Bohr
-RMS gradient: 8.577783e-02 Hartree/Bohr
-Max displacement: 1.485716e-01 Bohr
-Energy change: -3.776539e-02 Hartree
-
---- Geometry Optimization Step 1 ---
-Energy: -1.103874058211 Hartree
-...
-
---- Geometry Optimization Step 5 ---
-Energy: -1.117505884884 Hartree
-Max gradient: 1.768656e-05 Hartree/Bohr
-RMS gradient: 1.021134e-05 Hartree/Bohr
-
-============================================================
-         Geometry Optimization Converged!
-============================================================
-Final energy: -1.117505884884 Hartree
-Iterations: 5
-
-Optimized Geometry (Bohr):
-   H    0.0000000000    0.0000000000    0.2719187466
-   H    0.0000000000    0.0000000000    1.6178072420
-```
-
 To specify the optimization algorithm:
 ``` bash
 ./HF_main -x ../xyz/optimization/H2_stretched.xyz -g ../basis/sto-3g.gbs -r optimize --optimizer cg-fr
