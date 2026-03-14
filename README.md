@@ -24,7 +24,6 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Møller-Plesset Perturbation Theory (RMP2, RMP3, RI-RMP2, UMP2)
     * Coupled Cluster (RCCSD, RCCSD(T))
     * Full Configuration Interaction (RFCI)
-
 * Initial Guess
     * Core Hamiltonian (RHF, UHF, ROHF) 
     * Generalized Wolfsberg-Helmholz (GWH) (RHF, UHF, ROHF)
@@ -53,12 +52,23 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 * Bond order analysis
     * Mayer bond order (RHF, UHF, ROHF)
     * Wiberg bond order (RHF, UHF, ROHF)
+* Energy Gradient
+    * Analytical energy gradient (RHF, UHF)
+* Geometry Optimization (RHF, UHF)
+    * Quasi-Newton methods: BFGS, DFP, SR1
+    * Conjugate gradient methods: Fletcher-Reeves, Polak-Ribière, Hestenes-Stiefel, Dai-Yuan
+    * GDIIS (Geometry DIIS)
+    * Steepest Descent
+    * Armijo backtracking line search (Quasi-Newton, Conjugate Gradient, Steepest Descent)
+    * Translation and rotation projection
 * Export
     * Export wave function information in the Molden format for visualization
-        * Tested by [Avogadro](https://avogadro.cc/) and [Pegamoid](https://github.com/Jellby/Pegamoid) 
+        * Tested by [Avogadro](https://avogadro.cc/) and [Pegamoid](https://github.com/Jellby/Pegamoid)
       ![Orbital](/doc/images/orbital.png)
       *Resulting molecular orbital of Benzene*
-    
+
+
+
 ### Todo / Not Implemented yet
 * Convergence algorithms
   * Optimal Damping (UHF)
@@ -183,6 +193,7 @@ Short options:
 | `-g` | `--gbsfilename` | Gaussian basis set file |
 | `-ag` | `--auxiliary_gbsfilename` | Gaussian auxiliary basis set file |
 | `-c` | `--charge` | Charge of the molecule |
+| `-r` | `--run_type` | Run type (energy, gradient, optimize) |
 
 #### Examples
 
@@ -216,7 +227,22 @@ convergence_method = OptimalDamping
 > Parameters in the recipe file are overwritten by the command-line options.
 
 
-##### Example 3: Fullerene (C60) molecule using RI approximation
+##### Example 3: Energy gradient calculation
+``` bash
+./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs -r gradient
+```
+
+##### Example 4: Geometry optimization
+``` bash
+./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs -r optimize
+```
+
+To specify the optimization algorithm:
+``` bash
+./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs -r optimize --optimizer cg-fr
+```
+
+##### Example 5: Fullerene (C60) molecule using RI approximation
 If the molecule is large, it is recommended to use the RI approximation (density fitting) to reduce the memory usage. The auxiliary basis set file is required for the RI approximation.
 
 ``` bash
