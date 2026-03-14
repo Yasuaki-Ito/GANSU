@@ -295,6 +295,9 @@ void HF::compute_transform_matrix(){
 
 real_t HF::single_point_energy(const real_t* density_matrix_alpha, const real_t* density_matrix_beta, bool force_density){
 //    PROFILE_FUNCTION();
+    // Reset convergence method state (DIIS history, damping state) for a fresh SCF cycle
+    reset_convergence();
+
     // Start Profiling
     GlobalProfiler::initialize(); // timer starts
 
@@ -535,6 +538,17 @@ real_t HF::solve(const real_t* density_matrix_alpha, const real_t* density_matri
             std::vector<double> p = optimizer->compute_search_direction(coords, grad);
             project_out_tr(p, coords);
 
+            // --- Check descent direction; fall back to steepest descent if not ---
+            {
+                double gp = 0.0;
+                for(int i = 0; i < ndim; i++) gp += grad[i] * p[i];
+                if(gp >= 0.0){
+                    std::cout << "Search direction is not a descent direction (g*p=" << gp << "). Resetting to steepest descent." << std::endl;
+                    for(int i = 0; i < ndim; i++) p[i] = -grad[i];
+                    project_out_tr(p, coords);
+                }
+            }
+
             // --- Apply trust radius (scale p if too large) ---
             double max_disp = 0.0;
             for(int i = 0; i < num_atoms_val; i++){
@@ -559,6 +573,7 @@ real_t HF::solve(const real_t* density_matrix_alpha, const real_t* density_matri
 
                 const double c1 = 1.0e-4;
                 const int max_ls = 10;
+                bool ls_success = false;
 
                 for(int ls = 0; ls < max_ls; ls++){
                     for(int i = 0; i < ndim; i++)
@@ -567,12 +582,29 @@ real_t HF::solve(const real_t* density_matrix_alpha, const real_t* density_matri
                     update_geometry(new_atom_list);
                     new_energy = single_point_energy();
 
-                    if(new_energy <= energy + c1 * alpha * gp){
+                    if(std::isfinite(new_energy) && new_energy <= energy + c1 * alpha * gp){
+                        ls_success = true;
                         break;
                     }
                     alpha *= 0.5;
-                    if(ls == max_ls - 1){
-                        std::cout << "Line search: using smallest step (alpha=" << alpha << ")" << std::endl;
+                }
+
+                if(!ls_success){
+                    // Line search failed: take the smallest step that gives finite energy
+                    std::cout << "Line search: Armijo condition not satisfied, using smallest step (alpha=" << alpha << ")" << std::endl;
+                    for(int i = 0; i < ndim; i++)
+                        new_coords[i] = coords[i] + alpha * p[i];
+                    auto new_atom_list = coords_to_atoms(new_coords);
+                    update_geometry(new_atom_list);
+                    new_energy = single_point_energy();
+
+                    if(!std::isfinite(new_energy)){
+                        std::cout << "Line search failed with non-finite energy. Restoring geometry and terminating." << std::endl;
+                        // Restore original geometry and re-run SCF to get consistent state
+                        auto orig_atom_list = coords_to_atoms(coords);
+                        update_geometry(orig_atom_list);
+                        single_point_energy();
+                        return energy;
                     }
                 }
             } else {

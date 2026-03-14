@@ -59,6 +59,7 @@ public:
     void compute_coefficient_matrix_impl() override;
     void compute_energy() override;
     void update_fock_matrix() override;
+    void reset_convergence() override;
     std::vector<double> compute_Energy_Gradient() override;
 
     real_t get_energy() const override { return energy_; }
@@ -208,6 +209,8 @@ public:
      */
     virtual std::string get_algorithm_name() const = 0;
 
+    virtual void reset() {} ///< Reset internal state (e.g., DIIS history) for a new SCF cycle
+
 protected:
     UHF& hf_; ///< UHF
     bool verbose; ///< Verbose mode
@@ -291,6 +294,8 @@ public:
         }
         return name;
     }
+
+    void reset() override { first_iteration_ = true; }
 
 private:
     real_t damping_factor_; ///< Damping factor
@@ -414,6 +419,8 @@ public:
         name += ")";
         return name;
     }
+
+    void reset() override { iteration_ = 0; }
 
 private:
     int iteration_; ///< count of iterations
@@ -897,5 +904,7 @@ protected:
     UHF& uhf_; ///< UHF
 };
 
+
+inline void UHF::reset_convergence() { if(convergence_method_) convergence_method_->reset(); }
 
 } // namespace gansu

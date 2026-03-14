@@ -54,7 +54,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Wiberg bond order (RHF, UHF, ROHF)
 * Energy Gradient
     * Analytical energy gradient (RHF, UHF)
-* Geometry Optimization (RHF, UHF)
+* Geometry Optimization
     * Quasi-Newton methods: BFGS, DFP, SR1
     * Conjugate gradient methods: Fletcher-Reeves, Polak-Ribière, Hestenes-Stiefel, Dai-Yuan
     * GDIIS (Geometry DIIS)
@@ -63,8 +63,8 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Translation and rotation projection
 * Export
     * Export wave function information in the Molden format for visualization
-        * Tested by [Avogadro](https://avogadro.cc/) and [Pegamoid](https://github.com/Jellby/Pegamoid)
-      ![Orbital](/doc/images/orbital.png)
+        * Tested by [MOrbVis](https://yasuaki-ito.github.io/morbvis/), [Avogadro](https://avogadro.cc/), and [Pegamoid](https://github.com/Jellby/Pegamoid)
+      ![Orbital renderred by MOrbVis](/doc/images/orbital.png)
       *Resulting molecular orbital of Benzene*
 
 
@@ -81,6 +81,8 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
   * Algebraic Diagrammatic Construction (ADC)
   * Equation-of-Motion Coupled Cluster (EOM-CC)
   * Time-Dependent Hartree-Fock (TDHF)
+* Energy Gradient
+  * Post-HF energy gradient (MP2, CCSD, etc.)
 * Density Functional Theory (DFT)
 * GPU implementation
   * Total spin (UHF)
@@ -120,7 +122,8 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 ├─ xyz/
 │   ├─ large_molecular/
 │   ├─ larger_molecular/
-│   └─ monatomic/
+│   ├─ monatomic/
+│   └─ optimization/
 ├─ CMakeLists.txt
 ├─ LICENSE
 ├─ Parameter.md
@@ -144,6 +147,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 | `xyz/large_molecular/` | Contains the XYZ files for large molecules (e.g., fullerene.xyz). RI approximation (density fitting) may be necessary for them. |
 | `xyz/larger_molecular/` | Contains the XYZ files for larger molecules (e.g., C720.xyz). Direct-SCF may be necessary for them. |
 | `xyz/monatomic/` | Contains the XYZ files for monatomic molecules (e.g., H.xyz) |
+| `xyz/optimization/` | Contains the XYZ files with distorted geometries for geometry optimization tests (e.g., H2_stretched.xyz) |
 | `CMakeLists.txt` | CMake configuration file |
 | `LICENSE` | License file |
 | `Parameter.md` | Parameter overview and description |

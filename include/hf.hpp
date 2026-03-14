@@ -392,6 +392,8 @@ protected:
      */
     virtual void update_fock_matrix() = 0;
 
+    virtual void reset_convergence() {} ///< Reset convergence method state for a new SCF cycle
+
 
 
 
