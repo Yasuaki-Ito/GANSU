@@ -238,13 +238,48 @@ convergence_method = OptimalDamping
 
 ##### Example 4: Geometry optimization
 ``` bash
-./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs -r optimize
+./HF_main -x ../xyz/optimization/H2_stretched.xyz -g ../basis/sto-3g.gbs -r optimize
+```
+
+Sample output:
+```
+============================================================
+              Geometry Optimization (BFGS)
+============================================================
+
+--- Geometry Optimization Step 0 ---
+Energy: -1.066108670047 Hartree
+Max gradient: 1.485716e-01 Hartree/Bohr
+RMS gradient: 8.577783e-02 Hartree/Bohr
+Max displacement: 1.485716e-01 Bohr
+Energy change: -3.776539e-02 Hartree
+
+--- Geometry Optimization Step 1 ---
+Energy: -1.103874058211 Hartree
+...
+
+--- Geometry Optimization Step 5 ---
+Energy: -1.117505884884 Hartree
+Max gradient: 1.768656e-05 Hartree/Bohr
+RMS gradient: 1.021134e-05 Hartree/Bohr
+
+============================================================
+         Geometry Optimization Converged!
+============================================================
+Final energy: -1.117505884884 Hartree
+Iterations: 5
+
+Optimized Geometry (Bohr):
+   H    0.0000000000    0.0000000000    0.2719187466
+   H    0.0000000000    0.0000000000    1.6178072420
 ```
 
 To specify the optimization algorithm:
 ``` bash
-./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs -r optimize --optimizer cg-fr
+./HF_main -x ../xyz/optimization/H2_stretched.xyz -g ../basis/sto-3g.gbs -r optimize --optimizer cg-fr
 ```
+
+Available optimizers: `bfgs` (default), `dfp`, `sr1`, `gdiis`, `cg-fr`, `cg-pr`, `cg-hs`, `cg-dy`, `sd`
 
 ##### Example 5: Fullerene (C60) molecule using RI approximation
 If the molecule is large, it is recommended to use the RI approximation (density fitting) to reduce the memory usage. The auxiliary basis set file is required for the RI approximation.
