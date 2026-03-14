@@ -65,7 +65,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Export wave function information in the Molden format for visualization
         * Tested by [MOrbVis](https://yasuaki-ito.github.io/morbvis/), [Avogadro](https://avogadro.cc/), and [Pegamoid](https://github.com/Jellby/Pegamoid)
       ![Orbital renderred by MOrbVis](/doc/images/orbital.png)
-      *Resulting molecular orbital of Benzene*
+      *Resulting molecular orbital of Benzene by MOrbVis*
 
 
 
