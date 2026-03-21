@@ -744,12 +744,14 @@ inline cudaError_t tracked_cudaMalloc(T** ptr, size_t size) {
         // Update memory statistics
         CudaMemoryManager<T>::track_allocation(size);
     } else {
-        // Print detailed error message with current memory statistics
+        // Print detailed error message and throw exception to prevent use of null pointer
         size_t current_mem = CudaMemoryManager<T>::get_current_allocated_bytes();
-        std::cerr << "tracked_cudaMalloc failed: " << cudaGetErrorString(err) << "\n"
-                  << "  Attempted to allocate: " << CudaMemoryManager<T>::format_bytes(size) << "\n"
-                  << "  Current allocated:     " << CudaMemoryManager<T>::format_bytes(current_mem) << "\n"
-                  << "  Total would be:        " << CudaMemoryManager<T>::format_bytes(current_mem + size) << std::endl;
+        std::ostringstream oss;
+        oss << "tracked_cudaMalloc failed: " << cudaGetErrorString(err) << "\n"
+            << "  Attempted to allocate: " << CudaMemoryManager<T>::format_bytes(size) << "\n"
+            << "  Current allocated:     " << CudaMemoryManager<T>::format_bytes(current_mem) << "\n"
+            << "  Total would be:        " << CudaMemoryManager<T>::format_bytes(current_mem + size);
+        throw std::runtime_error(oss.str());
     }
 
     return err;

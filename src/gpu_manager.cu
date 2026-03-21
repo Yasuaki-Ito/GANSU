@@ -27,7 +27,8 @@
 
 #include <vector>    // std::vector
 #include <tuple>     // std::tuple
-#include <algorithm> // std::reverse
+#include <algorithm> // std::reverse, std::sort
+#include <numeric>   // std::iota
 #include <fstream>
 
 #include <cuda_runtime.h> // for int2 type
@@ -134,6 +135,187 @@ int eigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_
     return h_info; // 0 if successful
 }
 
+// LAPACK dgeev: non-symmetric eigenvalue decomposition (Fortran interface)
+extern "C" {
+    void dgeev_(const char* jobvl, const char* jobvr, const int* n,
+                double* a, const int* lda, double* wr, double* wi,
+                double* vl, const int* ldvl, double* vr, const int* ldvr,
+                double* work, const int* lwork, int* info);
+}
+
+/**
+ * @brief Eigenvalue decomposition of a general (non-symmetric) matrix
+ *
+ * Uses LAPACK dgeev on CPU (subspace matrices are small, typically ≤30×30).
+ * Eigenvalues are sorted by real part (ascending).
+ * Eigenvectors stored in the same transposed layout as eigenDecomposition
+ * (eigenvector i at stride=size, offset=i).
+ *
+ * @param d_matrix Input matrix (column-major, n×n) — not modified
+ * @param d_eigenvalues Output real parts of eigenvalues (sorted ascending) [size]
+ * @param d_eigenvectors Output right eigenvectors [size × size], transposed layout
+ * @param size Matrix dimension
+ * @return 0 if successful
+ */
+int eigenDecompositionNonSymmetric(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size) {
+    // Copy matrix to host (dgeev overwrites input)
+    std::vector<real_t> h_A((size_t)size * size);
+    cudaMemcpy(h_A.data(), d_matrix, (size_t)size * size * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+    // LAPACK output arrays
+    std::vector<real_t> h_WR(size);  // real parts of eigenvalues
+    std::vector<real_t> h_WI(size);  // imaginary parts of eigenvalues
+    std::vector<real_t> h_VR((size_t)size * size);  // right eigenvectors
+
+    // Query optimal workspace size
+    int n = size;
+    int lda = size;
+    int ldvr = size;
+    int ldvl = 1;
+    int lwork = -1;
+    int info = 0;
+    real_t work_query;
+
+    dgeev_("N", "V", &n,
+           h_A.data(), &lda, h_WR.data(), h_WI.data(),
+           nullptr, &ldvl, h_VR.data(), &ldvr,
+           &work_query, &lwork, &info);
+
+    lwork = (int)work_query;
+    std::vector<real_t> h_work(lwork);
+
+    // Solve
+    dgeev_("N", "V", &n,
+           h_A.data(), &lda, h_WR.data(), h_WI.data(),
+           nullptr, &ldvl, h_VR.data(), &ldvr,
+           h_work.data(), &lwork, &info);
+
+    if (info != 0) {
+        return info;
+    }
+
+    // Filter: keep only eigenvalues with negligible imaginary part
+    // Complex eigenvalues from dgeev come in conjugate pairs; skip both
+    double imag_threshold = 1e-6;
+    std::vector<int> real_indices;
+    real_indices.reserve(size);
+    for (int i = 0; i < size; i++) {
+        if (std::abs(h_WI[i]) < imag_threshold) {
+            real_indices.push_back(i);
+        }
+    }
+
+    // Sort real eigenvalues by real part (ascending)
+    std::sort(real_indices.begin(), real_indices.end(),
+              [&h_WR](int a, int b) { return h_WR[a] < h_WR[b]; });
+
+    int n_real = (int)real_indices.size();
+
+    // Build sorted eigenvalue array and reordered eigenvector matrix
+    // Output layout matches eigenDecomposition: transposed, eigenvector i at stride=size, offset=i
+    std::vector<real_t> h_sorted_evals(size, 1e30);  // fill unused slots with large value
+    std::vector<real_t> h_sorted_evecs((size_t)size * size, 0.0);
+
+    for (int i = 0; i < n_real; i++) {
+        int orig = real_indices[i];
+        h_sorted_evals[i] = h_WR[orig];
+        // h_VR column-major: column orig = eigenvector orig
+        // Transposed output: row i = eigenvector i
+        // Column-major element (i, j) = h_sorted_evecs[i + j*size]
+        for (int j = 0; j < size; j++) {
+            h_sorted_evecs[i + j * size] = h_VR[j + orig * size];
+        }
+    }
+
+    // Copy sorted results to device
+    cudaMemcpy(d_eigenvalues, h_sorted_evals.data(),
+               size * sizeof(real_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_eigenvectors, h_sorted_evecs.data(),
+               (size_t)size * size * sizeof(real_t), cudaMemcpyHostToDevice);
+
+    return 0;
+}
+
+/**
+ * @brief Compute only the k smallest eigenvalues/eigenvectors of a symmetric matrix
+ *
+ * Uses cusolverDnXsyevdx with index range [1, num_eigenvalues].
+ * Much faster than full eigenDecomposition when k << n.
+ *
+ * @param d_matrix Input symmetric matrix (column-major, n×n)
+ * @param d_eigenvalues Output eigenvalues (size: num_eigenvalues)
+ * @param d_eigenvectors Output eigenvectors (row-major after transpose, n×n buffer required)
+ * @param size Matrix dimension n
+ * @param num_eigenvalues Number of smallest eigenvalues to compute (k)
+ * @return 0 if successful
+ */
+int partialEigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size, const int num_eigenvalues) {
+    cusolverDnHandle_t cusolverHandle = GPUHandle::cusolver();
+    cusolverDnParams_t cusolverParams = GPUHandle::cusolverParams();
+
+    size_t workspaceInBytesOnDevice;
+    size_t workspaceInBytesOnHost;
+    real_t* d_workspace = nullptr;
+    real_t* h_workspace = nullptr;
+
+    // Copy input matrix (will be overwritten with eigenvectors)
+    real_t* d_temp_matrix;
+    gansu::tracked_cudaMalloc(&d_temp_matrix, (size_t)size * size * sizeof(real_t));
+    cudaMemcpy(d_temp_matrix, d_matrix, (size_t)size * size * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+    // Index range: 1-based, compute eigenvalues il..iu
+    int64_t il = 1;
+    int64_t iu = num_eigenvalues;
+    real_t vl = 0.0, vu = 0.0;  // unused for RANGE_I
+    int64_t h_meig = 0;
+
+    // Query workspace size
+    cusolverDnXsyevdx_bufferSize(
+        cusolverHandle, cusolverParams,
+        CUSOLVER_EIG_MODE_VECTOR, CUSOLVER_EIG_RANGE_I, CUBLAS_FILL_MODE_UPPER,
+        size, CUDA_R_64F, d_temp_matrix,
+        size, &vl, &vu, il, iu, &h_meig,
+        CUDA_R_64F, d_eigenvalues,
+        CUDA_R_64F,
+        &workspaceInBytesOnDevice, &workspaceInBytesOnHost
+    );
+
+    gansu::tracked_cudaMalloc(&d_workspace, workspaceInBytesOnDevice);
+    cudaMallocHost(&h_workspace, workspaceInBytesOnHost);
+
+    int* d_info;
+    gansu::tracked_cudaMalloc(&d_info, sizeof(int));
+
+    // Compute partial eigendecomposition
+    cusolverDnXsyevdx(
+        cusolverHandle, cusolverParams,
+        CUSOLVER_EIG_MODE_VECTOR, CUSOLVER_EIG_RANGE_I, CUBLAS_FILL_MODE_UPPER,
+        size, CUDA_R_64F, d_temp_matrix,
+        size, &vl, &vu, il, iu, &h_meig,
+        CUDA_R_64F, d_eigenvalues,
+        CUDA_R_64F,
+        d_workspace, workspaceInBytesOnDevice,
+        h_workspace, workspaceInBytesOnHost,
+        d_info
+    );
+
+    // Copy eigenvectors: first h_meig columns of d_temp_matrix → d_eigenvectors
+    // Store as full n×n to maintain same layout as eigenDecomposition
+    cudaMemcpy(d_eigenvectors, d_temp_matrix, (size_t)size * size * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+    // Transpose eigenvectors (same convention as eigenDecomposition)
+    transposeMatrixInPlace(d_eigenvectors, size);
+
+    int h_info_val;
+    cudaMemcpy(&h_info_val, d_info, sizeof(int), cudaMemcpyDeviceToHost);
+
+    gansu::tracked_cudaFree(d_temp_matrix);
+    gansu::tracked_cudaFree(d_workspace);
+    cudaFreeHost(h_workspace);
+    gansu::tracked_cudaFree(d_info);
+
+    return h_info_val;
+}
 
 /**
  * @brief Computes the product of a matrix and a matrix using cuBLAS.

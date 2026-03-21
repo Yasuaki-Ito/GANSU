@@ -36,6 +36,8 @@ void transposeMatrixInPlace(real_t* d_matrix, const int size);
 void makeDiagonalMatrix(const real_t* d_vector, real_t* d_matrix, const int size);
 real_t computeMatrixTrace(const real_t* d_matrix, const int size);
 int eigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size);
+int eigenDecompositionNonSymmetric(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size);
+int partialEigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size, const int num_eigenvalues);
 void matrixMatrixProduct(const double* d_matrix_A, const double* d_matrix_B, double* d_matrix_C, const int size, const bool transpose_A = false, const bool transpose_B = false, const bool accumulate=false);
 void matrixMatrixProductRect(const double* d_A, const double* d_B, double* d_C, const int M, const int N, const int K, const bool transpose_A = false, const bool transpose_B = false, const bool accumulate = false, const double alpha = 1.0);
 void matrixMatrixProductBatched(const double* d_A, const double* d_B, double* d_C, const int M, const int N, const int K, const long long strideA, const long long strideB, const long long strideC, const int batchCount, const bool transpose_A = false, const bool transpose_B = false, const bool accumulate = false, const double alpha = 1.0);

@@ -91,6 +91,29 @@ struct DavidsonConfig {
     bool use_preconditioner = true;
 
     /**
+     * @brief Assume the operator is symmetric
+     *
+     * If true, uses symmetric eigenvalue solver (dsyevd) for the subspace problem.
+     * If false, uses non-symmetric eigenvalue solver (dgeev).
+     * Non-symmetric mode is needed for operators like the full ADC(2) matrix
+     * where M12 ≠ M21^T in the spatial orbital representation.
+     *
+     * Default: true
+     */
+    bool symmetric = true;
+
+    /**
+     * @brief Minimum eigenvalue threshold for excited-state solvers
+     *
+     * Eigenvalues below this threshold are considered spurious (e.g., ground state
+     * at ω=0 in EOM methods) and their correction vectors are not added.
+     * Set to 0.0 to disable filtering (default for ground-state problems).
+     *
+     * Default: 0.0
+     */
+    double min_eigenvalue = 0.0;
+
+    /**
      * @brief Verbosity level
      *
      * - 0: Silent (only errors)

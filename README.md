@@ -24,6 +24,13 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Møller-Plesset Perturbation Theory (RMP2, RMP3, RI-RMP2, UMP2)
     * Coupled Cluster (RCCSD, RCCSD(T))
     * Full Configuration Interaction (RFCI)
+* Excited state methods
+    * Configuration Interaction Singles (CIS)
+    * Algebraic Diagrammatic Construction (ADC(2))
+    * Equation-of-Motion MP2 (EOM-MP2)
+    * Equation-of-Motion CC2 (EOM-CC2)
+    * Equation-of-Motion CCSD (EOM-CCSD)
+    * Oscillator strengths for all excited state methods
 * Initial Guess
     * Core Hamiltonian (RHF, UHF, ROHF) 
     * Generalized Wolfsberg-Helmholz (GWH) (RHF, UHF, ROHF)
@@ -78,8 +85,6 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
   * Random
   * Load the precomputed coefficients/Fock matrix
 * Excited State Methods
-  * Algebraic Diagrammatic Construction (ADC)
-  * Equation-of-Motion Coupled Cluster (EOM-CC)
   * Time-Dependent Hartree-Fock (TDHF)
 * Energy Gradient
   * Post-HF energy gradient (MP2, CCSD, etc.)
@@ -248,7 +253,28 @@ To specify the optimization algorithm:
 
 Available optimizers: `bfgs` (default), `dfp`, `sr1`, `gdiis`, `cg-fr`, `cg-pr`, `cg-hs`, `cg-dy`, `sd`
 
-##### Example 5: Fullerene (C60) molecule using RI approximation
+##### Example 5: Excited state calculations
+``` bash
+# CIS (Configuration Interaction Singles)
+./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs --post_hf_method cis --n_excited_states 10
+
+# ADC(2)
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2
+
+# EOM-MP2
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_mp2
+
+# EOM-CC2
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_cc2
+
+# EOM-CCSD
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_ccsd
+
+# EOM-MP2 with specific solver
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_mp2 --eom_mp2_solver schur_omega
+```
+
+##### Example 6: Fullerene (C60) molecule using RI approximation
 If the molecule is large, it is recommended to use the RI approximation (density fitting) to reduce the memory usage.
 
 With an explicit auxiliary basis set file:

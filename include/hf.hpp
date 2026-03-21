@@ -268,6 +268,52 @@ public:
     real_t get_post_hf_energy() const { return post_hf_energy_; } ///< Get the post-HF energy
 
     /**
+     * @brief Set the post-HF energy (called by ERI methods that compute correlation energy internally)
+     */
+    void set_post_hf_energy(real_t energy) { post_hf_energy_ = energy; }
+
+    /**
+     * @brief Get the number of excited states to compute
+     */
+    int get_n_excited_states() const { return n_excited_states_; }
+
+    /**
+     * @brief Get ADC(2) solver mode: "schur_static", "schur_omega", or "full"
+     */
+    const std::string& get_adc2_solver() const { return adc2_solver_; }
+
+    /**
+     * @brief Get EOM-MP2 solver mode: "full" or "schur"
+     */
+    const std::string& get_eom_mp2_solver() const { return eom_mp2_solver_; }
+
+    /**
+     * @brief Get excitation energies (populated after CIS/EOM calculations)
+     */
+    const std::vector<real_t>& get_excitation_energies() const { return excitation_energies_; }
+
+    /**
+     * @brief Set excitation energies (called by ERI compute_cis etc.)
+     */
+    void set_excitation_energies(const std::vector<real_t>& energies) { excitation_energies_ = energies; }
+
+    /**
+     * @brief Get oscillator strengths (populated after excited state calculations)
+     */
+    const std::vector<real_t>& get_oscillator_strengths() const { return oscillator_strengths_; }
+
+    /**
+     * @brief Set oscillator strengths (called by ERI compute_cis etc.)
+     */
+    void set_oscillator_strengths(const std::vector<real_t>& strengths) { oscillator_strengths_ = strengths; }
+
+    /**
+     * @brief Get/set excited state report string (printed in final summary)
+     */
+    const std::string& get_excited_state_report() const { return excited_state_report_; }
+    void set_excited_state_report(const std::string& report) { excited_state_report_ = report; }
+
+    /**
      * @brief Get whether the coefficient matrix has been computed
      */
     bool get_hasMatrixC() const { return hasMatrixC_; }
@@ -336,6 +382,12 @@ protected:
     // Post-HF methods
     PostHFMethod post_hf_method_; ///< Post-HF method
     real_t post_hf_energy_; ///< Post-HF energy
+    int n_excited_states_; ///< Number of excited states to compute
+    std::string adc2_solver_; ///< ADC(2) solver mode: schur_static, schur_omega, full
+    std::string eom_mp2_solver_; ///< EOM-MP2 solver mode: full, schur
+    std::vector<real_t> excitation_energies_; ///< Excitation energies (CIS/EOM)
+    std::vector<real_t> oscillator_strengths_; ///< Oscillator strengths (CIS/EOM)
+    std::string excited_state_report_; ///< Formatted excited state report for final summary
 
 
     // for Diect SCF

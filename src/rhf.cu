@@ -160,6 +160,16 @@ void RHF::post_process_after_scf() {
         post_hf_energy_ = eri_method_->compute_ccsd_energy();
     }else if(post_hf_method == PostHFMethod::CCSD_T){
         post_hf_energy_ = eri_method_->compute_ccsd_t_energy();
+    }else if(post_hf_method == PostHFMethod::CIS){
+        eri_method_->compute_cis(get_n_excited_states());
+    }else if(post_hf_method == PostHFMethod::ADC2){
+        eri_method_->compute_adc2(get_n_excited_states());
+    }else if(post_hf_method == PostHFMethod::EOM_MP2){
+        eri_method_->compute_eom_mp2(get_n_excited_states());
+    }else if(post_hf_method == PostHFMethod::EOM_CC2){
+        eri_method_->compute_eom_cc2(get_n_excited_states());
+    }else if(post_hf_method == PostHFMethod::EOM_CCSD){
+        eri_method_->compute_eom_ccsd(get_n_excited_states());
     }else{
         THROW_EXCEPTION("Invalid post-HF method.");
     }
@@ -467,9 +477,30 @@ void RHF::report() {
             std::cout << "CCSD" << std::endl;
         }else if(get_post_hf_method() == PostHFMethod::CCSD_T){
             std::cout << "CCSD(T)" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::CIS){
+            std::cout << "CIS" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::ADC2){
+            std::cout << "ADC(2)" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::EOM_MP2){
+            std::cout << "EOM-MP2" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::EOM_CC2){
+            std::cout << "EOM-CC2" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::EOM_CCSD){
+            std::cout << "EOM-CCSD" << std::endl;
         }
-        std::cout << "Post-HF energy correction: " << std::setprecision(17) << get_post_hf_energy() << " [hartree]" << std::endl;
-        std::cout << "Total Energy (including post-HF correction): " << std::setprecision(17) << get_total_energy() + get_post_hf_energy() << " [hartree]" << std::endl;
+
+        const auto& exc_energies = get_excitation_energies();
+        if(!exc_energies.empty()){
+            // Excited state methods: print detailed report
+            const auto& report = get_excited_state_report();
+            if(!report.empty()){
+                std::cout << report;
+            }
+        }else{
+            // Correlation energy methods (MP2, CCSD, etc.)
+            std::cout << "Post-HF energy correction: " << std::setprecision(17) << get_post_hf_energy() << " [hartree]" << std::endl;
+            std::cout << "Total Energy (including post-HF correction): " << std::setprecision(17) << get_total_energy() + get_post_hf_energy() << " [hartree]" << std::endl;
+        }
     }
 }
 

@@ -129,6 +129,47 @@ public:
         THROW_EXCEPTION("FCI energy computation is not supported for the selected ERI method.");
     }
 
+    /**
+     * @brief Compute CIS excited states
+     * @param n_states Number of excited states to compute
+     * @details This function computes CIS excited state energies.
+     */
+    virtual void compute_cis(int n_states){
+        THROW_EXCEPTION("CIS computation is not supported for the selected ERI method.");
+    }
+
+    /**
+     * @brief Compute ADC(2) excited states
+     * @param n_states Number of excited states to compute
+     */
+    virtual void compute_adc2(int n_states){
+        THROW_EXCEPTION("ADC(2) computation is not supported for the selected ERI method.");
+    }
+
+    /**
+     * @brief Compute EOM-MP2 excited states
+     * @param n_states Number of excited states to compute
+     */
+    virtual void compute_eom_mp2(int n_states){
+        THROW_EXCEPTION("EOM-MP2 computation is not supported for the selected ERI method.");
+    }
+
+    /**
+     * @brief Compute EOM-CC2 excited states
+     * @param n_states Number of excited states to compute
+     */
+    virtual void compute_eom_cc2(int n_states){
+        THROW_EXCEPTION("EOM-CC2 computation is not supported for the selected ERI method.");
+    }
+
+    /**
+     * @brief Compute EOM-CCSD excited states
+     * @param n_states Number of excited states to compute
+     */
+    virtual void compute_eom_ccsd(int n_states){
+        THROW_EXCEPTION("EOM-CCSD computation is not supported for the selected ERI method.");
+    }
+
 };
 
 /**
@@ -162,6 +203,11 @@ public:
             || method == PostHFMethod::MP4  // The stored ERI method supports MP4
             || method == PostHFMethod::CCSD // The stored ERI method supports CCSD
             || method == PostHFMethod::CCSD_T // The stored ERI method supports CCSD(T)
+            || method == PostHFMethod::CIS  // The stored ERI method supports CIS
+            || method == PostHFMethod::ADC2 // The stored ERI method supports ADC(2)
+            || method == PostHFMethod::EOM_MP2 // The stored ERI method supports EOM-MP2
+            || method == PostHFMethod::EOM_CC2 // The stored ERI method supports EOM-CC2
+            || method == PostHFMethod::EOM_CCSD // The stored ERI method supports EOM-CCSD
           ){
             return true;
         }

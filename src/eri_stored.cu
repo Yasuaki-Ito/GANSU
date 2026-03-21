@@ -4379,7 +4379,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             const real_t* __restrict__ d_coefficient_matrix,
                             const real_t* __restrict__ d_orbital_energies,
                             const int num_basis, const int num_occ,
-                            const bool computing_ccsd_t, real_t* ccsd_t_energy)
+                            const bool computing_ccsd_t, real_t* ccsd_t_energy,
+                            real_t** d_t1_out, real_t** d_t2_out)
 {
     const int N = num_basis;
     const int nocc = num_occ;
@@ -5158,6 +5159,16 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         }
     }
 
+    // Optionally copy converged T1/T2 to new device allocations for EOM-CCSD
+    if (d_t1_out) {
+        tracked_cudaMalloc((void**)d_t1_out, t1Size * sizeof(real_t));
+        cudaMemcpy(*d_t1_out, t1.data(), t1Size * sizeof(real_t), cudaMemcpyHostToDevice);
+    }
+    if (d_t2_out) {
+        tracked_cudaMalloc((void**)d_t2_out, t2Size * sizeof(real_t));
+        cudaMemcpy(*d_t2_out, t2v.data(), t2Size * sizeof(real_t), cudaMemcpyHostToDevice);
+    }
+
     // Free pre-allocated GPU buffers
     tracked_cudaFree(d_gpu_pool);  // single deallocation for all GPU buffers
 
@@ -5620,7 +5631,7 @@ real_t ERI_Stored_RHF::compute_ccsd_energy() {
     } else if (ccsd_algorithm_ == 1) {
         E_CCSD = ccsd_spatial_orbital_naive(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr);
     } else {
-        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr);
+        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, nullptr, nullptr);
     }
 
     std::cout << "CCSD energy: " << E_CCSD << " Hartree" << std::endl;
@@ -5648,7 +5659,7 @@ real_t ERI_Stored_RHF::compute_ccsd_t_energy() {
     } else if (ccsd_algorithm_ == 1) {
         E_CCSD = ccsd_spatial_orbital_naive(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy);
     } else {
-        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy);
+        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy, nullptr, nullptr);
     }
 
     std::cout << "CCSD correction energy: " << E_CCSD << " Hartree" << std::endl;

@@ -108,9 +108,33 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     }else if(post_hf_method_str == "ccsd_t"){
         std::cout << "Message: Post-HF method is CCSD(T)." << std::endl;
         post_hf_method_ = PostHFMethod::CCSD_T;
+    }else if(post_hf_method_str == "cis"){
+        std::cout << "Message: Post-HF method is CIS." << std::endl;
+        post_hf_method_ = PostHFMethod::CIS;
+    }else if(post_hf_method_str == "adc2"){
+        std::cout << "Message: Post-HF method is ADC(2)." << std::endl;
+        post_hf_method_ = PostHFMethod::ADC2;
+    }else if(post_hf_method_str == "eom_mp2"){
+        std::cout << "Message: Post-HF method is EOM-MP2." << std::endl;
+        post_hf_method_ = PostHFMethod::EOM_MP2;
+    }else if(post_hf_method_str == "eom_cc2"){
+        std::cout << "Message: Post-HF method is EOM-CC2." << std::endl;
+        post_hf_method_ = PostHFMethod::EOM_CC2;
+    }else if(post_hf_method_str == "eom_ccsd"){
+        std::cout << "Message: Post-HF method is EOM-CCSD." << std::endl;
+        post_hf_method_ = PostHFMethod::EOM_CCSD;
     }else{
         throw std::runtime_error("Error: Unknown post-HF method: " + post_hf_method_str);
     }
+
+    // Set the number of excited states
+    n_excited_states_ = parameters.get<int>("n_excited_states");
+
+    // Set the ADC(2) solver mode
+    adc2_solver_ = toLowerCase(parameters.get<std::string>("adc2_solver"));
+
+    // Set the EOM-MP2 solver mode
+    eom_mp2_solver_ = toLowerCase(parameters.get<std::string>("eom_mp2_solver"));
 
 
     // print all the values of boys function for the test (temporary implementation)

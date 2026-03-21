@@ -74,6 +74,20 @@ set(SOURCES
     src/eri_ri.cu
     src/eri_stored.cu
     src/eri_stored_fci.cu
+    src/eri_stored_cis.cu
+    src/cis_operator.cu
+    src/eri_stored_adc2.cu
+    src/adc2_operator.cu
+    src/adc2_full_operator.cu
+    src/eom_mp2_operator.cu
+    src/eom_mp2_schur_operator.cu
+    src/eri_stored_eom_mp2.cu
+    src/cc2_solver.cu
+    src/eom_cc2_operator.cu
+    src/eri_stored_eom_cc2.cu
+    src/eom_ccsd_operator.cu
+    src/eri_stored_eom_ccsd.cu
+    src/oscillator_strength.cu
     src/eri_stored_mp4.cu
     src/eri_stored_ump.cu
     src/davidson_solver.cu
@@ -85,9 +99,12 @@ set(SOURCES
 add_library(gansu STATIC ${SOURCES})
 target_compile_definitions(gansu PRIVATE PROFILE_ENABLED) # add option -DPROFILE_ENABLED
 target_compile_definitions(gansu PRIVATE CONSOLE_COLOR_ENABLED) # add option -DCONSOLE_COLOR_ENABLED
+find_package(LAPACK REQUIRED)
+
 target_link_libraries(gansu
         cublas
         cusolver
+        ${LAPACK_LIBRARIES}
         ${CUDA_LIBRARIES}
         int1e
         int2e

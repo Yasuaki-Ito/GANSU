@@ -19,7 +19,10 @@
 | convergence_energy_threshold | Energy convergence threshold | double | 1.0e-6 |
 | int1e_method | Method to use for one-electron integrals | string | hybrid |
 | eri_method | Method to use for two-electron repulsion integrals | string | stored |
-| post_hf_method | Post-Hartree-Fock method to use (FCI, MP2, CCSD, CCSD(T)) | string | none |
+| post_hf_method | Post-Hartree-Fock method to use (FCI, MP2, CCSD, CCSD(T), CIS, ADC2, EOM_MP2, EOM_CC2, EOM_CCSD) | string | none |
+| n_excited_states | Number of excited states to compute | int | 5 |
+| adc2_solver | Solver for ADC(2) (auto, schur_static, schur_omega, full) | string | auto |
+| eom_mp2_solver | Solver for EOM-MP2 (auto, schur_static, schur_omega, full) | string | auto |
 | schwarz_screening_threshold | Schwarz screening threshold | double | 1.0e-12 |
 | initial_guess | Method to use for initial guess | string | core |
 | convergence_method | Method to use for convergence | string | DIIS |
@@ -33,6 +36,9 @@
 | mayer | Perform Mayer bond order analysis | bool | false |
 | wiberg | Perform Wiberg bond order analysis | bool | false |
 | export_molden | Output Molden file | bool | false |
+| n_excited_states | Number of excited states to compute | int | 5 |
+| adc2_solver | Solver for ADC(2) | string | auto |
+| eom_mp2_solver | Solver for EOM-MP2 | string | auto |
 
 
 
@@ -145,7 +151,7 @@ If any of the following conditions are met, an exception is thrown:
 | diis_size | Number of previous Fock matrices to store | int | 8 |
 | diis_include_transform | Include the transformation matrix in DIIS | bool | false |
 | rohf_parameter_name | ROHF parameter set name | string | Roothaan |
-| post_hf_method | Post-Hartree-Fock method to use (MP2, CCSD, CCSD(T)) | string | none |
+| post_hf_method | Post-Hartree-Fock method to use | string | none |
 
 
 #### maxiter - Maximum number of SCF iterations
@@ -179,7 +185,7 @@ If any of the following conditions are met, an exception is thrown:
   4. Create uncontracted auxiliary functions (coefficient = 1.0) for angular momenta $L = 0, 1, \ldots, 2L_{\max}$, where $L_{\max}$ is the maximum angular momentum in the primary basis
 * The auto-generated auxiliary basis provides a quick approximation but is less accurate than purpose-built auxiliary basis sets (e.g., cc-pVDZ-RIFIT). Use explicit auxiliary basis files for production calculations.
 
-#### post_hf_method - Post-Hartree-Fock method to use (FCI, MP2, CCSD, CCSD(T))
+#### post_hf_method - Post-Hartree-Fock method to use
 * default: none
 * none - No post-Hartree-Fock method is applied
 * FCI - Full Configuration Interaction method (FCI)
@@ -187,6 +193,11 @@ If any of the following conditions are met, an exception is thrown:
 * MP3 - Møller-Plesset perturbation theory of third order (MP3)
 * CCSD - Coupled Cluster with Single and Double excitations (CCSD)
 * CCSD_T - Coupled Cluster with Single, Double, and perturbative Triple excitations (CCSD(T))
+* CIS - Configuration Interaction Singles (excited states)
+* ADC2 - Algebraic Diagrammatic Construction of second order (excited states)
+* EOM_MP2 - Equation-of-Motion MP2 (excited states)
+* EOM_CC2 - Equation-of-Motion CC2 (excited states)
+* EOM_CCSD - Equation-of-Motion CCSD (excited states)
 
 #### schwarz_screening_threshold - schwarz screening threshold
 * default:  1.0e-12
@@ -272,6 +283,51 @@ Otherwise, the two-electron repulsion integrals (ERIs) are set to zero.
 * true - Export Molden file after the SCF calculation (output filename: output.molden)
 * false - Do not output Molden file
 
+
+## Excited state parameters
+
+| Parameter | Description | Type | Default |
+| --- | --- | --- | --- |
+| n_excited_states | Number of excited states to compute | int | 5 |
+| adc2_solver | Solver for ADC(2) | string | auto |
+| eom_mp2_solver | Solver for EOM-MP2 | string | auto |
+
+These parameters are used when `post_hf_method` is set to an excited state method (CIS, ADC2, EOM_MP2, EOM_CC2, EOM_CCSD).
+
+#### n_excited_states - Number of excited states to compute
+* default: 5
+* Number of lowest excited states to compute. Must not exceed the singles dimension (nocc × nvir).
+
+#### adc2_solver - Solver for ADC(2)
+* default: auto
+* auto - Automatically selects `full` or `schur_omega` based on available GPU memory (80% threshold)
+* full - Full Davidson in singles+doubles space. Exact but requires more GPU memory.
+* schur_omega - ω-dependent Schur complement with self-consistent iteration. M_eff(ω) = M11 + M12·(ωI − D2)⁻¹·M21. Iterates each root until ω converges.
+* schur_static - Single Schur complement at ω=0. M_eff = M11 − M12·D2⁻¹·M21. Fastest but least accurate.
+
+#### eom_mp2_solver - Solver for EOM-MP2
+* default: auto
+* auto - Automatically selects `full` or `schur_omega` based on available GPU memory (80% threshold)
+* full - Full Davidson in singles+doubles space. Exact but may encounter near-zero eigenvalues from the doubles null space.
+* schur_omega - ω-dependent Schur complement with self-consistent iteration. Builds dense M_eff(ω) matrix and uses non-symmetric eigendecomposition. More accurate than schur_static.
+* schur_static - Approximate Schur complement at ω=0 using Davidson. M22 off-diagonal (t2×r2 coupling) is ignored. Fast but approximate.
+
+```bash
+# CIS with 10 excited states
+./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs --post_hf_method cis --n_excited_states 10
+
+# ADC(2) with auto solver selection (default)
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2
+
+# ADC(2) with explicit full Davidson solver
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2 --adc2_solver full
+
+# EOM-MP2 with schur_omega solver
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_mp2 --eom_mp2_solver schur_omega
+
+# EOM-CCSD
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_ccsd
+```
 
 ## Geometry optimization parameters
 

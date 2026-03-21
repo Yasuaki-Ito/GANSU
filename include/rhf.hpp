@@ -606,6 +606,11 @@ public:
     real_t compute_ccsd_energy() override;
     real_t compute_ccsd_t_energy() override;
     real_t compute_fci_energy() override;
+    void compute_cis(int n_states) override;
+    void compute_adc2(int n_states) override;
+    void compute_eom_mp2(int n_states) override;
+    void compute_eom_cc2(int n_states) override;
+    void compute_eom_ccsd(int n_states) override;
 
     /// Set CCSD algorithm: 0=spatial-optimized (default), 1=spatial-naive, 2=spin-orbital
     void set_ccsd_algorithm(int algo) { ccsd_algorithm_ = algo; }

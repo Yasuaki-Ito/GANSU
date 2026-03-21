@@ -125,6 +125,17 @@ public:
         cudaMemcpy(d_output, d_input, dimension() * sizeof(real_t),
                    cudaMemcpyDeviceToDevice);
     }
+
+    /**
+     * @brief Get device pointer to operator diagonal elements for Davidson correction
+     *
+     * Returns nullptr by default (no diagonal available).
+     * If non-null, Davidson solver uses Jacobi correction:
+     *   correction[j] = -residual[j] / (diagonal[j] - eigenvalue)
+     *
+     * @return Device pointer to diagonal elements [dimension()], or nullptr
+     */
+    virtual const real_t* get_diagonal_device() const { return nullptr; }
 };
 
 } // namespace gansu
