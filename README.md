@@ -253,7 +253,12 @@ To specify the optimization algorithm:
 
 Available optimizers: `bfgs` (default), `dfp`, `sr1`, `gdiis`, `cg-fr`, `cg-pr`, `cg-hs`, `cg-dy`, `sd`
 
-##### Example 5: Excited state calculations
+##### Example 5: CC2 correlation energy
+``` bash
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method cc2
+```
+
+##### Example 6: Excited state calculations
 ``` bash
 # CIS (Configuration Interaction Singles)
 ./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs --post_hf_method cis --n_excited_states 10
