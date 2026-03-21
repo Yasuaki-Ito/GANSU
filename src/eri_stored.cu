@@ -444,7 +444,6 @@ __global__ void build_Wabcd_kernel(const double* __restrict__ v_vvvv,
                                     int nvir) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
-    size_t vvv = vv * nvir;
     size_t vv2 = vv * vv;
     if (gid >= vv2) return;
 
@@ -3945,14 +3944,6 @@ real_t compute_ccsd_t_energy(const real_t* __restrict__ d_eri_mo,
 //             Scuseria, Janssen, Schaefer, JCP 89, 7382 (1988)
 // ============================================================
 
-// Device helper: access MO integral (pq|rs) in chemist's notation
-static __device__ __forceinline__ real_t mo_eri(const real_t* __restrict__ eri, int N,
-                                                 int p, int q, int r, int s)
-{
-    return eri[((size_t)p*N + q)*N*N + (size_t)r*N + s];
-}
-
-
 // ============================================================
 //  Naive spatial-orbital CCSD (no GPU DGEMM, no pre-built sub-blocks)
 //  Kept for benchmarking against the optimized version.
@@ -5183,7 +5174,6 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         PROFILE_ELAPSED_TIME(str);
 
         const size_t o3 = (size_t)nocc * nocc * nocc;
-        const size_t ov_sz = (size_t)nocc * nvir;
         real_t E_T = 0.0;
 
         // ---- DGEMM 1: F_sum for all f-sums ----

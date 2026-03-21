@@ -102,6 +102,9 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     }else if(post_hf_method_str == "mp4"){
         std::cout << "Message: Post-HF method is MP4." << std::endl;
         post_hf_method_ = PostHFMethod::MP4;
+    }else if(post_hf_method_str == "cc2"){
+        std::cout << "Message: Post-HF method is CC2." << std::endl;
+        post_hf_method_ = PostHFMethod::CC2;
     }else if(post_hf_method_str == "ccsd"){
         std::cout << "Message: Post-HF method is CCSD." << std::endl;
         post_hf_method_ = PostHFMethod::CCSD;

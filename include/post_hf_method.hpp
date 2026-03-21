@@ -22,6 +22,7 @@ enum class PostHFMethod {
     MP2,
     MP3,
     MP4,
+    CC2,
     CCSD,
     CCSD_T,
     CIS,

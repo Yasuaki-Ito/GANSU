@@ -76,14 +76,6 @@ static void generate_combinations(int n, int k, std::vector<uint64_t>& result) {
 // ========================================================================
 
 /**
- * @brief Count excitations between two bit strings
- * @return Number of orbitals that differ (excitation level = return/2 for each spin)
- */
-static __device__ __forceinline__ int count_excitations(uint64_t str1, uint64_t str2) {
-    return __popcll(str1 ^ str2) / 2;
-}
-
-/**
  * @brief Compute phase factor for single excitation p -> q in a string
  *
  * Phase = (-1)^(number of occupied orbitals between positions p and q)

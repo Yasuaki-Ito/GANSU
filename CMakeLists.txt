@@ -84,6 +84,7 @@ set(SOURCES
     src/eri_stored_eom_mp2.cu
     src/cc2_solver.cu
     src/eom_cc2_operator.cu
+    src/eri_stored_cc2.cu
     src/eri_stored_eom_cc2.cu
     src/eom_ccsd_operator.cu
     src/eri_stored_eom_ccsd.cu

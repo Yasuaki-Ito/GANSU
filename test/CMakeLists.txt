@@ -20,7 +20,7 @@ cmake_minimum_required(VERSION 3.31)
 include(FetchContent)
 FetchContent_Declare(
     googletest
-    URL https://github.com/google/googletest/archive/03597a01ee50ed33e9dfd640b249b4be3799d395.zip
+    URL https://github.com/google/googletest/archive/refs/tags/v1.15.2.zip
 )
 # Build settings for GTest
 FetchContent_MakeAvailable(googletest)

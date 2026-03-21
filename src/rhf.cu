@@ -156,6 +156,8 @@ void RHF::post_process_after_scf() {
         post_hf_energy_ = eri_method_->compute_mp3_energy();
     }else if(post_hf_method == PostHFMethod::MP4){
         post_hf_energy_ = eri_method_->compute_mp4_energy();
+    }else if(post_hf_method == PostHFMethod::CC2){
+        post_hf_energy_ = eri_method_->compute_cc2_energy();
     }else if(post_hf_method == PostHFMethod::CCSD){
         post_hf_energy_ = eri_method_->compute_ccsd_energy();
     }else if(post_hf_method == PostHFMethod::CCSD_T){
@@ -473,6 +475,8 @@ void RHF::report() {
             std::cout << "MP2" << std::endl;
         }else if(get_post_hf_method() == PostHFMethod::MP3){
             std::cout << "MP3" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::CC2){
+            std::cout << "CC2" << std::endl;
         }else if(get_post_hf_method() == PostHFMethod::CCSD){
             std::cout << "CCSD" << std::endl;
         }else if(get_post_hf_method() == PostHFMethod::CCSD_T){

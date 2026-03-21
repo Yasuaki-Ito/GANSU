@@ -107,6 +107,10 @@ public:
         * @return CCSD energy
         * @details This function computes the CCSD energy.
         */
+    virtual real_t compute_cc2_energy(){
+        THROW_EXCEPTION("CC2 energy computation is not supported for the selected ERI method.");
+    }
+
     virtual real_t compute_ccsd_energy(){
         THROW_EXCEPTION("CCSD energy computation is not supported for the selected ERI method.");
     }
@@ -201,6 +205,7 @@ public:
             || method == PostHFMethod::MP2  // The stored ERI method supports MP2
             || method == PostHFMethod::MP3  // The stored ERI method supports MP3
             || method == PostHFMethod::MP4  // The stored ERI method supports MP4
+            || method == PostHFMethod::CC2  // The stored ERI method supports CC2
             || method == PostHFMethod::CCSD // The stored ERI method supports CCSD
             || method == PostHFMethod::CCSD_T // The stored ERI method supports CCSD(T)
             || method == PostHFMethod::CIS  // The stored ERI method supports CIS
