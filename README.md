@@ -26,11 +26,12 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Full Configuration Interaction (RFCI)
 * Excited state methods
     * Configuration Interaction Singles (CIS)
-    * Algebraic Diagrammatic Construction (ADC(2))
+    * Algebraic Diagrammatic Construction (ADC(2), ADC(2)-x)
     * Equation-of-Motion MP2 (EOM-MP2)
     * Equation-of-Motion CC2 (EOM-CC2)
     * Equation-of-Motion CCSD (EOM-CCSD)
-    * Oscillator strengths for all excited state methods
+    * Singlet and triplet excited states (CIS, ADC(2), ADC(2)-x)
+    * Oscillator strengths for all singlet excited state methods
 * Initial Guess
     * Core Hamiltonian (RHF, UHF, ROHF) 
     * Generalized Wolfsberg-Helmholz (GWH) (RHF, UHF, ROHF)
@@ -265,6 +266,12 @@ Available optimizers: `bfgs` (default), `dfp`, `sr1`, `gdiis`, `cg-fr`, `cg-pr`,
 
 # ADC(2)
 ./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2
+
+# ADC(2)-x (extended ADC(2) with first-order M22 terms)
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2x
+
+# Triplet excited states
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2 --spin_type triplet
 
 # EOM-MP2
 ./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_mp2

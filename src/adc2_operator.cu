@@ -21,7 +21,9 @@
  * M_eff(ω) = M11 + M12 · diag(1/(ω - D2)) · M21
  *
  * M11 = CIS + ISR_corr - δ_ab × Σ_oo[i,j] + δ_ij × Σ_vv[a,b]
- *   ISR_corr = (2P1 - P2 - P5 + 0.5P6) + transpose, where:
+ *   Singlet ISR_corr = (2P1 - P2 - P5 + 0.5P6) + transpose
+ *   Triplet ISR_corr = (0.5P6) + transpose = 0.5*(P6 + P6^T)
+ *   where:
  *     P1[ia,jb] = Σ_{kc} t2[i,k,a,c]·(jb|kc)
  *     P2[ia,jb] = Σ_{kc} t2[i,k,a,c]·(kb|jc)
  *     P5[ia,jb] = Σ_{kc} t2[k,i,a,c]·(jb|kc)  (t2 occ-swapped)
@@ -198,18 +200,15 @@ __global__ void adc2_compute_D1_kernel(
 
 /**
  * @brief Build CIS A-matrix (column-major)
- * A[ia,jb] = δ_ij·δ_ab·(eps_a - eps_i) + 2(ia|jb) - (ij|ab)
- *
- * Note: (ij|ab) = eri_mo[(i*nao+j)*nao2 + a_abs*nao+b_abs], but we can express
- * it using ERI symmetry: (ij|ab) = (ji|ab) = eri_ovov permutation.
- * Actually, (ij|ab) has i,j occ and a,b vir — this is the oovv block.
- * We use the full eri_mo directly for this.
+ * Singlet: A[ia,jb] = δ_ij·δ_ab·(eps_a - eps_i) + 2(ia|jb) - (ij|ab)
+ * Triplet: A[ia,jb] = δ_ij·δ_ab·(eps_a - eps_i) - (ij|ab)
  */
 __global__ void adc2_build_cis_matrix_kernel(
     const real_t* __restrict__ d_eri_mo,
     const real_t* __restrict__ d_orbital_energies,
     real_t* __restrict__ d_cis,
-    int nocc, int nvir, int nao)
+    int nocc, int nvir, int nao,
+    bool is_triplet)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int ov = nocc * nvir;
@@ -235,13 +234,15 @@ __global__ void adc2_build_cis_matrix_kernel(
         val += d_orbital_energies[a_abs] - d_orbital_energies[i];
     }
 
-    // 2(ia|jb)
-    real_t ia_jb = d_eri_mo[((size_t)i * nao + a_abs) * nao2 + (size_t)j * nao + b_abs];
-    val += 2.0 * ia_jb;
-
     // -(ij|ab)
     real_t ij_ab = d_eri_mo[((size_t)i * nao + j) * nao2 + (size_t)a_abs * nao + b_abs];
     val -= ij_ab;
+
+    if (!is_triplet) {
+        // Singlet: +2(ia|jb)
+        real_t ia_jb = d_eri_mo[((size_t)i * nao + a_abs) * nao2 + (size_t)j * nao + b_abs];
+        val += 2.0 * ia_jb;
+    }
 
     d_cis[idx] = val;
 }
@@ -249,23 +250,20 @@ __global__ void adc2_build_cis_matrix_kernel(
 /**
  * @brief Build ISR-ADC(2) full-block correction (column-major)
  *
- * ISR correction = (2P1 - P2 - P5 + 0.5P6) + transpose
- * where the 4 patterns (with mapping I→i, D→a, L→j, A→b):
- *   P1[ia,jb] = Σ_{kc} t2[i,k,a,c] × ovov[j,b,k,c]
- *   P2[ia,jb] = Σ_{kc} t2[i,k,a,c] × ovov[k,b,j,c]
- *   P5[ia,jb] = Σ_{kc} t2[k,i,a,c] × ovov[j,b,k,c]
- *   P6[ia,jb] = Σ_{kc} t2[k,i,a,c] × ovov[k,b,j,c]
- * and the transpose swaps (ia) ↔ (jb).
+ * Singlet ISR: (2P1 - P2 - P5 + 0.5P6) + transpose
+ * Triplet ISR: (0P1 + 0P2 + 0P5 + 0.5P6) + transpose = 0.5*(P6 + P6^T)
  *
- * Each thread computes one element [ia,jb]. The kernel exploits the
- * transpose symmetry: the (ia,jb) element accumulates both the direct
- * and transposed contributions by adding terms with (i,a,j,b) AND (j,b,i,a).
+ * Derived by spin-tracing the ADC(2) ISR coupling term (Term C):
+ *   s1[i,a] += <jk||bc> * t2[ik,ac] * r[j,b]
+ * For singlet (r_β = +r_α): both αα and ββ channels contribute with same sign.
+ * For triplet (r_β = -r_α): ββ channel has opposite sign, canceling P1/P2/P5.
  */
 __global__ void adc2_build_M11_ISR_correction_kernel(
     const real_t* __restrict__ d_t2,
     const real_t* __restrict__ d_eri_ovov,
     real_t* __restrict__ d_ISR_corr,
-    int nocc, int nvir)
+    int nocc, int nvir,
+    bool is_triplet)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int ov = nocc * nvir;
@@ -286,45 +284,52 @@ __global__ void adc2_build_M11_ISR_correction_kernel(
     for (int k = 0; k < nocc; k++) {
         for (int c = 0; c < nvir; c++) {
             // ovov indices: ovov[p,q,r,s] at p*nvir*nocc*nvir + q*nocc*nvir + r*nvir + s
-            real_t t2_ikac = d_t2[(size_t)i * nocc * nvir * nvir +
-                                  (size_t)k * nvir * nvir +
-                                  (size_t)a * nvir + c];
             real_t t2_kiac = d_t2[(size_t)k * nocc * nvir * nvir +
                                   (size_t)i * nvir * nvir +
                                   (size_t)a * nvir + c];
-
-            real_t ovov_jbkc = d_eri_ovov[(size_t)j * ovov_stride +
-                                          (size_t)b * nocc * nvir +
-                                          (size_t)k * nvir + c];
             real_t ovov_kbjc = d_eri_ovov[(size_t)k * ovov_stride +
                                           (size_t)b * nocc * nvir +
                                           (size_t)j * nvir + c];
 
-            // Direct: 2*P1 - P2 - P5 + 0.5*P6
-            val += 2.0 * t2_ikac * ovov_jbkc;   // +2*P1
-            val -=       t2_ikac * ovov_kbjc;    // -P2
-            val -=       t2_kiac * ovov_jbkc;    // -P5
+            // P6 term (present in both singlet and triplet)
             val += 0.5 * t2_kiac * ovov_kbjc;    // +0.5*P6
 
+            if (!is_triplet) {
+                // Additional singlet terms: +2*P1 - P2 - P5
+                real_t t2_ikac = d_t2[(size_t)i * nocc * nvir * nvir +
+                                      (size_t)k * nvir * nvir +
+                                      (size_t)a * nvir + c];
+                real_t ovov_jbkc = d_eri_ovov[(size_t)j * ovov_stride +
+                                              (size_t)b * nocc * nvir +
+                                              (size_t)k * nvir + c];
+
+                val += 2.0 * t2_ikac * ovov_jbkc;   // +2*P1
+                val -=       t2_ikac * ovov_kbjc;    // -P2
+                val -=       t2_kiac * ovov_jbkc;    // -P5
+            }
+
             // Transpose: same patterns with (i,a) ↔ (j,b)
-            real_t t2_jkbc = d_t2[(size_t)j * nocc * nvir * nvir +
-                                  (size_t)k * nvir * nvir +
-                                  (size_t)b * nvir + c];
             real_t t2_kjbc = d_t2[(size_t)k * nocc * nvir * nvir +
                                   (size_t)j * nvir * nvir +
                                   (size_t)b * nvir + c];
-
-            real_t ovov_iakc = d_eri_ovov[(size_t)i * ovov_stride +
-                                          (size_t)a * nocc * nvir +
-                                          (size_t)k * nvir + c];
             real_t ovov_kaic = d_eri_ovov[(size_t)k * ovov_stride +
                                           (size_t)a * nocc * nvir +
                                           (size_t)i * nvir + c];
 
-            val += 2.0 * t2_jkbc * ovov_iakc;   // +2*P1^T
-            val -=       t2_jkbc * ovov_kaic;    // -P2^T
-            val -=       t2_kjbc * ovov_iakc;    // -P5^T
             val += 0.5 * t2_kjbc * ovov_kaic;    // +0.5*P6^T
+
+            if (!is_triplet) {
+                real_t t2_jkbc = d_t2[(size_t)j * nocc * nvir * nvir +
+                                      (size_t)k * nvir * nvir +
+                                      (size_t)b * nvir + c];
+                real_t ovov_iakc = d_eri_ovov[(size_t)i * ovov_stride +
+                                              (size_t)a * nocc * nvir +
+                                              (size_t)k * nvir + c];
+
+                val += 2.0 * t2_jkbc * ovov_iakc;   // +2*P1^T
+                val -=       t2_jkbc * ovov_kaic;    // -P2^T
+                val -=       t2_kjbc * ovov_iakc;    // -P5^T
+            }
         }
     }
 
@@ -1025,11 +1030,13 @@ __global__ void adc2_apply_M12_x2_kernel(
 ADC2Operator::ADC2Operator(
     const real_t* d_eri_mo,
     const real_t* d_orbital_energies,
-    int nocc, int nvir, int nao)
+    int nocc, int nvir, int nao,
+    bool is_triplet)
     : nocc_(nocc), nvir_(nvir), nao_(nao),
       singles_dim_(nocc * nvir),
       doubles_dim_(nocc * nocc * nvir * nvir),
       omega_(0.0),
+      is_triplet_(is_triplet),
       d_eri_ovov_(nullptr), d_eri_vvov_(nullptr), d_eri_ooov_(nullptr),
       d_t2_(nullptr),
       d_M11_(nullptr), d_M12_(nullptr), d_M21_(nullptr),
@@ -1142,14 +1149,14 @@ void ADC2Operator::build_M11(const real_t* d_eri_mo, const real_t* d_orbital_ene
     // Step 1: Build CIS A-matrix into d_M11_
     adc2_build_cis_matrix_kernel<<<blocks, threads>>>(
         d_eri_mo, d_orbital_energies, d_M11_,
-        nocc_, nvir_, nao_);
+        nocc_, nvir_, nao_, is_triplet_);
     cudaDeviceSynchronize();
 
     // Step 2: Compute ISR full-block correction into temp
     real_t* d_ISR_corr = nullptr;
     tracked_cudaMalloc(&d_ISR_corr, matrix_size * sizeof(real_t));
     adc2_build_M11_ISR_correction_kernel<<<blocks, threads>>>(
-        d_t2_, d_eri_ovov_, d_ISR_corr, nocc_, nvir_);
+        d_t2_, d_eri_ovov_, d_ISR_corr, nocc_, nvir_, is_triplet_);
     cudaDeviceSynchronize();
 
     // Step 3: M11 = CIS + ISR_correction (add via cublasDaxpy)

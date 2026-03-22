@@ -16,8 +16,9 @@
  * @file cis_operator.cu
  * @brief GPU implementation of CIS (Configuration Interaction Singles) operator
  *
- * CIS A-matrix for RHF singlet excited states:
- *   A_{ia,jb} = delta_{ij} delta_{ab} (eps_a - eps_i) + 2(ia|jb) - (ij|ab)
+ * CIS A-matrix for RHF excited states:
+ *   Singlet: A_{ia,jb} = delta_{ij} delta_{ab} (eps_a - eps_i) + 2(ia|jb) - (ij|ab)
+ *   Triplet: A_{ia,jb} = delta_{ij} delta_{ab} (eps_a - eps_i) - (ij|ab)
  *
  * Equations derived by spin2spatial tool (CIS_RHF.md):
  *   sigma^a_i = -2 f_ji r^a_j + 2 f_ab r^b_i + 4(ai|jb) r^b_j - 2(ab|ji) r^b_j
@@ -38,7 +39,8 @@ namespace gansu {
 /**
  * @brief Build CIS A-matrix elements
  *
- * A[ia, jb] = delta_{ij} * delta_{ab} * (eps_a - eps_i) + 2*(ia|jb) - (ij|ab)
+ * Singlet: A[ia, jb] = delta_{ij} * delta_{ab} * (eps_a - eps_i) + 2*(ia|jb) - (ij|ab)
+ * Triplet: A[ia, jb] = delta_{ij} * delta_{ab} * (eps_a - eps_i) - (ij|ab)
  *
  * Index mapping: ia = i * nvir + a_rel, where a_rel = a_abs - nocc
  * ERI access: eri_mo[(p*nao + q)*nao*nao + r*nao + s] = (pq|rs)
@@ -47,7 +49,8 @@ __global__ void cis_build_A_matrix_kernel(
     const real_t* __restrict__ d_eri_mo,
     const real_t* __restrict__ d_orbital_energies,
     real_t* __restrict__ d_A_matrix,
-    int nocc, int nvir, int nao)
+    int nocc, int nvir, int nao,
+    bool is_triplet)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int dim = nocc * nvir;
@@ -65,14 +68,20 @@ __global__ void cis_build_A_matrix_kernel(
     int a_abs = a_rel + nocc;
     int b_abs = b_rel + nocc;
 
-    // (ia|jb) = eri_mo[(i*nao + a_abs)*nao*nao + j*nao + b_abs]
     size_t nao2 = (size_t)nao * nao;
-    real_t ia_jb = d_eri_mo[((size_t)i * nao + a_abs) * nao2 + (size_t)j * nao + b_abs];
 
     // (ij|ab) = eri_mo[(i*nao + j)*nao*nao + a_abs*nao + b_abs]
     real_t ij_ab = d_eri_mo[((size_t)i * nao + j) * nao2 + (size_t)a_abs * nao + b_abs];
 
-    real_t val = 2.0 * ia_jb - ij_ab;
+    real_t val;
+    if (is_triplet) {
+        // Triplet: -(ij|ab)
+        val = -ij_ab;
+    } else {
+        // Singlet: 2*(ia|jb) - (ij|ab)
+        real_t ia_jb = d_eri_mo[((size_t)i * nao + a_abs) * nao2 + (size_t)j * nao + b_abs];
+        val = 2.0 * ia_jb - ij_ab;
+    }
 
     // Diagonal contribution
     if (i == j && a_rel == b_rel) {
@@ -117,9 +126,11 @@ __global__ void cis_preconditioner_kernel(
 CISOperator::CISOperator(
     const real_t* d_eri_mo,
     const real_t* d_orbital_energies,
-    int nocc, int nvir, int nao)
+    int nocc, int nvir, int nao,
+    bool is_triplet)
     : nocc_(nocc), nvir_(nvir), nao_(nao),
       dim_(nocc * nvir),
+      is_triplet_(is_triplet),
       d_A_matrix_(nullptr),
       d_diagonal_(nullptr)
 {
@@ -143,7 +154,7 @@ void CISOperator::build_A_matrix(const real_t* d_eri_mo, const real_t* d_orbital
     int blocks = (matrix_size + threads - 1) / threads;
     cis_build_A_matrix_kernel<<<blocks, threads>>>(
         d_eri_mo, d_orbital_energies, d_A_matrix_,
-        nocc_, nvir_, nao_);
+        nocc_, nvir_, nao_, is_triplet_);
     cudaDeviceSynchronize();
 
     // Extract diagonal

@@ -13,21 +13,23 @@
  */
 
 /**
- * @file eri_stored_cis.cu
- * @brief CIS (Configuration Interaction Singles) excited state calculation
+ * @file eri_stored_adc2x.cu
+ * @brief ADC(2)-x excited state calculation using stored ERIs
  *
- * Computes singlet or triplet excited states using the CIS method with RHF reference.
- * Uses stored AO ERIs transformed to MO basis, builds the CIS A-matrix,
- * and solves the eigenvalue problem with Davidson solver.
+ * ADC(2)-x = ADC(2)-s with first-order off-diagonal M22 terms.
+ * Reuses ADC2Operator for M11/M12/M21, adds oooo/vvvv/voov M22 corrections.
+ * Uses full Davidson solver in the singles+doubles space.
  */
 
 #include <iomanip>
 #include <iostream>
 #include <vector>
 #include <cmath>
+#include <algorithm>
 
 #include "rhf.hpp"
-#include "cis_operator.hpp"
+#include "adc2_operator.hpp"
+#include "adc2x_operator.hpp"
 #include "davidson_solver.hpp"
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
@@ -42,13 +44,15 @@ void transform_ao_eri_to_mo_eri_full(
     const double* d_eri_ao, const double* d_C, int nao, double* d_eri_mo);
 
 
-void ERI_Stored_RHF::compute_cis(int n_states) {
+void ERI_Stored_RHF::compute_adc2x(int n_states) {
     PROFILE_FUNCTION();
 
     const int num_basis = rhf_.get_num_basis();
     const int num_occ = rhf_.get_num_electrons() / 2;
     const int num_vir = num_basis - num_occ;
-    const int cis_dim = num_occ * num_vir;
+    const int singles_dim = num_occ * num_vir;
+    const int doubles_dim = num_occ * num_occ * num_vir * num_vir;
+    const int total_dim = singles_dim + doubles_dim;
 
     DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
     const real_t* d_C = coefficient_matrix.device_ptr();
@@ -57,15 +61,16 @@ void ERI_Stored_RHF::compute_cis(int n_states) {
     bool is_triplet = rhf_.is_triplet();
     std::string spin_label = is_triplet ? "triplet" : "singlet";
 
-    std::cout << "\n---- CIS " << spin_label << " excited states ---- "
+    std::cout << "\n---- ADC(2)-x " << spin_label << " excited states ---- "
               << "nocc=" << num_occ << ", nvir=" << num_vir
-              << ", dim=" << cis_dim
+              << ", singles=" << singles_dim << ", doubles=" << doubles_dim
+              << ", total_dim=" << total_dim
               << ", nstates=" << n_states << std::endl;
 
-    if (n_states > cis_dim) {
-        std::cout << "Warning: Requested " << n_states << " states but CIS dimension is "
-                  << cis_dim << ". Reducing to " << cis_dim << "." << std::endl;
-        n_states = cis_dim;
+    if (n_states > singles_dim) {
+        std::cout << "Warning: Requested " << n_states << " states but singles dimension is "
+                  << singles_dim << ". Reducing to " << singles_dim << "." << std::endl;
+        n_states = singles_dim;
     }
 
     // ------------------------------------------------------------------
@@ -77,63 +82,90 @@ void ERI_Stored_RHF::compute_cis(int n_states) {
     transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
 
     // ------------------------------------------------------------------
-    // Step 2: Get orbital energies
+    // Step 2: Build ADC(2)-s operator (for M11, M12, M21, D2)
+    //         Then build ADC(2)-x operator (adds M22 first-order terms)
     // ------------------------------------------------------------------
     DeviceHostMemory<real_t>& orbital_energies = rhf_.get_orbital_energies();
     const real_t* d_orbital_energies = orbital_energies.device_ptr();
 
+    ADC2Operator adc2_op(d_eri_mo, d_orbital_energies, num_occ, num_vir, num_basis, is_triplet);
+
+    // Build ADC(2)-x operator (extracts oooo/vvvv/oovv blocks, needs d_eri_mo)
+    ADC2XOperator adc2x_op(adc2_op, d_eri_mo, num_basis);
+
+    // Free full MO ERIs — all blocks are extracted
+    tracked_cudaFree(d_eri_mo);
+    d_eri_mo = nullptr;
+
     // ------------------------------------------------------------------
-    // Step 3: Build CIS operator and solve
+    // Step 3: Davidson solver
     // ------------------------------------------------------------------
-    CISOperator cis_op(d_eri_mo, d_orbital_energies, num_occ, num_vir, num_basis, is_triplet);
+    Timer adc2x_timer;
 
     DavidsonConfig config;
     config.num_eigenvalues = n_states;
-    config.max_subspace_size = std::min(cis_dim, std::max(30, 4 * n_states));
     config.convergence_threshold = 1e-6;
-    config.max_iterations = 100;
+    config.max_subspace_size = std::min(total_dim, std::max(100, 10 * n_states));
+    config.max_iterations = 500;
     config.use_preconditioner = true;
+    config.symmetric = false;  // ADC full matrix is non-symmetric in spatial orbitals
     config.verbose = 2;
 
-    DavidsonSolver solver(cis_op, config);
+    std::cout << "  Solving with full Davidson (dim=" << total_dim << ")..." << std::endl;
+
+    DavidsonSolver solver(adc2x_op, config);
     bool converged = solver.solve();
 
     if (!converged) {
-        std::cout << "Warning: Davidson solver did not converge for all states." << std::endl;
+        std::cout << "  Warning: Davidson did not fully converge" << std::endl;
     }
 
+    std::cout << "  ADC(2)-x time: " << std::fixed << std::setprecision(3)
+              << adc2x_timer.elapsed_seconds() << " s" << std::endl;
+
+    // ------------------------------------------------------------------
+    // Step 4: Extract results
+    // ------------------------------------------------------------------
     const auto& eigenvalues = solver.get_eigenvalues();
+    std::vector<real_t> h_full_evecs((size_t)n_states * total_dim);
+    solver.copy_eigenvectors_to_host(h_full_evecs.data());
 
-    // Store excitation energies for external access (e.g., tests)
-    rhf_.set_excitation_energies(eigenvalues);
+    // Filter out spurious near-zero eigenvalues
+    std::vector<real_t> excitation_energies;
+    std::vector<real_t> h_final_eigenvectors;
+
+    for (int k = 0; k < n_states; k++) {
+        if (eigenvalues[k] < 0.01) continue;
+        excitation_energies.push_back(eigenvalues[k]);
+        h_final_eigenvectors.insert(h_final_eigenvectors.end(),
+                                    &h_full_evecs[k * total_dim],
+                                    &h_full_evecs[k * total_dim + singles_dim]);
+    }
+    n_states = static_cast<int>(excitation_energies.size());
+
+    // Store excitation energies
+    rhf_.set_excitation_energies(excitation_energies);
 
     // ------------------------------------------------------------------
-    // Step 4: Analyze and print results with oscillator strengths
+    // Step 5: Print results with oscillator strengths
     // ------------------------------------------------------------------
-    std::vector<real_t> h_eigenvectors(cis_dim * n_states);
-    solver.copy_eigenvectors_to_host(h_eigenvectors.data());
-
-    // Get host data for oscillator strength computation
     coefficient_matrix.toHost();
     const auto& prim_shells = rhf_.get_primitive_shells();
     const auto& cgto_norms = rhf_.get_cgto_normalization_factors();
     const_cast<DeviceHostMemory<PrimitiveShell>&>(prim_shells).toHost();
     const_cast<DeviceHostMemory<real_t>&>(cgto_norms).toHost();
 
-    std::string method_name = is_triplet ? "CIS (triplet)" : "CIS";
+    std::string method_name = is_triplet ? "ADC(2)-x (triplet)" : "ADC(2)-x";
     auto es_result = compute_excited_state_properties(
         method_name,
         prim_shells.host_ptr(), prim_shells.size(),
         cgto_norms.host_ptr(),
         rhf_.get_shell_type_infos(),
         coefficient_matrix.host_ptr(),
-        eigenvalues, h_eigenvectors.data(),
+        excitation_energies, h_final_eigenvectors.data(),
         n_states, num_basis, num_occ, num_vir);
     rhf_.set_oscillator_strengths(es_result.oscillator_strengths);
     rhf_.set_excited_state_report(es_result.report);
-
-    // Cleanup
-    tracked_cudaFree(d_eri_mo);
 }
 
 } // namespace gansu

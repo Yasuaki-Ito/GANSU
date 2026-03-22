@@ -33,6 +33,12 @@ Parameters excluding file paths are not case-sensitive.
 | mayer | Perform Mayer bond order analysis | bool | false |
 | wiberg | Perform Wiberg bond order analysis | bool | false |
 | export_molden | Output Molden file | bool | false |
+| post_hf_method | Post-Hartree-Fock method | string | none |
+| n_excited_states | Number of excited states to compute | int | 5 |
+| spin_type | Spin type for excited states (singlet, triplet) | string | singlet |
+| adc2_solver | Solver for ADC(2) (auto, schur_static, schur_omega, full) | string | auto |
+| eom_mp2_solver | Solver for EOM-MP2 (auto, schur_static, schur_omega, full) | string | auto |
+| eom_cc2_solver | Solver for EOM-CC2 (auto, schur_static, schur_omega, full) | string | auto |
 
 
 
@@ -270,4 +276,37 @@ This parameter is used only when `run_type` is set to `optimize`.
 | RMS gradient | \f$2.0 \times 10^{-4}\f$ Hartree/Bohr | Root mean square of gradient |
 | Energy change | \f$1.0 \times 10^{-6}\f$ Hartree | Absolute energy change between steps |
 | Max displacement | \f$3.0 \times 10^{-4}\f$ Bohr | Maximum atomic displacement |
+
+## Post-Hartree-Fock and excited state parameters
+
+| Parameter | Description | Type | Default |
+| --- | --- | --- | --- |
+| post_hf_method | Post-Hartree-Fock method | string | none |
+| n_excited_states | Number of excited states to compute | int | 5 |
+| spin_type | Spin type for excited states (singlet, triplet) | string | singlet |
+| adc2_solver | Solver for ADC(2) | string | auto |
+| eom_mp2_solver | Solver for EOM-MP2 | string | auto |
+| eom_cc2_solver | Solver for EOM-CC2 | string | auto |
+
+#### post_hf_method - Post-Hartree-Fock method to use
+* default: none
+* none - No post-Hartree-Fock method
+* FCI - Full Configuration Interaction
+* MP2 - Møller-Plesset perturbation theory (2nd order)
+* MP3 - Møller-Plesset perturbation theory (3rd order)
+* CC2 - Coupled Cluster with approximate doubles
+* CCSD - Coupled Cluster Singles and Doubles
+* CCSD_T - CCSD with perturbative triples
+* CIS - Configuration Interaction Singles (excited states)
+* ADC2 - ADC(2)-s, Algebraic Diagrammatic Construction 2nd order, strict (excited states)
+* ADC2X - ADC(2)-x, extended ADC(2) with first-order M22 terms (excited states)
+* EOM_MP2 - Equation-of-Motion MP2 (excited states)
+* EOM_CC2 - Equation-of-Motion CC2 (excited states)
+* EOM_CCSD - Equation-of-Motion CCSD (excited states)
+
+#### spin_type - Spin type for excited states
+* default: singlet
+* singlet - Compute singlet excited states. Oscillator strengths are computed.
+* triplet - Compute triplet excited states. Oscillator strengths are zero (spin-forbidden).
+* Supported methods: CIS, ADC2, ADC2X
 

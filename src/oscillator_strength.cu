@@ -302,10 +302,17 @@ ExcitedStateResult compute_excited_state_properties(
     auto dip_mo_z = transform_dipole_ao_to_mo_ov(dip_ao_z, C_host, nao, nocc, nvir);
 
     // --- Compute oscillator strengths ---
-    auto osc_strengths = compute_oscillator_strengths(
-        h_eigenvectors, excitation_energies,
-        dip_mo_x, dip_mo_y, dip_mo_z,
-        n_states, nocc, nvir);
+    // Triplet→singlet electric dipole transitions are spin-forbidden (f=0)
+    bool is_triplet = (method_name.find("triplet") != std::string::npos);
+    std::vector<real_t> osc_strengths;
+    if (is_triplet) {
+        osc_strengths.assign(n_states, 0.0);
+    } else {
+        osc_strengths = compute_oscillator_strengths(
+            h_eigenvectors, excitation_energies,
+            dip_mo_x, dip_mo_y, dip_mo_z,
+            n_states, nocc, nvir);
+    }
 
     // --- Build report string ---
     const real_t eV = 27.211386245988;

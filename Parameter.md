@@ -19,8 +19,9 @@
 | convergence_energy_threshold | Energy convergence threshold | double | 1.0e-6 |
 | int1e_method | Method to use for one-electron integrals | string | hybrid |
 | eri_method | Method to use for two-electron repulsion integrals | string | stored |
-| post_hf_method | Post-Hartree-Fock method to use (FCI, MP2, CC2, CCSD, CCSD(T), CIS, ADC2, EOM_MP2, EOM_CC2, EOM_CCSD) | string | none |
+| post_hf_method | Post-Hartree-Fock method to use (FCI, MP2, CC2, CCSD, CCSD(T), CIS, ADC2, ADC2X, EOM_MP2, EOM_CC2, EOM_CCSD) | string | none |
 | n_excited_states | Number of excited states to compute | int | 5 |
+| spin_type | Spin type for excited states (singlet, triplet) | string | singlet |
 | adc2_solver | Solver for ADC(2) (auto, schur_static, schur_omega, full) | string | auto |
 | eom_mp2_solver | Solver for EOM-MP2 (auto, schur_static, schur_omega, full) | string | auto |
 | eom_cc2_solver | Solver for EOM-CC2 (auto, schur_static, schur_omega, full) | string | auto |
@@ -193,7 +194,8 @@ If any of the following conditions are met, an exception is thrown:
 * CCSD - Coupled Cluster with Single and Double excitations (CCSD)
 * CCSD_T - Coupled Cluster with Single, Double, and perturbative Triple excitations (CCSD(T))
 * CIS - Configuration Interaction Singles (excited states)
-* ADC2 - Algebraic Diagrammatic Construction of second order (excited states)
+* ADC2 - Algebraic Diagrammatic Construction of second order, ADC(2)-s (excited states)
+* ADC2X - Algebraic Diagrammatic Construction of second order, extended, ADC(2)-x (excited states)
 * EOM_MP2 - Equation-of-Motion MP2 (excited states)
 * EOM_CC2 - Equation-of-Motion CC2 (excited states)
 * EOM_CCSD - Equation-of-Motion CCSD (excited states)
@@ -288,15 +290,22 @@ Otherwise, the two-electron repulsion integrals (ERIs) are set to zero.
 | Parameter | Description | Type | Default |
 | --- | --- | --- | --- |
 | n_excited_states | Number of excited states to compute | int | 5 |
+| spin_type | Spin type for excited states | string | singlet |
 | adc2_solver | Solver for ADC(2) | string | auto |
 | eom_mp2_solver | Solver for EOM-MP2 | string | auto |
 | eom_cc2_solver | Solver for EOM-CC2 | string | auto |
 
-These parameters are used when `post_hf_method` is set to an excited state method (CIS, ADC2, EOM_MP2, EOM_CC2, EOM_CCSD).
+These parameters are used when `post_hf_method` is set to an excited state method (CIS, ADC2, ADC2X, EOM_MP2, EOM_CC2, EOM_CCSD).
 
 #### n_excited_states - Number of excited states to compute
 * default: 5
 * Number of lowest excited states to compute. Must not exceed the singles dimension (nocc × nvir).
+
+#### spin_type - Spin type for excited states
+* default: singlet
+* singlet - Compute singlet excited states (default). Oscillator strengths are computed.
+* triplet - Compute triplet excited states. Oscillator strengths are zero (spin-forbidden electric dipole transitions from singlet ground state).
+* Supported methods: CIS, ADC2, ADC2X. For triplet states, only the M11 block (CIS + ISR correction) differs from singlet; M12, M21, D2, and M22 are identical.
 
 #### adc2_solver - Solver for ADC(2)
 * default: auto
@@ -321,6 +330,18 @@ These parameters are used when `post_hf_method` is set to an excited state metho
 
 Note: For EOM-CC2, M22 is exactly diagonal, so the Schur complement introduces NO approximation (unlike EOM-MP2 where M22 off-diagonal terms are ignored). The only approximation in `schur_static` is the ω=0 assumption.
 
+#### ADC(2)-s vs ADC(2)-x
+
+ADC(2) has two variants:
+
+| | ADC(2)-s (`adc2`) | ADC(2)-x (`adc2x`) |
+|---|---|---|
+| M11 (singles) | CIS + ISR + self-energy | Same as ADC(2)-s |
+| M12, M21 (coupling) | Coupling blocks | Same as ADC(2)-s |
+| M22 (doubles) | Diagonal only: D2 = ε_a+ε_b−ε_i−ε_j | D2 + first-order off-diagonal terms (oooo, vvvv, voov) |
+
+ADC(2)-x includes explicit electron correlation in the doubles space, generally giving lower (more accurate) excitation energies. ADC(2)-x always uses the full Davidson solver.
+
 ```bash
 # CIS with 10 excited states
 ./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs --post_hf_method cis --n_excited_states 10
@@ -328,8 +349,16 @@ Note: For EOM-CC2, M22 is exactly diagonal, so the Schur complement introduces N
 # ADC(2) with auto solver selection (default)
 ./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2
 
+# ADC(2)-x (extended)
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2x
+
 # ADC(2) with explicit full Davidson solver
 ./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2 --adc2_solver full
+
+# Triplet excited states
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method cis --spin_type triplet
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2 --spin_type triplet
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2x --spin_type triplet
 
 # EOM-MP2 with schur_omega solver
 ./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_mp2 --eom_mp2_solver schur_omega

@@ -79,6 +79,8 @@ set(SOURCES
     src/eri_stored_adc2.cu
     src/adc2_operator.cu
     src/adc2_full_operator.cu
+    src/adc2x_operator.cu
+    src/eri_stored_adc2x.cu
     src/eom_mp2_operator.cu
     src/eom_mp2_schur_operator.cu
     src/eri_stored_eom_mp2.cu

@@ -117,6 +117,9 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     }else if(post_hf_method_str == "adc2"){
         std::cout << "Message: Post-HF method is ADC(2)." << std::endl;
         post_hf_method_ = PostHFMethod::ADC2;
+    }else if(post_hf_method_str == "adc2x" || post_hf_method_str == "adc2-x" || post_hf_method_str == "adc(2)-x"){
+        std::cout << "Message: Post-HF method is ADC(2)-x." << std::endl;
+        post_hf_method_ = PostHFMethod::ADC2X;
     }else if(post_hf_method_str == "eom_mp2"){
         std::cout << "Message: Post-HF method is EOM-MP2." << std::endl;
         post_hf_method_ = PostHFMethod::EOM_MP2;
@@ -141,6 +144,9 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
 
     // Set the EOM-CC2 solver mode
     eom_cc2_solver_ = toLowerCase(parameters.get<std::string>("eom_cc2_solver"));
+
+    // Set the spin type for excited states
+    spin_type_ = toLowerCase(parameters.get<std::string>("spin_type"));
 
 
     // print all the values of boys function for the test (temporary implementation)

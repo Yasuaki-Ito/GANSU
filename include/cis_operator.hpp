@@ -33,6 +33,9 @@ namespace gansu {
  *
  * Constructs the CIS A-matrix from MO ERIs and orbital energies,
  * then applies it to trial vectors using DGEMV.
+ *
+ * Singlet: A_{ia,jb} = delta_{ij} delta_{ab} (eps_a - eps_i) + 2(ia|jb) - (ij|ab)
+ * Triplet: A_{ia,jb} = delta_{ij} delta_{ab} (eps_a - eps_i) - (ij|ab)
  */
 class CISOperator : public LinearOperator {
 public:
@@ -44,10 +47,12 @@ public:
      * @param nocc Number of occupied spatial orbitals
      * @param nvir Number of virtual spatial orbitals
      * @param nao Total number of spatial orbitals (nocc + nvir)
+     * @param is_triplet If true, build triplet CIS matrix (TDA triplet)
      */
     CISOperator(const real_t* d_eri_mo,
                 const real_t* d_orbital_energies,
-                int nocc, int nvir, int nao);
+                int nocc, int nvir, int nao,
+                bool is_triplet = false);
 
     ~CISOperator();
 
@@ -66,6 +71,7 @@ private:
     int nao_;
     int dim_;  // nocc * nvir
 
+    bool is_triplet_;      // true for triplet CIS
     real_t* d_A_matrix_;   // CIS A-matrix [dim x dim], row-major
     real_t* d_diagonal_;   // diagonal elements for preconditioner [dim]
 

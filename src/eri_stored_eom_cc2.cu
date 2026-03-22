@@ -305,18 +305,19 @@ void ERI_Stored_RHF::compute_eom_cc2(int n_states) {
         }
 
         const auto& eigenvalues = solver.get_eigenvalues();
-        excitation_energies.resize(n_states);
-        h_eigenvectors.resize((size_t)n_states * singles_dim);
 
+        // Filter out spurious near-zero eigenvalues (ground state in EOM)
         std::vector<real_t> h_full_evecs((size_t)n_states * total_dim);
         solver.copy_eigenvectors_to_host(h_full_evecs.data());
 
         for (int k = 0; k < n_states; k++) {
-            excitation_energies[k] = eigenvalues[k];
-            std::copy(&h_full_evecs[k * total_dim],
-                      &h_full_evecs[k * total_dim + singles_dim],
-                      &h_eigenvectors[k * singles_dim]);
+            if (eigenvalues[k] < 0.01) continue;
+            excitation_energies.push_back(eigenvalues[k]);
+            h_eigenvectors.insert(h_eigenvectors.end(),
+                                  &h_full_evecs[k * total_dim],
+                                  &h_full_evecs[k * total_dim + singles_dim]);
         }
+        n_states = static_cast<int>(excitation_energies.size());
 
     } else if (solver_mode == "schur_static") {
         // ---- Schur complement with ω=0 (approximate but fast) ----

@@ -139,21 +139,20 @@ void ERI_Stored_RHF::compute_eom_ccsd(int n_states) {
 
     const auto& eigenvalues = solver.get_eigenvalues();
 
-    std::vector<real_t> excitation_energies(n_states);
-    for (int k = 0; k < n_states; k++) {
-        excitation_energies[k] = eigenvalues[k];
-    }
-
-    // Copy eigenvectors (only the singles part for transition analysis)
-    std::vector<real_t> h_eigenvectors((size_t)n_states * singles_dim);
-    // Get full eigenvectors and extract singles part
+    // Filter out spurious near-zero eigenvalues (ground state in EOM)
     std::vector<real_t> h_full_eigenvectors((size_t)n_states * total_dim);
     solver.copy_eigenvectors_to_host(h_full_eigenvectors.data());
+
+    std::vector<real_t> excitation_energies;
+    std::vector<real_t> h_eigenvectors;
     for (int k = 0; k < n_states; k++) {
-        for (int ia = 0; ia < singles_dim; ia++) {
-            h_eigenvectors[k * singles_dim + ia] = h_full_eigenvectors[k * total_dim + ia];
-        }
+        if (eigenvalues[k] < 0.01) continue;
+        excitation_energies.push_back(eigenvalues[k]);
+        h_eigenvectors.insert(h_eigenvectors.end(),
+                              &h_full_eigenvectors[k * total_dim],
+                              &h_full_eigenvectors[k * total_dim + singles_dim]);
     }
+    n_states = static_cast<int>(excitation_energies.size());
 
     std::cout << "  EOM-CCSD solve time: " << std::fixed << std::setprecision(3)
               << solve_timer.elapsed_seconds() << " s" << std::endl;

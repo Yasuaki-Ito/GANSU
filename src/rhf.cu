@@ -166,6 +166,8 @@ void RHF::post_process_after_scf() {
         eri_method_->compute_cis(get_n_excited_states());
     }else if(post_hf_method == PostHFMethod::ADC2){
         eri_method_->compute_adc2(get_n_excited_states());
+    }else if(post_hf_method == PostHFMethod::ADC2X){
+        eri_method_->compute_adc2x(get_n_excited_states());
     }else if(post_hf_method == PostHFMethod::EOM_MP2){
         eri_method_->compute_eom_mp2(get_n_excited_states());
     }else if(post_hf_method == PostHFMethod::EOM_CC2){
@@ -485,6 +487,8 @@ void RHF::report() {
             std::cout << "CIS" << std::endl;
         }else if(get_post_hf_method() == PostHFMethod::ADC2){
             std::cout << "ADC(2)" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::ADC2X){
+            std::cout << "ADC(2)-x" << std::endl;
         }else if(get_post_hf_method() == PostHFMethod::EOM_MP2){
             std::cout << "EOM-MP2" << std::endl;
         }else if(get_post_hf_method() == PostHFMethod::EOM_CC2){

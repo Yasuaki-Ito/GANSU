@@ -150,6 +150,10 @@ public:
         THROW_EXCEPTION("ADC(2) computation is not supported for the selected ERI method.");
     }
 
+    virtual void compute_adc2x(int n_states){
+        THROW_EXCEPTION("ADC(2)-x computation is not supported for the selected ERI method.");
+    }
+
     /**
      * @brief Compute EOM-MP2 excited states
      * @param n_states Number of excited states to compute
@@ -210,6 +214,7 @@ public:
             || method == PostHFMethod::CCSD_T // The stored ERI method supports CCSD(T)
             || method == PostHFMethod::CIS  // The stored ERI method supports CIS
             || method == PostHFMethod::ADC2 // The stored ERI method supports ADC(2)
+            || method == PostHFMethod::ADC2X // The stored ERI method supports ADC(2)-x
             || method == PostHFMethod::EOM_MP2 // The stored ERI method supports EOM-MP2
             || method == PostHFMethod::EOM_CC2 // The stored ERI method supports EOM-CC2
             || method == PostHFMethod::EOM_CCSD // The stored ERI method supports EOM-CCSD

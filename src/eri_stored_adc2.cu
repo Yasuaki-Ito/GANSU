@@ -284,7 +284,10 @@ void ERI_Stored_RHF::compute_adc2(int n_states) {
         }
     }
 
-    std::cout << "\n---- ADC(2) excited states ---- "
+    bool is_triplet = rhf_.is_triplet();
+    std::string spin_label = is_triplet ? "triplet" : "singlet";
+
+    std::cout << "\n---- ADC(2) " << spin_label << " excited states ---- "
               << "nocc=" << num_occ << ", nvir=" << num_vir
               << ", singles=" << singles_dim << ", doubles=" << doubles_dim
               << ", solver=" << solver_mode
@@ -310,7 +313,7 @@ void ERI_Stored_RHF::compute_adc2(int n_states) {
     DeviceHostMemory<real_t>& orbital_energies = rhf_.get_orbital_energies();
     const real_t* d_orbital_energies = orbital_energies.device_ptr();
 
-    ADC2Operator adc2_op(d_eri_mo, d_orbital_energies, num_occ, num_vir, num_basis);
+    ADC2Operator adc2_op(d_eri_mo, d_orbital_energies, num_occ, num_vir, num_basis, is_triplet);
 
     // Free full MO ERIs — blocks are already extracted
     tracked_cudaFree(d_eri_mo);
@@ -355,8 +358,9 @@ void ERI_Stored_RHF::compute_adc2(int n_states) {
     const_cast<DeviceHostMemory<PrimitiveShell>&>(prim_shells).toHost();
     const_cast<DeviceHostMemory<real_t>&>(cgto_norms).toHost();
 
+    std::string method_name = is_triplet ? "ADC(2) (triplet)" : "ADC(2)";
     auto es_result = compute_excited_state_properties(
-        "ADC(2)",
+        method_name,
         prim_shells.host_ptr(), prim_shells.size(),
         cgto_norms.host_ptr(),
         rhf_.get_shell_type_infos(),

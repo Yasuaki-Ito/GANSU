@@ -609,6 +609,7 @@ public:
     real_t compute_fci_energy() override;
     void compute_cis(int n_states) override;
     void compute_adc2(int n_states) override;
+    void compute_adc2x(int n_states) override;
     void compute_eom_mp2(int n_states) override;
     void compute_eom_cc2(int n_states) override;
     void compute_eom_ccsd(int n_states) override;

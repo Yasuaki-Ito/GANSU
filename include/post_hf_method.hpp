@@ -27,6 +27,7 @@ enum class PostHFMethod {
     CCSD_T,
     CIS,
     ADC2,
+    ADC2X,
     EOM_MP2,
     EOM_CC2,
     EOM_CCSD

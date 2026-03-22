@@ -618,16 +618,19 @@ void DavidsonSolver::compute_ritz_vectors_and_residuals() {
 // ========== Convergence Check ==========
 
 bool DavidsonSolver::check_convergence() {
+    int num_valid = 0;
     for (int i = 0; i < config_.num_eigenvalues; ++i) {
         // Skip spurious eigenvalues below threshold (e.g., ground state in EOM)
         if (config_.min_eigenvalue > 0.0 && h_eigenvalues_[i] < config_.min_eigenvalue) {
-            return false;  // Not yet converged to valid excited states
+            continue;  // This slot has a spurious eigenvalue, skip it
         }
+        ++num_valid;
         if (residual_norms_[i] > config_.convergence_threshold) {
             return false;
         }
     }
-    return true;
+    // Need at least one valid eigenvalue to declare convergence
+    return num_valid > 0;
 }
 
 // ========== Correction Vectors ==========

@@ -59,7 +59,8 @@ public:
      */
     ADC2Operator(const real_t* d_eri_mo,
                  const real_t* d_orbital_energies,
-                 int nocc, int nvir, int nao);
+                 int nocc, int nvir, int nao,
+                 bool is_triplet = false);
 
     ~ADC2Operator();
 
@@ -112,6 +113,7 @@ public:
     const real_t* get_D1() const { return d_D1_; }
     const real_t* get_D2() const { return d_D2_; }
     const real_t* get_M11() const { return d_M11_; }
+    const real_t* get_eri_ovov() const { return d_eri_ovov_; }
     const real_t* get_eri_vvov() const { return d_eri_vvov_; }
     const real_t* get_eri_ooov() const { return d_eri_ooov_; }
     bool is_dense_M12() const { return use_dense_M12_; }
@@ -124,6 +126,7 @@ private:
     int doubles_dim_;   // nocc * nocc * nvir * nvir
 
     real_t omega_ = 0.0;
+    bool is_triplet_ = false;    // true for triplet excited states
     bool use_dense_M12_ = true;  // false → on-the-fly M_eff (no M12/M21 stored)
 
     // === Pre-extracted MO ERI blocks (device) ===

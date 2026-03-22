@@ -70,7 +70,8 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"n_excited_states", "5"},                   // int
         {"adc2_solver", "auto"},                     // string (auto, schur_static, schur_omega, full)
         {"eom_mp2_solver", "auto"},                  // string (auto, schur_static, schur_omega, full)
-        {"eom_cc2_solver", "auto"}                    // string (auto, schur_static, schur_omega, full)
+        {"eom_cc2_solver", "auto"},                    // string (auto, schur_static, schur_omega, full)
+        {"spin_type", "singlet"}                        // string (singlet, triplet)
     };
 
 
