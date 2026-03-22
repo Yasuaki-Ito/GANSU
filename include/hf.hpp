@@ -288,6 +288,11 @@ public:
     const std::string& get_eom_mp2_solver() const { return eom_mp2_solver_; }
 
     /**
+     * @brief Get EOM-CC2 solver mode: "auto", "schur_static", "schur_omega", or "full"
+     */
+    const std::string& get_eom_cc2_solver() const { return eom_cc2_solver_; }
+
+    /**
      * @brief Get excitation energies (populated after CIS/EOM calculations)
      */
     const std::vector<real_t>& get_excitation_energies() const { return excitation_energies_; }
@@ -385,6 +390,7 @@ protected:
     int n_excited_states_; ///< Number of excited states to compute
     std::string adc2_solver_; ///< ADC(2) solver mode: schur_static, schur_omega, full
     std::string eom_mp2_solver_; ///< EOM-MP2 solver mode: full, schur
+    std::string eom_cc2_solver_; ///< EOM-CC2 solver mode: auto, schur_static, schur_omega, full
     std::vector<real_t> excitation_energies_; ///< Excitation energies (CIS/EOM)
     std::vector<real_t> oscillator_strengths_; ///< Oscillator strengths (CIS/EOM)
     std::string excited_state_report_; ///< Formatted excited state report for final summary

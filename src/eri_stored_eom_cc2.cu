@@ -236,97 +236,211 @@ void ERI_Stored_RHF::compute_eom_cc2(int n_states) {
     tracked_cudaFree(d_eri_mo);
     d_eri_mo = nullptr;
 
-    // Step 5: Solve EOM-CC2 eigenvalue problem using frequency-dependent Schur complement
+    // Step 5: Solve EOM-CC2 eigenvalue problem
     // M22 is exactly diagonal → Schur complement is EXACT at each ω.
     // M_eff(ω) = M11 + M12 · (ωI - M22)⁻¹ · M21
-    // Self-consistent iteration: solve with ω=0, then iterate ω = eigenvalue until convergence.
     Timer solve_timer;
 
-    std::cout << "  Solving EOM-CC2 with frequency-dependent Schur complement (dim="
-              << singles_dim << ")..." << std::endl;
+    std::string solver_mode = rhf_.get_eom_cc2_solver();
 
-    EOMMP2SchurOperator schur_op(eom_cc2_op);
+    // Auto solver selection: use schur_omega (exact & efficient) unless full is feasible and small
+    if (solver_mode == "auto") {
+        int total_dim = singles_dim + doubles_dim;
+        int max_sub = std::min(total_dim, std::max(200, 20 * n_states));
+        size_t davidson_bytes = (
+            static_cast<size_t>(total_dim) * max_sub * 2 +
+            static_cast<size_t>(max_sub) * max_sub * 2 +
+            static_cast<size_t>(total_dim) * n_states * 2 +
+            max_sub
+        ) * sizeof(real_t);
 
-    DavidsonConfig config;
-    config.num_eigenvalues = n_states;
-    config.convergence_threshold = 1e-6;
-    config.max_subspace_size = std::min(singles_dim, std::max(100, 10 * n_states));
-    config.max_iterations = 500;
-    config.use_preconditioner = true;
-    config.symmetric = false;
-    config.verbose = 2;
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
 
-    // --- Self-consistent ω iteration ---
-    const int max_omega_iter = 20;
-    const real_t omega_tol = 1e-6;  // convergence in Ha
+        if (davidson_bytes < free_mem * 0.8) {
+            solver_mode = "full";
+            std::cout << "  Auto solver: full Davidson ("
+                      << CudaMemoryManager<real_t>::format_bytes(davidson_bytes)
+                      << " needed, "
+                      << CudaMemoryManager<real_t>::format_bytes(free_mem)
+                      << " available)" << std::endl;
+        } else {
+            solver_mode = "schur_omega";
+            std::cout << "  Auto solver: schur_omega (full Davidson would need "
+                      << CudaMemoryManager<real_t>::format_bytes(davidson_bytes)
+                      << ", only "
+                      << CudaMemoryManager<real_t>::format_bytes(free_mem)
+                      << " available)" << std::endl;
+        }
+    }
 
-    std::vector<real_t> excitation_energies(n_states, 0.0);
-    std::vector<real_t> h_eigenvectors((size_t)n_states * singles_dim);
+    std::cout << "\n  EOM-CC2 solver=" << solver_mode
+              << ", singles=" << singles_dim << ", doubles=" << doubles_dim
+              << ", nstates=" << n_states << std::endl;
 
-    // Iteration 0: ω = 0 (standard Schur complement)
-    schur_op.set_omega(0.0);
-    {
+    std::vector<real_t> excitation_energies;
+    std::vector<real_t> h_eigenvectors;
+
+    if (solver_mode == "full") {
+        // ---- Full Davidson in singles+doubles space ----
+        // M22 is diagonal so no null space issues, but uses more memory
+        int total_dim = eom_cc2_op.dimension();
+        std::cout << "  Solving with full Davidson (dim=" << total_dim << ")..." << std::endl;
+
+        DavidsonConfig config;
+        config.num_eigenvalues = n_states;
+        config.convergence_threshold = 1e-6;
+        config.max_subspace_size = std::min(total_dim, std::max(200, 20 * n_states));
+        config.max_iterations = 500;
+        config.use_preconditioner = true;
+        config.symmetric = false;
+        config.min_eigenvalue = 0.01;
+        config.verbose = 2;
+
+        DavidsonSolver solver(eom_cc2_op, config);
+        bool converged = solver.solve();
+
+        if (!converged) {
+            std::cout << "  Warning: Davidson did not fully converge" << std::endl;
+        }
+
+        const auto& eigenvalues = solver.get_eigenvalues();
+        excitation_energies.resize(n_states);
+        h_eigenvectors.resize((size_t)n_states * singles_dim);
+
+        std::vector<real_t> h_full_evecs((size_t)n_states * total_dim);
+        solver.copy_eigenvectors_to_host(h_full_evecs.data());
+
+        for (int k = 0; k < n_states; k++) {
+            excitation_energies[k] = eigenvalues[k];
+            std::copy(&h_full_evecs[k * total_dim],
+                      &h_full_evecs[k * total_dim + singles_dim],
+                      &h_eigenvectors[k * singles_dim]);
+        }
+
+    } else if (solver_mode == "schur_static") {
+        // ---- Schur complement with ω=0 (approximate but fast) ----
+        // M22 is exactly diagonal → only ω=0 approximation, no M22 diagonal approximation
+        std::cout << "  Solving with Schur complement (ω=0, dim=" << singles_dim << ")..." << std::endl;
+
+        EOMMP2SchurOperator schur_op(eom_cc2_op);
+        schur_op.set_omega(0.0);
+
+        DavidsonConfig config;
+        config.num_eigenvalues = n_states;
+        config.convergence_threshold = 1e-6;
+        config.max_subspace_size = std::min(singles_dim, std::max(100, 10 * n_states));
+        config.max_iterations = 500;
+        config.use_preconditioner = true;
+        config.symmetric = false;
+        config.verbose = 2;
+
         DavidsonSolver solver(schur_op, config);
-        solver.solve();
-        const auto& eigenvalues = solver.get_eigenvalues();
-        solver.copy_eigenvectors_to_host(h_eigenvectors.data());
-        for (int k = 0; k < n_states; k++) {
-            excitation_energies[k] = eigenvalues[k];
+        bool converged = solver.solve();
+
+        if (!converged) {
+            std::cout << "  Warning: Davidson did not fully converge" << std::endl;
         }
-    }
 
-    std::cout << "  ω-iteration  0: ω=0.000000";
-    for (int k = 0; k < std::min(n_states, 5); k++) {
-        std::cout << std::fixed << std::setprecision(6)
-                  << "  E" << k+1 << "=" << excitation_energies[k];
-    }
-    std::cout << std::endl;
-
-    // Subsequent iterations: use lowest eigenvalue as ω for all states
-    // (common ω gives a single linear eigenvalue problem per iteration)
-    for (int omega_iter = 1; omega_iter <= max_omega_iter; omega_iter++) {
-        std::vector<real_t> prev_energies = excitation_energies;
-
-        // Use lowest excitation energy as ω
-        real_t omega = prev_energies[0];
-        schur_op.set_omega(omega);
-
-        // Reduce verbosity after first iteration
-        DavidsonConfig iter_config = config;
-        iter_config.verbose = 0;
-
-        DavidsonSolver solver(schur_op, iter_config);
-        solver.solve();
         const auto& eigenvalues = solver.get_eigenvalues();
+        excitation_energies.resize(n_states);
+        h_eigenvectors.resize((size_t)n_states * singles_dim);
         solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+
         for (int k = 0; k < n_states; k++) {
             excitation_energies[k] = eigenvalues[k];
         }
 
-        // Check convergence
-        real_t max_change = 0.0;
-        for (int k = 0; k < n_states; k++) {
-            max_change = std::max(max_change,
-                                  std::abs(excitation_energies[k] - prev_energies[k]));
+    } else {
+        // ---- schur_omega (default): ω-dependent Schur complement iteration ----
+        // M22 is exactly diagonal → Schur complement is EXACT at each ω.
+        // Self-consistent iteration: solve with ω=0, then iterate ω = eigenvalue until convergence.
+        if (solver_mode != "schur_omega") {
+            std::cout << "  Warning: Unknown eom_cc2_solver '" << solver_mode
+                      << "', using schur_omega" << std::endl;
         }
 
-        std::cout << "  ω-iteration " << std::setw(2) << omega_iter
-                  << ": ω=" << std::fixed << std::setprecision(6) << omega;
+        std::cout << "  Solving with frequency-dependent Schur complement (dim="
+                  << singles_dim << ")..." << std::endl;
+
+        EOMMP2SchurOperator schur_op(eom_cc2_op);
+
+        DavidsonConfig config;
+        config.num_eigenvalues = n_states;
+        config.convergence_threshold = 1e-6;
+        config.max_subspace_size = std::min(singles_dim, std::max(100, 10 * n_states));
+        config.max_iterations = 500;
+        config.use_preconditioner = true;
+        config.symmetric = false;
+        config.verbose = 2;
+
+        const int max_omega_iter = 20;
+        const real_t omega_tol = 1e-6;
+
+        excitation_energies.resize(n_states, 0.0);
+        h_eigenvectors.resize((size_t)n_states * singles_dim);
+
+        // Iteration 0: ω = 0
+        schur_op.set_omega(0.0);
+        {
+            DavidsonSolver solver(schur_op, config);
+            solver.solve();
+            const auto& eigenvalues = solver.get_eigenvalues();
+            solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+            for (int k = 0; k < n_states; k++) {
+                excitation_energies[k] = eigenvalues[k];
+            }
+        }
+
+        std::cout << "  ω-iteration  0: ω=0.000000";
         for (int k = 0; k < std::min(n_states, 5); k++) {
-            std::cout << "  E" << k+1 << "=" << excitation_energies[k];
+            std::cout << std::fixed << std::setprecision(6)
+                      << "  E" << k+1 << "=" << excitation_energies[k];
         }
-        std::cout << "  Δmax=" << std::scientific << std::setprecision(2)
-                  << max_change << std::endl;
+        std::cout << std::endl;
 
-        if (max_change < omega_tol) {
-            std::cout << "  ω-iteration converged after " << omega_iter
-                      << " iterations" << std::endl;
-            break;
-        }
+        // Subsequent iterations: use lowest eigenvalue as ω
+        for (int omega_iter = 1; omega_iter <= max_omega_iter; omega_iter++) {
+            std::vector<real_t> prev_energies = excitation_energies;
 
-        if (omega_iter == max_omega_iter) {
-            std::cout << "  Warning: ω-iteration did not converge (Δmax="
-                      << std::scientific << max_change << ")" << std::endl;
+            real_t omega = prev_energies[0];
+            schur_op.set_omega(omega);
+
+            DavidsonConfig iter_config = config;
+            iter_config.verbose = 0;
+
+            DavidsonSolver solver(schur_op, iter_config);
+            solver.solve();
+            const auto& eigenvalues = solver.get_eigenvalues();
+            solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+            for (int k = 0; k < n_states; k++) {
+                excitation_energies[k] = eigenvalues[k];
+            }
+
+            real_t max_change = 0.0;
+            for (int k = 0; k < n_states; k++) {
+                max_change = std::max(max_change,
+                                      std::abs(excitation_energies[k] - prev_energies[k]));
+            }
+
+            std::cout << "  ω-iteration " << std::setw(2) << omega_iter
+                      << ": ω=" << std::fixed << std::setprecision(6) << omega;
+            for (int k = 0; k < std::min(n_states, 5); k++) {
+                std::cout << "  E" << k+1 << "=" << excitation_energies[k];
+            }
+            std::cout << "  Δmax=" << std::scientific << std::setprecision(2)
+                      << max_change << std::endl;
+
+            if (max_change < omega_tol) {
+                std::cout << "  ω-iteration converged after " << omega_iter
+                          << " iterations" << std::endl;
+                break;
+            }
+
+            if (omega_iter == max_omega_iter) {
+                std::cout << "  Warning: ω-iteration did not converge (Δmax="
+                          << std::scientific << max_change << ")" << std::endl;
+            }
         }
     }
 

@@ -23,6 +23,7 @@
 | n_excited_states | Number of excited states to compute | int | 5 |
 | adc2_solver | Solver for ADC(2) (auto, schur_static, schur_omega, full) | string | auto |
 | eom_mp2_solver | Solver for EOM-MP2 (auto, schur_static, schur_omega, full) | string | auto |
+| eom_cc2_solver | Solver for EOM-CC2 (auto, schur_static, schur_omega, full) | string | auto |
 | schwarz_screening_threshold | Schwarz screening threshold | double | 1.0e-12 |
 | initial_guess | Method to use for initial guess | string | core |
 | convergence_method | Method to use for convergence | string | DIIS |
@@ -289,6 +290,7 @@ Otherwise, the two-electron repulsion integrals (ERIs) are set to zero.
 | n_excited_states | Number of excited states to compute | int | 5 |
 | adc2_solver | Solver for ADC(2) | string | auto |
 | eom_mp2_solver | Solver for EOM-MP2 | string | auto |
+| eom_cc2_solver | Solver for EOM-CC2 | string | auto |
 
 These parameters are used when `post_hf_method` is set to an excited state method (CIS, ADC2, EOM_MP2, EOM_CC2, EOM_CCSD).
 
@@ -310,6 +312,15 @@ These parameters are used when `post_hf_method` is set to an excited state metho
 * schur_omega - ω-dependent Schur complement with self-consistent iteration. Builds dense M_eff(ω) matrix and uses non-symmetric eigendecomposition. More accurate than schur_static.
 * schur_static - Approximate Schur complement at ω=0 using Davidson. M22 off-diagonal (t2×r2 coupling) is ignored. Fast but approximate.
 
+#### eom_cc2_solver - Solver for EOM-CC2
+* default: auto
+* auto - Automatically selects `full` or `schur_omega` based on available GPU memory (80% threshold)
+* full - Full Davidson in singles+doubles space. Exact. M22 is diagonal so no null space issues (unlike EOM-MP2).
+* schur_omega - ω-dependent Schur complement with self-consistent Davidson iteration. EXACT (M22 is purely diagonal, no approximation). Default and recommended.
+* schur_static - Schur complement at ω=0 using Davidson. EXACT Schur (no M22 approximation) but ω=0 approximation remains.
+
+Note: For EOM-CC2, M22 is exactly diagonal, so the Schur complement introduces NO approximation (unlike EOM-MP2 where M22 off-diagonal terms are ignored). The only approximation in `schur_static` is the ω=0 assumption.
+
 ```bash
 # CIS with 10 excited states
 ./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs --post_hf_method cis --n_excited_states 10
@@ -322,6 +333,9 @@ These parameters are used when `post_hf_method` is set to an excited state metho
 
 # EOM-MP2 with schur_omega solver
 ./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_mp2 --eom_mp2_solver schur_omega
+
+# EOM-CC2 with full Davidson solver
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_cc2 --eom_cc2_solver full
 
 # EOM-CCSD
 ./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_ccsd

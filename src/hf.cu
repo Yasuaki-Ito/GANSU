@@ -139,6 +139,9 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     // Set the EOM-MP2 solver mode
     eom_mp2_solver_ = toLowerCase(parameters.get<std::string>("eom_mp2_solver"));
 
+    // Set the EOM-CC2 solver mode
+    eom_cc2_solver_ = toLowerCase(parameters.get<std::string>("eom_cc2_solver"));
+
 
     // print all the values of boys function for the test (temporary implementation)
     if(verbose){
