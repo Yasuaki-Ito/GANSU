@@ -18,6 +18,9 @@ export interface CalculationParams {
   schwarz_screening_threshold: number;
   initial_guess: string;
   post_hf_method: string;
+  n_excited_states: number;
+  spin_type: string;
+  excited_solver: string;
   eri_method: string;
   auxiliary_basis: string;
   auxiliary_basis_dir: string;
@@ -47,6 +50,9 @@ export const DEFAULT_PARAMS: CalculationParams = {
   schwarz_screening_threshold: 1e-12,
   initial_guess: 'core',
   post_hf_method: 'none',
+  n_excited_states: 5,
+  spin_type: 'singlet',
+  excited_solver: 'auto',
   eri_method: 'stored',
   auxiliary_basis: '',
   auxiliary_basis_dir: 'auxiliary_basis',
@@ -125,7 +131,18 @@ export interface CalculationResult {
   timing: {
     entries?: { name: string; time: number; unit: string; calls: number }[];
   };
+  excited_states?: ExcitedState[];
+  excited_states_method?: string;
+  excited_states_spin?: string;
   molden_content?: string;
+}
+
+export interface ExcitedState {
+  state: number;
+  energy_ha: number;
+  energy_ev: number;
+  osc_strength: number;
+  transitions: string;
 }
 
 export interface SampleMolecule {

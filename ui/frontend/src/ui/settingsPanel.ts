@@ -124,6 +124,38 @@ export function createSettingsPanel(
       </div>
 
       <div class="setting-row">
+        <label>Excited States</label>
+        <div class="toggle-group" id="excited-group">
+          <button class="toggle active" data-value="none">None</button>
+          <button class="toggle" data-value="cis">CIS</button>
+          <button class="toggle" data-value="adc2">ADC(2)</button>
+          <button class="toggle" data-value="adc2x">ADC(2)-x</button>
+          <button class="toggle" data-value="eom_mp2">EOM-MP2</button>
+          <button class="toggle" data-value="eom_cc2">EOM-CC2</button>
+          <button class="toggle" data-value="eom_ccsd">EOM-CCSD</button>
+        </div>
+      </div>
+
+      <div class="setting-row hidden" id="excited-params">
+        <label>Spin Type</label>
+        <div class="toggle-group" id="spin-type-group">
+          <button class="toggle active" data-value="singlet">Singlet</button>
+          <button class="toggle" data-value="triplet">Triplet</button>
+        </div>
+        <label style="margin-top:6px">Number of States</label>
+        <input type="number" id="n-excited-states" value="5" min="1" max="100" class="num-input">
+        <div id="solver-row" class="hidden" style="margin-top:6px">
+          <label>Solver</label>
+          <div class="toggle-group" id="solver-group">
+            <button class="toggle active" data-value="auto">Auto</button>
+            <button class="toggle" data-value="schur_static">Schur Static</button>
+            <button class="toggle" data-value="schur_omega">Schur Omega</button>
+            <button class="toggle" data-value="full">Full</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="setting-row">
         <label>Analysis</label>
         <div class="checkbox-group">
           <label class="checkbox-label"><input type="checkbox" id="chk-mulliken"> Mulliken</label>
@@ -194,6 +226,36 @@ export function createSettingsPanel(
     auxBasisRow.classList.toggle('hidden', val !== 'ri' && val !== 'direct_ri');
   });
 
+  // Mutual exclusion: Post-HF and Excited States
+  const posthfGroup = container.querySelector('#posthf-group')!;
+  const excitedGroup = container.querySelector('#excited-group')!;
+  const excitedParams = container.querySelector<HTMLElement>('#excited-params')!;
+
+  posthfGroup.addEventListener('click', () => {
+    const active = posthfGroup.querySelector('.active') as HTMLElement;
+    if (active?.dataset.value && active.dataset.value !== 'none') {
+      // Clear excited state selection
+      excitedGroup.querySelectorAll('.toggle').forEach(b => b.classList.remove('active'));
+      excitedGroup.querySelector('[data-value="none"]')?.classList.add('active');
+      excitedParams.classList.add('hidden');
+    }
+  });
+
+  const solverRow = container.querySelector<HTMLElement>('#solver-row')!;
+  const solverMethods = new Set(['adc2', 'adc2x', 'eom_mp2', 'eom_cc2']);
+
+  excitedGroup.addEventListener('click', () => {
+    const active = excitedGroup.querySelector('.active') as HTMLElement;
+    const val = active?.dataset.value || 'none';
+    if (val !== 'none') {
+      // Clear post-HF selection
+      posthfGroup.querySelectorAll('.toggle').forEach(b => b.classList.remove('active'));
+      posthfGroup.querySelector('[data-value="none"]')?.classList.add('active');
+    }
+    excitedParams.classList.toggle('hidden', val === 'none');
+    solverRow.classList.toggle('hidden', !solverMethods.has(val));
+  });
+
   function getToggleValue(groupId: string): string {
     const active = container.querySelector(`#${groupId} .toggle.active`) as HTMLElement;
     return active?.dataset.value || '';
@@ -223,7 +285,12 @@ export function createSettingsPanel(
       eri_method: getToggleValue('eri-group') || DEFAULT_PARAMS.eri_method,
       auxiliary_basis: (container.querySelector<HTMLSelectElement>('#aux-basis-select')?.value) || '',
       auxiliary_basis_dir: (container.querySelector<HTMLSelectElement>('#aux-basis-select')?.selectedOptions[0]?.dataset.dir) || 'auxiliary_basis',
-      post_hf_method: getToggleValue('posthf-group') || DEFAULT_PARAMS.post_hf_method,
+      post_hf_method: getToggleValue('excited-group') !== 'none'
+        ? getToggleValue('excited-group')
+        : (getToggleValue('posthf-group') || DEFAULT_PARAMS.post_hf_method),
+      n_excited_states: getNumValue('n-excited-states', DEFAULT_PARAMS.n_excited_states),
+      spin_type: getToggleValue('spin-type-group') || DEFAULT_PARAMS.spin_type,
+      excited_solver: getToggleValue('solver-group') || 'auto',
       mulliken: getChecked('chk-mulliken'),
       mayer: getChecked('chk-mayer'),
       wiberg: getChecked('chk-wiberg'),

@@ -53,6 +53,9 @@ class CalcRequest(BaseModel):
     schwarz_screening_threshold: float = 1e-12
     initial_guess: str = "core"
     post_hf_method: str = "none"
+    n_excited_states: int = 5
+    spin_type: str = "singlet"
+    excited_solver: str = "auto"
     eri_method: str = "stored"
     auxiliary_basis: str = ""
     auxiliary_basis_dir: str = "auxiliary_basis"

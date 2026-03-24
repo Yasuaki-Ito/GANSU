@@ -8,6 +8,24 @@ from typing import Any
 
 
 @dataclass
+class ExcitedState:
+    state: int = 0
+    energy_ha: float = 0.0
+    energy_ev: float = 0.0
+    osc_strength: float = 0.0
+    transitions: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "state": self.state,
+            "energy_ha": self.energy_ha,
+            "energy_ev": self.energy_ev,
+            "osc_strength": self.osc_strength,
+            "transitions": self.transitions,
+        }
+
+
+@dataclass
 class ParsedResult:
     raw_output: str = ""
     molecule: dict[str, Any] = field(default_factory=dict)
@@ -21,6 +39,9 @@ class ParsedResult:
     mayer_bond_order: list[list[float]] = field(default_factory=list)
     wiberg_bond_order: list[list[float]] = field(default_factory=list)
     timing: dict[str, Any] = field(default_factory=dict)
+    excited_states: list[ExcitedState] = field(default_factory=list)
+    excited_states_method: str = ""
+    excited_states_spin: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -38,11 +59,35 @@ class ParsedResult:
         }
         if self.post_hf:
             d["post_hf"] = self.post_hf
+        if self.excited_states:
+            d["excited_states"] = [s.to_dict() for s in self.excited_states]
+            d["excited_states_method"] = self.excited_states_method
+            d["excited_states_spin"] = self.excited_states_spin
         return d
 
 
 # Regex for the single-line iteration format:
 # ---- Iteration: 0 ----  Energy: -1.860... Total energy: -1.117... Energy difference: 0
+# Regex for excited state header:
+#   "CIS Excited States"
+#   "CIS (triplet) Excited States"
+#   "ADC(2) Excited States"
+#   "ADC(2) (triplet) Excited States"
+#   "EOM-CCSD Excited States"
+_ES_HEADER_RE = re.compile(
+    r"^\s*(.+?)\s+Excited States\s*$", re.IGNORECASE
+)
+
+# Regex for excited state data line:
+#   1          0.344332       9.3690    0.0000   HOMO -> LUMO (0.99)
+_ES_LINE_RE = re.compile(
+    r"^\s*(\d+)\s+"
+    r"([-+]?\d+\.?\d*)\s+"
+    r"([-+]?\d+\.?\d*)\s+"
+    r"([-+]?\d+\.?\d*)\s+"
+    r"(.*)$"
+)
+
 _ITER_RE = re.compile(
     r"^-+\s*Iteration:\s*(\d+)\s*-+"
     r"\s+Energy:\s*([-+]?\d+\.?\d*(?:[eE][-+]?\d+)?)"
@@ -220,6 +265,8 @@ def parse_output(text: str) -> ParsedResult:
                 l = lines[i].strip()
                 if l.startswith("[") and l != "[Calculation Summary (Post-HF)]":
                     break
+                if l.startswith("====="):
+                    break
                 if l == "":
                     i += 1
                     continue
@@ -246,6 +293,39 @@ def parse_output(text: str) -> ParsedResult:
                     })
                 i += 1
             result.timing["entries"] = entries
+            continue
+
+        # --- Excited States ---
+        m = _ES_HEADER_RE.match(line)
+        if m:
+            raw_method = m.group(1).strip()
+            # Extract spin: "CIS (triplet)" -> method="CIS", spin="triplet"
+            triplet_m = re.match(r"^(.+?)\s*\(triplet\)$", raw_method, re.IGNORECASE)
+            if triplet_m:
+                result.excited_states_method = triplet_m.group(1).strip()
+                result.excited_states_spin = "triplet"
+            else:
+                result.excited_states_method = raw_method
+                result.excited_states_spin = "singlet"
+            i += 1
+            # Skip separator and header lines
+            while i < len(lines):
+                l = lines[i].strip()
+                if l.startswith("=") or l.startswith("-") or l.startswith("State") or l == "":
+                    i += 1
+                    continue
+                m2 = _ES_LINE_RE.match(l)
+                if m2:
+                    result.excited_states.append(ExcitedState(
+                        state=int(m2.group(1)),
+                        energy_ha=float(m2.group(2)),
+                        energy_ev=float(m2.group(3)),
+                        osc_strength=float(m2.group(4)),
+                        transitions=m2.group(5).strip(),
+                    ))
+                    i += 1
+                else:
+                    break
             continue
 
         i += 1

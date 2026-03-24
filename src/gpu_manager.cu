@@ -21,6 +21,7 @@
 #include "int2c2e.hpp"
 #include "int3c2e.hpp"
 #include "int2e_direct.hpp"
+#include "rys_eri_direct.hpp"
 #include "device_host_memory.hpp" // For tracked_gansu::tracked_cudaMalloc/tracked_cudaFree
 
 #include "gradients.hpp"
@@ -2700,7 +2701,7 @@ void computeFockMatrix_Direct_RHF(
                  head_bra, head_ket, num_bra, num_ket, num_fock_replicas);
         }
         else {
-            MD_direct_SCF_1T1SP<<<num_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
+            RysERI_direct<<<num_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
                 (d_fock_matrix_replicas, d_density_matrix, d_primitive_shells, num_fock_replicas, 
                  d_cgto_normalization_factors, shell_s0, shell_s1, shell_s2, shell_s3, 
                  num_braket, schwarz_screening_threshold, d_schwarz_upper_bound_factors, 
@@ -2929,7 +2930,7 @@ void computeFockMatrix_Direct_RHF(
                 }
         }
         else {
-            MD_direct_SCF_1T1SP<<<num_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
+            RysERI_direct<<<num_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
                 (d_fock_matrix_replicas, d_density_matrix_diff, d_primitive_shells, num_fock_replicas, 
                  d_cgto_normalization_factors, shell_s0, shell_s1, shell_s2, shell_s3, 
                  num_braket, schwarz_screening_threshold, d_schwarz_upper_bound_factors, 

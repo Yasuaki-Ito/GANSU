@@ -364,6 +364,10 @@ details.advanced-settings summary {
   margin-bottom: 0;
 }
 
+.result-card.full-width {
+  grid-column: 1 / -1;
+}
+
 .summary-row {
   display: flex;
   gap: 12px;

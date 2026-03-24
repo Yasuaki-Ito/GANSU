@@ -40,6 +40,9 @@ class RunParams:
     schwarz_screening_threshold: float = 1e-12
     initial_guess: str = "core"
     post_hf_method: str = "none"
+    n_excited_states: int = 5
+    spin_type: str = "singlet"  # "singlet" or "triplet"
+    excited_solver: str = "auto"  # "auto", "schur_static", "schur_omega", "full"
     eri_method: str = "stored"
     auxiliary_basis: str = ""
     auxiliary_basis_dir: str = "auxiliary_basis"  # "auxiliary_basis" or "basis"
@@ -83,6 +86,18 @@ def build_command(params: RunParams, xyz_path: str) -> list[str]:
         cmd.extend(["--initial_guess", params.initial_guess])
     if params.post_hf_method != "none":
         cmd.extend(["--post_hf_method", params.post_hf_method])
+    if params.post_hf_method in ("cis", "adc2", "adc2x", "eom_mp2", "eom_cc2", "eom_ccsd"):
+        cmd.extend(["--n_excited_states", str(params.n_excited_states)])
+    if params.spin_type != "singlet":
+        cmd.extend(["--spin_type", params.spin_type])
+    if params.excited_solver != "auto":
+        solver_param_map = {
+            "adc2": "adc2_solver", "adc2x": "adc2_solver",
+            "eom_mp2": "eom_mp2_solver", "eom_cc2": "eom_cc2_solver",
+        }
+        solver_key = solver_param_map.get(params.post_hf_method)
+        if solver_key:
+            cmd.extend([f"--{solver_key}", params.excited_solver])
     if params.eri_method != "stored":
         eri_map = {"ri": "RI", "direct": "Direct", "direct_ri": "Direct_RI", "stored": "stored"}
         cmd.extend(["--eri_method", eri_map.get(params.eri_method, params.eri_method)])

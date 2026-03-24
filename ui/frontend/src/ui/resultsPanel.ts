@@ -3,6 +3,7 @@
 import type { CalculationResult, OrbitalEnergy } from '../types';
 import { renderConvergenceGraph } from '../viz/convergenceGraph';
 import { renderOrbitalDiagram, renderUHFOrbitalDiagram } from '../viz/orbitalDiagram';
+import { renderSpectrumChart } from '../viz/spectrumChart';
 
 export function createResultsPanel(container: HTMLElement): {
   show: (result: CalculationResult) => void;
@@ -64,8 +65,8 @@ export function createResultsPanel(container: HTMLElement): {
         </div>`;
     }
 
-    // Post-HF
-    if (result.post_hf) {
+    // Post-HF (hide when only method is set, e.g. excited state methods)
+    if (result.post_hf && (result.post_hf.correction !== undefined || result.post_hf.total_energy !== undefined)) {
       html += `
         <div class="panel result-card">
           <h3>Post-HF: ${result.post_hf.method || ''}</h3>
@@ -74,6 +75,11 @@ export function createResultsPanel(container: HTMLElement): {
             ${result.post_hf.total_energy !== undefined ? row('Total Energy', formatEnergy(result.post_hf.total_energy) + ' Hartree') : ''}
           </table>
         </div>`;
+    }
+
+    // Excited States Spectrum (full width)
+    if (result.excited_states && result.excited_states.length > 0) {
+      html += '<div class="panel result-card full-width" id="spectrum-chart-container"></div>';
     }
 
     // Orbital Energies — diagram + collapsible table
@@ -195,6 +201,17 @@ export function createResultsPanel(container: HTMLElement): {
         .map(it => ({ iter: it.iteration, deltaE: it.delta_e! }));
       const threshold = result.summary.convergence_criterion || 1e-6;
       renderConvergenceGraph(graphContainer, iters, threshold);
+    }
+
+    // Render spectrum chart
+    const spectrumContainer = el.querySelector<HTMLElement>('#spectrum-chart-container');
+    if (spectrumContainer && result.excited_states && result.excited_states.length > 0) {
+      renderSpectrumChart(
+        spectrumContainer,
+        result.excited_states,
+        result.excited_states_method || '',
+        result.excited_states_spin || 'singlet',
+      );
     }
   }
 

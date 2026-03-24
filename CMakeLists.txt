@@ -50,6 +50,8 @@ add_library(int2e STATIC src/int2e.cu)
 add_library(int2c2e STATIC src/int2c2e.cu)
 add_library(int3c2e STATIC src/int3c2e.cu)
 add_library(int2e_direct STATIC src/int2e_direct.cu)
+add_library(rys_eri STATIC src/rys_eri.cu)
+add_library(rys_eri_direct STATIC src/rys_eri_direct.cu)
 
 
 add_library(grad_w STATIC src/grad/grad_w.cu)
@@ -114,6 +116,8 @@ target_link_libraries(gansu
         int2c2e
         int3c2e
         int2e_direct
+        rys_eri
+        rys_eri_direct
         grad_w
         grad_s
         grad_k

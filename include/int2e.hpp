@@ -19,6 +19,8 @@
 #include "boys.hpp"
 #include "types.hpp"
 #include "utils_cuda.hpp"
+#include <cstdlib>
+#include <string>
 
 #ifndef M_PI_2_5
     #define M_PI_2_5 17.49341832762486284622				
@@ -37,6 +39,7 @@ __global__ void spsp2e(double* g_int2e, const PrimitiveShell* g_shell, const rea
 __global__ void sppp2e(double* g_int2e, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const real_t schwarz_screening_threshold, const double* g_upper_bound_factors, const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket);
 __global__ void pppp2e(double* g_int2e, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const real_t schwarz_screening_threshold, const double* g_upper_bound_factors, const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket);
 __global__ void MD_1T1SP(double* g_int2e, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const real_t schwarz_screening_threshold, const double* g_upper_bound_factors, const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket);
+__global__ void RysERI(double* g_int2e, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const real_t schwarz_screening_threshold, const double* g_upper_bound_factors, const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket);
 
 __global__ void get_schwarz_upper_bound_factors_ss(const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t head, const size_t num_bra, const double* g_boys_grid, double* g_max_upper_bound_factors);
 __global__ void get_schwarz_upper_bound_factors_sp(const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const size_t head, const size_t num_bra, const double* g_boys_grid, double* g_max_upper_bound_factors);
@@ -50,7 +53,17 @@ using eri_kernel_t = void (*)(double*, const PrimitiveShell*, const real_t*, con
 using schwarz_kernel_t = void (*)(const PrimitiveShell*, const real_t*, const ShellTypeInfo, const ShellTypeInfo, const size_t, const size_t, const double*, double*);
 using schwarz_aux_kernel_t = void (*)(const PrimitiveShell*, const real_t*, const ShellTypeInfo, const size_t, const size_t, const double*, double*);
 
-// ここを対角，非対角の分岐にするぐらい？
+// ERI kernel selection for D+ shells: RysERI (default) or MD_1T1SP (legacy)
+// Set via environment variable: GANSU_ERI_KERNEL=md to use McMurchie-Davidson
+inline bool use_md_kernel() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = std::getenv("GANSU_ERI_KERNEL");
+        cached = (env && std::string(env) == "md") ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 inline eri_kernel_t get_eri_kernel(int a, int b, int c, int d){
     if(a>b) std::swap(a, b);
     if(c>d) std::swap(c, d);
@@ -58,26 +71,16 @@ inline eri_kernel_t get_eri_kernel(int a, int b, int c, int d){
         std::swap(a, c);
         std::swap(b, d);
     }
-    
-    //if(a==c && b==d) return UTM_1T1SP;
-    //else return RCT_1T1SP;
 
-    // if(a==0 && b==0 && c==0 && d==0)      return ssss2e;
-    // else if(a==0 && b==0 && c==0 && d==1) return sssp2e;
-    // else if(a==0 && b==0 && c==1 && d==1) return sspp2e;
-    // else if(a==0 && b==1 && c==0 && d==1) return spsp2e;
-    // else if(a==0 && b==1 && c==1 && d==1) return sppp2e;
-    // else if(a==1 && b==1 && c==1 && d==1) return pppp2e;
-    // else throw std::runtime_error("Invalid shell type");
-
-    // Hybrid
+    // S/P specialized kernels (always used)
     if (a == 0 && b == 0 && c == 0 && d == 0)      return ssss2e;
     else if (a == 0 && b == 0 && c == 0 && d == 1) return sssp2e;
     else if (a == 0 && b == 0 && c == 1 && d == 1) return sspp2e;
     else if (a == 0 && b == 1 && c == 0 && d == 1) return spsp2e;
     else if (a == 0 && b == 1 && c == 1 && d == 1) return sppp2e;
     else if (a == 1 && b == 1 && c == 1 && d == 1) return pppp2e;
-    else return MD_1T1SP;
+    // D+ shells: Rys quadrature or McMurchie-Davidson
+    else return use_md_kernel() ? MD_1T1SP : RysERI;
 }
 
 inline schwarz_kernel_t get_schwarz_kernel(int a, int b)
