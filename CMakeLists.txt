@@ -107,7 +107,7 @@ set(SOURCES
 add_library(gansu STATIC ${SOURCES})
 target_compile_definitions(gansu PRIVATE PROFILE_ENABLED) # add option -DPROFILE_ENABLED
 target_compile_definitions(gansu PRIVATE CONSOLE_COLOR_ENABLED) # add option -DCONSOLE_COLOR_ENABLED
-find_package(LAPACK QUIET)
+find_package(LAPACK REQUIRED)
 
 target_link_libraries(gansu
         cublas
@@ -161,72 +161,6 @@ if(BUILD_TESTS)
 endif()
 
 
-# === GANSU-UI (Web UI) ===
-set(UI_SRC_DIR "${CMAKE_SOURCE_DIR}/ui")
-set(UI_BUILD_DIR "${CMAKE_BINARY_DIR}/gansu-ui")
-set(NODE_VERSION "v22.14.0")
 
-# Find npm; if not found, download Node.js to build/_node/
-find_program(NPM_EXECUTABLE npm)
-if(NOT NPM_EXECUTABLE)
-    set(NODE_DIR "${CMAKE_BINARY_DIR}/_node")
-    if(NOT EXISTS "${NODE_DIR}/bin/npm")
-        message(STATUS "npm not found. Downloading Node.js ${NODE_VERSION}...")
-        if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-            set(NODE_ARCH "arm64")
-        else()
-            set(NODE_ARCH "x64")
-        endif()
-        set(NODE_TAR "node-${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz")
-        file(DOWNLOAD
-            "https://nodejs.org/dist/${NODE_VERSION}/${NODE_TAR}"
-            "${CMAKE_BINARY_DIR}/${NODE_TAR}"
-            SHOW_PROGRESS
-        )
-        execute_process(
-            COMMAND ${CMAKE_COMMAND} -E tar xf "${CMAKE_BINARY_DIR}/${NODE_TAR}"
-            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-        )
-        file(RENAME "${CMAKE_BINARY_DIR}/node-${NODE_VERSION}-linux-${NODE_ARCH}" "${NODE_DIR}")
-        file(REMOVE "${CMAKE_BINARY_DIR}/${NODE_TAR}")
-    endif()
-    set(NPM_EXECUTABLE "${NODE_DIR}/bin/npm")
-    set(NODE_PATH_PREFIX "${NODE_DIR}/bin:")
-endif()
-
-# Frontend build (only when source changes)
-file(GLOB_RECURSE UI_FRONTEND_SOURCES "${UI_SRC_DIR}/frontend/src/*.ts")
-add_custom_command(
-    OUTPUT "${UI_BUILD_DIR}/frontend/dist/index.html"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${UI_SRC_DIR}/frontend" "${UI_BUILD_DIR}/_frontend_build"
-    COMMAND ${CMAKE_COMMAND} -E env "PATH=${NODE_PATH_PREFIX}$ENV{PATH}"
-        "${NPM_EXECUTABLE}" install --prefix "${UI_BUILD_DIR}/_frontend_build"
-    COMMAND ${CMAKE_COMMAND} -E env "PATH=${NODE_PATH_PREFIX}$ENV{PATH}"
-        "${NPM_EXECUTABLE}" run build --prefix "${UI_BUILD_DIR}/_frontend_build"
-        -- --outDir "${UI_BUILD_DIR}/frontend/dist"
-    DEPENDS ${UI_FRONTEND_SOURCES} "${UI_SRC_DIR}/frontend/index.html"
-    COMMENT "Building GANSU-UI frontend"
-)
-
-# Backend copy + frontend build
-add_custom_target(gansu-ui ALL
-    DEPENDS "${UI_BUILD_DIR}/frontend/dist/index.html"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${UI_BUILD_DIR}/backend"
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "${UI_SRC_DIR}/backend/main.py"
-        "${UI_SRC_DIR}/backend/runner.py"
-        "${UI_SRC_DIR}/backend/parser.py"
-        "${UI_SRC_DIR}/backend/requirements.txt"
-        "${UI_BUILD_DIR}/backend/"
-    COMMAND ${CMAKE_COMMAND} -E copy "${UI_SRC_DIR}/run.sh" "${UI_BUILD_DIR}/"
-    COMMENT "Setting up GANSU-UI"
-)
-
-# Generate .env with correct paths (only if not already present)
-if(NOT EXISTS "${UI_BUILD_DIR}/.env")
-    file(WRITE "${UI_BUILD_DIR}/.env"
-        "GANSU_PATH=${CMAKE_SOURCE_DIR}\n"
-        "HF_MAIN_PATH=${CMAKE_BINARY_DIR}/HF_main\n"
-    )
-endif()
+# GANSU-UI (Web UI) is maintained as a separate project under ui/.
+# To build and run the UI, see ui/README.md.

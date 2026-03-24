@@ -109,6 +109,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
   * NVIDIA CUDA Toolkit 12.9 or later
   * cuBLAS 12.9 or later
   * cuSOLVER 11.7 or later
+  * LAPACK (e.g., `sudo apt install liblapack-dev` on Ubuntu)
 
 
 ### Directory Structure

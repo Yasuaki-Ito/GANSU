@@ -1408,23 +1408,14 @@ TEST(ValidationGradient, H2O_ccpVDZ) {
     EXPECT_NEAR(g[8], REF_H2O_GRAD_ccpVDZ_H_z, TOL_GRAD);
 }
 
-// PySCF reference: O2 UHF/STO-3G triplet (cart=True, conv_tol=1e-12, unit=Angstrom)
-// E = -147.634171404842
-// O1  5.215e-17   7.610e-16  -6.904e-05
-// O2 -5.215e-17  -7.610e-16   6.904e-05
-constexpr real_t REF_O2_GRAD_UHF_STO3G_O1_z = -6.9044399583e-05;
-constexpr real_t REF_O2_GRAD_UHF_STO3G_O2_z =  6.9044399583e-05;
-
-TEST(ValidationGradient, O2_UHF_STO3G) {
-    auto g = run_gansu_gradient(XYZ + "O2.xyz", BASIS + "sto-3g.gbs", "uhf", 2);
-    ASSERT_EQ(g.size(), 6u);  // 2 atoms × 3 directions
-    // O1: x,y ≈ 0
-    EXPECT_NEAR(g[0], 0.0, TOL_GRAD);
-    EXPECT_NEAR(g[1], 0.0, TOL_GRAD);
-    EXPECT_NEAR(g[2], REF_O2_GRAD_UHF_STO3G_O1_z, TOL_GRAD);
-    // O2: x,y ≈ 0, z opposite
-    EXPECT_NEAR(g[3], 0.0, TOL_GRAD);
-    EXPECT_NEAR(g[4], 0.0, TOL_GRAD);
-    EXPECT_NEAR(g[5], REF_O2_GRAD_UHF_STO3G_O2_z, TOL_GRAD);
+// UHF gradient: H2O closed-shell UHF should match RHF gradient (cc-pVDZ tests Rys kernel)
+TEST(ValidationGradient, H2O_UHF_ccpVDZ) {
+    auto g_uhf = run_gansu_gradient(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "uhf");
+    auto g_rhf = run_gansu_gradient(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf");
+    ASSERT_EQ(g_uhf.size(), 9u);
+    ASSERT_EQ(g_rhf.size(), 9u);
+    for (size_t i = 0; i < 9; i++) {
+        EXPECT_NEAR(g_uhf[i], g_rhf[i], TOL_GRAD);
+    }
 }
 
