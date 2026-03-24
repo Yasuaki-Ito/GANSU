@@ -48,9 +48,9 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
       * McMurchie-Davidson algorithm (s-, p-, d-, f-, g-, h-, and i-orbitals)
       * Obara-Saika algorithm (s-, p-, d-, and f-orbitals)
     * Electron repulsion integrals
-      * Rys quadrature (d-, f-, g-, h-, and i-orbitals)
-      * McMurchie-Davidson algorithm (s-, p-, d-, f-, g-, h-, and i-orbitals)
-      * Head-Gordon-Pople algorithm (s- and p-orbitals)
+      * Rys quadrature (shell quartets involving d-orbitals or higher)
+      * McMurchie-Davidson algorithm (fallback for all angular momenta)
+      * Head-Gordon-Pople algorithm (s- and p-orbital only quartets)
       * Schwarz Screening
     * Electron repulsion integrals for density fitting (RI approximation)
       * McMurchie-Davidson algorithm (s-, p-, d-, f-, and g-orbitals)
