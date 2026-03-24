@@ -107,7 +107,7 @@ set(SOURCES
 add_library(gansu STATIC ${SOURCES})
 target_compile_definitions(gansu PRIVATE PROFILE_ENABLED) # add option -DPROFILE_ENABLED
 target_compile_definitions(gansu PRIVATE CONSOLE_COLOR_ENABLED) # add option -DCONSOLE_COLOR_ENABLED
-find_package(LAPACK REQUIRED)
+find_package(LAPACK QUIET)
 
 target_link_libraries(gansu
         cublas

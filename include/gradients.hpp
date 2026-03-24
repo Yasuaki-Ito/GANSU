@@ -283,7 +283,7 @@ inline compute_basis_deriv_repulsion get_compute_gradients_repulsion() {
 }
 
 inline compute_basis_deriv_repulsion_uhf get_compute_gradients_repulsion_uhf() {
-    return Rys_compute_gradients_two_electron_uhf;
+    return compute_gradients_two_electron_uhf;  // MD version for now
 }
 
 
