@@ -102,6 +102,7 @@
     extern __global__ void calc_sss_gpu(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid);
  
     extern __global__ void MD_int3c2e_1T1SP(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors,  const double* g_auxiliary_upper_bound_factors,  const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid);
+    __global__ void Rys_int3c2e(real_t* g_result, const PrimitiveShell* g_pshell, const PrimitiveShell* g_pshell_aux, const real_t* d_cgto_normalization_factors, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, ShellTypeInfo shell_s2, int64_t num_tasks, int num_basis, const size_t2* d_primitive_shell_pair_indices, const double* g_upper_bound_factors, const double* g_auxiliary_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid);
 
     using eri_3center_kernel_t = void (*)(real_t*, const PrimitiveShell*, const PrimitiveShell*, const real_t*, const real_t*, ShellTypeInfo, ShellTypeInfo, ShellTypeInfo, int64_t, int, const size_t2*, const double*, const double*, const double, int, const double*);
     
@@ -118,14 +119,12 @@
         if (a < N_ORBITAL_TYPE_BASIS && b < N_ORBITAL_TYPE_BASIS && c < N_ORBITAL_TYPE_AUX){
 #if !defined(COMPUTE_D_BASIS)
             if (a >= 2 || b >= 2){
-                // printf("Caution: calling generic int3c2e kernel.\n");
-                return MD_int3c2e_1T1SP;
+                return Rys_int3c2e;
             }
 #endif
 #if !defined(COMPUTE_G_AUX)
             if (c >= 4){
-                // printf("Caution: calling generic int3c2e kernel.\n");
-                return MD_int3c2e_1T1SP;
+                return Rys_int3c2e;
             }
 #endif  
             return kernels[calcIdx_triangular(a, b, N_ORBITAL_TYPE_BASIS) * N_ORBITAL_TYPE_AUX + c];

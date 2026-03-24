@@ -72,9 +72,11 @@ __global__ void compute_gradients_nuclear(double* g_gradients, const real_t* g_d
 
 // define the kernel to calculate the gradient of the two-electron part
 __global__ void compute_gradients_two_electron(double* g_gradients, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const int num_basis, const double* g_boys_grid);
+__global__ void Rys_compute_gradients_two_electron(double* g_gradients, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const int num_basis, const double* g_boys_grid);
 
 // UHF version: takes alpha and beta density matrices separately
 __global__ void compute_gradients_two_electron_uhf(double* g_gradients, const real_t* g_density_matrix_a, const real_t* g_density_matrix_b, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const int num_basis, const double* g_boys_grid);
+__global__ void Rys_compute_gradients_two_electron_uhf(double* g_gradients, const real_t* g_density_matrix_a, const real_t* g_density_matrix_b, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const int num_basis, const double* g_boys_grid);
 
 
 // define the kernel functions as function poconst inters for one electron const integrals
@@ -277,11 +279,11 @@ inline compute_basis_deriv_nuclear get_compute_gradients_nuclear() {
 }
 
 inline compute_basis_deriv_repulsion get_compute_gradients_repulsion() {
-    return compute_gradients_two_electron;
+    return Rys_compute_gradients_two_electron;
 }
 
 inline compute_basis_deriv_repulsion_uhf get_compute_gradients_repulsion_uhf() {
-    return compute_gradients_two_electron_uhf;
+    return Rys_compute_gradients_two_electron_uhf;
 }
 
 

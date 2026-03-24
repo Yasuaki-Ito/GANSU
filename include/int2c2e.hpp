@@ -63,6 +63,7 @@ __constant__ int loop_to_ang_RI[7][28][3] = {
     extern __global__ void calc_fg_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid);
     extern __global__ void calc_gg_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid);
     extern __global__ void MD_int2c2e_1T1SP(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid);
+    __global__ void Rys_int2c2e(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid);
 
 
     inline int calcIdx_triangular(int a, int b, int N){
@@ -80,8 +81,7 @@ __constant__ int loop_to_ang_RI[7][28][3] = {
         if (a < N_ORBITAL_TYPE_AUX && b < N_ORBITAL_TYPE_AUX){
 #if !defined(COMPUTE_G_AUX)
             if (a >= 4 || b >= 4){
-                // printf("Caution: calling generic int2c2e kernel.\n");
-                return MD_int2c2e_1T1SP;
+                return Rys_int2c2e;
             }
 #endif
             return kernels[calcIdx_triangular(a,b,N_ORBITAL_TYPE_AUX)];

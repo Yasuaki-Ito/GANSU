@@ -52,6 +52,8 @@ add_library(int3c2e STATIC src/int3c2e.cu)
 add_library(int2e_direct STATIC src/int2e_direct.cu)
 add_library(rys_eri STATIC src/rys_eri.cu)
 add_library(rys_eri_direct STATIC src/rys_eri_direct.cu)
+add_library(rys_int3c2e STATIC src/rys_int3c2e.cu)
+add_library(rys_int2c2e STATIC src/rys_int2c2e.cu)
 
 
 add_library(grad_w STATIC src/grad/grad_w.cu)
@@ -59,6 +61,7 @@ add_library(grad_s STATIC src/grad/grad_s.cu)
 add_library(grad_k STATIC src/grad/grad_k.cu)
 add_library(grad_v STATIC src/grad/grad_v.cu)
 add_library(grad_g STATIC src/grad/grad_g.cu)
+add_library(rys_grad_g STATIC src/grad/rys_grad_g.cu)
 
 
 set(SOURCES
@@ -118,11 +121,14 @@ target_link_libraries(gansu
         int2e_direct
         rys_eri
         rys_eri_direct
+        rys_int3c2e
+        rys_int2c2e
         grad_w
         grad_s
         grad_k
         grad_v
         grad_g
+        rys_grad_g
     )
 
 

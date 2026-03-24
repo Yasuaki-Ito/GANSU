@@ -1316,3 +1316,115 @@ TEST(ValidationEOMCCSD, H2O_ccpVDZ) {
     EXPECT_NEAR(r.excitation_energies[4], REF_H2O_EOMCCSD_ccpVDZ_state5, TOL_EOMCCSD);
 }
 
+
+// ============================================================
+//  Energy Gradient
+// ============================================================
+// PySCF reference (cart=True, conv_tol=1e-12, GANSU internal Bohr coordinates):
+// H2O/STO-3G:
+//   O   1.243e-15   5.265e-16   1.694e-04
+//   H   4.393e-16   7.876e-06  -8.468e-05
+//   H  -1.682e-15  -7.876e-06  -8.468e-05
+// H2O/cc-pVDZ:
+//   O   1.781e-17   1.252e-16   6.088e-02
+//   H  -1.322e-16   2.829e-02  -3.044e-02
+//   H   1.144e-16  -2.829e-02  -3.044e-02
+
+// PySCF reference gradients (Cartesian basis, conv_tol=1e-12)
+constexpr real_t REF_H2O_GRAD_STO3G_O_z  =  1.6935712698e-04;
+constexpr real_t REF_H2O_GRAD_STO3G_H_y  =  7.8757152984e-06;
+constexpr real_t REF_H2O_GRAD_STO3G_H_z  = -8.4678563475e-05;
+
+constexpr real_t REF_H2O_GRAD_ccpVDZ_O_z =  6.0881404097e-02;
+constexpr real_t REF_H2O_GRAD_ccpVDZ_H_y =  2.8292229833e-02;
+constexpr real_t REF_H2O_GRAD_ccpVDZ_H_z = -3.0440702048e-02;
+
+constexpr real_t TOL_GRAD = 1e-5;  // Gradient tolerance
+
+static std::vector<double> run_gansu_gradient(const std::string& xyz,
+                                               const std::string& basis,
+                                               const std::string& method = "rhf",
+                                               int beta_to_alpha = 0) {
+    cudaDeviceSynchronize();
+    cudaGetLastError();
+
+    ParameterManager params;
+    params["xyzfilename"] = xyz;
+    params["gbsfilename"] = basis;
+    params["method"] = method;
+    params["convergence_energy_threshold"] = "1e-10";
+    params["run_type"] = "gradient";
+    if (beta_to_alpha != 0) {
+        params["beta_to_alpha"] = std::to_string(beta_to_alpha);
+    }
+
+    std::streambuf* orig_buf = std::cout.rdbuf();
+    std::ostringstream null_stream;
+    std::cout.rdbuf(null_stream.rdbuf());
+
+    auto hf = HFBuilder::buildHF(params);
+    hf->solve();
+    auto grad = hf->compute_Energy_Gradient();
+
+    std::cout.rdbuf(orig_buf);
+
+    std::cout << std::setprecision(10) << std::fixed
+              << "  Gradient: ";
+    for (size_t i = 0; i < grad.size(); i += 3) {
+        std::cout << "[" << grad[i] << ", " << grad[i+1] << ", " << grad[i+2] << "] ";
+    }
+    std::cout << std::endl;
+
+    return grad;
+}
+
+TEST(ValidationGradient, H2O_STO3G) {
+    auto g = run_gansu_gradient(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs");
+    ASSERT_EQ(g.size(), 9u);  // 3 atoms × 3 directions
+    // O: x,y ≈ 0
+    EXPECT_NEAR(g[0], 0.0, TOL_GRAD);
+    EXPECT_NEAR(g[1], 0.0, TOL_GRAD);
+    EXPECT_NEAR(g[2], REF_H2O_GRAD_STO3G_O_z, TOL_GRAD);
+    // H1: y,z
+    EXPECT_NEAR(g[4], REF_H2O_GRAD_STO3G_H_y, TOL_GRAD);
+    EXPECT_NEAR(g[5], REF_H2O_GRAD_STO3G_H_z, TOL_GRAD);
+    // H2: -y, same z
+    EXPECT_NEAR(g[7], -REF_H2O_GRAD_STO3G_H_y, TOL_GRAD);
+    EXPECT_NEAR(g[8], REF_H2O_GRAD_STO3G_H_z, TOL_GRAD);
+}
+
+TEST(ValidationGradient, H2O_ccpVDZ) {
+    auto g = run_gansu_gradient(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs");
+    ASSERT_EQ(g.size(), 9u);
+    // O: x,y ≈ 0
+    EXPECT_NEAR(g[0], 0.0, TOL_GRAD);
+    EXPECT_NEAR(g[1], 0.0, TOL_GRAD);
+    EXPECT_NEAR(g[2], REF_H2O_GRAD_ccpVDZ_O_z, TOL_GRAD);
+    // H1: y,z
+    EXPECT_NEAR(g[4], REF_H2O_GRAD_ccpVDZ_H_y, TOL_GRAD);
+    EXPECT_NEAR(g[5], REF_H2O_GRAD_ccpVDZ_H_z, TOL_GRAD);
+    // H2: -y, same z
+    EXPECT_NEAR(g[7], -REF_H2O_GRAD_ccpVDZ_H_y, TOL_GRAD);
+    EXPECT_NEAR(g[8], REF_H2O_GRAD_ccpVDZ_H_z, TOL_GRAD);
+}
+
+// PySCF reference: O2 UHF/STO-3G triplet (cart=True, conv_tol=1e-12, unit=Angstrom)
+// E = -147.634171404842
+// O1  5.215e-17   7.610e-16  -6.904e-05
+// O2 -5.215e-17  -7.610e-16   6.904e-05
+constexpr real_t REF_O2_GRAD_UHF_STO3G_O1_z = -6.9044399583e-05;
+constexpr real_t REF_O2_GRAD_UHF_STO3G_O2_z =  6.9044399583e-05;
+
+TEST(ValidationGradient, O2_UHF_STO3G) {
+    auto g = run_gansu_gradient(XYZ + "O2.xyz", BASIS + "sto-3g.gbs", "uhf", 2);
+    ASSERT_EQ(g.size(), 6u);  // 2 atoms × 3 directions
+    // O1: x,y ≈ 0
+    EXPECT_NEAR(g[0], 0.0, TOL_GRAD);
+    EXPECT_NEAR(g[1], 0.0, TOL_GRAD);
+    EXPECT_NEAR(g[2], REF_O2_GRAD_UHF_STO3G_O1_z, TOL_GRAD);
+    // O2: x,y ≈ 0, z opposite
+    EXPECT_NEAR(g[3], 0.0, TOL_GRAD);
+    EXPECT_NEAR(g[4], 0.0, TOL_GRAD);
+    EXPECT_NEAR(g[5], REF_O2_GRAD_UHF_STO3G_O2_z, TOL_GRAD);
+}
+
