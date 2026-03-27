@@ -156,7 +156,8 @@ static GansuResult run_gansu(const std::string& xyz,
                               const std::string& initial_guess = "core",
                               const std::string& eri_method = "stored",
                               const std::string& auxiliary_basis = "",
-                              int ccsd_algorithm = 0)
+                              int ccsd_algorithm = 0,
+                              const std::string& hash_fock_method = "compact")
 {
     // Clear any sticky CUDA errors from previous tests
     cudaDeviceSynchronize();
@@ -177,6 +178,9 @@ static GansuResult run_gansu(const std::string& xyz,
     }
     if (ccsd_algorithm != 0) {
         params["ccsd_algorithm"] = std::to_string(ccsd_algorithm);
+    }
+    if (eri_method == "hash") {
+        params["hash_fock_method"] = hash_fock_method;
     }
 
     // Suppress GANSU's verbose output during solve
@@ -1417,5 +1421,60 @@ TEST(ValidationGradient, H2O_UHF_ccpVDZ) {
     for (size_t i = 0; i < 9; i++) {
         EXPECT_NEAR(g_uhf[i], g_rhf[i], TOL_GRAD);
     }
+}
+
+// ============================================================
+//  Hash ERI: energy must match Stored ERI (all 3 Fock methods)
+// ============================================================
+
+// --- Compact (default) ---
+
+TEST(ValidationHashERI, H2_STO3G_Compact) {
+    auto r = run_gansu(XYZ + "H2.xyz", BASIS + "sto-3g.gbs", "rhf", "none", 0, 0, "core", "hash", "", 0, "compact");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2_RHF_STO3G, TOL_HF);
+}
+
+TEST(ValidationHashERI, H2O_STO3G_Compact) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf", "none", 0, 0, "core", "hash", "", 0, "compact");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_HF);
+}
+
+TEST(ValidationHashERI, NH3_STO3G_Compact) {
+    auto r = run_gansu(XYZ + "NH3.xyz", BASIS + "sto-3g.gbs", "rhf", "none", 0, 0, "core", "hash", "", 0, "compact");
+    EXPECT_NEAR(r.hf_total_energy, REF_NH3_RHF_STO3G, TOL_HF);
+}
+
+TEST(ValidationHashERI, CH4_STO3G_Compact) {
+    auto r = run_gansu(XYZ + "CH4.xyz", BASIS + "sto-3g.gbs", "rhf", "none", 0, 0, "core", "hash", "", 0, "compact");
+    EXPECT_NEAR(r.hf_total_energy, REF_CH4_RHF_STO3G, TOL_HF);
+}
+
+TEST(ValidationHashERI, H2O_ccpVDZ_Compact) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf", "none", 0, 0, "core", "hash", "", 0, "compact");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_HF);
+}
+
+// --- Indexed ---
+
+TEST(ValidationHashERI, H2O_STO3G_Indexed) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf", "none", 0, 0, "core", "hash", "", 0, "indexed");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_HF);
+}
+
+TEST(ValidationHashERI, H2O_ccpVDZ_Indexed) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf", "none", 0, 0, "core", "hash", "", 0, "indexed");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_HF);
+}
+
+// --- Fullscan ---
+
+TEST(ValidationHashERI, H2O_STO3G_Fullscan) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf", "none", 0, 0, "core", "hash", "", 0, "fullscan");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_HF);
+}
+
+TEST(ValidationHashERI, H2O_ccpVDZ_Fullscan) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf", "none", 0, 0, "core", "hash", "", 0, "fullscan");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_HF);
 }
 

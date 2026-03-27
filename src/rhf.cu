@@ -88,7 +88,15 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
     }else if(eri_method == "direct"){
         set_eri_method(std::make_unique<ERI_Direct_RHF>(*this));
     }else if(eri_method == "hash"){
-        set_eri_method(std::make_unique<ERI_Hash_RHF>(*this));
+        auto eri_hash = std::make_unique<ERI_Hash_RHF>(*this);
+        if (parameters.contains("hash_fock_method")) {
+            std::string hfm = parameters.get<std::string>("hash_fock_method");
+            if (hfm == "compact") eri_hash->set_hash_fock_method(HashFockMethod::Compact);
+            else if (hfm == "indexed") eri_hash->set_hash_fock_method(HashFockMethod::Indexed);
+            else if (hfm == "fullscan") eri_hash->set_hash_fock_method(HashFockMethod::Fullscan);
+            else THROW_EXCEPTION("Invalid hash_fock_method: " + hfm + ". Use compact, indexed, or fullscan.");
+        }
+        set_eri_method(std::move(eri_hash));
     }else if(eri_method == "direct_ri"){
         const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename");
         BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);

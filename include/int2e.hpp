@@ -478,6 +478,83 @@ __constant__ int tuv_list[2925][3] =
 
 
 
+// ========== Hash table ERI versions ==========
+// Hash versions of ERI kernels (COO output: keys, values, counter)
+__global__ void ssss2e_hash(unsigned long long* hash_keys, double* hash_values, size_t hash_mask, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const real_t schwarz_screening_threshold, const double* g_upper_bound_factors, const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket, size_t capacity_mask = 0);
+__global__ void sssp2e_hash(unsigned long long* hash_keys, double* hash_values, size_t hash_mask, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const real_t schwarz_screening_threshold, const double* g_upper_bound_factors, const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket, size_t capacity_mask = 0);
+__global__ void sspp2e_hash(unsigned long long* hash_keys, double* hash_values, size_t hash_mask, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const real_t schwarz_screening_threshold, const double* g_upper_bound_factors, const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket, size_t capacity_mask = 0);
+__global__ void spsp2e_hash(unsigned long long* hash_keys, double* hash_values, size_t hash_mask, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const real_t schwarz_screening_threshold, const double* g_upper_bound_factors, const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket, size_t capacity_mask = 0);
+__global__ void sppp2e_hash(unsigned long long* hash_keys, double* hash_values, size_t hash_mask, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const real_t schwarz_screening_threshold, const double* g_upper_bound_factors, const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket, size_t capacity_mask = 0);
+__global__ void pppp2e_hash(unsigned long long* hash_keys, double* hash_values, size_t hash_mask, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const real_t schwarz_screening_threshold, const double* g_upper_bound_factors, const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket, size_t capacity_mask = 0);
+
+// Hash insert helper: canonical key + atomicAdd accumulation
+inline __device__
+bool _is_canonical(int a, int b, int c, int d) {
+    if (a > b) return false;
+    if (c > d) return false;
+    if (a > c || (a == c && b > d)) return false;
+    return true;
+}
+
+inline __device__
+void _hash_insert_inline(unsigned long long* keys, double* values,
+    size_t capacity_mask, int i, int j, int k, int l, double res)
+{
+    size_t4 sorted = sort_eri_index(i, j, k, l);
+    unsigned long long key = (static_cast<unsigned long long>(sorted.x) << 48) |
+                             (static_cast<unsigned long long>(sorted.y) << 32) |
+                             (static_cast<unsigned long long>(sorted.z) << 16) |
+                             static_cast<unsigned long long>(sorted.w);
+    unsigned long long h = key;
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
+    size_t slot = static_cast<size_t>(h) & capacity_mask;
+    while (true) {
+        unsigned long long prev = atomicCAS(&keys[slot], 0xFFFFFFFFFFFFFFFFULL, key);
+        if (prev == 0xFFFFFFFFFFFFFFFFULL || prev == key) {
+            atomicAdd(&values[slot], res);
+            return;
+        }
+        slot = (slot + 1) & capacity_mask;
+    }
+}
+
+inline __device__
+void addToResult_hash(double res, unsigned long long* keys, double* values,
+    size_t capacity_mask, int p, int q, int r, int s, int nao,
+    bool sym_bra, bool sym_ket, bool sym_braket)
+{
+    if (_is_canonical(p, q, r, s))
+        _hash_insert_inline(keys, values, capacity_mask, p, q, r, s, res);
+    if (!sym_bra && _is_canonical(q, p, r, s))
+        _hash_insert_inline(keys, values, capacity_mask, q, p, r, s, res);
+    if (!sym_ket && _is_canonical(p, q, s, r))
+        _hash_insert_inline(keys, values, capacity_mask, p, q, s, r, res);
+    if (!sym_bra && !sym_ket && _is_canonical(q, p, s, r))
+        _hash_insert_inline(keys, values, capacity_mask, q, p, s, r, res);
+    if (!sym_braket) {
+        if (_is_canonical(r, s, p, q))
+            _hash_insert_inline(keys, values, capacity_mask, r, s, p, q, res);
+        if (!sym_bra && _is_canonical(r, s, q, p))
+            _hash_insert_inline(keys, values, capacity_mask, r, s, q, p, res);
+        if (!sym_ket && _is_canonical(s, r, p, q))
+            _hash_insert_inline(keys, values, capacity_mask, s, r, p, q, res);
+        if (!sym_bra && !sym_ket && _is_canonical(s, r, q, p))
+            _hash_insert_inline(keys, values, capacity_mask, s, r, q, p, res);
+    }
+}
+
+inline __device__
+void addToResult_hash(double res, unsigned long long* keys, double* values,
+    size_t capacity_mask, int p, int q, int r, int s, int nao,
+    bool sym_bra, bool sym_ket, bool sym_braket,
+    const double* g_cgto_normalization_factors)
+{
+    res *= g_cgto_normalization_factors[p] * g_cgto_normalization_factors[q]
+         * g_cgto_normalization_factors[r] * g_cgto_normalization_factors[s];
+    addToResult_hash(res, keys, values, capacity_mask, p, q, r, s, nao, sym_bra, sym_ket, sym_braket);
+}
+
 } // namespace gansu::gpu
 
 #endif

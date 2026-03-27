@@ -47,6 +47,7 @@ include_directories(include)
 # Static libraries
 add_library(int1e STATIC src/int1e.cu)
 add_library(int2e STATIC src/int2e.cu)
+add_library(int2e_hash STATIC src/int2e_hash.cu)
 add_library(int2c2e STATIC src/int2c2e.cu)
 add_library(int3c2e STATIC src/int3c2e.cu)
 add_library(int2e_direct STATIC src/int2e_direct.cu)
@@ -122,6 +123,7 @@ target_link_libraries(gansu
         ${CUDA_LIBRARIES}
         int1e
         int2e
+        int2e_hash
         int2c2e
         int3c2e
         int2e_direct

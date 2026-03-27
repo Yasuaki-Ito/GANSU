@@ -14,6 +14,7 @@
 
 
 #include "gpu_kernels.hpp"
+#include "gpu_hash_table.cuh"
 #include "utils.hpp"
 
 namespace gansu::gpu{
@@ -601,16 +602,354 @@ __global__ void compute_diagonal_of_product_sum(const double* A, const double* B
 
 
 
-__global__ void constructERIHash_kernel(const std::vector<ShellTypeInfo> shell_type_infos, const std::vector<ShellPairTypeInfo> shell_pair_type_infos, const PrimitiveShell* d_primitive_shells, const real_t* d_cgto_normalization_factors, /* Hash memoryへのポインタ, */ const bool verbose)
+/**
+ * @brief Kernel to copy non-zero ERI values from dense N^4 array to hash table
+ * @details Each thread handles one symmetry-unique (i,j,k,l) index combination.
+ *          Indices are enumerated as: i<=j, k<=l, (i,j)<=(k,l).
+ */
+__global__ void denseToHash_kernel(const real_t* d_dense_eri,
+    unsigned long long* d_hash_keys, real_t* d_hash_values,
+    size_t hash_capacity_mask, const int num_basis)
 {
-    // ここにERIを計算して、ハッシュテーブルに格納する処理を実装する
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t N = num_basis;
+    const size_t num_pairs = N * (N + 1) / 2;
+    const size_t num_unique = num_pairs * (num_pairs + 1) / 2;
+    if (tid >= num_unique) return;
+
+    // Convert linear index to (bra_idx, ket_idx) where bra_idx <= ket_idx
+    // Using triangular index formula: ket_idx = floor((sqrt(8*tid+1)-1)/2)
+    const size_t ket_idx = static_cast<size_t>(__double2ll_rd((__dsqrt_rn(8.0 * tid + 1.0) - 1.0) / 2.0));
+    const size_t bra_idx = tid - ket_idx * (ket_idx + 1) / 2;
+
+    // Convert pair indices to (i,j) and (k,l) where i<=j, k<=l
+    const size_t j = static_cast<size_t>(__double2ll_rd((__dsqrt_rn(8.0 * bra_idx + 1.0) - 1.0) / 2.0));
+    const size_t i = bra_idx - j * (j + 1) / 2;
+    const size_t l = static_cast<size_t>(__double2ll_rd((__dsqrt_rn(8.0 * ket_idx + 1.0) - 1.0) / 2.0));
+    const size_t k = ket_idx - l * (l + 1) / 2;
+
+    // Read ERI value from dense array
+    const size_t dense_idx = get_1d_indexM4(i, j, k, l, N);
+    const real_t value = d_dense_eri[dense_idx];
+
+    // Only insert non-zero values
+    if (value != 0.0) {
+        const unsigned long long key = canonical_eri_key(i, j, k, l);
+        hash_insert(d_hash_keys, d_hash_values, hash_capacity_mask, key, value);
+    }
 }
 
-__global__ void computeFockMatrix_Hash_RHF_kernel(const real_t* d_density_matrix, const real_t* d_core_hamiltonian_matrix, /* Hash memoryへのポインタ, */ real_t* d_fock_matrix, const int num_basis, const int verbose)
+/**
+ * @brief Compute Fock matrix for RHF using hash-stored ERIs
+ * @details Same structure as computeFockMatrix_RHF_kernel but uses hash_lookup
+ *          instead of direct dense array access.
+ *          F_ij = H_ij + sum_{kl} D_kl * ((ij|kl) - 0.5*(ik|jl))
+ */
+__global__ void computeFockMatrix_Hash_RHF_kernel(const real_t* d_density_matrix,
+    const real_t* d_core_hamiltonian_matrix,
+    const unsigned long long* d_hash_keys, const real_t* d_hash_values,
+    size_t hash_capacity_mask,
+    real_t* d_fock_matrix, const int num_basis)
 {
-    // ハッシュテーブルを使用してFock行列を計算する処理を実装する
+    const int bra = blockIdx.x;
+    const int i = bra / num_basis;
+    const int j = bra % num_basis;
+
+    const size_t l = blockDim.x * threadIdx.y + threadIdx.x;
+
+    __shared__ real_t s_F_ij[1];
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        s_F_ij[0] = 0.0;
+    }
+    __syncthreads();
+
+    real_t sum = 0.0;
+    if (l < num_basis) {
+        for (int k = 0; k < num_basis; ++k) {
+            const real_t eri_ijkl = hash_lookup(d_hash_keys, d_hash_values, hash_capacity_mask,
+                                                 canonical_eri_key(i, j, k, l));
+            const real_t eri_ikjl = hash_lookup(d_hash_keys, d_hash_values, hash_capacity_mask,
+                                                 canonical_eri_key(i, k, j, l));
+            sum += (eri_ijkl - 0.5 * eri_ikjl) * d_density_matrix[num_basis * k + l];
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum += __shfl_down_sync(FULL_MASK, sum, offset);
+    }
+
+    if (threadIdx.x == 0) {
+        atomicAdd(s_F_ij, sum);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        d_fock_matrix[bra] = s_F_ij[0] + d_core_hamiltonian_matrix[bra];
+    }
 }
 
 
+
+/**
+ * @brief Push-based Fock matrix construction from hash-stored ERIs (RHF)
+ * @details Each thread processes one hash table entry. For each non-zero ERI (a,b,c,d)=v,
+ *          it adds Coulomb and Exchange contributions to the Fock matrix via atomicAdd.
+ *          The 8-fold symmetry is fully expanded:
+ *            Coulomb: F[a,b] += 2*D[c,d]*v, F[c,d] += 2*D[a,b]*v (if bra!=ket)
+ *            Exchange: F[a,c] -= D[b,d]*v, F[a,d] -= D[b,c]*v (if c!=d),
+ *                      F[b,c] -= D[a,d]*v (if a!=b), F[b,d] -= D[a,c]*v (if a!=b && c!=d)
+ */
+__global__ void computeFockMatrix_Hash_Push_RHF_kernel(
+    const real_t* d_density_matrix,
+    const unsigned long long* d_hash_keys,
+    const real_t* d_hash_values,
+    size_t hash_table_capacity,
+    real_t* d_fock_matrix,
+    const int num_basis,
+    const int num_fock_replicas)
+{
+    const size_t tid = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+    if (tid >= hash_table_capacity) return;
+
+    const unsigned long long key = d_hash_keys[tid];
+    if (key == EMPTY_KEY) return;
+
+    const real_t v = d_hash_values[tid];
+    if (v == 0.0) return;
+
+    int a, b, c, d;
+    decode_eri_key(key, a, b, c, d);
+
+    const int N = num_basis;
+
+    const real_t* D = d_density_matrix;
+    real_t* F = d_fock_matrix + N * N * (threadIdx.x % num_fock_replicas);
+
+    const real_t D_cd = D[c * N + d];
+    const real_t D_ab = D[a * N + b];
+    const real_t D_bd = D[b * N + d];
+    const real_t D_ad = D[a * N + d];
+    const real_t D_bc = D[b * N + c];
+    const real_t D_ac = D[a * N + c];
+    const real_t hv = -0.5 * v;
+    const bool braket_diff = (a != c || b != d);
+
+    // --- Coulomb: enumerate unique (ij|kl) permutations ---
+    // (a,b,c,d) and (a,b,d,c) → F[a,b] += (c==d ? 1 : 2) * D[c,d] * v
+    atomicAdd(&F[a * N + b], (c != d ? 2.0 : 1.0) * D_cd * v);
+    // (b,a,c,d) and (b,a,d,c) → F[b,a], if a != b
+    if (a != b)
+        atomicAdd(&F[b * N + a], (c != d ? 2.0 : 1.0) * D_cd * v);
+    // (c,d,a,b) and (c,d,b,a) → F[c,d], if bra != ket
+    if (braket_diff)
+        atomicAdd(&F[c * N + d], (a != b ? 2.0 : 1.0) * D_ab * v);
+    // (d,c,a,b) and (d,c,b,a) → F[d,c], if bra != ket && c != d
+    if (braket_diff && c != d)
+        atomicAdd(&F[d * N + c], (a != b ? 2.0 : 1.0) * D_ab * v);
+
+    // --- Exchange: enumerate all 8 unique (ik|jl) permutations ---
+    // #1: (ik|jl)=(a,b,c,d) → F[a,c] -= 0.5*D[b,d]*v
+    atomicAdd(&F[a * N + c], hv * D_bd);
+    // #2: (ik|jl)=(b,a,c,d) → F[b,c] -= 0.5*D[a,d]*v, if a!=b
+    if (a != b)
+        atomicAdd(&F[b * N + c], hv * D_ad);
+    // #3: (ik|jl)=(a,b,d,c) → F[a,d] -= 0.5*D[b,c]*v, if c!=d
+    if (c != d)
+        atomicAdd(&F[a * N + d], hv * D_bc);
+    // #4: (ik|jl)=(b,a,d,c) → F[b,d] -= 0.5*D[a,c]*v, if a!=b && c!=d
+    if (a != b && c != d)
+        atomicAdd(&F[b * N + d], hv * D_ac);
+    // #5: (ik|jl)=(c,d,a,b) → F[c,a] -= 0.5*D[d,b]*v, if bra!=ket
+    if (braket_diff)
+        atomicAdd(&F[c * N + a], hv * D_bd);
+    // #6: (ik|jl)=(d,c,a,b) → F[d,a] -= 0.5*D[c,b]*v, if bra!=ket && c!=d
+    if (braket_diff && c != d)
+        atomicAdd(&F[d * N + a], hv * D_bc);
+    // #7: (ik|jl)=(c,d,b,a) → F[c,b] -= 0.5*D[d,a]*v, if bra!=ket && a!=b
+    if (braket_diff && a != b)
+        atomicAdd(&F[c * N + b], hv * D_ad);
+    // #8: (ik|jl)=(d,c,b,a) → F[d,b] -= 0.5*D[c,a]*v, if bra!=ket && a!=b && c!=d
+    if (braket_diff && a != b && c != d)
+        atomicAdd(&F[d * N + b], hv * D_ac);
+}
+
+/**
+ * @brief Push-based Fock matrix using pre-built non-zero index list.
+ *        Each thread processes one non-zero hash entry (no empty slot waste).
+ */
+__global__ void computeFockMatrix_Hash_Push_Indexed_RHF_kernel(
+    const real_t* d_density_matrix,
+    const unsigned long long* d_hash_keys,
+    const real_t* d_hash_values,
+    const size_t* d_nonzero_indices,
+    size_t num_nonzero,
+    real_t* d_fock_matrix,
+    const int num_basis,
+    const int num_fock_replicas)
+{
+    const size_t tid = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+    if (tid >= num_nonzero) return;
+
+    const size_t slot = d_nonzero_indices[tid];
+    const real_t v = d_hash_values[slot];
+    if (v == 0.0) return;
+
+    int a, b, c, d;
+    decode_eri_key(d_hash_keys[slot], a, b, c, d);
+
+    const int N = num_basis;
+    const real_t* D = d_density_matrix;
+    real_t* F = d_fock_matrix + N * N * (threadIdx.x % num_fock_replicas);
+
+    const real_t D_cd = D[c * N + d];
+    const real_t D_ab = D[a * N + b];
+    const real_t D_bd = D[b * N + d];
+    const real_t D_ad = D[a * N + d];
+    const real_t D_bc = D[b * N + c];
+    const real_t D_ac = D[a * N + c];
+    const real_t hv = -0.5 * v;
+    const bool braket_diff = (a != c || b != d);
+
+    // Coulomb
+    atomicAdd(&F[a * N + b], (c != d ? 2.0 : 1.0) * D_cd * v);
+    if (a != b)
+        atomicAdd(&F[b * N + a], (c != d ? 2.0 : 1.0) * D_cd * v);
+    if (braket_diff)
+        atomicAdd(&F[c * N + d], (a != b ? 2.0 : 1.0) * D_ab * v);
+    if (braket_diff && c != d)
+        atomicAdd(&F[d * N + c], (a != b ? 2.0 : 1.0) * D_ab * v);
+
+    // Exchange
+    atomicAdd(&F[a * N + c], hv * D_bd);
+    if (a != b)
+        atomicAdd(&F[b * N + c], hv * D_ad);
+    if (c != d)
+        atomicAdd(&F[a * N + d], hv * D_bc);
+    if (a != b && c != d)
+        atomicAdd(&F[b * N + d], hv * D_ac);
+    if (braket_diff)
+        atomicAdd(&F[c * N + a], hv * D_bd);
+    if (braket_diff && c != d)
+        atomicAdd(&F[d * N + a], hv * D_bc);
+    if (braket_diff && a != b)
+        atomicAdd(&F[c * N + b], hv * D_ad);
+    if (braket_diff && a != b && c != d)
+        atomicAdd(&F[d * N + b], hv * D_ac);
+}
+
+/**
+ * @brief Push-based Fock matrix from COO sparse ERIs.
+ *        Each thread processes one COO entry directly (no index indirection).
+ */
+__global__ void computeFockMatrix_COO_Push_RHF_kernel(
+    const real_t* d_density_matrix,
+    const unsigned long long* d_coo_keys,
+    const real_t* d_coo_values,
+    size_t num_entries,
+    real_t* d_fock_matrix,
+    const int num_basis,
+    const int num_fock_replicas)
+{
+    const size_t tid = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+    if (tid >= num_entries) return;
+
+    const real_t v = d_coo_values[tid];
+    if (v == 0.0) return;
+
+    int a, b, c, d;
+    decode_eri_key(d_coo_keys[tid], a, b, c, d);
+
+    const int N = num_basis;
+    const real_t* D = d_density_matrix;
+    real_t* F = d_fock_matrix + N * N * (threadIdx.x % num_fock_replicas);
+
+    const real_t D_cd = D[c * N + d];
+    const real_t D_ab = D[a * N + b];
+    const real_t D_bd = D[b * N + d];
+    const real_t D_ad = D[a * N + d];
+    const real_t D_bc = D[b * N + c];
+    const real_t D_ac = D[a * N + c];
+    const real_t hv = -0.5 * v;
+    const bool braket_diff = (a != c || b != d);
+
+    // Coulomb
+    atomicAdd(&F[a * N + b], (c != d ? 2.0 : 1.0) * D_cd * v);
+    if (a != b)
+        atomicAdd(&F[b * N + a], (c != d ? 2.0 : 1.0) * D_cd * v);
+    if (braket_diff)
+        atomicAdd(&F[c * N + d], (a != b ? 2.0 : 1.0) * D_ab * v);
+    if (braket_diff && c != d)
+        atomicAdd(&F[d * N + c], (a != b ? 2.0 : 1.0) * D_ab * v);
+
+    // Exchange
+    atomicAdd(&F[a * N + c], hv * D_bd);
+    if (a != b) atomicAdd(&F[b * N + c], hv * D_ad);
+    if (c != d) atomicAdd(&F[a * N + d], hv * D_bc);
+    if (a != b && c != d) atomicAdd(&F[b * N + d], hv * D_ac);
+    if (braket_diff) atomicAdd(&F[c * N + a], hv * D_bd);
+    if (braket_diff && c != d) atomicAdd(&F[d * N + a], hv * D_bc);
+    if (braket_diff && a != b) atomicAdd(&F[c * N + b], hv * D_ad);
+    if (braket_diff && a != b && c != d) atomicAdd(&F[d * N + b], hv * D_ac);
+}
+
+/**
+ * @brief Add core Hamiltonian to Fock matrix: F[i] += H[i]
+ */
+__global__ void addCoreHamiltonian_kernel(
+    const real_t* d_core_hamiltonian_matrix,
+    real_t* d_fock_matrix,
+    const int size)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < size) {
+        d_fock_matrix[tid] += d_core_hamiltonian_matrix[tid];
+    }
+}
+
+/**
+ * @brief Remove hash entries with |value| < threshold.
+ *        Resets key to EMPTY_KEY and value to 0.0 for negligible entries.
+ */
+__global__ void cleanupHashTable_kernel(
+    unsigned long long* d_hash_keys,
+    real_t* d_hash_values,
+    size_t hash_table_capacity,
+    real_t threshold)
+{
+    const size_t tid = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+    if (tid >= hash_table_capacity) return;
+    if (d_hash_keys[tid] == EMPTY_KEY) return;
+
+    if (fabs(d_hash_values[tid]) < threshold) {
+        d_hash_keys[tid] = EMPTY_KEY;
+        d_hash_values[tid] = 0.0;
+    }
+}
+
+__global__ void countNonEmptySlots_kernel(
+    const unsigned long long* d_hash_keys,
+    size_t hash_table_capacity,
+    size_t* d_count)
+{
+    const size_t tid = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+    if (tid >= hash_table_capacity) return;
+    if (d_hash_keys[tid] != EMPTY_KEY) {
+        atomicAdd((unsigned long long*)d_count, 1ULL);
+    }
+}
+
+__global__ void collectNonEmptyIndices_kernel(
+    const unsigned long long* d_hash_keys,
+    size_t hash_table_capacity,
+    size_t* d_indices,
+    size_t* d_write_pos)
+{
+    const size_t tid = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+    if (tid >= hash_table_capacity) return;
+    if (d_hash_keys[tid] != EMPTY_KEY) {
+        size_t pos = atomicAdd((unsigned long long*)d_write_pos, 1ULL);
+        d_indices[pos] = tid;
+    }
+}
 
 } // namespace gansu::gpu

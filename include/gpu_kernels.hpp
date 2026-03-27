@@ -49,7 +49,14 @@ __global__ void setZeroUpperTriangle(double* d_A, const int N);
 __global__ void compute_diagonal_of_product(const double* A, const double* B, double* diag, const int N);
 __global__ void compute_diagonal_of_product_sum(const double* A, const double* B, const double* C, double* diag, const int N);
 
-__global__ void constructERIHash_kernel(const std::vector<ShellTypeInfo> shell_type_infos, const std::vector<ShellPairTypeInfo> shell_pair_type_infos, const PrimitiveShell* d_primitive_shells, const real_t* d_cgto_normalization_factors, /* Hash memoryへのポインタ, */ const bool verbose);
-__global__ void computeFockMatrix_Hash_RHF_kernel(const real_t* d_density_matrix, const real_t* d_core_hamiltonian_matrix, /* Hash memoryへのポインタ, */ real_t* d_fock_matrix, const int num_basis, const int verbose);
+__global__ void denseToHash_kernel(const real_t* d_dense_eri, unsigned long long* d_hash_keys, real_t* d_hash_values, size_t hash_capacity_mask, const int num_basis);
+__global__ void computeFockMatrix_Hash_RHF_kernel(const real_t* d_density_matrix, const real_t* d_core_hamiltonian_matrix, const unsigned long long* d_hash_keys, const real_t* d_hash_values, size_t hash_capacity_mask, real_t* d_fock_matrix, const int num_basis);
+__global__ void computeFockMatrix_Hash_Push_RHF_kernel(const real_t* d_density_matrix, const unsigned long long* d_hash_keys, const real_t* d_hash_values, size_t hash_table_capacity, real_t* d_fock_matrix, const int num_basis, const int num_fock_replicas);
+__global__ void computeFockMatrix_Hash_Push_Indexed_RHF_kernel(const real_t* d_density_matrix, const unsigned long long* d_hash_keys, const real_t* d_hash_values, const size_t* d_nonzero_indices, size_t num_nonzero, real_t* d_fock_matrix, const int num_basis, const int num_fock_replicas);
+__global__ void computeFockMatrix_COO_Push_RHF_kernel(const real_t* d_density_matrix, const unsigned long long* d_coo_keys, const real_t* d_coo_values, size_t num_entries, real_t* d_fock_matrix, const int num_basis, const int num_fock_replicas);
+__global__ void addCoreHamiltonian_kernel(const real_t* d_core_hamiltonian_matrix, real_t* d_fock_matrix, const int size);
+__global__ void cleanupHashTable_kernel(unsigned long long* d_hash_keys, real_t* d_hash_values, size_t hash_table_capacity, real_t threshold);
+__global__ void countNonEmptySlots_kernel(const unsigned long long* d_hash_keys, size_t hash_table_capacity, size_t* d_count);
+__global__ void collectNonEmptyIndices_kernel(const unsigned long long* d_hash_keys, size_t hash_table_capacity, size_t* d_indices, size_t* d_write_pos);
 
 } // namespace gansu::gpu

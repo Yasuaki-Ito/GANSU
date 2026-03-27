@@ -48,6 +48,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"charge", "0"},                            // int
         {"beta_to_alpha", "0"},                     // int
         {"eri_method", "stored"},                   // string
+        {"hash_fock_method", "compact"},              // string: compact, indexed, fullscan
         {"post_hf_method", "none"},                  // string
         {"auxiliary_gbsfilename", ""},              // string
         {"maxiter", "100"},                         // int

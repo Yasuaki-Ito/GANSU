@@ -342,18 +342,23 @@ protected:
 /**
  * @brief ERI_Hash class for the electron repulsion integrals (ERIs) using hash memory
  */
+enum class HashFockMethod { Compact, Indexed, Fullscan };
+
 class ERI_Hash: public ERI {
 public:
-    
+
     ERI_Hash(const HF& hf); ///< Constructor
-        
+
     ERI_Hash(const ERI_Hash&) = delete; ///< copy constructor is deleted
-    virtual ~ERI_Hash() = default; ///< destructor
-        
+    virtual ~ERI_Hash(); ///< destructor
+
     void precomputation() override;
 
     std::string get_algorithm_name() override { return "Hash"; } ///< Get the algorithm name
-    
+
+    void set_hash_fock_method(HashFockMethod m) { hash_fock_method_ = m; }
+    HashFockMethod get_hash_fock_method() const { return hash_fock_method_; }
+
     bool supports_post_hf_method(PostHFMethod method) const override {
         if( method == PostHFMethod::None // always supported
           ){
@@ -361,13 +366,26 @@ public:
         }
         return false;
     }
-    
+
 protected:
     const HF& hf_; ///< HF. This excludes MOs.
     const int num_basis_;
 
-    // ここにHash memoryを宣言
-    
+    // Compact COO storage (for Push-type Fock construction)
+    unsigned long long* d_coo_keys_;    ///< Compact canonical keys
+    real_t*             d_coo_values_;  ///< Compact ERI values
+    size_t              num_entries_;   ///< Number of unique ERI entries
+
+    // Hash table (kept for O(1) random access lookup, e.g. Post-HF)
+    unsigned long long* d_hash_keys_;   ///< Full hash table keys
+    real_t*             d_hash_values_; ///< Full hash table values
+    size_t              hash_capacity_mask_; ///< capacity - 1
+
+    // Indexed: non-empty slot indices (for Indexed method)
+    size_t*             d_nonzero_indices_; ///< Indices of non-empty slots
+    size_t              num_nonzero_;   ///< Number of non-empty slots
+
+    HashFockMethod      hash_fock_method_ = HashFockMethod::Compact;
 };
 
 

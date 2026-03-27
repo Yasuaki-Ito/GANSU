@@ -23,6 +23,8 @@
 #include "int2e_direct.hpp"
 #include "rys_eri_direct.hpp"
 #include "device_host_memory.hpp" // For tracked_gansu::tracked_cudaMalloc/tracked_cudaFree
+#include "gpu_kernels.hpp"
+#include "rys_eri.hpp"
 
 #include "gradients.hpp"
 #include "rys_hessian_g.hpp"
@@ -3157,39 +3159,190 @@ void computeSqrtOverlapDensitySqrtOverlapMatrix(
 
 
 void constructERIHash(
-    const std::vector<ShellTypeInfo>& shell_type_infos, 
+    const std::vector<ShellTypeInfo>& shell_type_infos,
     const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
-    const PrimitiveShell* d_primitive_shells, 
-    const real_t* d_boys_grid, 
-    const real_t* d_cgto_normalization_factors, 
-    // Hash memoryへのポインタ
+    const PrimitiveShell* d_primitive_shells,
+    const real_t* d_boys_grid,
+    const real_t* d_cgto_normalization_factors,
+    const real_t* d_schwarz_upper_bound_factors,
+    real_t schwarz_screening_threshold,
+    unsigned long long* d_hash_keys,
+    real_t* d_hash_values,
+    size_t hash_capacity_mask,
+    const int num_basis,
     const bool verbose)
 {
-    // ここにERIを計算してハッシュメモリに追加するコードを書く（GPUカーネルを呼ぶ）
-    //const int threads_per_block = 256; // the number of threads per block
-    // ...
-    // GPUカーネルはgpu_kernels.hppにプロトタイプ宣言、gpu_kernels.cuに実装を記述
-    //constructERIHash_kernel<<<1, threads_per_block>>>(shell_type_infos, shell_pair_type_infos, d_primitive_shells, d_cgto_normalization_factors, /* Hash memory へのポインタ, */ verbose);
+    const int threads_per_block = 256;
+    const int shell_type_count = shell_type_infos.size();
 
-    THROW_EXCEPTION("Not implemented yet.");
+    std::vector<std::tuple<int, int, int, int>> shell_quadruples;
+    for (int a = 0; a < shell_type_count; ++a)
+        for (int b = a; b < shell_type_count; ++b)
+            for (int c = 0; c < shell_type_count; ++c)
+                for (int d = c; d < shell_type_count; ++d)
+                    if (a < c || (a == c && b <= d))
+                        shell_quadruples.emplace_back(a, b, c, d);
 
+    const int num_kernels = shell_quadruples.size();
+    std::vector<cudaStream_t> streams(num_kernels);
+    for (int i = 0; i < num_kernels; ++i)
+        cudaStreamCreate(&streams[i]);
+
+    int stream_id = 0;
+    for (const auto& quadruple : shell_quadruples) {
+        int s0, s1, s2, s3;
+        std::tie(s0, s1, s2, s3) = quadruple;
+
+        const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+        const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+        const ShellTypeInfo shell_s2 = shell_type_infos[s2];
+        const ShellTypeInfo shell_s3 = shell_type_infos[s3];
+
+        const size_t num_bra = (s0 == s1) ? shell_s0.count * (shell_s0.count + 1) / 2 : shell_s0.count * shell_s1.count;
+        const size_t num_ket = (s2 == s3) ? shell_s2.count * (shell_s2.count + 1) / 2 : shell_s2.count * shell_s3.count;
+        const size_t num_braket = ((s0 == s2) && (s1 == s3)) ? num_bra * (num_bra + 1) / 2 : num_bra * num_ket;
+        const int num_blocks = (num_braket + threads_per_block - 1) / threads_per_block;
+
+        const size_t head_bra = shell_pair_type_infos[get_index_2to1_horizontal(s0, s1, shell_type_count)].start_index;
+        const size_t head_ket = shell_pair_type_infos[get_index_2to1_horizontal(s2, s3, shell_type_count)].start_index;
+
+        int a = s0, b = s1, c = s2, dd = s3;
+        if (a > b) std::swap(a, b);
+        if (c > dd) std::swap(c, dd);
+        if (a > c || (a == c && b > dd)) { std::swap(a, c); std::swap(b, dd); }
+
+#define HASH_KERNEL_ARGS \
+    d_hash_keys, d_hash_values, hash_capacity_mask, \
+    d_primitive_shells, d_cgto_normalization_factors, \
+    shell_s0, shell_s1, shell_s2, shell_s3, \
+    num_braket, schwarz_screening_threshold, d_schwarz_upper_bound_factors, \
+    num_basis, d_boys_grid, head_bra, head_ket, hash_capacity_mask
+
+        if      (a==0 && b==0 && c==0 && dd==0) ssss2e_hash<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(HASH_KERNEL_ARGS);
+        else if (a==0 && b==0 && c==0 && dd==1) sssp2e_hash<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(HASH_KERNEL_ARGS);
+        else if (a==0 && b==0 && c==1 && dd==1) sspp2e_hash<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(HASH_KERNEL_ARGS);
+        else if (a==0 && b==1 && c==0 && dd==1) spsp2e_hash<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(HASH_KERNEL_ARGS);
+        else if (a==0 && b==1 && c==1 && dd==1) sppp2e_hash<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(HASH_KERNEL_ARGS);
+        else if (a==1 && b==1 && c==1 && dd==1) pppp2e_hash<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(HASH_KERNEL_ARGS);
+        else RysERI_Hash<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(HASH_KERNEL_ARGS);
+
+#undef HASH_KERNEL_ARGS
+    }
+
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA error after Hash ERI kernels: " << cudaGetErrorString(err) << std::endl;
+    }
+    for (int i = 0; i < num_kernels; i++)
+        cudaStreamDestroy(streams[i]);
 }
+
+
+// constructERICOO is deprecated — use constructERIHash instead
 
 
 void computeFockMatrix_Hash_RHF(
     const real_t* d_density_matrix,
     const real_t* d_core_hamiltonian_matrix,
-    // Hash memoryへのポインタ
+    const unsigned long long* d_coo_keys,
+    const real_t* d_coo_values,
+    size_t num_entries,
     real_t* d_fock_matrix,
     const int num_basis,
     const int verbose)
 {
-    // ここにERIハッシュを使ってFock行列を計算するコードを書く
-    // 
-    // computeFockMatrix_Hash_RHF_kernel<<<1, 256>>>(d_density_matrix, d_core_hamiltonian_matrix, /* Hash memory へのポインタ */, d_fock_matrix, num_basis);
+    const int matrix_size = num_basis * num_basis;
+    const int threads_per_block = 256;
+    const int num_fock_replicas = 8;
 
+    // Allocate and zero Fock replicas
+    real_t* d_fock_replicas = nullptr;
+    gansu::tracked_cudaMalloc(&d_fock_replicas, matrix_size * num_fock_replicas * sizeof(real_t));
+    cudaMemset(d_fock_replicas, 0, matrix_size * num_fock_replicas * sizeof(real_t));
 
-    THROW_EXCEPTION("Not implemented yet.");
+    // Push ERI contributions into replicas
+    const int num_blocks = (num_entries + threads_per_block - 1) / threads_per_block;
+    computeFockMatrix_COO_Push_RHF_kernel<<<num_blocks, threads_per_block>>>(
+        d_density_matrix, d_coo_keys, d_coo_values, num_entries,
+        d_fock_replicas, num_basis, num_fock_replicas);
+
+    // Sum replicas + add core Hamiltonian into final Fock matrix
+    cudaMemset(d_fock_matrix, 0, matrix_size * sizeof(real_t));
+    const int num_utm = num_basis * (num_basis + 1) / 2;
+    const int num_blocks_compose = (num_utm + threads_per_block - 1) / threads_per_block;
+    composeFockMatrix<<<num_blocks_compose, threads_per_block>>>(
+        d_fock_matrix, d_fock_replicas, d_core_hamiltonian_matrix,
+        num_basis, num_fock_replicas, true);
+
+    gansu::tracked_cudaFree(d_fock_replicas);
+}
+
+void computeFockMatrix_Hash_Indexed_RHF(
+    const real_t* d_density_matrix,
+    const real_t* d_core_hamiltonian_matrix,
+    const unsigned long long* d_hash_keys,
+    const real_t* d_hash_values,
+    const size_t* d_nonzero_indices,
+    size_t num_nonzero,
+    real_t* d_fock_matrix,
+    const int num_basis,
+    const int verbose)
+{
+    const int matrix_size = num_basis * num_basis;
+    const int threads_per_block = 256;
+    const int num_fock_replicas = 8;
+
+    real_t* d_fock_replicas = nullptr;
+    gansu::tracked_cudaMalloc(&d_fock_replicas, matrix_size * num_fock_replicas * sizeof(real_t));
+    cudaMemset(d_fock_replicas, 0, matrix_size * num_fock_replicas * sizeof(real_t));
+
+    const int num_blocks = (num_nonzero + threads_per_block - 1) / threads_per_block;
+    computeFockMatrix_Hash_Push_Indexed_RHF_kernel<<<num_blocks, threads_per_block>>>(
+        d_density_matrix, d_hash_keys, d_hash_values, d_nonzero_indices, num_nonzero,
+        d_fock_replicas, num_basis, num_fock_replicas);
+
+    cudaMemset(d_fock_matrix, 0, matrix_size * sizeof(real_t));
+    const int num_utm = num_basis * (num_basis + 1) / 2;
+    const int num_blocks_compose = (num_utm + threads_per_block - 1) / threads_per_block;
+    composeFockMatrix<<<num_blocks_compose, threads_per_block>>>(
+        d_fock_matrix, d_fock_replicas, d_core_hamiltonian_matrix,
+        num_basis, num_fock_replicas, true);
+
+    gansu::tracked_cudaFree(d_fock_replicas);
+}
+
+void computeFockMatrix_Hash_FullScan_RHF(
+    const real_t* d_density_matrix,
+    const real_t* d_core_hamiltonian_matrix,
+    const unsigned long long* d_hash_keys,
+    const real_t* d_hash_values,
+    size_t hash_capacity,
+    real_t* d_fock_matrix,
+    const int num_basis,
+    const int verbose)
+{
+    const int matrix_size = num_basis * num_basis;
+    const int threads_per_block = 256;
+    const int num_fock_replicas = 8;
+
+    real_t* d_fock_replicas = nullptr;
+    gansu::tracked_cudaMalloc(&d_fock_replicas, matrix_size * num_fock_replicas * sizeof(real_t));
+    cudaMemset(d_fock_replicas, 0, matrix_size * num_fock_replicas * sizeof(real_t));
+
+    const size_t num_blocks = (hash_capacity + threads_per_block - 1) / threads_per_block;
+    computeFockMatrix_Hash_Push_RHF_kernel<<<num_blocks, threads_per_block>>>(
+        d_density_matrix, d_hash_keys, d_hash_values, hash_capacity,
+        d_fock_replicas, num_basis, num_fock_replicas);
+
+    cudaMemset(d_fock_matrix, 0, matrix_size * sizeof(real_t));
+    const int num_utm = num_basis * (num_basis + 1) / 2;
+    const int num_blocks_compose = (num_utm + threads_per_block - 1) / threads_per_block;
+    composeFockMatrix<<<num_blocks_compose, threads_per_block>>>(
+        d_fock_matrix, d_fock_replicas, d_core_hamiltonian_matrix,
+        num_basis, num_fock_replicas, true);
+
+    gansu::tracked_cudaFree(d_fock_replicas);
 }
 
 

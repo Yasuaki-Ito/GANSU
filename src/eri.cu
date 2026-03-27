@@ -15,8 +15,22 @@
 
 #include "eri.hpp"
 #include "utils_cuda.hpp"
+#include "rys_eri.hpp"
+#include "gpu_kernels.hpp"
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
+#include <thrust/copy.h>
+#include <thrust/count.h>
+#include <thrust/reduce.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
+
+struct HashKeyIsNonEmpty {
+    __host__ __device__ bool operator()(unsigned long long key) const {
+        return key != 0xFFFFFFFFFFFFFFFFULL;
+    }
+};
 
 namespace gansu{
 
@@ -385,9 +399,24 @@ void ERI_Direct::precomputation()
 
 ERI_Hash::ERI_Hash(const HF& hf):
     hf_(hf),
-    num_basis_(hf.get_num_basis())
+    num_basis_(hf.get_num_basis()),
+    d_coo_keys_(nullptr),
+    d_coo_values_(nullptr),
+    num_entries_(0),
+    d_hash_keys_(nullptr),
+    d_hash_values_(nullptr),
+    hash_capacity_mask_(0),
+    d_nonzero_indices_(nullptr),
+    num_nonzero_(0)
 {
-    // ここでHash memoryの初期化をおこなう
+}
+
+ERI_Hash::~ERI_Hash() {
+    if (d_coo_keys_) tracked_cudaFree(d_coo_keys_);
+    if (d_coo_values_) tracked_cudaFree(d_coo_values_);
+    if (d_hash_keys_) tracked_cudaFree(d_hash_keys_);
+    if (d_hash_values_) tracked_cudaFree(d_hash_values_);
+    if (d_nonzero_indices_) tracked_cudaFree(d_nonzero_indices_);
 }
 
 void ERI_Hash::precomputation() {
@@ -396,17 +425,104 @@ void ERI_Hash::precomputation() {
     const DeviceHostMemory<PrimitiveShell>& primitive_shells = hf_.get_primitive_shells();
     const DeviceHostMemory<real_t>& cgto_normalization_factors = hf_.get_cgto_normalization_factors();
     const DeviceHostMemory<real_t>& boys_grid = hf_.get_boys_grid();
+    const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
     const int verbose = hf_.get_verbose();
 
+    // Compute Schwarz upper bounds
+    DeviceHostMemory<real_t> schwarz_upper_bound_factors(hf_.get_num_primitive_shell_pairs());
+    gpu::computeSchwarzUpperBounds(
+        shell_type_infos, shell_pair_type_infos,
+        primitive_shells.device_ptr(), boys_grid.device_ptr(),
+        cgto_normalization_factors.device_ptr(),
+        schwarz_upper_bound_factors.device_ptr(), verbose);
+
+    // === Phase 1: Allocate hash table ===
+    const size_t N = num_basis_;
+    const size_t num_pairs = N * (N + 1) / 2;
+    size_t estimated_entries = num_pairs * (num_pairs + 1) / 2;
+
+    // Hash table capacity: next power of 2, at least 2x estimated entries (load factor ~0.5)
+    size_t hash_capacity = 1;
+    while (hash_capacity < estimated_entries * 2) hash_capacity <<= 1;
+
+    // Cap by GPU memory
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    const size_t bytes_per_entry = sizeof(unsigned long long) + sizeof(real_t);
+    const size_t mem_cap_entries = (free_mem * 3 / 4) / bytes_per_entry;
+    size_t mem_cap_pow2 = 1;
+    while (mem_cap_pow2 * 2 <= mem_cap_entries) mem_cap_pow2 <<= 1;
+    if (hash_capacity > mem_cap_pow2) hash_capacity = mem_cap_pow2;
+
+    const size_t hash_capacity_mask = hash_capacity - 1;
+
+    // Allocate hash table
+    unsigned long long* d_hash_keys = nullptr;
+    real_t* d_hash_values = nullptr;
+    tracked_cudaMalloc(&d_hash_keys, hash_capacity * sizeof(unsigned long long));
+    tracked_cudaMalloc(&d_hash_values, hash_capacity * sizeof(real_t));
+    cudaMemset(d_hash_keys, 0xFF, hash_capacity * sizeof(unsigned long long));
+    cudaMemset(d_hash_values, 0, hash_capacity * sizeof(real_t));
+
+    if (verbose) {
+        std::cout << "ERI Hash: capacity = " << hash_capacity << " entries ("
+                  << (hash_capacity * bytes_per_entry) / (1024*1024) << " MB)" << std::endl;
+    }
+
+    // === Phase 2: Compute ERIs into hash table ===
     gpu::constructERIHash(
-        shell_type_infos,
-        shell_pair_type_infos,
-        primitive_shells.device_ptr(), 
-        boys_grid.device_ptr(), 
-        cgto_normalization_factors.device_ptr(), 
-        // Hash memoryのポインタを渡す
-        verbose
-    );
+        shell_type_infos, shell_pair_type_infos,
+        primitive_shells.device_ptr(), boys_grid.device_ptr(),
+        cgto_normalization_factors.device_ptr(),
+        schwarz_upper_bound_factors.device_ptr(), schwarz_screening_threshold,
+        d_hash_keys, d_hash_values, hash_capacity_mask,
+        num_basis_, verbose);
+
+    // === Phase 3: Cleanup — remove near-zero entries ===
+    const real_t cleanup_threshold = 1e-15;
+    {
+        const int threads_per_block = 256;
+        const int num_blocks = (hash_capacity + threads_per_block - 1) / threads_per_block;
+        gpu::cleanupHashTable_kernel<<<num_blocks, threads_per_block>>>(
+            d_hash_keys, d_hash_values, hash_capacity, cleanup_threshold);
+        cudaDeviceSynchronize();
+    }
+
+    // === Phase 4: Collect non-empty entries (method-dependent) ===
+    thrust::device_ptr<unsigned long long> keys_ptr(d_hash_keys);
+    size_t num_nonzero = thrust::count_if(keys_ptr, keys_ptr + hash_capacity, HashKeyIsNonEmpty());
+
+    // Keep hash table
+    d_hash_keys_ = d_hash_keys;
+    d_hash_values_ = d_hash_values;
+    hash_capacity_mask_ = hash_capacity_mask;
+
+    if (hash_fock_method_ == HashFockMethod::Compact) {
+        tracked_cudaMalloc(&d_coo_keys_, num_nonzero * sizeof(unsigned long long));
+        tracked_cudaMalloc(&d_coo_values_, num_nonzero * sizeof(real_t));
+        {
+            thrust::device_ptr<real_t> vals_ptr(d_hash_values);
+            auto zip_begin = thrust::make_zip_iterator(thrust::make_tuple(keys_ptr, vals_ptr));
+            auto zip_end = thrust::make_zip_iterator(thrust::make_tuple(keys_ptr + hash_capacity, vals_ptr + hash_capacity));
+            auto out_zip = thrust::make_zip_iterator(thrust::make_tuple(
+                thrust::device_ptr<unsigned long long>(d_coo_keys_),
+                thrust::device_ptr<real_t>(d_coo_values_)));
+            thrust::copy_if(zip_begin, zip_end, keys_ptr, out_zip, HashKeyIsNonEmpty());
+        }
+        num_entries_ = num_nonzero;
+    } else if (hash_fock_method_ == HashFockMethod::Indexed) {
+        tracked_cudaMalloc(&d_nonzero_indices_, num_nonzero * sizeof(size_t));
+        thrust::counting_iterator<size_t> count_begin(0);
+        thrust::device_ptr<size_t> out_indices(d_nonzero_indices_);
+        thrust::copy_if(count_begin, count_begin + hash_capacity, keys_ptr, out_indices, HashKeyIsNonEmpty());
+        num_nonzero_ = num_nonzero;
+    }
+    // Fullscan: no additional data structure needed
+
+    if (verbose) {
+        std::cout << "ERI Hash: " << num_nonzero << " unique entries after cleanup ("
+                  << (num_nonzero * bytes_per_entry) / (1024*1024) << " MB)" << std::endl;
+    }
 }
 
 

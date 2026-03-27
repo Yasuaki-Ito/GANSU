@@ -824,14 +824,27 @@ public:
         DeviceHostMatrix<real_t>& fock_matrix = rhf_.get_fock_matrix();
         const int verbose = rhf_.get_verbose();
 
-        gpu::computeFockMatrix_Hash_RHF(
-            density_matrix.device_ptr(),
-            core_hamiltonian_matrix.device_ptr(),
-            // Hash memoryへのポインタ
-            fock_matrix.device_ptr(),
-            num_basis_,
-            verbose
-        );
+        if (hash_fock_method_ == HashFockMethod::Compact) {
+            gpu::computeFockMatrix_Hash_RHF(
+                density_matrix.device_ptr(),
+                core_hamiltonian_matrix.device_ptr(),
+                d_coo_keys_, d_coo_values_, num_entries_,
+                fock_matrix.device_ptr(), num_basis_, verbose);
+        } else if (hash_fock_method_ == HashFockMethod::Indexed) {
+            gpu::computeFockMatrix_Hash_Indexed_RHF(
+                density_matrix.device_ptr(),
+                core_hamiltonian_matrix.device_ptr(),
+                d_hash_keys_, d_hash_values_,
+                d_nonzero_indices_, num_nonzero_,
+                fock_matrix.device_ptr(), num_basis_, verbose);
+        } else {
+            gpu::computeFockMatrix_Hash_FullScan_RHF(
+                density_matrix.device_ptr(),
+                core_hamiltonian_matrix.device_ptr(),
+                d_hash_keys_, d_hash_values_,
+                hash_capacity_mask_ + 1,
+                fock_matrix.device_ptr(), num_basis_, verbose);
+        }
 
         if(verbose){
             // copy the fock matrix to the host memory

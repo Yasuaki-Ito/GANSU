@@ -438,4 +438,265 @@ void RysERI(
     }
 }
 
+// ============================================================
+//  RysERI_Hash kernel — Same as RysERI but writes to hash table
+//  instead of dense array. Uses canonical key + hash_insert.
+// ============================================================
+__global__
+void RysERI_Hash(
+    unsigned long long* hash_keys,
+    double* hash_values,
+    size_t hash_capacity_mask,
+    const PrimitiveShell* g_shell,
+    const real_t* g_cgto_normalization_factors,
+    const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1,
+    const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3,
+    const size_t num_threads,
+    const real_t schwarz_screening_threshold,
+    const double* g_upper_bound_factors,
+    const int num_basis,
+    const double* g_boys_grid,
+    const size_t head_bra, const size_t head_ket,
+    size_t capacity_mask_unused)
+{
+    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= num_threads) return;
+
+    int ket_size;
+    if (shell_s2.start_index == shell_s3.start_index) {
+        ket_size = (shell_s2.count * (shell_s2.count + 1)) / 2;
+    } else {
+        ket_size = shell_s2.count * shell_s3.count;
+    }
+    const size_t2 abcd = index1to2(id,
+        (shell_s0.start_index == shell_s2.start_index &&
+         shell_s1.start_index == shell_s3.start_index), ket_size);
+    const size_t2 ab = index1to2(abcd.x,
+        shell_s0.start_index == shell_s1.start_index, shell_s1.count);
+    const size_t2 cd = index1to2(abcd.y,
+        shell_s2.start_index == shell_s3.start_index, shell_s3.count);
+
+    if (g_upper_bound_factors[head_bra + abcd.x] *
+        g_upper_bound_factors[head_ket + abcd.y] < schwarz_screening_threshold) {
+        return;
+    }
+
+    const size_t pidx_a = ab.x + shell_s0.start_index;
+    const size_t pidx_b = ab.y + shell_s1.start_index;
+    const size_t pidx_c = cd.x + shell_s2.start_index;
+    const size_t pidx_d = cd.y + shell_s3.start_index;
+
+    const PrimitiveShell sa = g_shell[pidx_a];
+    const PrimitiveShell sb = g_shell[pidx_b];
+    const PrimitiveShell sc = g_shell[pidx_c];
+    const PrimitiveShell sd = g_shell[pidx_d];
+
+    const size_t base_a = sa.basis_index;
+    const size_t base_b = sb.basis_index;
+    const size_t base_c = sc.basis_index;
+    const size_t base_d = sd.basis_index;
+
+    const bool sym_bra    = (pidx_a == pidx_b);
+    const bool sym_ket    = (pidx_c == pidx_d);
+    const bool sym_braket = (pidx_a == pidx_c && pidx_b == pidx_d);
+
+    const double alpha = sa.exponent, beta = sb.exponent;
+    const double gamma = sc.exponent, delta_exp = sd.exponent;
+    const double p = alpha + beta;
+    const double q = gamma + delta_exp;
+    const double rho = p * q / (p + q);
+
+    const double Ax = sa.coordinate.x, Ay = sa.coordinate.y, Az = sa.coordinate.z;
+    const double Bx = sb.coordinate.x, By = sb.coordinate.y, Bz = sb.coordinate.z;
+    const double Cx = sc.coordinate.x, Cy = sc.coordinate.y, Cz = sc.coordinate.z;
+    const double Dx = sd.coordinate.x, Dy = sd.coordinate.y, Dz = sd.coordinate.z;
+
+    const double Px = (alpha * Ax + beta * Bx) / p;
+    const double Py = (alpha * Ay + beta * By) / p;
+    const double Pz = (alpha * Az + beta * Bz) / p;
+    const double Qx = (gamma * Cx + delta_exp * Dx) / q;
+    const double Qy = (gamma * Cy + delta_exp * Dy) / q;
+    const double Qz = (gamma * Cz + delta_exp * Dz) / q;
+
+    const double PQx = Px - Qx, PQy = Py - Qy, PQz = Pz - Qz;
+    const double T = rho * (PQx * PQx + PQy * PQy + PQz * PQz);
+
+    const int la = sa.shell_type, lb = sb.shell_type;
+    const int lc = sc.shell_type, ld = sd.shell_type;
+    const int L = la + lb + lc + ld;
+
+    const double AB2 = (Ax-Bx)*(Ax-Bx) + (Ay-By)*(Ay-By) + (Az-Bz)*(Az-Bz);
+    const double CD2 = (Cx-Dx)*(Cx-Dx) + (Cy-Dy)*(Cy-Dy) + (Cz-Dz)*(Cz-Dz);
+    const double prefactor = 2.0 * M_PI_2_5 / (p * q * sqrt(p + q))
+                           * exp(-alpha * beta / p * AB2 - gamma * delta_exp / q * CD2)
+                           * sa.coefficient * sb.coefficient * sc.coefficient * sd.coefficient;
+
+    const int N = L / 2 + 1;
+    double rys_roots[9], rys_weights[9];
+    computeRysRootsAndWeights(N, T, g_boys_grid, rys_roots, rys_weights);
+
+    const int a_max = la + lb;
+    const int c_max_val = lc + ld;
+    const int cs = c_max_val + 1;
+    const int na = comb_max(la), nb = comb_max(lb);
+    const int nc = comb_max(lc), nd = comb_max(ld);
+    const int n_components = na * nb * nc * nd;
+
+    const double ABx = Ax - Bx, ABy = Ay - By, ABz = Az - Bz;
+    const double CDx = Cx - Dx, CDy = Cy - Dy, CDz = Cz - Dz;
+
+    double eri_buf[1296];
+    const bool use_buffer = (n_components <= 1296);
+
+    if (use_buffer) {
+        for (int i = 0; i < n_components; i++) eri_buf[i] = 0.0;
+    }
+
+    double Ix_vrr[81], Iy_vrr[81], Iz_vrr[81];
+
+    for (int n = 0; n < N; n++) {
+        const double t2 = rys_roots[n];
+        const double wn = rys_weights[n];
+        const double u = rho * t2;
+        const double u_over_p = u / p;
+        const double u_over_q = u / q;
+
+        const double B00 = t2 / (2.0 * (p + q));
+        const double B10 = (1.0 - u_over_p) / (2.0 * p);
+        const double B01 = (1.0 - u_over_q) / (2.0 * q);
+
+        const double C00x = (Px - Ax) + u_over_p * (Qx - Px);
+        const double C00y = (Py - Ay) + u_over_p * (Qy - Py);
+        const double C00z = (Pz - Az) + u_over_p * (Qz - Pz);
+        const double D00x = (Qx - Cx) + u_over_q * (Px - Qx);
+        const double D00y = (Qy - Cy) + u_over_q * (Py - Qy);
+        const double D00z = (Qz - Cz) + u_over_q * (Pz - Qz);
+
+        vrr_1d(a_max, c_max_val, C00x, D00x, B10, B01, B00, Ix_vrr);
+        vrr_1d(a_max, c_max_val, C00y, D00y, B10, B01, B00, Iy_vrr);
+        vrr_1d(a_max, c_max_val, C00z, D00z, B10, B01, B00, Iz_vrr);
+
+        for (int ia = 0; ia < na; ia++) {
+            const int ax = loop_to_ang[la][ia][0];
+            const int ay = loop_to_ang[la][ia][1];
+            const int az = loop_to_ang[la][ia][2];
+
+            for (int ib = 0; ib < nb; ib++) {
+                const int bx = loop_to_ang[lb][ib][0];
+                const int by = loop_to_ang[lb][ib][1];
+                const int bz = loop_to_ang[lb][ib][2];
+
+                double bra_x[9];
+                for (int ct = 0; ct <= c_max_val; ct++) {
+                    double val = 0.0;
+                    int binom = 1;
+                    double AB_pow = 1.0;
+                    for (int k = 0; k <= bx; k++) {
+                        val += binom * AB_pow * Ix_vrr[(ax + bx - k) * cs + ct];
+                        if (k < bx) { AB_pow *= ABx; binom = binom * (bx - k) / (k + 1); }
+                    }
+                    bra_x[ct] = val;
+                }
+
+                double bra_y[9];
+                for (int ct = 0; ct <= c_max_val; ct++) {
+                    double val = 0.0;
+                    int binom = 1;
+                    double AB_pow = 1.0;
+                    for (int k = 0; k <= by; k++) {
+                        val += binom * AB_pow * Iy_vrr[(ay + by - k) * cs + ct];
+                        if (k < by) { AB_pow *= ABy; binom = binom * (by - k) / (k + 1); }
+                    }
+                    bra_y[ct] = val;
+                }
+
+                double bra_z[9];
+                for (int ct = 0; ct <= c_max_val; ct++) {
+                    double val = 0.0;
+                    int binom = 1;
+                    double AB_pow = 1.0;
+                    for (int k = 0; k <= bz; k++) {
+                        val += binom * AB_pow * Iz_vrr[(az + bz - k) * cs + ct];
+                        if (k < bz) { AB_pow *= ABz; binom = binom * (bz - k) / (k + 1); }
+                    }
+                    bra_z[ct] = val;
+                }
+
+                for (int ic = 0; ic < nc; ic++) {
+                    const int cx_c = loop_to_ang[lc][ic][0];
+                    const int cy_c = loop_to_ang[lc][ic][1];
+                    const int cz_c = loop_to_ang[lc][ic][2];
+
+                    for (int id_c = 0; id_c < nd; id_c++) {
+                        const int dx_d = loop_to_ang[ld][id_c][0];
+                        const int dy_d = loop_to_ang[ld][id_c][1];
+                        const int dz_d = loop_to_ang[ld][id_c][2];
+
+                        double Ix_val = trr_ket_eval(cx_c, dx_d, CDx, &bra_x[cx_c]);
+                        double Iy_val = trr_ket_eval(cy_c, dy_d, CDy, &bra_y[cy_c]);
+                        double Iz_val = trr_ket_eval(cz_c, dz_d, CDz, &bra_z[cz_c]);
+
+                        double contrib = wn * Ix_val * Iy_val * Iz_val;
+
+                        if (use_buffer) {
+                            eri_buf[((ia * nb + ib) * nc + ic) * nd + id_c] += contrib;
+                        } else {
+                            double Norm = calcNorm(alpha, ax, ay, az)
+                                        * calcNorm(beta, bx, by, bz)
+                                        * calcNorm(gamma, cx_c, cy_c, cz_c)
+                                        * calcNorm(delta_exp, dx_d, dy_d, dz_d);
+                            addToResult_hash(
+                                Norm * prefactor * contrib, hash_keys, hash_values,
+                                hash_capacity_mask,
+                                base_a + ia, base_b + ib, base_c + ic, base_d + id_c,
+                                num_basis, sym_bra, sym_ket, sym_braket,
+                                g_cgto_normalization_factors);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (use_buffer) {
+        for (int ia = 0; ia < na; ia++) {
+            const int ax = loop_to_ang[la][ia][0];
+            const int ay = loop_to_ang[la][ia][1];
+            const int az = loop_to_ang[la][ia][2];
+            const double Norm_A = calcNorm(alpha, ax, ay, az);
+
+            for (int ib = 0; ib < nb; ib++) {
+                const int bx = loop_to_ang[lb][ib][0];
+                const int by = loop_to_ang[lb][ib][1];
+                const int bz = loop_to_ang[lb][ib][2];
+                const double Norm_B = calcNorm(beta, bx, by, bz);
+
+                for (int ic = 0; ic < nc; ic++) {
+                    const int cx_c = loop_to_ang[lc][ic][0];
+                    const int cy_c = loop_to_ang[lc][ic][1];
+                    const int cz_c = loop_to_ang[lc][ic][2];
+                    const double Norm_C = calcNorm(gamma, cx_c, cy_c, cz_c);
+
+                    for (int id_c = 0; id_c < nd; id_c++) {
+                        const int dx_d = loop_to_ang[ld][id_c][0];
+                        const int dy_d = loop_to_ang[ld][id_c][1];
+                        const int dz_d = loop_to_ang[ld][id_c][2];
+                        const double Norm_D = calcNorm(delta_exp, dx_d, dy_d, dz_d);
+
+                        double val = eri_buf[((ia * nb + ib) * nc + ic) * nd + id_c];
+                        if (val != 0.0) {
+                            addToResult_hash(
+                                Norm_A * Norm_B * Norm_C * Norm_D * prefactor * val,
+                                hash_keys, hash_values, hash_capacity_mask,
+                                base_a + ia, base_b + ib, base_c + ic, base_d + id_c,
+                                num_basis, sym_bra, sym_ket, sym_braket,
+                                g_cgto_normalization_factors);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 } // namespace gansu::gpu

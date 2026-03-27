@@ -36,6 +36,35 @@ namespace gansu{
 
 
 /**
+ * @brief Global (type-independent) GPU memory tracker.
+ *
+ * CudaMemoryManager<T> tracks memory per type T, so allocations of different types
+ * (e.g., unsigned long long vs double) are counted separately. This global tracker
+ * aggregates all allocations regardless of type to report correct total/peak memory.
+ */
+struct GlobalGpuMemoryTracker {
+    inline static size_t current_bytes_ = 0;
+    inline static size_t total_bytes_ = 0;
+    inline static size_t peak_bytes_ = 0;
+    inline static std::mutex mutex_;
+
+    static void track_allocation(size_t bytes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        current_bytes_ += bytes;
+        total_bytes_ += bytes;
+        if (current_bytes_ > peak_bytes_) peak_bytes_ = current_bytes_;
+    }
+    static void track_deallocation(size_t bytes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (current_bytes_ >= bytes) current_bytes_ -= bytes;
+    }
+    static size_t get_current() { std::lock_guard<std::mutex> lock(mutex_); return current_bytes_; }
+    static size_t get_peak() { std::lock_guard<std::mutex> lock(mutex_); return peak_bytes_; }
+    static size_t get_total() { std::lock_guard<std::mutex> lock(mutex_); return total_bytes_; }
+};
+
+
+/**
  * @brief Base class for managing CUDA memory.
  *
  * This class provides a unified interface for managing CUDA device and host memory.
@@ -143,12 +172,11 @@ public:
      * Prints current, total, and peak device memory usage.
      */
     static void report_memory_statistics() {
-        std::lock_guard<std::mutex> lock(memory_stats_mutex_);
         std::cout << std::endl;
         std::cout << "[Device Memory Statistics]" << std::endl;
-        std::cout << "Current allocated: " << format_bytes(current_allocated_bytes_) << std::endl;
-        std::cout << "Total allocated: " << format_bytes(total_allocated_bytes_) << std::endl;
-        std::cout << "Peak usage: " << format_bytes(peak_allocated_bytes_) << std::endl;
+        std::cout << "Current allocated: " << format_bytes(GlobalGpuMemoryTracker::get_current()) << std::endl;
+        std::cout << "Total allocated: " << format_bytes(GlobalGpuMemoryTracker::get_total()) << std::endl;
+        std::cout << "Peak usage: " << format_bytes(GlobalGpuMemoryTracker::get_peak()) << std::endl;
     }
 
     /**
@@ -186,8 +214,7 @@ public:
      * @return Peak allocated bytes.
      */
     static size_t get_peak_allocated_bytes() {
-        std::lock_guard<std::mutex> lock(memory_stats_mutex_);
-        return peak_allocated_bytes_;
+        return GlobalGpuMemoryTracker::get_peak();
     }
 
     /**
@@ -201,6 +228,7 @@ public:
         if (current_allocated_bytes_ > peak_allocated_bytes_) {
             peak_allocated_bytes_ = current_allocated_bytes_;
         }
+        GlobalGpuMemoryTracker::track_allocation(bytes);
     }
 
     /**
@@ -212,6 +240,7 @@ public:
         if (current_allocated_bytes_ >= bytes) {
             current_allocated_bytes_ -= bytes;
         }
+        GlobalGpuMemoryTracker::track_deallocation(bytes);
     }
 
     /**
@@ -745,12 +774,12 @@ inline cudaError_t tracked_cudaMalloc(T** ptr, size_t size) {
         CudaMemoryManager<T>::track_allocation(size);
     } else {
         // Print detailed error message and throw exception to prevent use of null pointer
-        size_t current_mem = CudaMemoryManager<T>::get_current_allocated_bytes();
+        size_t current_mem = GlobalGpuMemoryTracker::get_current();
         std::ostringstream oss;
         oss << "tracked_cudaMalloc failed: " << cudaGetErrorString(err) << "\n"
             << "  Attempted to allocate: " << CudaMemoryManager<T>::format_bytes(size) << "\n"
-            << "  Current allocated:     " << CudaMemoryManager<T>::format_bytes(current_mem) << "\n"
-            << "  Total would be:        " << CudaMemoryManager<T>::format_bytes(current_mem + size);
+            << "  Current allocated (global): " << CudaMemoryManager<T>::format_bytes(current_mem) << "\n"
+            << "  Total would be:             " << CudaMemoryManager<T>::format_bytes(current_mem + size);
         throw std::runtime_error(oss.str());
     }
 
@@ -787,7 +816,7 @@ inline cudaError_t tracked_cudaFree(void* ptr) {
 
     // Update statistics if free was successful and size was tracked
     if (err == cudaSuccess && size > 0) {
-        CudaMemoryManager<double>::track_deallocation(size);
+        GlobalGpuMemoryTracker::track_deallocation(size);
     }
 
     return err;
@@ -820,11 +849,11 @@ inline cudaError_t tracked_cudaMallocAsync(T** ptr, size_t size, cudaStream_t st
         CudaMemoryManager<T>::track_allocation(size);
     } else {
         // Print detailed error message with current memory statistics
-        size_t current_mem = CudaMemoryManager<T>::get_current_allocated_bytes();
+        size_t current_mem = GlobalGpuMemoryTracker::get_current();
         std::cerr << "tracked_cudaMallocAsync failed: " << cudaGetErrorString(err) << "\n"
                   << "  Attempted to allocate: " << CudaMemoryManager<T>::format_bytes(size) << "\n"
-                  << "  Current allocated:     " << CudaMemoryManager<T>::format_bytes(current_mem) << "\n"
-                  << "  Total would be:        " << CudaMemoryManager<T>::format_bytes(current_mem + size) << std::endl;
+                  << "  Current allocated (global): " << CudaMemoryManager<T>::format_bytes(current_mem) << "\n"
+                  << "  Total would be:             " << CudaMemoryManager<T>::format_bytes(current_mem + size) << std::endl;
     }
 
     return err;
@@ -861,7 +890,7 @@ inline cudaError_t tracked_cudaFreeAsync(void* ptr, cudaStream_t stream) {
 
     // Update statistics if free was successful and size was tracked
     if (err == cudaSuccess && size > 0) {
-        CudaMemoryManager<double>::track_deallocation(size);
+        GlobalGpuMemoryTracker::track_deallocation(size);
     }
 
     return err;
