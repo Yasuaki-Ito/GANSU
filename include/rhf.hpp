@@ -64,6 +64,7 @@ public:
     void update_fock_matrix() override;
     void reset_convergence() override;
     std::vector<double> compute_Energy_Gradient() override;
+    std::vector<double> compute_Energy_Hessian() override;
 
     real_t get_energy() const override { return energy_; }
     real_t get_total_spin() override { return 0.0; } // always 0 for RHF

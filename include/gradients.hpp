@@ -287,6 +287,12 @@ inline compute_basis_deriv_repulsion_uhf get_compute_gradients_repulsion_uhf() {
 }
 
 
+// Hessian kernels (1-electron)
+__global__ void compute_hessian_overlap(double* g_hessian, const real_t* g_W_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const int num_basis, const int num_atoms, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, const size_t num_threads);
+__global__ void compute_hessian_kinetic(double* g_hessian, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const int num_basis, const int num_atoms, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, const size_t num_threads);
+__global__ void compute_hessian_nuclear_attraction(double* g_hessian, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atoms, const int num_basis, const int num_atoms, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, const size_t num_threads, const double* g_boys_grid);
+__global__ void compute_hessian_nuclear_repulsion(double* g_hessian, const Atom* g_atoms, const int num_atoms);
+
 } // namespace gansu::gpu
 
 #endif

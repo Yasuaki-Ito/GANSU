@@ -18,13 +18,14 @@
  */
 
 #include "rhf.hpp"
-
+#include "cphf_solver.hpp"
+#include <cassert>
+#include "ao2mo.cuh"
 
 #include <limits> // numeric_limits<double>::max();
 #include <iomanip> // std::setprecision
 
 #include "utils.hpp" // THROW_EXCEPTION
-
 namespace gansu{
 
 
@@ -354,8 +355,397 @@ void RHF::export_density_matrix(real_t* density_matrix_a, real_t* density_martix
 
 
 /**
+ * @brief Compute the analytical Hessian (skeleton + CPHF response)
+ */
+std::vector<double> RHF::compute_Energy_Hessian() {
+    PROFILE_FUNCTION();
+
+    int num_atoms_val = static_cast<int>(atoms.size());
+    int ndim = 3 * num_atoms_val;
+
+    atoms.toHost();
+    std::vector<double> orig(3 * num_atoms_val);
+    for (int i = 0; i < num_atoms_val; i++) {
+        orig[3*i]   = atoms[i].coordinate.x;
+        orig[3*i+1] = atoms[i].coordinate.y;
+        orig[3*i+2] = atoms[i].coordinate.z;
+    }
+
+    // --- Skeleton Hessian ---
+    if (verbose) std::cout << "  Computing skeleton Hessian..." << std::endl;
+    auto skel_hessian = gpu::computeSkeletonHessian_RHF(
+        shell_type_infos,
+        shell_pair_type_infos,
+        atoms.device_ptr(),
+        density_matrix.device_ptr(),
+        coefficient_matrix.device_ptr(),
+        orbital_energies.device_ptr(),
+        primitive_shells.device_ptr(),
+        boys_grid.device_ptr(),
+        cgto_normalization_factors.device_ptr(),
+        static_cast<int>(atoms.size()),
+        num_basis,
+        num_electrons,
+        verbose
+    );
+
+    // --- CPHF Response Hessian ---
+    if (verbose) std::cout << "  Computing CPHF response Hessian..." << std::endl;
+
+    const int nao = num_basis;
+    const int nocc = num_electrons / 2;
+    const int nvir = nao - nocc;
+    const int nmo = nao;
+    const int n_pert = ndim;
+
+    // Save converged C, ε, D
+    std::vector<double> h_C(nao * nao), h_eps(nao), h_D(nao * nao);
+    cudaMemcpy(h_C.data(), coefficient_matrix.device_ptr(), nao * nao * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_eps.data(), orbital_energies.device_ptr(), nao * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_D.data(), density_matrix.device_ptr(), nao * nao * sizeof(double), cudaMemcpyDeviceToHost);
+
+    // --- Step 1: Compute h1ao and s1ao via finite difference ---
+    // h1ao[pert] = dF/dR at fixed D, s1ao[pert] = dS/dR
+    if (verbose) std::cout << "  Step 1: Computing Fock/overlap derivatives (finite difference)..." << std::endl;
+
+    std::vector<std::vector<double>> h1ao(n_pert, std::vector<double>(nao * nao));
+    std::vector<std::vector<double>> s1ao(n_pert, std::vector<double>(nao * nao));
+
+    const double h_fd = 1e-4;
+
+    for (int coord = 0; coord < n_pert; coord++) {
+        int aidx = coord / 3;
+        int dir = coord % 3;
+
+        auto get_F_S = [&](double delta) -> std::pair<std::vector<double>, std::vector<double>> {
+            // Set displaced geometry
+            atoms.toHost();
+            for (int i = 0; i < num_atoms_val; i++) {
+                atoms[i].coordinate.x = orig[3 * i];
+                atoms[i].coordinate.y = orig[3 * i + 1];
+                atoms[i].coordinate.z = orig[3 * i + 2];
+            }
+            if (dir == 0) atoms[aidx].coordinate.x += delta;
+            else if (dir == 1) atoms[aidx].coordinate.y += delta;
+            else atoms[aidx].coordinate.z += delta;
+            atoms.toDevice();
+
+            // Update primitive shell coordinates
+            primitive_shells.toHost();
+            for (size_t i = 0; i < primitive_shells.size(); i++) {
+                int ai2 = primitive_shells[i].atom_index;
+                primitive_shells[i].coordinate = atoms.host_ptr()[ai2].coordinate;
+            }
+            primitive_shells.toDevice();
+
+            // Rebuild integrals at displaced geometry
+            compute_core_hamiltonian_matrix();
+            precompute_eri_matrix();
+
+            // Restore density and build Fock at displaced geometry with original D
+            cudaMemcpy(density_matrix.device_ptr(), h_D.data(), nao * nao * sizeof(double), cudaMemcpyHostToDevice);
+            compute_fock_matrix();
+
+            std::vector<double> F(nao * nao), S(nao * nao);
+            cudaMemcpy(F.data(), fock_matrix.device_ptr(), nao * nao * sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(S.data(), overlap_matrix.device_ptr(), nao * nao * sizeof(double), cudaMemcpyDeviceToHost);
+            return {F, S};
+        };
+
+        auto [Fp, Sp] = get_F_S(+h_fd);
+        auto [Fm, Sm] = get_F_S(-h_fd);
+
+        for (int k = 0; k < nao * nao; k++) {
+            h1ao[coord][k] = (Fp[k] - Fm[k]) / (2.0 * h_fd);
+            s1ao[coord][k] = (Sp[k] - Sm[k]) / (2.0 * h_fd);
+        }
+    }
+
+    // Restore original geometry and integrals
+    atoms.toHost();
+    for (int i = 0; i < num_atoms_val; i++) {
+        atoms[i].coordinate.x = orig[3 * i];
+        atoms[i].coordinate.y = orig[3 * i + 1];
+        atoms[i].coordinate.z = orig[3 * i + 2];
+    }
+    atoms.toDevice();
+    primitive_shells.toHost();
+    for (size_t i = 0; i < primitive_shells.size(); i++) {
+        int ai2 = primitive_shells[i].atom_index;
+        primitive_shells[i].coordinate = atoms.host_ptr()[ai2].coordinate;
+    }
+    primitive_shells.toDevice();
+    compute_core_hamiltonian_matrix();
+    precompute_eri_matrix();
+    cudaMemcpy(density_matrix.device_ptr(), h_D.data(), nao * nao * sizeof(double), cudaMemcpyHostToDevice);
+    compute_fock_matrix();
+
+    // --- Step 2: Transform h1ao, s1ao to MO basis and build CPHF RHS ---
+    if (verbose) std::cout << "  Step 2: Building CPHF RHS..." << std::endl;
+
+    // Helper: C^T * M * C  (all nao × nao, on CPU)
+    auto ao2mo_matrix = [&](const std::vector<double>& M_ao) -> std::vector<double> {
+        std::vector<double> temp(nao * nao, 0.0), M_mo(nao * nao, 0.0);
+        // temp = M_ao * C
+        for (int mu = 0; mu < nao; mu++)
+            for (int q = 0; q < nao; q++) {
+                double s = 0.0;
+                for (int nu = 0; nu < nao; nu++)
+                    s += M_ao[mu * nao + nu] * h_C[nu * nao + q];
+                temp[mu * nao + q] = s;
+            }
+        // M_mo = C^T * temp
+        for (int p = 0; p < nao; p++)
+            for (int q = 0; q < nao; q++) {
+                double s = 0.0;
+                for (int mu = 0; mu < nao; mu++)
+                    s += h_C[mu * nao + p] * temp[mu * nao + q];
+                M_mo[p * nao + q] = s;
+            }
+        return M_mo;
+    };
+
+    // Compute s1oo (occ-occ overlap derivative in MO) for each perturbation
+    std::vector<std::vector<double>> s1oo(n_pert);    // nocc × nocc
+    std::vector<std::vector<double>> h1_mo(n_pert);   // nao × nao
+    std::vector<std::vector<double>> s1_mo(n_pert);   // nao × nao
+
+    // CPHF RHS: rhs[pert][i*nvir + a] = -(F^x_MO[a_mo, i] - ε_i * S^x_MO[a_mo, i])
+    std::vector<double> h_rhs(n_pert * nocc * nvir, 0.0);
+
+    for (int pert = 0; pert < n_pert; pert++) {
+        h1_mo[pert] = ao2mo_matrix(h1ao[pert]);
+        s1_mo[pert] = ao2mo_matrix(s1ao[pert]);
+
+        // Extract occ-occ block of s1_mo
+        s1oo[pert].resize(nocc * nocc);
+        for (int i = 0; i < nocc; i++)
+            for (int j = 0; j < nocc; j++)
+                s1oo[pert][i * nocc + j] = s1_mo[pert][i * nao + j];
+
+        // Build RHS (vir-occ block)
+        for (int i = 0; i < nocc; i++) {
+            for (int a = 0; a < nvir; a++) {
+                int a_mo = nocc + a;
+                double F_ai = h1_mo[pert][a_mo * nao + i];
+                double S_ai = s1_mo[pert][a_mo * nao + i];
+                h_rhs[pert * nocc * nvir + i * nvir + a] = -(F_ai - h_eps[i] * S_ai);
+            }
+        }
+    }
+
+    // --- Step 2b: Add occ-occ density response correction to CPHF RHS ---
+    // PySCF's CPHF includes the 2e response from the occ-occ density change
+    // D_oo = -2 C_occ s1oo C_occ^T. We compute G(D_oo) and add its vir-occ
+    // MO projection to the RHS: rhs[ai] -= (C^T G(D_oo) C)[a,i]
+    {
+        const real_t* d_eri_ao_ptr = eri_method_->get_eri_matrix_device();
+        real_t* d_Doo = nullptr;
+        real_t* d_zero = nullptr;
+        real_t* d_Goo = nullptr;
+        tracked_cudaMalloc(&d_Doo, nao * nao * sizeof(real_t));
+        tracked_cudaMalloc(&d_zero, nao * nao * sizeof(real_t));
+        tracked_cudaMalloc(&d_Goo, nao * nao * sizeof(real_t));
+        cudaMemset(d_zero, 0, nao * nao * sizeof(real_t));
+
+        for (int pert = 0; pert < n_pert; pert++) {
+            // D_oo = -2 C_occ s1oo C_occ^T
+            std::vector<double> D_oo(nao * nao, 0.0);
+            for (int mu = 0; mu < nao; mu++)
+                for (int nu = 0; nu < nao; nu++) {
+                    double s = 0.0;
+                    for (int i = 0; i < nocc; i++)
+                        for (int j = 0; j < nocc; j++)
+                            s += h_C[mu * nao + i] * s1oo[pert][i * nocc + j] * h_C[nu * nao + j];
+                    D_oo[mu * nao + nu] = -2.0 * s;
+                }
+
+            // G_oo = JK(D_oo)
+            cudaMemcpy(d_Doo, D_oo.data(), nao * nao * sizeof(double), cudaMemcpyHostToDevice);
+            gpu::computeFockMatrix_RHF(d_Doo, d_zero, d_eri_ao_ptr, d_Goo, nao);
+            std::vector<double> G_oo(nao * nao);
+            cudaMemcpy(G_oo.data(), d_Goo, nao * nao * sizeof(double), cudaMemcpyDeviceToHost);
+
+            // G_oo_mo = C^T G_oo C, then correct RHS
+            std::vector<double> G_oo_mo = ao2mo_matrix(G_oo);
+            for (int i = 0; i < nocc; i++)
+                for (int a = 0; a < nvir; a++) {
+                    int a_mo = nocc + a;
+                    h_rhs[pert * nocc * nvir + i * nvir + a] -= G_oo_mo[a_mo * nao + i];
+                }
+        }
+
+        tracked_cudaFree(d_Doo);
+        tracked_cudaFree(d_zero);
+        tracked_cudaFree(d_Goo);
+    }
+
+    // --- Step 3: AO→MO ERI transform ---
+    if (verbose) std::cout << "  Step 3: AO→MO ERI transform..." << std::endl;
+
+    const real_t* d_eri_ao = eri_method_->get_eri_matrix_device();
+    size_t eri_size = (size_t)nao * nao * nao * nao;
+    real_t* d_eri_work = nullptr;
+    real_t* d_eri_mo = nullptr;
+    tracked_cudaMalloc(&d_eri_work, eri_size * sizeof(real_t));
+    tracked_cudaMalloc(&d_eri_mo, eri_size * sizeof(real_t));
+    cudaMemcpy(d_eri_work, d_eri_ao, eri_size * sizeof(real_t), cudaMemcpyDeviceToDevice);
+    transform_eri_ao2mo_dgemm_full(d_eri_work, d_eri_mo, coefficient_matrix.device_ptr(), nao);
+
+    // --- Step 4: Solve CPHF ---
+    if (verbose) std::cout << "  Step 4: Solving CPHF equations..." << std::endl;
+
+    real_t* d_rhs = nullptr;
+    real_t* d_U = nullptr;
+    tracked_cudaMalloc(&d_rhs, n_pert * nocc * nvir * sizeof(real_t));
+    tracked_cudaMalloc(&d_U, n_pert * nocc * nvir * sizeof(real_t));
+    cudaMemcpy(d_rhs, h_rhs.data(), n_pert * nocc * nvir * sizeof(real_t), cudaMemcpyHostToDevice);
+
+    CPHFOperator cphf_op(d_eri_mo, orbital_energies.device_ptr(), nocc, nvir, nmo);
+    solve_cphf(cphf_op, d_rhs, d_U, n_pert);
+
+    // Download CPHF solution
+    std::vector<double> h_U(n_pert * nocc * nvir);
+    cudaMemcpy(h_U.data(), d_U, n_pert * nocc * nvir * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+    // --- Step 5: Build response quantities ---
+    if (verbose) std::cout << "  Step 5: Building response quantities..." << std::endl;
+
+    // For each perturbation y, build:
+    // mo1[p,i]: vir-occ = U (CPHF solution), occ-occ = -½ s1oo
+    // dm1[μ,ν] = Σ_p Σ_i C[μ,p] mo1[p,i] C[ν,i]  (one-sided response density)
+    // dm1e[μ,ν] = Σ_p Σ_i C[μ,p] mo1[p,i] ε_i C[ν,i]  (energy-weighted)
+    // D1 = 2*(dm1 + dm1^T)  (full first-order density, symmetric)
+    // vhf1 = G(D1) via Fock build with zero h_core
+    // mo_e1[i,j] = (C^T (h1ao + vhf1) C)[i,j] + ε_i * mo1_oo[i,j]  (Lagrange multiplier)
+
+    std::vector<std::vector<double>> dm1_all(n_pert, std::vector<double>(nao * nao, 0.0));
+    std::vector<std::vector<double>> dm1e_all(n_pert, std::vector<double>(nao * nao, 0.0));
+    std::vector<std::vector<double>> mo_e1_all(n_pert, std::vector<double>(nocc * nocc, 0.0));
+
+    // Temporary GPU buffers for vhf1 computation
+    real_t* d_D1 = nullptr;
+    real_t* d_zero_hcore = nullptr;
+    real_t* d_vhf1 = nullptr;
+    tracked_cudaMalloc(&d_D1, nao * nao * sizeof(real_t));
+    tracked_cudaMalloc(&d_zero_hcore, nao * nao * sizeof(real_t));
+    tracked_cudaMalloc(&d_vhf1, nao * nao * sizeof(real_t));
+    cudaMemset(d_zero_hcore, 0, nao * nao * sizeof(real_t));
+
+    for (int pert = 0; pert < n_pert; pert++) {
+        // Build mo1_MO (nmo × nocc)
+        std::vector<double> mo1(nmo * nocc, 0.0);
+        for (int i = 0; i < nocc; i++)
+            for (int a = 0; a < nvir; a++)
+                mo1[(nocc + a) * nocc + i] = h_U[pert * nocc * nvir + i * nvir + a];
+        for (int j = 0; j < nocc; j++)
+            for (int i = 0; i < nocc; i++)
+                mo1[j * nocc + i] = -0.5 * s1oo[pert][j * nocc + i];
+
+        // temp[μ,i] = Σ_p C[μ,p] * mo1[p,i]  (= mo1_AO, in AO representation)
+        std::vector<double> temp_mi(nao * nocc, 0.0);
+        for (int mu = 0; mu < nao; mu++)
+            for (int i = 0; i < nocc; i++) {
+                double s = 0.0;
+                for (int p = 0; p < nmo; p++)
+                    s += h_C[mu * nao + p] * mo1[p * nocc + i];
+                temp_mi[mu * nocc + i] = s;
+            }
+
+        // dm1[μ,ν] = Σ_i temp[μ,i] * C[ν,i]
+        for (int mu = 0; mu < nao; mu++)
+            for (int nu = 0; nu < nao; nu++) {
+                double s = 0.0;
+                for (int i = 0; i < nocc; i++)
+                    s += temp_mi[mu * nocc + i] * h_C[nu * nao + i];
+                dm1_all[pert][mu * nao + nu] = s;
+            }
+
+        // dm1e[μ,ν] = Σ_i temp[μ,i] * ε_i * C[ν,i]
+        for (int mu = 0; mu < nao; mu++)
+            for (int nu = 0; nu < nao; nu++) {
+                double s = 0.0;
+                for (int i = 0; i < nocc; i++)
+                    s += temp_mi[mu * nocc + i] * h_eps[i] * h_C[nu * nao + i];
+                dm1e_all[pert][mu * nao + nu] = s;
+            }
+
+        // D1 = 2*(dm1 + dm1^T) for vhf1 computation
+        std::vector<double> D1(nao * nao);
+        for (int mu = 0; mu < nao; mu++)
+            for (int nu = 0; nu < nao; nu++)
+                D1[mu * nao + nu] = 2.0 * (dm1_all[pert][mu * nao + nu] + dm1_all[pert][nu * nao + mu]);
+
+        // vhf1 = G(D1) via Fock build with zero h_core
+        cudaMemcpy(d_D1, D1.data(), nao * nao * sizeof(double), cudaMemcpyHostToDevice);
+        gpu::computeFockMatrix_RHF(d_D1, d_zero_hcore, d_eri_ao, d_vhf1, nao);
+        std::vector<double> vhf1(nao * nao);
+        cudaMemcpy(vhf1.data(), d_vhf1, nao * nao * sizeof(double), cudaMemcpyDeviceToHost);
+
+        // F_tot = h1ao + vhf1 (total first-order Fock in AO)
+        std::vector<double> F_tot(nao * nao);
+        for (int k = 0; k < nao * nao; k++)
+            F_tot[k] = h1ao[pert][k] + vhf1[k];
+
+        // F_tot_MO = C^T F_tot C
+        std::vector<double> F_tot_mo = ao2mo_matrix(F_tot);
+
+        // mo_e1[i,j] = F_tot_MO[i,j] - 0.5*(ε_i + ε_j)*s1oo[i,j]
+        // Derived from d/dR(F C = S C ε): ε^(1)_{ij} = F^(1)_{ij} - 0.5*(ε_i+ε_j)*S^(1)_{ij}
+        for (int i = 0; i < nocc; i++)
+            for (int j = 0; j < nocc; j++)
+                mo_e1_all[pert][i * nocc + j] = F_tot_mo[i * nao + j]
+                    - 0.5 * (h_eps[i] + h_eps[j]) * s1oo[pert][i * nocc + j];
+    }
+
+    // --- Step 6: Assemble response Hessian ---
+    if (verbose) std::cout << "  Step 6: Assembling response Hessian..." << std::endl;
+
+    // resp[x,y] = 4 * <h1ao_x, dm1_y>       ... Fock derivative × response density
+    //           - 4 * <s1ao_x, dm1e_y>       ... overlap derivative × energy-weighted response density
+    //           - 2 * <s1oo_x, mo_e1_y>      ... overlap occ-occ × Lagrange multiplier
+    std::vector<double> resp_hessian(ndim * ndim, 0.0);
+
+    for (int x = 0; x < n_pert; x++) {
+        for (int y = 0; y < n_pert; y++) {
+            double term1 = 0.0, term2 = 0.0, term3 = 0.0;
+
+            for (int k = 0; k < nao * nao; k++) {
+                term1 += h1ao[x][k] * dm1_all[y][k];
+                term2 += s1ao[x][k] * dm1e_all[y][k];
+            }
+            for (int k = 0; k < nocc * nocc; k++)
+                term3 += s1oo[x][k] * mo_e1_all[y][k];
+
+            resp_hessian[x * ndim + y] = 4.0 * term1 - 4.0 * term2 - 2.0 * term3;
+        }
+    }
+
+    // Symmetrize response
+    for (int i = 0; i < ndim; i++)
+        for (int j = i + 1; j < ndim; j++)
+            resp_hessian[i * ndim + j] = resp_hessian[j * ndim + i] =
+                0.5 * (resp_hessian[i * ndim + j] + resp_hessian[j * ndim + i]);
+
+    // Full analytical Hessian = skeleton + response
+    std::vector<double> hessian(ndim * ndim);
+    for (int k = 0; k < ndim * ndim; k++)
+        hessian[k] = skel_hessian[k] + resp_hessian[k];
+
+    // Clean up GPU memory
+    tracked_cudaFree(d_eri_work);
+    tracked_cudaFree(d_eri_mo);
+    tracked_cudaFree(d_rhs);
+    tracked_cudaFree(d_U);
+    tracked_cudaFree(d_D1);
+    tracked_cudaFree(d_zero_hcore);
+    tracked_cudaFree(d_vhf1);
+
+    return hessian;
+}
+
+/**
  * @brief Compute the gradient of the total electronic energy
- * @details This function calculates the gradient of the total electronic energy with respect to nuclear coordinates.
  */
 std::vector<double> RHF::compute_Energy_Gradient() {
     PROFILE_FUNCTION();

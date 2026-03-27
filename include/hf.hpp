@@ -549,7 +549,16 @@ public:
      * @details The result can be used for geometry optimization or force calculations.
      */
     virtual std::vector<double> compute_Energy_Gradient() = 0;
-    
+
+    /**
+     * @brief Compute the analytic Hessian of the total electronic energy
+     * @details Returns the second derivative matrix d²E/dR_i dR_j as a flat vector
+     *          of size (3*num_atoms)^2 in row-major order.
+     * @return Hessian matrix as flat vector
+     */
+    virtual std::vector<double> compute_Energy_Hessian() {
+        throw std::runtime_error("Hessian not implemented for this method.");
+    }
 
     /**
      * @brief Export the density matrix

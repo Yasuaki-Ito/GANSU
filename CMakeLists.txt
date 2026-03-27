@@ -62,6 +62,11 @@ add_library(grad_k STATIC src/grad/grad_k.cu)
 add_library(grad_v STATIC src/grad/grad_v.cu)
 add_library(grad_g STATIC src/grad/grad_g.cu)
 add_library(rys_grad_g STATIC src/grad/rys_grad_g.cu)
+add_library(rys_hessian_g STATIC src/grad/rys_hessian_g.cu)
+add_library(hessian_s STATIC src/grad/hessian_s.cu)
+add_library(hessian_k STATIC src/grad/hessian_k.cu)
+add_library(hessian_v STATIC src/grad/hessian_v.cu)
+add_library(hessian_w STATIC src/grad/hessian_w.cu)
 
 
 set(SOURCES
@@ -97,6 +102,7 @@ set(SOURCES
     src/eri_stored_eom_ccsd.cu
     src/oscillator_strength.cu
     src/eri_stored_mp4.cu
+    src/cphf_solver.cu
     src/eri_stored_ump.cu
     src/davidson_solver.cu
     src/fci.cu
@@ -129,6 +135,11 @@ target_link_libraries(gansu
         grad_v
         grad_g
         rys_grad_g
+        rys_hessian_g
+        hessian_s
+        hessian_k
+        hessian_v
+        hessian_w
     )
 
 

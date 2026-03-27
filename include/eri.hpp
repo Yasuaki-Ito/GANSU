@@ -63,6 +63,7 @@ public:
      * @details This function must be implemented in the derived class.
     */
     virtual std::string get_algorithm_name() = 0; ///< Get the algorithm name
+    virtual const real_t* get_eri_matrix_device() const { return nullptr; } ///< AO ERI (stored only)
 
     /**
      * @brief Check if the post-HF method is supported
@@ -202,6 +203,7 @@ public:
     void precomputation() override;
 
     std::string get_algorithm_name() override { return "Stored"; } ///< Get the algorithm name
+    const real_t* get_eri_matrix_device() const { return eri_matrix_.device_ptr(); }
 
     bool supports_post_hf_method(PostHFMethod method) const override {
         if( method == PostHFMethod::None // always supported

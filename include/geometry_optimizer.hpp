@@ -24,6 +24,7 @@
 #include <cmath>
 #include <algorithm>
 #include <memory>
+#include <functional>
 #include <stdexcept>
 
 namespace gansu {
@@ -496,6 +497,77 @@ private:
 
 
 // =============================================================================
+// Newton-Raphson: p = -H^{-1} g using exact analytical Hessian
+// Requires a callback to compute the Hessian at each step.
+// =============================================================================
+
+class NewtonOptimizer : public GeometryOptimizer {
+public:
+    using HessianCallback = std::function<std::vector<double>()>;
+
+    NewtonOptimizer(int ndim, HessianCallback hessian_fn)
+        : GeometryOptimizer(ndim), hessian_fn_(std::move(hessian_fn)) {}
+
+    void initialize(const std::vector<double>&, const std::vector<double>&) override {}
+
+    std::vector<double> compute_search_direction(
+        const std::vector<double>&, const std::vector<double>& grad) override {
+        // Compute analytical Hessian
+        auto hessian = hessian_fn_();
+
+        // Solve H * p = -g via Gaussian elimination
+        std::vector<double> H(hessian);
+        std::vector<double> neg_g(ndim_);
+        for (int i = 0; i < ndim_; i++) neg_g[i] = -grad[i];
+
+        if (!solve_linear_system(H, neg_g, ndim_)) {
+            // Hessian singular — fall back to steepest descent
+            for (int i = 0; i < ndim_; i++) neg_g[i] = -grad[i];
+        }
+        return neg_g;
+    }
+
+    void step_completed(const std::vector<double>&, const std::vector<double>&,
+                       const std::vector<double>&) override {}
+
+    bool use_line_search() const override { return false; }
+
+    std::string name() const override { return "Newton"; }
+
+private:
+    HessianCallback hessian_fn_;
+
+    static bool solve_linear_system(std::vector<double>& A, std::vector<double>& b, int n) {
+        for (int k = 0; k < n; k++) {
+            int max_row = k;
+            double max_val = std::abs(A[k * n + k]);
+            for (int i = k + 1; i < n; i++) {
+                if (std::abs(A[i * n + k]) > max_val) {
+                    max_val = std::abs(A[i * n + k]);
+                    max_row = i;
+                }
+            }
+            if (max_val < 1.0e-14) return false;
+            if (max_row != k) {
+                for (int j = 0; j < n; j++) std::swap(A[k * n + j], A[max_row * n + j]);
+                std::swap(b[k], b[max_row]);
+            }
+            for (int i = k + 1; i < n; i++) {
+                double factor = A[i * n + k] / A[k * n + k];
+                for (int j = k; j < n; j++) A[i * n + j] -= factor * A[k * n + j];
+                b[i] -= factor * b[k];
+            }
+        }
+        for (int i = n - 1; i >= 0; i--) {
+            for (int j = i + 1; j < n; j++) b[i] -= A[i * n + j] * b[j];
+            b[i] /= A[i * n + i];
+        }
+        return true;
+    }
+};
+
+
+// =============================================================================
 // Factory method
 // =============================================================================
 
@@ -511,9 +583,10 @@ inline std::unique_ptr<GeometryOptimizer> GeometryOptimizer::create(
     if(optimizer_name == "cg-hs")  return std::make_unique<CGHestenesStifel>(ndim);
     if(optimizer_name == "cg-dy")  return std::make_unique<CGDaiYuan>(ndim);
     if(optimizer_name == "sd")     return std::make_unique<SteepestDescentOptimizer>(ndim);
+    // "newton" is handled separately in hf.cu because it needs the HF object
 
     throw std::runtime_error("Unknown optimizer: " + optimizer_name
-        + ". Valid options: bfgs, dfp, sr1, gdiis, cg-fr, cg-pr, cg-hs, cg-dy, sd");
+        + ". Valid options: bfgs, dfp, sr1, gdiis, cg-fr, cg-pr, cg-hs, cg-dy, sd, newton");
 }
 
 } // namespace gansu

@@ -25,6 +25,7 @@
 #include "device_host_memory.hpp" // For tracked_gansu::tracked_cudaMalloc/tracked_cudaFree
 
 #include "gradients.hpp"
+#include "rys_hessian_g.hpp"
 
 #include <vector>    // std::vector
 #include <tuple>     // std::tuple
@@ -4653,6 +4654,112 @@ void computeSchwarzUpperBounds_for_SAD_K_computation(
             gpu::get_schwarz_upper_bound_factors_general_for_SAD_K_computation<<<num_blocks, threads_per_block>>>(d_primitive_shells, d_cgto_normalization_factors, shell_s0, shell_s1, head, num_bra, num_primitive_shells, d_boys_grid, d_upper_bound_factors, d_upper_bound_factors_for_SAD_K_computation);
         }
     }
+}
+
+// Skeleton Hessian (without CPHF response term)
+// H_skel = d²V_nn/dRdR + D·(d²T/dRdR + d²V/dRdR) - W·d²S/dRdR + d²G/dRdR
+std::vector<double> computeSkeletonHessian_RHF(
+    const std::vector<ShellTypeInfo>& shell_type_infos,
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+    const Atom* d_atoms,
+    const real_t* d_density_matrix,
+    const real_t* d_coefficient_matrix,
+    const real_t* d_orbital_energies,
+    const PrimitiveShell* d_primitive_shells,
+    const real_t* d_boys_grid,
+    const real_t* d_cgto_normalization_factors,
+    const int num_atoms, const int num_basis, const int num_electron, const bool verbose)
+{
+    const int ndim = 3 * num_atoms;
+    const size_t hess_bytes = ndim * ndim * sizeof(double);
+    const int threads_per_block = 128;
+    const int shell_type_count = shell_type_infos.size();
+
+    // Allocate Hessian on GPU
+    double* d_hessian = nullptr;
+    cudaMalloc(&d_hessian, hess_bytes);
+    cudaMemset(d_hessian, 0, hess_bytes);
+
+    // W matrix for overlap Hessian
+    const size_t wmat_bytes = num_basis * num_basis * sizeof(real_t);
+    real_t* d_W_matrix = nullptr;
+    cudaMalloc(&d_W_matrix, wmat_bytes);
+    cudaMemset(d_W_matrix, 0, wmat_bytes);
+    compute_W(d_W_matrix, d_coefficient_matrix, d_orbital_energies, num_basis, num_electron);
+
+    // Stack size for complex kernels
+    size_t stackSize = 64 * 1024;
+    cudaDeviceSetLimit(cudaLimitStackSize, stackSize);
+
+    // --- 2-electron Hessian ---
+    std::vector<std::tuple<int, int, int, int>> shell_quadruples;
+    for (int a = 0; a < shell_type_count; ++a)
+        for (int b = a; b < shell_type_count; ++b)
+            for (int c = 0; c < shell_type_count; ++c)
+                for (int d = c; d < shell_type_count; ++d)
+                    if (a < c || (a == c && b <= d))
+                        shell_quadruples.emplace_back(a, b, c, d);
+    std::reverse(shell_quadruples.begin(), shell_quadruples.end());
+
+    int stream_id = 0;
+    const int num_kernels = shell_quadruples.size() + 3*((shell_type_count)*(shell_type_count+1)/2) + 1;
+    std::vector<cudaStream_t> streams(num_kernels);
+    for (int i = 0; i < num_kernels; i++)
+        cudaStreamCreate(&streams[i]);
+
+    for (const auto& quadruple : shell_quadruples) {
+        int s0, s1, s2, s3;
+        std::tie(s0, s1, s2, s3) = quadruple;
+        const ShellTypeInfo ss0 = shell_type_infos[s0], ss1 = shell_type_infos[s1];
+        const ShellTypeInfo ss2 = shell_type_infos[s2], ss3 = shell_type_infos[s3];
+        const size_t num_bra = (s0==s1) ? ss0.count*(ss0.count+1)/2 : ss0.count*ss1.count;
+        const size_t num_ket = (s2==s3) ? ss2.count*(ss2.count+1)/2 : ss2.count*ss3.count;
+        const size_t num_braket = ((s0==s2)&&(s1==s3)) ? num_bra*(num_bra+1)/2 : num_bra*num_ket;
+        const int num_blocks = (num_braket + threads_per_block - 1) / threads_per_block;
+
+        Rys_compute_hessian_two_electron<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+            d_hessian, d_density_matrix, d_primitive_shells, d_cgto_normalization_factors,
+            ss0, ss1, ss2, ss3, num_braket, num_basis, num_atoms, d_boys_grid);
+    }
+
+    // --- 1-electron Hessian ---
+    for (int s0 = shell_type_count-1; s0 >= 0; s0--) {
+        for (int s1 = shell_type_count-1; s1 >= s0; s1--) {
+            const ShellTypeInfo ss0 = shell_type_infos[s0], ss1 = shell_type_infos[s1];
+            const int num_pairs = (s0==s1) ? (ss0.count*(ss0.count+1)/2) : (ss0.count*ss1.count);
+            const int num_blocks = (num_pairs + threads_per_block - 1) / threads_per_block;
+
+            compute_hessian_overlap<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+                d_hessian, d_W_matrix, d_primitive_shells, d_cgto_normalization_factors,
+                num_basis, num_atoms, ss0, ss1, num_pairs);
+            compute_hessian_kinetic<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+                d_hessian, d_density_matrix, d_primitive_shells, d_cgto_normalization_factors,
+                num_basis, num_atoms, ss0, ss1, num_pairs);
+            compute_hessian_nuclear_attraction<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+                d_hessian, d_density_matrix, d_primitive_shells, d_cgto_normalization_factors,
+                d_atoms, num_basis, num_atoms, ss0, ss1, num_pairs, d_boys_grid);
+        }
+    }
+
+    // --- Nuclear repulsion Hessian ---
+    const int num_pairs = num_atoms * (num_atoms + 1) / 2;
+    const int NR_blocks = (num_pairs + threads_per_block - 1) / threads_per_block;
+    compute_hessian_nuclear_repulsion<<<NR_blocks, threads_per_block, 0, streams[stream_id]>>>(
+        d_hessian, d_atoms, num_atoms);
+
+    cudaDeviceSynchronize();
+
+    for (int i = 0; i < num_kernels; i++)
+        cudaStreamDestroy(streams[i]);
+
+    // Copy to host
+    std::vector<double> hessian(ndim * ndim);
+    cudaMemcpy(hessian.data(), d_hessian, hess_bytes, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_hessian);
+    cudaFree(d_W_matrix);
+
+    return hessian;
 }
 
 } // namespace gansu::gpu
