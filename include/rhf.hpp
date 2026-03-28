@@ -379,6 +379,214 @@ private:
     DeviceHostMemory<real_t> prev_fock_matrices; ///< Previous Fock matrices
 };
 
+
+/**
+ * @brief Second-Order SCF (SOSCF) convergence method for the restricted HF method
+ * @details Uses DIIS for initial iterations, then switches to second-order orbital optimization
+ *          near convergence for quadratic convergence.
+ * @details Reference: P. Pulay, J. Comput. Chem. 3, 556 (1982)
+ *
+ * Algorithm (SOSCF phase):
+ *   1. Transform Fock matrix to MO basis: F_MO = C^T · F · C
+ *   2. Extract orbital gradient: g[a][i] = F_MO[a+nocc, i]
+ *   3. Compute rotation: θ[a][i] = -g[a][i] / (ε[a+nocc] - ε[i])
+ *   4. Update MO coefficients: C_new = C · (I + Θ)
+ *   5. Re-orthogonalize (modified Gram-Schmidt in S metric)
+ *   6. Build new density matrix and rebuild Fock matrix
+ *
+ * NOTE: This implementation uses host-side loops for clarity.
+ *       Students should optimize the marked sections using cuBLAS/cuSOLVER.
+ */
+class Convergence_RHF_SOSCF : public Convergence_RHF {
+public:
+    /**
+     * @brief Constructor
+     * @param hf RHF object
+     * @param diis_size DIIS history size for the initial phase
+     * @param switch_threshold Energy difference threshold to switch from DIIS to SOSCF
+     */
+    Convergence_RHF_SOSCF(RHF& hf, size_t diis_size = 8, real_t switch_threshold = 1e-4)
+        : Convergence_RHF(hf)
+        , diis_(hf, diis_size)
+        , switch_threshold_(switch_threshold)
+        , using_soscf_(false)
+    {}
+
+    std::string get_algorithm_name() const override { return "SOSCF"; }
+
+    void reset() override {
+        diis_.reset();
+        using_soscf_ = false;
+    }
+
+    void get_new_fock_matrix() override {
+        const int nao = hf_.get_num_basis();
+        const int nocc = hf_.get_num_electrons() / 2;
+        const int nvir = nao - nocc;
+
+        // =======================================================
+        //  Phase 1: Use DIIS until close to convergence
+        // =======================================================
+        if (!using_soscf_) {
+            diis_.get_new_fock_matrix();
+            real_t dE = hf_.get_energy_difference();
+            if (dE < switch_threshold_ && dE > 0) {
+                using_soscf_ = true;
+                if (verbose) std::cout << "  [SOSCF] Switching from DIIS to SOSCF" << std::endl;
+            }
+            return;
+        }
+
+        // =======================================================
+        //  Phase 2: Second-Order SCF (SOSCF)
+        // =======================================================
+
+        // --- Copy matrices to host ---
+        hf_.get_coefficient_matrix().toHost();
+        hf_.get_fock_matrix().toHost();
+        hf_.get_orbital_energies().toHost();
+        hf_.get_overlap_matrix().toHost();
+
+        const real_t* C   = hf_.get_coefficient_matrix().host_ptr();
+        const real_t* F   = hf_.get_fock_matrix().host_ptr();
+        const real_t* eps = hf_.get_orbital_energies().host_ptr();
+        const real_t* S   = hf_.get_overlap_matrix().host_ptr();
+
+        // -----------------------------------------------
+        // Step 1: F_MO = C^T · F · C    (nao × nao)
+        // -----------------------------------------------
+        // TODO: GPU化 — cublasDgemm を2回使用: tmp=F·C, F_MO=C^T·tmp
+        std::vector<real_t> tmp(nao * nao, 0.0);
+        std::vector<real_t> F_MO(nao * nao, 0.0);
+
+        // tmp[μ,q] = Σ_ν F[μ,ν] · C[ν,q]
+        for (int mu = 0; mu < nao; mu++)
+            for (int q = 0; q < nao; q++)
+                for (int nu = 0; nu < nao; nu++)
+                    tmp[mu * nao + q] += F[mu * nao + nu] * C[nu * nao + q];
+
+        // F_MO[p,q] = Σ_μ C[μ,p] · tmp[μ,q]
+        for (int p = 0; p < nao; p++)
+            for (int q = 0; q < nao; q++)
+                for (int mu = 0; mu < nao; mu++)
+                    F_MO[p * nao + q] += C[mu * nao + p] * tmp[mu * nao + q];
+
+        // -----------------------------------------------
+        // Step 2: Orbital gradient g[a][i] = F_MO[a+nocc, i]
+        //   (The off-diagonal vir-occ block of F_MO)
+        //   At convergence, F_MO is diagonal, so g → 0.
+        // -----------------------------------------------
+        double grad_norm = 0.0;
+        for (int a = 0; a < nvir; a++)
+            for (int i = 0; i < nocc; i++) {
+                double g = F_MO[(nocc + a) * nao + i];
+                grad_norm += g * g;
+            }
+        grad_norm = std::sqrt(grad_norm);
+
+        if (verbose)
+            std::cout << "  [SOSCF] Orbital gradient norm = " << grad_norm << std::endl;
+
+        // Fall back to DIIS if the gradient is too large
+        if (grad_norm > 0.5) {
+            if (verbose) std::cout << "  [SOSCF] Gradient too large, falling back to DIIS" << std::endl;
+            diis_.get_new_fock_matrix();
+            return;
+        }
+
+        // -----------------------------------------------
+        // Step 3: Rotation angles (diagonal Hessian approximation)
+        //   θ[a][i] = − F_MO[a+nocc, i] / (ε[a+nocc] − ε[i])
+        //
+        //   This is the Newton step with the approximate orbital Hessian:
+        //     H[ai,ai] ≈ ε_a − ε_i    (diagonal approximation)
+        // -----------------------------------------------
+        // TODO: GPU化 — デバイスカーネルで並列計算
+        std::vector<real_t> theta(nvir * nocc, 0.0);
+        for (int a = 0; a < nvir; a++)
+            for (int i = 0; i < nocc; i++) {
+                real_t denom = eps[nocc + a] - eps[i];
+                if (std::abs(denom) < 1e-12) denom = 1e-12;
+                theta[a * nocc + i] = -F_MO[(nocc + a) * nao + i] / denom;
+            }
+
+        // -----------------------------------------------
+        // Step 4: Rotate MO coefficients  C_new = C · (I + Θ)
+        //   occupied:  C_new[μ,i]      = C[μ,i]      + Σ_a θ[a,i] · C[μ, a+nocc]
+        //   virtual:   C_new[μ,a+nocc] = C[μ,a+nocc] − Σ_i θ[a,i] · C[μ, i]
+        // -----------------------------------------------
+        // TODO: GPU化 — cublasDgemm で一括計算
+        //   C_occ_new = C_occ + C_vir · Θ
+        //   C_vir_new = C_vir − C_occ · Θ^T
+        std::vector<real_t> C_new(nao * nao);
+        std::copy(C, C + nao * nao, C_new.begin());
+
+        for (int mu = 0; mu < nao; mu++)
+            for (int i = 0; i < nocc; i++)
+                for (int a = 0; a < nvir; a++)
+                    C_new[mu * nao + i] += theta[a * nocc + i] * C[mu * nao + (nocc + a)];
+
+        for (int mu = 0; mu < nao; mu++)
+            for (int a = 0; a < nvir; a++)
+                for (int i = 0; i < nocc; i++)
+                    C_new[mu * nao + (nocc + a)] -= theta[a * nocc + i] * C[mu * nao + i];
+
+        // -----------------------------------------------
+        // Step 5: Re-orthogonalize occupied orbitals
+        //   Modified Gram-Schmidt in the overlap (S) metric:
+        //     <i|j>_S = C[:,i]^T · S · C[:,j] = δ_{ij}
+        // -----------------------------------------------
+        // TODO: GPU化 — cublasDgemm で S·C を先に計算し、
+        //   cublasDdot でオーバーラップ計算、cublasDaxpy で射影除去
+        for (int i = 0; i < nocc; i++) {
+            // Project out components of orbitals 0..i-1
+            for (int j = 0; j < i; j++) {
+                double overlap = 0.0;
+                for (int mu = 0; mu < nao; mu++)
+                    for (int nu = 0; nu < nao; nu++)
+                        overlap += C_new[mu * nao + i] * S[mu * nao + nu] * C_new[nu * nao + j];
+                for (int mu = 0; mu < nao; mu++)
+                    C_new[mu * nao + i] -= overlap * C_new[mu * nao + j];
+            }
+            // Normalize
+            double norm = 0.0;
+            for (int mu = 0; mu < nao; mu++)
+                for (int nu = 0; nu < nao; nu++)
+                    norm += C_new[mu * nao + i] * S[mu * nao + nu] * C_new[nu * nao + i];
+            norm = std::sqrt(norm);
+            for (int mu = 0; mu < nao; mu++)
+                C_new[mu * nao + i] /= norm;
+        }
+
+        // -----------------------------------------------
+        // Step 6: Build new density matrix  D = 2 · C_occ · C_occ^T
+        // -----------------------------------------------
+        // TODO: GPU化 — cublasDsyrk: D = 2·C_occ·C_occ^T
+        std::vector<real_t> D_new(nao * nao, 0.0);
+        for (int mu = 0; mu < nao; mu++)
+            for (int nu = 0; nu < nao; nu++)
+                for (int i = 0; i < nocc; i++)
+                    D_new[mu * nao + nu] += 2.0 * C_new[mu * nao + i] * C_new[nu * nao + i];
+
+        // -----------------------------------------------
+        // Step 7: Upload C and D to device, then rebuild Fock matrix
+        // -----------------------------------------------
+        cudaMemcpy(hf_.get_coefficient_matrix().device_ptr(), C_new.data(),
+                   nao * nao * sizeof(real_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(hf_.get_density_matrix().device_ptr(), D_new.data(),
+                   nao * nao * sizeof(real_t), cudaMemcpyHostToDevice);
+
+        // Rebuild F from the SOSCF-improved density
+        hf_.compute_fock_matrix();
+    }
+
+private:
+    Convergence_RHF_DIIS diis_;   ///< DIIS for initial phase
+    real_t switch_threshold_;      ///< Energy difference threshold for DIIS→SOSCF switch
+    bool using_soscf_;             ///< true after switching to SOSCF
+};
+
+
 /**
  * @brief InitialGuess_RHF class for the restricted HF method
  * @details This class is a virtual class for the initial guess of the restricted HF method.

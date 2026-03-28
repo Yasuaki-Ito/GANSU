@@ -65,6 +65,15 @@ public:
     virtual std::string get_algorithm_name() = 0; ///< Get the algorithm name
     virtual const real_t* get_eri_matrix_device() const { return nullptr; } ///< AO ERI (stored only)
 
+    /// Build full MO ERI from AO ERI + coefficient matrix.
+    /// Returns device pointer to MO ERI [nmo⁴]. Caller must free with tracked_cudaFree.
+    /// Default: uses get_eri_matrix_device() + 4-index AO→MO transform.
+    virtual real_t* build_mo_eri(const real_t* d_C, int nmo) const;
+
+    /// Compute G(D) = 2J[D] - K[D] (two-electron response) from an arbitrary density matrix.
+    /// Default: uses get_eri_matrix_device() + computeFockMatrix_RHF with zero core Hamiltonian.
+    virtual void compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const;
+
     /**
      * @brief Check if the post-HF method is supported
      * @param method Post-HF method
@@ -261,7 +270,10 @@ public:
 
     /// Build full MO ERI directly from B: B→B_mo→(pq|rs) without nao⁴ intermediate
     /// Returns device pointer to MO ERI [nmo⁴]. Caller must free with tracked_cudaFree.
-    real_t* build_mo_eri(const real_t* d_C, int nmo) const;
+    real_t* build_mo_eri(const real_t* d_C, int nmo) const override;
+
+    /// Compute G(D) using RI B-matrix based J/K build (no AO ERI reconstruction needed).
+    void compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const override;
 
     bool supports_post_hf_method(PostHFMethod method) const override {
         if( method == PostHFMethod::None

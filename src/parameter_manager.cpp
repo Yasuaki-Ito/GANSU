@@ -59,6 +59,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"damping_factor", "0.9"},                  // real_t (0<=damping_factor<=1)
         {"diis_size", "8"},                         // int
         {"diis_include_transform", "0"},            // int(bool)
+        {"soscf_start_threshold", "1e-4"},          // real_t: energy diff threshold to switch DIIS→SOSCF
         {"rohf_parameter_name", "roothaan"},        // string
         {"run_type", "energy"},                      // string (energy, gradient, optimize)
         {"optimizer", "bfgs"},                       // string (bfgs)

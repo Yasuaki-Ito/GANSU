@@ -1,5 +1,6 @@
 #pragma once
 #include "eri.hpp"
+#include <cassert>
 
 
 namespace gansu {

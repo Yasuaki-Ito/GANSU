@@ -111,6 +111,8 @@ public:
      */
     int get_num_electrons() const { return num_electrons; }
 
+    real_t get_energy_difference() const { return energy_difference_; } ///< Get the energy difference from the previous iteration
+
     /**
      * @brief Get the number of alpha electrons
      */

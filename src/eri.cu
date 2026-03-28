@@ -17,6 +17,9 @@
 #include "utils_cuda.hpp"
 #include "rys_eri.hpp"
 #include "gpu_kernels.hpp"
+#include "gpu_manager.hpp"
+#include "ao2mo.cuh"
+#include <cassert>
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
 #include <thrust/copy.h>
@@ -227,11 +230,79 @@ void ERI_RI::reconstruct_ao_eri() {
     }
 }
 
+// ============================================================
+// ERI base class default implementations
+// ============================================================
+
+real_t* ERI::build_mo_eri(const real_t* d_C, int nmo) const {
+    const real_t* d_eri_ao = get_eri_matrix_device();
+    if (!d_eri_ao) {
+        THROW_EXCEPTION("build_mo_eri: no AO ERI available for this ERI method.");
+    }
+    const size_t n4 = (size_t)nmo * nmo * nmo * nmo;
+    real_t* d_eri_work = nullptr;
+    real_t* d_eri_mo = nullptr;
+    tracked_cudaMalloc(&d_eri_work, n4 * sizeof(real_t));
+    tracked_cudaMalloc(&d_eri_mo, n4 * sizeof(real_t));
+    cudaMemcpy(d_eri_work, d_eri_ao, n4 * sizeof(real_t), cudaMemcpyDeviceToDevice);
+    transform_eri_ao2mo_dgemm_full(d_eri_work, d_eri_mo, d_C, nmo);
+    tracked_cudaFree(d_eri_work);
+    return d_eri_mo;
+}
+
+void ERI::compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const {
+    const real_t* d_eri_ao = get_eri_matrix_device();
+    if (!d_eri_ao) {
+        THROW_EXCEPTION("compute_jk_response: no AO ERI available for this ERI method.");
+    }
+    real_t* d_zero = nullptr;
+    tracked_cudaMalloc(&d_zero, (size_t)nao * nao * sizeof(real_t));
+    cudaMemset(d_zero, 0, (size_t)nao * nao * sizeof(real_t));
+    // computeFockMatrix_RHF computes F = H + 2J - K. With H=0, output = 2J - K.
+    gpu::computeFockMatrix_RHF(d_D, d_zero, d_eri_ao, d_G, nao);
+    tracked_cudaFree(d_zero);
+}
+
+// ============================================================
+// ERI_RI implementations
+// ============================================================
+
 const real_t* ERI_RI::get_eri_matrix_device() const {
     if (!eri_reconstructed_) {
         const_cast<ERI_RI*>(this)->reconstruct_ao_eri();
     }
     return d_eri_reconstructed_;
+}
+
+void ERI_RI::compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const {
+    // Use RI B-matrix based Fock build: no AO ERI reconstruction needed.
+    // Allocate temporary buffers locally (CPHF is called infrequently).
+    const size_t nao2 = (size_t)nao * nao;
+    real_t* d_zero = nullptr;
+    real_t* d_J = nullptr;
+    real_t* d_K = nullptr;
+    real_t* d_W = nullptr;
+    real_t* d_T = nullptr;
+    real_t* d_V = nullptr;
+    tracked_cudaMalloc(&d_zero, nao2 * sizeof(real_t));
+    tracked_cudaMalloc(&d_J, nao2 * sizeof(real_t));
+    tracked_cudaMalloc(&d_K, nao2 * sizeof(real_t));
+    tracked_cudaMalloc(&d_W, num_auxiliary_basis_ * sizeof(real_t));
+    tracked_cudaMalloc(&d_T, (size_t)num_auxiliary_basis_ * nao2 * sizeof(real_t));
+    tracked_cudaMalloc(&d_V, (size_t)num_auxiliary_basis_ * nao2 * sizeof(real_t));
+    cudaMemset(d_zero, 0, nao2 * sizeof(real_t));
+
+    gpu::computeFockMatrix_RI_RHF_with_density_matrix(
+        d_D, d_zero, intermediate_matrix_B_.device_ptr(),
+        d_G, num_basis_, num_auxiliary_basis_,
+        d_J, d_K, d_W, d_T, d_V);
+
+    tracked_cudaFree(d_zero);
+    tracked_cudaFree(d_J);
+    tracked_cudaFree(d_K);
+    tracked_cudaFree(d_W);
+    tracked_cudaFree(d_T);
+    tracked_cudaFree(d_V);
 }
 
 real_t* ERI_RI::build_mo_eri(const real_t* d_C, int nmo) const {

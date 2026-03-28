@@ -66,6 +66,10 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
         const bool is_include_transform = parameters.get<bool>("diis_include_transform"); // include the transformation matrix in DIIS, default: false
 
         set_convergence_method(std::make_unique<Convergence_RHF_DIIS>(*this, DIIS_size, is_include_transform));
+    }else if(convergence_method == "soscf"){ // Second-Order SCF (DIIS → SOSCF)
+        const size_t DIIS_size = parameters.get<int>("diis_size");
+        const double soscf_start = parameters.get<double>("soscf_start_threshold");
+        set_convergence_method(std::make_unique<Convergence_RHF_SOSCF>(*this, DIIS_size, soscf_start));
     }else{
         THROW_EXCEPTION("Invalid convergence algorithm name: " + convergence_method);
     }
@@ -547,14 +551,10 @@ std::vector<double> RHF::compute_Energy_Hessian() {
     // D_oo = -2 C_occ s1oo C_occ^T. We compute G(D_oo) and add its vir-occ
     // MO projection to the RHS: rhs[ai] -= (C^T G(D_oo) C)[a,i]
     {
-        const real_t* d_eri_ao_ptr = eri_method_->get_eri_matrix_device();
         real_t* d_Doo = nullptr;
-        real_t* d_zero = nullptr;
         real_t* d_Goo = nullptr;
         tracked_cudaMalloc(&d_Doo, nao * nao * sizeof(real_t));
-        tracked_cudaMalloc(&d_zero, nao * nao * sizeof(real_t));
         tracked_cudaMalloc(&d_Goo, nao * nao * sizeof(real_t));
-        cudaMemset(d_zero, 0, nao * nao * sizeof(real_t));
 
         for (int pert = 0; pert < n_pert; pert++) {
             // D_oo = -2 C_occ s1oo C_occ^T
@@ -568,9 +568,9 @@ std::vector<double> RHF::compute_Energy_Hessian() {
                     D_oo[mu * nao + nu] = -2.0 * s;
                 }
 
-            // G_oo = JK(D_oo)
+            // G_oo = JK(D_oo) via ERI-method-native response
             cudaMemcpy(d_Doo, D_oo.data(), nao * nao * sizeof(double), cudaMemcpyHostToDevice);
-            gpu::computeFockMatrix_RHF(d_Doo, d_zero, d_eri_ao_ptr, d_Goo, nao);
+            eri_method_->compute_jk_response(d_Doo, d_Goo, nao);
             std::vector<double> G_oo(nao * nao);
             cudaMemcpy(G_oo.data(), d_Goo, nao * nao * sizeof(double), cudaMemcpyDeviceToHost);
 
@@ -584,21 +584,13 @@ std::vector<double> RHF::compute_Energy_Hessian() {
         }
 
         tracked_cudaFree(d_Doo);
-        tracked_cudaFree(d_zero);
         tracked_cudaFree(d_Goo);
     }
 
     // --- Step 3: AO→MO ERI transform ---
     if (verbose) std::cout << "  Step 3: AO→MO ERI transform..." << std::endl;
 
-    const real_t* d_eri_ao = eri_method_->get_eri_matrix_device();
-    size_t eri_size = (size_t)nao * nao * nao * nao;
-    real_t* d_eri_work = nullptr;
-    real_t* d_eri_mo = nullptr;
-    tracked_cudaMalloc(&d_eri_work, eri_size * sizeof(real_t));
-    tracked_cudaMalloc(&d_eri_mo, eri_size * sizeof(real_t));
-    cudaMemcpy(d_eri_work, d_eri_ao, eri_size * sizeof(real_t), cudaMemcpyDeviceToDevice);
-    transform_eri_ao2mo_dgemm_full(d_eri_work, d_eri_mo, coefficient_matrix.device_ptr(), nao);
+    real_t* d_eri_mo = eri_method_->build_mo_eri(coefficient_matrix.device_ptr(), nao);
 
     // --- Step 4: Solve CPHF ---
     if (verbose) std::cout << "  Step 4: Solving CPHF equations..." << std::endl;
@@ -633,12 +625,9 @@ std::vector<double> RHF::compute_Energy_Hessian() {
 
     // Temporary GPU buffers for vhf1 computation
     real_t* d_D1 = nullptr;
-    real_t* d_zero_hcore = nullptr;
     real_t* d_vhf1 = nullptr;
     tracked_cudaMalloc(&d_D1, nao * nao * sizeof(real_t));
-    tracked_cudaMalloc(&d_zero_hcore, nao * nao * sizeof(real_t));
     tracked_cudaMalloc(&d_vhf1, nao * nao * sizeof(real_t));
-    cudaMemset(d_zero_hcore, 0, nao * nao * sizeof(real_t));
 
     for (int pert = 0; pert < n_pert; pert++) {
         // Build mo1_MO (nmo × nocc)
@@ -684,9 +673,9 @@ std::vector<double> RHF::compute_Energy_Hessian() {
             for (int nu = 0; nu < nao; nu++)
                 D1[mu * nao + nu] = 2.0 * (dm1_all[pert][mu * nao + nu] + dm1_all[pert][nu * nao + mu]);
 
-        // vhf1 = G(D1) via Fock build with zero h_core
+        // vhf1 = G(D1) via ERI-method-native response
         cudaMemcpy(d_D1, D1.data(), nao * nao * sizeof(double), cudaMemcpyHostToDevice);
-        gpu::computeFockMatrix_RHF(d_D1, d_zero_hcore, d_eri_ao, d_vhf1, nao);
+        eri_method_->compute_jk_response(d_D1, d_vhf1, nao);
         std::vector<double> vhf1(nao * nao);
         cudaMemcpy(vhf1.data(), d_vhf1, nao * nao * sizeof(double), cudaMemcpyDeviceToHost);
 
@@ -741,12 +730,10 @@ std::vector<double> RHF::compute_Energy_Hessian() {
         hessian[k] = skel_hessian[k] + resp_hessian[k];
 
     // Clean up GPU memory
-    tracked_cudaFree(d_eri_work);
     tracked_cudaFree(d_eri_mo);
     tracked_cudaFree(d_rhs);
     tracked_cudaFree(d_U);
     tracked_cudaFree(d_D1);
-    tracked_cudaFree(d_zero_hcore);
     tracked_cudaFree(d_vhf1);
 
     return hessian;
