@@ -13,17 +13,20 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 
 ### Supported computations
 * Hartree-Fock methods
-    * Restricted Hartree-Fock (RHF) 
+    * Restricted Hartree-Fock (RHF)
     * Unrestricted Hartree-Fock (UHF)
     * Restricted Open-Shell Hartree-Fock (ROHF)
-    * RI approximation (Density Fitting) (RHF, UHF, ROHF)
-    * Direct-RI (RHF)
-      * RI approximation (Density Fitting) without storing three-center integrals
-    * Direct SCF (RHF) 
+    * ERI storage methods
+      * Stored (full nao⁴ tensor)
+      * Hash (sparse COO/hash table with Compact, Indexed, and Fullscan Fock construction)
+      * RI approximation (Density Fitting) (RHF, UHF, ROHF)
+      * Direct-RI (RHF) — RI without storing three-center integrals
+      * Direct SCF (RHF)
 * Post-Hartree-Fock methods
-    * Møller-Plesset Perturbation Theory (RMP2, RMP3, RI-RMP2, UMP2)
+    * Møller-Plesset Perturbation Theory (RMP2, RMP3, RMP4, UMP2)
     * Coupled Cluster (RCC2, RCCSD, RCCSD(T))
     * Full Configuration Interaction (RFCI)
+    * RI support for all post-HF methods (AO ERI reconstructed from B matrix, nao⁴ intermediate skipped via direct MO ERI construction)
 * Excited state methods
     * Configuration Interaction Singles (CIS)
     * Algebraic Diagrammatic Construction (ADC(2), ADC(2)-x)
@@ -32,8 +35,9 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Equation-of-Motion CCSD (EOM-CCSD)
     * Singlet and triplet excited states (CIS, ADC(2), ADC(2)-x)
     * Oscillator strengths for all singlet excited state methods
+    * RI support for all excited state methods
 * Initial Guess
-    * Core Hamiltonian (RHF, UHF, ROHF) 
+    * Core Hamiltonian (RHF, UHF, ROHF)
     * Generalized Wolfsberg-Helmholz (GWH) (RHF, UHF, ROHF)
     * Superposition of Atomic Densities (SAD) (RHF, UHF, ROHF)
     * Given density matrix (RHF, UHF, ROHF)
@@ -44,7 +48,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 * Molecular integrals
     * Overlap integrals
       * McMurchie-Davidson algorithm (s-, p-, d-, f-, g-, h-, and i-orbitals)
-    * Kinetic energy and nuclear attraction integrals 
+    * Kinetic energy and nuclear attraction integrals
       * McMurchie-Davidson algorithm (s-, p-, d-, f-, g-, h-, and i-orbitals)
       * Obara-Saika algorithm (s-, p-, d-, and f-orbitals)
     * Electron repulsion integrals
@@ -63,8 +67,12 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Wiberg bond order (RHF, UHF, ROHF)
 * Energy Gradient
     * Analytical energy gradient (RHF, UHF)
+* Energy Hessian
+    * Analytical Hessian (RHF) — skeleton (1e/2e/Vnn) + CPHF response
+    * Vibrational frequency analysis (harmonic, with translation/rotation projection)
 * Geometry Optimization
     * Quasi-Newton methods: BFGS, DFP, SR1
+    * Newton-Raphson with analytical Hessian
     * Conjugate gradient methods: Fletcher-Reeves, Polak-Ribière, Hestenes-Stiefel, Dai-Yuan
     * GDIIS (Geometry DIIS)
     * Steepest Descent
@@ -89,7 +97,11 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 * Excited State Methods
   * Time-Dependent Hartree-Fock (TDHF)
 * Energy Gradient
+  * RI-native gradient (3-center integral derivatives)
   * Post-HF energy gradient (MP2, CCSD, etc.)
+* Energy Hessian
+  * Analytical h1ao/s1ao derivatives (currently uses finite differences)
+  * UHF Hessian
 * Density Functional Theory (DFT)
 * GPU implementation
   * Total spin (UHF)
@@ -205,7 +217,7 @@ Short options:
 | `-g` | `--gbsfilename` | Gaussian basis set file |
 | `-ag` | `--auxiliary_gbsfilename` | Gaussian auxiliary basis set file |
 | `-c` | `--charge` | Charge of the molecule |
-| `-r` | `--run_type` | Run type (energy, gradient, optimize) |
+| `-r` | `--run_type` | Run type (energy, gradient, optimize, hessian) |
 
 #### Examples
 
@@ -254,7 +266,7 @@ To specify the optimization algorithm:
 ./HF_main -x ../xyz/optimization/H2_stretched.xyz -g ../basis/sto-3g.gbs -r optimize --optimizer cg-fr
 ```
 
-Available optimizers: `bfgs` (default), `dfp`, `sr1`, `gdiis`, `cg-fr`, `cg-pr`, `cg-hs`, `cg-dy`, `sd`
+Available optimizers: `bfgs` (default), `dfp`, `sr1`, `gdiis`, `newton`, `cg-fr`, `cg-pr`, `cg-hs`, `cg-dy`, `sd`
 
 ##### Example 5: CC2 correlation energy
 ``` bash
@@ -288,7 +300,27 @@ Available optimizers: `bfgs` (default), `dfp`, `sr1`, `gdiis`, `cg-fr`, `cg-pr`,
 ./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_mp2 --eom_mp2_solver schur_omega
 ```
 
-##### Example 6: Fullerene (C60) molecule using RI approximation
+##### Example 7: Hessian and vibrational frequencies
+``` bash
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs -r hessian
+```
+
+##### Example 8: Geometry optimization with Newton-Raphson (analytical Hessian)
+``` bash
+./HF_main -x ../xyz/optimization/H2O_distorted.xyz -g ../basis/cc-pvdz.gbs -r optimize --optimizer newton
+```
+
+##### Example 9: Hash-based ERI storage
+``` bash
+./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs --eri_method hash --hash_fock_method compact
+```
+
+##### Example 10: RI with post-HF excited states
+``` bash
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method eom_ccsd
+```
+
+##### Example 11: Fullerene (C60) molecule using RI approximation
 If the molecule is large, it is recommended to use the RI approximation (density fitting) to reduce the memory usage.
 
 With an explicit auxiliary basis set file:
