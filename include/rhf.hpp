@@ -957,6 +957,21 @@ public:
     ERI_Direct_RHF(const ERI_Direct_RHF&) = delete; ///< copy constructor is deleted
     ~ERI_Direct_RHF() = default; ///< destructor
 
+    // Post-HF methods (uses lazy AO ERI reconstruction + build_mo_eri)
+    real_t compute_mp2_energy() override;
+    real_t compute_mp3_energy() override;
+    real_t compute_mp4_energy() override;
+    real_t compute_cc2_energy() override;
+    real_t compute_ccsd_energy() override;
+    real_t compute_ccsd_t_energy() override;
+    real_t compute_fci_energy() override;
+    void compute_cis(int n_states) override;
+    void compute_adc2(int n_states) override;
+    void compute_adc2x(int n_states) override;
+    void compute_eom_mp2(int n_states) override;
+    void compute_eom_cc2(int n_states) override;
+    void compute_eom_ccsd(int n_states) override;
+
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
         const DeviceHostMatrix<real_t>& core_hamiltonian_matrix = rhf_.get_core_hamiltonian_matrix();

@@ -558,6 +558,68 @@ ERI_Direct::~ERI_Direct() {
         cudaFree(fock_matrix_replicas_);
         fock_matrix_replicas_ = nullptr;
     }
+    if (d_eri_reconstructed_) tracked_cudaFree(d_eri_reconstructed_);
+}
+
+void ERI_Direct::reconstruct_ao_eri() {
+    if (eri_reconstructed_) return;
+
+    const size_t nao2 = (size_t)num_basis_ * num_basis_;
+    const size_t required_bytes = nao2 * nao2 * sizeof(real_t);
+
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    if (required_bytes > free_mem * 8 / 10) {
+        THROW_EXCEPTION("Not enough GPU memory to reconstruct AO ERI from Direct SCF. "
+            "Required: " + std::to_string(required_bytes / (1024*1024)) + " MB, "
+            "Available: " + std::to_string(free_mem / (1024*1024)) + " MB.");
+    }
+
+    tracked_cudaMalloc(&d_eri_reconstructed_, required_bytes);
+
+    const auto& shell_type_infos = hf_.get_shell_type_infos();
+    const auto& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
+
+    // Recompute unsorted Schwarz factors — Direct SCF's schwarz_upper_bound_factors
+    // have been reordered by thrust::sort_by_key in precomputation(), so they cannot
+    // be used for computeERIMatrix which expects the original shell-pair ordering.
+    DeviceHostMemory<real_t> schwarz_unsorted(hf_.get_num_primitive_shell_pairs());
+    gpu::computeSchwarzUpperBounds(
+        shell_type_infos,
+        shell_pair_type_infos,
+        hf_.get_primitive_shells().device_ptr(),
+        hf_.get_boys_grid().device_ptr(),
+        hf_.get_cgto_normalization_factors().device_ptr(),
+        schwarz_unsorted.device_ptr(),
+        false
+    );
+
+    gpu::computeERIMatrix(
+        shell_type_infos,
+        shell_pair_type_infos,
+        hf_.get_primitive_shells().device_ptr(),
+        hf_.get_boys_grid().device_ptr(),
+        hf_.get_cgto_normalization_factors().device_ptr(),
+        d_eri_reconstructed_,
+        schwarz_unsorted.device_ptr(),
+        hf_.get_schwarz_screening_threshold(),
+        num_basis_,
+        hf_.get_verbose()
+    );
+
+    eri_reconstructed_ = true;
+
+    if (hf_.get_verbose()) {
+        std::cout << "[Direct] Reconstructed AO ERI: " << nao2 << " x " << nao2
+                  << " (" << required_bytes / (1024*1024) << " MB)" << std::endl;
+    }
+}
+
+const real_t* ERI_Direct::get_eri_matrix_device() const {
+    if (!eri_reconstructed_) {
+        const_cast<ERI_Direct*>(this)->reconstruct_ao_eri();
+    }
+    return d_eri_reconstructed_;
 }
 
 void ERI_Direct::precomputation() 

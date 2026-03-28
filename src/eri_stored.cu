@@ -867,7 +867,44 @@ __global__ void mp2_moeri_kernel(const double* __restrict__ eri_mo,
   }
 }
 
+// Direct MP2 energy accumulation kernel
+// V is (nocc, nvir, nvir, bj) where j ranges from j_start to j_start+bj-1
+// V[i*nvir*nvir*bj + a*nvir*bj + b*bj + jj] = (ia|jb) for j = j_start + jj
+__global__ void mp2_stored_kernel_ovov_direct(
+    double* g_energy, const double* V, const double* g_eps,
+    const int nocc, const int nvir, const int j_start, const int bj)
+{
+    __shared__ double s_tmp;
+    if (threadIdx.x == 0 && threadIdx.y == 0) s_tmp = 0;
+    __syncthreads();
 
+    double tmp = 0.0;
+    const size_t seq = (size_t)blockIdx.x * blockDim.x * blockDim.y + threadIdx.y * blockDim.x + threadIdx.x;
+    const size_t total = (size_t)nocc * nvir * nocc * nvir;
+    if (seq < total) {
+        // Decode (i, a, j_local_within_nocc, b) from flat index over full (nocc,nvir,nocc,nvir)
+        const int ia = seq / ((size_t)nocc * nvir);
+        const int jb = seq % ((size_t)nocc * nvir);
+        const int i = ia / nvir;
+        const int a = ia % nvir;
+        const int j = jb / nvir;
+        const int b = jb % nvir;
+
+        // Check if j is in current block
+        const int jj = j - j_start;
+        if (jj >= 0 && jj < bj) {
+            const double iajb = V[(size_t)i*nvir*nvir*bj + (size_t)a*nvir*bj + (size_t)b*bj + jj];
+            const double ibja = V[(size_t)i*nvir*nvir*bj + (size_t)b*nvir*bj + (size_t)a*bj + jj];
+            tmp = iajb * (2.0 * iajb - ibja) / (g_eps[i] + g_eps[j] - g_eps[nocc + a] - g_eps[nocc + b]);
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset /= 2)
+        tmp += __shfl_down_sync(0xFFFFFFFF, tmp, offset);
+    if (threadIdx.x == 0) atomicAdd(&s_tmp, tmp);
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0) atomicAdd(g_energy, s_tmp);
+}
 
 //*
 __global__ void mp2_stored_kernel_ovov(
@@ -1001,6 +1038,163 @@ real_t ERI_Stored_RHF::compute_mp2_energy() {
     return E_MP2;
 }
 
+// ============================================================
+//  Direct MP2: compute MP2 energy without storing nao^4 AO ERI
+//
+//  Algorithm (block over occupied index j):
+//    For each j-block [j_start, j_start + block_j):
+//      1. Half-transform: H(mu,nu,la,j~) = sum_sigma (mu nu|la sigma) C(sigma,j~)
+//         Memory: nao^3 * block_j  (GPU kernel: RysERI_half_transform)
+//      2. Contract mu -> i: K(i,nu,la,j~) = sum_mu C(mu,i) * H(mu,nu,la,j~)
+//         Memory: nocc * nao^2 * block_j  (cublasDgemm)
+//      3. Contract nu -> a: L(i,a,la,j~) = sum_nu C(nu,a+nocc) * K(i,nu,la,j~)
+//         Memory: nocc * nvir * nao * block_j  (cublasDgemm)
+//      4. Contract la -> b: V(i,a,b,j~) = sum_la C(la,b+nocc) * L(i,a,la,j~)
+//         Memory: nocc * nvir * nvir * block_j  (cublasDgemm)
+//      5. Accumulate: E += sum_{i,a,b,j} V(ia|jb)(2*V(ia|jb)-V(ib|ja)) / D_ijab
+//
+//  Memory peak: nao^3 * block_j (Step 1 buffer)
+//  Total integral evaluations: ceil(nocc / block_j) full AO integral passes
+//
+//  NOTE: Uses Rys quadrature for all angular momenta (no s/p specialization).
+//        TODO: GPU最適化 — s/p特化カーネルの追加、block_jの自動調整
+// ============================================================
+real_t ERI_Direct_RHF::compute_mp2_energy() {
+    PROFILE_FUNCTION();
+    const int nao = rhf_.get_num_basis();
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = nao - nocc;
+    const real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+    const real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+
+    // --- Determine block size from available GPU memory ---
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    const size_t nao3 = (size_t)nao * nao * nao;
+    // Reserve memory for H (nao^3 * block_j) + intermediates
+    // Use at most 60% of free memory for H
+    int block_j = std::max(1, (int)(free_mem * 6 / 10 / (nao3 * sizeof(real_t))));
+    block_j = std::min(block_j, nocc);
+    if (block_j > 8) block_j = 8; // Cap for reasonable # of atomicAdd per integral
+
+    std::cout << "  [Direct MP2] nao=" << nao << " nocc=" << nocc << " nvir=" << nvir
+              << " block_j=" << block_j << std::endl;
+
+    // --- Recompute unsorted Schwarz factors ---
+    const auto& shell_type_infos = hf_.get_shell_type_infos();
+    const auto& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
+    DeviceHostMemory<real_t> schwarz_unsorted(hf_.get_num_primitive_shell_pairs());
+    gpu::computeSchwarzUpperBounds(
+        shell_type_infos, shell_pair_type_infos,
+        hf_.get_primitive_shells().device_ptr(),
+        hf_.get_boys_grid().device_ptr(),
+        hf_.get_cgto_normalization_factors().device_ptr(),
+        schwarz_unsorted.device_ptr(), false);
+
+    // --- Allocate buffers ---
+    // Steps 2-3-4 are fused per occupied orbital i to minimize memory.
+    real_t* d_half = nullptr;    // H(mu,nu,la,j~): nao^3 * block_j
+    real_t* d_Ki = nullptr;      // K_i(nu,la,j~):  nao^2 * block_j  (per i)
+    real_t* d_Li = nullptr;      // L_i(a,la,j~):   nvir * nao * block_j  (per i)
+    real_t* d_V = nullptr;       // V(i,a,b,j~):    nocc * nvir * nvir * block_j
+    real_t* d_E = nullptr;       // scalar energy accumulator
+
+    tracked_cudaMalloc(&d_half, nao3 * block_j * sizeof(real_t));
+    tracked_cudaMalloc(&d_Ki, (size_t)nao * nao * block_j * sizeof(real_t));
+    tracked_cudaMalloc(&d_Li, (size_t)nvir * nao * block_j * sizeof(real_t));
+    tracked_cudaMalloc(&d_V, (size_t)nocc * nvir * nvir * block_j * sizeof(real_t));
+    tracked_cudaMalloc(&d_E, sizeof(real_t));
+    cudaMemset(d_E, 0, sizeof(real_t));
+
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    const double alpha = 1.0, beta_zero = 0.0;
+
+    // --- Main loop over j-blocks ---
+    for (int j_start = 0; j_start < nocc; j_start += block_j) {
+        int bj = std::min(block_j, nocc - j_start);
+
+        // Step 1: Half-transform H(mu,nu,la,j~) = sum_sigma (mu nu|la sigma) C(sigma,j~)
+        cudaMemset(d_half, 0, nao3 * bj * sizeof(real_t));
+        gpu::computeHalfTransformedERI(
+            shell_type_infos, shell_pair_type_infos,
+            hf_.get_primitive_shells().device_ptr(),
+            hf_.get_boys_grid().device_ptr(),
+            hf_.get_cgto_normalization_factors().device_ptr(),
+            d_half, schwarz_unsorted.device_ptr(),
+            hf_.get_schwarz_screening_threshold(),
+            nao, d_C, j_start, bj);
+
+        // Steps 2-3-4 fused per occupied orbital i (minimizes memory).
+        // Step 2: K_i(nu,la,j~) = sum_mu C(mu,i) * H(mu,nu,la,j~)     — rank-1 contraction
+        // Step 3: L_i(a,la,j~) = sum_nu C_vir(nu,a) * K_i(nu,la,j~)   — DGEMM
+        // Step 4: V_i(a,b,j~) = sum_la C_vir(la,b) * L_i(a,la,j~)     — DGEMM per a
+        {
+            const size_t M_nao2bj = (size_t)nao * nao * bj;
+            const size_t M_naobj = (size_t)nao * bj;
+
+            for (int i = 0; i < nocc; i++) {
+                // Step 2: K_i(nu*la*bj) = sum_mu C(mu,i) * H(mu, nu*la*bj)
+                //   Rank-1 contraction: K_i = C_col_i^T * H
+                //   cuBLAS: K_cm(nao^2*bj, 1) = H_cm(nao^2*bj, nao) * C_i_cm^T(nao, 1)
+                cublasDgemm(handle,
+                    CUBLAS_OP_N, CUBLAS_OP_T,
+                    M_nao2bj, 1, nao,
+                    &alpha,
+                    d_half, M_nao2bj,
+                    d_C + i, nao,       // column i of C (row-major stride = nao)
+                    &beta_zero,
+                    d_Ki, M_nao2bj);
+
+                // Step 3: L_i(a, la*bj) = sum_nu C_vir(nu,a) * K_i(nu, la*bj)
+                //   cuBLAS: L_cm(nao*bj, nvir) = K_cm(nao*bj, nao) * C_vir_cm^T(nao, nvir)
+                cublasDgemm(handle,
+                    CUBLAS_OP_N, CUBLAS_OP_T,
+                    M_naobj, nvir, nao,
+                    &alpha,
+                    d_Ki, M_naobj,
+                    d_C + nocc, nao,    // C_vir: columns nocc..nao-1
+                    &beta_zero,
+                    d_Li, M_naobj);
+
+                // Step 4: V_i(a, b, j~) = sum_la C_vir(la,b) * L_i(a, la, j~)
+                for (int a = 0; a < nvir; a++) {
+                    cublasDgemm(handle,
+                        CUBLAS_OP_N, CUBLAS_OP_T,
+                        bj, nvir, nao,
+                        &alpha,
+                        d_Li + (size_t)a * nao * bj, bj,
+                        d_C + nocc, nao,
+                        &beta_zero,
+                        d_V + (size_t)i * nvir * nvir * bj + (size_t)a * nvir * bj, bj);
+                }
+            }
+        }
+
+        // Step 5: Accumulate MP2 energy
+        // V(i, a, b, j~) at d_V[i*nvir*nvir*bj + a*nvir*bj + b*bj + jj]
+        // (ia|jb) = V[i][a][b][j-j_start]
+        // E_MP2 += (ia|jb) * (2*(ia|jb) - (ib|ja)) / (eps_i + eps_j - eps_a - eps_b)
+        mp2_stored_kernel_ovov_direct<<<(nocc*nvir*nocc*nvir + 1023)/1024, dim3(32,32)>>>(
+            d_E, d_V, d_eps, nocc, nvir, j_start, bj);
+        cudaDeviceSynchronize();
+
+        std::cout << "  [Direct MP2] j_block " << j_start << ".." << j_start+bj-1
+                  << " / " << nocc << " done" << std::endl;
+    }
+
+    // --- Read final energy ---
+    real_t h_E = 0.0;
+    cudaMemcpy(&h_E, d_E, sizeof(real_t), cudaMemcpyDeviceToHost);
+    std::cout << "  [Direct MP2] E_MP2 = " << std::setprecision(12) << h_E << std::endl;
+
+    tracked_cudaFree(d_half);
+    tracked_cudaFree(d_Ki);
+    tracked_cudaFree(d_Li);
+    tracked_cudaFree(d_V);
+    tracked_cudaFree(d_E);
+
+    return h_E;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// MP3 energy calculation (naive implementation with on-the-fly integral transformation)
 __global__ void mp3_naive_4h2p_kernel(const double* __restrict__ eri_ao,
@@ -1981,6 +2175,13 @@ real_t ERI_Stored_RHF::compute_mp3_energy() {
 }
 
 real_t ERI_RI_RHF::compute_mp3_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    real_t result = compute_mp3_energy_impl(rhf_, nullptr, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
+}
+
+real_t ERI_Direct_RHF::compute_mp3_energy() {
     real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
     real_t result = compute_mp3_energy_impl(rhf_, nullptr, d_mo_eri);
     tracked_cudaFree(d_mo_eri);
@@ -5662,6 +5863,13 @@ real_t ERI_RI_RHF::compute_ccsd_energy() {
     return result;
 }
 
+real_t ERI_Direct_RHF::compute_ccsd_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    real_t result = compute_ccsd_energy_impl(rhf_, nullptr, 0, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////// CCSD(T) implementation
 
@@ -5695,6 +5903,13 @@ real_t ERI_Stored_RHF::compute_ccsd_t_energy() {
 }
 
 real_t ERI_RI_RHF::compute_ccsd_t_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    real_t result = compute_ccsd_t_energy_impl(rhf_, nullptr, 0, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
+}
+
+real_t ERI_Direct_RHF::compute_ccsd_t_energy() {
     real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
     real_t result = compute_ccsd_t_energy_impl(rhf_, nullptr, 0, d_mo_eri);
     tracked_cudaFree(d_mo_eri);

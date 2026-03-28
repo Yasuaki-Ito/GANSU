@@ -1555,3 +1555,70 @@ TEST(ValidationRI_PostHF, H2O_EOM_CCSD_STO3G) {
     EXPECT_NEAR(r.excitation_energies[4], REF_H2O_EOMCCSD_STO3G_state5, TOL_RI_EOM);
 }
 
+// ============================================================
+//  Direct SCF post-HF validation
+//  Direct SCF reconstructs AO ERI lazily for post-HF;
+//  results must match Stored ERI within TOL_POSTHF.
+// ============================================================
+
+TEST(ValidationDirect_PostHF, H2O_MP2_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "mp2", 0, 0, "core", "direct");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_HF);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_MP2_STO3G_corr, TOL_POSTHF);
+}
+
+TEST(ValidationDirect_PostHF, H2O_CCSD_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "ccsd", 0, 0, "core", "direct");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_HF);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_CCSD_STO3G_corr, TOL_POSTHF);
+}
+
+TEST(ValidationDirect_PostHF, H2O_CCSD_T_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "ccsd_t", 0, 0, "core", "direct");
+    real_t total = r.hf_total_energy + r.post_hf_energy;
+    EXPECT_NEAR(total, REF_H2O_CCSDT_STO3G_total, TOL_POSTHF);
+}
+
+TEST(ValidationDirect_PostHF, H2O_FCI_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "fci", 0, 0, "core", "direct");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_HF);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_FCI_STO3G_corr, TOL_POSTHF);
+}
+
+TEST(ValidationDirect_PostHF, H2O_CIS_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "cis", 0, 0, "core", "direct");
+    ASSERT_GE(r.excitation_energies.size(), 5u);
+    EXPECT_NEAR(r.excitation_energies[0], REF_H2O_CIS_STO3G_state1, TOL_CIS);
+    EXPECT_NEAR(r.excitation_energies[1], REF_H2O_CIS_STO3G_state2, TOL_CIS);
+    EXPECT_NEAR(r.excitation_energies[2], REF_H2O_CIS_STO3G_state3, TOL_CIS);
+}
+
+TEST(ValidationDirect_PostHF, H2O_EOM_CCSD_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "eom_ccsd", 0, 0, "core", "direct");
+    ASSERT_GE(r.excitation_energies.size(), 5u);
+    // Uses TOL_EOMCCSD (3e-3): known GANSU vs PySCF discrepancy for EOM-CCSD
+    EXPECT_NEAR(r.excitation_energies[0], REF_H2O_EOMCCSD_STO3G_state1, TOL_EOMCCSD);
+    EXPECT_NEAR(r.excitation_energies[1], REF_H2O_EOMCCSD_STO3G_state2, TOL_EOMCCSD);
+    EXPECT_NEAR(r.excitation_energies[2], REF_H2O_EOMCCSD_STO3G_state3, TOL_EOMCCSD);
+}
+
+TEST(ValidationDirect_PostHF, H2O_MP2_ccpVDZ) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "mp2", 0, 0, "core", "direct");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_HF);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_MP2_ccpVDZ_corr, TOL_POSTHF_DZ);
+}
+
+TEST(ValidationDirect_PostHF, H2O_CCSD_ccpVDZ) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "ccsd", 0, 0, "core", "direct");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_HF);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_CCSD_ccpVDZ_corr, TOL_POSTHF_DZ);
+}
+

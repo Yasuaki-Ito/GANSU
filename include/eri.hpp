@@ -348,14 +348,31 @@ public:
 
     std::string get_algorithm_name() override { return "Direct"; } ///< Get the algorithm name
 
+    /// Reconstruct full AO ERI by computing all integrals (lazy, for post-HF)
+    void reconstruct_ao_eri();
+    const real_t* get_eri_matrix_device() const override;
+
     bool supports_post_hf_method(PostHFMethod method) const override {
-        if( method == PostHFMethod::None // always supported
+        if( method == PostHFMethod::None
+         || method == PostHFMethod::MP2
+         || method == PostHFMethod::MP3
+         || method == PostHFMethod::MP4
+         || method == PostHFMethod::CC2
+         || method == PostHFMethod::CCSD
+         || method == PostHFMethod::CCSD_T
+         || method == PostHFMethod::CIS
+         || method == PostHFMethod::ADC2
+         || method == PostHFMethod::ADC2X
+         || method == PostHFMethod::EOM_MP2
+         || method == PostHFMethod::EOM_CC2
+         || method == PostHFMethod::EOM_CCSD
+         || method == PostHFMethod::FCI
           ){
             return true;
         }
         return false;
     }
-    
+
 protected:
     const HF& hf_; ///< HF. This excludes MOs.
     const int num_basis_;
@@ -370,6 +387,10 @@ protected:
     DeviceHostMatrix<real_t> density_matrix_diff_shell_;
     DeviceHostMatrix<real_t> fock_matrix_prev_;
     bool is_first_call_ = true; ///< Reset per SCF solve for density difference tracking
+
+    // Reconstructed full AO ERI (lazily allocated for post-HF)
+    mutable real_t* d_eri_reconstructed_ = nullptr;
+    mutable bool eri_reconstructed_ = false;
 };
 
 

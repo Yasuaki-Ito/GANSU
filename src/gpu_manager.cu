@@ -25,6 +25,7 @@
 #include "device_host_memory.hpp" // For tracked_gansu::tracked_cudaMalloc/tracked_cudaFree
 #include "gpu_kernels.hpp"
 #include "rys_eri.hpp"
+#include "rys_eri_mp2.hpp"
 
 #include "gradients.hpp"
 #include "rys_hessian_g.hpp"
@@ -844,6 +845,73 @@ void computeERIMatrix(const std::vector<ShellTypeInfo>& shell_type_infos, const 
     }
 }
 
+
+// ============================================================
+//  Direct MP2: Half-transform AO ERI with MO coefficients
+//  H(mu,nu,la,i) = sum_sigma (mu nu | la sigma) * C(sigma, i)
+//  Uses RysERI_half_transform kernel for all shell types.
+//  TODO: GPU最適化 — s/p特化カーネルを使えば高速化可能
+// ============================================================
+void computeHalfTransformedERI(
+    const std::vector<ShellTypeInfo>& shell_type_infos,
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+    const PrimitiveShell* d_primitive_shells,
+    const real_t* d_boys_grid,
+    const real_t* d_cgto_normalization_factors,
+    real_t* d_half,
+    const real_t* d_schwarz_upper_bound_factors,
+    const real_t schwarz_screening_threshold,
+    const int num_basis,
+    const real_t* d_C,
+    int i_start,
+    int block_occ)
+{
+    const int threads_per_block = 256;
+    const int shell_type_count = shell_type_infos.size();
+
+    // Generate shell quadruples (same as computeERIMatrix)
+    std::vector<std::tuple<int, int, int, int>> shell_quadruples;
+    for (int a = 0; a < shell_type_count; ++a)
+        for (int b = a; b < shell_type_count; ++b)
+            for (int c = 0; c < shell_type_count; ++c)
+                for (int d = c; d < shell_type_count; ++d)
+                    if (a < c || (a == c && b <= d))
+                        shell_quadruples.emplace_back(a, b, c, d);
+    std::reverse(shell_quadruples.begin(), shell_quadruples.end());
+
+    const int num_kernels = shell_quadruples.size();
+    std::vector<cudaStream_t> streams(num_kernels);
+    for (int i = 0; i < num_kernels; ++i) cudaStreamCreate(&streams[i]);
+
+    int stream_id = 0;
+    for (const auto& quadruple : shell_quadruples) {
+        int s0, s1, s2, s3;
+        std::tie(s0, s1, s2, s3) = quadruple;
+
+        const ShellTypeInfo ss0 = shell_type_infos[s0];
+        const ShellTypeInfo ss1 = shell_type_infos[s1];
+        const ShellTypeInfo ss2 = shell_type_infos[s2];
+        const ShellTypeInfo ss3 = shell_type_infos[s3];
+
+        const size_t num_bra = (s0 == s1) ? ss0.count*(ss0.count+1)/2 : ss0.count*ss1.count;
+        const size_t num_ket = (s2 == s3) ? ss2.count*(ss2.count+1)/2 : ss2.count*ss3.count;
+        const size_t num_braket = ((s0 == s2) && (s1 == s3)) ? num_bra*(num_bra+1)/2 : num_bra*num_ket;
+        const int num_blocks = (num_braket + threads_per_block - 1) / threads_per_block;
+
+        const size_t head_bra = shell_pair_type_infos[get_index_2to1_horizontal(s0, s1, shell_type_count)].start_index;
+        const size_t head_ket = shell_pair_type_infos[get_index_2to1_horizontal(s2, s3, shell_type_count)].start_index;
+
+        gpu::RysERI_half_transform<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+            d_half, d_C, i_start, block_occ,
+            d_primitive_shells, d_cgto_normalization_factors,
+            ss0, ss1, ss2, ss3,
+            num_braket, schwarz_screening_threshold, d_schwarz_upper_bound_factors,
+            num_basis, d_boys_grid, head_bra, head_ket);
+    }
+
+    cudaDeviceSynchronize();
+    for (int i = 0; i < num_kernels; i++) cudaStreamDestroy(streams[i]);
+}
 
 
 /**
