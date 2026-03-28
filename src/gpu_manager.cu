@@ -4071,6 +4071,169 @@ void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_
 
 
 
+// ============================================================
+//  RI-Direct Fock build v2: BLAS-only J/K construction.
+//  Computes raw 3-center ERIs ONCE, then B via L-solve,
+//  then J and K entirely via DGEMM.
+//
+//  1. (μν|Q) via get_3center_kernel (default stream, int types for kernel args)
+//  2. B = L^{-1} × (μν|Q) via solve_lower_triangular
+//  3. J: W = B·D, J = B^T·W  (cublasDgemv)
+//  4. X_q = C^T·B_q           (cublasDgemmStridedBatched)
+//  5. K = 2·X_packed^T·X_packed (cublasDgemm)
+//  6. F = H + J - K/2
+// ============================================================
+void computeFockMatrix_RI_Direct_v2(
+    const real_t* d_density_matrix, const real_t* d_coefficient_matrix,
+    const real_t* d_two_center_eris_cholesky,  // L (Cholesky factor, row-major)
+    const real_t* d_L_inv_precomputed,         // L^{-1} (precomputed, row-major) — kept for API compat
+    const real_t* d_core_hamiltonian_matrix, real_t* d_fock_matrix,
+    const std::vector<ShellTypeInfo>& shell_type_infos,
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+    const PrimitiveShell* d_primitive_shells, const real_t* d_cgto_normalization_factors,
+    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+    const PrimitiveShell* d_auxiliary_primitive_shells, const real_t* d_auxiliary_cgto_normalization_factors,
+    const size_t2* d_primitive_shell_pair_indices,
+    int num_basis, int num_auxiliary_basis, int num_occ,
+    const real_t* d_boys_grid,
+    double schwarz_screening_threshold,
+    const real_t* d_schwarz_upper_bound_factors, const real_t* d_auxiliary_schwarz_upper_bound_factors,
+    bool verbose)
+{
+    cublasHandle_t handle = GPUHandle::cublas();
+    // Use int for kernel arguments (get_3center_kernel expects int, NOT size_t)
+    const int nao = num_basis;
+    const int naux = num_auxiliary_basis;
+    const size_t nao2 = (size_t)nao * nao;
+    const double one = 1.0, zero = 0.0, two = 2.0;
+
+    // -----------------------------------------------
+    // Step 1: Compute raw 3-center ERIs (μν|Q) → d_B
+    //   IMPORTANT: kernel expects int for num_basis/num_auxiliary_basis.
+    //   Passing size_t would misalign subsequent pointer arguments.
+    // -----------------------------------------------
+    real_t* d_B = nullptr;
+    gansu::tracked_cudaMalloc(&d_B, (size_t)naux * nao2 * sizeof(real_t));
+
+    {
+        const int threads_per_block = 128;
+        const int shell_type_count = shell_type_infos.size();
+        const int auxiliary_shell_type_count = auxiliary_shell_type_infos.size();
+
+        for (int s0 = 0; s0 < shell_type_count; ++s0) {
+            for (int s1 = s0; s1 < shell_type_count; ++s1) {
+                for (int s2 = 0; s2 < auxiliary_shell_type_count; ++s2) {
+                    const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+                    const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+                    const ShellTypeInfo shell_s2 = auxiliary_shell_type_infos[s2];
+
+                    const int64_t num_tasks = ((s0 == s1)
+                        ? ((int64_t)shell_s0.count * (shell_s0.count + 1) / 2)
+                        : ((int64_t)shell_s0.count * shell_s1.count))
+                        * (int64_t)shell_s2.count;
+                    const int num_blocks = (int)((num_tasks + threads_per_block - 1) / threads_per_block);
+
+                    const int pair_idx = calcIdx_triangular_(s0, s1, shell_type_count);
+
+                    // 3-center kernels expect RELATIVE bra indices (local within type)
+                    // and add start_index internally.  Direct RI's pair indices are ABSOLUTE,
+                    // so pass start_index=0 for bra shells to avoid double-counting.
+                    ShellTypeInfo shell_s0_nooff = shell_s0;  shell_s0_nooff.start_index = 0;
+                    ShellTypeInfo shell_s1_nooff = shell_s1;  shell_s1_nooff.start_index = 0;
+
+                    gpu::get_3center_kernel(s0, s1, s2)<<<num_blocks, threads_per_block>>>(
+                        d_B, d_primitive_shells, d_auxiliary_primitive_shells,
+                        d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors,
+                        shell_s0_nooff, shell_s1_nooff, shell_s2,
+                        num_tasks, nao,
+                        &d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index],
+                        &d_schwarz_upper_bound_factors[shell_pair_type_infos[pair_idx].start_index],
+                        d_auxiliary_schwarz_upper_bound_factors,
+                        schwarz_screening_threshold, naux, d_boys_grid);
+                }
+            }
+        }
+        cudaDeviceSynchronize();
+    }
+
+    // -----------------------------------------------
+    // Step 2: B = L^{-1} × (μν|Q) via solve_lower_triangular
+    // -----------------------------------------------
+    real_t* d_L_copy = nullptr;
+    gansu::tracked_cudaMalloc(&d_L_copy, (size_t)naux * naux * sizeof(real_t));
+    cudaMemcpy(d_L_copy, d_two_center_eris_cholesky, (size_t)naux * naux * sizeof(real_t), cudaMemcpyDeviceToDevice);
+    solve_lower_triangular(d_L_copy, d_B, naux, nao2);
+    gansu::tracked_cudaFree(d_L_copy);
+
+    // -----------------------------------------------
+    // Step 3: J via cublasDgemv
+    // -----------------------------------------------
+    real_t* d_J = nullptr;
+    real_t* d_W = nullptr;
+    gansu::tracked_cudaMalloc(&d_J, nao2 * sizeof(real_t));
+    gansu::tracked_cudaMalloc(&d_W, naux * sizeof(real_t));
+
+    cublasDgemv(handle, CUBLAS_OP_T, nao2, naux, &one, d_B, nao2, d_density_matrix, 1, &zero, d_W, 1);
+    cublasDgemv(handle, CUBLAS_OP_N, nao2, naux, &one, d_B, nao2, d_W, 1, &zero, d_J, 1);
+    gansu::tracked_cudaFree(d_W);
+
+    // -----------------------------------------------
+    // Step 4: X_q(i, ν) = Σ_μ C(μ,i) B_q(μ,ν) via cublasDgemmStridedBatched
+    // -----------------------------------------------
+    real_t* d_X = nullptr;
+    gansu::tracked_cudaMalloc(&d_X, (size_t)naux * nao * num_occ * sizeof(real_t));
+
+    cublasDgemmStridedBatched(handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        num_occ, nao, nao,
+        &one,
+        d_coefficient_matrix, nao, 0,
+        d_B, nao, (long long)nao * nao,
+        &zero,
+        d_X, num_occ, (long long)nao * num_occ,
+        naux);
+
+    gansu::tracked_cudaFree(d_B);
+
+    // -----------------------------------------------
+    // Step 5: K = 2·X_packed^T·X_packed
+    // -----------------------------------------------
+    real_t* d_X_packed = nullptr;
+    gansu::tracked_cudaMalloc(&d_X_packed, (size_t)naux * nao * num_occ * sizeof(real_t));
+
+    {
+        const size_t total = (size_t)naux * nao * num_occ;
+        const int th = 256;
+        const int bl = (total + th - 1) / th;
+        packThreeDimensionalTensorX<<<bl, th>>>(d_X, d_X_packed, nao, naux, num_occ);
+    }
+    gansu::tracked_cudaFree(d_X);
+
+    real_t* d_K = nullptr;
+    gansu::tracked_cudaMalloc(&d_K, nao2 * sizeof(real_t));
+
+    cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                nao, nao, naux * num_occ,
+                &two, d_X_packed, naux * num_occ,
+                d_X_packed, naux * num_occ,
+                &zero, d_K, nao);
+    gansu::tracked_cudaFree(d_X_packed);
+
+    // -----------------------------------------------
+    // Step 6: F = H + J - K/2
+    // -----------------------------------------------
+    {
+        const int th = 256;
+        const int bl = (nao2 + th - 1) / th;
+        computeFockMatrix_RI_RHF_kernel<<<bl, th>>>(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, nao);
+        cudaDeviceSynchronize();
+    }
+
+    gansu::tracked_cudaFree(d_J);
+    gansu::tracked_cudaFree(d_K);
+}
+
+
 /// @brief Check the validity and contents of the W matrix.
 /// @param label 
 /// @param W_matrix 

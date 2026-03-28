@@ -123,6 +123,24 @@ void computeFockMatrix_Hash_FullScan_RHF(const real_t* d_density_matrix, const r
 void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_t* d_coefficient_matrix, const real_t* d_L_inv,  real_t* d_decomposed_two_center_eris, const real_t* d_core_hamiltonian_matrix,  real_t* d_fock_matrix,  real_t* d_coefficient_matrix_prev, real_t* h_Z_tensor_prev, const std::vector<ShellTypeInfo>& shell_type_infos,  const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,  const PrimitiveShell* h_primitive_shells,  const PrimitiveShell* d_primitive_shells,  const real_t* d_cgto_normalization_factors,  const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,  const PrimitiveShell* d_auxiliary_primitive_shells,  const real_t* d_auxiliary_cgto_normalization_factors,  const size_t2* d_primitive_shell_pair_indices, const int num_basis, const int num_auxiliary_basis, const int num_electrons, const int num_primitive_shells, const real_t* d_boys_grid, const double schwarz_screening_threshold,  const real_t* d_schwarz_upper_bound_factors, const real_t* d_auxiliary_schwarz_upper_bound_factors,const bool verbose);
 void computeInverseByDtrsm(real_t* two_center_eris, real_t* two_center_eris_inverse, int num_auxiliary_basis);
 
+/// Semi-Direct RI Fock build: computes 3-center ERIs ONCE per iteration into temporary B, then BLAS-only J/K.
+void computeFockMatrix_RI_Direct_v2(
+    const real_t* d_density_matrix, const real_t* d_coefficient_matrix,
+    const real_t* d_two_center_eris_cholesky,  // L (Cholesky factor, row-major)
+    const real_t* d_L_inv,                     // L^{-1} (precomputed, row-major)
+    const real_t* d_core_hamiltonian_matrix, real_t* d_fock_matrix,
+    const std::vector<ShellTypeInfo>& shell_type_infos,
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+    const PrimitiveShell* d_primitive_shells, const real_t* d_cgto_normalization_factors,
+    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+    const PrimitiveShell* d_auxiliary_primitive_shells, const real_t* d_auxiliary_cgto_normalization_factors,
+    const size_t2* d_primitive_shell_pair_indices,
+    int num_basis, int num_auxiliary_basis, int num_occ,
+    const real_t* d_boys_grid,
+    double schwarz_screening_threshold,
+    const real_t* d_schwarz_upper_bound_factors, const real_t* d_auxiliary_schwarz_upper_bound_factors,
+    bool verbose);
+
 
 void computeInitialFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_t* d_C, const real_t* d_L_inv,  const real_t* d_core_hamiltonian_matrix,  real_t* d_fock_matrix,  const std::vector<ShellTypeInfo>& shell_type_infos,  const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,  const PrimitiveShell* h_primitive_shells,  const PrimitiveShell* d_primitive_shells,  const real_t* d_cgto_normalization_factors,  const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,  const PrimitiveShell* d_auxiliary_primitive_shells,  const real_t* d_auxiliary_cgto_normalization_factors,  const size_t2* d_primitive_shell_pair_indices, size_t2* h_primitive_shell_pair_indices_for_SAD_K_computation, const size_t2* d_primitive_shell_pair_indices_for_SAD_K_computation, const int num_basis, const int num_auxiliary_basis, const int num_electrons, const int num_primitive_shells, const real_t* d_boys_grid, const double schwarz_screening_threshold,  const real_t* d_schwarz_upper_bound_factors, const real_t* d_auxiliary_schwarz_upper_bound_factors, const bool verbose, real_t* d_decomposed_two_center_eris);
 

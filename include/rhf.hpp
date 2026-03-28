@@ -1102,14 +1102,15 @@ protected:
 
 class ERI_RI_Direct_RHF : public ERI_RI_Direct {
 public:
-    ERI_RI_Direct_RHF(RHF& rhf, const Molecular& auxiliary_molecular): ERI_RI_Direct(rhf, auxiliary_molecular), rhf_(rhf), coefficient_matrix_prev(rhf.get_num_basis() * rhf.get_num_basis())  {
-        cudaMemset(coefficient_matrix_prev.device_ptr(), 0.0, sizeof(real_t) * coefficient_matrix_prev.size());
-
+    ERI_RI_Direct_RHF(RHF& rhf, const Molecular& auxiliary_molecular)
+        : ERI_RI_Direct(rhf, auxiliary_molecular), rhf_(rhf),
+          coefficient_matrix_prev(rhf.get_num_basis() * rhf.get_num_basis()) {
+        cudaMemset(coefficient_matrix_prev.device_ptr(), 0, sizeof(real_t) * coefficient_matrix_prev.size());
         cudaMallocHost((void**)&h_Z_tensor, sizeof(real_t) * (rhf_.get_num_electrons() / 2) * num_basis_ * num_auxiliary_basis_);
-        memset(h_Z_tensor, 0.0, sizeof(real_t) * (rhf_.get_num_electrons() / 2) * num_basis_ * num_auxiliary_basis_);
-    } ///< Constructor
-    ERI_RI_Direct_RHF(const ERI_RI_Direct_RHF&) = delete; ///< copy constructor is deleted
-    ~ERI_RI_Direct_RHF() = default; ///< destructor
+        memset(h_Z_tensor, 0, sizeof(real_t) * (rhf_.get_num_electrons() / 2) * num_basis_ * num_auxiliary_basis_);
+    }
+    ERI_RI_Direct_RHF(const ERI_RI_Direct_RHF&) = delete;
+    ~ERI_RI_Direct_RHF() { if(h_Z_tensor) cudaFreeHost(h_Z_tensor); }
 
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
@@ -1121,106 +1122,97 @@ public:
         DeviceHostMatrix<real_t>& fock_matrix = rhf_.get_fock_matrix();
         const real_t schwarz_screening_threshold = rhf_.get_schwarz_screening_threshold();
         const int verbose = rhf_.get_verbose();
-
         const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
-
         const DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
-
         const int num_electrons = rhf_.get_num_electrons();
 
-
         if(rhf_.get_hasMatrixC() == false){
-        gpu::computeInitialFockMatrix_RI_Direct_RHF(
-            density_matrix.device_ptr(),
-            coefficient_matrix.device_ptr(),
-            two_center_eris_inverse.device_ptr(),
-            core_hamiltonian_matrix.device_ptr(),
-            fock_matrix.device_ptr(),
-            shell_type_infos,
-            shell_pair_type_infos,
-            primitive_shells.host_ptr(),
-            primitive_shells.device_ptr(),
-            cgto_normalization_factors.device_ptr(),
-            auxiliary_shell_type_infos_,
-            auxiliary_primitive_shells_.device_ptr(),
-            auxiliary_cgto_normalization_factors_.device_ptr(),
-            primitive_shell_pair_indices.device_ptr(),
-            primitive_shell_pair_indices_for_SAD_K_computation.host_ptr(),
-            primitive_shell_pair_indices_for_SAD_K_computation.device_ptr(),
-            num_basis_,
-            num_auxiliary_basis_,
-            num_electrons,
-            primitive_shells.size(),
-            boys_grid.device_ptr(),
-            rhf_.get_schwarz_screening_threshold(),
-            schwarz_upper_bound_factors.device_ptr(),
-            auxiliary_schwarz_upper_bound_factors.device_ptr(),
-            verbose,
-            two_center_eris.device_ptr()
-        );
-
-
-        }else{
-            gpu::computeFockMatrix_RI_Direct_RHF(
-                density_matrix.device_ptr(),
-                coefficient_matrix.device_ptr(),
+            gpu::computeInitialFockMatrix_RI_Direct_RHF(
+                density_matrix.device_ptr(), coefficient_matrix.device_ptr(),
                 two_center_eris_inverse.device_ptr(),
-                two_center_eris.device_ptr(),
-                core_hamiltonian_matrix.device_ptr(),
-                fock_matrix.device_ptr(),
-                coefficient_matrix_prev.device_ptr(),
-                h_Z_tensor,
-                shell_type_infos,
-                shell_pair_type_infos,
-                primitive_shells.host_ptr(),
-                primitive_shells.device_ptr(),
+                core_hamiltonian_matrix.device_ptr(), fock_matrix.device_ptr(),
+                shell_type_infos, shell_pair_type_infos,
+                primitive_shells.host_ptr(), primitive_shells.device_ptr(),
                 cgto_normalization_factors.device_ptr(),
-                auxiliary_shell_type_infos_,
-                auxiliary_primitive_shells_.device_ptr(),
+                auxiliary_shell_type_infos_, auxiliary_primitive_shells_.device_ptr(),
                 auxiliary_cgto_normalization_factors_.device_ptr(),
                 primitive_shell_pair_indices.device_ptr(),
-                num_basis_,
-                num_auxiliary_basis_,
-                num_electrons,
-                primitive_shells.size(),
-                boys_grid.device_ptr(),
-                rhf_.get_schwarz_screening_threshold(),
+                primitive_shell_pair_indices_for_SAD_K_computation.host_ptr(),
+                primitive_shell_pair_indices_for_SAD_K_computation.device_ptr(),
+                num_basis_, num_auxiliary_basis_, num_electrons, primitive_shells.size(),
+                boys_grid.device_ptr(), schwarz_screening_threshold,
                 schwarz_upper_bound_factors.device_ptr(),
                 auxiliary_schwarz_upper_bound_factors.device_ptr(),
-                verbose
-            );
+                verbose, two_center_eris.device_ptr());
+        } else {
+            gpu::computeFockMatrix_RI_Direct_RHF(
+                density_matrix.device_ptr(), coefficient_matrix.device_ptr(),
+                two_center_eris_inverse.device_ptr(), two_center_eris.device_ptr(),
+                core_hamiltonian_matrix.device_ptr(), fock_matrix.device_ptr(),
+                coefficient_matrix_prev.device_ptr(), h_Z_tensor,
+                shell_type_infos, shell_pair_type_infos,
+                primitive_shells.host_ptr(), primitive_shells.device_ptr(),
+                cgto_normalization_factors.device_ptr(),
+                auxiliary_shell_type_infos_, auxiliary_primitive_shells_.device_ptr(),
+                auxiliary_cgto_normalization_factors_.device_ptr(),
+                primitive_shell_pair_indices.device_ptr(),
+                num_basis_, num_auxiliary_basis_, num_electrons, primitive_shells.size(),
+                boys_grid.device_ptr(), schwarz_screening_threshold,
+                schwarz_upper_bound_factors.device_ptr(),
+                auxiliary_schwarz_upper_bound_factors.device_ptr(),
+                verbose);
         }
-
-
-        { // nan check
-            fock_matrix.toHost();
-            for(size_t i=0; i<num_basis_; i++){
-                for(size_t j=0; j<num_basis_; j++){
-                    if(std::isnan(fock_matrix(i, j))){
-                        THROW_EXCEPTION("Fock matrix contains NaN at (" + std::to_string(i) + ", " + std::to_string(j) + ")");
-                    }
-                }
-            }
-        }
-        if(verbose){
-            // copy the fock matrix to the host memory
-            fock_matrix.toHost();
-            std::cout << "Fock matrix:" << std::endl;
-            for(size_t i=0; i<num_basis_; i++){
-                for(size_t j=0; j<num_basis_; j++){
-                    std::cout << fock_matrix(i, j) << " ";
-                }
-                std::cout << std::endl;
-            }
-        }
-
     }
 
 protected:
-    RHF& rhf_; ///< RHF
-
+    RHF& rhf_;
     DeviceHostMemory<real_t> coefficient_matrix_prev;
-    real_t* h_Z_tensor;
+    real_t* h_Z_tensor = nullptr;
+};
+
+
+/// Semi-Direct RI: computes 3-center ERIs each iteration into temporary B matrix,
+/// then J/K entirely via BLAS.  Faster than Direct RI but uses O(naux×nao²) peak memory.
+class ERI_RI_SemiDirect_RHF : public ERI_RI_Direct {
+public:
+    ERI_RI_SemiDirect_RHF(RHF& rhf, const Molecular& auxiliary_molecular)
+        : ERI_RI_Direct(rhf, auxiliary_molecular), rhf_(rhf) {}
+    ERI_RI_SemiDirect_RHF(const ERI_RI_SemiDirect_RHF&) = delete;
+    ~ERI_RI_SemiDirect_RHF() = default;
+
+    std::string get_algorithm_name() override { return "Semi-Direct-RI"; }
+
+    void compute_fock_matrix() override {
+        const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
+        const DeviceHostMatrix<real_t>& core_hamiltonian_matrix = rhf_.get_core_hamiltonian_matrix();
+        const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
+        const DeviceHostMemory<PrimitiveShell>& primitive_shells = hf_.get_primitive_shells();
+        const DeviceHostMemory<real_t>& cgto_normalization_factors = hf_.get_cgto_normalization_factors();
+        const DeviceHostMemory<real_t>& boys_grid = hf_.get_boys_grid();
+        DeviceHostMatrix<real_t>& fock_matrix = rhf_.get_fock_matrix();
+        const int verbose = rhf_.get_verbose();
+        const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
+        const DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
+        const int num_occ = rhf_.get_num_electrons() / 2;
+
+        gpu::computeFockMatrix_RI_Direct_v2(
+            density_matrix.device_ptr(), coefficient_matrix.device_ptr(),
+            two_center_eris.device_ptr(), two_center_eris_inverse.device_ptr(),
+            core_hamiltonian_matrix.device_ptr(), fock_matrix.device_ptr(),
+            shell_type_infos, shell_pair_type_infos,
+            primitive_shells.device_ptr(), cgto_normalization_factors.device_ptr(),
+            auxiliary_shell_type_infos_, auxiliary_primitive_shells_.device_ptr(),
+            auxiliary_cgto_normalization_factors_.device_ptr(),
+            primitive_shell_pair_indices.device_ptr(),
+            num_basis_, num_auxiliary_basis_, num_occ,
+            boys_grid.device_ptr(), rhf_.get_schwarz_screening_threshold(),
+            schwarz_upper_bound_factors.device_ptr(),
+            auxiliary_schwarz_upper_bound_factors.device_ptr(),
+            verbose);
+    }
+
+protected:
+    RHF& rhf_;
 };
 
 
