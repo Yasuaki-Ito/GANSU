@@ -664,6 +664,18 @@ public:
     ~ERI_RI_RHF() = default; ///< destructor
 
     real_t compute_mp2_energy() override;
+    real_t compute_mp3_energy() override;
+    real_t compute_mp4_energy() override;
+    real_t compute_cc2_energy() override;
+    real_t compute_ccsd_energy() override;
+    real_t compute_ccsd_t_energy() override;
+    real_t compute_fci_energy() override;
+    void compute_cis(int n_states) override;
+    void compute_adc2(int n_states) override;
+    void compute_adc2x(int n_states) override;
+    void compute_eom_mp2(int n_states) override;
+    void compute_eom_cc2(int n_states) override;
+    void compute_eom_ccsd(int n_states) override;
 
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
@@ -672,7 +684,6 @@ public:
         DeviceHostMatrix<real_t>& fock_matrix = rhf_.get_fock_matrix();
         const int verbose = rhf_.get_verbose();
 
-        //if (false) {
         if (rhf_.get_hasMatrixC()) {
             gpu::computeFockMatrix_RI_RHF_with_coefficient_matrix(
                 coefficient_matrix.device_ptr(),

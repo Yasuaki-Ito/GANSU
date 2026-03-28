@@ -244,8 +244,8 @@ public:
     ERI_RI(const HF& hf, const Molecular& auxiliary_molecular); ///< Constructor
     
     ERI_RI(const ERI_RI&) = delete; ///< copy constructor is deleted
-    virtual ~ERI_RI() = default; ///< destructor
-    
+    virtual ~ERI_RI(); ///< destructor
+
     void precomputation() override;
 
     DeviceHostMemory<PrimitiveShell>& get_auxiliary_primitive_shells() { return auxiliary_primitive_shells_; } ///< Get the auxiliary primitive shells
@@ -253,12 +253,30 @@ public:
 
     std::string get_algorithm_name() override { return "RI"; } ///< Get the algorithm name
 
-    //suzuki
     DeviceHostMatrix<real_t>& get_intermediate_matrix_B() { return intermediate_matrix_B_; }
 
+    /// Reconstruct full AO ERI from B matrix: (μν|λσ) = Σ_Q B(Q,μν) B(Q,λσ)
+    void reconstruct_ao_eri();
+    const real_t* get_eri_matrix_device() const override;
+
+    /// Build full MO ERI directly from B: B→B_mo→(pq|rs) without nao⁴ intermediate
+    /// Returns device pointer to MO ERI [nmo⁴]. Caller must free with tracked_cudaFree.
+    real_t* build_mo_eri(const real_t* d_C, int nmo) const;
+
     bool supports_post_hf_method(PostHFMethod method) const override {
-        if( method == PostHFMethod::None // always supported
-         || method == PostHFMethod::MP2  // The RI ERI method supports MP2
+        if( method == PostHFMethod::None
+         || method == PostHFMethod::MP2
+         || method == PostHFMethod::MP3
+         || method == PostHFMethod::CC2
+         || method == PostHFMethod::CCSD
+         || method == PostHFMethod::CCSD_T
+         || method == PostHFMethod::CIS
+         || method == PostHFMethod::ADC2
+         || method == PostHFMethod::ADC2X
+         || method == PostHFMethod::EOM_MP2
+         || method == PostHFMethod::EOM_CC2
+         || method == PostHFMethod::EOM_CCSD
+         || method == PostHFMethod::FCI
           ){
             return true;
         }
@@ -293,6 +311,10 @@ protected:
     // d_tmp1_ and d_tmp2_ will be intermediate matrices X and X_packed (coefficient-matrix based).
     DeviceHostMatrix<real_t> d_tmp1_;
     DeviceHostMatrix<real_t> d_tmp2_;
+
+    // Reconstructed full AO ERI (lazily allocated for post-HF)
+    mutable real_t* d_eri_reconstructed_ = nullptr;
+    mutable bool eri_reconstructed_ = false;
 };
 
 

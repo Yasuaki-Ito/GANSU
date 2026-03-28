@@ -523,33 +523,39 @@ void FCIHamiltonianOperator::apply_preconditioner(const real_t* d_input, real_t*
 //  compute_fci_energy()
 // ========================================================================
 
-real_t ERI_Stored_RHF::compute_fci_energy() {
+static real_t compute_fci_energy_impl(RHF& rhf, const real_t* d_eri_ao, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
-    const int num_occ = rhf_.get_num_electrons() / 2;
-    const int num_basis = rhf_.get_num_basis();
-    DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
+    const int num_occ = rhf.get_num_electrons() / 2;
+    const int num_basis = rhf.get_num_basis();
+    DeviceHostMatrix<real_t>& coefficient_matrix = rhf.get_coefficient_matrix();
     const real_t* d_C = coefficient_matrix.device_ptr();
-    const real_t* d_eri_ao = eri_matrix_.device_ptr();
 
 
     std::cout << "\n=== Full-CI Calculation ===" << std::endl;
     std::cout << "Number of basis functions (spatial orbitals): " << num_basis << std::endl;
-    std::cout << "Number of electrons: " << rhf_.get_num_electrons() << std::endl;
+    std::cout << "Number of electrons: " << rhf.get_num_electrons() << std::endl;
     std::cout << "Number of occupied orbitals: " << num_occ << std::endl;
 
     // ------------------------------------------------------------------
     // Step 1: Transform AO ERIs to MO ERIs
     // ------------------------------------------------------------------
-    real_t* d_eri_mo = nullptr;
-    tracked_cudaMalloc(&d_eri_mo,
-                       (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
-    transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
+    real_t* d_eri_mo;
+    bool free_eri_mo;
+    if (d_eri_mo_precomputed) {
+        d_eri_mo = d_eri_mo_precomputed;
+        free_eri_mo = false;
+    } else {
+        tracked_cudaMalloc(&d_eri_mo,
+                           (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
+        transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
+        free_eri_mo = true;
+    }
 
     // ------------------------------------------------------------------
     // Step 2: Compute 1-electron MO integrals  h_MO = C^T * h_AO * C
     // ------------------------------------------------------------------
-    DeviceHostMatrix<real_t>& core_H = rhf_.get_core_hamiltonian_matrix();
+    DeviceHostMatrix<real_t>& core_H = rhf.get_core_hamiltonian_matrix();
     const real_t* d_h_ao = core_H.device_ptr();
 
     // Temporary for h_AO * C
@@ -587,10 +593,10 @@ real_t ERI_Stored_RHF::compute_fci_energy() {
     // ------------------------------------------------------------------
     
     double E_fci_electronic = 0.0;
-    real_t nuclearE = rhf_.get_nuclear_repulsion_energy();
+    real_t nuclearE = rhf.get_nuclear_repulsion_energy();
     E_fci_electronic = fci(d_h1_mo, d_eri_mo, num_basis, num_occ*2, num_alpha_det, num_det, nuclearE);
 
-    real_t E_hf_electronic  = rhf_.get_energy();
+    real_t E_hf_electronic  = rhf.get_energy();
     real_t E_corr = E_fci_electronic - E_hf_electronic;
 
     std::cout << std::fixed << std::setprecision(10);
@@ -599,15 +605,25 @@ real_t ERI_Stored_RHF::compute_fci_energy() {
     std::cout << "FCI electronic energy: " << E_fci_electronic << " Hartree" << std::endl;
     std::cout << "FCI correlation energy: " << E_corr << " Hartree" << std::endl;
     std::cout << "FCI total energy:      "
-              << E_fci_electronic + rhf_.get_nuclear_repulsion_energy()
+              << E_fci_electronic + rhf.get_nuclear_repulsion_energy()
               << " Hartree" << std::endl;
 
     // Cleanup
-    tracked_cudaFree(d_eri_mo);
+    if (free_eri_mo) tracked_cudaFree(d_eri_mo);
     tracked_cudaFree(d_h1_mo);
 
     return E_corr;
 }
 
+real_t ERI_Stored_RHF::compute_fci_energy() {
+    return compute_fci_energy_impl(rhf_, eri_matrix_.device_ptr());
+}
+
+real_t ERI_RI_RHF::compute_fci_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    real_t result = compute_fci_energy_impl(rhf_, nullptr, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
+}
 
 } // namespace gansu

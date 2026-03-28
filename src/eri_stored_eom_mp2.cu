@@ -264,25 +264,24 @@ static void solve_eom_mp2_schur_omega(
 //  Main entry point: compute_eom_mp2
 // ========================================================================
 
-void ERI_Stored_RHF::compute_eom_mp2(int n_states) {
+static void compute_eom_mp2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
-    const int num_basis = rhf_.get_num_basis();
-    const int num_occ = rhf_.get_num_electrons() / 2;
+    const int num_basis = rhf.get_num_basis();
+    const int num_occ = rhf.get_num_electrons() / 2;
     const int num_vir = num_basis - num_occ;
     const int singles_dim = num_occ * num_vir;
     const int doubles_dim = num_occ * num_occ * num_vir * num_vir;
 
-    std::string solver_mode = rhf_.get_eom_mp2_solver();
+    std::string solver_mode = rhf.get_eom_mp2_solver();
 
     // "schur" is an alias for "schur_static" (backward compatibility)
     if (solver_mode == "schur") {
         solver_mode = "schur_static";
     }
 
-    DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
+    DeviceHostMatrix<real_t>& coefficient_matrix = rhf.get_coefficient_matrix();
     const real_t* d_C = coefficient_matrix.device_ptr();
-    const real_t* d_eri_ao = eri_matrix_.device_ptr();
 
     // Auto solver selection: use full Davidson if GPU memory is sufficient, else schur_omega
     if (solver_mode == "auto") {
@@ -328,19 +327,26 @@ void ERI_Stored_RHF::compute_eom_mp2(int n_states) {
     }
 
     // Step 1: Transform AO ERIs to MO ERIs
-    real_t* d_eri_mo = nullptr;
-    tracked_cudaMalloc(&d_eri_mo,
-                       (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
-    transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
+    real_t* d_eri_mo;
+    bool free_eri_mo;
+    if (d_eri_mo_precomputed) {
+        d_eri_mo = d_eri_mo_precomputed;
+        free_eri_mo = false;
+    } else {
+        tracked_cudaMalloc(&d_eri_mo,
+                           (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
+        transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
+        free_eri_mo = true;
+    }
 
     // Step 2: Build EOM-MP2 operator
-    DeviceHostMemory<real_t>& orbital_energies = rhf_.get_orbital_energies();
+    DeviceHostMemory<real_t>& orbital_energies = rhf.get_orbital_energies();
     const real_t* d_orbital_energies = orbital_energies.device_ptr();
 
     EOMMP2Operator eom_mp2_op(d_eri_mo, d_orbital_energies, num_occ, num_vir, num_basis);
 
     // Free full MO ERIs — blocks are already extracted
-    tracked_cudaFree(d_eri_mo);
+    if (free_eri_mo) tracked_cudaFree(d_eri_mo);
     d_eri_mo = nullptr;
 
     // Step 3: Solve (dispatch based on solver mode)
@@ -368,12 +374,12 @@ void ERI_Stored_RHF::compute_eom_mp2(int n_states) {
     std::cout << "  EOM-MP2 time: " << std::fixed << std::setprecision(3)
               << solve_timer.elapsed_seconds() << " s" << std::endl;
 
-    rhf_.set_excitation_energies(excitation_energies);
+    rhf.set_excitation_energies(excitation_energies);
 
     // Step 4: Print results with oscillator strengths
     coefficient_matrix.toHost();
-    const auto& prim_shells = rhf_.get_primitive_shells();
-    const auto& cgto_norms = rhf_.get_cgto_normalization_factors();
+    const auto& prim_shells = rhf.get_primitive_shells();
+    const auto& cgto_norms = rhf.get_cgto_normalization_factors();
     const_cast<DeviceHostMemory<PrimitiveShell>&>(prim_shells).toHost();
     const_cast<DeviceHostMemory<real_t>&>(cgto_norms).toHost();
 
@@ -381,12 +387,22 @@ void ERI_Stored_RHF::compute_eom_mp2(int n_states) {
         "EOM-MP2",
         prim_shells.host_ptr(), prim_shells.size(),
         cgto_norms.host_ptr(),
-        rhf_.get_shell_type_infos(),
+        rhf.get_shell_type_infos(),
         coefficient_matrix.host_ptr(),
         excitation_energies, h_eigenvectors.data(),
         n_states, num_basis, num_occ, num_vir);
-    rhf_.set_oscillator_strengths(es_result.oscillator_strengths);
-    rhf_.set_excited_state_report(es_result.report);
+    rhf.set_oscillator_strengths(es_result.oscillator_strengths);
+    rhf.set_excited_state_report(es_result.report);
+}
+
+void ERI_Stored_RHF::compute_eom_mp2(int n_states) {
+    compute_eom_mp2_impl(rhf_, eri_matrix_.device_ptr(), n_states);
+}
+
+void ERI_RI_RHF::compute_eom_mp2(int n_states) {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    compute_eom_mp2_impl(rhf_, nullptr, n_states, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
 }
 
 } // namespace gansu

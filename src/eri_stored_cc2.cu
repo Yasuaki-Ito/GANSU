@@ -59,30 +59,36 @@ extern __global__ void cc2_standard_D2_kernel(
     const real_t*, real_t*, int, int);
 
 
-real_t ERI_Stored_RHF::compute_cc2_energy() {
+static real_t compute_cc2_energy_impl(RHF& rhf, const real_t* d_eri_ao, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
-    const int num_basis = rhf_.get_num_basis();
-    const int num_occ = rhf_.get_num_electrons() / 2;
+    const int num_basis = rhf.get_num_basis();
+    const int num_occ = rhf.get_num_electrons() / 2;
     const int num_vir = num_basis - num_occ;
     const int singles_dim = num_occ * num_vir;
     const int doubles_dim = num_occ * num_occ * num_vir * num_vir;
 
-    DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
+    DeviceHostMatrix<real_t>& coefficient_matrix = rhf.get_coefficient_matrix();
     const real_t* d_C = coefficient_matrix.device_ptr();
-    const real_t* d_eri_ao = eri_matrix_.device_ptr();
 
     std::cout << "\n---- CC2 ground state ---- "
               << "nocc=" << num_occ << ", nvir=" << num_vir << std::endl;
 
     // Step 1: Transform AO ERIs to MO ERIs
-    real_t* d_eri_mo = nullptr;
-    tracked_cudaMalloc(&d_eri_mo,
-                       (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
-    transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
+    real_t* d_eri_mo;
+    bool free_eri_mo;
+    if (d_eri_mo_precomputed) {
+        d_eri_mo = d_eri_mo_precomputed;
+        free_eri_mo = false;
+    } else {
+        tracked_cudaMalloc(&d_eri_mo,
+                           (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
+        transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
+        free_eri_mo = true;
+    }
 
     // Step 2: Extract ERI blocks for CC2 solver
-    DeviceHostMemory<real_t>& orbital_energies = rhf_.get_orbital_energies();
+    DeviceHostMemory<real_t>& orbital_energies = rhf.get_orbital_energies();
     const real_t* d_orbital_energies = orbital_energies.device_ptr();
 
     int threads = 256;
@@ -138,7 +144,7 @@ real_t ERI_Stored_RHF::compute_cc2_energy() {
     eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo, num_occ, num_basis);
 
     // Free full MO ERIs
-    tracked_cudaFree(d_eri_mo);
+    if (free_eri_mo) tracked_cudaFree(d_eri_mo);
     d_eri_mo = nullptr;
 
     // D1, D2, Fock
@@ -190,6 +196,17 @@ real_t ERI_Stored_RHF::compute_cc2_energy() {
     tracked_cudaFree(cc2.d_t2);
 
     return cc2_energy;
+}
+
+real_t ERI_Stored_RHF::compute_cc2_energy() {
+    return compute_cc2_energy_impl(rhf_, eri_matrix_.device_ptr());
+}
+
+real_t ERI_RI_RHF::compute_cc2_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    real_t result = compute_cc2_energy_impl(rhf_, nullptr, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
 }
 
 } // namespace gansu

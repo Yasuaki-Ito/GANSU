@@ -464,6 +464,54 @@ TEST(ValidationRI, H2O_MP2_ccpVDZ) {
     EXPECT_NEAR(r.post_hf_energy, REF_H2O_MP2_ccpVDZ_corr, TOL_RI);
 }
 
+// ============================================================
+//  RI post-HF: reconstruct AO ERI from B matrix, then run post-HF
+//  Tolerance is TOL_RI because the RI SCF energy has fitting error,
+//  but post-HF correlation with reconstructed ERI should be close.
+// ============================================================
+
+TEST(ValidationRI_PostHF, H2O_MP3_ccpVDZ) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "mp3", 0, 0, "core", "ri",
+                       AUX_BASIS + "cc-pvdz-rifit.gbs");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_RI);
+}
+
+TEST(ValidationRI_PostHF, H2O_CCSD_ccpVDZ) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "ccsd", 0, 0, "core", "ri",
+                       AUX_BASIS + "cc-pvdz-rifit.gbs");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_RI);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_CCSD_ccpVDZ_corr, TOL_RI);
+}
+
+TEST(ValidationRI_PostHF, H2O_CCSD_T_ccpVDZ) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "ccsd_t", 0, 0, "core", "ri",
+                       AUX_BASIS + "cc-pvdz-rifit.gbs");
+    EXPECT_NEAR(r.hf_total_energy + r.post_hf_energy, REF_H2O_CCSDT_ccpVDZ_total, TOL_RI);
+}
+
+TEST(ValidationRI_PostHF, H2O_CIS_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "cis", 0, 0, "core", "ri",
+                       AUX_BASIS + "cc-pvdz-rifit.gbs");
+    // CIS excitation energy should be close to stored ERI result
+    ASSERT_FALSE(r.excitation_energies.empty());
+    EXPECT_NEAR(r.excitation_energies[0], REF_H2O_EOMCCSD_STO3G_state1, 0.1);
+    // CIS ≠ EOM-CCSD, so use loose tolerance — just check it runs and gives reasonable values
+}
+
+TEST(ValidationRI_PostHF, H2O_FCI_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "fci", 0, 0, "core", "ri",
+                       AUX_BASIS + "cc-pvdz-rifit.gbs");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_RI);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_FCI_STO3G_corr, TOL_RI);
+}
+
+// ADC(2) and EOM-CCSD RI tests are placed later (after reference value definitions)
+
 
 // ============================================================
 //  Benchmark: CCSD algorithm comparison (3 implementations)
@@ -1313,11 +1361,12 @@ TEST(ValidationEOMCCSD, H2O_ccpVDZ) {
     EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_HF);
     EXPECT_NEAR(r.post_hf_energy, REF_H2O_CCSD_ccpVDZ_corr, TOL_POSTHF_DZ);
     ASSERT_EQ(r.excitation_energies.size(), 5u);
-    EXPECT_NEAR(r.excitation_energies[0], REF_H2O_EOMCCSD_ccpVDZ_state1, TOL_EOMCCSD);
-    EXPECT_NEAR(r.excitation_energies[1], REF_H2O_EOMCCSD_ccpVDZ_state2, TOL_EOMCCSD);
-    EXPECT_NEAR(r.excitation_energies[2], REF_H2O_EOMCCSD_ccpVDZ_state3, TOL_EOMCCSD);
-    EXPECT_NEAR(r.excitation_energies[3], REF_H2O_EOMCCSD_ccpVDZ_state4, TOL_EOMCCSD);
-    EXPECT_NEAR(r.excitation_energies[4], REF_H2O_EOMCCSD_ccpVDZ_state5, TOL_EOMCCSD);
+    constexpr real_t TOL_EOMCCSD_ccpVDZ = TOL_EOMCCSD;
+    EXPECT_NEAR(r.excitation_energies[0], REF_H2O_EOMCCSD_ccpVDZ_state1, TOL_EOMCCSD_ccpVDZ);
+    EXPECT_NEAR(r.excitation_energies[1], REF_H2O_EOMCCSD_ccpVDZ_state2, TOL_EOMCCSD_ccpVDZ);
+    EXPECT_NEAR(r.excitation_energies[2], REF_H2O_EOMCCSD_ccpVDZ_state3, TOL_EOMCCSD_ccpVDZ);
+    EXPECT_NEAR(r.excitation_energies[3], REF_H2O_EOMCCSD_ccpVDZ_state4, TOL_EOMCCSD_ccpVDZ);
+    EXPECT_NEAR(r.excitation_energies[4], REF_H2O_EOMCCSD_ccpVDZ_state5, TOL_EOMCCSD_ccpVDZ);
 }
 
 
@@ -1476,5 +1525,33 @@ TEST(ValidationHashERI, H2O_STO3G_Fullscan) {
 TEST(ValidationHashERI, H2O_ccpVDZ_Fullscan) {
     auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf", "none", 0, 0, "core", "hash", "", 0, "fullscan");
     EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_HF);
+}
+
+// ============================================================
+//  RI post-HF excited states (placed after reference value definitions)
+// ============================================================
+
+TEST(ValidationRI_PostHF, H2O_ADC2_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "adc2", 0, 0, "core", "ri",
+                       AUX_BASIS + "cc-pvdz-rifit.gbs");
+    ASSERT_GE(r.excitation_energies.size(), 3u);
+    EXPECT_NEAR(r.excitation_energies[0], REF_H2O_ADC2_STO3G_state1, TOL_RI);
+    EXPECT_NEAR(r.excitation_energies[1], REF_H2O_ADC2_STO3G_state2, TOL_RI);
+    EXPECT_NEAR(r.excitation_energies[2], REF_H2O_ADC2_STO3G_state3, TOL_RI);
+}
+
+TEST(ValidationRI_PostHF, H2O_EOM_CCSD_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "eom_ccsd", 0, 0, "core", "ri",
+                       AUX_BASIS + "cc-pvdz-rifit.gbs");
+    ASSERT_GE(r.excitation_energies.size(), 5u);
+    // RI fitting error propagates through CCSD + EOM: ~3 mHa for STO-3G
+    constexpr real_t TOL_RI_EOM = 5e-3;
+    EXPECT_NEAR(r.excitation_energies[0], REF_H2O_EOMCCSD_STO3G_state1, TOL_RI_EOM);
+    EXPECT_NEAR(r.excitation_energies[1], REF_H2O_EOMCCSD_STO3G_state2, TOL_RI_EOM);
+    EXPECT_NEAR(r.excitation_energies[2], REF_H2O_EOMCCSD_STO3G_state3, TOL_RI_EOM);
+    EXPECT_NEAR(r.excitation_energies[3], REF_H2O_EOMCCSD_STO3G_state4, TOL_RI_EOM);
+    EXPECT_NEAR(r.excitation_energies[4], REF_H2O_EOMCCSD_STO3G_state5, TOL_RI_EOM);
 }
 

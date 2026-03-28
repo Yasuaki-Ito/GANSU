@@ -181,10 +181,175 @@ ERI_RI::ERI_RI(const HF& hf, const Molecular& auxiliary_molecular):
     // to device memory
     auxiliary_primitive_shells_.toDevice();
     auxiliary_cgto_normalization_factors_.toDevice();
-    std::cout << "get_hasMatrixC: " << hf_.get_hasMatrixC() << std::endl;
 }
 
+ERI_RI::~ERI_RI() {
+    if (d_eri_reconstructed_) tracked_cudaFree(d_eri_reconstructed_);
+}
 
+void ERI_RI::reconstruct_ao_eri() {
+    if (eri_reconstructed_) return;
+
+    const size_t nao2 = (size_t)num_basis_ * num_basis_;
+    const size_t required_bytes = nao2 * nao2 * sizeof(real_t);
+
+    // Memory check
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    if (required_bytes > free_mem * 8 / 10) {
+        THROW_EXCEPTION("Not enough GPU memory to reconstruct AO ERI from RI. "
+            "Required: " + std::to_string(required_bytes / (1024*1024)) + " MB, "
+            "Available: " + std::to_string(free_mem / (1024*1024)) + " MB. "
+            "Use stored ERI method for post-HF on this system.");
+    }
+
+    tracked_cudaMalloc(&d_eri_reconstructed_, required_bytes);
+
+    // ERI[nao^2 x nao^2] = B^T * B  where B is (naux x nao^2) row-major
+    // cuBLAS column-major: B_cm is (nao^2 x naux), so ERI_cm = B_cm * B_cm^T
+    const double alpha = 1.0, beta = 0.0;
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    cublasDgemm(handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        nao2, nao2, num_auxiliary_basis_,
+        &alpha,
+        intermediate_matrix_B_.device_ptr(), nao2,
+        intermediate_matrix_B_.device_ptr(), nao2,
+        &beta,
+        d_eri_reconstructed_, nao2);
+    cudaDeviceSynchronize();
+
+    eri_reconstructed_ = true;
+
+    if (hf_.get_verbose()) {
+        std::cout << "[RI] Reconstructed AO ERI: " << nao2 << " x " << nao2
+                  << " (" << required_bytes / (1024*1024) << " MB)" << std::endl;
+    }
+}
+
+const real_t* ERI_RI::get_eri_matrix_device() const {
+    if (!eri_reconstructed_) {
+        const_cast<ERI_RI*>(this)->reconstruct_ao_eri();
+    }
+    return d_eri_reconstructed_;
+}
+
+real_t* ERI_RI::build_mo_eri(const real_t* d_C, int nmo) const {
+    // Build MO ERI directly: B(Q,μν) → B_mo(Q,pq) → (pq|rs) = B_mo^T B_mo
+    // Avoids the nao⁴ AO ERI intermediate.
+    //
+    // Step 1: Right half-transform  B(Q,μ,ν) · C(ν,q) → B_tmp(Q,μ,q)
+    // Step 2: Left half-transform   C(μ,p)^T · B_tmp(Q,μ,q) → B_mo(Q,p,q)
+    // Step 3: MO ERI = B_mo^T · B_mo
+    //
+    // B layout: row-major (naux, nao, nao) → cuBLAS sees column-major (nao, nao*naux)
+    // C layout: row-major (nao, nmo) → cuBLAS sees column-major (nmo, nao)
+
+    const int nao = num_basis_;
+    const int naux = num_auxiliary_basis_;
+    const size_t nmo2 = (size_t)nmo * nmo;
+
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    const double alpha = 1.0, beta = 0.0;
+
+    // Allocate workspace: B_tmp (naux * nao * nmo)
+    real_t* d_B_tmp = nullptr;
+    tracked_cudaMalloc(&d_B_tmp, (size_t)naux * nao * nmo * sizeof(real_t));
+
+    // Step 1: Right half-transform (batched over Q slices)
+    // For each Q: B_tmp(Q, μ, q) = Σ_ν B(Q, μ, ν) · C(ν, q)
+    // Treat as single DGEMM: B is (naux*nao, nao), C is (nao, nmo)
+    // Result: B_tmp is (naux*nao, nmo)
+    // cuBLAS col-major: C_cm(nmo,nao) * B_cm(nao, naux*nao) → impossible directly
+    // Instead: B_tmp = B · C in row-major = C^T · B^T in col-major
+    // Actually simpler: treat as batched with naux*nao rows
+    cublasDgemm(handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        nmo, (long long)naux * nao, nao,
+        &alpha,
+        d_C, nmo,           // C is (nao, nmo) row-major → col-major (nmo, nao)
+        intermediate_matrix_B_.device_ptr(), nao,  // B is (naux*nao, nao) row-major → col-major (nao, naux*nao)
+        &beta,
+        d_B_tmp, nmo);       // result (naux*nao, nmo) row-major → col-major (nmo, naux*nao)
+
+    // Step 2: Left half-transform
+    // For each Q: B_mo(Q, p, q) = Σ_μ C(μ, p) · B_tmp(Q, μ, q)
+    // B_tmp is (naux, nao, nmo) → treat as naux*nmo columns of length nao
+    // B_mo  is (naux, nmo, nmo) → treat as naux*nmo columns of length nmo
+    //
+    // We need to transpose B_tmp from (naux*nao, nmo) to (nmo, naux*nao)
+    // then multiply C^T · B_tmp_reshaped. But this is complex.
+    //
+    // Alternative: use the transposed approach.
+    // B_tmp is stored as (Q*nao+μ, q) in row-major, i.e., (nmo, naux*nao) in col-major.
+    // We want B_mo(Q*nmo+p, q) = Σ_μ C(μ,p) B_tmp(Q*nao+μ, q)
+    //
+    // For fixed q: B_mo(:,q) = [C^T ⊗ I_naux] B_tmp(:,q) ... this needs a reshape.
+    //
+    // Simplest: transpose B_tmp to get B_tmp2(Q, q, μ) then multiply by C
+    // B_tmp2(naux*nmo, nao) then B_mo2 = B_tmp2 · C → (naux*nmo, nmo)
+
+    real_t* d_B_tmp2 = nullptr;
+    tracked_cudaMalloc(&d_B_tmp2, (size_t)naux * nao * nmo * sizeof(real_t));
+
+    // Transpose: for each Q, transpose (nao, nmo) → (nmo, nao)
+    // B_tmp[Q*nao*nmo + μ*nmo + q] → B_tmp2[Q*nmo*nao + q*nao + μ]
+    // Use cublasDgeam for batch transpose
+    for (int Q = 0; Q < naux; Q++) {
+        cublasDgeam(handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            nao, nmo,
+            &alpha,
+            d_B_tmp + (size_t)Q * nao * nmo, nmo,  // col-major (nmo, nao) → transpose to (nao, nmo)
+            &beta,
+            nullptr, nao,
+            d_B_tmp2 + (size_t)Q * nmo * nao, nao); // result (nao, nmo) in col-major
+    }
+
+    tracked_cudaFree(d_B_tmp);
+
+    // Now B_tmp2 is (naux*nmo, nao) in row-major = (nao, naux*nmo) in col-major
+    // Step 2 DGEMM: B_mo = B_tmp2 · C → (naux*nmo, nmo) in row-major
+    real_t* d_B_mo = nullptr;
+    tracked_cudaMalloc(&d_B_mo, (size_t)naux * nmo2 * sizeof(real_t));
+
+    cublasDgemm(handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        nmo, (long long)naux * nmo, nao,
+        &alpha,
+        d_C, nmo,            // (nmo, nao) col-major
+        d_B_tmp2, nao,       // (nao, naux*nmo) col-major
+        &beta,
+        d_B_mo, nmo);        // (nmo, naux*nmo) col-major = (naux*nmo, nmo) row-major
+
+    tracked_cudaFree(d_B_tmp2);
+
+    // Step 3: MO ERI = B_mo^T · B_mo
+    // B_mo is (naux, nmo²) row-major = (nmo², naux) col-major
+    // ERI = B_cm · B_cm^T = (nmo², naux) × (naux, nmo²) = (nmo², nmo²) col-major
+    real_t* d_eri_mo = nullptr;
+    tracked_cudaMalloc(&d_eri_mo, nmo2 * nmo2 * sizeof(real_t));
+
+    cublasDgemm(handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        nmo2, nmo2, naux,
+        &alpha,
+        d_B_mo, nmo2,
+        d_B_mo, nmo2,
+        &beta,
+        d_eri_mo, nmo2);
+
+    tracked_cudaFree(d_B_mo);
+    cudaDeviceSynchronize();
+
+    if (hf_.get_verbose()) {
+        std::cout << "[RI] Built MO ERI directly: " << nmo << "^4 = "
+                  << (nmo2 * nmo2 * sizeof(real_t)) / (1024*1024) << " MB"
+                  << " (skipped nao^4 = " << ((size_t)nao*nao*nao*nao*sizeof(real_t))/(1024*1024) << " MB)" << std::endl;
+    }
+
+    return d_eri_mo;
+}
 
 void ERI_RI::precomputation() {
     // compute the intermediate matrix B of the auxiliary basis functions

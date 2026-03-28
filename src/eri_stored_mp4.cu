@@ -4490,7 +4490,7 @@ void get_mp4_term_num_block_thread_shmem(int term_index, const int num_spin_occ,
 
 
 
-real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, const int num_basis, const int num_occ) {
+real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, const int num_basis, const int num_occ, real_t* d_eri_mo_precomputed = nullptr) {
     const int num_threads = 256;
 
     const int N = num_basis * num_basis;
@@ -4498,23 +4498,27 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
     // ------------------------------------------------------------
     // 1) allocate full MO ERI on device: d_eri_mo (N x N)
     // ------------------------------------------------------------
-    double* d_eri_mo = nullptr;
-    size_t bytes_mo = (size_t)N * (size_t)N * sizeof(double);
-    tracked_cudaMalloc((void**)&d_eri_mo, bytes_mo);
-    if(!d_eri_mo){
-        THROW_EXCEPTION("tracked_cudaMalloc failed for d_eri_mo.");
-    }
+    double* d_eri_mo;
+    bool free_eri_mo;
+    if (d_eri_mo_precomputed) {
+        d_eri_mo = d_eri_mo_precomputed;
+        free_eri_mo = false;
+    } else {
+        d_eri_mo = nullptr;
+        size_t bytes_mo = (size_t)N * (size_t)N * sizeof(double);
+        tracked_cudaMalloc((void**)&d_eri_mo, bytes_mo);
+        if(!d_eri_mo){
+            THROW_EXCEPTION("tracked_cudaMalloc failed for d_eri_mo.");
+        }
 
-
-    // ------------------------------------------------------------
-    // 2) AO -> MO full transformation (writes into d_eri_mo)
-    // ------------------------------------------------------------
-    {
-        std::string str = "Computing AO -> MO full integral transformation... ";
-        PROFILE_ELAPSED_TIME(str);
-
-        transform_ao_eri_to_mo_eri_full(d_eri_ao, d_coefficient_matrix, num_basis, d_eri_mo);
-        cudaDeviceSynchronize(); // It is for PROFILE_ELAPSED_TIME
+        // 2) AO -> MO full transformation (writes into d_eri_mo)
+        {
+            std::string str = "Computing AO -> MO full integral transformation... ";
+            PROFILE_ELAPSED_TIME(str);
+            transform_ao_eri_to_mo_eri_full(d_eri_ao, d_coefficient_matrix, num_basis, d_eri_mo);
+            cudaDeviceSynchronize();
+        }
+        free_eri_mo = true;
     }
 
 
@@ -4778,7 +4782,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
 
 
 
-    tracked_cudaFree(d_eri_mo);
+    if (free_eri_mo) tracked_cudaFree(d_eri_mo);
 
 
 
@@ -4793,32 +4797,33 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
 
 
 
-real_t ERI_Stored_RHF::compute_mp4_energy() {
+static real_t compute_mp4_energy_impl(RHF& rhf, const real_t* d_eri_ao, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
-    // Naive implementation for MP4 energy calculation 
+    // Naive implementation for MP4 energy calculation
 
-    const int num_occ = rhf_.get_num_electrons() / 2; // number of occupied orbitals for RHF
-    const int num_basis = rhf_.get_num_basis();
-    DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
-    DeviceHostMemory<real_t>& orbital_energies = rhf_.get_orbital_energies();
+    const int num_occ = rhf.get_num_electrons() / 2; // number of occupied orbitals for RHF
+    const int num_basis = rhf.get_num_basis();
+    DeviceHostMatrix<real_t>& coefficient_matrix = rhf.get_coefficient_matrix();
+    DeviceHostMemory<real_t>& orbital_energies = rhf.get_orbital_energies();
     const real_t* d_C = coefficient_matrix.device_ptr();
     const real_t* d_eps = orbital_energies.device_ptr();
-    const real_t* d_eri = eri_matrix_.device_ptr();
 
 
-//    real_t E_MP4 = mp4_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ);
-    real_t E_MP4 = mp4_from_aoeri_via_full_moeri_factorization(d_eri, d_C, d_eps, num_basis, num_occ);
-
-//    if(fabs(E_MP2_naive - E_MP2_stored) > 1e-8){
-//        std::cerr << "Warning: MP2 energy mismatch between naive and stored MOERI methods." << std::endl;
-//        std::cerr << "  E_MP2_naive  = " << E_MP2_naive << std::endl;
-//        std::cerr << "  E_MP2_stored = " << E_MP2_stored << std::endl;
-//    }
-
+//    real_t E_MP4 = mp4_from_aoeri_via_full_moeri(d_eri_ao, d_C, d_eps, num_basis, num_occ);
+    real_t E_MP4 = mp4_from_aoeri_via_full_moeri_factorization(d_eri_ao, d_C, d_eps, num_basis, num_occ, d_eri_mo_precomputed);
     return E_MP4;
 }
 
+real_t ERI_Stored_RHF::compute_mp4_energy() {
+    return compute_mp4_energy_impl(rhf_, eri_matrix_.device_ptr());
+}
 
+real_t ERI_RI_RHF::compute_mp4_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    real_t result = compute_mp4_energy_impl(rhf_, nullptr, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
+}
 
 } // namespace gansu

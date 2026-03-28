@@ -83,6 +83,7 @@ set(SOURCES
     src/parameter_manager.cpp
     src/eri.cu
     src/eri_ri.cu
+    src/eri_ri_posthf.cu
     src/eri_stored.cu
     src/eri_stored_fci.cu
     src/eri_stored_cis.cu

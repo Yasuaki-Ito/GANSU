@@ -1774,8 +1774,9 @@ void contract_iajb_tensors(   // 4h2p, 2h4p, 3h3p
 
 //*
 real_t mp3_from_aoeri_via_full_moeri_dgemm(
-    real_t* d_eri_ao, const real_t* d_coefficient_matrix, 
-    const real_t* d_orbital_energies, const int num_basis, const int num_occ) 
+    real_t* d_eri_ao, const real_t* d_coefficient_matrix,
+    const real_t* d_orbital_energies, const int num_basis, const int num_occ,
+    real_t* d_eri_mo_precomputed = nullptr)
 {
     cudaDeviceProp prop;
     int device = 0;
@@ -1791,14 +1792,22 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
     printf("#orbitals_occ: %d, #orbitals_vir: %d\n", num_occ, num_vir);
 
     // Full MO ERI transformation
-    double* d_eri_mo = nullptr;
+    double* d_eri_mo;
+    bool free_eri_mo;
     const size_t num_basis_2 = num_basis * num_basis;
-    tracked_cudaMalloc((void**)&d_eri_mo, sizeof(double) * num_basis_2 * num_basis_2);
-    if (!d_eri_mo) {
-        THROW_EXCEPTION("cudaMalloc failed for d_eri_mo.");
+    if (d_eri_mo_precomputed) {
+        d_eri_mo = d_eri_mo_precomputed;
+        free_eri_mo = false;
+    } else {
+        d_eri_mo = nullptr;
+        tracked_cudaMalloc((void**)&d_eri_mo, sizeof(double) * num_basis_2 * num_basis_2);
+        if (!d_eri_mo) {
+            THROW_EXCEPTION("cudaMalloc failed for d_eri_mo.");
+        }
+        transform_eri_ao2mo_dgemm_full(d_eri_ao, d_eri_mo, d_coefficient_matrix, num_basis);
+        cudaDeviceSynchronize();
+        free_eri_mo = true;
     }
-    transform_eri_ao2mo_dgemm_full(d_eri_ao, d_eri_mo, d_coefficient_matrix, num_basis);
-    cudaDeviceSynchronize();
 
     // MP2 energy from full MO ERI
     real_t E_MP2 = mp2_from_full_moeri(d_eri_mo, d_coefficient_matrix, d_orbital_energies, num_basis, num_occ);
@@ -1936,7 +1945,7 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
     tracked_cudaFree(d_mm3);
     tracked_cudaFree(d_mm4);
 
-    tracked_cudaFree(d_eri_mo);
+    if (free_eri_mo) tracked_cudaFree(d_eri_mo);
 
     return E_MP2 + correlationE_3rd;
 }
@@ -1951,36 +1960,31 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
 
 //////////////////////////////////////////////////////////////////////////////////////// MP3 energy calculation
 
-real_t ERI_Stored_RHF::compute_mp3_energy() {
+static real_t compute_mp3_energy_impl(RHF& rhf, real_t* d_eri, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
-
-    // MP3 energy calculation 
-    // MP2 energy is also calculated inside this function.
-
-    const int num_occ = rhf_.get_num_electrons() / 2; // number of occupied orbitals for RHF
-    const int num_basis = rhf_.get_num_basis();
-    DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
-    DeviceHostMemory<real_t>& orbital_energies = rhf_.get_orbital_energies();
+    const int num_occ = rhf.get_num_electrons() / 2;
+    const int num_basis = rhf.get_num_basis();
+    DeviceHostMatrix<real_t>& coefficient_matrix = rhf.get_coefficient_matrix();
+    DeviceHostMemory<real_t>& orbital_energies = rhf.get_orbital_energies();
     const real_t* d_C = coefficient_matrix.device_ptr();
     const real_t* d_eps = orbital_energies.device_ptr();
-    //const real_t* d_eri = eri_matrix_.device_ptr();
-    real_t* d_eri = eri_matrix_.device_ptr();
 
-    //real_t E_MP3_naive = mp3_naive(d_eri, d_C, d_eps, num_basis, num_occ);
-    //real_t E_MP3 = mp3_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ);
-    real_t E_MP3 = mp3_from_aoeri_via_full_moeri_dgemm(d_eri, d_C, d_eps, num_basis, num_occ);
-
-//    if(fabs(E_MP3 - E_MP3_stored) > 1e-8){
-//        std::cerr << "Warning: MP3 energy mismatch between naive and stored MOERI methods." << std::endl;
-//        std::cerr << "  E_MP3_naive  = " << E_MP3 << std::endl;
-//        std::cerr << "  E_MP3_stored = " << E_MP3_stored << std::endl;
-//    }
-
+    real_t E_MP3 = mp3_from_aoeri_via_full_moeri_dgemm(d_eri, d_C, d_eps, num_basis, num_occ, d_eri_mo_precomputed);
 
     std::cout << "MP3 energy: " << E_MP3 << " Hartree" << std::endl;
-
     return E_MP3;
+}
+
+real_t ERI_Stored_RHF::compute_mp3_energy() {
+    return compute_mp3_energy_impl(rhf_, eri_matrix_.device_ptr());
+}
+
+real_t ERI_RI_RHF::compute_mp3_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    real_t result = compute_mp3_energy_impl(rhf_, nullptr, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
 }
 
 
@@ -3952,7 +3956,8 @@ real_t ccsd_spatial_orbital_naive(const real_t* __restrict__ d_eri_ao,
                             const real_t* __restrict__ d_coefficient_matrix,
                             const real_t* __restrict__ d_orbital_energies,
                             const int num_basis, const int num_occ,
-                            const bool computing_ccsd_t, real_t* ccsd_t_energy)
+                            const bool computing_ccsd_t, real_t* ccsd_t_energy,
+                            real_t* d_eri_mo_precomputed = nullptr)
 {
     const int N = num_basis;
     const int nocc = num_occ;
@@ -3965,17 +3970,25 @@ real_t ccsd_spatial_orbital_naive(const real_t* __restrict__ d_eri_ao,
               << " nocc=" << nocc << " nvir=" << nvir << std::endl;
 
     // AO->MO transform on GPU, download to host
-    real_t* d_eri_mo = nullptr;
-    tracked_cudaMalloc((void**)&d_eri_mo, N4 * sizeof(real_t));
-    {
-        std::string str = "Computing AO -> MO full integral transformation... ";
-        PROFILE_ELAPSED_TIME(str);
-        transform_ao_eri_to_mo_eri_full(d_eri_ao, d_coefficient_matrix, N, d_eri_mo);
-        cudaDeviceSynchronize();
+    real_t* d_eri_mo;
+    bool free_eri_mo;
+    if (d_eri_mo_precomputed) {
+        d_eri_mo = d_eri_mo_precomputed;
+        free_eri_mo = false;
+    } else {
+        d_eri_mo = nullptr;
+        tracked_cudaMalloc((void**)&d_eri_mo, N4 * sizeof(real_t));
+        {
+            std::string str = "Computing AO -> MO full integral transformation... ";
+            PROFILE_ELAPSED_TIME(str);
+            transform_ao_eri_to_mo_eri_full(d_eri_ao, d_coefficient_matrix, N, d_eri_mo);
+            cudaDeviceSynchronize();
+        }
+        free_eri_mo = true;
     }
     std::vector<real_t> eri(N4);
     cudaMemcpy(eri.data(), d_eri_mo, N4 * sizeof(real_t), cudaMemcpyDeviceToHost);
-    tracked_cudaFree(d_eri_mo);
+    if (free_eri_mo) tracked_cudaFree(d_eri_mo);
 
     std::vector<real_t> eps(N);
     cudaMemcpy(eps.data(), d_orbital_energies, N * sizeof(real_t), cudaMemcpyDeviceToHost);
@@ -4371,7 +4384,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             const real_t* __restrict__ d_orbital_energies,
                             const int num_basis, const int num_occ,
                             const bool computing_ccsd_t, real_t* ccsd_t_energy,
-                            real_t** d_t1_out, real_t** d_t2_out)
+                            real_t** d_t1_out, real_t** d_t2_out,
+                            real_t* d_eri_mo_precomputed = nullptr)
 {
     const int N = num_basis;
     const int nocc = num_occ;
@@ -4382,13 +4396,21 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
               << " nvir=" << nvir << std::endl;
 
     // AO->MO transform on GPU (4-stage half-transform, O(N^5))
-    real_t* d_eri_mo = nullptr;
-    tracked_cudaMalloc((void**)&d_eri_mo, N4 * sizeof(real_t));
-    {
-        std::string str = "Computing AO -> MO 4-stage integral transformation... ";
-        PROFILE_ELAPSED_TIME(str);
-        transform_ao_eri_to_mo_eri_4stage(d_eri_ao, d_coefficient_matrix, N, d_eri_mo);
-        cudaDeviceSynchronize();
+    real_t* d_eri_mo;
+    bool free_eri_mo;
+    if (d_eri_mo_precomputed) {
+        d_eri_mo = d_eri_mo_precomputed;
+        free_eri_mo = false;
+    } else {
+        d_eri_mo = nullptr;
+        tracked_cudaMalloc((void**)&d_eri_mo, N4 * sizeof(real_t));
+        {
+            std::string str = "Computing AO -> MO 4-stage integral transformation... ";
+            PROFILE_ELAPSED_TIME(str);
+            transform_ao_eri_to_mo_eri_4stage(d_eri_ao, d_coefficient_matrix, N, d_eri_mo);
+            cudaDeviceSynchronize();
+        }
+        free_eri_mo = true;
     }
 
     std::vector<real_t> eps(N);
@@ -4627,7 +4649,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     }
     cudaDeviceSynchronize();
     // Now d_eri_mo is no longer needed — free it
-    tracked_cudaFree(d_eri_mo);
+    if (free_eri_mo) tracked_cudaFree(d_eri_mo);
     d_eri_mo = nullptr;
 
     cudaMemcpy(d_v_ovvv_T, v_ovvv_T.data(), vvv * nocc * sizeof(double), cudaMemcpyHostToDevice);
@@ -5313,7 +5335,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
 // ============================================================
 //  Legacy spin-orbital CCSD implementation (kept for reference/fallback)
 // ============================================================
-real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const real_t* __restrict__ d_coefficient_matrix, const real_t* __restrict__ d_orbital_energies, const int num_basis, const int num_occ, const bool computing_ccsd_t=false, real_t* ccsd_t_energy=nullptr) {
+real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const real_t* __restrict__ d_coefficient_matrix, const real_t* __restrict__ d_orbital_energies, const int num_basis, const int num_occ, const bool computing_ccsd_t=false, real_t* ccsd_t_energy=nullptr, real_t* d_eri_mo_precomputed=nullptr) {
 
     const int num_spin_mo = num_basis * 2;
     const int num_spin_occ = num_occ * 2;
@@ -5328,24 +5350,28 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
 
     // ------------------------------------------------------------
     // 1) allocate full MO ERI on device: d_eri_mo (N x N) for RHF (closed-shell)
-    // ------------------------------------------------------------
-    double* d_eri_mo = nullptr;
-    size_t bytes_mo = (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(double);
-    tracked_cudaMalloc((void**)&d_eri_mo, bytes_mo);
-    if(!d_eri_mo){
-        THROW_EXCEPTION("tracked_cudaMalloc failed for d_eri_mo.");
-    }
-
-
-    // ------------------------------------------------------------
     // 2) AO -> MO full transformation (writes into d_eri_mo) for RHF (closed-shell)
     // ------------------------------------------------------------
-    {
-        std::string str = "Computing AO -> MO full integral transformation... ";
-        PROFILE_ELAPSED_TIME(str);
+    double* d_eri_mo;
+    bool free_eri_mo;
+    size_t bytes_mo = (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(double);
+    if (d_eri_mo_precomputed) {
+        d_eri_mo = d_eri_mo_precomputed;
+        free_eri_mo = false;
+    } else {
+        d_eri_mo = nullptr;
+        tracked_cudaMalloc((void**)&d_eri_mo, bytes_mo);
+        if(!d_eri_mo){
+            THROW_EXCEPTION("tracked_cudaMalloc failed for d_eri_mo.");
+        }
+        {
+            std::string str = "Computing AO -> MO full integral transformation... ";
+            PROFILE_ELAPSED_TIME(str);
 
-        transform_ao_eri_to_mo_eri_full(d_eri_ao, d_coefficient_matrix, num_basis, d_eri_mo);
-        cudaDeviceSynchronize(); // It is for PROFILE_ELAPSED_TIME
+            transform_ao_eri_to_mo_eri_full(d_eri_ao, d_coefficient_matrix, num_basis, d_eri_mo);
+            cudaDeviceSynchronize(); // It is for PROFILE_ELAPSED_TIME
+        }
+        free_eri_mo = true;
     }
 
 
@@ -5592,7 +5618,7 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
 
 
     deallocate_ccsd_amplitudes(t_ia_new, t_ia_old, t_ijab_new, t_ijab_old);
-    tracked_cudaFree(d_eri_mo);
+    if (free_eri_mo) tracked_cudaFree(d_eri_mo);
 
     return E_CCSD_new;
 }
@@ -5604,52 +5630,57 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
 //                 1 = spatial-orbital naive (pure CPU)
 //                 2 = spin-orbital (legacy)
 
-real_t ERI_Stored_RHF::compute_ccsd_energy() {
+static real_t compute_ccsd_energy_impl(RHF& rhf, const real_t* d_eri, int ccsd_algorithm, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
-    const int num_occ = rhf_.get_num_electrons() / 2;
-    const int num_basis = rhf_.get_num_basis();
-    DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
-    DeviceHostMemory<real_t>& orbital_energies = rhf_.get_orbital_energies();
-    const real_t* d_C = coefficient_matrix.device_ptr();
-    const real_t* d_eps = orbital_energies.device_ptr();
-    const real_t* d_eri = eri_matrix_.device_ptr();
+    const int num_occ = rhf.get_num_electrons() / 2;
+    const int num_basis = rhf.get_num_basis();
+    const real_t* d_C = rhf.get_coefficient_matrix().device_ptr();
+    const real_t* d_eps = rhf.get_orbital_energies().device_ptr();
 
     real_t E_CCSD;
-    if (ccsd_algorithm_ == 2) {
-        E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr);
-    } else if (ccsd_algorithm_ == 1) {
-        E_CCSD = ccsd_spatial_orbital_naive(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr);
+    if (ccsd_algorithm == 2) {
+        E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, d_eri_mo_precomputed);
+    } else if (ccsd_algorithm == 1) {
+        E_CCSD = ccsd_spatial_orbital_naive(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, d_eri_mo_precomputed);
     } else {
-        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, nullptr, nullptr);
+        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, nullptr, nullptr, d_eri_mo_precomputed);
     }
 
     std::cout << "CCSD energy: " << E_CCSD << " Hartree" << std::endl;
     return E_CCSD;
 }
 
+real_t ERI_Stored_RHF::compute_ccsd_energy() {
+    return compute_ccsd_energy_impl(rhf_, eri_matrix_.device_ptr(), ccsd_algorithm_);
+}
+
+real_t ERI_RI_RHF::compute_ccsd_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    real_t result = compute_ccsd_energy_impl(rhf_, nullptr, 0, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////// CCSD(T) implementation
 
-real_t ERI_Stored_RHF::compute_ccsd_t_energy() {
+static real_t compute_ccsd_t_energy_impl(RHF& rhf, const real_t* d_eri, int ccsd_algorithm, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
-    const int num_occ = rhf_.get_num_electrons() / 2;
-    const int num_basis = rhf_.get_num_basis();
-    DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
-    DeviceHostMemory<real_t>& orbital_energies = rhf_.get_orbital_energies();
-    const real_t* d_C = coefficient_matrix.device_ptr();
-    const real_t* d_eps = orbital_energies.device_ptr();
-    const real_t* d_eri = eri_matrix_.device_ptr();
+    const int num_occ = rhf.get_num_electrons() / 2;
+    const int num_basis = rhf.get_num_basis();
+    const real_t* d_C = rhf.get_coefficient_matrix().device_ptr();
+    const real_t* d_eps = rhf.get_orbital_energies().device_ptr();
 
     real_t ccsd_t_energy = 0.0;
     real_t E_CCSD;
-    if (ccsd_algorithm_ == 2) {
-        E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy);
-    } else if (ccsd_algorithm_ == 1) {
-        E_CCSD = ccsd_spatial_orbital_naive(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy);
+    if (ccsd_algorithm == 2) {
+        E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy, d_eri_mo_precomputed);
+    } else if (ccsd_algorithm == 1) {
+        E_CCSD = ccsd_spatial_orbital_naive(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy, d_eri_mo_precomputed);
     } else {
-        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy, nullptr, nullptr);
+        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy, nullptr, nullptr, d_eri_mo_precomputed);
     }
 
     std::cout << "CCSD correction energy: " << E_CCSD << " Hartree" << std::endl;
@@ -5658,6 +5689,16 @@ real_t ERI_Stored_RHF::compute_ccsd_t_energy() {
 
     return E_CCSD+ccsd_t_energy;
 }
- 
+
+real_t ERI_Stored_RHF::compute_ccsd_t_energy() {
+    return compute_ccsd_t_energy_impl(rhf_, eri_matrix_.device_ptr(), ccsd_algorithm_);
+}
+
+real_t ERI_RI_RHF::compute_ccsd_t_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    real_t result = compute_ccsd_t_energy_impl(rhf_, nullptr, 0, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
+}
 
  } // namespace gansu
