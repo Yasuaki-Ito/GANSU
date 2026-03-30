@@ -514,6 +514,82 @@ TEST(ValidationRI_PostHF, H2O_FCI_STO3G) {
 
 
 // ============================================================
+//  Semi-Direct RI: recomputes 3-center ERIs each iteration,
+//  builds B temporarily, J/K via BLAS.  Same accuracy as stored RI.
+// ============================================================
+
+TEST(ValidationSemiDirectRI, H2O_RHF_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "none", 0, 0, "core", "semi_direct_ri");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_RI_AUTO);
+}
+
+TEST(ValidationSemiDirectRI, H2O_RHF_ccpVDZ) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "none", 0, 0, "core", "semi_direct_ri");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_RI_AUTO);
+}
+
+TEST(ValidationSemiDirectRI, NH3_RHF_STO3G) {
+    auto r = run_gansu(XYZ + "NH3.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "none", 0, 0, "core", "semi_direct_ri");
+    EXPECT_NEAR(r.hf_total_energy, REF_NH3_RHF_STO3G, TOL_RI_AUTO);
+}
+
+TEST(ValidationSemiDirectRI, CH4_RHF_STO3G) {
+    auto r = run_gansu(XYZ + "CH4.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "none", 0, 0, "core", "semi_direct_ri");
+    EXPECT_NEAR(r.hf_total_energy, REF_CH4_RHF_STO3G, TOL_RI_AUTO);
+}
+
+TEST(ValidationSemiDirectRI, H2O_RHF_ccpVDZ_RIFIT) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "none", 0, 0, "core", "semi_direct_ri",
+                       AUX_BASIS + "cc-pvdz-rifit.gbs");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_RI);
+}
+
+// ============================================================
+//  Direct RI: on-the-fly contraction, no B matrix stored.
+// ============================================================
+
+TEST(ValidationDirectRI, H2O_RHF_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "none", 0, 0, "core", "direct_ri");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_RI_AUTO);
+}
+
+TEST(ValidationDirectRI, H2O_RHF_ccpVDZ) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "none", 0, 0, "core", "direct_ri");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_RI_AUTO);
+}
+
+TEST(ValidationDirectRI, NH3_RHF_STO3G) {
+    auto r = run_gansu(XYZ + "NH3.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "none", 0, 0, "core", "direct_ri");
+    EXPECT_NEAR(r.hf_total_energy, REF_NH3_RHF_STO3G, TOL_RI_AUTO);
+}
+
+TEST(ValidationDirectRI, CH4_RHF_STO3G) {
+    auto r = run_gansu(XYZ + "CH4.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "none", 0, 0, "core", "direct_ri");
+    EXPECT_NEAR(r.hf_total_energy, REF_CH4_RHF_STO3G, TOL_RI_AUTO);
+}
+
+// Cross-check: semi-direct and stored RI give same energy
+TEST(ValidationSemiDirectRI, MatchesStoredRI_H2O) {
+    auto r_ri = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                          "none", 0, 0, "core", "ri",
+                          AUX_BASIS + "cc-pvdz-rifit.gbs");
+    auto r_sd = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                          "none", 0, 0, "core", "semi_direct_ri",
+                          AUX_BASIS + "cc-pvdz-rifit.gbs");
+    EXPECT_NEAR(r_sd.hf_total_energy, r_ri.hf_total_energy, TOL_HF);
+}
+
+
+// ============================================================
 //  Benchmark: CCSD algorithm comparison (3 implementations)
 //  Algorithm 0 = spatial-optimized (GPU DGEMM + sub-blocks)
 //  Algorithm 1 = spatial-naive (no GPU, no sub-blocks)
