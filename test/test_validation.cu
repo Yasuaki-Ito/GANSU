@@ -577,6 +577,39 @@ TEST(ValidationDirectRI, CH4_RHF_STO3G) {
     EXPECT_NEAR(r.hf_total_energy, REF_CH4_RHF_STO3G, TOL_RI_AUTO);
 }
 
+// UHF Semi-Direct RI
+TEST(ValidationSemiDirectRI, O2_UHF_STO3G) {
+    auto r = run_gansu(XYZ + "O2.xyz", BASIS + "sto-3g.gbs", "uhf",
+                       "none", 0, 1, "gwh", "semi_direct_ri");
+    EXPECT_NEAR(r.hf_total_energy, REF_O2_UHF_STO3G, TOL_RI_AUTO);
+}
+
+// ============================================================
+//  UMP3 validation
+// ============================================================
+
+// Closed-shell UMP3 should match RMP3
+// Tolerance is slightly looser than TOL_POSTHF due to different numerical paths (UHF vs RHF MO integrals)
+TEST(ValidationUMP3, H2O_ClosedShell_MatchesRMP3) {
+    auto r_rhf = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf", "mp3");
+    auto r_uhf = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "uhf", "mp3");
+    EXPECT_NEAR(r_uhf.hf_total_energy, r_rhf.hf_total_energy, TOL_HF);
+    EXPECT_NEAR(r_uhf.post_hf_energy, r_rhf.post_hf_energy, 2e-3);
+}
+
+// Open-shell UMP3: O2 triplet
+// No PySCF UMP3 reference; check MP3 correlation is negative and |MP3| > |MP2|
+TEST(ValidationUMP3, O2_OpenShell) {
+    auto r_mp2 = run_gansu(XYZ + "O2.xyz", BASIS + "sto-3g.gbs", "uhf", "mp2", 0, 1, "gwh");
+    auto r_mp3 = run_gansu(XYZ + "O2.xyz", BASIS + "sto-3g.gbs", "uhf", "mp3", 0, 1, "gwh");
+    // UHF energies should match
+    EXPECT_NEAR(r_mp3.hf_total_energy, r_mp2.hf_total_energy, TOL_HF);
+    // MP3 correlation should be negative
+    EXPECT_LT(r_mp3.post_hf_energy, 0.0);
+    // |MP3 corr| > |MP2 corr| (MP3 recovers more correlation)
+    EXPECT_LT(r_mp3.post_hf_energy, r_mp2.post_hf_energy);
+}
+
 // Cross-check: semi-direct and stored RI give same energy
 TEST(ValidationSemiDirectRI, MatchesStoredRI_H2O) {
     auto r_ri = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",

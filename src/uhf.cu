@@ -59,6 +59,8 @@
     if(convergence_method == "damping"){ // damping algorithm with a constant damping factor
         const double damping_factor = parameters.get<double>("damping_factor");
         set_convergence_method(std::make_unique<Convergence_UHF_Damping>(*this, damping_factor));
+    }else if(convergence_method == "optimaldamping"){
+        set_convergence_method(std::make_unique<Convergence_UHF_Damping>(*this));
     }else if(convergence_method == "diis"){ // DIIS algorithm
         const size_t DIIS_size = parameters.get<size_t>("diis_size"); // DIIS size (number of previous Fock matrices)
         const bool is_include_transform = parameters.get<bool>("diis_include_transform"); // include the transformation matrix in DIIS
@@ -79,6 +81,12 @@
         Molecular auxiliary_molecular(molecular.get_atoms(), aux_basis);
         std::cout << "[RI] Auxiliary basis: " << auxiliary_molecular.get_num_basis() << " functions" << std::endl;
         set_eri_method(std::make_unique<ERI_RI_UHF>(*this, auxiliary_molecular));
+    }else if(eri_method == "semi_direct_ri"){
+        const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename");
+        BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);
+        Molecular auxiliary_molecular(molecular.get_atoms(), aux_basis);
+        std::cout << "[RI] Auxiliary basis: " << auxiliary_molecular.get_num_basis() << " functions" << std::endl;
+        set_eri_method(std::make_unique<ERI_RI_SemiDirect_UHF>(*this, auxiliary_molecular));
     }else{
         THROW_EXCEPTION("Invalid eri_method: " + eri_method);
     }
@@ -131,8 +139,8 @@ void UHF::post_process_after_scf() {
         return; // do nothing
     }else if(post_hf_method == PostHFMethod::MP2){
         post_hf_energy_ = eri_method_->compute_mp2_energy();
-    //}else if(post_hf_method == PostHFMethod::MP3){
-    //    post_hf_energy_ = eri_method_->compute_mp3_energy();
+    }else if(post_hf_method == PostHFMethod::MP3){
+        post_hf_energy_ = eri_method_->compute_mp3_energy();
     }else{
         THROW_EXCEPTION("Invalid post-HF method.");
     }

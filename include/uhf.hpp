@@ -271,14 +271,23 @@ public:
             cudaMemcpy(prev_fock_matrix_b.device_ptr(), hf_.get_fock_matrix_b().device_ptr(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyDeviceToDevice);
             return;
         }else{
-            /*
-               Optimized damping factor is not implemented yet.
-                If implement it, code here
-            */
-            if(verbose) std::cout << "Damping factor (constant): " << damping_factor_ << std::endl;
-            // Damping (after dammping, store the Fock matrix to the previous Fock matrix)
-            gpu::damping(prev_fock_matrix_a.device_ptr(), hf_.get_fock_matrix_a().device_ptr(), damping_factor_, hf_.get_num_basis());
-            gpu::damping(prev_fock_matrix_b.device_ptr(), hf_.get_fock_matrix_b().device_ptr(), damping_factor_, hf_.get_num_basis());
+            if (use_optimized_) {
+                const real_t factor = gpu::computeOptimalDampingFactor_UHF(
+                    hf_.get_fock_matrix_a().device_ptr(), prev_fock_matrix_a.device_ptr(),
+                    hf_.get_density_matrix_a().device_ptr(), prev_density_matrix_a.device_ptr(),
+                    hf_.get_fock_matrix_b().device_ptr(), prev_fock_matrix_b.device_ptr(),
+                    hf_.get_density_matrix_b().device_ptr(), prev_density_matrix_b.device_ptr(),
+                    hf_.get_num_basis());
+                if(verbose) std::cout << "Damping factor (optimal): " << factor << std::endl;
+                gpu::damping(prev_fock_matrix_a.device_ptr(), hf_.get_fock_matrix_a().device_ptr(), factor, hf_.get_num_basis());
+                gpu::damping(prev_fock_matrix_b.device_ptr(), hf_.get_fock_matrix_b().device_ptr(), factor, hf_.get_num_basis());
+                gpu::damping(prev_density_matrix_a.device_ptr(), hf_.get_density_matrix_a().device_ptr(), factor, hf_.get_num_basis());
+                gpu::damping(prev_density_matrix_b.device_ptr(), hf_.get_density_matrix_b().device_ptr(), factor, hf_.get_num_basis());
+            }else{
+                if(verbose) std::cout << "Damping factor (constant): " << damping_factor_ << std::endl;
+                gpu::damping(prev_fock_matrix_a.device_ptr(), hf_.get_fock_matrix_a().device_ptr(), damping_factor_, hf_.get_num_basis());
+                gpu::damping(prev_fock_matrix_b.device_ptr(), hf_.get_fock_matrix_b().device_ptr(), damping_factor_, hf_.get_num_basis());
+            }
         }
     }
 
@@ -807,7 +816,7 @@ public:
     ~ERI_Stored_UHF() = default; ///< destructor
 
     real_t compute_mp2_energy() override;
-    //real_t compute_mp3_energy() override;
+    real_t compute_mp3_energy() override;
 
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix_a = uhf_.get_density_matrix_a();
@@ -902,6 +911,48 @@ public:
 
 protected:
     UHF& uhf_; ///< UHF
+};
+
+
+/// Semi-Direct RI for UHF: recomputes B each iteration, J/K via BLAS.
+class ERI_RI_SemiDirect_UHF : public ERI_RI_Direct {
+public:
+    ERI_RI_SemiDirect_UHF(UHF& uhf, const Molecular& auxiliary_molecular)
+        : ERI_RI_Direct(uhf, auxiliary_molecular), uhf_(uhf) {}
+    ERI_RI_SemiDirect_UHF(const ERI_RI_SemiDirect_UHF&) = delete;
+    ~ERI_RI_SemiDirect_UHF() = default;
+
+    std::string get_algorithm_name() override { return "Semi-Direct-RI"; }
+
+    void compute_fock_matrix() override {
+        gpu::computeFockMatrix_RI_SemiDirect_UHF(
+            uhf_.get_density_matrix_a().device_ptr(),
+            uhf_.get_density_matrix_b().device_ptr(),
+            uhf_.get_coefficient_matrix_a().device_ptr(),
+            uhf_.get_coefficient_matrix_b().device_ptr(),
+            two_center_eris.device_ptr(),
+            uhf_.get_core_hamiltonian_matrix().device_ptr(),
+            uhf_.get_fock_matrix_a().device_ptr(),
+            uhf_.get_fock_matrix_b().device_ptr(),
+            hf_.get_shell_type_infos(),
+            hf_.get_shell_pair_type_infos(),
+            hf_.get_primitive_shells().device_ptr(),
+            hf_.get_cgto_normalization_factors().device_ptr(),
+            auxiliary_shell_type_infos_,
+            auxiliary_primitive_shells_.device_ptr(),
+            auxiliary_cgto_normalization_factors_.device_ptr(),
+            primitive_shell_pair_indices.device_ptr(),
+            num_basis_, num_auxiliary_basis_,
+            uhf_.get_num_alpha_spins(), uhf_.get_num_beta_spins(),
+            hf_.get_boys_grid().device_ptr(),
+            uhf_.get_schwarz_screening_threshold(),
+            schwarz_upper_bound_factors.device_ptr(),
+            auxiliary_schwarz_upper_bound_factors.device_ptr(),
+            uhf_.get_verbose());
+    }
+
+protected:
+    UHF& uhf_;
 };
 
 

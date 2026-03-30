@@ -1367,6 +1367,53 @@ real_t computeOptimalDampingFactor_RHF(const real_t* d_fock_matrix, const real_t
     return computeOptimalDampingFactor_RHF(d_fock_matrix, d_prev_fock_matrix, d_density_matrix, d_prev_density_matrix, num_basis);
  }
 
+real_t computeOptimalDampingFactor_UHF(
+    const real_t* d_fock_matrix_a, const real_t* d_prev_fock_matrix_a,
+    const real_t* d_density_matrix_a, const real_t* d_prev_density_matrix_a,
+    const real_t* d_fock_matrix_b, const real_t* d_prev_fock_matrix_b,
+    const real_t* d_density_matrix_b, const real_t* d_prev_density_matrix_b,
+    const int num_basis) {
+    real_t* d_tempDiffFockMatrix = nullptr;
+    real_t* d_tempDiffDensityMatrix = nullptr;
+    real_t* d_tempMatrix = nullptr;
+
+    gansu::tracked_cudaMalloc(&d_tempDiffFockMatrix, num_basis * num_basis * sizeof(real_t));
+    gansu::tracked_cudaMalloc(&d_tempDiffDensityMatrix, num_basis * num_basis * sizeof(real_t));
+    gansu::tracked_cudaMalloc(&d_tempMatrix, num_basis * num_basis * sizeof(real_t));
+
+    real_t s = 0.0;
+    real_t c = 0.0;
+
+    matrixSubtraction(d_fock_matrix_a, d_prev_fock_matrix_a, d_tempDiffFockMatrix, num_basis);
+    matrixSubtraction(d_density_matrix_a, d_prev_density_matrix_a, d_tempDiffDensityMatrix, num_basis);
+    matrixMatrixProduct(d_prev_fock_matrix_a, d_tempDiffDensityMatrix, d_tempMatrix, num_basis, false, false);
+    s += computeMatrixTrace(d_tempMatrix, num_basis);
+    matrixMatrixProduct(d_tempDiffFockMatrix, d_tempDiffDensityMatrix, d_tempMatrix, num_basis, false, false);
+    c += computeMatrixTrace(d_tempMatrix, num_basis);
+
+    matrixSubtraction(d_fock_matrix_b, d_prev_fock_matrix_b, d_tempDiffFockMatrix, num_basis);
+    matrixSubtraction(d_density_matrix_b, d_prev_density_matrix_b, d_tempDiffDensityMatrix, num_basis);
+    matrixMatrixProduct(d_prev_fock_matrix_b, d_tempDiffDensityMatrix, d_tempMatrix, num_basis, false, false);
+    s += computeMatrixTrace(d_tempMatrix, num_basis);
+    matrixMatrixProduct(d_tempDiffFockMatrix, d_tempDiffDensityMatrix, d_tempMatrix, num_basis, false, false);
+    c += computeMatrixTrace(d_tempMatrix, num_basis);
+
+    real_t alpha;
+    if (c <= -s/2.0) {
+        alpha = 1.0;
+    } else if (c == 0.0) {
+        alpha = 1.0;
+    } else {
+        alpha = -0.5 * s / c;
+    }
+
+    gansu::tracked_cudaFree(d_tempDiffFockMatrix);
+    gansu::tracked_cudaFree(d_tempDiffDensityMatrix);
+    gansu::tracked_cudaFree(d_tempMatrix);
+
+    return alpha;
+}
+
 
 /**
  * @brief Update the Fock/density matrix using the damping factor.
@@ -4235,6 +4282,164 @@ void computeFockMatrix_RI_Direct_v2(
 
     gansu::tracked_cudaFree(d_J);
     gansu::tracked_cudaFree(d_K);
+}
+
+
+// ============================================================
+//  Semi-Direct RI Fock build (UHF)
+//  Same B computation as RHF.
+//  J uses D_total = D_alpha + D_beta.
+//  K_alpha and K_beta computed separately from C_alpha, C_beta.
+//  F_alpha = H + J - K_alpha,  F_beta = H + J - K_beta  (no 1/2 factor)
+// ============================================================
+void computeFockMatrix_RI_SemiDirect_UHF(
+    const real_t* d_density_matrix_a, const real_t* d_density_matrix_b,
+    const real_t* d_coefficient_matrix_a, const real_t* d_coefficient_matrix_b,
+    const real_t* d_two_center_eris_cholesky,
+    const real_t* d_core_hamiltonian_matrix,
+    real_t* d_fock_matrix_a, real_t* d_fock_matrix_b,
+    const std::vector<ShellTypeInfo>& shell_type_infos,
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+    const PrimitiveShell* d_primitive_shells, const real_t* d_cgto_normalization_factors,
+    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+    const PrimitiveShell* d_auxiliary_primitive_shells, const real_t* d_auxiliary_cgto_normalization_factors,
+    const size_t2* d_primitive_shell_pair_indices,
+    int num_basis, int num_auxiliary_basis, int num_occ_a, int num_occ_b,
+    const real_t* d_boys_grid,
+    double schwarz_screening_threshold,
+    const real_t* d_schwarz_upper_bound_factors, const real_t* d_auxiliary_schwarz_upper_bound_factors,
+    bool verbose)
+{
+    cublasHandle_t handle = GPUHandle::cublas();
+    const int nao = num_basis;
+    const int naux = num_auxiliary_basis;
+    const size_t nao2 = (size_t)nao * nao;
+    const double one = 1.0, zero = 0.0;
+
+    // ========== Step 1: Compute B = L^{-1} × (μν|Q) ==========
+    real_t* d_B = nullptr;
+    gansu::tracked_cudaMalloc(&d_B, (size_t)naux * nao2 * sizeof(real_t));
+
+    {
+        const int threads_per_block = 128;
+        const int shell_type_count = shell_type_infos.size();
+        const int auxiliary_shell_type_count = auxiliary_shell_type_infos.size();
+
+        for (int s0 = 0; s0 < shell_type_count; ++s0) {
+            for (int s1 = s0; s1 < shell_type_count; ++s1) {
+                for (int s2 = 0; s2 < auxiliary_shell_type_count; ++s2) {
+                    const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+                    const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+                    const ShellTypeInfo shell_s2 = auxiliary_shell_type_infos[s2];
+
+                    const int64_t num_tasks = ((s0 == s1)
+                        ? ((int64_t)shell_s0.count * (shell_s0.count + 1) / 2)
+                        : ((int64_t)shell_s0.count * shell_s1.count))
+                        * (int64_t)shell_s2.count;
+                    const int num_blocks = (int)((num_tasks + threads_per_block - 1) / threads_per_block);
+                    const int pair_idx = calcIdx_triangular_(s0, s1, shell_type_count);
+
+                    ShellTypeInfo shell_s0_nooff = shell_s0;  shell_s0_nooff.start_index = 0;
+                    ShellTypeInfo shell_s1_nooff = shell_s1;  shell_s1_nooff.start_index = 0;
+
+                    gpu::get_3center_kernel(s0, s1, s2)<<<num_blocks, threads_per_block>>>(
+                        d_B, d_primitive_shells, d_auxiliary_primitive_shells,
+                        d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors,
+                        shell_s0_nooff, shell_s1_nooff, shell_s2,
+                        num_tasks, nao,
+                        &d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index],
+                        &d_schwarz_upper_bound_factors[shell_pair_type_infos[pair_idx].start_index],
+                        d_auxiliary_schwarz_upper_bound_factors,
+                        schwarz_screening_threshold, naux, d_boys_grid);
+                }
+            }
+        }
+        cudaDeviceSynchronize();
+    }
+
+    cublasDtrsm(handle, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
+                nao2, naux, &one, d_two_center_eris_cholesky, naux, d_B, nao2);
+
+    // ========== Step 2: J from D_total ==========
+    // D_total = D_alpha + D_beta
+    real_t* d_D_total = nullptr;
+    gansu::tracked_cudaMalloc(&d_D_total, nao2 * sizeof(real_t));
+    matrixAddition(d_density_matrix_a, d_density_matrix_b, d_D_total, nao);
+
+    real_t* d_J = nullptr;
+    real_t* d_W = nullptr;
+    gansu::tracked_cudaMalloc(&d_J, nao2 * sizeof(real_t));
+    gansu::tracked_cudaMalloc(&d_W, naux * sizeof(real_t));
+    cublasDgemv(handle, CUBLAS_OP_T, nao2, naux, &one, d_B, nao2, d_D_total, 1, &zero, d_W, 1);
+    cublasDgemv(handle, CUBLAS_OP_N, nao2, naux, &one, d_B, nao2, d_W, 1, &zero, d_J, 1);
+    gansu::tracked_cudaFree(d_W);
+    gansu::tracked_cudaFree(d_D_total);
+
+    // ========== Step 3: K_alpha and K_beta via chunked auxiliary loop ==========
+    // Helper lambda: compute K from B and C_occ
+    // UHF K has NO factor of 2 (per-spin density, not total)
+    const int aux_chunk = std::min(naux, 64);
+
+    auto compute_K_from_B = [&](const real_t* d_C, int nocc, real_t* d_K) {
+        if (nocc == 0) { cudaMemset(d_K, 0, nao2 * sizeof(real_t)); return; }
+        cudaMemset(d_K, 0, nao2 * sizeof(real_t));
+        const size_t chunk_elems = (size_t)aux_chunk * nao * nocc;
+        real_t* d_X_chunk = nullptr;
+        real_t* d_X_packed_chunk = nullptr;
+        gansu::tracked_cudaMalloc(&d_X_chunk, chunk_elems * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_X_packed_chunk, chunk_elems * sizeof(real_t));
+
+        for (int q_start = 0; q_start < naux; q_start += aux_chunk) {
+            const int actual = std::min(aux_chunk, naux - q_start);
+
+            cublasDgemmStridedBatched(handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                nocc, nao, nao,
+                &one, d_C, nao, 0,
+                &d_B[(size_t)q_start * nao2], nao, (long long)nao * nao,
+                &zero, d_X_chunk, nocc, (long long)nao * nocc,
+                actual);
+
+            {
+                const size_t total = (size_t)actual * nao * nocc;
+                const int th = 256;
+                const int bl = (total + th - 1) / th;
+                packThreeDimensionalTensorX<<<bl, th>>>(d_X_chunk, d_X_packed_chunk, nao, actual, nocc);
+            }
+
+            cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                        nao, nao, actual * nocc,
+                        &one, d_X_packed_chunk, actual * nocc,
+                        d_X_packed_chunk, actual * nocc,
+                        &one, d_K, nao);
+        }
+
+        gansu::tracked_cudaFree(d_X_chunk);
+        gansu::tracked_cudaFree(d_X_packed_chunk);
+    };
+
+    real_t* d_Ka = nullptr;
+    real_t* d_Kb = nullptr;
+    gansu::tracked_cudaMalloc(&d_Ka, nao2 * sizeof(real_t));
+    gansu::tracked_cudaMalloc(&d_Kb, nao2 * sizeof(real_t));
+
+    compute_K_from_B(d_coefficient_matrix_a, num_occ_a, d_Ka);
+    compute_K_from_B(d_coefficient_matrix_b, num_occ_b, d_Kb);
+
+    gansu::tracked_cudaFree(d_B);
+
+    // ========== Step 4: F = H + J - K ==========
+    {
+        const int th = 256;
+        const int bl = (nao2 + th - 1) / th;
+        computeFockMatrix_RI_UHF_kernel<<<bl, th>>>(d_core_hamiltonian_matrix, d_J, d_Ka, d_fock_matrix_a, nao);
+        computeFockMatrix_RI_UHF_kernel<<<bl, th>>>(d_core_hamiltonian_matrix, d_J, d_Kb, d_fock_matrix_b, nao);
+        cudaDeviceSynchronize();
+    }
+
+    gansu::tracked_cudaFree(d_J);
+    gansu::tracked_cudaFree(d_Ka);
+    gansu::tracked_cudaFree(d_Kb);
 }
 
 
