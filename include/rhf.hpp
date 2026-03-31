@@ -810,6 +810,7 @@ public:
     ~ERI_Stored_RHF() = default; ///< destructor
 
     real_t compute_mp2_energy() override;
+    void compute_mp2_effective_densities(real_t* d_P_eff, real_t* d_W_eff, real_t* d_Gamma_eff) override;
     real_t compute_mp3_energy() override;
     real_t compute_mp4_energy() override;
     real_t compute_cc2_energy() override;

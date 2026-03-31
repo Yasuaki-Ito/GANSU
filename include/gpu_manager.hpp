@@ -98,6 +98,17 @@ void computeFockMatrix_Direct_RHF(const real_t* d_density_matrix, real_t* d_dens
 std::vector<double> computeSkeletonHessian_RHF(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, const Atom* d_atoms, const real_t* d_density_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors, const int num_atoms, const int num_basis, const int num_electron, const bool verbose);
 
 std::vector<double> computeEnergyGradient_RHF(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, const Atom* d_atoms, const real_t* d_density_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors, const int num_atoms, const int num_basis, const int num_electron, const bool verbose);
+
+/// Generalized gradient: separate densities for 1-electron, overlap (W), and 2-electron terms.
+/// d_density_1el: for kinetic + nuclear attraction derivatives
+/// d_W_matrix_ext: for overlap derivative (pass nullptr to compute HF W internally)
+/// d_density_2el: for ERI derivative (Coulomb + Exchange)
+std::vector<double> computeEnergyGradient_general(
+    const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+    const Atom* d_atoms,
+    const real_t* d_density_1el, const real_t* d_W_matrix_ext, const real_t* d_density_2el,
+    const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors,
+    const int num_atoms, const int num_basis, const bool verbose);
 std::vector<double> computeEnergyGradient_UHF(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, const Atom* d_atoms, const real_t* d_density_matrix_a, const real_t* d_density_matrix_b, const real_t* d_coefficient_matrix_a, const real_t* d_coefficient_matrix_b, const real_t* d_orbital_energies_a, const real_t* d_orbital_energies_b, const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors, const int num_atoms, const int num_basis, const int num_alpha, const int num_beta, const bool verbose);
 // void computeEnergyGradient_ROHF(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, const Atom* d_atoms, const real_t* d_density_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors, const int num_atoms, const int num_basis, const int num_electron, const bool verbose);
 

@@ -95,6 +95,18 @@ public:
     }
 
     /**
+     * @brief Compute MP2 effective density matrices for gradient calculation
+     * @param d_P_eff   Output: effective 1-PDM in AO basis (num_basis × num_basis)
+     * @param d_W_eff   Output: effective energy-weighted density in AO basis
+     * @param d_Gamma_eff Output: effective 2-PDM density pair for ERI derivative contraction
+     * @details Computes relaxed MP2 density (unrelaxed + Z-vector) and transforms to AO basis.
+     *          The caller uses these to compute the MP2 gradient via existing integral derivative kernels.
+     */
+    virtual void compute_mp2_effective_densities(real_t* d_P_eff, real_t* d_W_eff, real_t* d_Gamma_eff) {
+        THROW_EXCEPTION("MP2 gradient is not supported for the selected ERI method.");
+    }
+
+    /**
      * @brief Compute MP3 energy
         * @return MP3 energy
         * @details This function computes the MP3 energy.

@@ -1071,6 +1071,14 @@ inline void transform_eri_ao2mo_dgemm_full_os(
         num_basis
     );
 
+    // debug
+    dgeam_transpose_row_major(
+        cublasH, 
+        num_basis_2, num_basis_2, 
+        d_eri_mo, 
+        d_eri_ao);
+    cudaMemcpy(d_eri_mo, d_eri_ao, sizeof(double) * num_basis_2 * num_basis_2, cudaMemcpyDeviceToDevice);
+
     cudaDeviceSynchronize();
     cublasDestroy(cublasH);
 }

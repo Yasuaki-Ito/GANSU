@@ -4684,6 +4684,124 @@ std::vector<double> computeEnergyGradient_RHF(const std::vector<ShellTypeInfo>& 
 }
 
 
+// Generalized gradient: separate densities for 1-electron (kinetic+nuclear), overlap (W), and 2-electron terms.
+std::vector<double> computeEnergyGradient_general(
+    const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+    const Atom* d_atoms,
+    const real_t* d_density_1el, const real_t* d_W_matrix_ext, const real_t* d_density_2el,
+    const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors,
+    const int num_atoms, const int num_basis, const bool verbose)
+{
+    const int n = 3 * num_atoms;
+    const size_t gradients_bytes = n * sizeof(double);
+
+    double* grad_total = nullptr;
+    cudaMallocHost((void**)&grad_total, gradients_bytes);
+
+    double* d_grad_N = nullptr;
+    double* d_grad_S = nullptr;
+    double* d_grad_K = nullptr;
+    double* d_grad_V = nullptr;
+    double* d_grad_G = nullptr;
+    double* d_grad_total = nullptr;
+
+    cudaMalloc(&d_grad_N, gradients_bytes);
+    cudaMalloc(&d_grad_S, gradients_bytes);
+    cudaMalloc(&d_grad_K, gradients_bytes);
+    cudaMalloc(&d_grad_V, gradients_bytes);
+    cudaMalloc(&d_grad_G, gradients_bytes);
+    cudaMalloc(&d_grad_total, gradients_bytes);
+
+    cudaMemset(d_grad_N, 0, gradients_bytes);
+    cudaMemset(d_grad_S, 0, gradients_bytes);
+    cudaMemset(d_grad_K, 0, gradients_bytes);
+    cudaMemset(d_grad_V, 0, gradients_bytes);
+    cudaMemset(d_grad_G, 0, gradients_bytes);
+    cudaMemset(d_grad_total, 0, gradients_bytes);
+
+    size_t stackSize = 64 * 1024;
+    cudaDeviceSetLimit(cudaLimitStackSize, stackSize);
+
+    // Same kernel dispatch as computeMolucularGradients, but with separate densities:
+    // - ERI derivative uses d_density_2el
+    // - Kinetic/Nuclear uses d_density_1el
+    // - Overlap uses d_W_matrix_ext
+    const int threads_per_block = 128;
+    const int shell_type_count = shell_type_infos.size();
+
+    std::vector<std::tuple<int, int, int, int>> shell_quadruples;
+    for (int a = 0; a < shell_type_count; ++a)
+        for (int b = a; b < shell_type_count; ++b)
+            for (int c = 0; c < shell_type_count; ++c)
+                for (int d = c; d < shell_type_count; ++d)
+                    if (a < c || (a == c && b <= d))
+                        shell_quadruples.emplace_back(a, b, c, d);
+    std::reverse(shell_quadruples.begin(), shell_quadruples.end());
+
+    int stream_id = 0;
+    const int num_kernels = shell_quadruples.size() + 3*((shell_type_count)*(shell_type_count+1)/2) + 1;
+    std::vector<cudaStream_t> streams(num_kernels);
+    for (int i = 0; i < num_kernels; i++) cudaStreamCreate(&streams[i]);
+
+    // 2-electron derivatives (uses d_density_2el)
+    for (const auto& quadruple : shell_quadruples) {
+        int s0, s1, s2, s3;
+        std::tie(s0, s1, s2, s3) = quadruple;
+        const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+        const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+        const ShellTypeInfo shell_s2 = shell_type_infos[s2];
+        const ShellTypeInfo shell_s3 = shell_type_infos[s3];
+        const size_t num_bra = (s0==s1) ? shell_s0.count*(shell_s0.count+1)/2 : shell_s0.count*shell_s1.count;
+        const size_t num_ket = (s2==s3) ? shell_s2.count*(shell_s2.count+1)/2 : shell_s2.count*shell_s3.count;
+        const size_t num_braket = ((s0==s2)&&(s1==s3)) ? num_bra*(num_bra+1)/2 : num_bra*num_ket;
+        const int num_blocks = (num_braket + threads_per_block - 1) / threads_per_block;
+        get_compute_gradients_repulsion()<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+            d_grad_G, d_density_2el, d_primitive_shells, d_cgto_normalization_factors,
+            shell_s0, shell_s1, shell_s2, shell_s3, num_braket, num_basis, d_boys_grid);
+    }
+
+    // 1-electron derivatives (overlap uses W, kinetic/nuclear use d_density_1el)
+    for (int s0 = shell_type_count-1; s0 >= 0; s0--) {
+        for (int s1 = shell_type_count-1; s1 >= s0; s1--) {
+            const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+            const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+            const int num_shell_pairs = (s0==s1) ? (shell_s0.count*(shell_s0.count+1)/2) : (shell_s0.count*shell_s1.count);
+            const int num_blocks = (num_shell_pairs + threads_per_block - 1) / threads_per_block;
+            get_compute_gradients_overlap()<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+                d_grad_S, d_W_matrix_ext, d_primitive_shells, d_cgto_normalization_factors, num_basis, shell_s0, shell_s1, num_shell_pairs);
+            get_compute_gradients_kinetic()<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+                d_grad_K, d_density_1el, d_primitive_shells, d_cgto_normalization_factors, num_basis, shell_s0, shell_s1, num_shell_pairs);
+            get_compute_gradients_nuclear()<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+                d_grad_V, d_density_1el, d_primitive_shells, d_cgto_normalization_factors, d_atoms, num_atoms, num_basis, shell_s0, shell_s1, num_shell_pairs, d_boys_grid);
+        }
+    }
+
+    const int NR_blocks = (num_atoms * num_atoms + threads_per_block - 1) / threads_per_block;
+    compute_nuclear_repulsion_gradient_kernel<<<NR_blocks, threads_per_block, 0, streams[stream_id]>>>(d_grad_N, d_atoms, num_atoms);
+
+    cudaDeviceSynchronize();
+    for (int i = 0; i < num_kernels; i++) cudaStreamDestroy(streams[i]);
+
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    const double alpha = 1.0;
+    cudaMemcpy(d_grad_total, d_grad_N, gradients_bytes, cudaMemcpyDeviceToDevice);
+    cublasDaxpy(handle, n, &alpha, d_grad_S, 1, d_grad_total, 1);
+    cublasDaxpy(handle, n, &alpha, d_grad_K, 1, d_grad_total, 1);
+    cublasDaxpy(handle, n, &alpha, d_grad_V, 1, d_grad_total, 1);
+    cublasDaxpy(handle, n, &alpha, d_grad_G, 1, d_grad_total, 1);
+    cublasDestroy(handle);
+
+    cudaMemcpy(grad_total, d_grad_total, gradients_bytes, cudaMemcpyDeviceToHost);
+    std::vector<double> gradient(grad_total, grad_total + n);
+
+    cudaFree(d_grad_N); cudaFree(d_grad_S); cudaFree(d_grad_K);
+    cudaFree(d_grad_V); cudaFree(d_grad_G); cudaFree(d_grad_total);
+    cudaFreeHost(grad_total);
+
+    return gradient;
+}
+
 
 // UHF版: 各分子積分の微分を同時に計算
 void computeMolucularGradients_UHF(double* d_grad_total, double* d_grad_N, double* d_grad_S, double* d_grad_K, double* d_grad_V, double* d_grad_G,

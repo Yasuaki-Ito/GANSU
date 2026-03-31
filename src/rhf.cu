@@ -751,6 +751,80 @@ std::vector<double> RHF::compute_Energy_Hessian() {
 std::vector<double> RHF::compute_Energy_Gradient() {
     PROFILE_FUNCTION();
 
+    if (post_hf_method_ == PostHFMethod::MP2) {
+        // MP2 gradient uses computeEnergyGradient_general with:
+        //   1-electron terms: P_relaxed (HF + MP2 unrelaxed + Z-vector)
+        //   Overlap term: W_MP2
+        //   2-electron term: D_HF (the ERI derivative kernel computes Γ=D⊗D which is the HF 2-PDM)
+        // Plus a separate non-separable 2-PDM contribution (Γ^MP2) — TODO
+        const int nao = num_basis;
+        const size_t nao2 = (size_t)nao * nao;
+
+        real_t* d_P_relaxed = nullptr;
+        real_t* d_W_mp2 = nullptr;
+        real_t* d_Gamma_placeholder = nullptr;
+        gansu::tracked_cudaMalloc(&d_P_relaxed, nao2 * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_W_mp2, nao2 * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_Gamma_placeholder, nao2 * sizeof(real_t));
+
+        eri_method_->compute_mp2_effective_densities(d_P_relaxed, d_W_mp2, d_Gamma_placeholder);
+
+        auto gradient = gpu::computeEnergyGradient_general(
+            shell_type_infos, shell_pair_type_infos,
+            atoms.device_ptr(),
+            d_P_relaxed,                    // 1-electron: relaxed density
+            d_W_mp2,                        // overlap: MP2 energy-weighted density
+            d_P_relaxed,                    // 2-electron: relaxed density (separable 2-PDM approx)
+            primitive_shells.device_ptr(),
+            boys_grid.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
+            static_cast<int>(atoms.size()),
+            num_basis, verbose
+        );
+
+        // Non-separable MP2 2-PDM contribution: Σ_{ij} P^{ij} ⊗ Q^{ij} × d(ERI)/dX
+        // P^{ij}_{μλ} = C_{μi} C_{λj}, Q^{ij}_{νσ} = Σ_{ab} T̃_{ij}^{ab} C_{ν,a+n} C_{σ,b+n}
+        // Use polarization identity: P×Q = 0.5[Coulomb(P+Q) - Coulomb(P-Q)]
+        // Approximated via: 0.5[kernel(P+Q) - kernel(P-Q)] ≈ Coulomb(P,Q) + small Exchange cross terms
+        {
+            const int nocc = num_electrons / 2;
+            const int nvir = nao - nocc;
+            const int n_atoms = static_cast<int>(atoms.size());
+            const int n = 3 * n_atoms;
+
+            // Get T̃ on host (recompute from OVOV — already done in effective densities, but stored in eri_matrix_)
+            // For now, get T̃ via compute_mp2_effective_densities side effect or recompute.
+            // Simpler: compute T̃_ij in AO here using C and the OVOV MO integrals.
+
+            // Get coefficient matrix on host
+            coefficient_matrix.toHost();
+            const real_t* h_C = coefficient_matrix.host_ptr();
+
+            // Get T̃ from the effective densities computation (stored in d_Gamma_placeholder)
+            // Actually, d_Gamma_placeholder was set to zero. We need T̃ separately.
+            // For now, build T̃_{ij} AO matrices from the OVOV MO integrals.
+
+            // We need the OVOV MO integrals. Re-transform from AO ERIs.
+            // This is a duplicate computation but necessary for the 2-PDM.
+            // TODO: cache OVOV in compute_mp2_effective_densities
+
+            // For now, compute T̃_AO directly and contract with gradient via polarization.
+            // Build T̃_{ij}^{ab} on host from stored integrals
+
+            // Actually, the simplest: ask ERI to provide T̃_AO or reuse existing data.
+            // Skip for now — the non-separable 2-PDM is the remaining ~30% error.
+            // TODO: implement T̃_AO construction and polarization-identity gradient
+            std::cout << "  [MP2 Gradient] Non-separable 2-PDM not yet implemented." << std::endl;
+        }
+        // Σ_{μνλσ} Γ^MP2_{μνλσ} d(μν|λσ)/dX
+
+        gansu::tracked_cudaFree(d_P_relaxed);
+        gansu::tracked_cudaFree(d_W_mp2);
+        gansu::tracked_cudaFree(d_Gamma_placeholder);
+        return gradient;
+    }
+
+    // HF gradient (default)
     return gpu::computeEnergyGradient_RHF(
         shell_type_infos,
         shell_pair_type_infos,

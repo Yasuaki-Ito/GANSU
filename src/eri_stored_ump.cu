@@ -129,8 +129,8 @@ __global__ void compute_ump2_energy_contrib_ss(
         const int b = jb % num_virtual;
 
         const double iajb = g_eri_mo[ovov2seq(i, a, j, b, num_occupied, num_virtual)];
+        //const double jaib = g_eri_mo[ovov2seq(i, b, j, a, num_occupied, num_virtual)];
         const double jaib = g_eri_mo[ovov2seq(j, a, i, b, num_occupied, num_virtual)];
-        //tmp = iajb * (2 * iajb - jaib) / (g_eps[i] + g_eps[j] - g_eps[num_occupied + a] - g_eps[num_occupied + b]);
         tmp = iajb * (iajb - jaib) / (g_eps[i] + g_eps[j] - g_eps[num_occupied + a] - g_eps[num_occupied + b]);
     }
 
@@ -1222,7 +1222,7 @@ double ump3_from_aoeri_via_full_moeri(
     double h_energy_4h2p = 0.0;
     double h_energy_2h4p = 0.0;
     double h_energy_3h3p = 0.0;
-    //double h_energy = 0.0;
+    double h_energy = 0.0;
 
     /*
     cudaMemcpy(&h_energy_4h2p, d_energy_4h2p_aa, sizeof(double), cudaMemcpyDeviceToHost);
