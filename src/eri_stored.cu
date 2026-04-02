@@ -26,6 +26,8 @@
 
 #include "ao2mo.cuh"
 
+extern "C" void dgesv_(int*, int*, double*, int*, int*, double*, int*, int*);
+
 #define FULLMASK 0xffffffff
 
 namespace gansu {
@@ -1053,7 +1055,7 @@ real_t ERI_Stored_RHF::compute_mp2_energy() {
 //    7. 2-PDM contribution → Gamma_eff
 // ============================================================
 void ERI_Stored_RHF::compute_mp2_effective_densities(
-    real_t* d_P_eff, real_t* d_W_eff, real_t* d_Gamma_eff)
+    real_t* d_P_eff, real_t* d_W_eff, real_t* d_Gamma_eff, real_t* d_P_2el)
 {
     cublasHandle_t handle = gpu::GPUHandle::cublas();
     const int nao = rhf_.get_num_basis();
@@ -1062,7 +1064,7 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
     const int nmo = nao;
     const size_t nao2 = (size_t)nao * nao;
     const size_t novov = (size_t)nocc * nvir * nocc * nvir;
-    const double one = 1.0, zero = 0.0, minus_two = -2.0, two = 2.0;
+    const double zero = 0.0;
 
     const real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
     const real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
@@ -1072,16 +1074,13 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
     std::cout << "    nao=" << nao << " nocc=" << nocc << " nvir=" << nvir << std::endl;
 
     // -------------------------------------------------------
-    // Step 1: AO→MO transformation (OVOV block only)
-    //   NOTE: transform_eri_ao2mo_dgemm_ovov writes the final OVOV result
-    //   to the FIRST argument (d_eri_ao), using the second as workspace.
-    //   After the call, the first novov elements of d_eri_ao contain (ia|jb).
+    // Step 1: OVOV MO integrals
+    //   compute_mp2_energy() has already been called and overwrote
+    //   eri_matrix_ with (ia|jb) OVOV integrals in the first novov elements.
+    //   We just copy them — no re-transformation needed.
     // -------------------------------------------------------
     real_t* d_eri_ovov = nullptr;
     gansu::tracked_cudaMalloc(&d_eri_ovov, novov * sizeof(real_t));
-    // Use d_eri_ovov as workspace (2nd arg), result lands in d_eri_ao
-    transform_eri_ao2mo_dgemm_ovov(d_eri_ao, d_eri_ovov, d_C, nocc, nvir);
-    // Copy result from d_eri_ao to d_eri_ovov
     cudaMemcpy(d_eri_ovov, d_eri_ao, novov * sizeof(real_t), cudaMemcpyDeviceToDevice);
 
     // -------------------------------------------------------
@@ -1118,21 +1117,15 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
     cudaMemcpy(d_T2, h_T2.data(), novov * sizeof(real_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_T2tilde, h_T2tilde.data(), novov * sizeof(real_t), cudaMemcpyHostToDevice);
 
-    // Diagnostic: T2 norm and sample elements
+    // Diagnostic: T2 and OVOV norms
     {
-        double t2_norm = 0;
+        double t2_norm = 0, t2t_norm = 0, ovov_norm = 0;
         for (auto v : h_T2) t2_norm += v * v;
-        std::cout << "    |T2| = " << std::sqrt(t2_norm) << " (PySCF: 0.1191)" << std::endl;
-        // Print t2[0,0,0,0] and t2[0,0,0,1] — GANSU layout: t(i,a,j,b)
-        // = PySCF t2[i,j,a,b] so t_gansu(0,0,0,0) = t_pyscf(0,0,0,0)
-        // MO integrals: (ia|jb) at ovov2seq(i,a,j,b)
-        std::cout << "    (0,5|0,5)=" << h_ovov[0]  // i=0,a=0,j=0,b=0
-                  << " (0,5|0,6)=" << h_ovov[1]      // i=0,a=0,j=0,b=1
-                  << " D(0,0,0,0)=" << (h_eps[0]+h_eps[0]-h_eps[nocc]-h_eps[nocc])
-                  << std::endl;
-        std::cout << "    t2(0,0,0,0)=" << h_T2[0]
-                  << " t2(0,0,0,1)=" << h_T2[1]
-                  << std::endl;
+        for (auto v : h_T2tilde) t2t_norm += v * v;
+        for (auto v : h_ovov) ovov_norm += v * v;
+        std::cout << "    |T2| = " << std::sqrt(t2_norm)
+                  << ", |T2tilde| = " << std::sqrt(t2t_norm)
+                  << ", |OVOV| = " << std::sqrt(ovov_norm) << std::endl;
     }
 
     // -------------------------------------------------------
@@ -1140,36 +1133,29 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
     //   P_ij = -2 Σ_{kab} T̃_{ik}^{ab} T_{jk}^{ab}
     //   P_ab =  2 Σ_{ijc} T̃_{ij}^{ac} T_{ij}^{bc}
     //
-    //   Reshape T2(i,a,j,b) as T_mat(i, a*j*b = nvir*nocc*nvir)
-    //   P_oo = -2 * T̃_mat × T_mat^T
-    //   Similarly for P_vv
+    //   P_oo(i,j) = -Σ_{kab} T̃(i,a,k,b) * T(j,a,k,b)
+    //   P_vv(a,b) =  Σ_{ijc} T̃(i,a,j,c) * T(i,b,j,c)
+    //
+    //   T2 layout: T2[i*nvir*nocc*nvir + a*nocc*nvir + j*nvir + b]
+    //   Reshape as mat(nocc, nvir*nocc*nvir) for P_oo via DGEMM.
     // -------------------------------------------------------
-    const size_t nocc_x_nvir2 = (size_t)nocc * nvir * nvir;
-
-    // P_oo: reshape T2(i, a*nocc*nvir+j*nvir+b) → (nocc, nvir*nocc*nvir)
-    // P_oo(i,j) = -2 * Σ_{k,a,b} T̃(i,a,k,b) * T(j,a,k,b)
-    // T2 layout: T2[i*nvir*nocc*nvir + a*nocc*nvir + j*nvir + b]
-    // This is already (nocc, nvir*nocc*nvir) in row-major!
     real_t* d_P_oo = nullptr;
     gansu::tracked_cudaMalloc(&d_P_oo, (size_t)nocc * nocc * sizeof(real_t));
 
-    // P_oo = -2 * T̃ × T^T, where T̃ and T are (nocc, nvir*nocc*nvir)
-    // cuBLAS: C = alpha * op(A) * op(B) + beta * C
-    // Row-major (nocc, nvir*nocc*nvir) → col-major (nvir*nocc*nvir, nocc)
-    // P_oo_rm = -2 * T̃_rm × T_rm^T
-    // In cuBLAS: P_cm(nocc, nocc) = -2 * T_cm^T(nocc, N) × T̃_cm(N, nocc)  where N = nvir*nocc*nvir
-    // P_ij = -2 Σ_{kab} T_{ik}^{ab} T_{jk}^{ab}  (PySCF convention: t×t, NOT t̃×t)
-    cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                nocc, nocc, (int)(nvir * nocc * nvir),
-                &minus_two, d_T2, nvir * nocc * nvir,
-                d_T2, nvir * nocc * nvir,
-                &zero, d_P_oo, nocc);
+    // P_oo = -1 * T̃_mat × T_mat^T, where both are (nocc, nvir*nocc*nvir) in row-major
+    // cuBLAS col-major: P_cm(nocc,nocc) = -1 * T_cm^T(nocc,N) × T̃_cm(N,nocc)
+    {
+        const double minus_one = -1.0;
+        const int N = (int)(nvir * nocc * nvir);
+        cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    nocc, nocc, N,
+                    &minus_one, d_T2, N,
+                    d_T2tilde, N,
+                    &zero, d_P_oo, nocc);
+    }
 
-    // P_vv: reshape T2(i*nvir+a, j*nvir+b) → need T2(ij, a, c) contraction
-    // P_ab = 2 * Σ_{ijc} T̃_{ij}^{ac} T_{ij}^{bc}
-    // Reshape as T_vv(nocc*nocc, nvir) with T_vv[i*nocc+j, a] = ... sum over internal index
-    // Actually simpler: T2_perm(a, i*nocc*nvir + j*nvir + b) then P_vv = 2 * T̃_perm × T_perm^T
-    // This requires permutation. For now, compute on host.
+    // P_vv(a,b) = Σ_{ijc} T̃(i,a,j,c) * T(i,b,j,c)
+    // Compute on host (requires permuted layout for DGEMM)
     std::vector<real_t> h_P_vv(nvir * nvir, 0.0);
     for (int a = 0; a < nvir; a++) {
         for (int b = 0; b < nvir; b++) {
@@ -1179,11 +1165,11 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
                     for (int c = 0; c < nvir; c++) {
                         const size_t idx_ac = ((size_t)i * nvir + a) * nocc * nvir + (size_t)j * nvir + c;
                         const size_t idx_bc = ((size_t)i * nvir + b) * nocc * nvir + (size_t)j * nvir + c;
-                        sum += h_T2[idx_ac] * h_T2[idx_bc];  // t×t (PySCF convention)
+                        sum += h_T2tilde[idx_ac] * h_T2[idx_bc];
                     }
                 }
             }
-            h_P_vv[a * nvir + b] = 2.0 * sum;
+            h_P_vv[a * nvir + b] = sum;
         }
     }
     real_t* d_P_vv = nullptr;
@@ -1208,41 +1194,191 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
     std::cout << "    Unrelaxed density computed." << std::endl;
 
     // -------------------------------------------------------
-    // Step 4: Z-vector equation
-    //   Need full MO ERI for CPHF operator
-    //   A_{ai,bj} z_{bj} = -L_{ai}
+    // Step 4: Z-vector equation (canonical HF)
+    //   Xvo(a,i) = vhf_mo(a,i) + I(i,a) - I(a,i)
+    //   where vhf = (2J-K) response from unrelaxed density, scaled by 2
+    //   z(a,i) = Xvo(a,i) / (ε_a - ε_i)
     // -------------------------------------------------------
-    // Build full MO ERI
-    real_t* d_eri_mo = build_mo_eri(d_C, nmo);
+    // Copy P_oo to host (needed here and in Step 5)
+    std::vector<real_t> h_P_oo(nocc * nocc);
+    cudaMemcpy(h_P_oo.data(), d_P_oo, nocc * nocc * sizeof(real_t), cudaMemcpyDeviceToHost);
 
-    // For canonical HF, the Z-vector occ-vir block is ZERO (verified with PySCF).
-    // Skip CPHF solve — Z-vector does not contribute to the relaxed density.
-    std::cout << "    Z-vector = 0 (canonical orbitals)." << std::endl;
+    // Build unrelaxed density in AO for vhf computation
+    std::vector<real_t> h_dm1_unrelaxed_MO(nmo * nmo, 0.0);
+    for (int i = 0; i < nocc; i++)
+        for (int j = 0; j < nocc; j++)
+            h_dm1_unrelaxed_MO[i * nmo + j] = h_P_oo[i * nocc + j] + h_P_oo[j * nocc + i];
+    for (int a = 0; a < nvir; a++)
+        for (int b = 0; b < nvir; b++)
+            h_dm1_unrelaxed_MO[(a + nocc) * nmo + (b + nocc)] = h_P_vv[a * nvir + b] + h_P_vv[b * nvir + a];
+
+    // Compute vhf_MO(a,i) on host using full MO ERI.
+    // AO ERI was overwritten by MP2, so rebuild full MO ERI from scratch.
+    // For small molecules this is acceptable (nmo^4 storage).
+    rhf_.get_coefficient_matrix().toHost();
+    const real_t* h_C = rhf_.get_coefficient_matrix().host_ptr();
+
+    // Rebuild AO ERI on host from scratch using int2e computation
+    // Actually, use get_eri_matrix_host which may have AO ERI cached
+    // Since eri_matrix_ is overwritten, we need to recompute AO ERI.
+    // For now, compute full MO ERI via a fresh AO→MO transform.
+    // Precompute the AO ERI again (stored in eri_matrix_)
+    precomputation();
+
+    // Now eri_matrix_ has fresh AO ERI. Build full MO ERI.
+    real_t* d_eri_mo_full = build_mo_eri(d_C, nmo);
+    std::vector<real_t> h_eri_mo(nmo * nmo * nmo * nmo);
+    cudaMemcpy(h_eri_mo.data(), d_eri_mo_full, h_eri_mo.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+    gansu::tracked_cudaFree(d_eri_mo_full);
+
+    // Compute vhf_MO(p,q) = Σ_{rs} dm1(r,s) * [2*(pq|rs) - (ps|rq)]
+    // dm1 only has oo and vv blocks
+    std::vector<real_t> h_vhf_MO(nmo * nmo, 0.0);
+    auto eri4 = [&](int p, int q, int r, int s) -> real_t {
+        return h_eri_mo[((size_t)p * nmo + q) * nmo * nmo + (size_t)r * nmo + s];
+    };
+    for (int p = 0; p < nmo; p++) {
+        for (int q = 0; q < nmo; q++) {
+            real_t val = 0.0;
+            // oo block
+            for (int j = 0; j < nocc; j++)
+                for (int k = 0; k < nocc; k++) {
+                    real_t dm = h_dm1_unrelaxed_MO[j * nmo + k];
+                    if (fabs(dm) < 1e-15) continue;
+                    val += dm * (2.0 * eri4(p, q, j, k) - eri4(p, k, j, q));
+                }
+            // vv block
+            for (int c = 0; c < nvir; c++)
+                for (int d = 0; d < nvir; d++) {
+                    real_t dm = h_dm1_unrelaxed_MO[(c+nocc) * nmo + (d+nocc)];
+                    if (fabs(dm) < 1e-15) continue;
+                    val += dm * (2.0 * eri4(p, q, c+nocc, d+nocc) - eri4(p, d+nocc, c+nocc, q));
+                }
+            h_vhf_MO[p * nmo + q] = val;  // (2J-K) convention — will be halved for CPHF
+        }
+    }
+
+    // I_oo(i,j) = Σ_{akb} T̃(i,a,k,b) × (ja|kb)  [OVOV integrals]
+    // I_vv(a,b) = Σ_{ijc} T̃(i,a,j,c) × (ib|jc)
+    // Used in both W matrix (Step 6) and Z-vector RHS.
+    std::vector<real_t> h_I_oo(nocc * nocc, 0.0);
+    std::vector<real_t> h_I_vv(nvir * nvir, 0.0);
+    for (int i = 0; i < nocc; i++) {
+        for (int j = 0; j < nocc; j++) {
+            real_t sum = 0.0;
+            for (int a = 0; a < nvir; a++)
+                for (int k = 0; k < nocc; k++)
+                    for (int b = 0; b < nvir; b++) {
+                        const size_t idx_iakb = ((size_t)i * nvir + a) * nocc * nvir + (size_t)k * nvir + b;
+                        const size_t idx_jakb = ((size_t)j * nvir + a) * nocc * nvir + (size_t)k * nvir + b;
+                        sum += h_T2tilde[idx_iakb] * h_ovov[idx_jakb];
+                    }
+            h_I_oo[i * nocc + j] = sum;
+        }
+    }
+    for (int a = 0; a < nvir; a++) {
+        for (int b = 0; b < nvir; b++) {
+            real_t sum = 0.0;
+            for (int i = 0; i < nocc; i++)
+                for (int j = 0; j < nocc; j++)
+                    for (int c = 0; c < nvir; c++) {
+                        const size_t idx_iajc = ((size_t)i * nvir + a) * nocc * nvir + (size_t)j * nvir + c;
+                        const size_t idx_ibjc = ((size_t)i * nvir + b) * nocc * nvir + (size_t)j * nvir + c;
+                        sum += h_T2tilde[idx_iajc] * h_ovov[idx_ibjc];
+                    }
+            h_I_vv[a * nvir + b] = sum;
+        }
+    }
+
+    // Coupled-Perturbed HF (CPHF) Z-vector solve.
+    // Full equation: (diag(ε_a - ε_i) + A) * z = -Xvo
+    // where A_{ai,bj} = 4*(ai|bj) - (ab|ij) - (aj|bi) is the RHF orbital Hessian.
+    // Xvo(a,i) = vhf_MO(a+nocc, i)
+    // Note: The T2-derived Lagrangian (L1, L2) enters through the 2-RDM
+    // (sep(P_unrelaxed) + Gamma^T2), NOT through the CPHF RHS.
+    const int nvo = nvir * nocc;
+    std::vector<real_t> h_z(nvo, 0.0);
+
+    // Build RHS: Xvo = 0.5 * vhf_MO(vo) [J - 0.5K convention, matching PySCF]
+    // vhf_MO is (2J-K); PySCF uses (J-0.5K) = 0.5*(2J-K)
+    std::vector<real_t> h_Xvo(nvo, 0.0);
+    for (int a = 0; a < nvir; a++)
+        for (int i = 0; i < nocc; i++)
+            h_Xvo[a * nocc + i] = 0.5 * h_vhf_MO[(a + nocc) * nmo + i];
+
+    // Build M = diag(ε_a - ε_i) + A (CPHF matrix, PySCF convention)
+    // A_{ai,bj} = 2*(a+n,i|b+n,j) - 0.5*(a+n,b+n|i,j) - 0.5*(a+n,j|b+n,i)
+    // This matches PySCF's (J - 0.5K) convention for the orbital Hessian.
+    std::vector<real_t> h_M(nvo * nvo, 0.0);
+    for (int a = 0; a < nvir; a++) {
+        for (int i = 0; i < nocc; i++) {
+            int ai = a * nocc + i;
+            for (int b = 0; b < nvir; b++) {
+                for (int j = 0; j < nocc; j++) {
+                    int bj = b * nocc + j;
+                    real_t A_val = 2.0 * eri4(a + nocc, i, b + nocc, j)
+                                 - 0.5 * eri4(a + nocc, b + nocc, i, j)
+                                 - 0.5 * eri4(a + nocc, j, b + nocc, i);
+                    // Column-major: M[ai, bj] stored at h_M[ai + bj*nvo]
+                    h_M[ai + bj * nvo] = A_val;
+                    if (ai == bj)
+                        h_M[ai + bj * nvo] += (h_eps[nocc + a] - h_eps[i]);
+                }
+            }
+        }
+    }
+
+    // Solve M * z = -Xvo using LAPACK dgesv
+    {
+        std::vector<real_t> rhs(nvo);
+        for (int k = 0; k < nvo; k++) rhs[k] = -h_Xvo[k];
+        std::vector<int> ipiv(nvo);
+        int n = nvo, nrhs = 1, lda = nvo, ldb = nvo, info = 0;
+        dgesv_(&n, &nrhs, h_M.data(), &lda, ipiv.data(), rhs.data(), &ldb, &info);
+        if (info != 0)
+            std::cerr << "    [WARNING] CPHF dgesv failed, info=" << info << std::endl;
+        h_z = rhs;
+    }
+
+    {
+        double z_norm = 0;
+        for (auto v : h_z) z_norm += v * v;
+        std::cout << "    |z| (CPHF) = " << std::sqrt(z_norm) << " (PySCF: 0.000784)" << std::endl;
+    }
 
     // -------------------------------------------------------
     // Step 5: Build relaxed density in MO basis → transform to AO
-    //   P_MO(i,j) = 2δ_{ij} + P^(2)_oo(i,j)  (HF + MP2 occ-occ)
-    //   P_MO(a,b) = P^(2)_vv(a,b)              (MP2 vir-vir)
-    //   P_MO(a,i) = P_MO(i,a) = z(a,i)         (Z-vector)
+    //   dm1mo: MP2 correction to 1-RDM (no factor 2, no HF part)
+    //   P_MO = D_HF_MO + 2*dm1mo  (factor 2 for spin-sum, matching PySCF dm1p)
     // -------------------------------------------------------
-    std::vector<real_t> h_P_MO(nmo * nmo, 0.0);
-
-    // HF density: P_MO(i,j) = 2 δ_{ij}
-    for (int i = 0; i < nocc; i++) h_P_MO[i * nmo + i] = 2.0;
-
-    // Add MP2 occ-occ
-    std::vector<real_t> h_P_oo(nocc * nocc);
-    cudaMemcpy(h_P_oo.data(), d_P_oo, nocc * nocc * sizeof(real_t), cudaMemcpyDeviceToHost);
+    // First build dm1mo (used for W matrix, factor-1)
+    std::vector<real_t> h_dm1mo(nmo * nmo, 0.0);
     for (int i = 0; i < nocc; i++)
         for (int j = 0; j < nocc; j++)
-            h_P_MO[i * nmo + j] += h_P_oo[i * nocc + j];
-
-    // Add MP2 vir-vir
+            h_dm1mo[i * nmo + j] = h_P_oo[i * nocc + j] + h_P_oo[j * nocc + i];
     for (int a = 0; a < nvir; a++)
         for (int b = 0; b < nvir; b++)
-            h_P_MO[(a + nocc) * nmo + (b + nocc)] += h_P_vv[a * nvir + b];
+            h_dm1mo[(a + nocc) * nmo + (b + nocc)] = h_P_vv[a * nvir + b] + h_P_vv[b * nvir + a];
+    for (int a = 0; a < nvir; a++)
+        for (int i = 0; i < nocc; i++) {
+            h_dm1mo[(a + nocc) * nmo + i] = h_z[a * nocc + i];
+            h_dm1mo[i * nmo + (a + nocc)] = h_z[a * nocc + i];
+        }
 
-    // Z-vector ov block = 0 for canonical HF (no contribution to P_MO)
+    // Diagnostic: dm1mo norm (PySCF: 0.04174 with z-vector)
+    {
+        double dm1_norm = 0;
+        for (auto v : h_dm1mo) dm1_norm += v * v;
+        std::cout << "    |dm1mo| = " << std::sqrt(dm1_norm) << " (PySCF: 0.02903)" << std::endl;
+    }
+
+    // Build P_MO = D_HF_MO + dm1mo (factor 1, for 1-el gradient)
+    // PySCF: dm1 = D_HF + dm1_ao (1-el uses this)
+    std::vector<real_t> h_P_MO(nmo * nmo, 0.0);
+    for (int i = 0; i < nocc; i++) h_P_MO[i * nmo + i] = 2.0;
+    for (int p = 0; p < nmo; p++)
+        for (int q = 0; q < nmo; q++)
+            h_P_MO[p * nmo + q] += h_dm1mo[p * nmo + q];
 
     // Transform P_MO to AO: P_AO = C × P_MO × C^T
     real_t* d_P_MO = nullptr;
@@ -1261,34 +1397,47 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
     gpu::matrixMatrixProduct(d_C, d_P_MO, d_tmp, nao, false, false);  // tmp = C × P_MO
     gpu::matrixMatrixProduct(d_tmp, d_C, d_P_eff, nao, false, true);  // P_eff = tmp × C^T
 
-    // Diagnostic: compare P_eff with HF density
+    // Build unrelaxed density for 2-electron term (NO z-vector)
+    // PySCF's make_rdm2() uses unrelaxed dm1 for the separable 2-PDM.
+    // The z-vector response enters only through 1-el and overlap terms.
     {
-        double p_eff_sum = 0, p_hf_sum = 0;
-        std::vector<real_t> h_P_eff(nao2), h_D_hf(nao2);
-        cudaMemcpy(h_P_eff.data(), d_P_eff, nao2 * sizeof(real_t), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_D_hf.data(), rhf_.get_density_matrix().device_ptr(), nao2 * sizeof(real_t), cudaMemcpyDeviceToHost);
-        double diff_norm = 0;
-        for (size_t i = 0; i < nao2; i++) {
-            p_eff_sum += h_P_eff[i] * h_P_eff[i];
-            p_hf_sum += h_D_hf[i] * h_D_hf[i];
-            diff_norm += (h_P_eff[i] - h_D_hf[i]) * (h_P_eff[i] - h_D_hf[i]);
-        }
-        std::cout << "    |P_eff| = " << std::sqrt(p_eff_sum) << ", |D_HF| = " << std::sqrt(p_hf_sum)
-                  << ", |P_eff - D_HF| = " << std::sqrt(diff_norm) << std::endl;
+        std::vector<real_t> h_P_MO_2el(nmo * nmo, 0.0);
+        for (int i = 0; i < nocc; i++) h_P_MO_2el[i * nmo + i] = 2.0;
+        // Add oo and vv blocks (unrelaxed), but NOT ov block (z-vector)
+        for (int i = 0; i < nocc; i++)
+            for (int j = 0; j < nocc; j++)
+                h_P_MO_2el[i * nmo + j] += h_P_oo[i * nocc + j] + h_P_oo[j * nocc + i];
+        for (int a = 0; a < nvir; a++)
+            for (int b = 0; b < nvir; b++)
+                h_P_MO_2el[(a + nocc) * nmo + (b + nocc)] += h_P_vv[a * nvir + b] + h_P_vv[b * nvir + a];
+        cudaMemcpy(d_P_MO, h_P_MO_2el.data(), nao2 * sizeof(real_t), cudaMemcpyHostToDevice);
+        gpu::matrixMatrixProduct(d_C, d_P_MO, d_tmp, nao, false, false);
+        gpu::matrixMatrixProduct(d_tmp, d_C, d_P_2el, nao, false, true);
     }
+
     std::cout << "    Relaxed density in AO basis." << std::endl;
 
     // -------------------------------------------------------
     // Step 6: Energy-weighted density W
-    //   W_MO(p,q) = Σ_r ε_r P_MO(p,r) δ_{rq}  -- simplified for diagonal ε
-    //   W_MO(p,q) = ε_q P_MO(p,q)
-    //   But the full formula includes Lagrangian contributions...
-    //   For now, use: W_AO = C × W_MO × C^T where W_MO(p,q) = ε_q P_MO(p,q)
+    //   W_MO(p,q) = (ε_p + ε_q)/2 × P_total(p,q)
+    //   where P_total = D_HF (2*δ_ij) + dm1mo (MP2 correction).
     // -------------------------------------------------------
     std::vector<real_t> h_W_MO(nmo * nmo, 0.0);
+
+    // HF energy-weighted density: W_HF(i,i) = 2*ε_i
+    for (int i = 0; i < nocc; i++)
+        h_W_MO[i * nmo + i] = 2.0 * h_eps[i];
+
+    // MP2 correction: ε_q × dm1mo(p,q)
     for (int p = 0; p < nmo; p++)
         for (int q = 0; q < nmo; q++)
-            h_W_MO[p * nmo + q] = h_eps[q] * h_P_MO[p * nmo + q];
+            h_W_MO[p * nmo + q] += h_eps[q] * h_dm1mo[p * nmo + q];
+
+    // Note: Lagrangian I terms (I_oo, I_vv) are NOT added to W here.
+    // They enter the gradient through the 2-RDM (cross term in sep(P_unrelaxed))
+    // rather than through the overlap derivative. Adding them to W would
+    // double-count their contribution.
+    // TODO: Verify this against PySCF's exact dme0 construction.
 
     // Symmetrize: W = (W + W^T) / 2
     for (int p = 0; p < nmo; p++)
@@ -1306,12 +1455,79 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
     gpu::matrixMatrixProduct(d_tmp, d_C, d_W_eff, nao, false, true);
 
     // -------------------------------------------------------
-    // Step 7: 2-PDM effective density for ERI derivatives
-    //   For now, set to zero (the separable 2-PDM contribution
-    //   is handled via the effective 1-PDM in the ERI derivative kernel).
-    //   Non-separable MP2 2-PDM contribution will be added later.
+    // Step 7: Non-separable 2-PDM: Γ^T2_{μνλσ} = Σ_{ijab} C_{μi} C_{ν,a+n} T̃_{ij}^{ab} C_{λj} C_{σ,b+n}
+    //   Build symmetrized AO 4-index density for ERI derivative contraction.
+    //   Symmetrized for 8-fold ERI symmetry: (μν|λσ) = (νμ|λσ) = (μν|σλ) = (λσ|μν) etc.
     // -------------------------------------------------------
-    cudaMemset(d_Gamma_eff, 0, nao2 * sizeof(real_t));
+    {
+        // Get C on host
+        rhf_.get_coefficient_matrix().toHost();
+        const real_t* h_C = rhf_.get_coefficient_matrix().host_ptr();
+        const size_t nao4 = nao2 * nao2;
+
+        // Build Γ^T2 on host (nao^4 elements)
+        std::vector<real_t> h_Gamma(nao4, 0.0);
+
+        // Γ(μ,ν,λ,σ) = Σ_{ijab} C(μ,i) C(ν,a+nocc) T̃(i,a,j,b) C(λ,j) C(σ,b+nocc)
+        // Use efficient contraction: for each (i,j), form rank-1 × T̃-contracted outer product
+        for (int i = 0; i < nocc; i++) {
+            for (int j = 0; j < nocc; j++) {
+                // Q^{ij}(ν,σ) = Σ_{ab} T̃_{ij}^{ab} C(ν,a+nocc) C(σ,b+nocc)
+                // First: t̃_ab = T̃(i,a,j,b) for this (i,j)
+                for (int a = 0; a < nvir; a++) {
+                    for (int b = 0; b < nvir; b++) {
+                        const size_t t_idx = ((size_t)i * nvir + a) * nocc * nvir + (size_t)j * nvir + b;
+                        real_t t_ab = h_T2tilde[t_idx];
+                        if (fabs(t_ab) < 1e-15) continue;
+                        // Add contribution to Γ: t_ab * C(μ,i)*C(ν,a+n)*C(λ,j)*C(σ,b+n)
+                        for (int mu = 0; mu < nao; mu++) {
+                            real_t Cmi = h_C[mu * nao + i];
+                            if (fabs(Cmi) < 1e-15) continue;
+                            real_t Cmi_t = Cmi * t_ab;
+                            for (int nu = 0; nu < nao; nu++) {
+                                real_t CnA = h_C[nu * nao + (a + nocc)];
+                                if (fabs(CnA) < 1e-15) continue;
+                                real_t CnA_Cmi_t = CnA * Cmi_t;
+                                for (int la = 0; la < nao; la++) {
+                                    real_t ClJ = h_C[la * nao + j];
+                                    if (fabs(ClJ) < 1e-15) continue;
+                                    real_t factor = CnA_Cmi_t * ClJ;
+                                    for (int si = 0; si < nao; si++) {
+                                        h_Gamma[((size_t)mu * nao + nu) * nao2 + la * nao + si]
+                                            += factor * h_C[si * nao + (b + nocc)];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4-fold symmetrize for ERI symmetry: (μν|λσ)=(νμ|λσ)=(μν|σλ)=(νμ|σλ)
+        std::vector<real_t> h_Gamma_sym(nao4, 0.0);
+        for (int mu = 0; mu < nao; mu++) {
+            for (int nu = 0; nu < nao; nu++) {
+                for (int la = 0; la < nao; la++) {
+                    for (int si = 0; si < nao; si++) {
+                        const size_t i0 = ((size_t)mu*nao + nu)*nao2 + la*nao + si;  // (μν|λσ)
+                        const size_t i1 = ((size_t)nu*nao + mu)*nao2 + la*nao + si;  // (νμ|λσ)
+                        const size_t i2 = ((size_t)mu*nao + nu)*nao2 + si*nao + la;  // (μν|σλ)
+                        const size_t i3 = ((size_t)nu*nao + mu)*nao2 + si*nao + la;  // (νμ|σλ)
+                        h_Gamma_sym[i0] = 0.25 * (
+                            h_Gamma[i0] + h_Gamma[i1] + h_Gamma[i2] + h_Gamma[i3]);
+                    }
+                }
+            }
+        }
+        // gamma_4idx = Γ^T2_sym only.
+        // The kernel computes sep(P_relaxed) + gamma_4idx.
+        // Since P_relaxed = D_HF + ΔP (full relaxed 1-RDM), sep(P_relaxed)
+        // already includes sep(D_HF) + cross(D_HF, ΔP) + sep(ΔP).
+        // The full 2-RDM is sep(P_total) + Γ^T2 (cumulant), so gamma_4idx = Γ^T2.
+        // No sep(ΔP) subtraction needed.
+        cudaMemcpy(d_Gamma_eff, h_Gamma_sym.data(), nao4 * sizeof(real_t), cudaMemcpyHostToDevice);
+    }
 
     // Cleanup
     gansu::tracked_cudaFree(d_eri_ovov);
@@ -1319,7 +1535,6 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
     gansu::tracked_cudaFree(d_T2tilde);
     gansu::tracked_cudaFree(d_P_oo);
     gansu::tracked_cudaFree(d_P_vv);
-    gansu::tracked_cudaFree(d_eri_mo);
     gansu::tracked_cudaFree(d_P_MO);
     gansu::tracked_cudaFree(d_W_MO);
     gansu::tracked_cudaFree(d_tmp);

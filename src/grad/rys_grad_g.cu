@@ -332,6 +332,235 @@ void Rys_compute_gradients_two_electron(
 }
 
 // ============================================================
+//  2-PDM version: adds 4-index Gamma correction to density_w
+//  Used for MP2 gradient non-separable 2-PDM contribution
+// ============================================================
+__global__
+void Rys_compute_gradients_two_electron_2pdm(
+    double* g_gradients,
+    const real_t* g_density_matrix,
+    const PrimitiveShell* g_shell,
+    const real_t* g_cgto_normalization_factors,
+    const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1,
+    const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3,
+    const size_t num_threads,
+    const int num_basis,
+    const double* g_boys_grid,
+    const double* g_gamma_4idx)   // nao^4 symmetrized 2-PDM correction
+{
+    // Identical to Rys_compute_gradients_two_electron except density_w includes Gamma
+    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= num_threads) return;
+
+    size_t ket_size;
+    if (shell_s2.start_index == shell_s3.start_index)
+        ket_size = (shell_s2.count * (shell_s2.count + 1)) / 2;
+    else
+        ket_size = shell_s2.count * shell_s3.count;
+    const size_t2 abcd = index1to2(id, (shell_s0.start_index == shell_s2.start_index && shell_s1.start_index == shell_s3.start_index), ket_size);
+    const size_t2 ab = index1to2(abcd.x, shell_s0.start_index == shell_s1.start_index, shell_s1.count);
+    const size_t2 cd = index1to2(abcd.y, shell_s2.start_index == shell_s3.start_index, shell_s3.count);
+
+    const size_t pidx_a = ab.x + shell_s0.start_index;
+    const size_t pidx_b = ab.y + shell_s1.start_index;
+    const size_t pidx_c = cd.x + shell_s2.start_index;
+    const size_t pidx_d = cd.y + shell_s3.start_index;
+
+    const PrimitiveShell sa = g_shell[pidx_a];
+    const PrimitiveShell sb = g_shell[pidx_b];
+    const PrimitiveShell sc = g_shell[pidx_c];
+    const PrimitiveShell sd = g_shell[pidx_d];
+
+    const size_t base_a = sa.basis_index, base_b = sb.basis_index;
+    const size_t base_c = sc.basis_index, base_d = sd.basis_index;
+
+    const bool sym_bra = (pidx_a == pidx_b);
+    const bool sym_ket = (pidx_c == pidx_d);
+    const bool sym_braket = (pidx_a == pidx_c && pidx_b == pidx_d);
+
+    const double alpha = sa.exponent, beta = sb.exponent;
+    const double gamma_e = sc.exponent, delta_e = sd.exponent;
+    const double p = alpha + beta, q = gamma_e + delta_e;
+    const double rho = p * q / (p + q);
+
+    const double Ax = sa.coordinate.x, Ay = sa.coordinate.y, Az = sa.coordinate.z;
+    const double Bx = sb.coordinate.x, By = sb.coordinate.y, Bz = sb.coordinate.z;
+    const double Cx = sc.coordinate.x, Cy = sc.coordinate.y, Cz = sc.coordinate.z;
+    const double Dx = sd.coordinate.x, Dy = sd.coordinate.y, Dz = sd.coordinate.z;
+
+    const double Px = (alpha*Ax+beta*Bx)/p, Py = (alpha*Ay+beta*By)/p, Pz = (alpha*Az+beta*Bz)/p;
+    const double Qx = (gamma_e*Cx+delta_e*Dx)/q, Qy = (gamma_e*Cy+delta_e*Dy)/q, Qz = (gamma_e*Cz+delta_e*Dz)/q;
+
+    const double PQx = Px-Qx, PQy = Py-Qy, PQz = Pz-Qz;
+    const double T = rho * (PQx*PQx + PQy*PQy + PQz*PQz);
+
+    const int la = sa.shell_type, lb = sb.shell_type;
+    const int lc = sc.shell_type, ld = sd.shell_type;
+    const int L = la + lb + lc + ld;
+
+    const double AB2 = (Ax-Bx)*(Ax-Bx)+(Ay-By)*(Ay-By)+(Az-Bz)*(Az-Bz);
+    const double CD2 = (Cx-Dx)*(Cx-Dx)+(Cy-Dy)*(Cy-Dy)+(Cz-Dz)*(Cz-Dz);
+    const double CoefBase = 2.0 * M_PI_2_5 / (p*q*sqrt(p+q))
+                          * exp(-alpha*beta/p*AB2 - gamma_e*delta_e/q*CD2)
+                          * sa.coefficient * sb.coefficient * sc.coefficient * sd.coefficient;
+
+    int sym_f = 1 + (!sym_bra ? 1 : 0) + (!sym_ket ? 1 : 0)
+              + (!sym_bra && !sym_ket ? 1 : 0)
+              + (!sym_braket ? 1 : 0) * (1 + (!sym_bra ? 1 : 0) + (!sym_ket ? 1 : 0)
+              + (!sym_bra && !sym_ket ? 1 : 0));
+
+    const int N = (L + 1) / 2 + 1;
+    double rys_roots[9], rys_weights[9];
+    computeRysRootsAndWeights(N, T, g_boys_grid, rys_roots, rys_weights);
+
+    const int a_max = la + lb + 1;
+    const int c_max = lc + ld + 1;
+    const int cs = c_max + 1;
+
+    const double ABx = Ax-Bx, ABy = Ay-By, ABz = Az-Bz;
+    const double CDx = Cx-Dx, CDy = Cy-Dy, CDz = Cz-Dz;
+
+    const int na = comb_max(la), nb = comb_max(lb);
+    const int nc = comb_max(lc), nd = comb_max(ld);
+
+    double Ix[100], Iy[100], Iz[100];
+
+    double grad_atom[12] = {0.0};
+    const size_t N4 = (size_t)num_basis;
+
+    for (int ia = 0; ia < na; ia++) {
+        int l1 = loop_to_ang[la][ia][0], m1 = loop_to_ang[la][ia][1], n1 = loop_to_ang[la][ia][2];
+        double NA = calcNorm(alpha, l1, m1, n1);
+        for (int ib = 0; ib < nb; ib++) {
+            int l2 = loop_to_ang[lb][ib][0], m2 = loop_to_ang[lb][ib][1], n2 = loop_to_ang[lb][ib][2];
+            double NB = calcNorm(beta, l2, m2, n2);
+            for (int ic = 0; ic < nc; ic++) {
+                int l3 = loop_to_ang[lc][ic][0], m3 = loop_to_ang[lc][ic][1], n3 = loop_to_ang[lc][ic][2];
+                double NC = calcNorm(gamma_e, l3, m3, n3);
+                for (int id_c = 0; id_c < nd; id_c++) {
+                    int l4 = loop_to_ang[ld][id_c][0], m4 = loop_to_ang[ld][id_c][1], n4 = loop_to_ang[ld][id_c][2];
+                    double ND = calcNorm(delta_e, l4, m4, n4);
+
+                    const size_t a_idx = base_a + ia, b_idx = base_b + ib;
+                    const size_t c_idx = base_c + ic, d_idx = base_d + id_c;
+
+                    double D_ab = g_density_matrix[a_idx*num_basis + b_idx];
+                    double D_cd = g_density_matrix[c_idx*num_basis + d_idx];
+                    double D_ac = g_density_matrix[a_idx*num_basis + c_idx];
+                    double D_bd = g_density_matrix[b_idx*num_basis + d_idx];
+                    double D_ad = g_density_matrix[a_idx*num_basis + d_idx];
+                    double D_bc = g_density_matrix[b_idx*num_basis + c_idx];
+
+                    // Standard HF 2-PDM + non-separable MP2 correction
+                    double density_w = 0.5*D_ab*D_cd - 0.125*(D_ac*D_bd + D_ad*D_bc)
+                                     + g_gamma_4idx[((a_idx*N4 + b_idx)*N4 + c_idx)*N4 + d_idx];
+
+                    if (fabs(density_w) < 1.0e-18) continue;
+
+                    double w = (double)sym_f * CoefBase
+                        * g_cgto_normalization_factors[a_idx]
+                        * g_cgto_normalization_factors[b_idx]
+                        * g_cgto_normalization_factors[c_idx]
+                        * g_cgto_normalization_factors[d_idx]
+                        * NA * NB * NC * ND * density_w;
+
+                    double part[12] = {0.0};
+
+                    for (int n = 0; n < N; n++) {
+                        const double t2 = rys_roots[n];
+                        const double wn = rys_weights[n];
+                        const double u = rho * t2;
+                        const double u_over_p = u / p, u_over_q = u / q;
+
+                        const double B00 = t2 / (2.0*(p+q));
+                        const double B10 = (1.0-u_over_p) / (2.0*p);
+                        const double B01 = (1.0-u_over_q) / (2.0*q);
+
+                        const double C00x = (Px-Ax)+u_over_p*(Qx-Px);
+                        const double C00y = (Py-Ay)+u_over_p*(Qy-Py);
+                        const double C00z = (Pz-Az)+u_over_p*(Qz-Pz);
+                        const double D00x = (Qx-Cx)+u_over_q*(Px-Qx);
+                        const double D00y = (Qy-Cy)+u_over_q*(Py-Qy);
+                        const double D00z = (Qz-Cz)+u_over_q*(Pz-Qz);
+
+                        vrr_1d_grad(a_max, c_max, C00x, D00x, B10, B01, B00, Ix);
+                        vrr_1d_grad(a_max, c_max, C00y, D00y, B10, B01, B00, Iy);
+                        vrr_1d_grad(a_max, c_max, C00z, D00z, B10, B01, B00, Iz);
+
+                        #define I1D(vrr, ax, bx, cx, dx, AB, CD) \
+                            compute_integral_1d(ax, bx, cx, dx, AB, CD, cs, vrr)
+
+                        double Ix_base = I1D(Ix, l1, l2, l3, l4, ABx, CDx);
+                        double Iy_base = I1D(Iy, m1, m2, m3, m4, ABy, CDy);
+                        double Iz_base = I1D(Iz, n1, n2, n3, n4, ABz, CDz);
+
+                        double dA_x = 2.0*alpha * I1D(Ix, l1+1, l2, l3, l4, ABx, CDx)
+                                    - (l1 > 0 ? l1 * I1D(Ix, l1-1, l2, l3, l4, ABx, CDx) : 0.0);
+                        double dA_y = 2.0*alpha * I1D(Iy, m1+1, m2, m3, m4, ABy, CDy)
+                                    - (m1 > 0 ? m1 * I1D(Iy, m1-1, m2, m3, m4, ABy, CDy) : 0.0);
+                        double dA_z = 2.0*alpha * I1D(Iz, n1+1, n2, n3, n4, ABz, CDz)
+                                    - (n1 > 0 ? n1 * I1D(Iz, n1-1, n2, n3, n4, ABz, CDz) : 0.0);
+
+                        part[0] += wn * dA_x * Iy_base * Iz_base;
+                        part[1] += wn * Ix_base * dA_y * Iz_base;
+                        part[2] += wn * Ix_base * Iy_base * dA_z;
+
+                        double dB_x = 2.0*beta * I1D(Ix, l1, l2+1, l3, l4, ABx, CDx)
+                                    - (l2 > 0 ? l2 * I1D(Ix, l1, l2-1, l3, l4, ABx, CDx) : 0.0);
+                        double dB_y = 2.0*beta * I1D(Iy, m1, m2+1, m3, m4, ABy, CDy)
+                                    - (m2 > 0 ? m2 * I1D(Iy, m1, m2-1, m3, m4, ABy, CDy) : 0.0);
+                        double dB_z = 2.0*beta * I1D(Iz, n1, n2+1, n3, n4, ABz, CDz)
+                                    - (n2 > 0 ? n2 * I1D(Iz, n1, n2-1, n3, n4, ABz, CDz) : 0.0);
+
+                        part[3] += wn * dB_x * Iy_base * Iz_base;
+                        part[4] += wn * Ix_base * dB_y * Iz_base;
+                        part[5] += wn * Ix_base * Iy_base * dB_z;
+
+                        double dC_x = 2.0*gamma_e * I1D(Ix, l1, l2, l3+1, l4, ABx, CDx)
+                                    - (l3 > 0 ? l3 * I1D(Ix, l1, l2, l3-1, l4, ABx, CDx) : 0.0);
+                        double dC_y = 2.0*gamma_e * I1D(Iy, m1, m2, m3+1, m4, ABy, CDy)
+                                    - (m3 > 0 ? m3 * I1D(Iy, m1, m2, m3-1, m4, ABy, CDy) : 0.0);
+                        double dC_z = 2.0*gamma_e * I1D(Iz, n1, n2, n3+1, n4, ABz, CDz)
+                                    - (n3 > 0 ? n3 * I1D(Iz, n1, n2, n3-1, n4, ABz, CDz) : 0.0);
+
+                        part[6] += wn * dC_x * Iy_base * Iz_base;
+                        part[7] += wn * Ix_base * dC_y * Iz_base;
+                        part[8] += wn * Ix_base * Iy_base * dC_z;
+
+                        double dD_x = 2.0*delta_e * I1D(Ix, l1, l2, l3, l4+1, ABx, CDx)
+                                    - (l4 > 0 ? l4 * I1D(Ix, l1, l2, l3, l4-1, ABx, CDx) : 0.0);
+                        double dD_y = 2.0*delta_e * I1D(Iy, m1, m2, m3, m4+1, ABy, CDy)
+                                    - (m4 > 0 ? m4 * I1D(Iy, m1, m2, m3, m4-1, ABy, CDy) : 0.0);
+                        double dD_z = 2.0*delta_e * I1D(Iz, n1, n2, n3, n4+1, ABz, CDz)
+                                    - (n4 > 0 ? n4 * I1D(Iz, n1, n2, n3, n4-1, ABz, CDz) : 0.0);
+
+                        part[9]  += wn * dD_x * Iy_base * Iz_base;
+                        part[10] += wn * Ix_base * dD_y * Iz_base;
+                        part[11] += wn * Ix_base * Iy_base * dD_z;
+
+                        #undef I1D
+                    }
+
+                    for (int dir = 0; dir < 3; dir++) {
+                        grad_atom[0+dir] += w * part[0+dir];
+                        grad_atom[3+dir] += w * part[3+dir];
+                        grad_atom[6+dir] += w * part[6+dir];
+                        grad_atom[9+dir] += w * part[9+dir];
+                    }
+                }
+            }
+        }
+    }
+
+    for (int dir = 0; dir < 3; dir++) {
+        atomicAdd(&g_gradients[3*sa.atom_index + dir], grad_atom[0+dir]);
+        atomicAdd(&g_gradients[3*sb.atom_index + dir], grad_atom[3+dir]);
+        atomicAdd(&g_gradients[3*sc.atom_index + dir], grad_atom[6+dir]);
+        atomicAdd(&g_gradients[3*sd.atom_index + dir], grad_atom[9+dir]);
+    }
+}
+
+// ============================================================
 //  UHF version
 // ============================================================
 __global__

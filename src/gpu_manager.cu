@@ -31,6 +31,7 @@
 #include "rys_hessian_g.hpp"
 
 #include <vector>    // std::vector
+#include <iomanip>   // std::setw, std::setprecision
 #include <tuple>     // std::tuple
 #include <algorithm> // std::reverse, std::sort
 #include <numeric>   // std::iota
@@ -4690,7 +4691,8 @@ std::vector<double> computeEnergyGradient_general(
     const Atom* d_atoms,
     const real_t* d_density_1el, const real_t* d_W_matrix_ext, const real_t* d_density_2el,
     const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors,
-    const int num_atoms, const int num_basis, const bool verbose)
+    const int num_atoms, const int num_basis, const bool verbose,
+    const real_t* d_gamma_4idx)
 {
     const int n = 3 * num_atoms;
     const size_t gradients_bytes = n * sizeof(double);
@@ -4743,7 +4745,7 @@ std::vector<double> computeEnergyGradient_general(
     std::vector<cudaStream_t> streams(num_kernels);
     for (int i = 0; i < num_kernels; i++) cudaStreamCreate(&streams[i]);
 
-    // 2-electron derivatives (uses d_density_2el)
+    // 2-electron derivatives (uses d_density_2el, optionally with 4-index 2-PDM correction)
     for (const auto& quadruple : shell_quadruples) {
         int s0, s1, s2, s3;
         std::tie(s0, s1, s2, s3) = quadruple;
@@ -4755,9 +4757,15 @@ std::vector<double> computeEnergyGradient_general(
         const size_t num_ket = (s2==s3) ? shell_s2.count*(shell_s2.count+1)/2 : shell_s2.count*shell_s3.count;
         const size_t num_braket = ((s0==s2)&&(s1==s3)) ? num_bra*(num_bra+1)/2 : num_bra*num_ket;
         const int num_blocks = (num_braket + threads_per_block - 1) / threads_per_block;
-        get_compute_gradients_repulsion()<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
-            d_grad_G, d_density_2el, d_primitive_shells, d_cgto_normalization_factors,
-            shell_s0, shell_s1, shell_s2, shell_s3, num_braket, num_basis, d_boys_grid);
+        if (d_gamma_4idx != nullptr) {
+            get_compute_gradients_repulsion_2pdm()<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+                d_grad_G, d_density_2el, d_primitive_shells, d_cgto_normalization_factors,
+                shell_s0, shell_s1, shell_s2, shell_s3, num_braket, num_basis, d_boys_grid, d_gamma_4idx);
+        } else {
+            get_compute_gradients_repulsion()<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+                d_grad_G, d_density_2el, d_primitive_shells, d_cgto_normalization_factors,
+                shell_s0, shell_s1, shell_s2, shell_s3, num_braket, num_basis, d_boys_grid);
+        }
     }
 
     // 1-electron derivatives (overlap uses W, kinetic/nuclear use d_density_1el)

@@ -108,7 +108,8 @@ std::vector<double> computeEnergyGradient_general(
     const Atom* d_atoms,
     const real_t* d_density_1el, const real_t* d_W_matrix_ext, const real_t* d_density_2el,
     const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors,
-    const int num_atoms, const int num_basis, const bool verbose);
+    const int num_atoms, const int num_basis, const bool verbose,
+    const real_t* d_gamma_4idx = nullptr);  // optional 4-index 2-PDM correction for MP2
 std::vector<double> computeEnergyGradient_UHF(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, const Atom* d_atoms, const real_t* d_density_matrix_a, const real_t* d_density_matrix_b, const real_t* d_coefficient_matrix_a, const real_t* d_coefficient_matrix_b, const real_t* d_orbital_energies_a, const real_t* d_orbital_energies_b, const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors, const int num_atoms, const int num_basis, const int num_alpha, const int num_beta, const bool verbose);
 // void computeEnergyGradient_ROHF(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, const Atom* d_atoms, const real_t* d_density_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors, const int num_atoms, const int num_basis, const int num_electron, const bool verbose);
 

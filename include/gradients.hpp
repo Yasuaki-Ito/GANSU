@@ -73,6 +73,8 @@ __global__ void compute_gradients_nuclear(double* g_gradients, const real_t* g_d
 // define the kernel to calculate the gradient of the two-electron part
 __global__ void compute_gradients_two_electron(double* g_gradients, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const int num_basis, const double* g_boys_grid);
 __global__ void Rys_compute_gradients_two_electron(double* g_gradients, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const int num_basis, const double* g_boys_grid);
+// With 4-index 2-PDM correction for MP2 gradient
+__global__ void Rys_compute_gradients_two_electron_2pdm(double* g_gradients, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const int num_basis, const double* g_boys_grid, const double* g_gamma_4idx);
 
 // UHF version: takes alpha and beta density matrices separately
 __global__ void compute_gradients_two_electron_uhf(double* g_gradients, const real_t* g_density_matrix_a, const real_t* g_density_matrix_b, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const int num_basis, const double* g_boys_grid);
@@ -87,6 +89,9 @@ using compute_basis_deriv_nuclear = void (*)(double*, const real_t*, const Primi
 using compute_basis_deriv_repulsion = void (*)(double*, const real_t*, const PrimitiveShell*, const real_t*, const ShellTypeInfo, const ShellTypeInfo, const ShellTypeInfo, const ShellTypeInfo, const size_t, const int, const double*);
 
 using compute_basis_deriv_repulsion_uhf = void (*)(double*, const real_t*, const real_t*, const PrimitiveShell*, const real_t*, const ShellTypeInfo, const ShellTypeInfo, const ShellTypeInfo, const ShellTypeInfo, const size_t, const int, const double*);
+
+// With optional 4-index 2-PDM correction (for MP2 gradient)
+using compute_basis_deriv_repulsion_2pdm = void (*)(double*, const real_t*, const PrimitiveShell*, const real_t*, const ShellTypeInfo, const ShellTypeInfo, const ShellTypeInfo, const ShellTypeInfo, const size_t, const int, const double*, const double*);
 
 
 
@@ -284,6 +289,10 @@ inline compute_basis_deriv_repulsion get_compute_gradients_repulsion() {
 
 inline compute_basis_deriv_repulsion_uhf get_compute_gradients_repulsion_uhf() {
     return Rys_compute_gradients_two_electron_uhf;
+}
+
+inline compute_basis_deriv_repulsion_2pdm get_compute_gradients_repulsion_2pdm() {
+    return Rys_compute_gradients_two_electron_2pdm;
 }
 
 

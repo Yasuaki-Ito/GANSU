@@ -102,7 +102,7 @@ public:
      * @details Computes relaxed MP2 density (unrelaxed + Z-vector) and transforms to AO basis.
      *          The caller uses these to compute the MP2 gradient via existing integral derivative kernels.
      */
-    virtual void compute_mp2_effective_densities(real_t* d_P_eff, real_t* d_W_eff, real_t* d_Gamma_eff) {
+    virtual void compute_mp2_effective_densities(real_t* d_P_eff, real_t* d_W_eff, real_t* d_Gamma_eff, real_t* d_P_2el) {
         THROW_EXCEPTION("MP2 gradient is not supported for the selected ERI method.");
     }
 
