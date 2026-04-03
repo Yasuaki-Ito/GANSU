@@ -848,6 +848,19 @@ private:
 
 
 /**
+ * @brief MINAO (Minimal ANO) initial guess for RHF
+ * @details Projects atomic ground-state occupations in ANO-RCC-MB basis onto the calculation basis.
+ *          Faster than SAD (no atomic HF needed), better than core Hamiltonian.
+ */
+class InitialGuess_RHF_MINAO : public InitialGuess_RHF {
+public:
+    InitialGuess_RHF_MINAO(RHF& hf) : InitialGuess_RHF(hf) {}
+    ~InitialGuess_RHF_MINAO() = default;
+    void guess() override;
+};
+
+
+/**
  * @brief ERI_Stored_RHF class for the stored ERIs of the restricted HF method
  * @details This class computes the ERIs and stores them in the device memory.
  * @details The size of ERI should be reduced to \f$ {1 \over 8} \f$ using the symmetry.

@@ -42,6 +42,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Generalized Wolfsberg-Helmholz (GWH) (RHF, UHF, ROHF)
     * Superposition of Atomic Densities (SAD) (RHF, UHF, ROHF)
     * Given density matrix (RHF, UHF, ROHF)
+    * MINAO (RHF) — Projection of minimal ANO basis occupations (ANO-RCC-MB)
 * Convergence algorithms
     * Damping (RHF, UHF, ROHF)
     * Optimal Damping (RHF, UHF, ROHF)

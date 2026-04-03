@@ -223,6 +223,7 @@ Otherwise, the two-electron repulsion integrals (ERIs) are set to zero.
 * gwh - Generalized Wolfsberg-Helmholz method (GWH) is used as the initial guess of the Fock matrix
 * sad - Superposition of Atomic Densities (SAD) is used as the initial guess of the Fock matrix
 * density - Given density matrix is used as the initial guess of the Fock matrix
+* minao - Minimal ANO (ANO-RCC-MB) projection initial guess (RHF)
 
 #### convergence_method - Method to use for convergence
 * default:  DIIS

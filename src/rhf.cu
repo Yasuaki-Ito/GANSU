@@ -24,6 +24,9 @@
 
 #include <limits> // numeric_limits<double>::max();
 #include <iomanip> // std::setprecision
+#include <filesystem>
+#include <numeric>
+#include "minao.hpp"
 
 #include "utils.hpp" // THROW_EXCEPTION
 namespace gansu{
@@ -236,6 +239,8 @@ void RHF::guess_initial_fock_matrix(const real_t* density_matrix_a, const real_t
             THROW_EXCEPTION("The basis set file is not specified for SAD initial guess method. Please specify the basis set file name by -gbsfilename option.");
         }
         initial_guess = std::make_unique<InitialGuess_RHF_SAD>(*this);
+    }else if(initial_guess_method_ == "minao"){ // MINAO (Minimal ANO) projection
+        initial_guess = std::make_unique<InitialGuess_RHF_MINAO>(*this);
     }else{
         throw std::runtime_error("Invalid initial guess method: " + initial_guess_method_);
     }
@@ -1443,6 +1448,91 @@ std::vector<real_t> Convergence_RHF_ADIIS::solve_ediis_coefficients(
     std::vector<real_t> c(n);
     for (int i = 0; i < n; i++) c[i] = x[i] * x[i] / x2sum;
     return c;
+}
+
+// ============================================================
+//  MINAO initial guess
+// ============================================================
+void InitialGuess_RHF_MINAO::guess() {
+    const int nb = hf_.get_num_basis();
+    const size_t nb2 = (size_t)nb * nb;
+
+    // Resolve ANO-RCC-MB basis path relative to calculation basis
+    std::filesystem::path gbs_path(hf_.get_gbsfilename());
+    std::filesystem::path minao_path = gbs_path.parent_path() / "ano-rcc-mb.gbs";
+    std::cout << " [MINAO] Loading ANO-RCC-MB from: " << minao_path << std::endl;
+
+    BasisSet calc_basis = BasisSet::construct_from_gbs(hf_.get_gbsfilename());
+    BasisSet minao_basis = BasisSet::construct_from_gbs(minao_path.string());
+
+    // Get atoms on host
+    const auto& atoms_dev = hf_.get_atoms();
+    std::vector<Atom> atoms_host(atoms_dev.size());
+    cudaMemcpy(atoms_host.data(), atoms_dev.device_ptr(),
+               atoms_host.size() * sizeof(Atom), cudaMemcpyDeviceToHost);
+
+    // Build MINAO occupation vector
+    int n_minao = 0;
+    std::vector<double> occ;
+    for (size_t ia = 0; ia < atoms_host.size(); ia++) {
+        const std::string elem = atomic_number_to_element_name(atoms_host[ia].atomic_number);
+        const auto& ebs = minao_basis.get_element_basis_set(elem);
+        auto atom_occ = get_minao_occupations(atoms_host[ia].atomic_number, ebs);
+        occ.insert(occ.end(), atom_occ.begin(), atom_occ.end());
+        n_minao += (int)atom_occ.size();
+    }
+    std::cout << " [MINAO] n_calc=" << nb << " n_minao=" << n_minao
+              << " n_electrons(occ)=" << std::accumulate(occ.begin(), occ.end(), 0.0) << std::endl;
+
+    // Compute cross overlap S_cross (n_calc × n_minao)
+    auto S_cross = compute_cross_overlap(atoms_host, calc_basis, minao_basis);
+
+    // Compute S_calc overlap on host (reuse from HF object)
+    hf_.get_overlap_matrix().toHost();
+    std::vector<double> S_calc(nb2);
+    std::memcpy(S_calc.data(), hf_.get_overlap_matrix().host_ptr(), nb2 * sizeof(double));
+
+    // Projection: P = S_calc^{-1} × S_cross
+    // Use Cholesky: S_calc = L L^T, solve L L^T P = S_cross
+    // Or use transform matrix X: S_calc^{-1} = X X^T (where X = S^{-1/2})
+    // P = X X^T S_cross = X (X^T S_cross)
+    hf_.get_transform_matrix().toHost();
+    std::vector<double> X(nb2);
+    std::memcpy(X.data(), hf_.get_transform_matrix().host_ptr(), nb2 * sizeof(double));
+
+    // tmp = X^T × S_cross (nb × n_minao)
+    std::vector<double> tmp(nb * n_minao, 0.0);
+    for (int i = 0; i < nb; i++)
+        for (int j = 0; j < n_minao; j++)
+            for (int k = 0; k < nb; k++)
+                tmp[i * n_minao + j] += X[k * nb + i] * S_cross[k * n_minao + j];
+
+    // P = X × tmp (nb × n_minao)
+    std::vector<double> P(nb * n_minao, 0.0);
+    for (int i = 0; i < nb; i++)
+        for (int j = 0; j < n_minao; j++)
+            for (int k = 0; k < nb; k++)
+                P[i * n_minao + j] += X[i * nb + k] * tmp[k * n_minao + j];
+
+    // D = P × diag(occ) × P^T (nb × nb)
+    // Scale columns: P_occ[i][j] = P[i][j] * occ[j]
+    std::vector<double> D(nb2, 0.0);
+    for (int i = 0; i < nb; i++)
+        for (int j = 0; j < nb; j++) {
+            double sum = 0;
+            for (int k = 0; k < n_minao; k++)
+                sum += P[i * n_minao + k] * occ[k] * P[j * n_minao + k];
+            D[i * nb + j] = sum;
+        }
+
+    // Upload density to GPU
+    cudaMemcpy(hf_.get_density_matrix().device_ptr(), D.data(), nb2 * sizeof(real_t), cudaMemcpyHostToDevice);
+    hf_.compute_fock_matrix();
+    hf_.compute_coefficient_matrix();
+    hf_.compute_density_matrix();
+    hf_.compute_fock_matrix();
+
+    std::cout << " [MINAO] Initial guess ready." << std::endl;
 }
 
 } // namespace gansu
