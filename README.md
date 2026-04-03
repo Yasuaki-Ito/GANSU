@@ -46,6 +46,10 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Damping (RHF, UHF, ROHF)
     * Optimal Damping (RHF, UHF, ROHF)
     * DIIS (RHF, UHF, ROHF)
+    * SOSCF (RHF) — DIIS→Second-Order SCF automatic switching
+    * ADIIS (RHF) — Augmented DIIS (JCP 132, 054109 (2010))
+    * EDIIS (RHF) — Energy DIIS (JCP 116, 8255 (2002))
+    * AEDIIS (RHF) — Automatic EDIIS→ADIIS→DIIS switching
 * Molecular integrals
     * Overlap integrals
       * McMurchie-Davidson algorithm (s-, p-, d-, f-, g-, h-, and i-orbitals)
@@ -90,8 +94,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 ### Todo / Not Implemented yet
 * Convergence algorithms
   * Optimal Damping (UHF)
-  * EDIIS
-  * ADIIS
+  * ADIIS/EDIIS/AEDIIS (UHF, ROHF)
 * Initial Guess
   * Random
   * Load the precomputed coefficients/Fock matrix

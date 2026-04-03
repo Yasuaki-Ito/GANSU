@@ -70,6 +70,15 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
         const size_t DIIS_size = parameters.get<int>("diis_size");
         const double soscf_start = parameters.get<double>("soscf_start_threshold");
         set_convergence_method(std::make_unique<Convergence_RHF_SOSCF>(*this, DIIS_size, soscf_start));
+    }else if(convergence_method == "adiis"){
+        const size_t DIIS_size = parameters.get<int>("diis_size");
+        set_convergence_method(std::make_unique<Convergence_RHF_ADIIS>(*this, ADIISMode::ADIIS, DIIS_size));
+    }else if(convergence_method == "ediis"){
+        const size_t DIIS_size = parameters.get<int>("diis_size");
+        set_convergence_method(std::make_unique<Convergence_RHF_ADIIS>(*this, ADIISMode::EDIIS, DIIS_size));
+    }else if(convergence_method == "aediis"){
+        const size_t DIIS_size = parameters.get<int>("diis_size");
+        set_convergence_method(std::make_unique<Convergence_RHF_ADIIS>(*this, ADIISMode::AEDIIS, DIIS_size));
     }else{
         THROW_EXCEPTION("Invalid convergence algorithm name: " + convergence_method);
     }
@@ -1206,6 +1215,234 @@ std::vector<std::vector<real_t>> RHF::compute_wiberg_bond_order() {
 
 
     return wiberg_bond_order_matrix;
+}
+
+// ============================================================
+//  ADIIS/EDIIS convergence method
+// ============================================================
+
+void Convergence_RHF_ADIIS::get_new_fock_matrix() {
+    const int nb = num_basis_;
+    const size_t nb2 = (size_t)nb * nb;
+
+    // Store current Fock, Density, Energy
+    const int idx = iteration_ % num_prev_;
+    cudaMemcpy(&prev_fock_matrices.device_ptr()[idx * nb2],
+               hf_.get_fock_matrix().device_ptr(), nb2 * sizeof(real_t), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(&prev_density_matrices.device_ptr()[idx * nb2],
+               hf_.get_density_matrix().device_ptr(), nb2 * sizeof(real_t), cudaMemcpyDeviceToDevice);
+    prev_energies[idx] = hf_.get_energy();
+
+    // Also store DIIS error for fallback to DIIS near convergence
+    gpu::computeDIISErrorMatrix(
+        hf_.get_overlap_matrix().device_ptr(),
+        hf_.get_transform_matrix().device_ptr(),
+        hf_.get_fock_matrix().device_ptr(),
+        hf_.get_density_matrix().device_ptr(),
+        error_matrix.device_ptr(), nb, false);
+    cudaMemcpy(&prev_error_matrices.device_ptr()[idx * nb2],
+               error_matrix.device_ptr(), nb2 * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+    const int n = std::min(iteration_ + 1, num_prev_);
+    iteration_++;
+
+    if (n <= 1) return;  // first iteration: no extrapolation
+
+    // Compute Tr[D_i F_j] matrix on host
+    // Copy all stored D and F to host
+    std::vector<real_t> h_D(n * nb2), h_F(n * nb2);
+    for (int k = 0; k < n; k++) {
+        int ki = (iteration_ - n + k) % num_prev_;
+        cudaMemcpy(&h_D[k * nb2], &prev_density_matrices.device_ptr()[ki * nb2],
+                   nb2 * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&h_F[k * nb2], &prev_fock_matrices.device_ptr()[ki * nb2],
+                   nb2 * sizeof(real_t), cudaMemcpyDeviceToHost);
+    }
+    // df[i][j] = Tr[D_i F_j] = Σ_{μν} D_i(μν) F_j(νμ) = Σ D_i(μν) F_j(μν) (symmetric)
+    std::vector<real_t> df(n * n, 0.0);
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) {
+            real_t tr = 0;
+            for (size_t k = 0; k < nb2; k++)
+                tr += h_D[i * nb2 + k] * h_F[j * nb2 + k];
+            df[i * n + j] = tr;
+        }
+
+    // Collect energies for current window
+    std::vector<real_t> energies(n);
+    for (int k = 0; k < n; k++) {
+        int ki = (iteration_ - n + k) % num_prev_;
+        energies[k] = prev_energies[ki];
+    }
+
+    // Check DIIS error norm to decide EDIIS vs ADIIS vs DIIS
+    real_t err_norm = 0;
+    {
+        std::vector<real_t> h_err(nb2);
+        int newest_idx = (iteration_ - 1) % num_prev_;
+        cudaMemcpy(h_err.data(), &prev_error_matrices.device_ptr()[newest_idx * nb2],
+                   nb2 * sizeof(real_t), cudaMemcpyDeviceToHost);
+        for (auto v : h_err) err_norm += v * v;
+        err_norm = std::sqrt(err_norm);
+    }
+
+    std::vector<real_t> coeffs;
+    std::string method_used;
+    if (mode_ == ADIISMode::ADIIS) {
+        coeffs = solve_adiis_coefficients(n, df, n - 1);
+        method_used = "ADIIS";
+    } else if (mode_ == ADIISMode::EDIIS) {
+        coeffs = solve_ediis_coefficients(n, energies, df);
+        method_used = "EDIIS";
+    } else {  // AEDIIS: automatic switching
+        if (err_norm < 1e-1) {
+            gpu::computeFockMatrixDIIS(
+                prev_error_matrices.device_ptr(),
+                prev_fock_matrices.device_ptr(),
+                hf_.get_fock_matrix().device_ptr(),
+                n, nb);
+            return;
+        } else if (err_norm < 1.0) {
+            coeffs = solve_adiis_coefficients(n, df, n - 1);
+            method_used = "ADIIS";
+        } else {
+            coeffs = solve_ediis_coefficients(n, energies, df);
+            method_used = "EDIIS";
+        }
+    }
+
+    if (verbose)
+        std::cout << "    [" << method_used << "] err=" << err_norm << " c=[";
+
+    // F_new = Σ c_i F_i
+    // Zero out Fock, then accumulate
+    cudaMemset(hf_.get_fock_matrix().device_ptr(), 0, nb2 * sizeof(real_t));
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    for (int k = 0; k < n; k++) {
+        int ki = (iteration_ - n + k) % num_prev_;
+        real_t c = coeffs[k];
+        if (verbose) std::cout << (k > 0 ? "," : "") << c;
+        cublasDaxpy(handle, (int)nb2, &c,
+                    &prev_fock_matrices.device_ptr()[ki * nb2], 1,
+                    hf_.get_fock_matrix().device_ptr(), 1);
+    }
+    if (verbose) std::cout << "]" << std::endl;
+}
+
+std::vector<real_t> Convergence_RHF_ADIIS::solve_adiis_coefficients(
+    int n, const std::vector<real_t>& df, int newest) const
+{
+    // ADIIS cost: minimize 2*Σ c_i*(df[i,n]-df[n,n]) + Σ c_i*c_j*(df[i,j]-df[i,n]-df[n,j]+df[n,n])
+    // subject to c_i >= 0, Σ c_i = 1
+    // Use parameterization c_i = x_i^2 / Σ x_j^2 and BFGS-like iteration
+    // For small n, simple iterative reweighting works.
+    // Simplified: use uniform coefficients as starting point, then a few gradient steps.
+
+    real_t dn_fn = df[newest * n + newest];
+    std::vector<real_t> dd_fn(n);
+    std::vector<real_t> df_shifted(n * n);
+    for (int i = 0; i < n; i++) {
+        dd_fn[i] = df[i * n + newest] - dn_fn;
+        for (int j = 0; j < n; j++)
+            df_shifted[i * n + j] = df[i * n + j] - df[i * n + newest] - df[newest * n + j] + dn_fn;
+    }
+
+    // x parameterization: c_i = x_i^2 / sum(x^2)
+    std::vector<real_t> x(n, 1.0);
+
+    for (int iter = 0; iter < 50; iter++) {
+        real_t x2sum = 0;
+        for (int i = 0; i < n; i++) x2sum += x[i] * x[i];
+        std::vector<real_t> c(n);
+        for (int i = 0; i < n; i++) c[i] = x[i] * x[i] / x2sum;
+
+        // Gradient of cost w.r.t. x
+        std::vector<real_t> fc(n, 0.0);
+        for (int k = 0; k < n; k++) {
+            fc[k] = 2.0 * dd_fn[k];
+            for (int j = 0; j < n; j++)
+                fc[k] += c[j] * df_shifted[k * n + j] + c[j] * df_shifted[j * n + k];
+        }
+
+        std::vector<real_t> grad(n, 0.0);
+        for (int nn = 0; nn < n; nn++) {
+            for (int k = 0; k < n; k++) {
+                real_t dcdk = (k == nn ? x[nn] * x2sum - x[nn] * x[nn] * x[nn] : -x[nn] * x[nn] * x[k]);
+                dcdk *= 2.0 / (x2sum * x2sum);
+                grad[nn] += fc[k] * dcdk;
+            }
+        }
+
+        real_t grad_norm = 0;
+        for (auto g : grad) grad_norm += g * g;
+        if (std::sqrt(grad_norm) < 1e-10) break;
+
+        // Simple steepest descent with small step
+        real_t step = 0.1;
+        for (int i = 0; i < n; i++) x[i] -= step * grad[i];
+        // Keep x positive
+        for (int i = 0; i < n; i++) if (x[i] < 0.01) x[i] = 0.01;
+    }
+
+    real_t x2sum = 0;
+    for (int i = 0; i < n; i++) x2sum += x[i] * x[i];
+    std::vector<real_t> c(n);
+    for (int i = 0; i < n; i++) c[i] = x[i] * x[i] / x2sum;
+    return c;
+}
+
+std::vector<real_t> Convergence_RHF_ADIIS::solve_ediis_coefficients(
+    int n, const std::vector<real_t>& energies, const std::vector<real_t>& df) const
+{
+    // EDIIS cost: minimize Σ c_i E_i - Σ c_i c_j (diag_i + diag_j - df_ij - df_ji) / 2
+    // where diag_i = df[i,i] = Tr[D_i F_i]
+    std::vector<real_t> diag(n);
+    for (int i = 0; i < n; i++) diag[i] = df[i * n + i];
+
+    std::vector<real_t> df_sym(n * n);
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            df_sym[i * n + j] = diag[i] + diag[j] - df[i * n + j] - df[j * n + i];
+
+    std::vector<real_t> x(n, 1.0);
+
+    for (int iter = 0; iter < 50; iter++) {
+        real_t x2sum = 0;
+        for (int i = 0; i < n; i++) x2sum += x[i] * x[i];
+        std::vector<real_t> c(n);
+        for (int i = 0; i < n; i++) c[i] = x[i] * x[i] / x2sum;
+
+        // fc_k = E_k - 2 Σ_i c_i df_sym[i,k]
+        std::vector<real_t> fc(n, 0.0);
+        for (int k = 0; k < n; k++) {
+            fc[k] = energies[k];
+            for (int i = 0; i < n; i++)
+                fc[k] -= 2.0 * c[i] * df_sym[i * n + k];
+        }
+
+        std::vector<real_t> grad(n, 0.0);
+        for (int nn = 0; nn < n; nn++) {
+            for (int k = 0; k < n; k++) {
+                real_t dcdk = (k == nn ? x[nn] * x2sum - x[nn] * x[nn] * x[nn] : -x[nn] * x[nn] * x[k]);
+                dcdk *= 2.0 / (x2sum * x2sum);
+                grad[nn] += fc[k] * dcdk;
+            }
+        }
+
+        real_t grad_norm = 0;
+        for (auto g : grad) grad_norm += g * g;
+        if (std::sqrt(grad_norm) < 1e-10) break;
+
+        real_t step = 0.1;
+        for (int i = 0; i < n; i++) x[i] -= step * grad[i];
+        for (int i = 0; i < n; i++) if (x[i] < 0.01) x[i] = 0.01;
+    }
+
+    real_t x2sum = 0;
+    for (int i = 0; i < n; i++) x2sum += x[i] * x[i];
+    std::vector<real_t> c(n);
+    for (int i = 0; i < n; i++) c[i] = x[i] * x[i] / x2sum;
+    return c;
 }
 
 } // namespace gansu

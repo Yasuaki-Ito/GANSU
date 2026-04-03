@@ -588,6 +588,58 @@ private:
 
 
 /**
+ * @brief ADIIS/EDIIS convergence methods for the restricted HF method
+ * @details Three modes:
+ *   - ADIIS: Augmented DIIS only (JCP 132, 054109 (2010))
+ *   - EDIIS: Energy DIIS only (JCP 116, 8255 (2002))
+ *   - AEDIIS: Automatic EDIIS→ADIIS→DIIS switching based on error norm
+ */
+enum class ADIISMode { ADIIS, EDIIS, AEDIIS };
+
+class Convergence_RHF_ADIIS : public Convergence_RHF {
+public:
+    Convergence_RHF_ADIIS(RHF& hf, ADIISMode mode, const int num_prev = 8)
+        : Convergence_RHF(hf),
+          mode_(mode),
+          num_prev_(num_prev),
+          num_basis_(hf.get_num_basis()),
+          iteration_(0),
+          error_matrix(hf.get_num_basis(), hf.get_num_basis()),
+          prev_error_matrices(num_prev * hf.get_num_basis() * hf.get_num_basis()),
+          prev_fock_matrices(num_prev * hf.get_num_basis() * hf.get_num_basis()),
+          prev_density_matrices(num_prev * hf.get_num_basis() * hf.get_num_basis()),
+          prev_energies(num_prev, 0.0) {}
+
+    ~Convergence_RHF_ADIIS() = default;
+    Convergence_RHF_ADIIS(const Convergence_RHF_ADIIS&) = delete;
+
+    void get_new_fock_matrix() override;
+    std::string get_algorithm_name() const override {
+        const char* name = (mode_ == ADIISMode::ADIIS) ? "ADIIS" :
+                           (mode_ == ADIISMode::EDIIS) ? "EDIIS" : "AEDIIS";
+        return std::string(name) + " (size=" + std::to_string(num_prev_) + ")";
+    }
+    void reset() override { iteration_ = 0; }
+
+private:
+    std::vector<real_t> solve_adiis_coefficients(int n, const std::vector<real_t>& df_matrix, int newest) const;
+    std::vector<real_t> solve_ediis_coefficients(int n, const std::vector<real_t>& energies,
+                                                  const std::vector<real_t>& df_matrix) const;
+
+    const ADIISMode mode_;
+    int iteration_;
+    const int num_prev_;
+    const int num_basis_;
+
+    DeviceHostMatrix<real_t> error_matrix;
+    DeviceHostMemory<real_t> prev_error_matrices;
+    DeviceHostMemory<real_t> prev_fock_matrices;
+    DeviceHostMemory<real_t> prev_density_matrices;
+    std::vector<real_t> prev_energies;
+};
+
+
+/**
  * @brief InitialGuess_RHF class for the restricted HF method
  * @details This class is a virtual class for the initial guess of the restricted HF method.
  * @details This class will be derived to implement the initial guess.

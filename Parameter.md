@@ -229,6 +229,10 @@ Otherwise, the two-electron repulsion integrals (ERIs) are set to zero.
 * Damping - Damping method with constant damping factor
 * OptimalDamping - Damping method with optimal damping factor (RHF, ROHF)
 * DIIS - Direct Inversion of the Iterative Subspace (DIIS)
+* SOSCF - Second-Order SCF (DIIS→SOSCF automatic switching, RHF)
+* ADIIS - Augmented DIIS (RHF)
+* EDIIS - Energy DIIS (RHF)
+* AEDIIS - Automatic EDIIS→ADIIS→DIIS switching (RHF)
 
 #### damping_factor - Damping factor for DIIS
 * default:  0.9
