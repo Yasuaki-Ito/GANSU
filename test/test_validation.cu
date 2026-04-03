@@ -1731,3 +1731,134 @@ TEST(ValidationDirect_PostHF, H2O_CCSD_ccpVDZ) {
     EXPECT_NEAR(r.post_hf_energy, REF_H2O_CCSD_ccpVDZ_corr, TOL_POSTHF_DZ);
 }
 
+// ============================================================
+//  Semi-Direct RI MP2
+// ============================================================
+
+TEST(ValidationSemiDirectRI, H2O_MP2_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "mp2", 0, 0, "core", "semi_direct_ri",
+                       AUX_BASIS + "cc-pvdz-rifit.gbs");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_RI);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_MP2_STO3G_corr, TOL_RI);
+}
+
+TEST(ValidationSemiDirectRI, H2O_MP2_ccpVDZ) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "mp2", 0, 0, "core", "semi_direct_ri",
+                       AUX_BASIS + "cc-pvdz-rifit.gbs");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_RI);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_MP2_ccpVDZ_corr, TOL_RI);
+}
+
+// ============================================================
+//  Direct RI MP2
+// ============================================================
+
+TEST(ValidationDirectRI, H2O_MP2_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "mp2", 0, 0, "core", "direct_ri",
+                       AUX_BASIS + "cc-pvdz-rifit.gbs");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_RI);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_MP2_STO3G_corr, TOL_RI);
+}
+
+TEST(ValidationDirectRI, H2O_MP2_ccpVDZ) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "mp2", 0, 0, "core", "direct_ri",
+                       AUX_BASIS + "cc-pvdz-rifit.gbs");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_RI);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_MP2_ccpVDZ_corr, TOL_RI);
+}
+
+// ============================================================
+//  ADIIS / EDIIS / AEDIIS convergence
+// ============================================================
+
+static GansuResult run_gansu_convergence(const std::string& xyz,
+                                          const std::string& basis,
+                                          const std::string& conv_method) {
+    ParameterManager params;
+    params["xyzfilename"] = xyz;
+    params["gbsfilename"] = basis;
+    params["method"] = "rhf";
+    params["convergence_method"] = conv_method;
+    params["convergence_energy_threshold"] = "1e-10";
+    params["post_hf_method"] = "none";
+    params["initial_guess"] = "core";
+    params["eri_method"] = "stored";
+    params["run_type"] = "energy";
+    params["verbose"] = "0";
+    params["diis_size"] = "8";
+    params["damping_factor"] = "0.9";
+    params["diis_include_transform"] = "false";
+    params["schwarz_screening_threshold"] = "1e-12";
+    params["max_iteration"] = "200";
+    params["soscf_start_threshold"] = "1e-4";
+
+    std::streambuf* orig = std::cout.rdbuf();
+    std::ostringstream null_s;
+    std::cout.rdbuf(null_s.rdbuf());
+    auto hf = HFBuilder::buildHF(params);
+    hf->solve();
+    std::cout.rdbuf(orig);
+
+    GansuResult result;
+    result.hf_total_energy = hf->get_total_energy();
+    result.post_hf_energy = 0.0;
+    return result;
+}
+
+TEST(ValidationConvergence, H2O_ADIIS_STO3G) {
+    auto r = run_gansu_convergence(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "adiis");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_HF);
+}
+
+TEST(ValidationConvergence, H2O_EDIIS_STO3G) {
+    auto r = run_gansu_convergence(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "ediis");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_HF);
+}
+
+TEST(ValidationConvergence, H2O_AEDIIS_STO3G) {
+    auto r = run_gansu_convergence(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "aediis");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_HF);
+}
+
+// ============================================================
+//  MINAO initial guess
+// ============================================================
+
+TEST(ValidationInitialGuess, H2O_MINAO_STO3G) {
+    // MINAO requires ano-rcc-mb.gbs in the basis directory
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "none", 0, 0, "minao");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_HF);
+}
+
+TEST(ValidationInitialGuess, H2O_MINAO_ccpVDZ) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "none", 0, 0, "minao");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_HF);
+}
+
+// Cross-check: Semi-Direct RI and Direct RI MP2 should match Stored RI MP2
+TEST(ValidationSemiDirectRI, H2O_MP2_matches_StoredRI) {
+    auto r_stored = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                              "mp2", 0, 0, "core", "ri",
+                              AUX_BASIS + "cc-pvdz-rifit.gbs");
+    auto r_semi = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                            "mp2", 0, 0, "core", "semi_direct_ri",
+                            AUX_BASIS + "cc-pvdz-rifit.gbs");
+    EXPECT_NEAR(r_semi.post_hf_energy, r_stored.post_hf_energy, 1e-10);
+}
+
+TEST(ValidationDirectRI, H2O_MP2_matches_StoredRI) {
+    auto r_stored = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                              "mp2", 0, 0, "core", "ri",
+                              AUX_BASIS + "cc-pvdz-rifit.gbs");
+    auto r_direct = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                              "mp2", 0, 0, "core", "direct_ri",
+                              AUX_BASIS + "cc-pvdz-rifit.gbs");
+    EXPECT_NEAR(r_direct.post_hf_energy, r_stored.post_hf_energy, 1e-10);
+}
+

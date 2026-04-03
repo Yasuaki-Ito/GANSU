@@ -28,6 +28,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Coupled Cluster (RCC2, RCCSD, RCCSD(T))
     * Full Configuration Interaction (RFCI)
     * RI support for all post-HF methods (AO ERI reconstructed from B matrix, nao⁴ intermediate skipped via direct MO ERI construction)
+    * Semi-Direct RI and Direct-RI MP2 (B matrix built on-the-fly, no persistent naux×nao² storage)
 * Excited state methods
     * Configuration Interaction Singles (CIS)
     * Algebraic Diagrammatic Construction (ADC(2), ADC(2)-x)

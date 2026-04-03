@@ -1178,6 +1178,8 @@ public:
     ERI_RI_Direct_RHF(const ERI_RI_Direct_RHF&) = delete;
     ~ERI_RI_Direct_RHF() { if(h_Z_tensor) cudaFreeHost(h_Z_tensor); }
 
+    real_t compute_mp2_energy() override;
+
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
         const DeviceHostMatrix<real_t>& core_hamiltonian_matrix = rhf_.get_core_hamiltonian_matrix();
@@ -1247,6 +1249,8 @@ public:
     ~ERI_RI_SemiDirect_RHF() = default;
 
     std::string get_algorithm_name() override { return "Semi-Direct-RI"; }
+
+    real_t compute_mp2_energy() override;
 
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();

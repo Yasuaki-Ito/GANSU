@@ -477,7 +477,9 @@ public:
 
     std::string get_algorithm_name() override { return "Direct-RI"; } ///< Get the algorithm name
 
-
+    bool supports_post_hf_method(PostHFMethod method) const override {
+        return method == PostHFMethod::None || method == PostHFMethod::MP2;
+    }
 
 protected:
     const HF& hf_; ///< HF. This excludes MOs.

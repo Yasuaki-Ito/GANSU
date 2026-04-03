@@ -17,12 +17,14 @@
 #include <cstdlib>  // std::getenv
 #include <string>   // std::string
 #include <fstream>
+#include <iomanip>
 
 //#include <omp.h>
 
 
 #include "rhf.hpp"
 #include "device_host_memory.hpp"
+#include "int3c2e.hpp"
 
 namespace gansu{
 
@@ -686,5 +688,242 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
 }
 
 
+
+// ============================================================
+//  Common RI-MP2 computation from a given B matrix pointer.
+//  Used by Stored RI, Semi-Direct RI, and Direct RI.
+// ============================================================
+static real_t compute_ri_mp2_from_B(
+    real_t* d_B, int num_basis, int num_auxiliary_basis,
+    int nocc, int nvir, real_t* d_C, real_t* d_eps)
+{
+    // MO transform: B(Q,μν) → B(Q,ia)
+    real_t* d_tmp;
+    tracked_cudaMalloc((void**)&d_tmp, sizeof(double) * num_basis * (size_t)nvir * num_auxiliary_basis);
+    transform_intermediate_matrix(num_basis, nocc, nvir, num_auxiliary_basis, d_C, d_B, d_tmp);
+    tracked_cudaFree(d_tmp);
+
+    // Allocate energy accumulator
+    double *d_energy;
+    tracked_cudaMalloc((void**)&d_energy, sizeof(double));
+    cudaMemset(d_energy, 0, sizeof(double));
+
+    const int num_threads = 1024;
+    cudaStream_t streams[4];
+    for(int i = 0; i < 4; i++) cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking);
+
+    double *d_iajb = nullptr;
+    int nocc_block;
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    cublasSetStream(handle, streams[0]);
+
+    search_k_and_cudamalloc_4cERI(nocc, nvir, nocc_block, &d_iajb, streams[0]);
+
+    size_t num_blocks_3 = ((size_t)(nocc_block * (size_t)nvir * (nvir - 1.0) / 2) + num_threads - 1) / num_threads;
+    size_t num_blocks_4 = ((size_t)(nocc_block * (size_t)nvir) + num_threads - 1) / num_threads;
+
+    int niter = ((double)nocc + nocc_block - 1) / nocc_block;
+    cudaEvent_t events[2];
+    for (int i = 0; i < 2; i++) cudaEventCreate(&events[i]);
+    cudaEvent_t *events_for_sync = new cudaEvent_t[niter * 4];
+    for(int i = 0; i < niter * 4; i++) cudaEventCreate(&events_for_sync[i]);
+
+    std::vector<KernelPair> num_blocks_list{
+        {calc_RI_RMP2_energy_kernel1, 0},
+        {calc_RI_RMP2_energy_kernel2, 0},
+        {calc_RI_RMP2_energy_kernel3, num_blocks_3},
+        {calc_RI_RMP2_energy_kernel4, num_blocks_4}};
+
+    int iter_count = 0;
+    const double alpha = 1.0, beta = 0.0;
+
+    cudaDeviceSynchronize();
+    cudaEventRecord(events[0], streams[0]);
+
+    for(int i = 0; i < nocc; i += nocc_block) {
+        num_blocks_list[0].num_blocks = (((size_t)(nocc_block*i + (size_t)nocc_block*(nocc_block-1)/2) * nvir*(nvir-1)/2) + num_threads - 1) / num_threads;
+        num_blocks_list[1].num_blocks = (((size_t)(nocc_block*i + (size_t)nocc_block*(nocc_block-1)/2) * nvir) + num_threads - 1) / num_threads;
+
+        cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+            nocc * nvir,
+            ((nocc_block < nocc - i) ? nocc_block : nocc - i) * nvir,
+            num_auxiliary_basis,
+            &alpha, d_B, nocc * nvir,
+            &d_B[i * nvir], nocc * nvir,
+            &beta, d_iajb, nocc * nvir);
+
+        cudaEventRecord(events_for_sync[iter_count*4 + 0], streams[0]);
+        for(int s = 1; s < 4; s++) cudaStreamWaitEvent(streams[s], events_for_sync[iter_count*4 + 0], 0);
+
+        for (size_t j = 0; j < num_blocks_list.size(); j++) {
+            num_blocks_list[j].kernel<<<num_blocks_list[j].num_blocks, num_threads, 0, streams[j]>>>(
+                nocc, nocc_block, nvir, i, num_auxiliary_basis, d_iajb, d_eps, d_energy);
+            cudaEventRecord(events_for_sync[iter_count*4 + j], streams[j]);
+            cudaStreamWaitEvent(streams[0], events_for_sync[iter_count*4 + j], 0);
+        }
+        iter_count++;
+    }
+
+    cudaEventRecord(events[1], streams[0]);
+    cudaEventSynchronize(events[1]);
+
+    tracked_cudaFree(d_iajb);
+    cublasDestroy(handle);
+
+    double energy;
+    cudaMemcpy(&energy, d_energy, sizeof(double), cudaMemcpyDeviceToHost);
+    tracked_cudaFree(d_energy);
+
+    for (int i = 0; i < 4; i++) cudaStreamDestroy(streams[i]);
+    for (int i = 0; i < niter * 4; i++) cudaEventDestroy(events_for_sync[i]);
+    for (int i = 0; i < 2; i++) cudaEventDestroy(events[i]);
+    delete[] events_for_sync;
+
+    return energy;
+}
+
+// ============================================================
+//  Build temporary B matrix for Semi-Direct/Direct RI
+//  Uses the same 3-center + L^{-1} logic as computeFockMatrix_RI_Direct_v2
+// ============================================================
+static inline int calcIdx_triangular_local(int a, int b, int N) {
+    return a * N - a * (a + 1) / 2 + b;
+}
+
+static real_t* build_temporary_B_matrix(
+    const std::vector<ShellTypeInfo>& shell_type_infos,
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+    const PrimitiveShell* d_primitive_shells,
+    const real_t* d_cgto_normalization_factors,
+    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+    const PrimitiveShell* d_auxiliary_primitive_shells,
+    const real_t* d_auxiliary_cgto_normalization_factors,
+    const size_t2* d_primitive_shell_pair_indices,
+    const real_t* d_schwarz_upper_bound_factors,
+    const real_t* d_auxiliary_schwarz_upper_bound_factors,
+    const real_t* d_two_center_eris_cholesky,
+    double schwarz_screening_threshold,
+    int num_basis, int num_auxiliary_basis,
+    const real_t* d_boys_grid)
+{
+    const int nao = num_basis;
+    const int naux = num_auxiliary_basis;
+    const size_t nao2 = (size_t)nao * nao;
+    const double one = 1.0;
+
+    // Step 1: Compute raw 3-center ERIs
+    real_t* d_B = nullptr;
+    tracked_cudaMalloc(&d_B, (size_t)naux * nao2 * sizeof(real_t));
+    cudaMemset(d_B, 0, (size_t)naux * nao2 * sizeof(real_t));
+
+    {
+        const int threads_per_block = 128;
+        const int shell_type_count = shell_type_infos.size();
+        const int auxiliary_shell_type_count = auxiliary_shell_type_infos.size();
+
+        for (int s0 = 0; s0 < shell_type_count; ++s0) {
+            for (int s1 = s0; s1 < shell_type_count; ++s1) {
+                for (int s2 = 0; s2 < auxiliary_shell_type_count; ++s2) {
+                    const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+                    const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+                    const ShellTypeInfo shell_s2 = auxiliary_shell_type_infos[s2];
+
+                    const int64_t num_tasks = ((s0 == s1)
+                        ? ((int64_t)shell_s0.count * (shell_s0.count + 1) / 2)
+                        : ((int64_t)shell_s0.count * shell_s1.count))
+                        * (int64_t)shell_s2.count;
+                    const int num_blocks = (int)((num_tasks + threads_per_block - 1) / threads_per_block);
+                    const int pair_idx = calcIdx_triangular_local(s0, s1, shell_type_count);
+
+                    ShellTypeInfo shell_s0_nooff = shell_s0;  shell_s0_nooff.start_index = 0;
+                    ShellTypeInfo shell_s1_nooff = shell_s1;  shell_s1_nooff.start_index = 0;
+
+                    gpu::get_3center_kernel(s0, s1, s2)<<<num_blocks, threads_per_block>>>(
+                        d_B, d_primitive_shells, d_auxiliary_primitive_shells,
+                        d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors,
+                        shell_s0_nooff, shell_s1_nooff, shell_s2,
+                        num_tasks, nao,
+                        &d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index],
+                        &d_schwarz_upper_bound_factors[shell_pair_type_infos[pair_idx].start_index],
+                        d_auxiliary_schwarz_upper_bound_factors,
+                        schwarz_screening_threshold, naux, d_boys_grid);
+                }
+            }
+        }
+        cudaDeviceSynchronize();
+    }
+
+    // Step 2: B = L^{-1} × raw_3center (via DTRSM)
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    cublasDtrsm(handle, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
+                nao2, naux, &one, d_two_center_eris_cholesky, naux, d_B, nao2);
+
+    return d_B;
+}
+
+// ============================================================
+//  Semi-Direct RI MP2
+// ============================================================
+real_t ERI_RI_SemiDirect_RHF::compute_mp2_energy() {
+    PROFILE_FUNCTION();
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = num_basis_ - nocc;
+    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+    real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+
+    std::cout << "  [Semi-Direct RI-MP2] Building temporary B matrix..." << std::endl;
+
+    real_t* d_B = build_temporary_B_matrix(
+        hf_.get_shell_type_infos(), hf_.get_shell_pair_type_infos(),
+        hf_.get_primitive_shells().device_ptr(), hf_.get_cgto_normalization_factors().device_ptr(),
+        auxiliary_shell_type_infos_, auxiliary_primitive_shells_.device_ptr(),
+        auxiliary_cgto_normalization_factors_.device_ptr(),
+        primitive_shell_pair_indices.device_ptr(),
+        schwarz_upper_bound_factors.device_ptr(),
+        auxiliary_schwarz_upper_bound_factors.device_ptr(),
+        two_center_eris.device_ptr(),  // Cholesky factor L
+        rhf_.get_schwarz_screening_threshold(),
+        num_basis_, num_auxiliary_basis_,
+        hf_.get_boys_grid().device_ptr());
+
+    real_t energy = compute_ri_mp2_from_B(d_B, num_basis_, num_auxiliary_basis_, nocc, nvir, d_C, d_eps);
+    tracked_cudaFree(d_B);
+
+    std::cout << "h_E: " << std::setprecision(12) << energy << std::endl;
+    return energy;
+}
+
+// ============================================================
+//  Direct RI MP2 (same as Semi-Direct for MP2 — both build B temporarily)
+// ============================================================
+real_t ERI_RI_Direct_RHF::compute_mp2_energy() {
+    PROFILE_FUNCTION();
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = num_basis_ - nocc;
+    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+    real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+
+    std::cout << "  [Direct RI-MP2] Building temporary B matrix..." << std::endl;
+
+    real_t* d_B = build_temporary_B_matrix(
+        hf_.get_shell_type_infos(), hf_.get_shell_pair_type_infos(),
+        hf_.get_primitive_shells().device_ptr(), hf_.get_cgto_normalization_factors().device_ptr(),
+        auxiliary_shell_type_infos_, auxiliary_primitive_shells_.device_ptr(),
+        auxiliary_cgto_normalization_factors_.device_ptr(),
+        primitive_shell_pair_indices.device_ptr(),
+        schwarz_upper_bound_factors.device_ptr(),
+        auxiliary_schwarz_upper_bound_factors.device_ptr(),
+        two_center_eris.device_ptr(),  // Cholesky factor L
+        rhf_.get_schwarz_screening_threshold(),
+        num_basis_, num_auxiliary_basis_,
+        hf_.get_boys_grid().device_ptr());
+
+    real_t energy = compute_ri_mp2_from_B(d_B, num_basis_, num_auxiliary_basis_, nocc, nvir, d_C, d_eps);
+    tracked_cudaFree(d_B);
+
+    std::cout << "h_E: " << std::setprecision(12) << energy << std::endl;
+    return energy;
+}
 
 } // namespace gansu
