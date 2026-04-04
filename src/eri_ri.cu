@@ -547,18 +547,21 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
 
     real_t *d_C = coefficient_matrix.device_ptr();
     real_t *d_eps = orbital_energies.device_ptr();
-    real_t *d_intermediate_matrix_B = intermediate_matrix_B_.device_ptr();
     const int num_auxiliary_basis = num_auxiliary_basis_;
 
+    // Copy B matrix to avoid in-place destruction of intermediate_matrix_B_
+    const size_t B_size = (size_t)num_auxiliary_basis * num_basis_ * num_basis_;
+    real_t* d_B_copy = nullptr;
+    tracked_cudaMalloc(&d_B_copy, B_size * sizeof(real_t));
+    cudaMemcpy(d_B_copy, intermediate_matrix_B_.device_ptr(), B_size * sizeof(real_t), cudaMemcpyDeviceToDevice);
+    real_t *d_intermediate_matrix_B = d_B_copy;
 
     real_t* d_tmp;
     tracked_cudaMalloc((void**)&d_tmp, sizeof(double) * num_basis_ * (size_t)nvir * num_auxiliary_basis);
 
     double *d_energy;
     tracked_cudaMalloc((void**)&d_energy, sizeof(double));
-    cudaMemset(d_energy, 0.0, sizeof(double));
-
-
+    cudaMemset(d_energy, 0, sizeof(double));
 
     const int num_threads = 1024;
     cudaEvent_t events[2];
@@ -651,7 +654,8 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
     cudaEventRecord(events[1], streams[0]);
     cudaEventSynchronize(events[1]);
 
-    tracked_cudaFree(d_iajb);            
+    tracked_cudaFree(d_iajb);
+    tracked_cudaFree(d_B_copy);
     cublasDestroy(handle);
 
 

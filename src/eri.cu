@@ -489,6 +489,10 @@ void ERI_RI::precomputation() {
     }
 
 
+    // Zero-initialize B matrix before computation (defensive: prevent stale GPU memory)
+    cudaMemset(intermediate_matrix_B_.device_ptr(), 0,
+               (size_t)num_auxiliary_basis_ * num_basis_ * num_basis_ * sizeof(real_t));
+
     gpu::compute_RI_IntermediateMatrixB(
         shell_type_infos, 
         shell_pair_type_infos,
@@ -510,6 +514,7 @@ void ERI_RI::precomputation() {
 
 
     cudaFree(d_primitive_shell_pair_indices);
+    cudaDeviceSynchronize();
     /*
     if(1){
         // copy the intermediate matrix B to the host memory
