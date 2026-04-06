@@ -497,4 +497,8 @@ void ERI_Hash_RHF::compute_eom_cc2(int n_states) {
     tracked_cudaFree(d_mo_eri);
 }
 
+// Note: EOM-CC2 requires oooo+vvvv for M21 (σ2 kernel) even in schur_omega mode,
+// so half-transform sub-block construction provides limited memory savings.
+// Using build_mo_eri for simplicity.
+
 } // namespace gansu
