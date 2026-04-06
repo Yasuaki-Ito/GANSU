@@ -909,6 +909,147 @@ __global__ void mp2_stored_kernel_ovov_direct(
     if (threadIdx.x == 0 && threadIdx.y == 0) atomicAdd(g_energy, s_tmp);
 }
 
+// ============================================================
+//  Hash COO → dense OVOV transformation kernel
+//  Each thread processes one COO entry (μν|λσ) and accumulates
+//  contributions to (ia|jb) using MO coefficients.
+// ============================================================
+__global__ void hash_coo_to_ovov_kernel(
+    const unsigned long long* __restrict__ g_coo_keys,
+    const double* __restrict__ g_coo_values,
+    const size_t num_entries,
+    const double* __restrict__ g_C,   // MO coefficients [nao × nao] row-major
+    double* __restrict__ g_ovov,       // output OVOV [nocc*nvir*nocc*nvir]
+    const int nao, const int nocc, const int nvir)
+{
+    const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_entries) return;
+
+    const unsigned long long key = g_coo_keys[tid];
+    const double val = g_coo_values[tid];
+    if (fabs(val) < 1e-18) return;
+
+    // Decode canonical (mu<=nu, la<=si, mn<=ls) indices
+    int mu = (int)((key >> 48) & 0xFFFF);
+    int nu = (int)((key >> 32) & 0xFFFF);
+    int la = (int)((key >> 16) & 0xFFFF);
+    int si = (int)(key & 0xFFFF);
+
+    // Enumerate all unique permutations of (μν|λσ) under 8-fold symmetry.
+    // Canonical: mu<=nu, la<=si, (mu,nu)<=(la,si).
+    // 8 permutations: (mn|ls), (nm|ls), (mn|sl), (nm|sl),
+    //                 (ls|mn), (sl|mn), (ls|nm), (sl|nm)
+    // Use a small buffer and deduplicate.
+    struct Perm { int m, n, l, s; };
+    Perm perms[8] = {
+        {mu,nu,la,si}, {nu,mu,la,si}, {mu,nu,si,la}, {nu,mu,si,la},
+        {la,si,mu,nu}, {si,la,mu,nu}, {la,si,nu,mu}, {si,la,nu,mu}
+    };
+    // Deduplicate: mark visited by comparing encoded (m,n,l,s)
+    int n_unique = 0;
+    Perm unique[8];
+    for (int p = 0; p < 8; p++) {
+        bool dup = false;
+        for (int q = 0; q < n_unique; q++) {
+            if (perms[p].m == unique[q].m && perms[p].n == unique[q].n &&
+                perms[p].l == unique[q].l && perms[p].s == unique[q].s) {
+                dup = true; break;
+            }
+        }
+        if (!dup) unique[n_unique++] = perms[p];
+    }
+
+    for (int p = 0; p < n_unique; p++) {
+        int m = unique[p].m, n = unique[p].n, l = unique[p].l, s = unique[p].s;
+        // (ia|jb) += C(m,i)*C(n,a+nocc) * val * C(l,j)*C(s,b+nocc)
+        for (int i = 0; i < nocc; i++) {
+            double Cmi = g_C[m * nao + i];
+            if (fabs(Cmi) < 1e-15) continue;
+            for (int a = 0; a < nvir; a++) {
+                double CnA = g_C[n * nao + (a + nocc)];
+                if (fabs(CnA) < 1e-15) continue;
+                double fac1 = Cmi * CnA * val;
+                for (int j = 0; j < nocc; j++) {
+                    double ClJ = g_C[l * nao + j];
+                    if (fabs(ClJ) < 1e-15) continue;
+                    double fac2 = fac1 * ClJ;
+                    for (int b = 0; b < nvir; b++) {
+                        double CsB = g_C[s * nao + (b + nocc)];
+                        atomicAdd(&g_ovov[((size_t)i * nvir + a) * nocc * nvir + j * nvir + b],
+                                  fac2 * CsB);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+//  Hash COO → full dense MO ERI transformation kernel
+//  Each thread processes one COO entry and accumulates all
+//  MO ERI contributions (pq|rs) = Σ C(μ,p)C(ν,q)(μν|λσ)C(λ,r)C(σ,s)
+// ============================================================
+__global__ void hash_coo_to_mo_eri_kernel(
+    const unsigned long long* __restrict__ g_coo_keys,
+    const double* __restrict__ g_coo_values,
+    const size_t num_entries,
+    const double* __restrict__ g_C,
+    double* __restrict__ g_mo_eri,
+    const int nao)
+{
+    const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_entries) return;
+
+    const unsigned long long key = g_coo_keys[tid];
+    const double val = g_coo_values[tid];
+    if (fabs(val) < 1e-18) return;
+
+    int mu = (int)((key >> 48) & 0xFFFF);
+    int nu = (int)((key >> 32) & 0xFFFF);
+    int la = (int)((key >> 16) & 0xFFFF);
+    int si = (int)(key & 0xFFFF);
+
+    // 8-fold symmetry: enumerate unique permutations
+    struct Perm { int m, n, l, s; };
+    Perm perms[8] = {
+        {mu,nu,la,si}, {nu,mu,la,si}, {mu,nu,si,la}, {nu,mu,si,la},
+        {la,si,mu,nu}, {si,la,mu,nu}, {la,si,nu,mu}, {si,la,nu,mu}
+    };
+    int n_unique = 0;
+    Perm unique[8];
+    for (int pp = 0; pp < 8; pp++) {
+        bool dup = false;
+        for (int q = 0; q < n_unique; q++)
+            if (perms[pp].m == unique[q].m && perms[pp].n == unique[q].n &&
+                perms[pp].l == unique[q].l && perms[pp].s == unique[q].s) { dup = true; break; }
+        if (!dup) unique[n_unique++] = perms[pp];
+    }
+
+    const size_t nao2 = (size_t)nao * nao;
+    for (int pp = 0; pp < n_unique; pp++) {
+        int m = unique[pp].m, n = unique[pp].n, l = unique[pp].l, s = unique[pp].s;
+        for (int p = 0; p < nao; p++) {
+            double Cmp = g_C[m * nao + p];
+            if (fabs(Cmp) < 1e-15) continue;
+            for (int q = 0; q < nao; q++) {
+                double CnQ = g_C[n * nao + q];
+                if (fabs(CnQ) < 1e-15) continue;
+                double fac1 = Cmp * CnQ * val;
+                for (int r = 0; r < nao; r++) {
+                    double ClR = g_C[l * nao + r];
+                    if (fabs(ClR) < 1e-15) continue;
+                    double fac2 = fac1 * ClR;
+                    for (int ss = 0; ss < nao; ss++) {
+                        double CsS = g_C[s * nao + ss];
+                        atomicAdd(&g_mo_eri[((size_t)p * nao + q) * nao2 + r * nao + ss],
+                                  fac2 * CsS);
+                    }
+                }
+            }
+        }
+    }
+}
+
 //*
 __global__ void mp2_stored_kernel_ovov(
     double* g_energy_second, 
@@ -1561,6 +1702,167 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
 //  Memory peak: nao^3 * block_j (Step 1 buffer)
 //  Total integral evaluations: ceil(nocc / block_j) full AO integral passes
 //
+// ============================================================
+//  Hash ERI MP2: COO → dense OVOV → MP2 energy
+// ============================================================
+// COO → dense AO ERI expansion kernel
+__global__ void hash_coo_to_dense_kernel(
+    const unsigned long long* __restrict__ g_coo_keys,
+    const double* __restrict__ g_coo_values,
+    const size_t num_entries,
+    double* __restrict__ g_eri_dense,
+    const int nao)
+{
+    const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_entries) return;
+
+    const unsigned long long key = g_coo_keys[tid];
+    const double val = g_coo_values[tid];
+    if (fabs(val) < 1e-18) return;
+
+    int mu = (int)((key >> 48) & 0xFFFF);
+    int nu = (int)((key >> 32) & 0xFFFF);
+    int la = (int)((key >> 16) & 0xFFFF);
+    int si = (int)(key & 0xFFFF);
+
+    const size_t nao2 = (size_t)nao * nao;
+    // Expand 8-fold symmetry
+    struct Perm { int a, b, c, d; };
+    Perm perms[8] = {
+        {mu,nu,la,si}, {nu,mu,la,si}, {mu,nu,si,la}, {nu,mu,si,la},
+        {la,si,mu,nu}, {si,la,mu,nu}, {la,si,nu,mu}, {si,la,nu,mu}
+    };
+    for (int p = 0; p < 8; p++) {
+        size_t idx = ((size_t)perms[p].a*nao + perms[p].b)*nao2 + perms[p].c*nao + perms[p].d;
+        g_eri_dense[idx] = val;  // Direct write (no race: each permutation maps to unique index)
+    }
+}
+
+// Forward declarations (hash_half_transform.cu) — in gansu namespace (same as this file)
+__global__ void hash_half_transform_compact_kernel(
+    const unsigned long long* g_coo_keys, const double* g_coo_values, size_t num_entries,
+    const double* g_C, double* g_half, int nao, int j_start, int block_j);
+__global__ void hash_half_transform_indexed_kernel(
+    const unsigned long long* g_hash_keys, const double* g_hash_values,
+    const size_t* g_nonzero_indices, size_t num_nonzero,
+    const double* g_C, double* g_half, int nao, int j_start, int block_j);
+__global__ void hash_half_transform_fullscan_kernel(
+    const unsigned long long* g_hash_keys, const double* g_hash_values, size_t hash_capacity,
+    const double* g_C, double* g_half, int nao, int j_start, int block_j);
+
+real_t ERI_Hash_RHF::compute_mp2_energy() {
+    PROFILE_FUNCTION();
+
+    const int nao = rhf_.get_num_basis();
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = nao - nocc;
+    const real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+    const real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+
+    // Determine block_j (same as Direct MP2)
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    const size_t nao3 = (size_t)nao * nao * nao;
+    int block_j = std::max(1, (int)(free_mem * 6 / 10 / (nao3 * sizeof(real_t))));
+    block_j = std::min(block_j, nocc);
+    if (block_j > 8) block_j = 8;
+
+    const char* method_name = (hash_fock_method_ == HashFockMethod::Compact) ? "Compact" :
+                              (hash_fock_method_ == HashFockMethod::Indexed) ? "Indexed" : "Fullscan";
+    std::cout << "  [Hash MP2 / " << method_name << "] nao=" << nao << " nocc=" << nocc
+              << " nvir=" << nvir << " nnz=" << num_entries_ << " block_j=" << block_j << std::endl;
+
+    // Allocate buffers (same as Direct MP2)
+    real_t* d_half = nullptr;
+    real_t* d_Ki = nullptr;
+    real_t* d_Li = nullptr;
+    real_t* d_V = nullptr;
+    real_t* d_E = nullptr;
+
+    tracked_cudaMalloc(&d_half, nao3 * block_j * sizeof(real_t));
+    tracked_cudaMalloc(&d_Ki, (size_t)nao * nao * block_j * sizeof(real_t));
+    tracked_cudaMalloc(&d_Li, (size_t)nvir * nao * block_j * sizeof(real_t));
+    tracked_cudaMalloc(&d_V, (size_t)nocc * nvir * nvir * block_j * sizeof(real_t));
+    tracked_cudaMalloc(&d_E, sizeof(real_t));
+    cudaMemset(d_E, 0, sizeof(real_t));
+
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    const double alpha = 1.0, beta_zero = 0.0;
+
+    for (int j_start = 0; j_start < nocc; j_start += block_j) {
+        int bj = std::min(block_j, nocc - j_start);
+
+        // Step 1: Half-transform via Hash lookup (replaces on-the-fly Rys computation)
+        cudaMemset(d_half, 0, nao3 * bj * sizeof(real_t));
+        {
+            const int threads = 256;
+            if (hash_fock_method_ == HashFockMethod::Compact) {
+                const int blocks = ((int)num_entries_ + threads - 1) / threads;
+                hash_half_transform_compact_kernel<<<blocks, threads>>>(
+                    d_coo_keys_, d_coo_values_, num_entries_,
+                    d_C, d_half, nao, j_start, bj);
+            } else if (hash_fock_method_ == HashFockMethod::Indexed) {
+                const int blocks = ((int)num_nonzero_ + threads - 1) / threads;
+                hash_half_transform_indexed_kernel<<<blocks, threads>>>(
+                    d_hash_keys_, d_hash_values_,
+                    d_nonzero_indices_, num_nonzero_,
+                    d_C, d_half, nao, j_start, bj);
+            } else { // Fullscan
+                const size_t capacity = hash_capacity_mask_ + 1;
+                const int blocks = ((int)capacity + threads - 1) / threads;
+                hash_half_transform_fullscan_kernel<<<blocks, threads>>>(
+                    d_hash_keys_, d_hash_values_, capacity,
+                    d_C, d_half, nao, j_start, bj);
+            }
+            cudaDeviceSynchronize();
+        }
+
+        // Steps 2-4: DGEMM chain (identical to Direct MP2)
+        {
+            const size_t M_nao2bj = (size_t)nao * nao * bj;
+            const size_t M_naobj = (size_t)nao * bj;
+
+            for (int i = 0; i < nocc; i++) {
+                cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                    M_nao2bj, 1, nao, &alpha,
+                    d_half, M_nao2bj, d_C + i, nao,
+                    &beta_zero, d_Ki, M_nao2bj);
+
+                cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                    M_naobj, nvir, nao, &alpha,
+                    d_Ki, M_naobj, d_C + nocc, nao,
+                    &beta_zero, d_Li, M_naobj);
+
+                for (int a = 0; a < nvir; a++) {
+                    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                        bj, nvir, nao, &alpha,
+                        d_Li + (size_t)a * nao * bj, bj,
+                        d_C + nocc, nao,
+                        &beta_zero,
+                        d_V + (size_t)i * nvir * nvir * bj + (size_t)a * nvir * bj, bj);
+                }
+            }
+        }
+
+        // Step 5: MP2 energy accumulation
+        mp2_stored_kernel_ovov_direct<<<(nocc*nvir*nocc*nvir + 1023)/1024, dim3(32,32)>>>(
+            d_E, d_V, d_eps, nocc, nvir, j_start, bj);
+        cudaDeviceSynchronize();
+    }
+
+    real_t h_E = 0.0;
+    cudaMemcpy(&h_E, d_E, sizeof(real_t), cudaMemcpyDeviceToHost);
+    std::cout << "h_E: " << std::setprecision(12) << h_E << std::endl;
+
+    tracked_cudaFree(d_half);
+    tracked_cudaFree(d_Ki);
+    tracked_cudaFree(d_Li);
+    tracked_cudaFree(d_V);
+    tracked_cudaFree(d_E);
+
+    return h_E;
+}
+
 //  NOTE: Uses Rys quadrature for all angular momenta (no s/p specialization).
 //        TODO: GPU最適化 — s/p特化カーネルの追加、block_jの自動調整
 // ============================================================
@@ -2565,6 +2867,13 @@ real_t ERI_RI_RHF::compute_mp3_energy() {
 }
 
 real_t ERI_Direct_RHF::compute_mp3_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    real_t result = compute_mp3_energy_impl(rhf_, nullptr, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
+}
+
+real_t ERI_Hash_RHF::compute_mp3_energy() {
     real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
     real_t result = compute_mp3_energy_impl(rhf_, nullptr, d_mo_eri);
     tracked_cudaFree(d_mo_eri);
@@ -6253,6 +6562,13 @@ real_t ERI_Direct_RHF::compute_ccsd_energy() {
     return result;
 }
 
+real_t ERI_Hash_RHF::compute_ccsd_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    real_t result = compute_ccsd_energy_impl(rhf_, nullptr, 0, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////// CCSD(T) implementation
 
@@ -6293,6 +6609,13 @@ real_t ERI_RI_RHF::compute_ccsd_t_energy() {
 }
 
 real_t ERI_Direct_RHF::compute_ccsd_t_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    real_t result = compute_ccsd_t_energy_impl(rhf_, nullptr, 0, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
+}
+
+real_t ERI_Hash_RHF::compute_ccsd_t_energy() {
     real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
     real_t result = compute_ccsd_t_energy_impl(rhf_, nullptr, 0, d_mo_eri);
     tracked_cudaFree(d_mo_eri);

@@ -190,4 +190,10 @@ void ERI_Direct_RHF::compute_adc2x(int n_states) {
     tracked_cudaFree(d_mo_eri);
 }
 
+void ERI_Hash_RHF::compute_adc2x(int n_states) {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    compute_adc2x_impl(rhf_, nullptr, n_states, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+}
+
 } // namespace gansu

@@ -1637,6 +1637,22 @@ TEST(ValidationHashERI, H2O_ccpVDZ_Fullscan) {
 }
 
 // ============================================================
+//  Hash ERI MP2
+// ============================================================
+
+TEST(ValidationHashERI, H2O_MP2_STO3G) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf", "mp2", 0, 0, "core", "hash", "", 0, "compact");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_HF);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_MP2_STO3G_corr, TOL_POSTHF);
+}
+
+TEST(ValidationHashERI, H2O_MP2_ccpVDZ) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf", "mp2", 0, 0, "core", "hash", "", 0, "compact");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_HF);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_MP2_ccpVDZ_corr, TOL_POSTHF_DZ);
+}
+
+// ============================================================
 //  RI post-HF excited states (placed after reference value definitions)
 // ============================================================
 

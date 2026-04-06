@@ -1114,9 +1114,23 @@ protected:
 
 class ERI_Hash_RHF : public ERI_Hash {
 public:
-    ERI_Hash_RHF(RHF& rhf): ERI_Hash(rhf), rhf_(rhf) {} ///< Constructor
-    ERI_Hash_RHF(const ERI_Hash_RHF&) = delete; ///< copy constructor is deleted
-    ~ERI_Hash_RHF() = default; ///< destructor
+    ERI_Hash_RHF(RHF& rhf): ERI_Hash(rhf), rhf_(rhf) {}
+    ERI_Hash_RHF(const ERI_Hash_RHF&) = delete;
+    ~ERI_Hash_RHF() = default;
+
+    real_t compute_mp2_energy() override;
+    real_t compute_mp3_energy() override;
+    real_t compute_mp4_energy() override;
+    real_t compute_cc2_energy() override;
+    real_t compute_ccsd_energy() override;
+    real_t compute_ccsd_t_energy() override;
+    real_t compute_fci_energy() override;
+    void compute_cis(int n_states) override;
+    void compute_adc2(int n_states) override;
+    void compute_adc2x(int n_states) override;
+    void compute_eom_mp2(int n_states) override;
+    void compute_eom_cc2(int n_states) override;
+    void compute_eom_ccsd(int n_states) override;
 
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();

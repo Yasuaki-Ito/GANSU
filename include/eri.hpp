@@ -426,8 +426,28 @@ public:
     void set_hash_fock_method(HashFockMethod m) { hash_fock_method_ = m; }
     HashFockMethod get_hash_fock_method() const { return hash_fock_method_; }
 
+    /// Compute G(D) = 2J[D] - K[D] using Hash ERI (reuses Fock construction with H=0)
+    void compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const override;
+
+    /// Build full MO ERI tensor from COO AO ERI
+    real_t* build_mo_eri(const real_t* d_C, int nmo) const override;
+
     bool supports_post_hf_method(PostHFMethod method) const override {
-        if( method == PostHFMethod::None // always supported
+        // With build_mo_eri, all post-HF methods are supported
+        if( method == PostHFMethod::None
+         || method == PostHFMethod::MP2
+         || method == PostHFMethod::MP3
+         || method == PostHFMethod::MP4
+         || method == PostHFMethod::CC2
+         || method == PostHFMethod::CCSD
+         || method == PostHFMethod::CCSD_T
+         || method == PostHFMethod::CIS
+         || method == PostHFMethod::ADC2
+         || method == PostHFMethod::ADC2X
+         || method == PostHFMethod::EOM_MP2
+         || method == PostHFMethod::EOM_CC2
+         || method == PostHFMethod::EOM_CCSD
+         || method == PostHFMethod::FCI
           ){
             return true;
         }

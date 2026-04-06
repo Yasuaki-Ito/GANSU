@@ -633,4 +633,11 @@ real_t ERI_Direct_RHF::compute_fci_energy() {
     return result;
 }
 
+real_t ERI_Hash_RHF::compute_fci_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+    real_t result = compute_fci_energy_impl(rhf_, nullptr, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
+}
+
 } // namespace gansu

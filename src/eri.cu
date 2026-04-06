@@ -722,6 +722,48 @@ ERI_Hash::~ERI_Hash() {
     if (d_nonzero_indices_) tracked_cudaFree(d_nonzero_indices_);
 }
 
+void ERI_Hash::compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const {
+    // G = 2J[D] - K[D] = Fock(D, H=0) using Hash ERI
+    // Use Compact (COO) method — always available after precomputation
+    real_t* d_zero = nullptr;
+    tracked_cudaMalloc(&d_zero, (size_t)nao * nao * sizeof(real_t));
+    cudaMemset(d_zero, 0, (size_t)nao * nao * sizeof(real_t));
+    gpu::computeFockMatrix_Hash_RHF(d_D, d_zero,
+        d_coo_keys_, d_coo_values_, num_entries_,
+        d_G, nao, false);
+    tracked_cudaFree(d_zero);
+}
+
+// Forward declaration of kernel in eri_stored.cu
+__global__ void hash_coo_to_dense_kernel(
+    const unsigned long long* g_coo_keys, const double* g_coo_values,
+    size_t num_entries, double* g_eri_dense, int nao);
+
+real_t* ERI_Hash::build_mo_eri(const real_t* d_C, int nmo) const {
+    const size_t n4 = (size_t)nmo * nmo * nmo * nmo;
+
+    // Step 1: COO → dense AO ERI (O(nnz) expansion)
+    real_t* d_eri_work = nullptr;
+    tracked_cudaMalloc(&d_eri_work, n4 * sizeof(real_t));
+    cudaMemset(d_eri_work, 0, n4 * sizeof(real_t));
+    {
+        const int threads = 256;
+        const int blocks = ((int)num_entries_ + threads - 1) / threads;
+        hash_coo_to_dense_kernel<<<blocks, threads>>>(
+            d_coo_keys_, d_coo_values_, num_entries_,
+            d_eri_work, nmo);
+        cudaDeviceSynchronize();
+    }
+
+    // Step 2: AO → MO transform via DGEMM (same as Stored ERI)
+    real_t* d_eri_mo = nullptr;
+    tracked_cudaMalloc(&d_eri_mo, n4 * sizeof(real_t));
+    transform_eri_ao2mo_dgemm_full(d_eri_work, d_eri_mo, d_C, nmo);
+    tracked_cudaFree(d_eri_work);
+
+    return d_eri_mo;
+}
+
 void ERI_Hash::precomputation() {
     const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
     const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
@@ -795,32 +837,34 @@ void ERI_Hash::precomputation() {
     thrust::device_ptr<unsigned long long> keys_ptr(d_hash_keys);
     size_t num_nonzero = thrust::count_if(keys_ptr, keys_ptr + hash_capacity, HashKeyIsNonEmpty());
 
-    // Keep hash table
+    // Keep hash table (needed for all methods including MP2 half-transform)
     d_hash_keys_ = d_hash_keys;
     d_hash_values_ = d_hash_values;
     hash_capacity_mask_ = hash_capacity_mask;
+    num_nonzero_ = num_nonzero;  // Store for all methods (used by Indexed MP2 half-transform)
 
-    if (hash_fock_method_ == HashFockMethod::Compact) {
-        tracked_cudaMalloc(&d_coo_keys_, num_nonzero * sizeof(unsigned long long));
-        tracked_cudaMalloc(&d_coo_values_, num_nonzero * sizeof(real_t));
-        {
-            thrust::device_ptr<real_t> vals_ptr(d_hash_values);
-            auto zip_begin = thrust::make_zip_iterator(thrust::make_tuple(keys_ptr, vals_ptr));
-            auto zip_end = thrust::make_zip_iterator(thrust::make_tuple(keys_ptr + hash_capacity, vals_ptr + hash_capacity));
-            auto out_zip = thrust::make_zip_iterator(thrust::make_tuple(
-                thrust::device_ptr<unsigned long long>(d_coo_keys_),
-                thrust::device_ptr<real_t>(d_coo_values_)));
-            thrust::copy_if(zip_begin, zip_end, keys_ptr, out_zip, HashKeyIsNonEmpty());
-        }
-        num_entries_ = num_nonzero;
-    } else if (hash_fock_method_ == HashFockMethod::Indexed) {
-        tracked_cudaMalloc(&d_nonzero_indices_, num_nonzero * sizeof(size_t));
+    // Build all auxiliary data structures for SCF Fock and MP2 half-transform
+    // COO (Compact) — always built (needed for compute_jk_response and MP2 compact)
+    tracked_cudaMalloc(&d_coo_keys_, num_nonzero * sizeof(unsigned long long));
+    tracked_cudaMalloc(&d_coo_values_, num_nonzero * sizeof(real_t));
+    {
+        thrust::device_ptr<real_t> vals_ptr(d_hash_values);
+        auto zip_begin = thrust::make_zip_iterator(thrust::make_tuple(keys_ptr, vals_ptr));
+        auto zip_end = thrust::make_zip_iterator(thrust::make_tuple(keys_ptr + hash_capacity, vals_ptr + hash_capacity));
+        auto out_zip = thrust::make_zip_iterator(thrust::make_tuple(
+            thrust::device_ptr<unsigned long long>(d_coo_keys_),
+            thrust::device_ptr<real_t>(d_coo_values_)));
+        thrust::copy_if(zip_begin, zip_end, keys_ptr, out_zip, HashKeyIsNonEmpty());
+    }
+    num_entries_ = num_nonzero;
+
+    // Indexed — always built (needed for MP2 indexed half-transform)
+    tracked_cudaMalloc(&d_nonzero_indices_, num_nonzero * sizeof(size_t));
+    {
         thrust::counting_iterator<size_t> count_begin(0);
         thrust::device_ptr<size_t> out_indices(d_nonzero_indices_);
         thrust::copy_if(count_begin, count_begin + hash_capacity, keys_ptr, out_indices, HashKeyIsNonEmpty());
-        num_nonzero_ = num_nonzero;
     }
-    // Fullscan: no additional data structure needed
 
     if (verbose) {
         std::cout << "ERI Hash: " << num_nonzero << " unique entries after cleanup ("

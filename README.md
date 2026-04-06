@@ -18,7 +18,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Restricted Open-Shell Hartree-Fock (ROHF)
     * ERI storage methods
       * Stored (full nao⁴ tensor)
-      * Hash (sparse COO/hash table with Compact, Indexed, and Fullscan Fock construction)
+      * Hash (sparse COO/hash table with Compact, Indexed, and Fullscan Fock construction, full post-HF support)
       * RI approximation (Density Fitting) (RHF, UHF, ROHF)
       * Semi-Direct-RI (RHF, UHF) — recomputes B matrix each iteration, J/K via BLAS
       * Direct-RI (RHF) — on-the-fly contraction without storing B matrix
