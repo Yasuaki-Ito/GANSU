@@ -2866,18 +2866,46 @@ real_t ERI_RI_RHF::compute_mp3_energy() {
     return result;
 }
 
+// Forward declarations for half-transform MP3 (defined in half_transform_mp3.cu)
+real_t mp3_half_transform_direct(RHF& rhf, const HF& hf, int block_s);
+real_t mp3_half_transform_hash(
+    RHF& rhf,
+    const unsigned long long* d_coo_keys, const real_t* d_coo_values, size_t num_entries,
+    const unsigned long long* d_hash_keys, const real_t* d_hash_values,
+    const size_t* d_nonzero_indices, size_t num_nonzero,
+    size_t hash_capacity_mask, HashFockMethod method, int block_s);
+
 real_t ERI_Direct_RHF::compute_mp3_energy() {
-    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
-    real_t result = compute_mp3_energy_impl(rhf_, nullptr, d_mo_eri);
-    tracked_cudaFree(d_mo_eri);
-    return result;
+    PROFILE_FUNCTION();
+    const int nao = rhf_.get_num_basis();
+
+    // Determine block_s from available GPU memory
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    const size_t nao3 = (size_t)nao * nao * nao;
+    int block_s = std::max(1, (int)(free_mem * 4 / 10 / (nao3 * sizeof(real_t))));
+    block_s = std::min(block_s, nao);
+    if (block_s > 8) block_s = 8;
+
+    return mp3_half_transform_direct(rhf_, hf_, block_s);
 }
 
 real_t ERI_Hash_RHF::compute_mp3_energy() {
-    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
-    real_t result = compute_mp3_energy_impl(rhf_, nullptr, d_mo_eri);
-    tracked_cudaFree(d_mo_eri);
-    return result;
+    PROFILE_FUNCTION();
+    const int nao = rhf_.get_num_basis();
+
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    const size_t nao3 = (size_t)nao * nao * nao;
+    int block_s = std::max(1, (int)(free_mem * 4 / 10 / (nao3 * sizeof(real_t))));
+    block_s = std::min(block_s, nao);
+    if (block_s > 8) block_s = 8;
+
+    return mp3_half_transform_hash(rhf_,
+        d_coo_keys_, d_coo_values_, num_entries_,
+        d_hash_keys_, d_hash_values_,
+        d_nonzero_indices_, num_nonzero_,
+        hash_capacity_mask_, hash_fock_method_, block_s);
 }
 
 
