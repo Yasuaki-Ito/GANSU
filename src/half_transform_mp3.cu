@@ -500,17 +500,70 @@ __global__ void kbjc2kcjb_block(
 
 
 // ============================================================
-//  MP3 energy via half-transformation (avoids full nao^4 MO ERI)
+//  Gather kernels for streaming DGEMM
 // ============================================================
 
 /**
- * Build 4 MO ERI sub-blocks via half-transformation and compute MP3 energy.
- * Sub-blocks: oooo, vvvv, ovov, oovv.
+ * Gather t_oovv columns for l in [l_blk, l_blk+bs).
+ * t_oovv layout: t_oovv[(k*nocc + l)*nvir² + ab]  (column-major, lda=nvir²)
+ * Output: t_slice[(k*bs + l_local)*nvir² + ab]     (contiguous, lda=nvir²)
+ */
+__global__ void gather_for_l_block_kernel(
+    const double* __restrict__ t_oovv, double* __restrict__ t_slice,
+    int nocc, int nvir2, int l_blk, int bs)
+{
+    const size_t total = (size_t)nocc * bs * nvir2;
+    const size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= total) return;
+
+    size_t t = gid;
+    const int ab = t % nvir2; t /= nvir2;
+    const int l_local = t % bs; t /= bs;
+    const int k = (int)t;
+
+    // src: kl = k*nocc + l_blk + l_local
+    t_slice[gid] = t_oovv[(size_t)(k * nocc + l_blk + l_local) * nvir2 + ab];
+}
+
+/**
+ * Gather t_vvoo columns for d in [d_blk, d_blk+bs).
+ * t_vvoo layout: t_vvoo[(c*nvir + d)*nocc² + ij]  (column-major, lda=nocc²)
+ * Output: t_slice[(c*bs + d_local)*nocc² + ij]     (contiguous, lda=nocc²)
+ */
+__global__ void gather_for_d_block_kernel(
+    const double* __restrict__ t_vvoo, double* __restrict__ t_slice,
+    int nvir, int nocc2, int d_blk, int bs)
+{
+    const size_t total = (size_t)nvir * bs * nocc2;
+    const size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= total) return;
+
+    size_t t = gid;
+    const int ij = t % nocc2; t /= nocc2;
+    const int d_local = t % bs; t /= bs;
+    const int c = (int)t;
+
+    // src: cd = c*nvir + d_blk + d_local
+    t_slice[gid] = t_vvoo[(size_t)(c * nvir + d_blk + d_local) * nocc2 + ij];
+}
+
+
+// ============================================================
+//  Streaming MP3 energy via half-transformation
+//  Avoids materializing oooo (nocc⁴) and vvvv (nvir⁴).
+//  Only ovov and oovv (nocc²×nvir² each) are fully stored.
+// ============================================================
+
+/**
+ * Streaming MP3: compute MP3 energy without full oooo/vvvv tensors.
  *
- * Phase 1: s ∈ occ → build oooo
- * Phase 2: s ∈ vir → build ovov, oovv, vvvv (sharing Step 1 half-transform)
- *
- * @param step1_func  Callable: step1_func(d_half, nao, s_abs, bs) performs Step 1
+ * Pass 0 (s∈vir): Build ovov + oovv
+ * Compute: s_ovov, t_ovov, mm3, t_oovv
+ * Pass 1 (s∈occ): Stream oooo blocks → accumulate mm1
+ * Compute: t_vvoo (overwrite t_oovv buffer)
+ * Pass 2 (s∈vir): Stream vvvv blocks → accumulate mm2
+ * Compute: mm4
+ * Final: MP2 + contraction → E_MP3
  */
 template <typename Step1Func>
 real_t mp3_half_transform_impl(
@@ -526,209 +579,230 @@ real_t mp3_half_transform_impl(
               << " block_s=" << block_s << std::endl;
 
     const size_t nao3 = (size_t)nao * nao * nao;
-    const size_t num_oooo = (size_t)nocc * nocc * nocc * nocc;
-    const size_t num_vvvv = (size_t)nvir * nvir * nvir * nvir;
     const size_t num_ovov = (size_t)nocc * nvir * nocc * nvir;
     const size_t num_oovv = (size_t)nocc * nocc * nvir * nvir;
 
-    // --- Allocate sub-blocks ---
-    real_t* d_oooo = nullptr;   // (ij|kl) then permuted to (ik|jl)
-    real_t* d_vvvv = nullptr;   // (ab|cd) then permuted to (ac|bd)
-    real_t* d_ovov = nullptr;   // (ia|jb) direct
-    real_t* d_oovv = nullptr;   // (ij|ab) direct
+    const int num_oo = nocc * nocc;
+    const int num_vv = nvir * nvir;
+    const int num_ov = nocc * nvir;
+    constexpr int num_threads_per_block = 32 * 32;
+    constexpr int scatter_threads = 256;
+    dim3 threads_2d(32, 32);
 
-    tracked_cudaMalloc(&d_oooo, num_oooo * sizeof(real_t));
-    tracked_cudaMalloc(&d_vvvv, num_vvvv * sizeof(real_t));
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    const double alpha = 1.0, beta_zero = 0.0, beta_one = 1.0;
+
+    // ============================================================
+    //  Allocate persistent tensors: ovov, oovv, s/t_ovov, mm1-4
+    //  NO oooo (nocc⁴) or vvvv (nvir⁴) — these are streamed
+    // ============================================================
+    real_t* d_ovov = nullptr;    // (ia|jb)
+    real_t* d_oovv = nullptr;    // (ij|ab)
+    real_t* d_s_ovov = nullptr;
+    real_t* d_t_ovov = nullptr;
+    real_t* d_t_perm = nullptr;  // t_oovv → t_vvoo → mm4 workspace
+    real_t* d_mm1 = nullptr;     // oovv layout
+    real_t* d_mm2 = nullptr;     // vvoo layout
+    real_t* d_mm3 = nullptr;     // ovov layout
+    real_t* d_mm4 = nullptr;     // ovov layout
+
     tracked_cudaMalloc(&d_ovov, num_ovov * sizeof(real_t));
     tracked_cudaMalloc(&d_oovv, num_oovv * sizeof(real_t));
-    cudaMemset(d_oooo, 0, num_oooo * sizeof(real_t));
-    cudaMemset(d_vvvv, 0, num_vvvv * sizeof(real_t));
+    tracked_cudaMalloc(&d_s_ovov, num_ovov * sizeof(real_t));
+    tracked_cudaMalloc(&d_t_ovov, num_ovov * sizeof(real_t));
+    tracked_cudaMalloc(&d_t_perm, num_ovov * sizeof(real_t));
+    tracked_cudaMalloc(&d_mm1, num_oovv * sizeof(real_t));
+    tracked_cudaMalloc(&d_mm2, num_oovv * sizeof(real_t));
+    tracked_cudaMalloc(&d_mm3, num_ovov * sizeof(real_t));
+    tracked_cudaMalloc(&d_mm4, num_ovov * sizeof(real_t));
     cudaMemset(d_ovov, 0, num_ovov * sizeof(real_t));
     cudaMemset(d_oovv, 0, num_oovv * sizeof(real_t));
 
-    // --- Workspace for half-transform ---
-    // Li needs max(n_q) * nao * block_s; max n_q = nvir
+    // ============================================================
+    //  Half-transform workspace
+    // ============================================================
+    const int max_dim = std::max(nocc, nvir);
+    const size_t max_block_elems = (size_t)max_dim * max_dim * max_dim * block_s;
+
     real_t* d_half = nullptr;
     real_t* d_Ki = nullptr;
     real_t* d_Li = nullptr;
-    real_t* d_tmp_block = nullptr;  // Temporary buffer for s-block output
+    real_t* d_tmp_block = nullptr;   // raw Steps 2-4 output
+    real_t* d_perm_block = nullptr;  // permuted block (for streaming DGEMM)
+    real_t* d_gather_slice = nullptr; // gathered t columns
+
     tracked_cudaMalloc(&d_half, nao3 * block_s * sizeof(real_t));
     tracked_cudaMalloc(&d_Ki, (size_t)nao * nao * block_s * sizeof(real_t));
-    tracked_cudaMalloc(&d_Li, (size_t)std::max(nocc, nvir) * nao * block_s * sizeof(real_t));
-    // Largest sub-block per s-block: oooo(nocc³) can be larger than vvvv(nvir³) when nocc > nvir
-    const size_t max_block_elems = std::max({
-        (size_t)nocc * nocc * nocc * block_s,   // oooo (Phase 1)
-        (size_t)nocc * nvir * nocc * block_s,    // ovov (Phase 2)
-        (size_t)nocc * nocc * nvir * block_s,    // oovv (Phase 2)
-        (size_t)nvir * nvir * nvir * block_s     // vvvv (Phase 2)
-    });
+    tracked_cudaMalloc(&d_Li, (size_t)max_dim * nao * block_s * sizeof(real_t));
     tracked_cudaMalloc(&d_tmp_block, max_block_elems * sizeof(real_t));
+    tracked_cudaMalloc(&d_perm_block, max_block_elems * sizeof(real_t));
+    const size_t gather_size = (size_t)std::max(num_vv * nocc, num_oo * nvir) * block_s;
+    tracked_cudaMalloc(&d_gather_slice, gather_size * sizeof(real_t));
 
-    constexpr int scatter_threads = 256;
-
-    // Helper lambda: Steps 2-4 into temp buffer, then scatter to output
+    // Helper: Steps 2-4 → scatter to full tensor
     auto build_and_scatter = [&](real_t* d_dst, int n_p, int n_q, int n_r, int n_s,
                                   int s_blk, int bs,
                                   int p_start, int q_start, int r_start) {
         half_transform_steps234(d_half, d_C, d_tmp_block,
             d_Ki, d_Li, nao, bs, p_start, n_p, q_start, n_q, r_start, n_r);
-
         const size_t block_total = (size_t)n_p * n_q * n_r * bs;
-        const size_t scatter_blocks = (block_total + scatter_threads - 1) / scatter_threads;
-        scatter_s_block_kernel<<<scatter_blocks, scatter_threads>>>(
+        scatter_s_block_kernel<<<(block_total + scatter_threads - 1) / scatter_threads, scatter_threads>>>(
             d_tmp_block, d_dst, n_p, n_q, n_r, n_s, s_blk, bs);
     };
 
     // ============================================================
-    //  Phase 1: s ∈ occ → build oooo = (ij|kl)
+    //  Pass 0 (s ∈ vir): Build ovov + oovv
     // ============================================================
-    std::cout << "  [Phase 1] Building oooo block..." << std::flush;
-    for (int s_blk = 0; s_blk < nocc; s_blk += block_s) {
-        int bs = std::min(block_s, nocc - s_blk);
-        int s_abs = s_blk;  // s_start = 0 for occ
-
-        cudaMemset(d_half, 0, nao3 * bs * sizeof(real_t));
-        step1_func(d_half, nao, d_C, s_abs, bs);
-
-        build_and_scatter(d_oooo, nocc, nocc, nocc, nocc, s_blk, bs, 0, 0, 0);
-    }
-    std::cout << " done" << std::endl;
-
-    // ============================================================
-    //  Phase 2: s ∈ vir → build ovov, oovv, vvvv
-    //  Share Step 1 half-transform H(μ,ν,λ,s) across 3 blocks
-    // ============================================================
-    std::cout << "  [Phase 2] Building ovov, oovv, vvvv blocks..." << std::flush;
+    std::cout << "  [Pass 0] Building ovov, oovv..." << std::flush;
     for (int s_blk = 0; s_blk < nvir; s_blk += block_s) {
         int bs = std::min(block_s, nvir - s_blk);
-        int s_abs = nocc + s_blk;  // s_start = nocc for vir
-
         cudaMemset(d_half, 0, nao3 * bs * sizeof(real_t));
-        step1_func(d_half, nao, d_C, s_abs, bs);
+        step1_func(d_half, nao, d_C, nocc + s_blk, bs);
 
-        // ovov: p∈occ(nocc), q∈vir(nvir), r∈occ(nocc)  → V(i, a, j, b) = (ia|jb)
         build_and_scatter(d_ovov, nocc, nvir, nocc, nvir, s_blk, bs, 0, nocc, 0);
-
-        // oovv: p∈occ(nocc), q∈occ(nocc), r∈vir(nvir)  → V(i, j, a, b) = (ij|ab)
         build_and_scatter(d_oovv, nocc, nocc, nvir, nvir, s_blk, bs, 0, 0, nocc);
-
-        // vvvv: p∈vir(nvir), q∈vir(nvir), r∈vir(nvir)  → V(a, b, c, d) = (ab|cd)
-        build_and_scatter(d_vvvv, nvir, nvir, nvir, nvir, s_blk, bs, nocc, nocc, nocc);
     }
     std::cout << " done" << std::endl;
 
-    // --- Free half-transform workspace ---
-    tracked_cudaFree(d_half);
-    tracked_cudaFree(d_Ki);
-    tracked_cudaFree(d_Li);
-    tracked_cudaFree(d_tmp_block);
-
     // ============================================================
-    //  Permute oooo and vvvv: swap indices 1↔2
-    //  oooo: V(i,j,k,l)=(ij|kl) → perm[i,j,k,l]=(ik|jl)
-    //  vvvv: V(a,b,c,d)=(ab|cd) → perm[a,b,c,d]=(ac|bd)
-    // ============================================================
-    {
-        real_t* d_tmp = nullptr;
-        const size_t max_size = std::max(num_oooo, num_vvvv);
-        tracked_cudaMalloc(&d_tmp, max_size * sizeof(real_t));
-
-        int threads = 256;
-        // Permute oooo
-        {
-            size_t blocks = (num_oooo + threads - 1) / threads;
-            cudaMemcpy(d_tmp, d_oooo, num_oooo * sizeof(real_t), cudaMemcpyDeviceToDevice);
-            permute_swap12_kernel<<<blocks, threads>>>(d_tmp, d_oooo, nocc, nocc, nocc, nocc);
-        }
-        // Permute vvvv
-        {
-            size_t blocks = (num_vvvv + threads - 1) / threads;
-            cudaMemcpy(d_tmp, d_vvvv, num_vvvv * sizeof(real_t), cudaMemcpyDeviceToDevice);
-            permute_swap12_kernel<<<blocks, threads>>>(d_tmp, d_vvvv, nvir, nvir, nvir, nvir);
-        }
-        tracked_cudaFree(d_tmp);
-    }
-    cudaDeviceSynchronize();
-
-    // ============================================================
-    //  Compute MP2 energy from ovov block
+    //  Compute MP2 energy from ovov
     // ============================================================
     real_t* d_E_mp2 = nullptr;
     tracked_cudaMalloc(&d_E_mp2, sizeof(real_t));
     cudaMemset(d_E_mp2, 0, sizeof(real_t));
-
     mp2_from_ovov_block_kernel<<<(num_ovov + 1023) / 1024, dim3(32, 32)>>>(
         d_ovov, d_eps, nocc, nvir, d_E_mp2);
-    cudaDeviceSynchronize();
-
     real_t h_E_mp2 = 0.0;
     cudaMemcpy(&h_E_mp2, d_E_mp2, sizeof(real_t), cudaMemcpyDeviceToHost);
     tracked_cudaFree(d_E_mp2);
     std::cout << "  [Half-Transform MP3] MP2 energy: " << std::setprecision(12) << h_E_mp2 << std::endl;
 
     // ============================================================
-    //  Build s_ovov and t_ovov from ovov block
+    //  Build s_ovov, t_ovov, mm3
     // ============================================================
-    real_t* d_s_ovov = nullptr;
-    real_t* d_t_ovov = nullptr;
-    real_t* d_t_tmp  = nullptr;
-    tracked_cudaMalloc(&d_s_ovov, num_ovov * sizeof(real_t));
-    tracked_cudaMalloc(&d_t_ovov, num_ovov * sizeof(real_t));
-    tracked_cudaMalloc(&d_t_tmp,  num_ovov * sizeof(real_t));
-
     {
-        int threads = 256;
-        size_t blocks = (num_ovov + threads - 1) / threads;
-        build_st_ovov_from_block<<<blocks, threads>>>(d_ovov, d_eps, d_s_ovov, d_t_ovov, nocc, nvir);
+        const size_t num_blocks_ovov = (num_ovov + num_threads_per_block - 1) / num_threads_per_block;
+        build_st_ovov_from_block<<<(num_ovov + 255) / 256, 256>>>(
+            d_ovov, d_eps, d_s_ovov, d_t_ovov, nocc, nvir);
+        cudaDeviceSynchronize();
+
+        // mm3 = t_ovov^T * t_ovov
+        cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, num_ov, num_ov, num_ov,
+                    &alpha, d_t_ovov, num_ov, d_t_ovov, num_ov, &beta_zero, d_mm3, num_ov);
+
+        // t_oovv = kalb2klab(t_ovov) → d_t_perm
+        kalb2klab_block<<<num_blocks_ovov, threads_2d>>>(d_t_ovov, d_t_perm, nocc, nvir);
         cudaDeviceSynchronize();
     }
 
     // ============================================================
-    //  DGEMM contractions (same as existing MP3)
+    //  Pass 1 (s ∈ occ): Stream oooo blocks → accumulate mm1
+    //  mm1[ab, ij] += t_oovv_slice[ab, k*bs+l_local] * oooo_perm[k*bs+l_local, ij]
     // ============================================================
-    real_t* d_mm1 = nullptr;  // oovv layout
-    real_t* d_mm2 = nullptr;  // vvoo layout
-    real_t* d_mm3 = nullptr;  // ovov layout
-    real_t* d_mm4 = nullptr;  // ovov layout
-    tracked_cudaMalloc(&d_mm1, num_oovv * sizeof(real_t));
-    tracked_cudaMalloc(&d_mm2, num_oovv * sizeof(real_t));
-    tracked_cudaMalloc(&d_mm3, num_ovov * sizeof(real_t));
-    tracked_cudaMalloc(&d_mm4, num_ovov * sizeof(real_t));
+    std::cout << "  [Pass 1] Streaming oooo → mm1..." << std::flush;
+    cudaMemset(d_mm1, 0, num_oovv * sizeof(real_t));
+    for (int s_blk = 0; s_blk < nocc; s_blk += block_s) {
+        int bs = std::min(block_s, nocc - s_blk);
 
-    cublasHandle_t handle = gpu::GPUHandle::cublas();
-    const double alpha = 1.0, beta_zero = 0.0;
-    const int num_oo = nocc * nocc;
-    const int num_vv = nvir * nvir;
-    const int num_ov = nocc * nvir;
+        cudaMemset(d_half, 0, nao3 * bs * sizeof(real_t));
+        step1_func(d_half, nao, d_C, s_blk, bs);
 
-    constexpr int num_threads_per_block = 32 * 32;
-    const size_t num_blocks_ovov = (num_ovov + num_threads_per_block - 1) / num_threads_per_block;
-    dim3 threads_2d(32, 32);
+        // Steps 2-4: raw oooo block (ij|k,l_local)
+        half_transform_steps234(d_half, d_C, d_tmp_block,
+            d_Ki, d_Li, nao, bs, 0, nocc, 0, nocc, 0, nocc);
 
-    // mm1 = oooo * t_oovv (t_ovov permuted to oovv via kalb2klab)
-    kalb2klab_block<<<num_blocks_ovov, threads_2d>>>(d_t_ovov, d_t_tmp, nocc, nvir);
-    cudaDeviceSynchronize();
-    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, num_vv, num_oo, num_oo,
-                &alpha, d_t_tmp, num_vv, d_oooo, num_oo, &beta_zero, d_mm1, num_vv);
+        // Permute swap12: (ij|kl) → (ik|jl)
+        {
+            const size_t total = (size_t)nocc * nocc * nocc * bs;
+            permute_swap12_kernel<<<(total + 255) / 256, 256>>>(
+                d_tmp_block, d_perm_block, nocc, nocc, nocc, bs);
+        }
 
-    // mm2 = t_vvoo * vvvv (t_ovov permuted to vvoo via icjd2cdij)
-    icjd2cdij_block<<<num_blocks_ovov, threads_2d>>>(d_t_ovov, d_t_tmp, nocc, nvir);
-    cudaDeviceSynchronize();
-    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, num_oo, num_vv, num_vv,
-                &alpha, d_t_tmp, num_oo, d_vvvv, num_vv, &beta_zero, d_mm2, num_oo);
+        // Gather t_oovv columns for l ∈ [s_blk, s_blk+bs)
+        {
+            const size_t total = (size_t)nocc * bs * num_vv;
+            gather_for_l_block_kernel<<<(total + 255) / 256, 256>>>(
+                d_t_perm, d_gather_slice, nocc, num_vv, s_blk, bs);
+        }
+        cudaDeviceSynchronize();
 
-    // mm3 = t_ovov^T * t_ovov
-    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, num_ov, num_ov, num_ov,
-                &alpha, d_t_ovov, num_ov, d_t_ovov, num_ov, &beta_zero, d_mm3, num_ov);
+        // mm1 += t_oovv_slice * oooo_perm_block
+        cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            num_vv, num_oo, nocc * bs,
+            &alpha, d_gather_slice, num_vv, d_perm_block, nocc * bs,
+            &beta_one, d_mm1, num_vv);
+    }
+    std::cout << " done" << std::endl;
 
-    // mm4 = s_ovov(kbjc→kcjb) * s_ovov(kaic→iakc)
-    real_t* d_s_tmp1 = d_t_ovov;  // Reuse t_ovov as workspace
-    real_t* d_s_tmp2 = d_t_tmp;   // Reuse t_tmp as workspace
-    kaic2iakc_block<<<num_blocks_ovov, threads_2d>>>(d_s_ovov, d_s_tmp1, nocc, nvir);
-    kbjc2kcjb_block<<<num_blocks_ovov, threads_2d>>>(d_s_ovov, d_s_tmp2, nocc, nvir);
-    cudaDeviceSynchronize();
-    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, num_ov, num_ov, num_ov,
-                &alpha, d_s_tmp2, num_ov, d_s_tmp1, num_ov, &beta_zero, d_mm4, num_ov);
+    // ============================================================
+    //  Compute t_vvoo (overwrite d_t_perm; t_oovv no longer needed)
+    // ============================================================
+    {
+        const size_t num_blocks_ovov = (num_ovov + num_threads_per_block - 1) / num_threads_per_block;
+        icjd2cdij_block<<<num_blocks_ovov, threads_2d>>>(d_t_ovov, d_t_perm, nocc, nvir);
+        cudaDeviceSynchronize();
+    }
+
+    // ============================================================
+    //  Pass 2 (s ∈ vir): Stream vvvv blocks → accumulate mm2
+    //  mm2[ij, ab] += t_vvoo_slice[ij, c*bs+d_local] * vvvv_perm[c*bs+d_local, ab]
+    // ============================================================
+    std::cout << "  [Pass 2] Streaming vvvv → mm2..." << std::flush;
+    cudaMemset(d_mm2, 0, num_oovv * sizeof(real_t));
+    for (int s_blk = 0; s_blk < nvir; s_blk += block_s) {
+        int bs = std::min(block_s, nvir - s_blk);
+
+        // Recompute Step 1 for s ∈ vir (same as Pass 0, but only vvvv block needed)
+        cudaMemset(d_half, 0, nao3 * bs * sizeof(real_t));
+        step1_func(d_half, nao, d_C, nocc + s_blk, bs);
+
+        // Steps 2-4: raw vvvv block (ab|c,d_local)
+        half_transform_steps234(d_half, d_C, d_tmp_block,
+            d_Ki, d_Li, nao, bs, nocc, nvir, nocc, nvir, nocc, nvir);
+
+        // Permute swap12: (ab|cd) → (ac|bd)
+        {
+            const size_t total = (size_t)nvir * nvir * nvir * bs;
+            permute_swap12_kernel<<<(total + 255) / 256, 256>>>(
+                d_tmp_block, d_perm_block, nvir, nvir, nvir, bs);
+        }
+
+        // Gather t_vvoo columns for d ∈ [s_blk, s_blk+bs)
+        {
+            const size_t total = (size_t)nvir * bs * num_oo;
+            gather_for_d_block_kernel<<<(total + 255) / 256, 256>>>(
+                d_t_perm, d_gather_slice, nvir, num_oo, s_blk, bs);
+        }
+        cudaDeviceSynchronize();
+
+        // mm2 += t_vvoo_slice * vvvv_perm_block
+        cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            num_oo, num_vv, nvir * bs,
+            &alpha, d_gather_slice, num_oo, d_perm_block, nvir * bs,
+            &beta_one, d_mm2, num_oo);
+    }
+    std::cout << " done" << std::endl;
+
+    // ============================================================
+    //  mm4 = s_ovov(kbjc→kcjb) * s_ovov(kaic→iakc)
+    //  Reuse d_t_ovov and d_t_perm as workspace
+    // ============================================================
+    {
+        const size_t num_blocks_ovov = (num_ovov + num_threads_per_block - 1) / num_threads_per_block;
+        kaic2iakc_block<<<num_blocks_ovov, threads_2d>>>(d_s_ovov, d_t_ovov, nocc, nvir);
+        kbjc2kcjb_block<<<num_blocks_ovov, threads_2d>>>(d_s_ovov, d_t_perm, nocc, nvir);
+        cudaDeviceSynchronize();
+        cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, num_ov, num_ov, num_ov,
+                    &alpha, d_t_perm, num_ov, d_t_ovov, num_ov, &beta_zero, d_mm4, num_ov);
+    }
+
+    // --- Free half-transform workspace ---
+    tracked_cudaFree(d_half);
+    tracked_cudaFree(d_Ki);
+    tracked_cudaFree(d_Li);
+    tracked_cudaFree(d_tmp_block);
+    tracked_cudaFree(d_perm_block);
+    tracked_cudaFree(d_gather_slice);
 
     // ============================================================
     //  Final contraction: 3 MP3 terms
@@ -752,13 +826,11 @@ real_t mp3_half_transform_impl(
     std::cout << "MP3 energy: " << E_MP3 << " Hartree" << std::endl;
 
     // --- Cleanup ---
-    tracked_cudaFree(d_oooo);
-    tracked_cudaFree(d_vvvv);
     tracked_cudaFree(d_ovov);
     tracked_cudaFree(d_oovv);
     tracked_cudaFree(d_s_ovov);
     tracked_cudaFree(d_t_ovov);
-    tracked_cudaFree(d_t_tmp);
+    tracked_cudaFree(d_t_perm);
     tracked_cudaFree(d_mm1);
     tracked_cudaFree(d_mm2);
     tracked_cudaFree(d_mm3);
