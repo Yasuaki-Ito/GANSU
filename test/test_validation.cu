@@ -1869,6 +1869,112 @@ TEST(ValidationInitialGuess, H2O_MINAO_ccpVDZ) {
 //  RI CIS (B-matrix based) — compare excitation energies with PySCF CIS
 // ============================================================
 
+// ============================================================
+//  Half-Transform MP3: Direct and Hash
+//  Streaming MP3 avoids nao^4 MO ERI.
+// ============================================================
+
+constexpr real_t REF_H2O_MP3_STO3G_corr = -0.049566450115;
+constexpr real_t REF_H2O_MP3_ccpVDZ_corr = -0.216247874383;
+
+TEST(ValidationHalfTransform_MP3, H2O_STO3G_Direct) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "mp3", 0, 0, "core", "direct");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_HF);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_MP3_STO3G_corr, TOL_POSTHF);
+}
+
+TEST(ValidationHalfTransform_MP3, H2O_STO3G_Hash) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "mp3", 0, 0, "core", "hash");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_STO3G, TOL_HF);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_MP3_STO3G_corr, TOL_POSTHF);
+}
+
+TEST(ValidationHalfTransform_MP3, H2O_ccpVDZ_Direct) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "mp3", 0, 0, "core", "direct");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_HF);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_MP3_ccpVDZ_corr, TOL_POSTHF_DZ);
+}
+
+TEST(ValidationHalfTransform_MP3, H2O_ccpVDZ_Hash) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "mp3", 0, 0, "core", "hash");
+    EXPECT_NEAR(r.hf_total_energy, REF_H2O_RHF_ccpVDZ, TOL_HF);
+    EXPECT_NEAR(r.post_hf_energy, REF_H2O_MP3_ccpVDZ_corr, TOL_POSTHF_DZ);
+}
+
+
+// ============================================================
+//  Half-Transform CIS: Direct and Hash
+//  OVOV+OOVV sub-blocks built via half-transform, matrix-free Davidson.
+// ============================================================
+
+TEST(ValidationHalfTransform_CIS, H2O_STO3G_Direct) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "cis", 0, 0, "core", "direct");
+    ASSERT_GE(r.excitation_energies.size(), 3u);
+    EXPECT_NEAR(r.excitation_energies[0], REF_H2O_CIS_STO3G_state1, TOL_CIS);
+    EXPECT_NEAR(r.excitation_energies[1], REF_H2O_CIS_STO3G_state2, TOL_CIS);
+    EXPECT_NEAR(r.excitation_energies[2], REF_H2O_CIS_STO3G_state3, TOL_CIS);
+}
+
+TEST(ValidationHalfTransform_CIS, H2O_STO3G_Hash) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "cis", 0, 0, "core", "hash");
+    ASSERT_GE(r.excitation_energies.size(), 3u);
+    EXPECT_NEAR(r.excitation_energies[0], REF_H2O_CIS_STO3G_state1, TOL_CIS);
+    EXPECT_NEAR(r.excitation_energies[1], REF_H2O_CIS_STO3G_state2, TOL_CIS);
+    EXPECT_NEAR(r.excitation_energies[2], REF_H2O_CIS_STO3G_state3, TOL_CIS);
+}
+
+TEST(ValidationHalfTransform_CIS, H2O_ccpVDZ_Direct) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "cis", 0, 0, "core", "direct");
+    ASSERT_GE(r.excitation_energies.size(), 3u);
+    EXPECT_NEAR(r.excitation_energies[0], REF_H2O_CIS_ccpVDZ_state1, TOL_CIS);
+    EXPECT_NEAR(r.excitation_energies[1], REF_H2O_CIS_ccpVDZ_state2, TOL_CIS);
+    EXPECT_NEAR(r.excitation_energies[2], REF_H2O_CIS_ccpVDZ_state3, TOL_CIS);
+}
+
+TEST(ValidationHalfTransform_CIS, H2O_ccpVDZ_Hash) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "cc-pvdz.gbs", "rhf",
+                       "cis", 0, 0, "core", "hash");
+    ASSERT_GE(r.excitation_energies.size(), 3u);
+    EXPECT_NEAR(r.excitation_energies[0], REF_H2O_CIS_ccpVDZ_state1, TOL_CIS);
+    EXPECT_NEAR(r.excitation_energies[1], REF_H2O_CIS_ccpVDZ_state2, TOL_CIS);
+    EXPECT_NEAR(r.excitation_energies[2], REF_H2O_CIS_ccpVDZ_state3, TOL_CIS);
+}
+
+
+// ============================================================
+//  ADC(2) with Direct and Hash (auto-selects build_mo_eri or half-transform)
+// ============================================================
+
+TEST(ValidationHalfTransform_ADC2, H2O_STO3G_Direct) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "adc2", 0, 0, "core", "direct");
+    ASSERT_GE(r.excitation_energies.size(), 3u);
+    EXPECT_NEAR(r.excitation_energies[0], REF_H2O_ADC2_STO3G_state1, TOL_ADC2);
+    EXPECT_NEAR(r.excitation_energies[1], REF_H2O_ADC2_STO3G_state2, TOL_ADC2);
+    EXPECT_NEAR(r.excitation_energies[2], REF_H2O_ADC2_STO3G_state3, TOL_ADC2_HIGH);
+}
+
+TEST(ValidationHalfTransform_ADC2, H2O_STO3G_Hash) {
+    auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
+                       "adc2", 0, 0, "core", "hash");
+    ASSERT_GE(r.excitation_energies.size(), 3u);
+    EXPECT_NEAR(r.excitation_energies[0], REF_H2O_ADC2_STO3G_state1, TOL_ADC2);
+    EXPECT_NEAR(r.excitation_energies[1], REF_H2O_ADC2_STO3G_state2, TOL_ADC2);
+    EXPECT_NEAR(r.excitation_energies[2], REF_H2O_ADC2_STO3G_state3, TOL_ADC2_HIGH);
+}
+
+
+// ============================================================
+//  RI CIS (B-matrix based, for comparison)
+// ============================================================
+
 TEST(ValidationRI_CIS_Bbase, H2O_CIS_STO3G_excitations) {
     auto r = run_gansu(XYZ + "H2O.xyz", BASIS + "sto-3g.gbs", "rhf",
                        "cis", 0, 0, "core", "ri",

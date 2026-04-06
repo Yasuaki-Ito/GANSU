@@ -389,16 +389,309 @@ void ERI_RI_RHF::compute_adc2(int n_states) {
     tracked_cudaFree(d_mo_eri);
 }
 
+// ========================================================================
+//  Forward declarations (from half_transform_mp3.cu)
+// ========================================================================
+void half_transform_steps234(
+    const real_t* d_half, const real_t* d_C, real_t* d_result,
+    real_t* d_Ki, real_t* d_Li,
+    int nao, int bs, int p_start, int n_p, int q_start, int n_q, int r_start, int n_r);
+__global__ void scatter_s_block_kernel(
+    const double* __restrict__ src, double* __restrict__ dst,
+    int n_p, int n_q, int n_r, int n_s, int s_blk, int bs);
+__global__ void hash_half_transform_compact_kernel(
+    const unsigned long long* g_coo_keys, const double* g_coo_values, size_t num_entries,
+    const double* g_C, double* g_half, int nao, int j_start, int block_j);
+__global__ void hash_half_transform_indexed_kernel(
+    const unsigned long long* g_hash_keys, const double* g_hash_values,
+    const size_t* g_nonzero_indices, size_t num_nonzero,
+    const double* g_C, double* g_half, int nao, int j_start, int block_j);
+__global__ void hash_half_transform_fullscan_kernel(
+    const unsigned long long* g_hash_keys, const double* g_hash_values, size_t hash_capacity,
+    const double* g_C, double* g_half, int nao, int j_start, int block_j);
+
+
+// ========================================================================
+//  Build 4 sub-blocks (ovov, vvov, ooov, oovv) via half-transform
+// ========================================================================
+template <typename Step1Func>
+static void build_adc2_blocks(
+    RHF& rhf, Step1Func step1_func, int block_s,
+    real_t* d_ovov, real_t* d_vvov, real_t* d_ooov, real_t* d_oovv)
+{
+    const int nao = rhf.get_num_basis();
+    const int nocc = rhf.get_num_electrons() / 2;
+    const int nvir = nao - nocc;
+    const real_t* d_C = rhf.get_coefficient_matrix().device_ptr();
+    const size_t nao3 = (size_t)nao * nao * nao;
+    const int max_dim = std::max(nocc, nvir);
+
+    real_t* d_half = nullptr;
+    real_t* d_Ki = nullptr;
+    real_t* d_Li = nullptr;
+    real_t* d_tmp_block = nullptr;
+    tracked_cudaMalloc(&d_half, nao3 * block_s * sizeof(real_t));
+    tracked_cudaMalloc(&d_Ki, (size_t)nao * nao * block_s * sizeof(real_t));
+    tracked_cudaMalloc(&d_Li, (size_t)max_dim * nao * block_s * sizeof(real_t));
+    const size_t max_block = std::max({
+        (size_t)nocc * nvir * nocc * block_s,
+        (size_t)nvir * nvir * nocc * block_s,
+        (size_t)nocc * nocc * nocc * block_s,
+        (size_t)nocc * nocc * nvir * block_s
+    });
+    tracked_cudaMalloc(&d_tmp_block, max_block * sizeof(real_t));
+
+    constexpr int scatter_threads = 256;
+    auto build_and_scatter = [&](real_t* d_dst, int n_p, int n_q, int n_r, int n_s,
+                                  int s_blk, int bs,
+                                  int p_start, int q_start, int r_start) {
+        half_transform_steps234(d_half, d_C, d_tmp_block,
+            d_Ki, d_Li, nao, bs, p_start, n_p, q_start, n_q, r_start, n_r);
+        const size_t block_total = (size_t)n_p * n_q * n_r * bs;
+        scatter_s_block_kernel<<<(block_total + scatter_threads - 1) / scatter_threads, scatter_threads>>>(
+            d_tmp_block, d_dst, n_p, n_q, n_r, n_s, s_blk, bs);
+    };
+
+    std::cout << "  Building ADC(2) sub-blocks via half-transform..." << std::flush;
+    for (int s_blk = 0; s_blk < nvir; s_blk += block_s) {
+        int bs = std::min(block_s, nvir - s_blk);
+        cudaMemset(d_half, 0, nao3 * bs * sizeof(real_t));
+        step1_func(d_half, nao, d_C, nocc + s_blk, bs);
+        build_and_scatter(d_ovov, nocc, nvir, nocc, nvir, s_blk, bs, 0, nocc, 0);
+        build_and_scatter(d_vvov, nvir, nvir, nocc, nvir, s_blk, bs, nocc, nocc, 0);
+        build_and_scatter(d_ooov, nocc, nocc, nocc, nvir, s_blk, bs, 0, 0, 0);
+        build_and_scatter(d_oovv, nocc, nocc, nvir, nvir, s_blk, bs, 0, 0, nocc);
+    }
+    std::cout << " done" << std::endl;
+
+    tracked_cudaFree(d_half);
+    tracked_cudaFree(d_Ki);
+    tracked_cudaFree(d_Li);
+    tracked_cudaFree(d_tmp_block);
+}
+
+
+// ========================================================================
+//  ADC(2) solver from pre-built sub-blocks
+// ========================================================================
+static void compute_adc2_from_blocks(
+    RHF& rhf,
+    const real_t* d_ovov, const real_t* d_vvov, const real_t* d_ooov, const real_t* d_oovv,
+    int n_states)
+{
+    const int nao = rhf.get_num_basis();
+    const int nocc = rhf.get_num_electrons() / 2;
+    const int nvir = nao - nocc;
+    const int singles_dim = nocc * nvir;
+    const int doubles_dim = nocc * nocc * nvir * nvir;
+    std::string solver_mode = rhf.get_adc2_solver();
+    const bool is_triplet = rhf.is_triplet();
+
+    if (solver_mode == "auto") {
+        int total_dim = singles_dim + doubles_dim;
+        int max_sub = std::min(total_dim, std::max(100, 10 * n_states));
+        size_t davidson_bytes = (
+            static_cast<size_t>(total_dim) * max_sub * 2 +
+            static_cast<size_t>(max_sub) * max_sub * 2 +
+            static_cast<size_t>(total_dim) * n_states * 2 + max_sub
+        ) * sizeof(real_t);
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        solver_mode = (davidson_bytes < free_mem * 0.8) ? "full" : "schur_omega";
+        std::cout << "  Auto solver: " << solver_mode << std::endl;
+    }
+
+    std::string spin_label = is_triplet ? "triplet" : "singlet";
+    std::cout << "\n---- ADC(2) " << spin_label << " (half-transform) ---- "
+              << "nocc=" << nocc << ", nvir=" << nvir
+              << ", singles=" << singles_dim << ", doubles=" << doubles_dim
+              << ", solver=" << solver_mode
+              << ", nstates=" << n_states << std::endl;
+
+    if (n_states > singles_dim) {
+        std::cout << "Warning: Reducing to " << singles_dim << " states." << std::endl;
+        n_states = singles_dim;
+    }
+
+    const real_t* d_eps = rhf.get_orbital_energies().device_ptr();
+    ADC2Operator adc2_op(d_ovov, d_vvov, d_ooov, d_oovv, d_eps,
+                         nocc, nvir, nao, is_triplet);
+
+    Timer adc2_timer;
+    std::vector<real_t> excitation_energies;
+    std::vector<real_t> h_final_eigenvectors;
+
+    if (solver_mode == "schur_static") {
+        solve_schur_static(adc2_op, n_states, singles_dim,
+                           excitation_energies, h_final_eigenvectors);
+    } else if (solver_mode == "full") {
+        solve_full_davidson(adc2_op, n_states, singles_dim,
+                            excitation_energies, h_final_eigenvectors);
+    } else {
+        solve_schur_omega(adc2_op, n_states, singles_dim,
+                          excitation_energies, h_final_eigenvectors);
+    }
+
+    std::cout << "  ADC(2) time: " << std::fixed << std::setprecision(3)
+              << adc2_timer.elapsed_seconds() << " s" << std::endl;
+
+    rhf.set_excitation_energies(excitation_energies);
+
+    rhf.get_coefficient_matrix().toHost();
+    const auto& prim_shells = rhf.get_primitive_shells();
+    const auto& cgto_norms = rhf.get_cgto_normalization_factors();
+    const_cast<DeviceHostMemory<PrimitiveShell>&>(prim_shells).toHost();
+    const_cast<DeviceHostMemory<real_t>&>(cgto_norms).toHost();
+
+    std::string method_name = is_triplet ? "ADC(2) (triplet)" : "ADC(2)";
+    auto es_result = compute_excited_state_properties(
+        method_name,
+        prim_shells.host_ptr(), prim_shells.size(),
+        cgto_norms.host_ptr(),
+        rhf.get_shell_type_infos(),
+        rhf.get_coefficient_matrix().host_ptr(),
+        excitation_energies, h_final_eigenvectors.data(),
+        n_states, nao, nocc, nvir);
+    rhf.set_oscillator_strengths(es_result.oscillator_strengths);
+    rhf.set_excited_state_report(es_result.report);
+}
+
+
+// ========================================================================
+//  Auto-select: build_mo_eri (fast) if nao⁴ fits, else half-transform
+// ========================================================================
+
 void ERI_Direct_RHF::compute_adc2(int n_states) {
-    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
-    compute_adc2_impl(rhf_, nullptr, n_states, d_mo_eri);
-    tracked_cudaFree(d_mo_eri);
+    PROFILE_FUNCTION();
+    const int nao = rhf_.get_num_basis();
+    const size_t nao4_bytes = (size_t)nao * nao * nao * nao * sizeof(real_t);
+
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+
+    if (nao4_bytes < free_mem * 6 / 10) {
+        // Fast path: build full MO ERI
+        std::cout << "  [Direct ADC(2)] Using build_mo_eri (nao^4 = "
+                  << nao4_bytes / (1024*1024) << " MB fits in GPU)" << std::endl;
+        real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), nao);
+        compute_adc2_impl(rhf_, nullptr, n_states, d_mo_eri);
+        tracked_cudaFree(d_mo_eri);
+    } else {
+        // Memory-efficient path: half-transform sub-blocks
+        std::cout << "  [Direct ADC(2)] Using half-transform (nao^4 = "
+                  << nao4_bytes / (1024*1024) << " MB exceeds GPU memory)" << std::endl;
+        const int nocc = rhf_.get_num_electrons() / 2;
+        const int nvir = nao - nocc;
+
+        real_t *d_ovov = nullptr, *d_vvov = nullptr, *d_ooov = nullptr, *d_oovv = nullptr;
+        tracked_cudaMalloc(&d_ovov, (size_t)nocc * nvir * nocc * nvir * sizeof(real_t));
+        tracked_cudaMalloc(&d_vvov, (size_t)nvir * nvir * nocc * nvir * sizeof(real_t));
+        tracked_cudaMalloc(&d_ooov, (size_t)nocc * nocc * nocc * nvir * sizeof(real_t));
+        tracked_cudaMalloc(&d_oovv, (size_t)nocc * nocc * nvir * nvir * sizeof(real_t));
+        cudaMemset(d_ovov, 0, (size_t)nocc * nvir * nocc * nvir * sizeof(real_t));
+        cudaMemset(d_vvov, 0, (size_t)nvir * nvir * nocc * nvir * sizeof(real_t));
+        cudaMemset(d_ooov, 0, (size_t)nocc * nocc * nocc * nvir * sizeof(real_t));
+        cudaMemset(d_oovv, 0, (size_t)nocc * nocc * nvir * nvir * sizeof(real_t));
+
+        const size_t nao3 = (size_t)nao * nao * nao;
+        int block_s = std::max(1, (int)(free_mem * 4 / 10 / (nao3 * sizeof(real_t))));
+        block_s = std::min(block_s, nao);
+        if (block_s > 8) block_s = 8;
+
+        DeviceHostMemory<real_t> schwarz_unsorted(hf_.get_num_primitive_shell_pairs());
+        gpu::computeSchwarzUpperBounds(
+            hf_.get_shell_type_infos(), hf_.get_shell_pair_type_infos(),
+            hf_.get_primitive_shells().device_ptr(),
+            hf_.get_boys_grid().device_ptr(),
+            hf_.get_cgto_normalization_factors().device_ptr(),
+            schwarz_unsorted.device_ptr(), false);
+
+        const auto& sti = hf_.get_shell_type_infos();
+        const auto& spti = hf_.get_shell_pair_type_infos();
+        const auto* d_ps = hf_.get_primitive_shells().device_ptr();
+        const auto* d_bg = hf_.get_boys_grid().device_ptr();
+        const auto* d_cn = hf_.get_cgto_normalization_factors().device_ptr();
+        const auto* d_sw = schwarz_unsorted.device_ptr();
+        const real_t sw_th = hf_.get_schwarz_screening_threshold();
+
+        auto step1 = [&](real_t* d_half, int nao_arg, const real_t* d_C, int s_abs, int bs) {
+            gpu::computeHalfTransformedERI(sti, spti, d_ps, d_bg, d_cn,
+                d_half, d_sw, sw_th, nao_arg, d_C, s_abs, bs);
+        };
+
+        build_adc2_blocks(rhf_, step1, block_s, d_ovov, d_vvov, d_ooov, d_oovv);
+        compute_adc2_from_blocks(rhf_, d_ovov, d_vvov, d_ooov, d_oovv, n_states);
+
+        tracked_cudaFree(d_ovov);
+        tracked_cudaFree(d_vvov);
+        tracked_cudaFree(d_ooov);
+        tracked_cudaFree(d_oovv);
+    }
 }
 
 void ERI_Hash_RHF::compute_adc2(int n_states) {
-    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
-    compute_adc2_impl(rhf_, nullptr, n_states, d_mo_eri);
-    tracked_cudaFree(d_mo_eri);
+    PROFILE_FUNCTION();
+    const int nao = rhf_.get_num_basis();
+    const size_t nao4_bytes = (size_t)nao * nao * nao * nao * sizeof(real_t);
+
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+
+    if (nao4_bytes < free_mem * 6 / 10) {
+        std::cout << "  [Hash ADC(2)] Using build_mo_eri (nao^4 = "
+                  << nao4_bytes / (1024*1024) << " MB fits in GPU)" << std::endl;
+        real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), nao);
+        compute_adc2_impl(rhf_, nullptr, n_states, d_mo_eri);
+        tracked_cudaFree(d_mo_eri);
+    } else {
+        std::cout << "  [Hash ADC(2)] Using half-transform (nao^4 = "
+                  << nao4_bytes / (1024*1024) << " MB exceeds GPU memory)" << std::endl;
+        const int nocc = rhf_.get_num_electrons() / 2;
+        const int nvir = nao - nocc;
+
+        real_t *d_ovov = nullptr, *d_vvov = nullptr, *d_ooov = nullptr, *d_oovv = nullptr;
+        tracked_cudaMalloc(&d_ovov, (size_t)nocc * nvir * nocc * nvir * sizeof(real_t));
+        tracked_cudaMalloc(&d_vvov, (size_t)nvir * nvir * nocc * nvir * sizeof(real_t));
+        tracked_cudaMalloc(&d_ooov, (size_t)nocc * nocc * nocc * nvir * sizeof(real_t));
+        tracked_cudaMalloc(&d_oovv, (size_t)nocc * nocc * nvir * nvir * sizeof(real_t));
+        cudaMemset(d_ovov, 0, (size_t)nocc * nvir * nocc * nvir * sizeof(real_t));
+        cudaMemset(d_vvov, 0, (size_t)nvir * nvir * nocc * nvir * sizeof(real_t));
+        cudaMemset(d_ooov, 0, (size_t)nocc * nocc * nocc * nvir * sizeof(real_t));
+        cudaMemset(d_oovv, 0, (size_t)nocc * nocc * nvir * nvir * sizeof(real_t));
+
+        const size_t nao3 = (size_t)nao * nao * nao;
+        int block_s = std::max(1, (int)(free_mem * 4 / 10 / (nao3 * sizeof(real_t))));
+        block_s = std::min(block_s, nao);
+        if (block_s > 8) block_s = 8;
+
+        auto step1 = [&](real_t* d_half, int nao_arg, const real_t* d_C, int s_abs, int bs) {
+            const int threads = 256;
+            if (hash_fock_method_ == HashFockMethod::Compact) {
+                const int blocks = ((int)num_entries_ + threads - 1) / threads;
+                hash_half_transform_compact_kernel<<<blocks, threads>>>(
+                    d_coo_keys_, d_coo_values_, num_entries_, d_C, d_half, nao_arg, s_abs, bs);
+            } else if (hash_fock_method_ == HashFockMethod::Indexed) {
+                const int blocks = ((int)num_nonzero_ + threads - 1) / threads;
+                hash_half_transform_indexed_kernel<<<blocks, threads>>>(
+                    d_hash_keys_, d_hash_values_, d_nonzero_indices_, num_nonzero_,
+                    d_C, d_half, nao_arg, s_abs, bs);
+            } else {
+                const size_t capacity = hash_capacity_mask_ + 1;
+                const int blocks = ((int)capacity + threads - 1) / threads;
+                hash_half_transform_fullscan_kernel<<<blocks, threads>>>(
+                    d_hash_keys_, d_hash_values_, capacity, d_C, d_half, nao_arg, s_abs, bs);
+            }
+            cudaDeviceSynchronize();
+        };
+
+        build_adc2_blocks(rhf_, step1, block_s, d_ovov, d_vvov, d_ooov, d_oovv);
+        compute_adc2_from_blocks(rhf_, d_ovov, d_vvov, d_ooov, d_oovv, n_states);
+
+        tracked_cudaFree(d_ovov);
+        tracked_cudaFree(d_vvov);
+        tracked_cudaFree(d_ooov);
+        tracked_cudaFree(d_oovv);
+    }
 }
 
 } // namespace gansu

@@ -1092,6 +1092,142 @@ ADC2Operator::ADC2Operator(
     compute_diagonal();
 }
 
+// ========================================================================
+//  CIS matrix kernel using sub-blocks (no full MO ERI)
+// ========================================================================
+__global__ void adc2_build_cis_matrix_from_blocks_kernel(
+    const real_t* __restrict__ d_eri_ovov,
+    const real_t* __restrict__ d_eri_oovv,
+    const real_t* __restrict__ d_orbital_energies,
+    real_t* __restrict__ d_cis,
+    int nocc, int nvir, bool is_triplet)
+{
+    int ov = nocc * nvir;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= ov * ov) return;
+
+    int ia_idx = idx % ov;
+    int jb_idx = idx / ov;
+    int i = ia_idx / nvir;
+    int a = ia_idx % nvir;
+    int j = jb_idx / nvir;
+    int b = jb_idx % nvir;
+
+    real_t val = 0.0;
+    if (i == j && a == b) {
+        val += d_orbital_energies[nocc + a] - d_orbital_energies[i];
+    }
+    val -= d_eri_oovv[(size_t)i * nocc * nvir * nvir + (size_t)j * nvir * nvir + (size_t)a * nvir + b];
+    if (!is_triplet) {
+        val += 2.0 * d_eri_ovov[(size_t)i * nvir * nocc * nvir + (size_t)a * nocc * nvir + (size_t)j * nvir + b];
+    }
+    d_cis[idx] = val;
+}
+
+// ========================================================================
+//  Constructor from pre-built sub-blocks
+// ========================================================================
+ADC2Operator::ADC2Operator(
+    const real_t* d_eri_ovov,
+    const real_t* d_eri_vvov,
+    const real_t* d_eri_ooov,
+    const real_t* d_eri_oovv,
+    const real_t* d_orbital_energies,
+    int nocc, int nvir, int nao,
+    bool is_triplet)
+    : nocc_(nocc), nvir_(nvir), nao_(nao),
+      singles_dim_(nocc * nvir),
+      doubles_dim_(nocc * nocc * nvir * nvir),
+      omega_(0.0), is_triplet_(is_triplet),
+      d_eri_ovov_(nullptr), d_eri_vvov_(nullptr), d_eri_ooov_(nullptr),
+      d_t2_(nullptr), d_M11_(nullptr), d_M12_(nullptr), d_M21_(nullptr),
+      d_D2_(nullptr), d_D1_(nullptr),
+      d_scaled_M21_(nullptr), d_temp_doubles_(nullptr), d_diagonal_(nullptr)
+{
+    size_t ov = singles_dim_;
+    size_t dd = doubles_dim_;
+
+    tracked_cudaMalloc(&d_eri_ovov_, (size_t)nocc * nvir * nocc * nvir * sizeof(real_t));
+    tracked_cudaMalloc(&d_eri_vvov_, (size_t)nvir * nvir * nocc * nvir * sizeof(real_t));
+    tracked_cudaMalloc(&d_eri_ooov_, (size_t)nocc * nocc * nocc * nvir * sizeof(real_t));
+    cudaMemcpy(d_eri_ovov_, d_eri_ovov, (size_t)nocc * nvir * nocc * nvir * sizeof(real_t), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_eri_vvov_, d_eri_vvov, (size_t)nvir * nvir * nocc * nvir * sizeof(real_t), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_eri_ooov_, d_eri_ooov, (size_t)nocc * nocc * nocc * nvir * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+    tracked_cudaMalloc(&d_t2_, dd * sizeof(real_t));
+    tracked_cudaMalloc(&d_D2_, dd * sizeof(real_t));
+    tracked_cudaMalloc(&d_D1_, ov * sizeof(real_t));
+    tracked_cudaMalloc(&d_M11_, ov * ov * sizeof(real_t));
+
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    size_t m12_bytes = 3ULL * ov * dd * sizeof(real_t);
+    use_dense_M12_ = (m12_bytes < free_mem / 2);
+
+    tracked_cudaMalloc(&d_temp_doubles_, dd * sizeof(real_t));
+    if (use_dense_M12_) {
+        tracked_cudaMalloc(&d_M12_, ov * dd * sizeof(real_t));
+        tracked_cudaMalloc(&d_M21_, dd * ov * sizeof(real_t));
+        tracked_cudaMalloc(&d_scaled_M21_, dd * ov * sizeof(real_t));
+    } else {
+        printf("  ADC(2): Kernel-based M_eff·x mode (dense M12 would need %.1f GB)\n",
+               m12_bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+    tracked_cudaMalloc(&d_diagonal_, ov * sizeof(real_t));
+
+    compute_mp1_t2_and_D2(d_orbital_energies);
+    compute_D1(d_orbital_energies);
+    build_M11_from_blocks(d_eri_ovov, d_eri_oovv, d_orbital_energies);
+    if (use_dense_M12_) { build_M12_M21(); }
+    compute_diagonal();
+}
+
+void ADC2Operator::build_M11_from_blocks(
+    const real_t* d_eri_ovov, const real_t* d_eri_oovv,
+    const real_t* d_orbital_energies)
+{
+    int threads = 256;
+    size_t matrix_size = (size_t)singles_dim_ * singles_dim_;
+    int blocks = (matrix_size + threads - 1) / threads;
+
+    adc2_build_cis_matrix_from_blocks_kernel<<<blocks, threads>>>(
+        d_eri_ovov, d_eri_oovv, d_orbital_energies, d_M11_,
+        nocc_, nvir_, is_triplet_);
+    cudaDeviceSynchronize();
+
+    real_t* d_ISR_corr = nullptr;
+    tracked_cudaMalloc(&d_ISR_corr, matrix_size * sizeof(real_t));
+    adc2_build_M11_ISR_correction_kernel<<<blocks, threads>>>(
+        d_t2_, d_eri_ovov_, d_ISR_corr, nocc_, nvir_, is_triplet_);
+    cudaDeviceSynchronize();
+
+    const real_t one = 1.0;
+    cublasDaxpy(gpu::GPUHandle::cublas(), matrix_size, &one, d_ISR_corr, 1, d_M11_, 1);
+    tracked_cudaFree(d_ISR_corr);
+
+    real_t* d_sigma_oo = nullptr;
+    tracked_cudaMalloc(&d_sigma_oo, (size_t)nocc_ * nocc_ * sizeof(real_t));
+    {
+        int blk = (nocc_ * nocc_ + threads - 1) / threads;
+        adc2_compute_sigma_oo_kernel<<<blk, threads>>>(d_t2_, d_eri_ovov_, d_sigma_oo, nocc_, nvir_);
+        cudaDeviceSynchronize();
+    }
+
+    real_t* d_sigma_vv = nullptr;
+    tracked_cudaMalloc(&d_sigma_vv, (size_t)nvir_ * nvir_ * sizeof(real_t));
+    {
+        int blk = (nvir_ * nvir_ + threads - 1) / threads;
+        adc2_compute_sigma_vv_kernel<<<blk, threads>>>(d_t2_, d_eri_ovov_, d_sigma_vv, nocc_, nvir_);
+        cudaDeviceSynchronize();
+    }
+
+    adc2_add_self_energy_to_M11_kernel<<<blocks, threads>>>(d_sigma_oo, d_sigma_vv, d_M11_, nocc_, nvir_);
+    cudaDeviceSynchronize();
+
+    tracked_cudaFree(d_sigma_oo);
+    tracked_cudaFree(d_sigma_vv);
+}
+
 ADC2Operator::~ADC2Operator() {
     if (d_eri_ovov_) tracked_cudaFree(d_eri_ovov_);
     if (d_eri_vvov_) tracked_cudaFree(d_eri_vvov_);

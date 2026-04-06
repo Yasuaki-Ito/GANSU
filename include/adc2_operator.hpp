@@ -62,6 +62,19 @@ public:
                  int nocc, int nvir, int nao,
                  bool is_triplet = false);
 
+    /**
+     * @brief Construct ADC(2) operator from pre-built MO ERI sub-blocks
+     *
+     * No full MO ERI (nao⁴) needed. Used when nao⁴ doesn't fit in GPU memory.
+     */
+    ADC2Operator(const real_t* d_eri_ovov,
+                 const real_t* d_eri_vvov,
+                 const real_t* d_eri_ooov,
+                 const real_t* d_eri_oovv,
+                 const real_t* d_orbital_energies,
+                 int nocc, int nvir, int nao,
+                 bool is_triplet = false);
+
     ~ADC2Operator();
 
     ADC2Operator(const ADC2Operator&) = delete;
@@ -158,6 +171,8 @@ private:
     void compute_mp1_t2_and_D2(const real_t* d_orbital_energies);
     void compute_D1(const real_t* d_orbital_energies);
     void build_M11(const real_t* d_eri_mo, const real_t* d_orbital_energies);
+    void build_M11_from_blocks(const real_t* d_eri_ovov, const real_t* d_eri_oovv,
+                               const real_t* d_orbital_energies);
     void build_M12_M21();
     void compute_diagonal();
 };
