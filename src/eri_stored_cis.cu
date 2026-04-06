@@ -29,6 +29,7 @@
 #include "rhf.hpp"
 #include "cis_operator.hpp"
 #include "cis_operator_ri.hpp"
+#include "cis_operator_jk.hpp"
 #include "davidson_solver.hpp"
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
@@ -334,16 +335,342 @@ void ERI_RI_RHF::compute_cis(int n_states) {
     tracked_cudaFree(d_B_vv);
 }
 
-void ERI_Direct_RHF::compute_cis(int n_states) {
-    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
-    compute_cis_impl(rhf_, nullptr, n_states, d_mo_eri);
-    tracked_cudaFree(d_mo_eri);
+// Forward declarations (defined in half_transform_mp3.cu)
+void half_transform_steps234(
+    const real_t* d_half, const real_t* d_C, real_t* d_result,
+    real_t* d_Ki, real_t* d_Li,
+    int nao, int bs, int p_start, int n_p, int q_start, int n_q, int r_start, int n_r);
+__global__ void scatter_s_block_kernel(
+    const double* __restrict__ src, double* __restrict__ dst,
+    int n_p, int n_q, int n_r, int n_s, int s_blk, int bs);
+
+/**
+ * Build OVOV and OOVV sub-blocks via Direct (on-the-fly) half-transform.
+ */
+static void build_ovov_oovv_direct(
+    RHF& rhf, const HF& hf,
+    real_t* d_ovov, real_t* d_oovv, int block_s)
+{
+    const int nao = rhf.get_num_basis();
+    const int nocc = rhf.get_num_electrons() / 2;
+    const int nvir = nao - nocc;
+    const real_t* d_C = rhf.get_coefficient_matrix().device_ptr();
+    const size_t nao3 = (size_t)nao * nao * nao;
+    const int max_dim = std::max(nocc, nvir);
+
+    // Schwarz factors
+    DeviceHostMemory<real_t> schwarz_unsorted(hf.get_num_primitive_shell_pairs());
+    gpu::computeSchwarzUpperBounds(
+        hf.get_shell_type_infos(), hf.get_shell_pair_type_infos(),
+        hf.get_primitive_shells().device_ptr(),
+        hf.get_boys_grid().device_ptr(),
+        hf.get_cgto_normalization_factors().device_ptr(),
+        schwarz_unsorted.device_ptr(), false);
+
+    const auto& shell_type_infos = hf.get_shell_type_infos();
+    const auto& shell_pair_type_infos = hf.get_shell_pair_type_infos();
+    const auto* d_primitive_shells = hf.get_primitive_shells().device_ptr();
+    const auto* d_boys_grid = hf.get_boys_grid().device_ptr();
+    const auto* d_cgto_norm = hf.get_cgto_normalization_factors().device_ptr();
+    const auto* d_schwarz = schwarz_unsorted.device_ptr();
+    const real_t schwarz_thresh = hf.get_schwarz_screening_threshold();
+
+    // Workspace
+    real_t* d_half = nullptr;
+    real_t* d_Ki = nullptr;
+    real_t* d_Li = nullptr;
+    real_t* d_tmp_block = nullptr;
+    tracked_cudaMalloc(&d_half, nao3 * block_s * sizeof(real_t));
+    tracked_cudaMalloc(&d_Ki, (size_t)nao * nao * block_s * sizeof(real_t));
+    tracked_cudaMalloc(&d_Li, (size_t)max_dim * nao * block_s * sizeof(real_t));
+    const size_t max_block = std::max((size_t)nocc * nvir * nocc, (size_t)nocc * nocc * nvir) * block_s;
+    tracked_cudaMalloc(&d_tmp_block, max_block * sizeof(real_t));
+
+    constexpr int scatter_threads = 256;
+
+    auto build_and_scatter = [&](real_t* d_dst, int n_p, int n_q, int n_r, int n_s,
+                                  int s_blk, int bs,
+                                  int p_start, int q_start, int r_start) {
+        half_transform_steps234(d_half, d_C, d_tmp_block,
+            d_Ki, d_Li, nao, bs, p_start, n_p, q_start, n_q, r_start, n_r);
+        const size_t block_total = (size_t)n_p * n_q * n_r * bs;
+        scatter_s_block_kernel<<<(block_total + scatter_threads - 1) / scatter_threads, scatter_threads>>>(
+            d_tmp_block, d_dst, n_p, n_q, n_r, n_s, s_blk, bs);
+    };
+
+    for (int s_blk = 0; s_blk < nvir; s_blk += block_s) {
+        int bs = std::min(block_s, nvir - s_blk);
+
+        cudaMemset(d_half, 0, nao3 * bs * sizeof(real_t));
+        gpu::computeHalfTransformedERI(
+            shell_type_infos, shell_pair_type_infos,
+            d_primitive_shells, d_boys_grid, d_cgto_norm,
+            d_half, d_schwarz, schwarz_thresh,
+            nao, d_C, nocc + s_blk, bs);
+
+        build_and_scatter(d_ovov, nocc, nvir, nocc, nvir, s_blk, bs, 0, nocc, 0);
+        build_and_scatter(d_oovv, nocc, nocc, nvir, nvir, s_blk, bs, 0, 0, nocc);
+    }
+
+    tracked_cudaFree(d_half);
+    tracked_cudaFree(d_Ki);
+    tracked_cudaFree(d_Li);
+    tracked_cudaFree(d_tmp_block);
 }
 
+
+/**
+ * Helper: run CIS Davidson with OVOV/OOVV sub-blocks.
+ * Shared by Direct and Hash CIS.
+ */
+static void run_cis_with_subblocks(
+    RHF& rhf, const real_t* d_ovov, const real_t* d_oovv,
+    int n_states, const std::string& method_label)
+{
+    const int nao = rhf.get_num_basis();
+    const int nocc = rhf.get_num_electrons() / 2;
+    const int nvir = nao - nocc;
+    const int cis_dim = nocc * nvir;
+    const bool is_triplet = rhf.is_triplet();
+    const real_t* d_eps = rhf.get_orbital_energies().device_ptr();
+
+    CISOperator_HalfTransform cis_op(d_ovov, d_oovv, d_eps, nocc, nvir, is_triplet);
+
+    DavidsonConfig config;
+    config.num_eigenvalues = n_states;
+    config.max_subspace_size = std::min(cis_dim, std::max(30, 4 * n_states));
+    config.convergence_threshold = 1e-6;
+    config.max_iterations = 100;
+    config.use_preconditioner = true;
+    config.verbose = 2;
+
+    DavidsonSolver solver(cis_op, config);
+    bool converged = solver.solve();
+    if (!converged)
+        std::cout << "Warning: Davidson solver did not converge." << std::endl;
+
+    const auto& eigenvalues = solver.get_eigenvalues();
+    rhf.set_excitation_energies(eigenvalues);
+
+    std::vector<real_t> h_eigenvectors(cis_dim * n_states);
+    solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+
+    rhf.get_coefficient_matrix().toHost();
+    const auto& prim_shells = rhf.get_primitive_shells();
+    const auto& cgto_norms = rhf.get_cgto_normalization_factors();
+    const_cast<DeviceHostMemory<PrimitiveShell>&>(prim_shells).toHost();
+    const_cast<DeviceHostMemory<real_t>&>(cgto_norms).toHost();
+
+    auto es_result = compute_excited_state_properties(
+        method_label,
+        prim_shells.host_ptr(), prim_shells.size(),
+        cgto_norms.host_ptr(),
+        rhf.get_shell_type_infos(),
+        rhf.get_coefficient_matrix().host_ptr(),
+        eigenvalues, h_eigenvectors.data(),
+        n_states, nao, nocc, nvir);
+    rhf.set_oscillator_strengths(es_result.oscillator_strengths);
+    rhf.set_excited_state_report(es_result.report);
+}
+
+
+void ERI_Direct_RHF::compute_cis(int n_states) {
+    PROFILE_FUNCTION();
+
+    const int nao = rhf_.get_num_basis();
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = nao - nocc;
+    const int cis_dim = nocc * nvir;
+    const bool is_triplet = rhf_.is_triplet();
+    const size_t num_ovov = (size_t)nocc * nvir * nocc * nvir;
+    const size_t num_oovv = (size_t)nocc * nocc * nvir * nvir;
+
+    std::string spin_label = is_triplet ? "triplet" : "singlet";
+    std::cout << "\n---- CIS (half-transform, Direct) " << spin_label << " ----"
+              << " nocc=" << nocc << ", nvir=" << nvir
+              << ", dim=" << cis_dim << ", nstates=" << n_states << std::endl;
+
+    if (n_states > cis_dim) {
+        std::cout << "Warning: Reducing to " << cis_dim << " states." << std::endl;
+        n_states = cis_dim;
+    }
+
+    real_t* d_ovov = nullptr;
+    real_t* d_oovv = nullptr;
+    tracked_cudaMalloc(&d_ovov, num_ovov * sizeof(real_t));
+    tracked_cudaMalloc(&d_oovv, num_oovv * sizeof(real_t));
+    cudaMemset(d_ovov, 0, num_ovov * sizeof(real_t));
+    cudaMemset(d_oovv, 0, num_oovv * sizeof(real_t));
+
+    const size_t nao3 = (size_t)nao * nao * nao;
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    int block_s = std::max(1, (int)(free_mem * 4 / 10 / (nao3 * sizeof(real_t))));
+    block_s = std::min(block_s, nao);
+    if (block_s > 8) block_s = 8;
+
+    build_ovov_oovv_direct(rhf_, hf_, d_ovov, d_oovv, block_s);
+
+    std::string label = is_triplet ? "CIS-HT-Direct (triplet)" : "CIS-HT-Direct";
+    run_cis_with_subblocks(rhf_, d_ovov, d_oovv, n_states, label);
+
+    tracked_cudaFree(d_ovov);
+    tracked_cudaFree(d_oovv);
+}
+
+// Forward declaration: build OVOV + OOVV via Hash half-transform
+// (defined in half_transform_mp3.cu)
+real_t mp3_half_transform_hash(
+    RHF& rhf,
+    const unsigned long long* d_coo_keys, const real_t* d_coo_values, size_t num_entries,
+    const unsigned long long* d_hash_keys, const real_t* d_hash_values,
+    const size_t* d_nonzero_indices, size_t num_nonzero,
+    size_t hash_capacity_mask, HashFockMethod method, int block_s);
+
+// Forward declarations for half-transform kernels (from half_transform_mp3.cu)
+__global__ void hash_half_transform_compact_kernel(
+    const unsigned long long* g_coo_keys, const double* g_coo_values, size_t num_entries,
+    const double* g_C, double* g_half, int nao, int j_start, int block_j);
+__global__ void hash_half_transform_indexed_kernel(
+    const unsigned long long* g_hash_keys, const double* g_hash_values,
+    const size_t* g_nonzero_indices, size_t num_nonzero,
+    const double* g_C, double* g_half, int nao, int j_start, int block_j);
+__global__ void hash_half_transform_fullscan_kernel(
+    const unsigned long long* g_hash_keys, const double* g_hash_values, size_t hash_capacity,
+    const double* g_C, double* g_half, int nao, int j_start, int block_j);
+
+
+
+/**
+ * Build OVOV and OOVV sub-blocks via Hash half-transform.
+ * Used for CIS (and potentially other methods).
+ */
+static void build_ovov_oovv_hash(
+    RHF& rhf,
+    const unsigned long long* d_coo_keys, const real_t* d_coo_values, size_t num_entries,
+    const unsigned long long* d_hash_keys, const real_t* d_hash_values,
+    const size_t* d_nonzero_indices, size_t num_nonzero,
+    size_t hash_capacity_mask, HashFockMethod method,
+    real_t* d_ovov, real_t* d_oovv, int block_s)
+{
+    const int nao = rhf.get_num_basis();
+    const int nocc = rhf.get_num_electrons() / 2;
+    const int nvir = nao - nocc;
+    const real_t* d_C = rhf.get_coefficient_matrix().device_ptr();
+    const size_t nao3 = (size_t)nao * nao * nao;
+    const int max_dim = std::max(nocc, nvir);
+
+    // Workspace
+    real_t* d_half = nullptr;
+    real_t* d_Ki = nullptr;
+    real_t* d_Li = nullptr;
+    real_t* d_tmp_block = nullptr;
+    tracked_cudaMalloc(&d_half, nao3 * block_s * sizeof(real_t));
+    tracked_cudaMalloc(&d_Ki, (size_t)nao * nao * block_s * sizeof(real_t));
+    tracked_cudaMalloc(&d_Li, (size_t)max_dim * nao * block_s * sizeof(real_t));
+    const size_t max_block = std::max((size_t)nocc * nvir * nocc, (size_t)nocc * nocc * nvir) * block_s;
+    tracked_cudaMalloc(&d_tmp_block, max_block * sizeof(real_t));
+
+    constexpr int scatter_threads = 256;
+
+    auto build_and_scatter = [&](real_t* d_dst, int n_p, int n_q, int n_r, int n_s,
+                                  int s_blk, int bs,
+                                  int p_start, int q_start, int r_start) {
+        half_transform_steps234(d_half, d_C, d_tmp_block,
+            d_Ki, d_Li, nao, bs, p_start, n_p, q_start, n_q, r_start, n_r);
+        const size_t block_total = (size_t)n_p * n_q * n_r * bs;
+        scatter_s_block_kernel<<<(block_total + scatter_threads - 1) / scatter_threads, scatter_threads>>>(
+            d_tmp_block, d_dst, n_p, n_q, n_r, n_s, s_blk, bs);
+    };
+
+    // Build OVOV and OOVV (same as streaming MP3 Pass 0)
+    for (int s_blk = 0; s_blk < nvir; s_blk += block_s) {
+        int bs = std::min(block_s, nvir - s_blk);
+
+        cudaMemset(d_half, 0, nao3 * bs * sizeof(real_t));
+        {
+            const int threads = 256;
+            if (method == HashFockMethod::Compact) {
+                const int blocks = ((int)num_entries + threads - 1) / threads;
+                hash_half_transform_compact_kernel<<<blocks, threads>>>(
+                    d_coo_keys, d_coo_values, num_entries,
+                    d_C, d_half, nao, nocc + s_blk, bs);
+            } else if (method == HashFockMethod::Indexed) {
+                const int blocks = ((int)num_nonzero + threads - 1) / threads;
+                hash_half_transform_indexed_kernel<<<blocks, threads>>>(
+                    d_hash_keys, d_hash_values,
+                    d_nonzero_indices, num_nonzero,
+                    d_C, d_half, nao, nocc + s_blk, bs);
+            } else {
+                const size_t capacity = hash_capacity_mask + 1;
+                const int blocks = ((int)capacity + threads - 1) / threads;
+                hash_half_transform_fullscan_kernel<<<blocks, threads>>>(
+                    d_hash_keys, d_hash_values, capacity,
+                    d_C, d_half, nao, nocc + s_blk, bs);
+            }
+            cudaDeviceSynchronize();
+        }
+
+        build_and_scatter(d_ovov, nocc, nvir, nocc, nvir, s_blk, bs, 0, nocc, 0);
+        build_and_scatter(d_oovv, nocc, nocc, nvir, nvir, s_blk, bs, 0, 0, nocc);
+    }
+
+    tracked_cudaFree(d_half);
+    tracked_cudaFree(d_Ki);
+    tracked_cudaFree(d_Li);
+    tracked_cudaFree(d_tmp_block);
+}
+
+
 void ERI_Hash_RHF::compute_cis(int n_states) {
-    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
-    compute_cis_impl(rhf_, nullptr, n_states, d_mo_eri);
-    tracked_cudaFree(d_mo_eri);
+    PROFILE_FUNCTION();
+
+    const int nao = rhf_.get_num_basis();
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = nao - nocc;
+    const int cis_dim = nocc * nvir;
+    const bool is_triplet = rhf_.is_triplet();
+    const size_t num_ovov = (size_t)nocc * nvir * nocc * nvir;
+    const size_t num_oovv = (size_t)nocc * nocc * nvir * nvir;
+
+    std::string spin_label = is_triplet ? "triplet" : "singlet";
+    std::cout << "\n---- CIS (half-transform, Hash) " << spin_label << " ----"
+              << " nocc=" << nocc << ", nvir=" << nvir
+              << ", dim=" << cis_dim << ", nstates=" << n_states << std::endl;
+
+    if (n_states > cis_dim) {
+        std::cout << "Warning: Reducing to " << cis_dim << " states." << std::endl;
+        n_states = cis_dim;
+    }
+
+    // Build OVOV and OOVV via half-transform
+    real_t* d_ovov = nullptr;
+    real_t* d_oovv = nullptr;
+    tracked_cudaMalloc(&d_ovov, num_ovov * sizeof(real_t));
+    tracked_cudaMalloc(&d_oovv, num_oovv * sizeof(real_t));
+    cudaMemset(d_ovov, 0, num_ovov * sizeof(real_t));
+    cudaMemset(d_oovv, 0, num_oovv * sizeof(real_t));
+
+    // block_s heuristic
+    const size_t nao3 = (size_t)nao * nao * nao;
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    int block_s = std::max(1, (int)(free_mem * 4 / 10 / (nao3 * sizeof(real_t))));
+    block_s = std::min(block_s, nao);
+    if (block_s > 8) block_s = 8;
+
+    build_ovov_oovv_hash(rhf_,
+        d_coo_keys_, d_coo_values_, num_entries_,
+        d_hash_keys_, d_hash_values_,
+        d_nonzero_indices_, num_nonzero_,
+        hash_capacity_mask_, hash_fock_method_,
+        d_ovov, d_oovv, block_s);
+
+    std::string label = is_triplet ? "CIS-HT-Hash (triplet)" : "CIS-HT-Hash";
+    run_cis_with_subblocks(rhf_, d_ovov, d_oovv, n_states, label);
+
+    tracked_cudaFree(d_ovov);
+    tracked_cudaFree(d_oovv);
 }
 
 } // namespace gansu

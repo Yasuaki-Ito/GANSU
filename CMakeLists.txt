@@ -90,6 +90,7 @@ set(SOURCES
     src/eri_stored_cis.cu
     src/cis_operator.cu
     src/cis_operator_ri.cu
+    src/cis_operator_jk.cu
     src/hash_half_transform.cu
     src/half_transform_mp3.cu
     src/eri_ri_hash.cu
