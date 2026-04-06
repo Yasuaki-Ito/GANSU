@@ -697,7 +697,7 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
 //  Common RI-MP2 computation from a given B matrix pointer.
 //  Used by Stored RI, Semi-Direct RI, and Direct RI.
 // ============================================================
-static real_t compute_ri_mp2_from_B(
+real_t compute_ri_mp2_from_B(
     real_t* d_B, int num_basis, int num_auxiliary_basis,
     int nocc, int nvir, real_t* d_C, real_t* d_eps)
 {

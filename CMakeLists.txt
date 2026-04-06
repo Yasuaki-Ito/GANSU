@@ -91,6 +91,7 @@ set(SOURCES
     src/cis_operator.cu
     src/cis_operator_ri.cu
     src/hash_half_transform.cu
+    src/eri_ri_hash.cu
     src/eri_stored_adc2.cu
     src/adc2_operator.cu
     src/adc2_full_operator.cu

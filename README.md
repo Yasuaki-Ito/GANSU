@@ -22,6 +22,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
       * RI approximation (Density Fitting) (RHF, UHF, ROHF)
       * Semi-Direct-RI (RHF, UHF) — recomputes B matrix each iteration, J/K via BLAS
       * Direct-RI (RHF) — on-the-fly contraction without storing B matrix
+      * Hash-RI (RHF) — 3-center ERIs in sparse COO, B matrix built on-demand from COO
       * Direct SCF (RHF)
 * Post-Hartree-Fock methods
     * Møller-Plesset Perturbation Theory (RMP2, RMP3, RMP4, UMP2, UMP3)

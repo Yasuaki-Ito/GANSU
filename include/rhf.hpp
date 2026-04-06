@@ -1300,6 +1300,37 @@ protected:
 };
 
 
+/// Hash RI: stores 3-center ERIs in a Hash table (like Hash ERI for 4-center).
+/// Each SCF iteration: Hash 3c → dense B → J/K via BLAS.
+/// Combines Hash ERI's reuse advantage with RI's O(naux×nao²) scaling.
+class ERI_RI_Hash_RHF : public ERI_RI_Direct {
+public:
+    ERI_RI_Hash_RHF(RHF& rhf, const Molecular& auxiliary_molecular)
+        : ERI_RI_Direct(rhf, auxiliary_molecular), rhf_(rhf),
+          d_3c_coo_keys_(nullptr), d_3c_coo_values_(nullptr), num_3c_entries_(0) {}
+    ERI_RI_Hash_RHF(const ERI_RI_Hash_RHF&) = delete;
+    ~ERI_RI_Hash_RHF();
+
+    std::string get_algorithm_name() override { return "Hash-RI"; }
+
+    void precomputation() override;  // Compute 2-center + store 3-center in Hash
+    void compute_fock_matrix() override;  // Hash → dense B → J/K
+
+    real_t compute_mp2_energy() override;
+
+    bool supports_post_hf_method(PostHFMethod method) const override {
+        return method == PostHFMethod::None || method == PostHFMethod::MP2;
+    }
+
+protected:
+    RHF& rhf_;
+
+    // 3-center COO storage
+    unsigned long long* d_3c_coo_keys_;
+    real_t* d_3c_coo_values_;
+    size_t num_3c_entries_;
+};
+
 inline void RHF::reset_convergence() { if(convergence_method_) convergence_method_->reset(); }
 
 } // namespace gansu
