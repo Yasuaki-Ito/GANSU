@@ -41,10 +41,27 @@ using namespace gansu;
  */
 int main(int argc, char* argv[]){
   try {
-    gpu::initialize_gpu(); // Detect GPU availability (CPU fallback if no GPU)
+    // Check for --cpu flag and remove it from argv before parameter parsing
+    bool force_cpu = false;
+    std::vector<char*> filtered_argv;
+    filtered_argv.push_back(argv[0]);
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--cpu") {
+            force_cpu = true;
+        } else {
+            filtered_argv.push_back(argv[i]);
+        }
+    }
+    int filtered_argc = (int)filtered_argv.size();
+
+    if (force_cpu) {
+        gpu::disable_gpu();
+    } else {
+        gpu::initialize_gpu(); // Detect GPU availability (CPU fallback if no GPU)
+    }
 
     ParameterManager parameters;
-    parameters.parse_command_line_args(argc, argv); // Parse the command line arguments
+    parameters.parse_command_line_args(filtered_argc, filtered_argv.data()); // Parse the command line arguments
 
     std::unique_ptr<HF> hf = HFBuilder::buildHF(parameters);
 

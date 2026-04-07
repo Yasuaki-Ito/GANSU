@@ -33,8 +33,7 @@
 #include "profiler.hpp"
 #include "geometry_optimizer.hpp"
 
-// LAPACK eigenvalue decomposition for vibrational frequency analysis
-extern "C" void dsyev_(char*, char*, int*, double*, int*, double*, double*, int*, int*);
+#include <Eigen/Dense>
 
 namespace gansu{
 
@@ -898,12 +897,13 @@ real_t HF::solve(const real_t* density_matrix_alpha, const real_t* density_matri
                     }
                 }
 
-                // Eigenvalue decomposition of projected mass-weighted Hessian
+                // Eigenvalue decomposition of projected mass-weighted Hessian (Eigen)
                 std::vector<double> eigenvalues(ndim);
-                std::vector<double> work(3*ndim);
-                char jobz = 'N', uplo = 'U';
-                int info = 0, lwork = 3*ndim;
-                dsyev_(&jobz, &uplo, &ndim, hess_mw.data(), &ndim, eigenvalues.data(), work.data(), &lwork, &info);
+                {
+                    Eigen::Map<Eigen::MatrixXd> H(hess_mw.data(), ndim, ndim);
+                    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(H);
+                    for (int i = 0; i < ndim; i++) eigenvalues[i] = solver.eigenvalues()(i);
+                }
 
                 // Convert eigenvalues to frequencies (cm^-1)
                 // freq = sqrt(|eigenvalue|) * 5140.487 (Hartree/(bohr^2 * amu) -> cm^-1)

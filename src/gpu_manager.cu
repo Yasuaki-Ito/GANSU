@@ -86,6 +86,12 @@ bool gpu_available() {
     return g_gpu_available;
 }
 
+void disable_gpu() {
+    g_gpu_available = false;
+    g_gpu_initialized = true;
+    std::cout << "GPU disabled by user. Using CPU (Eigen + OpenMP) backend." << std::endl;
+}
+
 
 
 

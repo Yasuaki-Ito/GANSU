@@ -42,6 +42,9 @@ void initialize_gpu();
 /// Returns true if a CUDA-capable GPU is available.
 bool gpu_available();
 
+/// Force CPU-only mode (disable GPU even if available).
+void disable_gpu();
+
 
 // prototype declarations
 void invertSqrtElements(real_t* d_vectors, const size_t size, const double threshold=1e-6);

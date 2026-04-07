@@ -26,7 +26,7 @@
 
 #include "ao2mo.cuh"
 
-extern "C" void dgesv_(int*, int*, double*, int*, int*, double*, int*, int*);
+#include <Eigen/Dense>
 
 #define FULLMASK 0xffffffff
 
@@ -1469,16 +1469,14 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
         }
     }
 
-    // Solve M * z = -Xvo using LAPACK dgesv
+    // Solve M * z = -Xvo using Eigen
     {
-        std::vector<real_t> rhs(nvo);
-        for (int k = 0; k < nvo; k++) rhs[k] = -h_Xvo[k];
-        std::vector<int> ipiv(nvo);
-        int n = nvo, nrhs = 1, lda = nvo, ldb = nvo, info = 0;
-        dgesv_(&n, &nrhs, h_M.data(), &lda, ipiv.data(), rhs.data(), &ldb, &info);
-        if (info != 0)
-            std::cerr << "    [WARNING] CPHF dgesv failed, info=" << info << std::endl;
-        h_z = rhs;
+        Eigen::Map<Eigen::MatrixXd> M(h_M.data(), nvo, nvo);
+        Eigen::VectorXd rhs(nvo);
+        for (int k = 0; k < nvo; k++) rhs(k) = -h_Xvo[k];
+        Eigen::VectorXd z = M.colPivHouseholderQr().solve(rhs);
+        h_z.resize(nvo);
+        for (int k = 0; k < nvo; k++) h_z[k] = z(k);
     }
 
     {
