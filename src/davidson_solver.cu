@@ -17,7 +17,9 @@
 #include "gpu_manager.hpp"
 #include "utils.hpp"
 
+#ifndef GANSU_CPU_ONLY
 #include <cublas_v2.h>
+#endif
 #include <iostream>
 #include <iomanip>
 #include <cmath>

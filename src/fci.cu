@@ -12,14 +12,16 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
  
+#ifndef GANSU_CPU_ONLY
 #include <cuda.h>
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
+#include <cusolverDn.h>
+#endif
 #include <omp.h>
 #include <cmath>
 #include <utility>
 #include <iostream>
-#include <cusolverDn.h>
 #include "gpu_manager.hpp"
 #include "utils.hpp"
 #include<sys/time.h>

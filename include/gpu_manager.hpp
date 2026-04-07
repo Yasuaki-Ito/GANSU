@@ -15,9 +15,13 @@
 
 #pragma once
 
+#ifdef GANSU_CPU_ONLY
+#include "cuda_compat.hpp"
+#else
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cusolverDn.h>
+#endif
 #include <iostream>
 #include <stdexcept>
 
@@ -27,6 +31,16 @@
 #include "utils.hpp" // THROW_EXCEPTION
 
 namespace gansu::gpu{
+
+// ============================================================================
+// GPU availability detection (runtime)
+// ============================================================================
+
+/// Call once at startup to detect GPU availability.
+void initialize_gpu();
+
+/// Returns true if a CUDA-capable GPU is available.
+bool gpu_available();
 
 
 // prototype declarations
@@ -297,6 +311,8 @@ private:
     cusolverDnParams_t cusolver_params_ = nullptr;
 
     GPUHandle() {
+        if (!gpu_available()) return; // CPU-only mode: no handles needed
+
         // Create cuBLAS handle
         if (cublasCreate(&cublas_) != CUBLAS_STATUS_SUCCESS) {
             throw std::runtime_error("Failed to create cuBLAS handle");
@@ -314,14 +330,6 @@ private:
             cublasDestroy(cublas_);
             throw std::runtime_error("Failed to create cuSOLVER params");
         }
-
-        // Link params to handle
-    //    if (cusolverDnSetAdvOptions(cusolver_, cusolver_params_) != CUSOLVER_STATUS_SUCCESS) {
-    //        cusolverDnDestroyParams(cusolver_params_);
-    //        cusolverDnDestroy(cusolver_);
-    //        cublasDestroy(cublas_);
-    //        throw std::runtime_error("Failed to set cuSOLVER advanced options");
-    //    }
     }
 
     ~GPUHandle() {

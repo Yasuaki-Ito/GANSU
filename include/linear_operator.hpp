@@ -23,7 +23,9 @@
 #pragma once
 
 #include <string>
+#ifndef GANSU_CPU_ONLY
 #include <cuda_runtime.h>
+#endif
 #include "types.hpp"
 
 namespace gansu {

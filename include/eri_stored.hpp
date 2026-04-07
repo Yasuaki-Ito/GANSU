@@ -5,6 +5,7 @@
 
 namespace gansu {
 
+#ifndef GANSU_CPU_ONLY
 static __device__ double block_reduce_sum(double x){
   extern __shared__ double sdata[];
   int tid = threadIdx.x;
@@ -17,6 +18,7 @@ static __device__ double block_reduce_sum(double x){
   }
   return sdata[0];
 }
+#endif
 
 static __device__  size_t idx4_to_1(int num_basis, int mu, int nu, int la, int si){
   return ( ( (size_t(mu)*num_basis + nu)*num_basis + la)*num_basis + si );

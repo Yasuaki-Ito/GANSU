@@ -21,7 +21,11 @@
 
 #pragma once
 
+#ifdef GANSU_CPU_ONLY
+#include "cuda_compat.hpp"
+#else
 #include <cuda_runtime.h>
+#endif
 #include <iostream>
 #include <stdexcept>
 #include <cstring>
@@ -31,6 +35,9 @@
 #include <unordered_map>
 
 #include "utils.hpp" // THROW_EXCEPTION
+
+// Forward declaration for gpu_available() — avoids circular include with gpu_manager.hpp
+namespace gansu::gpu { bool gpu_available(); }
 
 namespace gansu{
 
@@ -105,14 +112,23 @@ public:
      * Frees the allocated device and host memory if they exist and updates statistics.
      */
     virtual ~CudaMemoryManager() {
-        if (device_ptr_) {
-            cudaFree(device_ptr_);
-            // Update memory statistics
-            track_deallocation(device_bytes_);
+        if (gpu::gpu_available()) {
+            if (device_ptr_) {
+                cudaFree(device_ptr_);
+                track_deallocation(device_bytes_);
+            }
+            if (host_ptr_) {
+                cudaFreeHost(host_ptr_);
+            }
+        } else {
+            // CPU mode: device_ptr_ == host_ptr_, free once
+            if (host_ptr_) {
+                std::free(host_ptr_);
+            }
+            // Don't free device_ptr_ separately (same pointer)
         }
-        if (host_ptr_) {
-            cudaFreeHost(host_ptr_);
-        }
+        device_ptr_ = nullptr;
+        host_ptr_ = nullptr;
     }
 
     /**
@@ -283,6 +299,20 @@ public:
     }
 
     void allocate() override {
+        if (!gpu::gpu_available()) {
+            // CPU mode: single allocation, device_ptr == host_ptr
+            this->host_bytes_ = this->size_ * sizeof(T);
+            this->device_bytes_ = this->host_bytes_;
+            this->host_ptr_ = static_cast<T*>(std::calloc(this->size_, sizeof(T)));
+            if (!this->host_ptr_) {
+                THROW_EXCEPTION("Failed to allocate host memory (CPU mode)");
+            }
+            this->device_ptr_ = this->host_ptr_; // Same pointer
+            this->track_allocation(this->device_bytes_);
+            return;
+        }
+
+        // GPU mode: separate host and device allocations
         cudaError_t err;
 
         if (allocate_host_memory_in_advance) {
@@ -316,6 +346,7 @@ public:
     }
 
     void toDevice() override {
+        if (!gpu::gpu_available()) return; // CPU mode: no-op (same pointer)
         if (!this->device_ptr_) {
             allocate();
         }
@@ -325,6 +356,7 @@ public:
     }
 
     void toHost() override {
+        if (!gpu::gpu_available()) return; // CPU mode: no-op (same pointer)
         if (!this->host_ptr_) {
             this->host_bytes_ = this->size_ * sizeof(T);
             cudaError_t err = cudaMallocHost(&this->host_ptr_, this->host_bytes_);

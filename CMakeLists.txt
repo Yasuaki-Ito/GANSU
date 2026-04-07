@@ -1,18 +1,26 @@
-# 
+#
 # GANSU: GPU Accelerated Numerical Simulation Utility
-# 
+#
 # Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
 # All rights reserved.
-# 
+#
 # This software is licensed under the BSD 3-Clause License.
 # You may obtain a copy of the license in the LICENSE file
 # located in the root directory of this source tree or at:
 # https://opensource.org/licenses/BSD-3-Clause
-#  
+#
 # SPDX-License-Identifier: BSD-3-Clause
-# 
+#
 cmake_minimum_required(VERSION 3.31)
-project(GANSU LANGUAGES CUDA CXX)
+
+# GPU support option (must be set before project())
+option(ENABLE_GPU "Build with CUDA GPU support" ON)
+
+if(ENABLE_GPU)
+    project(GANSU LANGUAGES CUDA CXX)
+else()
+    project(GANSU LANGUAGES CXX)
+endif()
 
 
 # Uncomment the following line if f- or g-orbital basis functions are present.
@@ -26,51 +34,99 @@ project(GANSU LANGUAGES CUDA CXX)
 
 # Uncomment the following line to enable to support G-type auxiliary basis functions for RI approximations (density fitting)
 # Note: Build time will take one day or more
-# 
+#
 # add_definitions(-DCOMPUTE_G_AUX)
 
 
-# set compute capability
-set(CMAKE_CUDA_ARCHITECTURES 80 86 90)
-
-# Enable line info and debug info for CUDA when in Debug mode
-set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -lineinfo")
+if(ENABLE_GPU)
+    # set compute capability
+    set(CMAKE_CUDA_ARCHITECTURES 80 86 90)
+    # Enable line info and debug info for CUDA when in Debug mode
+    set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -lineinfo")
+    set(CMAKE_CUDA_STANDARD 17)
+else()
+    add_definitions(-DGANSU_CPU_ONLY)
+endif()
 
 # C++ standard
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CUDA_STANDARD 17)
 
 # Set include directories (global)
 include_directories(include)
 
 
-# Static libraries
-add_library(int1e STATIC src/int1e.cu)
-add_library(int2e STATIC src/int2e.cu)
-add_library(int2e_hash STATIC src/int2e_hash.cu)
-add_library(int2c2e STATIC src/int2c2e.cu)
-add_library(int3c2e STATIC src/int3c2e.cu)
-add_library(int2e_direct STATIC src/int2e_direct.cu)
-add_library(rys_eri STATIC src/rys_eri.cu)
-add_library(rys_eri_direct STATIC src/rys_eri_direct.cu)
-add_library(rys_eri_mp2 STATIC src/rys_eri_mp2.cu)
-add_library(rys_int3c2e STATIC src/rys_int3c2e.cu)
-add_library(rys_int2c2e STATIC src/rys_int2c2e.cu)
+# ============================================================================
+# Dependencies: Eigen (header-only) and OpenMP
+# ============================================================================
+include(FetchContent)
+FetchContent_Declare(
+    eigen
+    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+    GIT_TAG 3.4.0
+    GIT_SHALLOW TRUE
+)
+set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
+set(EIGEN_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(eigen)
+
+find_package(OpenMP REQUIRED)
 
 
-add_library(grad_w STATIC src/grad/grad_w.cu)
-add_library(grad_s STATIC src/grad/grad_s.cu)
-add_library(grad_k STATIC src/grad/grad_k.cu)
-add_library(grad_v STATIC src/grad/grad_v.cu)
-add_library(grad_g STATIC src/grad/grad_g.cu)
-add_library(rys_grad_g STATIC src/grad/rys_grad_g.cu)
-add_library(rys_hessian_g STATIC src/grad/rys_hessian_g.cu)
-add_library(hessian_s STATIC src/grad/hessian_s.cu)
-add_library(hessian_k STATIC src/grad/hessian_k.cu)
-add_library(hessian_v STATIC src/grad/hessian_v.cu)
-add_library(hessian_w STATIC src/grad/hessian_w.cu)
+# ============================================================================
+# Source files for integral static libraries
+# ============================================================================
+set(INTEGRAL_SOURCES
+    src/int1e.cu
+    src/int2e.cu
+    src/int2e_hash.cu
+    src/int2c2e.cu
+    src/int3c2e.cu
+    src/int2e_direct.cu
+    src/rys_eri.cu
+    src/rys_eri_direct.cu
+    src/rys_eri_mp2.cu
+    src/rys_int3c2e.cu
+    src/rys_int2c2e.cu
+)
+
+set(GRADIENT_SOURCES
+    src/grad/grad_w.cu
+    src/grad/grad_s.cu
+    src/grad/grad_k.cu
+    src/grad/grad_v.cu
+    src/grad/grad_g.cu
+    src/grad/rys_grad_g.cu
+    src/grad/rys_hessian_g.cu
+    src/grad/hessian_s.cu
+    src/grad/hessian_k.cu
+    src/grad/hessian_v.cu
+    src/grad/hessian_w.cu
+)
+
+# When GPU is disabled, compile .cu files as C++
+if(NOT ENABLE_GPU)
+    set_source_files_properties(${INTEGRAL_SOURCES} ${GRADIENT_SOURCES} PROPERTIES LANGUAGE CXX)
+endif()
+
+# Static libraries (integrals)
+foreach(src ${INTEGRAL_SOURCES})
+    get_filename_component(lib_name ${src} NAME_WE)
+    add_library(${lib_name} STATIC ${src})
+    target_link_libraries(${lib_name} Eigen3::Eigen OpenMP::OpenMP_CXX)
+endforeach()
+
+# Static libraries (gradients)
+foreach(src ${GRADIENT_SOURCES})
+    get_filename_component(lib_name ${src} NAME_WE)
+    add_library(${lib_name} STATIC ${src})
+    target_link_libraries(${lib_name} Eigen3::Eigen OpenMP::OpenMP_CXX)
+endforeach()
 
 
+# ============================================================================
+# Main GANSU library
+# ============================================================================
 set(SOURCES
     src/basis_set.cpp
     src/parseXYZ.cpp
@@ -118,16 +174,16 @@ set(SOURCES
     src/utils.cpp
 )
 
-add_library(gansu STATIC ${SOURCES})
-target_compile_definitions(gansu PRIVATE PROFILE_ENABLED) # add option -DPROFILE_ENABLED
-target_compile_definitions(gansu PRIVATE CONSOLE_COLOR_ENABLED) # add option -DCONSOLE_COLOR_ENABLED
-find_package(LAPACK REQUIRED)
+if(NOT ENABLE_GPU)
+    set_source_files_properties(${SOURCES} PROPERTIES LANGUAGE CXX)
+endif()
 
+add_library(gansu STATIC ${SOURCES})
+target_compile_definitions(gansu PRIVATE PROFILE_ENABLED)
+target_compile_definitions(gansu PRIVATE CONSOLE_COLOR_ENABLED)
 target_link_libraries(gansu
-        cublas
-        cusolver
-        ${LAPACK_LIBRARIES}
-        ${CUDA_LIBRARIES}
+        Eigen3::Eigen
+        OpenMP::OpenMP_CXX
         int1e
         int2e
         int2e_hash
@@ -152,35 +208,37 @@ target_link_libraries(gansu
         hessian_w
     )
 
-
-add_executable(HF_main src/HF_main.cu)
-target_compile_definitions(HF_main PRIVATE PROFILE_ENABLED) # add option -DPROFILE_ENABLED 
-target_compile_definitions(HF_main PRIVATE CONSOLE_COLOR_ENABLED) # add option -DCONSOLE_COLOR_ENABLED 
-target_link_libraries(HF_main
-        gansu
-    )
-
-# add_executable(demo src/demo.cu ${SOURCES})
-# target_link_libraries(demo
-#         gansu
-#     )
+if(ENABLE_GPU)
+    target_link_libraries(gansu cublas cusolver ${CUDA_LIBRARIES})
+    # Delay-load cuBLAS/cuSOLVER DLLs (Windows only) so binary runs without GPU
+    if(WIN32)
+        target_link_options(gansu PUBLIC /DELAYLOAD:cublas64_12.dll /DELAYLOAD:cusolver64_11.dll)
+        target_link_libraries(gansu delayimp)
+    endif()
+endif()
 
 
-# add_executable(HF_main_no_profile src/HF_main.cu ${SOURCES})
-# target_link_libraries(HF_main_no_profile
-#         cublas
-#         cusolver
-#         ${CUDA_LIBRARIES}
-#         int1e
-#         int2e
-#     )
+# ============================================================================
+# Main executable
+# ============================================================================
+set(MAIN_SOURCE src/HF_main.cu)
+if(NOT ENABLE_GPU)
+    set_source_files_properties(${MAIN_SOURCE} PROPERTIES LANGUAGE CXX)
+endif()
 
-# Add test directory (optional, can be enabled/disabled)
+add_executable(HF_main ${MAIN_SOURCE})
+target_compile_definitions(HF_main PRIVATE PROFILE_ENABLED)
+target_compile_definitions(HF_main PRIVATE CONSOLE_COLOR_ENABLED)
+target_link_libraries(HF_main gansu)
+
+
+# ============================================================================
+# Tests (optional)
+# ============================================================================
 option(BUILD_TESTS "Build the test suite" OFF)
 if(BUILD_TESTS)
     add_subdirectory(test)
 endif()
-
 
 
 # GANSU-UI (Web UI) is maintained as a separate project under ui/.

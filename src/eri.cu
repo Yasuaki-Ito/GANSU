@@ -20,6 +20,7 @@
 #include "gpu_manager.hpp"
 #include "ao2mo.cuh"
 #include <cassert>
+#ifndef GANSU_CPU_ONLY
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
 #include <thrust/copy.h>
@@ -28,6 +29,46 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/tuple.h>
+#else
+#include <algorithm>
+#include <numeric>
+
+// CPU replacement for thrust::sort_by_key (descending order)
+template <typename KeyT, typename ValueT>
+void cpu_sort_by_key_descending(KeyT* keys, ValueT* values, size_t count) {
+    std::vector<size_t> indices(count);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+        return keys[a] > keys[b];
+    });
+    std::vector<KeyT> sorted_keys(count);
+    std::vector<ValueT> sorted_values(count);
+    for (size_t i = 0; i < count; i++) {
+        sorted_keys[i] = keys[indices[i]];
+        sorted_values[i] = values[indices[i]];
+    }
+    std::copy(sorted_keys.begin(), sorted_keys.end(), keys);
+    std::copy(sorted_values.begin(), sorted_values.end(), values);
+}
+
+// CPU replacement for thrust::sort_by_key (ascending, using operator<)
+template <typename KeyT, typename ValueT>
+void cpu_sort_by_key_ascending(KeyT* keys, ValueT* values, size_t count) {
+    std::vector<size_t> indices(count);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+        return keys[a] < keys[b];
+    });
+    std::vector<KeyT> sorted_keys(count);
+    std::vector<ValueT> sorted_values(count);
+    for (size_t i = 0; i < count; i++) {
+        sorted_keys[i] = keys[indices[i]];
+        sorted_values[i] = values[indices[i]];
+    }
+    std::copy(sorted_keys.begin(), sorted_keys.end(), keys);
+    std::copy(sorted_values.begin(), sorted_values.end(), values);
+}
+#endif
 
 struct HashKeyIsNonEmpty {
     __host__ __device__ bool operator()(unsigned long long key) const {
@@ -456,11 +497,18 @@ void ERI_RI::precomputation() {
             const int num_blocks = (shell_pair_type_infos[pair_idx].count + threads_per_block - 1) / threads_per_block; // the number of blocks
             generatePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index], shell_pair_type_infos[pair_idx].count, s0 == s1, shell_type_infos[s1].count);
 
-            thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);  
+
+#ifdef GANSU_CPU_ONLY
+            cpu_sort_by_key_descending(
+                &schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index],
+                &d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index],
+                shell_pair_type_infos[pair_idx].count);
+#else
+            thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);
             thrust::device_ptr<real_t> keys_end(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index] + shell_pair_type_infos[pair_idx].count);
             thrust::device_ptr<size_t2> values_begin(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index]);
-
             thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+#endif
 
             pair_idx++;
         }
@@ -481,11 +529,17 @@ void ERI_RI::precomputation() {
     );
 
     for(const auto& s : auxiliary_shell_type_infos_){
-        thrust::device_ptr<real_t> keys_begin(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index]);  
+#ifdef GANSU_CPU_ONLY
+        cpu_sort_by_key_descending(
+            &auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index],
+            &auxiliary_primitive_shells_.device_ptr()[s.start_index],
+            s.count);
+#else
+        thrust::device_ptr<real_t> keys_begin(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index]);
         thrust::device_ptr<real_t> keys_end(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index] + s.count);
         thrust::device_ptr<PrimitiveShell> values_begin(&auxiliary_primitive_shells_.device_ptr()[s.start_index]);
-
         thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+#endif
     }
 
 
@@ -689,10 +743,17 @@ void ERI_Direct::precomputation()
             const int num_blocks = (shell_pair_type_infos[pair_idx].count + threads_per_block - 1) / threads_per_block; // the number of blocks
             //initializePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index], shell_pair_type_infos[pair_idx].count, s0 == s1, shell_type_infos[s1].count);
             initializePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index], shell_pair_type_infos[pair_idx].count, s0 == s1, shell_type_infos[s1].count, shell_type_infos[s0].start_index, shell_type_infos[s1].start_index);
-            thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);  
+#ifdef GANSU_CPU_ONLY
+            cpu_sort_by_key_descending(
+                &schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index],
+                &d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index],
+                shell_pair_type_infos[pair_idx].count);
+#else
+            thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);
             thrust::device_ptr<real_t> keys_end(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index] + shell_pair_type_infos[pair_idx].count);
             thrust::device_ptr<int2> values_begin(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index]);
             thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+#endif
             pair_idx++;
         }
     }
@@ -834,8 +895,15 @@ void ERI_Hash::precomputation() {
     }
 
     // === Phase 4: Collect non-empty entries (method-dependent) ===
+#ifdef GANSU_CPU_ONLY
+    size_t num_nonzero = 0;
+    for (size_t i = 0; i < hash_capacity; i++) {
+        if (HashKeyIsNonEmpty()(d_hash_keys[i])) num_nonzero++;
+    }
+#else
     thrust::device_ptr<unsigned long long> keys_ptr(d_hash_keys);
     size_t num_nonzero = thrust::count_if(keys_ptr, keys_ptr + hash_capacity, HashKeyIsNonEmpty());
+#endif
 
     // Keep hash table (needed for all methods including MP2 half-transform)
     d_hash_keys_ = d_hash_keys;
@@ -847,6 +915,18 @@ void ERI_Hash::precomputation() {
     // COO (Compact) — always built (needed for compute_jk_response and MP2 compact)
     tracked_cudaMalloc(&d_coo_keys_, num_nonzero * sizeof(unsigned long long));
     tracked_cudaMalloc(&d_coo_values_, num_nonzero * sizeof(real_t));
+#ifdef GANSU_CPU_ONLY
+    {
+        size_t write_pos = 0;
+        for (size_t i = 0; i < hash_capacity; i++) {
+            if (HashKeyIsNonEmpty()(d_hash_keys[i])) {
+                d_coo_keys_[write_pos] = d_hash_keys[i];
+                d_coo_values_[write_pos] = d_hash_values[i];
+                write_pos++;
+            }
+        }
+    }
+#else
     {
         thrust::device_ptr<real_t> vals_ptr(d_hash_values);
         auto zip_begin = thrust::make_zip_iterator(thrust::make_tuple(keys_ptr, vals_ptr));
@@ -856,15 +936,27 @@ void ERI_Hash::precomputation() {
             thrust::device_ptr<real_t>(d_coo_values_)));
         thrust::copy_if(zip_begin, zip_end, keys_ptr, out_zip, HashKeyIsNonEmpty());
     }
+#endif
     num_entries_ = num_nonzero;
 
     // Indexed — always built (needed for MP2 indexed half-transform)
     tracked_cudaMalloc(&d_nonzero_indices_, num_nonzero * sizeof(size_t));
+#ifdef GANSU_CPU_ONLY
+    {
+        size_t write_pos = 0;
+        for (size_t i = 0; i < hash_capacity; i++) {
+            if (HashKeyIsNonEmpty()(d_hash_keys[i])) {
+                d_nonzero_indices_[write_pos++] = i;
+            }
+        }
+    }
+#else
     {
         thrust::counting_iterator<size_t> count_begin(0);
         thrust::device_ptr<size_t> out_indices(d_nonzero_indices_);
         thrust::copy_if(count_begin, count_begin + hash_capacity, keys_ptr, out_indices, HashKeyIsNonEmpty());
     }
+#endif
 
     if (verbose) {
         std::cout << "ERI Hash: " << num_nonzero << " unique entries after cleanup ("
@@ -969,10 +1061,17 @@ void ERI_RI_Direct::precomputation() {
         );
 
         // K計算用のshell-pair配列ソート
-        thrust::device_ptr<ShellPairSorter> keys_begin(d_shell_pair_sorter_for_SAD_K_computation);  
+#ifdef GANSU_CPU_ONLY
+        cpu_sort_by_key_ascending(
+            d_shell_pair_sorter_for_SAD_K_computation,
+            primitive_shell_pair_indices_for_SAD_K_computation.device_ptr(),
+            num_tasks);
+#else
+        thrust::device_ptr<ShellPairSorter> keys_begin(d_shell_pair_sorter_for_SAD_K_computation);
         thrust::device_ptr<ShellPairSorter> keys_end(d_shell_pair_sorter_for_SAD_K_computation + num_tasks);
         thrust::device_ptr<size_t2> values_begin(primitive_shell_pair_indices_for_SAD_K_computation.device_ptr());
         thrust::sort_by_key(keys_begin, keys_end, values_begin);
+#endif
 
         copySchwarzUpperBoundFactors_for_SAD_K_computation<<<num_blocks, threads_per_block>>>(schwarz_upper_bound_factors_for_SAD_K_computation.device_ptr(), d_shell_pair_sorter_for_SAD_K_computation, num_primitive_shells);
 
@@ -999,11 +1098,18 @@ void ERI_RI_Direct::precomputation() {
             const int num_blocks = (shell_pair_type_infos[pair_idx].count + threads_per_block - 1) / threads_per_block; // the number of blocks
             generatePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&primitive_shell_pair_indices.device_ptr()[shell_pair_type_infos[pair_idx].start_index], shell_pair_type_infos[pair_idx].count, s0 == s1, shell_type_infos[s1].count, true, shell_type_infos[s0].start_index, shell_type_infos[s1].start_index);
 
-            thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);  
+
+#ifdef GANSU_CPU_ONLY
+            cpu_sort_by_key_descending(
+                &schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index],
+                &primitive_shell_pair_indices.device_ptr()[shell_pair_type_infos[pair_idx].start_index],
+                shell_pair_type_infos[pair_idx].count);
+#else
+            thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);
             thrust::device_ptr<real_t> keys_end(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index] + shell_pair_type_infos[pair_idx].count);
             thrust::device_ptr<size_t2> values_begin(&primitive_shell_pair_indices.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);
-
             thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+#endif
 
             pair_idx++;
         }
@@ -1029,11 +1135,17 @@ void ERI_RI_Direct::precomputation() {
     );
 
     for(const auto& s : auxiliary_shell_type_infos_){
+#ifdef GANSU_CPU_ONLY
+        cpu_sort_by_key_descending(
+            &auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index],
+            &auxiliary_primitive_shells_.device_ptr()[s.start_index],
+            s.count);
+#else
         thrust::device_ptr<real_t> keys_begin(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index]);
         thrust::device_ptr<real_t> keys_end(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index] + s.count);
         thrust::device_ptr<PrimitiveShell> values_begin(&auxiliary_primitive_shells_.device_ptr()[s.start_index]);
-
         thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+#endif
     }
 
 

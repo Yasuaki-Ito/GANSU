@@ -20,9 +20,14 @@
 #pragma once
 
 #include <iostream>
+
+#ifdef GANSU_CPU_ONLY
+#include "cuda_compat.hpp"
+#else
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cusolverDn.h>
+#endif
 
 namespace gansu{
 
@@ -30,6 +35,9 @@ namespace gansu{
  * @brief Display the environment information
  */
 inline void display_env_info(){
+#ifdef GANSU_CPU_ONLY
+    std::cout << "GANSU CPU-only build (no GPU)" << std::endl;
+#else
     // CUDA Runtime Version
     int cuda_runtime_version;
     cudaRuntimeGetVersion(&cuda_runtime_version);
@@ -60,7 +68,7 @@ inline void display_env_info(){
     std::cout << "CUDA Driver Version: " << cuda_driver_major << "." << cuda_driver_minor << "." << cuda_driver_patch << std::endl;
     std::cout << "cuBLAS Version: " << cublas_major << "." << cublas_minor << "." << cublas_patch << std::endl;
     std::cout << "cuSOLVER Version: " << cusolver_major << "." << cusolver_minor << "." << cusolver_patch << std::endl;
-
+#endif
 }
 
 

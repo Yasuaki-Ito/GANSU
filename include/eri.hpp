@@ -22,7 +22,9 @@
 #include "types.hpp"
 #include "device_host_memory.hpp"
 
+#ifndef GANSU_CPU_ONLY
 #include <cuda_runtime.h> // for int2 type
+#endif
 
 
 namespace gansu{

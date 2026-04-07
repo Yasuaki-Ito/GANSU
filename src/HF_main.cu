@@ -27,6 +27,7 @@
 #include "hf.hpp"
 #include "parameter_manager.hpp"
 #include "builder.hpp"
+#include "gpu_manager.hpp"
 
 
 using namespace gansu;
@@ -40,6 +41,8 @@ using namespace gansu;
  */
 int main(int argc, char* argv[]){
   try {
+    gpu::initialize_gpu(); // Detect GPU availability (CPU fallback if no GPU)
+
     ParameterManager parameters;
     parameters.parse_command_line_args(argc, argv); // Parse the command line arguments
 
