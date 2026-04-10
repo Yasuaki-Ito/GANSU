@@ -17,6 +17,8 @@
 #include "gpu_manager.hpp"
 #include "utils.hpp"
 
+#include <Eigen/Dense>
+
 #ifndef GANSU_CPU_ONLY
 #include <cublas_v2.h>
 #endif
@@ -444,6 +446,49 @@ void DavidsonSolver::initialize_subspace(const real_t* d_initial_guess) {
 // ========== Orthogonalization ==========
 
 void DavidsonSolver::orthogonalize_vectors(int start_index, int num_vectors) {
+    using Eigen::Map;
+    using Eigen::VectorXd;
+
+    if (!gpu::gpu_available()) {
+        // CPU implementation using Eigen
+        for (int i = start_index; i < start_index + num_vectors; ++i) {
+            real_t* vec_i = &d_subspace_vectors_[static_cast<size_t>(i) * dim_];
+            Map<VectorXd> vi(vec_i, dim_);
+
+            // Orthogonalize against all previous vectors
+            for (int j = 0; j < i; ++j) {
+                const real_t* vec_j = &d_subspace_vectors_[static_cast<size_t>(j) * dim_];
+                Map<const VectorXd> vj(vec_j, dim_);
+                real_t proj = vj.dot(vi);
+                vi -= proj * vj;
+            }
+
+            // Normalize
+            real_t norm = vi.norm();
+
+            if (norm < 1e-12) {
+                if (config_.verbose > 0) {
+                    std::cout << "Warning: Linear dependence detected in vector "
+                             << i << ", replacing with random vector" << std::endl;
+                }
+                std::vector<real_t> h_random(dim_);
+                std::mt19937_64 rng(1234ULL + i);
+                std::normal_distribution<real_t> dist(0.0, 1.0);
+                for (int k = 0; k < dim_; ++k) {
+                    h_random[k] = dist(rng);
+                }
+                cudaMemcpy(vec_i, h_random.data(), dim_ * sizeof(real_t), cudaMemcpyHostToDevice);
+
+                orthogonalize_vectors(i, 1);
+                continue;
+            }
+
+            vi *= 1.0 / norm;
+        }
+        return;
+    }
+
+    // GPU implementation
     cublasHandle_t handle = gansu::gpu::GPUHandle::cublas();
 
     for (int i = start_index; i < start_index + num_vectors; ++i) {
@@ -493,6 +538,27 @@ void DavidsonSolver::orthogonalize_vectors(int start_index, int num_vectors) {
 // ========== Subspace Matrix Construction ==========
 
 void DavidsonSolver::build_subspace_matrix() {
+    using Eigen::Map;
+    using Eigen::MatrixXd;
+
+    if (!gpu::gpu_available()) {
+        // CPU implementation using Eigen
+        // V and Sigma are column-major: dim_ × subspace_dim_
+        Map<MatrixXd> V(d_subspace_vectors_, dim_, subspace_dim_);
+        Map<MatrixXd> S(d_sigma_vectors_, dim_, subspace_dim_);
+        Map<MatrixXd> H(d_subspace_matrix_, subspace_dim_, subspace_dim_);
+
+        // H = V^T * Sigma
+        H.noalias() = V.transpose() * S;
+
+        // Symmetrize H = (H + H^T) / 2
+        if (config_.symmetric && subspace_dim_ > 1) {
+            H = (H + H.transpose().eval()) * 0.5;
+        }
+        return;
+    }
+
+    // GPU implementation
     cublasHandle_t handle = gansu::gpu::GPUHandle::cublas();
 
     // Compute H = V^T * Σ using DGEMM (single cuBLAS call)
@@ -577,6 +643,39 @@ void DavidsonSolver::solve_subspace_eigenproblem() {
 // ========== Ritz Vectors and Residuals ==========
 
 void DavidsonSolver::compute_ritz_vectors_and_residuals() {
+    using Eigen::Map;
+    using Eigen::VectorXd;
+    using Eigen::MatrixXd;
+
+    if (!gpu::gpu_available()) {
+        // CPU implementation using Eigen
+        // Subspace vectors: column-major dim_ × subspace_dim_
+        Map<MatrixXd> V(d_subspace_vectors_, dim_, subspace_dim_);
+        Map<MatrixXd> Sigma(d_sigma_vectors_, dim_, subspace_dim_);
+
+        for (int i = 0; i < config_.num_eigenvalues; ++i) {
+            // Eigenvector i: starts at index i, stride = subspace_dim_ (column i in col-major layout)
+            Map<VectorXd, 0, Eigen::InnerStride<>> ci(&d_subspace_eigenvectors_[i], subspace_dim_,
+                             Eigen::InnerStride<>(subspace_dim_));
+
+            // Ritz vector: ψ_i = V * c_i
+            Map<VectorXd> psi(&d_eigenvectors_[static_cast<size_t>(i) * dim_], dim_);
+            psi.noalias() = V * ci;
+
+            // Hψ_i = Sigma * c_i
+            Map<VectorXd> res(&d_residuals_[static_cast<size_t>(i) * dim_], dim_);
+            res.noalias() = Sigma * ci;
+
+            // Residual: r_i = Hψ_i - λ_i * ψ_i
+            res -= h_eigenvalues_[i] * psi;
+
+            // Residual norm
+            residual_norms_[i] = res.norm();
+        }
+        return;
+    }
+
+    // GPU implementation
     cublasHandle_t handle = gansu::gpu::GPUHandle::cublas();
 
     for (int i = 0; i < config_.num_eigenvalues; ++i) {
@@ -638,6 +737,65 @@ bool DavidsonSolver::check_convergence() {
 // ========== Correction Vectors ==========
 
 void DavidsonSolver::add_correction_vectors() {
+    using Eigen::Map;
+    using Eigen::VectorXd;
+
+    if (!gpu::gpu_available()) {
+        // CPU implementation using Eigen
+        const real_t* diagonal = linear_op_.get_diagonal_device();
+        int num_new_vectors = 0;
+
+        for (int i = 0; i < config_.num_eigenvalues; ++i) {
+            if (config_.min_eigenvalue > 0.0 && h_eigenvalues_[i] < config_.min_eigenvalue) {
+                continue;
+            }
+            if (residual_norms_[i] > config_.convergence_threshold) {
+                if (subspace_dim_ + num_new_vectors >= config_.max_subspace_size) {
+                    break;
+                }
+
+                real_t* correction = &d_subspace_vectors_[static_cast<size_t>(subspace_dim_ + num_new_vectors) * dim_];
+                const real_t* residual = &d_residuals_[static_cast<size_t>(i) * dim_];
+
+                if (config_.use_preconditioner && diagonal != nullptr) {
+                    // Davidson-Jacobi correction: δ[j] = -r[j] / (H_jj - θ_i)
+                    real_t eigenvalue = h_eigenvalues_[i];
+                    for (int j = 0; j < dim_; ++j) {
+                        real_t denom = diagonal[j] - eigenvalue;
+                        correction[j] = (std::fabs(denom) > 1e-12) ? -residual[j] / denom : 0.0;
+                    }
+                } else if (config_.use_preconditioner) {
+                    linear_op_.apply_preconditioner(residual, correction);
+                } else {
+                    cudaMemcpy(correction, residual,
+                              dim_ * sizeof(real_t), cudaMemcpyDeviceToDevice);
+                }
+
+                // Normalize correction vector
+                Map<VectorXd> corr_vec(correction, dim_);
+                real_t norm = corr_vec.norm();
+
+                if (norm > 1e-12) {
+                    corr_vec *= 1.0 / norm;
+                    num_new_vectors++;
+                }
+            }
+        }
+
+        if (num_new_vectors > 0) {
+            orthogonalize_vectors(subspace_dim_, num_new_vectors);
+            subspace_dim_ += num_new_vectors;
+
+            if (config_.verbose > 2) {
+                std::cout << "Added " << num_new_vectors
+                         << " correction vectors (subspace dim: "
+                         << subspace_dim_ << ")" << std::endl;
+            }
+        }
+        return;
+    }
+
+    // GPU implementation
     cublasHandle_t handle = gansu::gpu::GPUHandle::cublas();
     const real_t* d_diagonal = linear_op_.get_diagonal_device();
     int num_new_vectors = 0;
@@ -700,10 +858,47 @@ void DavidsonSolver::add_correction_vectors() {
 // ========== Subspace Restart ==========
 
 void DavidsonSolver::restart_subspace() {
+    using Eigen::Map;
+    using Eigen::VectorXd;
+    using Eigen::MatrixXd;
+
     // Keep 2*num_eigenvalues Ritz vectors (or all if subspace is small)
     // This preserves more spectral information across restarts
-    cublasHandle_t handle = gansu::gpu::GPUHandle::cublas();
     int num_keep = std::min(2 * config_.num_eigenvalues, subspace_dim_);
+
+    if (!gpu::gpu_available()) {
+        // CPU implementation using Eigen
+        real_t* temp;
+        tracked_cudaMalloc(&temp, static_cast<size_t>(dim_) * num_keep * sizeof(real_t));
+
+        // Copy already-computed Ritz vectors for the first num_eigenvalues
+        int n_from_eigvecs = std::min(config_.num_eigenvalues, num_keep);
+        cudaMemcpy(temp, d_eigenvectors_,
+                   static_cast<size_t>(dim_) * n_from_eigvecs * sizeof(real_t),
+                   cudaMemcpyDeviceToDevice);
+
+        // Compute additional Ritz vectors using Eigen
+        Map<MatrixXd> V(d_subspace_vectors_, dim_, subspace_dim_);
+        for (int i = n_from_eigvecs; i < num_keep; ++i) {
+            // Eigenvector i: starts at index i, stride = subspace_dim_
+            Map<VectorXd, 0, Eigen::InnerStride<>> ci(&d_subspace_eigenvectors_[i], subspace_dim_,
+                             Eigen::InnerStride<>(subspace_dim_));
+            Map<VectorXd> out(&temp[static_cast<size_t>(i) * dim_], dim_);
+            out.noalias() = V * ci;
+        }
+
+        // Copy back to subspace
+        cudaMemcpy(d_subspace_vectors_, temp,
+                   static_cast<size_t>(dim_) * num_keep * sizeof(real_t),
+                   cudaMemcpyDeviceToDevice);
+        tracked_cudaFree(temp);
+
+        subspace_dim_ = num_keep;
+        return;
+    }
+
+    // GPU implementation
+    cublasHandle_t handle = gansu::gpu::GPUHandle::cublas();
 
     // Allocate temporary buffer
     real_t* d_temp;

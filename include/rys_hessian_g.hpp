@@ -30,6 +30,19 @@ __global__ void Rys_compute_hessian_two_electron(
     const int num_atoms,
     const double* g_boys_grid);
 
+// CPU host-callable mirror.
+void Rys_compute_hessian_two_electron_cpu(
+    double* g_hessian,
+    const real_t* g_density_matrix,
+    const PrimitiveShell* g_shell,
+    const real_t* g_cgto_normalization_factors,
+    const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1,
+    const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3,
+    const size_t num_threads,
+    const int num_basis,
+    const int num_atoms,
+    const double* g_boys_grid);
+
 } // namespace gansu::gpu
 
 #endif // RYS_HESSIAN_G_HPP

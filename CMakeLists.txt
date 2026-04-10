@@ -44,6 +44,20 @@ if(ENABLE_GPU)
     # Enable line info and debug info for CUDA when in Debug mode
     set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -lineinfo")
     set(CMAKE_CUDA_STANDARD 17)
+    # --- Suppress Eigen/CUDA interop warnings ---
+    # Eigen headers included from .cu files (for the CPU fallback paths) trigger
+    # spurious NVCC diagnostics because Eigen marks some methods __host__ __device__
+    # via EIGEN_DEVICE_FUNC but the full template instantiation pulls in plain
+    # __host__ helpers.  These code paths are never reached from actual CUDA
+    # kernels (they only run inside `if (!gpu_available())` branches on the host),
+    # so the warnings are false positives.
+    #
+    #   20011/20014: calling a __host__ function from a __host__ __device__ function
+    #   20012      : __host__ annotation on a defaulted function (legacy suppression)
+    #   20013/20015: constexpr variants of the above; Eigen suggests
+    #                --expt-relaxed-constexpr to allow, which we enable below.
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -diag-suppress=20011,20012,20013,20014,20015")
 else()
     add_definitions(-DGANSU_CPU_ONLY)
 endif()
@@ -237,6 +251,7 @@ target_link_libraries(HF_main gansu)
 # ============================================================================
 option(BUILD_TESTS "Build the test suite" OFF)
 if(BUILD_TESTS)
+    enable_testing()
     add_subdirectory(test)
 endif()
 

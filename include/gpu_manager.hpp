@@ -45,6 +45,9 @@ bool gpu_available();
 /// Force CPU-only mode (disable GPU even if available).
 void disable_gpu();
 
+/// Re-enable GPU detection (reset and re-detect).
+void enable_gpu();
+
 
 // prototype declarations
 void invertSqrtElements(real_t* d_vectors, const size_t size, const double threshold=1e-6);
@@ -153,6 +156,9 @@ void computeFockMatrix_Hash_FullScan_RHF(const real_t* d_density_matrix, const r
 void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_t* d_coefficient_matrix, const real_t* d_L_inv,  real_t* d_decomposed_two_center_eris, const real_t* d_core_hamiltonian_matrix,  real_t* d_fock_matrix,  real_t* d_coefficient_matrix_prev, real_t* h_Z_tensor_prev, const std::vector<ShellTypeInfo>& shell_type_infos,  const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,  const PrimitiveShell* h_primitive_shells,  const PrimitiveShell* d_primitive_shells,  const real_t* d_cgto_normalization_factors,  const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,  const PrimitiveShell* d_auxiliary_primitive_shells,  const real_t* d_auxiliary_cgto_normalization_factors,  const size_t2* d_primitive_shell_pair_indices, const int num_basis, const int num_auxiliary_basis, const int num_electrons, const int num_primitive_shells, const real_t* d_boys_grid, const double schwarz_screening_threshold,  const real_t* d_schwarz_upper_bound_factors, const real_t* d_auxiliary_schwarz_upper_bound_factors,const bool verbose);
 void computeInverseByDtrsm(real_t* two_center_eris, real_t* two_center_eris_inverse, int num_auxiliary_basis);
 
+/// Solve L * X = B in place (B is overwritten with X). L is row x row lower triangular, B is row x col.
+void solve_lower_triangular(double* d_A, double* d_B, int row, int col);
+
 /// Semi-Direct RI Fock build (RHF): computes 3-center ERIs ONCE per iteration into temporary B, then BLAS-only J/K.
 void computeFockMatrix_RI_Direct_v2(
     const real_t* d_density_matrix, const real_t* d_coefficient_matrix,
@@ -212,8 +218,8 @@ public:
           cusolverParams(createCusolverDnParams()){}
 
     ~cusolverManager() {
-        cusolverDnDestroy(cusolverHandle);
-        cusolverDnDestroyParams(cusolverParams);
+        if (cusolverHandle) cusolverDnDestroy(cusolverHandle);
+        if (cusolverParams) cusolverDnDestroyParams(cusolverParams);
     }
     
 private:
@@ -222,7 +228,7 @@ private:
      * @return A valid cuSOLVER handle.
      */
      static cusolverDnHandle_t createCusolverHandle() {
-//        PROFILE_FUNCTION(Initialize_cuSOLVER);
+        if (!gpu_available()) return nullptr;
 
         cusolverDnHandle_t handle;
         if (cusolverDnCreate(&handle) != CUSOLVER_STATUS_SUCCESS) {
@@ -236,7 +242,7 @@ private:
      * @return A valid cuSOLVER handle.
      */
     static cusolverDnParams_t createCusolverDnParams() {
-//        PROFILE_FUNCTION(Initialize_cuSOLVER);
+        if (!gpu_available()) return nullptr;
 
         cusolverDnParams_t params;
         if (cusolverDnCreateParams(&params) != CUSOLVER_STATUS_SUCCESS) {
@@ -259,16 +265,12 @@ public:
     cublasManager(): cublasHandle(createcublasHandle()) {}
 
     ~cublasManager() {
-        cublasDestroy(cublasHandle);
+        if (cublasHandle) cublasDestroy(cublasHandle);
     }
 
 private:
-    /**
-     * @brief Helper function to create and initialize a cuBLAS handle.
-     * @return A valid cuBLAS handle.
-     */
      static cublasHandle_t createcublasHandle() {
-//        PROFILE_FUNCTION(Initialize_cuBLAS);
+        if (!gpu_available()) return nullptr;
 
         cublasHandle_t handle;
         if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {

@@ -20,6 +20,7 @@
 #include "gpu_manager.hpp"
 #include "ao2mo.cuh"
 #include <cassert>
+#include <cmath>
 #ifndef GANSU_CPU_ONLY
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
@@ -29,11 +30,13 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/tuple.h>
-#else
+#endif
+
 #include <algorithm>
 #include <numeric>
 
-// CPU replacement for thrust::sort_by_key (descending order)
+// CPU replacement for thrust::sort_by_key (descending order).
+// Always defined so runtime (ENABLE_GPU=ON + --cpu) can use it too.
 template <typename KeyT, typename ValueT>
 void cpu_sort_by_key_descending(KeyT* keys, ValueT* values, size_t count) {
     std::vector<size_t> indices(count);
@@ -51,6 +54,7 @@ void cpu_sort_by_key_descending(KeyT* keys, ValueT* values, size_t count) {
     std::copy(sorted_values.begin(), sorted_values.end(), values);
 }
 
+#ifdef GANSU_CPU_ONLY
 // CPU replacement for thrust::sort_by_key (ascending, using operator<)
 template <typename KeyT, typename ValueT>
 void cpu_sort_by_key_ascending(KeyT* keys, ValueT* values, size_t count) {
@@ -249,18 +253,16 @@ void ERI_RI::reconstruct_ao_eri() {
 
     tracked_cudaMalloc(&d_eri_reconstructed_, required_bytes);
 
-    // ERI[nao^2 x nao^2] = B^T * B  where B is (naux x nao^2) row-major
-    // cuBLAS column-major: B_cm is (nao^2 x naux), so ERI_cm = B_cm * B_cm^T
-    const double alpha = 1.0, beta = 0.0;
-    cublasHandle_t handle = gpu::GPUHandle::cublas();
-    cublasDgemm(handle,
-        CUBLAS_OP_N, CUBLAS_OP_T,
-        nao2, nao2, num_auxiliary_basis_,
-        &alpha,
-        intermediate_matrix_B_.device_ptr(), nao2,
-        intermediate_matrix_B_.device_ptr(), nao2,
-        &beta,
-        d_eri_reconstructed_, nao2);
+    // ERI[nao^2 x nao^2] = B^T * B  where B is (naux x nao^2) row-major.
+    // matrixMatrixProductRect handles both GPU (cuBLAS) and CPU (Eigen) paths.
+    // Row-major view: ERI_rm(nao², nao²) = B_rm^T(nao², naux) * B_rm(naux, nao²)
+    gpu::matrixMatrixProductRect(
+        intermediate_matrix_B_.device_ptr(),   // (naux, nao²) row-major
+        intermediate_matrix_B_.device_ptr(),   // (naux, nao²) row-major
+        d_eri_reconstructed_,                  // (nao², nao²) row-major
+        (int)nao2, (int)nao2, num_auxiliary_basis_,
+        /*transpose_A=*/true, /*transpose_B=*/false,
+        /*accumulate=*/false, /*alpha=*/1.0);
     cudaDeviceSynchronize();
 
     eri_reconstructed_ = true;
@@ -280,11 +282,81 @@ real_t* ERI::build_mo_eri(const real_t* d_C, int nmo) const {
     if (!d_eri_ao) {
         THROW_EXCEPTION("build_mo_eri: no AO ERI available for this ERI method.");
     }
-    const size_t n4 = (size_t)nmo * nmo * nmo * nmo;
-    real_t* d_eri_work = nullptr;
+    const size_t N = nmo;
+    const size_t n4 = N * N * N * N;
     real_t* d_eri_mo = nullptr;
-    tracked_cudaMalloc(&d_eri_work, n4 * sizeof(real_t));
     tracked_cudaMalloc(&d_eri_mo, n4 * sizeof(real_t));
+
+    if (!gpu::gpu_available()) {
+        // CPU: 4-index AO→MO transform using O(N^5) algorithm
+        // (pq|rs) = sum_{mu,nu,la,si} C(mu,p)*C(nu,q)*(mu nu|la si)*C(la,r)*C(si,s)
+        // Step-by-step quarter transforms to keep O(N^5):
+        // Step 1: (mu nu|la s) = sum_si (mu nu|la si) * C(si,s)
+        real_t* tmp1 = nullptr;
+        real_t* tmp2 = nullptr;
+        tracked_cudaMalloc(&tmp1, n4 * sizeof(real_t));
+        tracked_cudaMalloc(&tmp2, n4 * sizeof(real_t));
+
+        // Step 1: contract 4th index: tmp1(mu,nu,la,s) = sum_si eri(mu,nu,la,si) * C(si,s)
+        std::memset(tmp1, 0, n4 * sizeof(real_t));
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t mu = 0; mu < N; mu++)
+            for (size_t nu = 0; nu < N; nu++)
+                for (size_t la = 0; la < N; la++)
+                    for (size_t s = 0; s < N; s++) {
+                        double val = 0.0;
+                        for (size_t si = 0; si < N; si++)
+                            val += d_eri_ao[mu*N*N*N + nu*N*N + la*N + si] * d_C[si*N + s];
+                        tmp1[mu*N*N*N + nu*N*N + la*N + s] = val;
+                    }
+
+        // Step 2: contract 3rd index: tmp2(mu,nu,r,s) = sum_la tmp1(mu,nu,la,s) * C(la,r)
+        std::memset(tmp2, 0, n4 * sizeof(real_t));
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t mu = 0; mu < N; mu++)
+            for (size_t nu = 0; nu < N; nu++)
+                for (size_t r = 0; r < N; r++)
+                    for (size_t s = 0; s < N; s++) {
+                        double val = 0.0;
+                        for (size_t la = 0; la < N; la++)
+                            val += tmp1[mu*N*N*N + nu*N*N + la*N + s] * d_C[la*N + r];
+                        tmp2[mu*N*N*N + nu*N*N + r*N + s] = val;
+                    }
+
+        // Step 3: contract 2nd index: tmp1(mu,q,r,s) = sum_nu tmp2(mu,nu,r,s) * C(nu,q)
+        std::memset(tmp1, 0, n4 * sizeof(real_t));
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t mu = 0; mu < N; mu++)
+            for (size_t q = 0; q < N; q++)
+                for (size_t r = 0; r < N; r++)
+                    for (size_t s = 0; s < N; s++) {
+                        double val = 0.0;
+                        for (size_t nu = 0; nu < N; nu++)
+                            val += tmp2[mu*N*N*N + nu*N*N + r*N + s] * d_C[nu*N + q];
+                        tmp1[mu*N*N*N + q*N*N + r*N + s] = val;
+                    }
+
+        // Step 4: contract 1st index: eri_mo(p,q,r,s) = sum_mu tmp1(mu,q,r,s) * C(mu,p)
+        std::memset(d_eri_mo, 0, n4 * sizeof(real_t));
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t p = 0; p < N; p++)
+            for (size_t q = 0; q < N; q++)
+                for (size_t r = 0; r < N; r++)
+                    for (size_t s = 0; s < N; s++) {
+                        double val = 0.0;
+                        for (size_t mu = 0; mu < N; mu++)
+                            val += d_C[mu*N + p] * tmp1[mu*N*N*N + q*N*N + r*N + s];
+                        d_eri_mo[p*N*N*N + q*N*N + r*N + s] = val;
+                    }
+
+        tracked_cudaFree(tmp1);
+        tracked_cudaFree(tmp2);
+        return d_eri_mo;
+    }
+
+    // GPU path
+    real_t* d_eri_work = nullptr;
+    tracked_cudaMalloc(&d_eri_work, n4 * sizeof(real_t));
     cudaMemcpy(d_eri_work, d_eri_ao, n4 * sizeof(real_t), cudaMemcpyDeviceToDevice);
     transform_eri_ao2mo_dgemm_full(d_eri_work, d_eri_mo, d_C, nmo);
     tracked_cudaFree(d_eri_work);
@@ -347,6 +419,12 @@ void ERI_RI::compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const 
 }
 
 real_t* ERI_RI::build_mo_eri(const real_t* d_C, int nmo) const {
+    // CPU fallback: delegate to the base-class implementation which uses
+    // get_eri_matrix_device() (via reconstruct_ao_eri) + O(N^5) quarter transform.
+    if (!gpu::gpu_available()) {
+        return ERI::build_mo_eri(d_C, nmo);
+    }
+
     // Build MO ERI directly: B(Q,μν) → B_mo(Q,pq) → (pq|rs) = B_mo^T B_mo
     // Avoids the nao⁴ AO ERI intermediate.
     //
@@ -488,27 +566,49 @@ void ERI_RI::precomputation() {
 
     const size_t num_primitive_shell_pairs = primitive_shells.size() * (primitive_shells.size() + 1) / 2;
     size_t2* d_primitive_shell_pair_indices;
-    cudaMalloc((void**)&d_primitive_shell_pair_indices, sizeof(size_t2) * num_primitive_shell_pairs);
+    // Use tracked_cudaMalloc so hybrid --cpu mode falls back to host calloc.
+    tracked_cudaMalloc(&d_primitive_shell_pair_indices, sizeof(size_t2) * num_primitive_shell_pairs);
 
     int pair_idx = 0;
     const int threads_per_block = 1024;
     for(int s0 = 0; s0 < shell_type_infos.size(); s0++){
         for(int s1 = s0; s1 < shell_type_infos.size(); s1++){
-            const int num_blocks = (shell_pair_type_infos[pair_idx].count + threads_per_block - 1) / threads_per_block; // the number of blocks
-            generatePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index], shell_pair_type_infos[pair_idx].count, s0 == s1, shell_type_infos[s1].count);
+            const size_t count = shell_pair_type_infos[pair_idx].count;
+            const size_t start = shell_pair_type_infos[pair_idx].start_index;
 
-
-#ifdef GANSU_CPU_ONLY
-            cpu_sort_by_key_descending(
-                &schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index],
-                &d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index],
-                shell_pair_type_infos[pair_idx].count);
-#else
-            thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);
-            thrust::device_ptr<real_t> keys_end(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index] + shell_pair_type_infos[pair_idx].count);
-            thrust::device_ptr<size_t2> values_begin(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index]);
-            thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+#ifndef GANSU_CPU_ONLY
+            if (gpu::gpu_available()) {
+                const int num_blocks = (count + threads_per_block - 1) / threads_per_block;
+                generatePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&d_primitive_shell_pair_indices[start], count, s0 == s1, shell_type_infos[s1].count);
+                thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[start]);
+                thrust::device_ptr<real_t> keys_end(&schwarz_upper_bound_factors.device_ptr()[start] + count);
+                thrust::device_ptr<size_t2> values_begin(&d_primitive_shell_pair_indices[start]);
+                thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+            } else
 #endif
+            {
+                // === CPU path: generate indices in original order, skip Schwarz sort ===
+                // In CPU mode schwarz_upper_bound_factors are all 1.0 (no screening),
+                // so a sort would only scramble primitives to no effect.  Leave them
+                // in basis-index order so group_contracted_shells sees them in the
+                // same sequence as the untouched GPU case (important for determinism).
+                size_t2* h_pair = &d_primitive_shell_pair_indices[start];
+                const bool is_symmetric = (s0 == s1);
+                const size_t ns1 = shell_type_infos[s1].count;
+                for (size_t id = 0; id < count; ++id) {
+                    size_t r1, r2;
+                    if (is_symmetric) {
+                        r2 = (size_t)((std::sqrt(8.0 * (double)id + 1.0) - 1.0) / 2.0);
+                        while ((r2 + 1) * (r2 + 2) / 2 <= id) ++r2;
+                        while (r2 > 0 && r2 * (r2 + 1) / 2 > id) --r2;
+                        r1 = id - r2 * (r2 + 1) / 2;
+                    } else {
+                        r1 = id / ns1;
+                        r2 = id % ns1;
+                    }
+                    h_pair[id] = {r1, r2};
+                }
+            }
 
             pair_idx++;
         }
@@ -520,25 +620,23 @@ void ERI_RI::precomputation() {
 
     // compute upper bounds of  aux-shell
     gpu::computeAuxiliarySchwarzUpperBounds(
-        auxiliary_shell_type_infos_, 
-        auxiliary_primitive_shells_.device_ptr(), 
-        boys_grid.device_ptr(), 
-        auxiliary_cgto_normalization_factors_.device_ptr(), 
+        auxiliary_shell_type_infos_,
+        auxiliary_primitive_shells_.device_ptr(),
+        boys_grid.device_ptr(),
+        auxiliary_cgto_normalization_factors_.device_ptr(),
         auxiliary_schwarz_upper_bound_factors.device_ptr(),   // auxiliary_schwarz_upper_bound_factorsに√(pq|pq)の値がはいっている
         verbose
     );
 
     for(const auto& s : auxiliary_shell_type_infos_){
-#ifdef GANSU_CPU_ONLY
-        cpu_sort_by_key_descending(
-            &auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index],
-            &auxiliary_primitive_shells_.device_ptr()[s.start_index],
-            s.count);
-#else
-        thrust::device_ptr<real_t> keys_begin(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index]);
-        thrust::device_ptr<real_t> keys_end(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index] + s.count);
-        thrust::device_ptr<PrimitiveShell> values_begin(&auxiliary_primitive_shells_.device_ptr()[s.start_index]);
-        thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+#ifndef GANSU_CPU_ONLY
+        if (gpu::gpu_available()) {
+            thrust::device_ptr<real_t> keys_begin(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index]);
+            thrust::device_ptr<real_t> keys_end(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index] + s.count);
+            thrust::device_ptr<PrimitiveShell> values_begin(&auxiliary_primitive_shells_.device_ptr()[s.start_index]);
+            thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+        }
+        // CPU path: skip sort (all Schwarz bounds = 1.0 in the stub).
 #endif
     }
 
@@ -548,46 +646,27 @@ void ERI_RI::precomputation() {
                (size_t)num_auxiliary_basis_ * num_basis_ * num_basis_ * sizeof(real_t));
 
     gpu::compute_RI_IntermediateMatrixB(
-        shell_type_infos, 
+        shell_type_infos,
         shell_pair_type_infos,
-        primitive_shells.device_ptr(), 
-        cgto_normalization_factors.device_ptr(), 
-        auxiliary_shell_type_infos_, 
-        auxiliary_primitive_shells_.device_ptr(), 
-        auxiliary_cgto_normalization_factors_.device_ptr(), 
-        intermediate_matrix_B_.device_ptr(), 
+        primitive_shells.device_ptr(),
+        cgto_normalization_factors.device_ptr(),
+        auxiliary_shell_type_infos_,
+        auxiliary_primitive_shells_.device_ptr(),
+        auxiliary_cgto_normalization_factors_.device_ptr(),
+        intermediate_matrix_B_.device_ptr(),
         d_primitive_shell_pair_indices,
         schwarz_upper_bound_factors.device_ptr(),
         auxiliary_schwarz_upper_bound_factors.device_ptr(),
         schwarz_screening_threshold,
-        num_basis_, 
-        num_auxiliary_basis_, 
-        boys_grid.device_ptr(), 
+        num_basis_,
+        num_auxiliary_basis_,
+        boys_grid.device_ptr(),
         verbose
-        );    
+        );
 
 
-    cudaFree(d_primitive_shell_pair_indices);
+    tracked_cudaFree(d_primitive_shell_pair_indices);
     cudaDeviceSynchronize();
-    /*
-    if(1){
-        // copy the intermediate matrix B to the host memory
-        intermediate_matrix_B_.toHost();
-
-        std::cout << "Intermediate matrix B:" << std::endl;
-        for(int i=0; i<num_auxiliary_basis_; i++){
-            for(int j=0; j<num_basis_; j++){
-                for(int k=0; k<num_basis_; k++){
-                    auto value = intermediate_matrix_B_(i, j*num_basis_+k);
-                    if (std::isnan(value)) {
-                        std::cout << "NaN found at (" << i << "," << j << "): " << value << std::endl;
-                    }
-                }
-                std::cout << std::endl;
-            }
-        }
-    }
-    */
 }
 
 
@@ -740,24 +819,54 @@ void ERI_Direct::precomputation()
     const int threads_per_block = 1024;
     for(int s0 = 0; s0 < shell_type_infos.size(); s0++){
         for(int s1 = s0; s1 < shell_type_infos.size(); s1++){
-            const int num_blocks = (shell_pair_type_infos[pair_idx].count + threads_per_block - 1) / threads_per_block; // the number of blocks
-            //initializePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index], shell_pair_type_infos[pair_idx].count, s0 == s1, shell_type_infos[s1].count);
-            initializePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index], shell_pair_type_infos[pair_idx].count, s0 == s1, shell_type_infos[s1].count, shell_type_infos[s0].start_index, shell_type_infos[s1].start_index);
-#ifdef GANSU_CPU_ONLY
-            cpu_sort_by_key_descending(
-                &schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index],
-                &d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index],
-                shell_pair_type_infos[pair_idx].count);
-#else
-            thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);
-            thrust::device_ptr<real_t> keys_end(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index] + shell_pair_type_infos[pair_idx].count);
-            thrust::device_ptr<int2> values_begin(&d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index]);
-            thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+            const size_t count = shell_pair_type_infos[pair_idx].count;
+            const size_t start = shell_pair_type_infos[pair_idx].start_index;
+
+#ifndef GANSU_CPU_ONLY
+            if (gpu::gpu_available()) {
+                const int num_blocks = (count + threads_per_block - 1) / threads_per_block;
+                initializePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&d_primitive_shell_pair_indices[start], count, s0 == s1, shell_type_infos[s1].count, shell_type_infos[s0].start_index, shell_type_infos[s1].start_index);
+                thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[start]);
+                thrust::device_ptr<real_t> keys_end(&schwarz_upper_bound_factors.device_ptr()[start] + count);
+                thrust::device_ptr<int2> values_begin(&d_primitive_shell_pair_indices[start]);
+                thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+            } else
 #endif
+            {
+                // === CPU path: generate indices on host, skip Schwarz sort ===
+                // In CPU mode schwarz_upper_bound_factors are 1.0 stubs so
+                // sorting is meaningless and std::sort could scramble order.
+                int2* h_pair = &d_primitive_shell_pair_indices[start];
+                const bool is_symmetric = (s0 == s1);
+                const size_t ns1 = shell_type_infos[s1].count;
+                const size_t off_a = shell_type_infos[s0].start_index;
+                const size_t off_b = shell_type_infos[s1].start_index;
+                for (size_t id = 0; id < count; ++id) {
+                    size_t r1, r2;
+                    if (is_symmetric) {
+                        r2 = (size_t)((std::sqrt(8.0 * (double)id + 1.0) - 1.0) / 2.0);
+                        while ((r2 + 1) * (r2 + 2) / 2 <= id) ++r2;
+                        while (r2 > 0 && r2 * (r2 + 1) / 2 > id) --r2;
+                        r1 = id - r2 * (r2 + 1) / 2;
+                    } else {
+                        r1 = id / ns1;
+                        r2 = id % ns1;
+                    }
+                    h_pair[id] = make_int2((int)(r1 + off_a), (int)(r2 + off_b));
+                }
+            }
             pair_idx++;
         }
     }
     cudaDeviceSynchronize();
+
+    // === CPU fallback: build the full 4D AO ERI tensor once ===
+    // Direct SCF on GPU avoids storing the ERI for memory reasons, but on CPU
+    // we fall back to the stored-ERI Fock path.  reconstruct_ao_eri() already
+    // runs through gpu::computeERIMatrix which has a CPU implementation.
+    if (!gpu::gpu_available()) {
+        reconstruct_ao_eri();
+    }
 }
 
 
@@ -776,6 +885,7 @@ ERI_Hash::ERI_Hash(const HF& hf):
 }
 
 ERI_Hash::~ERI_Hash() {
+    if (d_eri_cpu_tensor_) tracked_cudaFree(d_eri_cpu_tensor_);
     if (d_coo_keys_) tracked_cudaFree(d_coo_keys_);
     if (d_coo_values_) tracked_cudaFree(d_coo_values_);
     if (d_hash_keys_) tracked_cudaFree(d_hash_keys_);
@@ -801,6 +911,14 @@ __global__ void hash_coo_to_dense_kernel(
     size_t num_entries, double* g_eri_dense, int nao);
 
 real_t* ERI_Hash::build_mo_eri(const real_t* d_C, int nmo) const {
+    // CPU fallback: on CPU we skip the hash machinery entirely (see
+    // ERI_Hash::precomputation) and cache the full AO ERI tensor in
+    // d_eri_cpu_tensor_.  The base class build_mo_eri will pick it up
+    // via get_eri_matrix_device() and run the O(N^5) transform.
+    if (!gpu::gpu_available()) {
+        return ERI::build_mo_eri(d_C, nmo);
+    }
+
     const size_t n4 = (size_t)nmo * nmo * nmo * nmo;
 
     // Step 1: COO → dense AO ERI (O(nnz) expansion)
@@ -833,6 +951,35 @@ void ERI_Hash::precomputation() {
     const DeviceHostMemory<real_t>& boys_grid = hf_.get_boys_grid();
     const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
     const int verbose = hf_.get_verbose();
+
+    // === CPU fallback: skip hash construction and build the full 4D tensor ===
+    // The hash-table machinery below uses raw CUDA kernels that are not
+    // exercised on CPU.  Instead, compute the dense AO ERI tensor once
+    // via gpu::computeERIMatrix (which already has a CPU implementation)
+    // and let ERI_Hash_RHF::compute_fock_matrix() reuse the stored-ERI path.
+    if (!gpu::gpu_available()) {
+        const size_t nao2 = (size_t)num_basis_ * num_basis_;
+        const size_t tensor_bytes = nao2 * nao2 * sizeof(real_t);
+        tracked_cudaMalloc(&d_eri_cpu_tensor_, tensor_bytes);
+        cudaMemset(d_eri_cpu_tensor_, 0, tensor_bytes);
+
+        DeviceHostMemory<real_t> schwarz_unsorted(hf_.get_num_primitive_shell_pairs());
+        gpu::computeSchwarzUpperBounds(
+            shell_type_infos, shell_pair_type_infos,
+            primitive_shells.device_ptr(), boys_grid.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
+            schwarz_unsorted.device_ptr(), verbose);
+
+        gpu::computeERIMatrix(
+            shell_type_infos, shell_pair_type_infos,
+            primitive_shells.device_ptr(), boys_grid.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
+            d_eri_cpu_tensor_, schwarz_unsorted.device_ptr(),
+            schwarz_screening_threshold, num_basis_, verbose);
+
+        // Leave the hash-related members null/zero; they are unused in CPU mode.
+        return;
+    }
 
     // Compute Schwarz upper bounds
     DeviceHostMemory<real_t> schwarz_upper_bound_factors(hf_.get_num_primitive_shell_pairs());
@@ -1010,11 +1157,47 @@ ERI_RI_Direct::ERI_RI_Direct(const HF& hf, const Molecular& auxiliary_molecular)
     two_center_eris_inverse(num_auxiliary_basis_ * num_auxiliary_basis_), 
     primitive_shell_pair_indices(hf_.get_primitive_shells().size() * (hf_.get_primitive_shells().size() + 1) / 2),
     schwarz_upper_bound_factors_for_SAD_K_computation((hf_.get_initial_guess_algorithm_name() == "sad") ? hf_.get_primitive_shells().size() * hf_.get_primitive_shells().size() : 0),
-    primitive_shell_pair_indices_for_SAD_K_computation((hf_.get_initial_guess_algorithm_name() == "sad") ? hf_.get_primitive_shells().size() * hf_.get_primitive_shells().size() : 0)
+    primitive_shell_pair_indices_for_SAD_K_computation((hf_.get_initial_guess_algorithm_name() == "sad") ? hf_.get_primitive_shells().size() * hf_.get_primitive_shells().size() : 0),
+    // CPU-only B matrix cache: allocate full size on CPU, 1x1 placeholder on GPU.
+    intermediate_matrix_B_cpu_(
+        gpu::gpu_available() ? 1 : num_auxiliary_basis_,
+        gpu::gpu_available() ? 1 : num_basis_ * num_basis_)
 {
     // to device memory
     auxiliary_primitive_shells_.toDevice();
     auxiliary_cgto_normalization_factors_.toDevice();
+}
+
+ERI_RI_Direct::~ERI_RI_Direct() {
+    if (d_eri_reconstructed_cpu_) {
+        tracked_cudaFree(d_eri_reconstructed_cpu_);
+        d_eri_reconstructed_cpu_ = nullptr;
+    }
+}
+
+const real_t* ERI_RI_Direct::get_eri_matrix_device() const {
+    if (gpu::gpu_available()) {
+        // On GPU the Direct/SemiDirect/Hash variants don't maintain a dense
+        // AO ERI tensor; post-HF methods have their own GPU pipelines.
+        return nullptr;
+    }
+    if (d_eri_reconstructed_cpu_) return d_eri_reconstructed_cpu_;
+
+    // Lazily reconstruct: (μν|λσ) = Σ_Q B(Q,μν) · B(Q,λσ)
+    // where B is intermediate_matrix_B_cpu_ with shape (naux, nao²).
+    const size_t nao2 = (size_t)num_basis_ * num_basis_;
+    const size_t required_bytes = nao2 * nao2 * sizeof(real_t);
+    tracked_cudaMalloc(&d_eri_reconstructed_cpu_, required_bytes);
+
+    gpu::matrixMatrixProductRect(
+        intermediate_matrix_B_cpu_.device_ptr(),
+        intermediate_matrix_B_cpu_.device_ptr(),
+        d_eri_reconstructed_cpu_,
+        (int)nao2, (int)nao2, num_auxiliary_basis_,
+        /*transpose_A=*/true, /*transpose_B=*/false,
+        /*accumulate=*/false, /*alpha=*/1.0);
+
+    return d_eri_reconstructed_cpu_;
 }
 
 
@@ -1036,14 +1219,19 @@ void ERI_RI_Direct::precomputation() {
 
 
     // K計算用のペア配列生成
-    if(schwarz_upper_bound_factors_for_SAD_K_computation.size() > 0){
+    // The SAD-K pre-sort below feeds the GPU computeInitialFockMatrix_RI_Direct_RHF
+    // path which is entirely skipped on CPU (ERI_RI_Direct_RHF::compute_fock_matrix
+    // short-circuits to the cached intermediate_matrix_B_cpu_).  So in CPU mode we
+    // just compute the regular Schwarz bounds (stub = 1.0) and skip the SAD-K work.
+    if(schwarz_upper_bound_factors_for_SAD_K_computation.size() > 0 && gpu::gpu_available()){
+#ifndef GANSU_CPU_ONLY
         size_t num_tasks = num_primitive_shells*num_primitive_shells;
         size_t num_blocks = (num_tasks + threads_per_block - 1) / threads_per_block;
         generatePrimitiveShellPairIndices_for_SAD_K_computation<<<num_blocks, threads_per_block>>>(primitive_shell_pair_indices_for_SAD_K_computation.device_ptr(), primitive_shells.device_ptr(), num_primitive_shells, num_tasks);
-    
+
         // Sort用構造体配列
         ShellPairSorter* d_shell_pair_sorter_for_SAD_K_computation;
-        if(schwarz_upper_bound_factors_for_SAD_K_computation.size() > 0) cudaMalloc((void**)&d_shell_pair_sorter_for_SAD_K_computation, sizeof(ShellPairSorter)*num_tasks);
+        cudaMalloc((void**)&d_shell_pair_sorter_for_SAD_K_computation, sizeof(ShellPairSorter)*num_tasks);
 
 
         // compute upper bounds of primitive-shell-pair
@@ -1051,9 +1239,9 @@ void ERI_RI_Direct::precomputation() {
         gpu::computeSchwarzUpperBounds_for_SAD_K_computation(
             shell_type_infos,
             shell_pair_type_infos,
-            primitive_shells.device_ptr(), 
-            boys_grid.device_ptr(), 
-            cgto_normalization_factors.device_ptr(), 
+            primitive_shells.device_ptr(),
+            boys_grid.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
             schwarz_upper_bound_factors.device_ptr(),   // schwarz_upper_bound_factorsに√(pq|pq)の値がはいっている
             d_shell_pair_sorter_for_SAD_K_computation,
             num_primitive_shells,
@@ -1061,29 +1249,23 @@ void ERI_RI_Direct::precomputation() {
         );
 
         // K計算用のshell-pair配列ソート
-#ifdef GANSU_CPU_ONLY
-        cpu_sort_by_key_ascending(
-            d_shell_pair_sorter_for_SAD_K_computation,
-            primitive_shell_pair_indices_for_SAD_K_computation.device_ptr(),
-            num_tasks);
-#else
         thrust::device_ptr<ShellPairSorter> keys_begin(d_shell_pair_sorter_for_SAD_K_computation);
         thrust::device_ptr<ShellPairSorter> keys_end(d_shell_pair_sorter_for_SAD_K_computation + num_tasks);
         thrust::device_ptr<size_t2> values_begin(primitive_shell_pair_indices_for_SAD_K_computation.device_ptr());
         thrust::sort_by_key(keys_begin, keys_end, values_begin);
-#endif
 
         copySchwarzUpperBoundFactors_for_SAD_K_computation<<<num_blocks, threads_per_block>>>(schwarz_upper_bound_factors_for_SAD_K_computation.device_ptr(), d_shell_pair_sorter_for_SAD_K_computation, num_primitive_shells);
 
         primitive_shell_pair_indices_for_SAD_K_computation.toHost();
         cudaFree(d_shell_pair_sorter_for_SAD_K_computation);
+#endif // !GANSU_CPU_ONLY
     }else{
         gpu::computeSchwarzUpperBounds(
             shell_type_infos,
             shell_pair_type_infos,
-            primitive_shells.device_ptr(), 
-            boys_grid.device_ptr(), 
-            cgto_normalization_factors.device_ptr(), 
+            primitive_shells.device_ptr(),
+            boys_grid.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
             schwarz_upper_bound_factors.device_ptr(),   // schwarz_upper_bound_factorsに√(pq|pq)の値がはいっている
             verbose
         );
@@ -1095,21 +1277,42 @@ void ERI_RI_Direct::precomputation() {
     int pair_idx = 0;
     for(int s0 = 0; s0 < shell_type_infos.size(); s0++){
         for(int s1 = s0; s1 < shell_type_infos.size(); s1++){
-            const int num_blocks = (shell_pair_type_infos[pair_idx].count + threads_per_block - 1) / threads_per_block; // the number of blocks
-            generatePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&primitive_shell_pair_indices.device_ptr()[shell_pair_type_infos[pair_idx].start_index], shell_pair_type_infos[pair_idx].count, s0 == s1, shell_type_infos[s1].count, true, shell_type_infos[s0].start_index, shell_type_infos[s1].start_index);
+            const size_t count = shell_pair_type_infos[pair_idx].count;
+            const size_t start = shell_pair_type_infos[pair_idx].start_index;
 
-
-#ifdef GANSU_CPU_ONLY
-            cpu_sort_by_key_descending(
-                &schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index],
-                &primitive_shell_pair_indices.device_ptr()[shell_pair_type_infos[pair_idx].start_index],
-                shell_pair_type_infos[pair_idx].count);
-#else
-            thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);
-            thrust::device_ptr<real_t> keys_end(&schwarz_upper_bound_factors.device_ptr()[shell_pair_type_infos[pair_idx].start_index] + shell_pair_type_infos[pair_idx].count);
-            thrust::device_ptr<size_t2> values_begin(&primitive_shell_pair_indices.device_ptr()[shell_pair_type_infos[pair_idx].start_index]);
-            thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+#ifndef GANSU_CPU_ONLY
+            if (gpu::gpu_available()) {
+                const int num_blocks = (count + threads_per_block - 1) / threads_per_block;
+                generatePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&primitive_shell_pair_indices.device_ptr()[start], count, s0 == s1, shell_type_infos[s1].count, true, shell_type_infos[s0].start_index, shell_type_infos[s1].start_index);
+                thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[start]);
+                thrust::device_ptr<real_t> keys_end(&schwarz_upper_bound_factors.device_ptr()[start] + count);
+                thrust::device_ptr<size_t2> values_begin(&primitive_shell_pair_indices.device_ptr()[start]);
+                thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+            } else
 #endif
+            {
+                // === CPU path: generate indices (with start offsets) + sort on host ===
+                size_t2* h_pair = &primitive_shell_pair_indices.device_ptr()[start];
+                real_t* h_keys  = &schwarz_upper_bound_factors.device_ptr()[start];
+                const bool is_symmetric = (s0 == s1);
+                const size_t ns1 = shell_type_infos[s1].count;
+                const size_t off_a = shell_type_infos[s0].start_index;
+                const size_t off_b = shell_type_infos[s1].start_index;
+                for (size_t id = 0; id < count; ++id) {
+                    size_t r1, r2;
+                    if (is_symmetric) {
+                        r2 = (size_t)((std::sqrt(8.0 * (double)id + 1.0) - 1.0) / 2.0);
+                        while ((r2 + 1) * (r2 + 2) / 2 <= id) ++r2;
+                        while (r2 > 0 && r2 * (r2 + 1) / 2 > id) --r2;
+                        r1 = id - r2 * (r2 + 1) / 2;
+                    } else {
+                        r1 = id / ns1;
+                        r2 = id % ns1;
+                    }
+                    h_pair[id] = {r1 + off_a, r2 + off_b};
+                }
+                cpu_sort_by_key_descending(h_keys, h_pair, count);
+            }
 
             pair_idx++;
         }
@@ -1135,17 +1338,19 @@ void ERI_RI_Direct::precomputation() {
     );
 
     for(const auto& s : auxiliary_shell_type_infos_){
-#ifdef GANSU_CPU_ONLY
-        cpu_sort_by_key_descending(
-            &auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index],
-            &auxiliary_primitive_shells_.device_ptr()[s.start_index],
-            s.count);
-#else
-        thrust::device_ptr<real_t> keys_begin(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index]);
-        thrust::device_ptr<real_t> keys_end(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index] + s.count);
-        thrust::device_ptr<PrimitiveShell> values_begin(&auxiliary_primitive_shells_.device_ptr()[s.start_index]);
-        thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+#ifndef GANSU_CPU_ONLY
+        if (gpu::gpu_available()) {
+            thrust::device_ptr<real_t> keys_begin(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index]);
+            thrust::device_ptr<real_t> keys_end(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index] + s.count);
+            thrust::device_ptr<PrimitiveShell> values_begin(&auxiliary_primitive_shells_.device_ptr()[s.start_index]);
+            thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+        } else
 #endif
+        {
+            real_t*         h_keys = &auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index];
+            PrimitiveShell* h_vals = &auxiliary_primitive_shells_.device_ptr()[s.start_index];
+            cpu_sort_by_key_descending(h_keys, h_vals, s.count);
+        }
     }
 
 
@@ -1165,6 +1370,52 @@ void ERI_RI_Direct::precomputation() {
 
     gpu::choleskyDecomposition(two_center_eris.device_ptr(), num_auxiliary_basis_);
     gpu::computeInverseByDtrsm(two_center_eris.device_ptr(), two_center_eris_inverse.device_ptr(), num_auxiliary_basis_);
+
+    // === CPU fallback: also precompute the full B matrix ===
+    // Direct-RI on GPU avoids storing B for memory reasons, but on CPU we
+    // reuse the stored RHF Fock path which needs B.  Build it once here
+    // (3-center ERI + triangular solve against the Cholesky factor L).
+    if (!gpu::gpu_available()) {
+        const size_t naux2_times_nao2 =
+            (size_t)num_auxiliary_basis_ * num_basis_ * num_basis_;
+        // Allocate a scratch buffer for the 3-center ERIs.  On CPU,
+        // tracked_cudaMalloc falls back to std::calloc, so this is host memory.
+        real_t* d_three_center_eri = nullptr;
+        tracked_cudaMalloc(&d_three_center_eri, naux2_times_nao2 * sizeof(real_t));
+        cudaMemset(d_three_center_eri, 0, naux2_times_nao2 * sizeof(real_t));
+
+        gpu::computeThreeCenterERIs(
+            shell_type_infos,
+            shell_pair_type_infos,
+            primitive_shells.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
+            auxiliary_shell_type_infos_,
+            auxiliary_primitive_shells_.device_ptr(),
+            auxiliary_cgto_normalization_factors_.device_ptr(),
+            d_three_center_eri,
+            primitive_shell_pair_indices.device_ptr(),
+            num_basis_,
+            num_auxiliary_basis_,
+            boys_grid.device_ptr(),
+            schwarz_upper_bound_factors.device_ptr(),
+            auxiliary_schwarz_upper_bound_factors.device_ptr(),
+            schwarz_screening_threshold,
+            verbose);
+
+        // Solve L * B = T (T is the 3-center ERI matrix viewed as naux x nao²).
+        // two_center_eris currently holds L (Cholesky factor, lower triangular).
+        gpu::solve_lower_triangular(
+            two_center_eris.device_ptr(),
+            d_three_center_eri,
+            num_auxiliary_basis_,
+            num_basis_ * num_basis_);
+
+        // Copy the result into intermediate_matrix_B_cpu_.
+        cudaMemcpy(intermediate_matrix_B_cpu_.device_ptr(), d_three_center_eri,
+                   naux2_times_nao2 * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+        tracked_cudaFree(d_three_center_eri);
+    }
 }
 
 

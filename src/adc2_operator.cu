@@ -43,9 +43,11 @@
 
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 #include <vector>
 #include <algorithm>
 
+#include <Eigen/Dense>
 #include "adc2_operator.hpp"
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
@@ -1062,9 +1064,13 @@ ADC2Operator::ADC2Operator(
 
     // Check if dense M12/M21 fit in GPU memory
     size_t free_mem = 0, total_mem = 0;
-    cudaMemGetInfo(&free_mem, &total_mem);
     size_t m12_bytes = 3ULL * ov * dd * sizeof(real_t);  // M12 + M21 + scaled_M21
-    use_dense_M12_ = (m12_bytes < free_mem / 2);
+    if (gpu::gpu_available()) {
+        cudaMemGetInfo(&free_mem, &total_mem);
+        use_dense_M12_ = (m12_bytes < free_mem / 2);
+    } else {
+        use_dense_M12_ = true;  // CPU mode: always use dense path
+    }
 
     // Always allocate temp_doubles (needed for both dense and kernel-based apply)
     tracked_cudaMalloc(&d_temp_doubles_, dd * sizeof(real_t));
@@ -1160,9 +1166,13 @@ ADC2Operator::ADC2Operator(
     tracked_cudaMalloc(&d_M11_, ov * ov * sizeof(real_t));
 
     size_t free_mem = 0, total_mem = 0;
-    cudaMemGetInfo(&free_mem, &total_mem);
     size_t m12_bytes = 3ULL * ov * dd * sizeof(real_t);
-    use_dense_M12_ = (m12_bytes < free_mem / 2);
+    if (gpu::gpu_available()) {
+        cudaMemGetInfo(&free_mem, &total_mem);
+        use_dense_M12_ = (m12_bytes < free_mem / 2);
+    } else {
+        use_dense_M12_ = true;  // CPU mode: always use dense path
+    }
 
     tracked_cudaMalloc(&d_temp_doubles_, dd * sizeof(real_t));
     if (use_dense_M12_) {
@@ -1186,8 +1196,133 @@ void ADC2Operator::build_M11_from_blocks(
     const real_t* d_eri_ovov, const real_t* d_eri_oovv,
     const real_t* d_orbital_energies)
 {
+    using Eigen::Map;
+    using Eigen::VectorXd;
+
     int threads = 256;
     size_t matrix_size = (size_t)singles_dim_ * singles_dim_;
+    int ov = singles_dim_;
+
+    if (!gpu::gpu_available()) {
+        // Step 1: Build CIS from blocks (column-major)
+        for (int ia_idx = 0; ia_idx < ov; ia_idx++) {
+            int i = ia_idx / nvir_;
+            int a = ia_idx % nvir_;
+            for (int jb_idx = 0; jb_idx < ov; jb_idx++) {
+                int j = jb_idx / nvir_;
+                int b = jb_idx % nvir_;
+                size_t idx = (size_t)jb_idx * ov + ia_idx;
+                real_t val = 0.0;
+                if (i == j && a == b)
+                    val += d_orbital_energies[nocc_ + a] - d_orbital_energies[i];
+                val -= d_eri_oovv[(size_t)i * nocc_ * nvir_ * nvir_ + (size_t)j * nvir_ * nvir_ + (size_t)a * nvir_ + b];
+                if (!is_triplet_)
+                    val += 2.0 * d_eri_ovov[(size_t)i * nvir_ * nocc_ * nvir_ + (size_t)a * nocc_ * nvir_ + (size_t)j * nvir_ + b];
+                d_M11_[idx] = val;
+            }
+        }
+
+        // Step 2: ISR correction (same as build_M11)
+        size_t ovov_stride = (size_t)nvir_ * nocc_ * nvir_;
+        real_t* d_ISR_corr = nullptr;
+        tracked_cudaMalloc(&d_ISR_corr, matrix_size * sizeof(real_t));
+        for (int ia_idx = 0; ia_idx < ov; ia_idx++) {
+            int i = ia_idx / nvir_;
+            int a = ia_idx % nvir_;
+            for (int jb_idx = 0; jb_idx < ov; jb_idx++) {
+                int j = jb_idx / nvir_;
+                int b = jb_idx % nvir_;
+                size_t idx = (size_t)jb_idx * ov + ia_idx;
+                real_t val = 0.0;
+                for (int k = 0; k < nocc_; k++)
+                    for (int c = 0; c < nvir_; c++) {
+                        real_t t2_kiac = d_t2_[(size_t)k * nocc_ * nvir_ * nvir_ + (size_t)i * nvir_ * nvir_ + (size_t)a * nvir_ + c];
+                        real_t ovov_kbjc = d_eri_ovov_[(size_t)k * ovov_stride + (size_t)b * nocc_ * nvir_ + (size_t)j * nvir_ + c];
+                        val += 0.5 * t2_kiac * ovov_kbjc;
+                        if (!is_triplet_) {
+                            real_t t2_ikac = d_t2_[(size_t)i * nocc_ * nvir_ * nvir_ + (size_t)k * nvir_ * nvir_ + (size_t)a * nvir_ + c];
+                            real_t ovov_jbkc = d_eri_ovov_[(size_t)j * ovov_stride + (size_t)b * nocc_ * nvir_ + (size_t)k * nvir_ + c];
+                            val += 2.0 * t2_ikac * ovov_jbkc;
+                            val -= t2_ikac * ovov_kbjc;
+                            val -= t2_kiac * ovov_jbkc;
+                        }
+                        real_t t2_kjbc = d_t2_[(size_t)k * nocc_ * nvir_ * nvir_ + (size_t)j * nvir_ * nvir_ + (size_t)b * nvir_ + c];
+                        real_t ovov_kaic = d_eri_ovov_[(size_t)k * ovov_stride + (size_t)a * nocc_ * nvir_ + (size_t)i * nvir_ + c];
+                        val += 0.5 * t2_kjbc * ovov_kaic;
+                        if (!is_triplet_) {
+                            real_t t2_jkbc = d_t2_[(size_t)j * nocc_ * nvir_ * nvir_ + (size_t)k * nvir_ * nvir_ + (size_t)b * nvir_ + c];
+                            real_t ovov_iakc = d_eri_ovov_[(size_t)i * ovov_stride + (size_t)a * nocc_ * nvir_ + (size_t)k * nvir_ + c];
+                            val += 2.0 * t2_jkbc * ovov_iakc;
+                            val -= t2_jkbc * ovov_kaic;
+                            val -= t2_kjbc * ovov_iakc;
+                        }
+                    }
+                d_ISR_corr[idx] = val;
+            }
+        }
+        Map<VectorXd>(d_M11_, matrix_size) += Map<VectorXd>(d_ISR_corr, matrix_size);
+        tracked_cudaFree(d_ISR_corr);
+
+        // Steps 4-6: Σ_oo, Σ_vv, self-energy corrections
+        real_t* d_sigma_oo = nullptr;
+        tracked_cudaMalloc(&d_sigma_oo, (size_t)nocc_ * nocc_ * sizeof(real_t));
+        for (int i = 0; i < nocc_; i++)
+            for (int j = 0; j < nocc_; j++) {
+                real_t val_ij = 0.0, val_ji = 0.0;
+                for (int k = 0; k < nocc_; k++)
+                    for (int a = 0; a < nvir_; a++)
+                        for (int b = 0; b < nvir_; b++) {
+                            real_t t2_ikab = d_t2_[(size_t)i * nocc_ * nvir_ * nvir_ + (size_t)k * nvir_ * nvir_ + (size_t)a * nvir_ + b];
+                            real_t ja_kb = d_eri_ovov_[(size_t)j * ovov_stride + (size_t)a * nocc_ * nvir_ + (size_t)k * nvir_ + b];
+                            real_t jb_ka = d_eri_ovov_[(size_t)j * ovov_stride + (size_t)b * nocc_ * nvir_ + (size_t)k * nvir_ + a];
+                            val_ij += t2_ikab * (ja_kb - 0.5 * jb_ka);
+                            real_t t2_jkab = d_t2_[(size_t)j * nocc_ * nvir_ * nvir_ + (size_t)k * nvir_ * nvir_ + (size_t)a * nvir_ + b];
+                            real_t ia_kb = d_eri_ovov_[(size_t)i * ovov_stride + (size_t)a * nocc_ * nvir_ + (size_t)k * nvir_ + b];
+                            real_t ib_ka = d_eri_ovov_[(size_t)i * ovov_stride + (size_t)b * nocc_ * nvir_ + (size_t)k * nvir_ + a];
+                            val_ji += t2_jkab * (ia_kb - 0.5 * ib_ka);
+                        }
+                d_sigma_oo[i * nocc_ + j] = val_ij + val_ji;
+            }
+
+        real_t* d_sigma_vv = nullptr;
+        tracked_cudaMalloc(&d_sigma_vv, (size_t)nvir_ * nvir_ * sizeof(real_t));
+        for (int a = 0; a < nvir_; a++)
+            for (int b = 0; b < nvir_; b++) {
+                real_t val_ab = 0.0, val_ba = 0.0;
+                for (int i = 0; i < nocc_; i++)
+                    for (int j = 0; j < nocc_; j++)
+                        for (int c = 0; c < nvir_; c++) {
+                            real_t t2_ijac = d_t2_[(size_t)i * nocc_ * nvir_ * nvir_ + (size_t)j * nvir_ * nvir_ + (size_t)a * nvir_ + c];
+                            real_t ib_jc = d_eri_ovov_[(size_t)i * ovov_stride + (size_t)b * nocc_ * nvir_ + (size_t)j * nvir_ + c];
+                            real_t jb_ic = d_eri_ovov_[(size_t)j * ovov_stride + (size_t)b * nocc_ * nvir_ + (size_t)i * nvir_ + c];
+                            val_ab += t2_ijac * (-ib_jc + 0.5 * jb_ic);
+                            real_t t2_ijbc = d_t2_[(size_t)i * nocc_ * nvir_ * nvir_ + (size_t)j * nvir_ * nvir_ + (size_t)b * nvir_ + c];
+                            real_t ia_jc = d_eri_ovov_[(size_t)i * ovov_stride + (size_t)a * nocc_ * nvir_ + (size_t)j * nvir_ + c];
+                            real_t ja_ic = d_eri_ovov_[(size_t)j * ovov_stride + (size_t)a * nocc_ * nvir_ + (size_t)i * nvir_ + c];
+                            val_ba += t2_ijbc * (-ia_jc + 0.5 * ja_ic);
+                        }
+                d_sigma_vv[a * nvir_ + b] = val_ab + val_ba;
+            }
+
+        for (int ia_idx = 0; ia_idx < ov; ia_idx++) {
+            int i = ia_idx / nvir_;
+            int a = ia_idx % nvir_;
+            for (int jb_idx = 0; jb_idx < ov; jb_idx++) {
+                int j = jb_idx / nvir_;
+                int b = jb_idx % nvir_;
+                size_t idx = (size_t)jb_idx * ov + ia_idx;
+                real_t correction = 0.0;
+                if (a == b) correction -= d_sigma_oo[i * nocc_ + j];
+                if (i == j) correction += d_sigma_vv[a * nvir_ + b];
+                d_M11_[idx] += correction;
+            }
+        }
+
+        tracked_cudaFree(d_sigma_oo);
+        tracked_cudaFree(d_sigma_vv);
+        return;
+    }
+
     int blocks = (matrix_size + threads - 1) / threads;
 
     adc2_build_cis_matrix_from_blocks_kernel<<<blocks, threads>>>(
@@ -1244,6 +1379,35 @@ ADC2Operator::~ADC2Operator() {
 }
 
 void ADC2Operator::extract_eri_blocks(const real_t* d_eri_mo) {
+    if (!gpu::gpu_available()) {
+        size_t nao2 = (size_t)nao_ * nao_;
+        // Extract ovov
+        for (int i = 0; i < nocc_; i++)
+            for (int a = 0; a < nvir_; a++)
+                for (int j = 0; j < nocc_; j++)
+                    for (int b = 0; b < nvir_; b++) {
+                        int idx = ((i * nvir_ + a) * nocc_ + j) * nvir_ + b;
+                        d_eri_ovov_[idx] = d_eri_mo[((size_t)i * nao_ + a + nocc_) * nao2 + (size_t)j * nao_ + b + nocc_];
+                    }
+        // Extract vvov
+        for (int a = 0; a < nvir_; a++)
+            for (int b = 0; b < nvir_; b++)
+                for (int i = 0; i < nocc_; i++)
+                    for (int c = 0; c < nvir_; c++) {
+                        int idx = ((a * nvir_ + b) * nocc_ + i) * nvir_ + c;
+                        d_eri_vvov_[idx] = d_eri_mo[((size_t)(a + nocc_) * nao_ + b + nocc_) * nao2 + (size_t)i * nao_ + c + nocc_];
+                    }
+        // Extract ooov
+        for (int j = 0; j < nocc_; j++)
+            for (int i = 0; i < nocc_; i++)
+                for (int k = 0; k < nocc_; k++)
+                    for (int b = 0; b < nvir_; b++) {
+                        int idx = ((j * nocc_ + i) * nocc_ + k) * nvir_ + b;
+                        d_eri_ooov_[idx] = d_eri_mo[((size_t)j * nao_ + i) * nao2 + (size_t)k * nao_ + b + nocc_];
+                    }
+        return;
+    }
+
     int threads = 256;
 
     int n_ovov = nocc_ * nvir_ * nocc_ * nvir_;
@@ -1262,6 +1426,26 @@ void ADC2Operator::extract_eri_blocks(const real_t* d_eri_mo) {
 }
 
 void ADC2Operator::compute_mp1_t2_and_D2(const real_t* d_orbital_energies) {
+    if (!gpu::gpu_available()) {
+        for (int i = 0; i < nocc_; i++)
+            for (int j = 0; j < nocc_; j++)
+                for (int a = 0; a < nvir_; a++)
+                    for (int b = 0; b < nvir_; b++) {
+                        int idx = ((i * nocc_ + j) * nvir_ + a) * nvir_ + b;
+                        real_t eps_i = d_orbital_energies[i];
+                        real_t eps_j = d_orbital_energies[j];
+                        real_t eps_a = d_orbital_energies[a + nocc_];
+                        real_t eps_b = d_orbital_energies[b + nocc_];
+                        real_t denom = eps_i + eps_j - eps_a - eps_b;
+                        real_t ia_jb = d_eri_ovov_[(size_t)i * nvir_ * nocc_ * nvir_ +
+                                                    (size_t)a * nocc_ * nvir_ +
+                                                    (size_t)j * nvir_ + b];
+                        d_t2_[idx] = ia_jb / denom;
+                        d_D2_[idx] = eps_a + eps_b - eps_i - eps_j;
+                    }
+        return;
+    }
+
     int threads = 256;
     int blocks = (doubles_dim_ + threads - 1) / threads;
     adc2_compute_mp1_t2_and_D2_kernel<<<blocks, threads>>>(
@@ -1270,6 +1454,13 @@ void ADC2Operator::compute_mp1_t2_and_D2(const real_t* d_orbital_energies) {
 }
 
 void ADC2Operator::compute_D1(const real_t* d_orbital_energies) {
+    if (!gpu::gpu_available()) {
+        for (int i = 0; i < nocc_; i++)
+            for (int a = 0; a < nvir_; a++)
+                d_D1_[i * nvir_ + a] = d_orbital_energies[a + nocc_] - d_orbital_energies[i];
+        return;
+    }
+
     int threads = 256;
     int blocks = (singles_dim_ + threads - 1) / threads;
     adc2_compute_D1_kernel<<<blocks, threads>>>(
@@ -1278,8 +1469,148 @@ void ADC2Operator::compute_D1(const real_t* d_orbital_energies) {
 }
 
 void ADC2Operator::build_M11(const real_t* d_eri_mo, const real_t* d_orbital_energies) {
+    using Eigen::Map;
+    using Eigen::VectorXd;
+
     int threads = 256;
     size_t matrix_size = (size_t)singles_dim_ * singles_dim_;
+    int ov = singles_dim_;
+
+    if (!gpu::gpu_available()) {
+        size_t nao2 = (size_t)nao_ * nao_;
+
+        // Step 1: Build CIS A-matrix (column-major)
+        for (int ia_idx = 0; ia_idx < ov; ia_idx++) {
+            int i = ia_idx / nvir_;
+            int a = ia_idx % nvir_;
+            int a_abs = a + nocc_;
+            for (int jb_idx = 0; jb_idx < ov; jb_idx++) {
+                int j = jb_idx / nvir_;
+                int b = jb_idx % nvir_;
+                int b_abs = b + nocc_;
+                size_t idx = (size_t)jb_idx * ov + ia_idx;  // column-major
+
+                real_t val = 0.0;
+                if (i == j && a == b)
+                    val += d_orbital_energies[a_abs] - d_orbital_energies[i];
+                val -= d_eri_mo[((size_t)i * nao_ + j) * nao2 + (size_t)a_abs * nao_ + b_abs];
+                if (!is_triplet_) {
+                    real_t ia_jb = d_eri_mo[((size_t)i * nao_ + a_abs) * nao2 + (size_t)j * nao_ + b_abs];
+                    val += 2.0 * ia_jb;
+                }
+                d_M11_[idx] = val;
+            }
+        }
+
+        // Step 2: ISR correction (column-major)
+        real_t* d_ISR_corr = nullptr;
+        tracked_cudaMalloc(&d_ISR_corr, matrix_size * sizeof(real_t));
+        size_t ovov_stride = (size_t)nvir_ * nocc_ * nvir_;
+        for (int ia_idx = 0; ia_idx < ov; ia_idx++) {
+            int i = ia_idx / nvir_;
+            int a = ia_idx % nvir_;
+            for (int jb_idx = 0; jb_idx < ov; jb_idx++) {
+                int j = jb_idx / nvir_;
+                int b = jb_idx % nvir_;
+                size_t idx = (size_t)jb_idx * ov + ia_idx;
+                real_t val = 0.0;
+                for (int k = 0; k < nocc_; k++) {
+                    for (int c = 0; c < nvir_; c++) {
+                        real_t t2_kiac = d_t2_[(size_t)k * nocc_ * nvir_ * nvir_ + (size_t)i * nvir_ * nvir_ + (size_t)a * nvir_ + c];
+                        real_t ovov_kbjc = d_eri_ovov_[(size_t)k * ovov_stride + (size_t)b * nocc_ * nvir_ + (size_t)j * nvir_ + c];
+                        val += 0.5 * t2_kiac * ovov_kbjc;
+                        if (!is_triplet_) {
+                            real_t t2_ikac = d_t2_[(size_t)i * nocc_ * nvir_ * nvir_ + (size_t)k * nvir_ * nvir_ + (size_t)a * nvir_ + c];
+                            real_t ovov_jbkc = d_eri_ovov_[(size_t)j * ovov_stride + (size_t)b * nocc_ * nvir_ + (size_t)k * nvir_ + c];
+                            val += 2.0 * t2_ikac * ovov_jbkc;
+                            val -= t2_ikac * ovov_kbjc;
+                            val -= t2_kiac * ovov_jbkc;
+                        }
+                        // Transpose
+                        real_t t2_kjbc = d_t2_[(size_t)k * nocc_ * nvir_ * nvir_ + (size_t)j * nvir_ * nvir_ + (size_t)b * nvir_ + c];
+                        real_t ovov_kaic = d_eri_ovov_[(size_t)k * ovov_stride + (size_t)a * nocc_ * nvir_ + (size_t)i * nvir_ + c];
+                        val += 0.5 * t2_kjbc * ovov_kaic;
+                        if (!is_triplet_) {
+                            real_t t2_jkbc = d_t2_[(size_t)j * nocc_ * nvir_ * nvir_ + (size_t)k * nvir_ * nvir_ + (size_t)b * nvir_ + c];
+                            real_t ovov_iakc = d_eri_ovov_[(size_t)i * ovov_stride + (size_t)a * nocc_ * nvir_ + (size_t)k * nvir_ + c];
+                            val += 2.0 * t2_jkbc * ovov_iakc;
+                            val -= t2_jkbc * ovov_kaic;
+                            val -= t2_kjbc * ovov_iakc;
+                        }
+                    }
+                }
+                d_ISR_corr[idx] = val;
+            }
+        }
+
+        // Step 3: M11 += ISR_corr
+        Map<VectorXd>(d_M11_, matrix_size) += Map<VectorXd>(d_ISR_corr, matrix_size);
+        tracked_cudaFree(d_ISR_corr);
+
+        // Step 4: Σ_oo
+        real_t* d_sigma_oo = nullptr;
+        tracked_cudaMalloc(&d_sigma_oo, (size_t)nocc_ * nocc_ * sizeof(real_t));
+        for (int i = 0; i < nocc_; i++) {
+            for (int j = 0; j < nocc_; j++) {
+                real_t val_ij = 0.0, val_ji = 0.0;
+                for (int k = 0; k < nocc_; k++)
+                    for (int a = 0; a < nvir_; a++)
+                        for (int b = 0; b < nvir_; b++) {
+                            real_t t2_ikab = d_t2_[(size_t)i * nocc_ * nvir_ * nvir_ + (size_t)k * nvir_ * nvir_ + (size_t)a * nvir_ + b];
+                            real_t ja_kb = d_eri_ovov_[(size_t)j * ovov_stride + (size_t)a * nocc_ * nvir_ + (size_t)k * nvir_ + b];
+                            real_t jb_ka = d_eri_ovov_[(size_t)j * ovov_stride + (size_t)b * nocc_ * nvir_ + (size_t)k * nvir_ + a];
+                            val_ij += t2_ikab * (ja_kb - 0.5 * jb_ka);
+                            real_t t2_jkab = d_t2_[(size_t)j * nocc_ * nvir_ * nvir_ + (size_t)k * nvir_ * nvir_ + (size_t)a * nvir_ + b];
+                            real_t ia_kb = d_eri_ovov_[(size_t)i * ovov_stride + (size_t)a * nocc_ * nvir_ + (size_t)k * nvir_ + b];
+                            real_t ib_ka = d_eri_ovov_[(size_t)i * ovov_stride + (size_t)b * nocc_ * nvir_ + (size_t)k * nvir_ + a];
+                            val_ji += t2_jkab * (ia_kb - 0.5 * ib_ka);
+                        }
+                d_sigma_oo[i * nocc_ + j] = val_ij + val_ji;
+            }
+        }
+
+        // Step 5: Σ_vv
+        real_t* d_sigma_vv = nullptr;
+        tracked_cudaMalloc(&d_sigma_vv, (size_t)nvir_ * nvir_ * sizeof(real_t));
+        for (int a = 0; a < nvir_; a++) {
+            for (int b = 0; b < nvir_; b++) {
+                real_t val_ab = 0.0, val_ba = 0.0;
+                for (int i = 0; i < nocc_; i++)
+                    for (int j = 0; j < nocc_; j++)
+                        for (int c = 0; c < nvir_; c++) {
+                            real_t t2_ijac = d_t2_[(size_t)i * nocc_ * nvir_ * nvir_ + (size_t)j * nvir_ * nvir_ + (size_t)a * nvir_ + c];
+                            real_t ib_jc = d_eri_ovov_[(size_t)i * ovov_stride + (size_t)b * nocc_ * nvir_ + (size_t)j * nvir_ + c];
+                            real_t jb_ic = d_eri_ovov_[(size_t)j * ovov_stride + (size_t)b * nocc_ * nvir_ + (size_t)i * nvir_ + c];
+                            val_ab += t2_ijac * (-ib_jc + 0.5 * jb_ic);
+                            real_t t2_ijbc = d_t2_[(size_t)i * nocc_ * nvir_ * nvir_ + (size_t)j * nvir_ * nvir_ + (size_t)b * nvir_ + c];
+                            real_t ia_jc = d_eri_ovov_[(size_t)i * ovov_stride + (size_t)a * nocc_ * nvir_ + (size_t)j * nvir_ + c];
+                            real_t ja_ic = d_eri_ovov_[(size_t)j * ovov_stride + (size_t)a * nocc_ * nvir_ + (size_t)i * nvir_ + c];
+                            val_ba += t2_ijbc * (-ia_jc + 0.5 * ja_ic);
+                        }
+                d_sigma_vv[a * nvir_ + b] = val_ab + val_ba;
+            }
+        }
+
+        // Step 6: Add self-energy corrections to M11
+        for (int ia_idx = 0; ia_idx < ov; ia_idx++) {
+            int i = ia_idx / nvir_;
+            int a = ia_idx % nvir_;
+            for (int jb_idx = 0; jb_idx < ov; jb_idx++) {
+                int j = jb_idx / nvir_;
+                int b = jb_idx % nvir_;
+                size_t idx = (size_t)jb_idx * ov + ia_idx;  // column-major
+                real_t correction = 0.0;
+                if (a == b) correction -= d_sigma_oo[i * nocc_ + j];
+                if (i == j) correction += d_sigma_vv[a * nvir_ + b];
+                d_M11_[idx] += correction;
+            }
+        }
+
+        tracked_cudaFree(d_sigma_oo);
+        tracked_cudaFree(d_sigma_vv);
+        return;
+    }
+
     int blocks = (matrix_size + threads - 1) / threads;
 
     // Step 1: Build CIS A-matrix into d_M11_
@@ -1338,6 +1669,56 @@ void ADC2Operator::build_M12_M21() {
     size_t ov = singles_dim_;
     size_t dd = doubles_dim_;
 
+    if (!gpu::gpu_available()) {
+        size_t vvov_stride = (size_t)nvir_ * nocc_ * nvir_;
+        size_t ooov_stride = (size_t)nocc_ * nocc_ * nvir_;
+
+        // Build M12 [ov × dd] column-major
+        for (size_t idx = 0; idx < ov * dd; idx++) {
+            int ov_idx = (int)(idx % ov);
+            size_t dd_idx = idx / ov;
+            int K = ov_idx / nvir_;
+            int E = ov_idx % nvir_;
+            int I = (int)(dd_idx / ((size_t)nocc_ * nvir_ * nvir_));
+            int rem = (int)(dd_idx % ((size_t)nocc_ * nvir_ * nvir_));
+            int J = rem / (nvir_ * nvir_);
+            rem = rem % (nvir_ * nvir_);
+            int C = rem / nvir_;
+            int D = rem % nvir_;
+            real_t val = 0.0;
+            if (I == K) {
+                val += 2.0 * d_eri_vvov_[E * vvov_stride + C * nocc_ * nvir_ + J * nvir_ + D]
+                           - d_eri_vvov_[D * vvov_stride + E * nocc_ * nvir_ + J * nvir_ + C];
+            }
+            if (C == E) {
+                val += d_eri_ooov_[J * ooov_stride + K * nocc_ * nvir_ + I * nvir_ + D]
+                 - 2.0 * d_eri_ooov_[I * ooov_stride + K * nocc_ * nvir_ + J * nvir_ + D];
+            }
+            d_M12_[idx] = val;
+        }
+
+        // Build M21 [dd × ov] column-major
+        for (size_t idx = 0; idx < dd * ov; idx++) {
+            size_t dd_idx = idx % dd;
+            int ov_idx = (int)(idx / dd);
+            int K = ov_idx / nvir_;
+            int E = ov_idx % nvir_;
+            int I = (int)(dd_idx / ((size_t)nocc_ * nvir_ * nvir_));
+            int rem = (int)(dd_idx % ((size_t)nocc_ * nvir_ * nvir_));
+            int J = rem / (nvir_ * nvir_);
+            rem = rem % (nvir_ * nvir_);
+            int C = rem / nvir_;
+            int D = rem % nvir_;
+            real_t val = 0.0;
+            if (K == I) val += d_eri_vvov_[E * vvov_stride + C * nocc_ * nvir_ + J * nvir_ + D];
+            if (K == J) val += d_eri_vvov_[E * vvov_stride + D * nocc_ * nvir_ + I * nvir_ + C];
+            if (E == C) val -= d_eri_ooov_[I * ooov_stride + K * nocc_ * nvir_ + J * nvir_ + D];
+            if (E == D) val -= d_eri_ooov_[J * ooov_stride + K * nocc_ * nvir_ + I * nvir_ + C];
+            d_M21_[idx] = val;
+        }
+        return;
+    }
+
     // Build M12 [ov × dd] column-major
     {
         size_t total = ov * dd;
@@ -1360,6 +1741,90 @@ void ADC2Operator::build_M12_M21() {
 void ADC2Operator::compute_diagonal() {
     // Compute M_eff(ω) diagonal including Schur complement contribution
     // Critical for Davidson preconditioner quality
+    if (!gpu::gpu_available()) {
+        int ov = singles_dim_;
+        size_t vs1 = (size_t)nvir_ * nocc_ * nvir_;
+        size_t os1 = (size_t)nocc_ * nocc_ * nvir_;
+        size_t ds1 = (size_t)nocc_ * nvir_ * nvir_;
+        size_t ds2 = (size_t)nvir_ * nvir_;
+
+        for (int idx = 0; idx < ov; idx++) {
+            int k = idx / nvir_;
+            int e = idx % nvir_;
+            real_t schur = 0.0;
+
+            // G1a
+            for (int J = 0; J < nocc_; J++)
+                for (int C = 0; C < nvir_; C++)
+                    for (int D = 0; D < nvir_; D++) {
+                        real_t m12 = 2.0 * d_eri_vvov_[e*vs1 + C*nocc_*nvir_ + J*nvir_ + D]
+                                         - d_eri_vvov_[D*vs1 + e*nocc_*nvir_ + J*nvir_ + C];
+                        real_t w = 1.0 / (omega_ - d_D2_[k*ds1 + J*ds2 + C*nvir_ + D]);
+                        schur += m12 * w * d_eri_vvov_[e*vs1 + C*nocc_*nvir_ + J*nvir_ + D];
+                    }
+            // G1b
+            for (int C = 0; C < nvir_; C++)
+                for (int D = 0; D < nvir_; D++) {
+                    real_t m12 = 2.0 * d_eri_vvov_[e*vs1 + C*nocc_*nvir_ + k*nvir_ + D]
+                                     - d_eri_vvov_[D*vs1 + e*nocc_*nvir_ + k*nvir_ + C];
+                    real_t w = 1.0 / (omega_ - d_D2_[k*ds1 + k*ds2 + C*nvir_ + D]);
+                    schur += m12 * w * d_eri_vvov_[e*vs1 + D*nocc_*nvir_ + k*nvir_ + C];
+                }
+            // G1c
+            for (int J = 0; J < nocc_; J++)
+                for (int D = 0; D < nvir_; D++) {
+                    real_t m12 = 2.0 * d_eri_vvov_[e*vs1 + e*nocc_*nvir_ + J*nvir_ + D]
+                                     - d_eri_vvov_[D*vs1 + e*nocc_*nvir_ + J*nvir_ + e];
+                    real_t w = 1.0 / (omega_ - d_D2_[k*ds1 + J*ds2 + e*nvir_ + D]);
+                    schur -= m12 * w * d_eri_ooov_[k*os1 + k*nocc_*nvir_ + J*nvir_ + D];
+                }
+            // G1d
+            for (int J = 0; J < nocc_; J++)
+                for (int C = 0; C < nvir_; C++) {
+                    real_t m12 = 2.0 * d_eri_vvov_[e*vs1 + C*nocc_*nvir_ + J*nvir_ + e]
+                                     - d_eri_vvov_[e*vs1 + e*nocc_*nvir_ + J*nvir_ + C];
+                    real_t w = 1.0 / (omega_ - d_D2_[k*ds1 + J*ds2 + C*nvir_ + e]);
+                    schur -= m12 * w * d_eri_ooov_[J*os1 + k*nocc_*nvir_ + k*nvir_ + C];
+                }
+            // G2a
+            for (int J = 0; J < nocc_; J++)
+                for (int D = 0; D < nvir_; D++) {
+                    real_t m12 = d_eri_ooov_[J*os1 + k*nocc_*nvir_ + k*nvir_ + D]
+                           - 2.0*d_eri_ooov_[k*os1 + k*nocc_*nvir_ + J*nvir_ + D];
+                    real_t w = 1.0 / (omega_ - d_D2_[k*ds1 + J*ds2 + e*nvir_ + D]);
+                    schur += m12 * w * d_eri_vvov_[e*vs1 + e*nocc_*nvir_ + J*nvir_ + D];
+                }
+            // G2b
+            for (int I = 0; I < nocc_; I++)
+                for (int D = 0; D < nvir_; D++) {
+                    real_t m12 = d_eri_ooov_[k*os1 + k*nocc_*nvir_ + I*nvir_ + D]
+                           - 2.0*d_eri_ooov_[I*os1 + k*nocc_*nvir_ + k*nvir_ + D];
+                    real_t w = 1.0 / (omega_ - d_D2_[I*ds1 + k*ds2 + e*nvir_ + D]);
+                    schur += m12 * w * d_eri_vvov_[e*vs1 + D*nocc_*nvir_ + I*nvir_ + e];
+                }
+            // G2c
+            for (int I = 0; I < nocc_; I++)
+                for (int J = 0; J < nocc_; J++)
+                    for (int D = 0; D < nvir_; D++) {
+                        real_t m12 = d_eri_ooov_[J*os1 + k*nocc_*nvir_ + I*nvir_ + D]
+                               - 2.0*d_eri_ooov_[I*os1 + k*nocc_*nvir_ + J*nvir_ + D];
+                        real_t w = 1.0 / (omega_ - d_D2_[I*ds1 + J*ds2 + e*nvir_ + D]);
+                        schur -= m12 * w * d_eri_ooov_[I*os1 + k*nocc_*nvir_ + J*nvir_ + D];
+                    }
+            // G2d
+            for (int I = 0; I < nocc_; I++)
+                for (int J = 0; J < nocc_; J++) {
+                    real_t m12 = d_eri_ooov_[J*os1 + k*nocc_*nvir_ + I*nvir_ + e]
+                           - 2.0*d_eri_ooov_[I*os1 + k*nocc_*nvir_ + J*nvir_ + e];
+                    real_t w = 1.0 / (omega_ - d_D2_[I*ds1 + J*ds2 + e*nvir_ + e]);
+                    schur -= m12 * w * d_eri_ooov_[J*os1 + k*nocc_*nvir_ + I*nvir_ + e];
+                }
+
+            d_diagonal_[idx] = d_M11_[(size_t)idx * ov + idx] + schur;
+        }
+        return;
+    }
+
     int threads = 256;
     int blocks = (singles_dim_ + threads - 1) / threads;
     adc2_compute_M_eff_diagonal_kernel<<<blocks, threads>>>(
@@ -1377,6 +1842,10 @@ void ADC2Operator::update_diagonal() {
 // ========================================================================
 
 void ADC2Operator::validate_onthefly_vs_dense(real_t omega) const {
+    using Eigen::Map;
+    using Eigen::MatrixXd;
+    using Eigen::VectorXd;
+
     if (!use_dense_M12_) {
         printf("  [validate] Cannot validate: dense M12/M21 not available.\n");
         return;
@@ -1392,35 +1861,54 @@ void ADC2Operator::validate_onthefly_vs_dense(real_t omega) const {
     tracked_cudaMalloc(&d_M_eff_dense, matrix_size * sizeof(real_t));
     tracked_cudaMalloc(&d_M_eff_onthefly, matrix_size * sizeof(real_t));
 
-    // Compute via dense DGEMM path
-    {
+    if (!gpu::gpu_available()) {
         size_t dd = doubles_dim_;
-        size_t total = dd * ov;
-        size_t blocks = (total + threads - 1) / threads;
-        adc2_scale_M21_by_omega_D2_kernel<<<blocks, threads>>>(
-            d_M21_, d_D2_, d_scaled_M21_, omega, (int)dd, ov);
-        cudaDeviceSynchronize();
 
-        cudaMemcpy(d_M_eff_dense, d_M11_, matrix_size * sizeof(real_t), cudaMemcpyDeviceToDevice);
+        // Dense path: scale M21, then DGEMM
+        for (size_t idx = 0; idx < dd * (size_t)ov; idx++) {
+            size_t dd_idx = idx % dd;
+            real_t scale = 1.0 / (omega - d_D2_[dd_idx]);
+            d_scaled_M21_[idx] = d_M21_[idx] * scale;
+        }
+        std::memcpy(d_M_eff_dense, d_M11_, matrix_size * sizeof(real_t));
 
-        const real_t alpha = 1.0;
-        const real_t beta = 1.0;
-        cublasDgemm(gpu::GPUHandle::cublas(), CUBLAS_OP_N, CUBLAS_OP_N,
-                    ov, ov, (int)dd,
-                    &alpha,
-                    d_M12_, ov,
-                    d_scaled_M21_, (int)dd,
-                    &beta,
-                    d_M_eff_dense, ov);
-    }
+        // M_eff_dense += M12 * scaled_M21 using Eigen
+        Map<MatrixXd> Meff_dense(d_M_eff_dense, ov, ov);
+        Meff_dense.noalias() += Map<const MatrixXd>(d_M12_, ov, (int)dd) * Map<const MatrixXd>(d_scaled_M21_, (int)dd, ov);
 
-    // Compute via on-the-fly kernel
-    {
-        size_t blocks = (matrix_size + threads - 1) / threads;
-        adc2_build_M_eff_onthefly_kernel<<<blocks, threads>>>(
-            d_M11_, d_eri_vvov_, d_eri_ooov_, d_D2_,
-            d_M_eff_onthefly, omega, nocc_, nvir_);
-        cudaDeviceSynchronize();
+        // On-the-fly: replicate kernel logic
+        build_M_eff_matrix(omega, d_M_eff_onthefly);
+    } else {
+        // Compute via dense DGEMM path
+        {
+            size_t dd = doubles_dim_;
+            size_t total = dd * ov;
+            size_t blocks = (total + threads - 1) / threads;
+            adc2_scale_M21_by_omega_D2_kernel<<<blocks, threads>>>(
+                d_M21_, d_D2_, d_scaled_M21_, omega, (int)dd, ov);
+            cudaDeviceSynchronize();
+
+            cudaMemcpy(d_M_eff_dense, d_M11_, matrix_size * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+            const real_t alpha = 1.0;
+            const real_t beta = 1.0;
+            cublasDgemm(gpu::GPUHandle::cublas(), CUBLAS_OP_N, CUBLAS_OP_N,
+                        ov, ov, (int)dd,
+                        &alpha,
+                        d_M12_, ov,
+                        d_scaled_M21_, (int)dd,
+                        &beta,
+                        d_M_eff_dense, ov);
+        }
+
+        // Compute via on-the-fly kernel
+        {
+            size_t blocks = (matrix_size + threads - 1) / threads;
+            adc2_build_M_eff_onthefly_kernel<<<blocks, threads>>>(
+                d_M11_, d_eri_vvov_, d_eri_ooov_, d_D2_,
+                d_M_eff_onthefly, omega, nocc_, nvir_);
+            cudaDeviceSynchronize();
+        }
     }
 
     // Copy both to host and compare
@@ -1481,9 +1969,116 @@ void ADC2Operator::validate_onthefly_vs_dense(real_t omega) const {
 // ========================================================================
 
 void ADC2Operator::build_M_eff_matrix(real_t omega, real_t* d_M_eff) const {
+    using Eigen::Map;
+    using Eigen::MatrixXd;
+
     int ov = singles_dim_;
     size_t dd = doubles_dim_;
     int threads = 256;
+
+    if (!gpu::gpu_available()) {
+        if (!use_dense_M12_) {
+            // On-the-fly CPU: replicate adc2_build_M_eff_onthefly_kernel
+            size_t vs1 = (size_t)nvir_ * nocc_ * nvir_;
+            size_t os1 = (size_t)nocc_ * nocc_ * nvir_;
+            size_t ds1 = (size_t)nocc_ * nvir_ * nvir_;
+            size_t ds2 = (size_t)nvir_ * nvir_;
+
+            for (int idx = 0; idx < ov * ov; idx++) {
+                int row = idx % ov;
+                int col = idx / ov;
+                int k  = row / nvir_;
+                int e  = row % nvir_;
+                int jp = col / nvir_;
+                int bp = col % nvir_;
+                real_t schur = 0.0;
+
+                // G1a
+                if (jp == k) {
+                    for (int J = 0; J < nocc_; J++)
+                        for (int C = 0; C < nvir_; C++)
+                            for (int D = 0; D < nvir_; D++) {
+                                real_t m12 = 2.0 * d_eri_vvov_[e*vs1 + C*nocc_*nvir_ + J*nvir_ + D]
+                                                 - d_eri_vvov_[D*vs1 + e*nocc_*nvir_ + J*nvir_ + C];
+                                real_t w = 1.0 / (omega - d_D2_[k*ds1 + J*ds2 + C*nvir_ + D]);
+                                schur += m12 * w * d_eri_vvov_[bp*vs1 + C*nocc_*nvir_ + J*nvir_ + D];
+                            }
+                }
+                // G1b
+                for (int C = 0; C < nvir_; C++)
+                    for (int D = 0; D < nvir_; D++) {
+                        real_t m12 = 2.0 * d_eri_vvov_[e*vs1 + C*nocc_*nvir_ + jp*nvir_ + D]
+                                         - d_eri_vvov_[D*vs1 + e*nocc_*nvir_ + jp*nvir_ + C];
+                        real_t w = 1.0 / (omega - d_D2_[k*ds1 + jp*ds2 + C*nvir_ + D]);
+                        schur += m12 * w * d_eri_vvov_[bp*vs1 + D*nocc_*nvir_ + k*nvir_ + C];
+                    }
+                // G1c
+                for (int J = 0; J < nocc_; J++)
+                    for (int D = 0; D < nvir_; D++) {
+                        real_t m12 = 2.0 * d_eri_vvov_[e*vs1 + bp*nocc_*nvir_ + J*nvir_ + D]
+                                         - d_eri_vvov_[D*vs1 + e*nocc_*nvir_ + J*nvir_ + bp];
+                        real_t w = 1.0 / (omega - d_D2_[k*ds1 + J*ds2 + bp*nvir_ + D]);
+                        schur -= m12 * w * d_eri_ooov_[k*os1 + jp*nocc_*nvir_ + J*nvir_ + D];
+                    }
+                // G1d
+                for (int J = 0; J < nocc_; J++)
+                    for (int C = 0; C < nvir_; C++) {
+                        real_t m12 = 2.0 * d_eri_vvov_[e*vs1 + C*nocc_*nvir_ + J*nvir_ + bp]
+                                         - d_eri_vvov_[bp*vs1 + e*nocc_*nvir_ + J*nvir_ + C];
+                        real_t w = 1.0 / (omega - d_D2_[k*ds1 + J*ds2 + C*nvir_ + bp]);
+                        schur -= m12 * w * d_eri_ooov_[J*os1 + jp*nocc_*nvir_ + k*nvir_ + C];
+                    }
+                // G2a
+                for (int J = 0; J < nocc_; J++)
+                    for (int D = 0; D < nvir_; D++) {
+                        real_t m12 = d_eri_ooov_[J*os1 + k*nocc_*nvir_ + jp*nvir_ + D]
+                               - 2.0*d_eri_ooov_[jp*os1 + k*nocc_*nvir_ + J*nvir_ + D];
+                        real_t w = 1.0 / (omega - d_D2_[jp*ds1 + J*ds2 + e*nvir_ + D]);
+                        schur += m12 * w * d_eri_vvov_[bp*vs1 + e*nocc_*nvir_ + J*nvir_ + D];
+                    }
+                // G2b
+                for (int I = 0; I < nocc_; I++)
+                    for (int D = 0; D < nvir_; D++) {
+                        real_t m12 = d_eri_ooov_[jp*os1 + k*nocc_*nvir_ + I*nvir_ + D]
+                               - 2.0*d_eri_ooov_[I*os1 + k*nocc_*nvir_ + jp*nvir_ + D];
+                        real_t w = 1.0 / (omega - d_D2_[I*ds1 + jp*ds2 + e*nvir_ + D]);
+                        schur += m12 * w * d_eri_vvov_[bp*vs1 + D*nocc_*nvir_ + I*nvir_ + e];
+                    }
+                // G2c
+                if (bp == e) {
+                    for (int I = 0; I < nocc_; I++)
+                        for (int J = 0; J < nocc_; J++)
+                            for (int D = 0; D < nvir_; D++) {
+                                real_t m12 = d_eri_ooov_[J*os1 + k*nocc_*nvir_ + I*nvir_ + D]
+                                       - 2.0*d_eri_ooov_[I*os1 + k*nocc_*nvir_ + J*nvir_ + D];
+                                real_t w = 1.0 / (omega - d_D2_[I*ds1 + J*ds2 + e*nvir_ + D]);
+                                schur -= m12 * w * d_eri_ooov_[I*os1 + jp*nocc_*nvir_ + J*nvir_ + D];
+                            }
+                }
+                // G2d
+                for (int I = 0; I < nocc_; I++)
+                    for (int J = 0; J < nocc_; J++) {
+                        real_t m12 = d_eri_ooov_[J*os1 + k*nocc_*nvir_ + I*nvir_ + bp]
+                               - 2.0*d_eri_ooov_[I*os1 + k*nocc_*nvir_ + J*nvir_ + bp];
+                        real_t w = 1.0 / (omega - d_D2_[I*ds1 + J*ds2 + e*nvir_ + bp]);
+                        schur -= m12 * w * d_eri_ooov_[J*os1 + jp*nocc_*nvir_ + I*nvir_ + e];
+                    }
+
+                d_M_eff[idx] = d_M11_[idx] + schur;
+            }
+            return;
+        }
+
+        // Dense CPU path
+        for (size_t idx = 0; idx < dd * (size_t)ov; idx++) {
+            size_t dd_idx = idx % dd;
+            d_scaled_M21_[idx] = d_M21_[idx] / (omega - d_D2_[dd_idx]);
+        }
+        std::memcpy(d_M_eff, d_M11_, (size_t)ov * ov * sizeof(real_t));
+        Map<MatrixXd>(d_M_eff, ov, ov).noalias() +=
+            Map<const MatrixXd>(d_M12_, ov, (int)dd) * Map<const MatrixXd>(d_scaled_M21_, (int)dd, ov);
+        return;
+    }
 
     if (!use_dense_M12_) {
         // On-the-fly: compute M_eff directly using δ-structure of M12/M21
@@ -1526,9 +2121,79 @@ void ADC2Operator::build_M_eff_matrix(real_t omega, real_t* d_M_eff) const {
 // ========================================================================
 
 void ADC2Operator::apply(const real_t* d_input, real_t* d_output) const {
+    using Eigen::Map;
+    using Eigen::MatrixXd;
+    using Eigen::VectorXd;
+
     int ov = singles_dim_;
     size_t dd = doubles_dim_;
     int threads = 256;
+
+    if (!gpu::gpu_available()) {
+        // Step 1: sigma = M11 · x
+        Map<VectorXd>(d_output, ov) = Map<const MatrixXd>(d_M11_, ov, ov) * Map<const VectorXd>(d_input, ov);
+
+        if (use_dense_M12_) {
+            // Step 2: temp_doubles = M21 · x
+            Map<VectorXd>(d_temp_doubles_, (int)dd) = Map<const MatrixXd>(d_M21_, (int)dd, ov) * Map<const VectorXd>(d_input, ov);
+
+            // Step 3: temp_doubles /= (ω - D2)
+            for (size_t i = 0; i < dd; i++)
+                d_temp_doubles_[i] /= (omega_ - d_D2_[i]);
+
+            // Step 4: sigma += M12 · temp_doubles
+            Map<VectorXd>(d_output, ov) += Map<const MatrixXd>(d_M12_, ov, (int)dd) * Map<const VectorXd>(d_temp_doubles_, (int)dd);
+        } else {
+            // Kernel-based: M21·x via δ-structure
+            int vov = nvir_ * nocc_ * nvir_;
+            int vv = nvir_ * nvir_;
+            for (size_t idx = 0; idx < dd; idx++) {
+                int I = (int)(idx / ((size_t)nocc_ * nvir_ * nvir_));
+                int rem = (int)(idx % ((size_t)nocc_ * nvir_ * nvir_));
+                int J = rem / vv;
+                rem = rem % vv;
+                int C = rem / nvir_;
+                int D = rem % nvir_;
+                real_t val = 0.0;
+                for (int E = 0; E < nvir_; E++)
+                    val += d_eri_vvov_[E * vov + C * nocc_ * nvir_ + J * nvir_ + D] * d_input[I * nvir_ + E];
+                for (int E = 0; E < nvir_; E++)
+                    val += d_eri_vvov_[E * vov + D * nocc_ * nvir_ + I * nvir_ + C] * d_input[J * nvir_ + E];
+                for (int K = 0; K < nocc_; K++)
+                    val -= d_eri_ooov_[I * nocc_ * nocc_ * nvir_ + K * nocc_ * nvir_ + J * nvir_ + D] * d_input[K * nvir_ + C];
+                for (int K = 0; K < nocc_; K++)
+                    val -= d_eri_ooov_[J * nocc_ * nocc_ * nvir_ + K * nocc_ * nvir_ + I * nvir_ + C] * d_input[K * nvir_ + D];
+                d_temp_doubles_[idx] = val;
+            }
+
+            // Step 3: temp_doubles /= (ω - D2)
+            for (size_t i = 0; i < dd; i++)
+                d_temp_doubles_[i] /= (omega_ - d_D2_[i]);
+
+            // Step 4: sigma += M12 · temp_doubles via δ-structure
+            for (int idx = 0; idx < ov; idx++) {
+                int K = idx / nvir_;
+                int E = idx % nvir_;
+                real_t val = 0.0;
+                for (int J = 0; J < nocc_; J++)
+                    for (int C = 0; C < nvir_; C++)
+                        for (int D = 0; D < nvir_; D++) {
+                            real_t eri1 = d_eri_vvov_[E * vov + C * nocc_ * nvir_ + J * nvir_ + D];
+                            real_t eri2 = d_eri_vvov_[D * vov + E * nocc_ * nvir_ + J * nvir_ + C];
+                            val += (2.0 * eri1 - eri2) * d_temp_doubles_[K * nocc_ * vv + J * vv + C * nvir_ + D];
+                        }
+                for (int I = 0; I < nocc_; I++)
+                    for (int J = 0; J < nocc_; J++)
+                        for (int D = 0; D < nvir_; D++) {
+                            real_t eri1 = d_eri_ooov_[J * nocc_ * nocc_ * nvir_ + K * nocc_ * nvir_ + I * nvir_ + D];
+                            real_t eri2 = d_eri_ooov_[I * nocc_ * nocc_ * nvir_ + K * nocc_ * nvir_ + J * nvir_ + D];
+                            val += (eri1 - 2.0 * eri2) * d_temp_doubles_[I * nocc_ * vv + J * vv + E * nvir_ + D];
+                        }
+                d_output[idx] += val;
+            }
+        }
+        return;
+    }
 
     // Step 1: sigma = M11 · x (DGEMV) — common to both paths
     {
@@ -1605,6 +2270,14 @@ void ADC2Operator::apply(const real_t* d_input, real_t* d_output) const {
 }
 
 void ADC2Operator::apply_preconditioner(const real_t* d_input, real_t* d_output) const {
+    if (!gpu::gpu_available()) {
+        for (int i = 0; i < singles_dim_; i++) {
+            real_t diag = d_diagonal_[i];
+            d_output[i] = (std::fabs(diag) > 1e-12) ? d_input[i] / diag : 0.0;
+        }
+        return;
+    }
+
     int threads = 256;
     int blocks = (singles_dim_ + threads - 1) / threads;
     adc2_preconditioner_kernel<<<blocks, threads>>>(

@@ -20,11 +20,11 @@ static __device__ double block_reduce_sum(double x){
 }
 #endif
 
-static __device__  size_t idx4_to_1(int num_basis, int mu, int nu, int la, int si){
+static __host__ __device__  size_t idx4_to_1(int num_basis, int mu, int nu, int la, int si){
   return ( ( (size_t(mu)*num_basis + nu)*num_basis + la)*num_basis + si );
 }
 
-static __device__ __forceinline__ real_t antisym_eri(const real_t* __restrict__ eri_mo,
+static __host__ __device__ __forceinline__ real_t antisym_eri(const real_t* __restrict__ eri_mo,
                                     const int num_basis,
                                     const int p, const int q, const int r, const int s)
 {

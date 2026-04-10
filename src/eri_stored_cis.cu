@@ -26,6 +26,7 @@
 #include <vector>
 #include <cmath>
 
+#include <Eigen/Dense>
 #include "rhf.hpp"
 #include "cis_operator.hpp"
 #include "cis_operator_ri.hpp"
@@ -158,6 +159,17 @@ void ERI_RI_RHF::compute_cis(int n_states) {
     const int cis_dim = nocc * nvir;
     const bool is_triplet = rhf_.is_triplet();
 
+    // CPU fallback: CISOperator_RI uses cuBLAS-only kernels with no CPU
+    // backend, so on CPU we route through the base CISOperator path by
+    // building the full MO ERI tensor via build_mo_eri (which on CPU
+    // reconstructs AO ERI from B and applies the O(N^5) quarter transform).
+    if (!gpu::gpu_available()) {
+        real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), nao);
+        compute_cis_impl(rhf_, nullptr, n_states, d_mo_eri);
+        tracked_cudaFree(d_mo_eri);
+        return;
+    }
+
     std::cout << "\n---- CIS (RI, B-matrix based) "
               << (is_triplet ? "triplet" : "singlet") << " ----"
               << " nocc=" << nocc << ", nvir=" << nvir << ", naux=" << naux
@@ -184,7 +196,28 @@ void ERI_RI_RHF::compute_cis(int n_states) {
     // B_tmp(Q,μ,q) = Σ_ν B(Q,μ,ν) C(ν,q)
     // B(Q,μ,ν) stored as (naux, nao*nao), each Q-slice is (nao, nao) row-major
     // For all Q at once: reshape as (naux*nao, nao) × C(nao, nao) → (naux*nao, nao)
-    {
+    if (!gpu::gpu_available()) {
+        // CPU fallback: two-step MO transformation using Eigen
+        using Eigen::Map;
+        using Eigen::MatrixXd;
+        const real_t alpha = 1.0, beta = 0.0;
+
+        // Step 1: B_tmp(Q*nao+μ, q) = Σ_ν B(Q*nao+μ, ν) × C(ν, q)
+        // = (naux*nao, nao) × (nao, nao)
+        Map<const MatrixXd> B_mat(d_B, nao, naux * nao);   // col-major view
+        Map<const MatrixXd> C_mat(d_C, nao, nao);           // col-major view
+        Map<MatrixXd> Tmp_mat(d_B_tmp, nao, naux * nao);
+        // col-major: result(nao, naux*nao) = C_cm × B_cm = C_rm^T × B_rm^T (as col-major)
+        Tmp_mat.noalias() = C_mat * B_mat;
+
+        // Step 2: B_mo_Q(p,q) = C^T × B_tmp_Q for each Q
+        // In col-major: B_mo_cm = B_tmp_cm × C_cm^T  per Q-slice
+        for (int Q = 0; Q < naux; Q++) {
+            Map<const MatrixXd> Bq(d_B_tmp + (size_t)Q * nao * nao, nao, nao);
+            Map<MatrixXd> Mq(d_B_mo + (size_t)Q * nao * nao, nao, nao);
+            Mq.noalias() = Bq * C_mat.transpose();
+        }
+    } else {
         const real_t alpha = 1.0, beta = 0.0;
         cublasHandle_t handle = gpu::GPUHandle::cublas();
         // cuBLAS col-major: B_cm(nao, naux*nao) × C_cm(nao, nao)
@@ -485,6 +518,15 @@ void ERI_Direct_RHF::compute_cis(int n_states) {
     const size_t num_ovov = (size_t)nocc * nvir * nocc * nvir;
     const size_t num_oovv = (size_t)nocc * nocc * nvir * nvir;
 
+    // CPU fallback: half-transform path (computeHalfTransformedERI) is GPU-only,
+    // so reconstruct the AO ERI on CPU and route through the stored-CIS impl.
+    if (!gpu::gpu_available()) {
+        real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), nao);
+        compute_cis_impl(rhf_, nullptr, n_states, d_mo_eri);
+        tracked_cudaFree(d_mo_eri);
+        return;
+    }
+
     std::string spin_label = is_triplet ? "triplet" : "singlet";
     std::cout << "\n---- CIS (half-transform, Direct) " << spin_label << " ----"
               << " nocc=" << nocc << ", nvir=" << nvir
@@ -632,6 +674,16 @@ void ERI_Hash_RHF::compute_cis(int n_states) {
     const bool is_triplet = rhf_.is_triplet();
     const size_t num_ovov = (size_t)nocc * nvir * nocc * nvir;
     const size_t num_oovv = (size_t)nocc * nocc * nvir * nvir;
+
+    // CPU fallback: half-transform kernels are GPU-only.  Use cached
+    // hash AO ERI tensor (set up by ERI_Hash::precomputation on CPU)
+    // via build_mo_eri + stored-CIS impl.
+    if (!gpu::gpu_available()) {
+        real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), nao);
+        compute_cis_impl(rhf_, nullptr, n_states, d_mo_eri);
+        tracked_cudaFree(d_mo_eri);
+        return;
+    }
 
     std::string spin_label = is_triplet ? "triplet" : "singlet";
     std::cout << "\n---- CIS (half-transform, Hash) " << spin_label << " ----"

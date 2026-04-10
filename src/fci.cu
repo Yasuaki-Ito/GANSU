@@ -20,6 +20,8 @@
 #endif
 #include <omp.h>
 #include <cmath>
+#include <cstring>
+#include <algorithm>
 #include <utility>
 #include <iostream>
 #include "gpu_manager.hpp"
@@ -28,6 +30,10 @@
 
 #include "device_host_memory.hpp"
 #include "fci.hpp"
+
+#include <Eigen/Dense>
+
+using gansu::gpu::gpu_available;
 
 
 
@@ -114,19 +120,31 @@ void gen_occs_iter_ci_new(int *occslst_flat, int *index, int *orb_list, int nele
 
 
 void computeEigenvaluesAndVectorsn(cusolverDnHandle_t cusolverH, int N, double* d_A, double* values, double* vectors, int* devInfo, double* d_W) {
-    double *d_work = NULL;
-    int lwork = 0;
     using gansu::tracked_cudaMalloc;
     using gansu::tracked_cudaFree;
-    // Query workspace size
-    cusolverDnDsyevd_bufferSize(cusolverH, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, N, d_A, N, d_W, &lwork);
-    tracked_cudaMalloc(&d_work, sizeof(double) * lwork);
+    if (!gpu_available()) {
+        // CPU fallback using Eigen (column-major d_A, N×N)
+        Eigen::Map<Eigen::MatrixXd> A(d_A, N, N);
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(A);
+        // Copy smallest eigenvalue and its eigenvector
+        values[0] = solver.eigenvalues()(0);
+        Eigen::VectorXd v0 = solver.eigenvectors().col(0);
+        memcpy(vectors, v0.data(), N * sizeof(double));
+        // Overwrite d_A with eigenvectors (column-major)
+        A = solver.eigenvectors();
+    } else {
+        double *d_work = NULL;
+        int lwork = 0;
+        // Query workspace size
+        cusolverDnDsyevd_bufferSize(cusolverH, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, N, d_A, N, d_W, &lwork);
+        tracked_cudaMalloc(&d_work, sizeof(double) * lwork);
 
-    cusolverDnDsyevd(cusolverH, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, N, d_A, N, d_W, d_work, lwork, devInfo);
-    // Copy results back to host
-    cudaMemcpy(vectors, d_A, sizeof(double) * N, cudaMemcpyDeviceToHost);
-    cudaMemcpy(values, d_W, sizeof(double) * 1, cudaMemcpyDeviceToHost);
-    tracked_cudaFree(d_work);
+        cusolverDnDsyevd(cusolverH, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, N, d_A, N, d_W, d_work, lwork, devInfo);
+        // Copy results back to host
+        cudaMemcpy(vectors, d_A, sizeof(double) * N, cudaMemcpyDeviceToHost);
+        cudaMemcpy(values, d_W, sizeof(double) * 1, cudaMemcpyDeviceToHost);
+        tracked_cudaFree(d_work);
+    }
 }
 
 
@@ -176,11 +194,44 @@ void absorb_h1e(double* d_h1e,  double* d_erio, double* d_eri, int norb, int nel
     double norm_factor = 1.0 / (nelec + 1e-100);
     double *d_f1e;
     tracked_cudaMalloc((void **)&d_f1e, d2* sizeof(double));
-    f1e_kernel<<<d2, 1>>>(d_f1e, d_erio, d_h1e, norb, d2, d3, norm_factor);
-    adderi_kernel<<<d3, 1>>>(d_f1e, d_erio, norb, d2, d3);
-    
-    int nnorb=norb*(norb+1)/2;
-    nr1to4_kernel<<<nnorb*nnorb, 1>>>(d_erio, d_eri, norb, norb, d2, d3, nnorb, fac);
+
+    if (!gpu_available()) {
+        // CPU fallback: f1e_kernel
+        for (int jk = 0; jk < d2; jk++) {
+            int j = jk / norb;
+            int k = jk % norb;
+            double sum = 0.0;
+            for (int i = 0; i < norb; i++) {
+                sum += d_erio[j * d3 + i * d2 + i * norb + k];
+            }
+            d_f1e[j * norb + k] = (d_h1e[j * norb + k] - 0.5 * sum) * norm_factor;
+        }
+        // CPU fallback: adderi_kernel
+        for (int ijk = 0; ijk < d3; ijk++) {
+            int i = ijk / d2;
+            int j = (ijk - i * d2) / norb;
+            int k = (ijk - i * d2) % norb;
+            d_erio[k * d3 + k * d2 + i * norb + j] += d_f1e[i * norb + j];
+            d_erio[i * d3 + j * d2 + k * norb + k] += d_f1e[i * norb + j];
+        }
+        // CPU fallback: nr1to4_kernel
+        int nnorb = norb * (norb + 1) / 2;
+        for (int idx = 0; idx < nnorb * nnorb; idx++) {
+            int ij = idx / nnorb;
+            int kl = idx % nnorb;
+            int i = (int)((sqrt(8.0 * ij + 1) - 1) / 2);
+            int j = ij - i * (i + 1) / 2;
+            int k = (int)((sqrt(8.0 * kl + 1) - 1) / 2);
+            int l = kl - k * (k + 1) / 2;
+            d_eri[ij * nnorb + kl] = d_erio[i * d3 + j * d2 + k * norb + l] * fac;
+        }
+    } else {
+        f1e_kernel<<<d2, 1>>>(d_f1e, d_erio, d_h1e, norb, d2, d3, norm_factor);
+        adderi_kernel<<<d3, 1>>>(d_f1e, d_erio, norb, d2, d3);
+
+        int nnorb = norb * (norb + 1) / 2;
+        nr1to4_kernel<<<nnorb*nnorb, 1>>>(d_erio, d_eri, norb, norb, d2, d3, nnorb, fac);
+    }
 
     free(f1e);
     tracked_cudaFree(d_f1e);
@@ -402,6 +453,19 @@ __global__ void propgate1e_kernel(int nelec, int norb, int nstring,
 
 }
 
+// CPU helper: inline sort for small arrays (mirrors __device__ sort_small)
+static inline void sort_small_cpu(int* arr, int n) {
+    for (int i = 1; i < n; i++) {
+        int key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && arr[j] > key) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+}
+
 void gen_linkstr_index(int nelec, int norb, int nstring, int* d_occslst,  int* d_link_index, int* d_link_nnorb) {
     using gansu::tracked_cudaMalloc;
     using gansu::tracked_cudaFree;
@@ -409,20 +473,105 @@ void gen_linkstr_index(int nelec, int norb, int nstring, int* d_occslst,  int* d
     int nlink = nelec + nelec * nvir;
     int  *d_scratch;
     int threads = 128;
-    
+
     int blocks = (nstring + threads - 1) / threads;
     const int per_thread_scratch_size = (nvir * 2 + nvir * nelec); // in int units
     int total_scratch_bytes = nstring * per_thread_scratch_size * sizeof(int);
 
     tracked_cudaMalloc((void **)&d_scratch, total_scratch_bytes);
-    
-    
-    cudaMemset(d_scratch, 0, total_scratch_bytes);
-    
-    propgate1e_kernel<<<blocks, threads>>>(nelec, norb, nstring,
-        d_link_index,  d_occslst,  d_link_nnorb, nvir, nlink, d_scratch);
 
-    //cudaGetLastError(); 
+
+    cudaMemset(d_scratch, 0, total_scratch_bytes);
+
+    if (!gpu_available()) {
+        // CPU fallback: propgate1e_kernel
+        #pragma omp parallel for schedule(dynamic)
+        for (int id = 0; id < nstring; id++) {
+            int* scratch_base = &d_scratch[id * per_thread_scratch_size];
+            int* vir = scratch_base;
+            int* where_vir = scratch_base + nvir;
+            int* str1buf = scratch_base + nvir * 2;
+
+            int parity_occ_orb = 1;
+            int* str0 = &d_occslst[id * nelec];
+
+            // compute vir[]
+            int j_vir = 0;
+            for (int i = 0; i < norb; ++i) {
+                bool found = false;
+                for (int n = 0; n < nelec; ++n) {
+                    if (str0[n] == i) { found = true; break; }
+                }
+                if (!found) { vir[j_vir++] = i; }
+            }
+
+            // compute where_vir[]
+            for (int i = 0; i < nvir; ++i) {
+                where_vir[i] = 0;
+                for (int j = 0; j < nelec; ++j) {
+                    if (str0[j] < vir[i]) where_vir[i]++;
+                }
+            }
+
+            // fill link_index (initial entries)
+            for (int i = 0; i < nelec; ++i) {
+                int a = str0[i];
+                a = a * (a + 1) / 2 + a;
+                d_link_index[(id * nlink + i) * 3 + 0] = a;
+                d_link_index[(id * nlink + i) * 3 + 1] = id;
+                d_link_index[(id * nlink + i) * 3 + 2] = 1;
+            }
+
+            // loop over electrons
+            for (int n = 0; n < nelec; ++n) {
+                for (int i = 0; i < nvir; ++i) {
+                    int* s1 = str1buf + i * nelec;
+                    for (int k = 0; k < nelec; ++k) s1[k] = str0[k];
+                    s1[n] = vir[i];
+                    sort_small_cpu(s1, nelec);
+                }
+
+                for (int i = 0; i < nvir; ++i) {
+                    int* s1 = str1buf + i * nelec;
+                    int comp = (vir[i] > str0[n]) ? 1 : 0;
+                    int sum = where_vir[i] + comp + 1;
+                    int parity = (sum % 2 == 0 ? -1 : 1) * parity_occ_orb;
+
+                    int s_index = -1;
+                    for (int k = 0; k < nstring; ++k) {
+                        bool eq = true;
+                        for (int x = 0; x < nelec; ++x) {
+                            if (s1[x] != d_occslst[k * nelec + x]) { eq = false; break; }
+                        }
+                        if (eq) { s_index = k; break; }
+                    }
+
+                    int pos_offset = nelec + n * nvir + i;
+                    int a = vir[i];
+                    int idx = str0[n];
+                    a = std::max(a * (a + 1) / 2 + idx, idx * (idx + 1) / 2 + a);
+                    d_link_index[(id * nlink + pos_offset) * 3 + 0] = a;
+                    d_link_index[(id * nlink + pos_offset) * 3 + 1] = s_index;
+                    d_link_index[(id * nlink + pos_offset) * 3 + 2] = parity;
+                }
+                parity_occ_orb *= -1;
+            }
+
+            // Remap to d_link_nnorb
+            for (int rlink_j = 0; rlink_j < nlink; ++rlink_j) {
+                int id_flat = id * nlink + rlink_j;
+                int ia_aj = d_link_index[id_flat * 3];
+                size_t id_st = (size_t)ia_aj * (size_t)nstring + (size_t)id;
+                d_link_nnorb[2 * id_st] = d_link_index[id_flat * 3 + 1];
+                d_link_nnorb[2 * id_st + 1] = d_link_index[id_flat * 3 + 2];
+            }
+        }
+    } else {
+        propgate1e_kernel<<<blocks, threads>>>(nelec, norb, nstring,
+            d_link_index,  d_occslst,  d_link_nnorb, nvir, nlink, d_scratch);
+    }
+
+    //cudaGetLastError();
     tracked_cudaFree(d_scratch);
 }
 
@@ -447,15 +596,35 @@ __global__ void Dcopy_kernel(double *in, double *out, int heff_size, int space){
 void fill_heff_hermitian_gpu(cublasHandle_t handle, double* d_heff_tmp, double* d_heff,  double* d_ci0, double* d_ci1, double* d_ci1_list, int row1, int nrow, int heff_size, int np){
     //xs: ci0_list, ax: ci1_list, xt:ci0, axt:ci1
     int row0 = row1 - nrow;
-    cublasDdot(handle, np, d_ci0, 1, d_ci1, 1, &d_heff[row0*heff_size+row0]);
-    
-    for (int i=0; i<row0; i++){
-	   cublasDdot(handle, np, d_ci0, 1, d_ci1_list+i*np, 1, &d_heff[row0*heff_size+i]);
-           cudaMemcpy(&d_heff[i*heff_size+row0], &d_heff[row0*heff_size+i], sizeof(double), cudaMemcpyDeviceToDevice);
+
+    if (!gpu_available()) {
+        // CPU fallback: cublasDdot -> manual dot product
+        double dot_val = 0.0;
+        for (int i = 0; i < np; i++) dot_val += d_ci0[i] * d_ci1[i];
+        d_heff[row0 * heff_size + row0] = dot_val;
+
+        for (int i = 0; i < row0; i++) {
+            double dot_i = 0.0;
+            for (int j = 0; j < np; j++) dot_i += d_ci0[j] * d_ci1_list[i * np + j];
+            d_heff[row0 * heff_size + i] = dot_i;
+            d_heff[i * heff_size + row0] = dot_i;
+        }
+
+        // CPU fallback: Dcopy_kernel
+        for (int id = 0; id < row1 * row1; id++) {
+            int j = id / row1;
+            d_heff_tmp[id] = d_heff[j * heff_size + id % row1];
+        }
+    } else {
+        cublasDdot(handle, np, d_ci0, 1, d_ci1, 1, &d_heff[row0*heff_size+row0]);
+
+        for (int i=0; i<row0; i++){
+            cublasDdot(handle, np, d_ci0, 1, d_ci1_list+i*np, 1, &d_heff[row0*heff_size+i]);
+            cudaMemcpy(&d_heff[i*heff_size+row0], &d_heff[row0*heff_size+i], sizeof(double), cudaMemcpyDeviceToDevice);
+        }
+
+        Dcopy_kernel<<<row1*row1, 1>>>(d_heff, d_heff_tmp, heff_size, row1);
     }
-    
-    Dcopy_kernel<<<row1*row1, 1>>>(d_heff, d_heff_tmp, heff_size, row1);
-    
 }
 
 
@@ -474,11 +643,26 @@ __global__ void Dscalplus_kernel(double *in, double *out, double k,  int np){
 
 void gen_x0_gpu(double *v, double *d_c_list, double *d_x0, int space, int np){
      //einsum_cx(v + (space - 1), c_list+(space - 1)*np, x0, np);
-     int nthread=256;
-     int nblock=(np+nthread-1)/nthread;
-     Dscal_kernel<<<nblock, nthread>>>(d_c_list+(space - 1)*np, d_x0, v[space - 1], np);
-     for (int i = space - 2; i >= 0; i--) {
-	     Dscalplus_kernel<<<nblock, nthread>>>(d_c_list+i*np, d_x0, v[i], np);
+     if (!gpu_available()) {
+         // CPU fallback: Dscal_kernel
+         double k = v[space - 1];
+         double* src = d_c_list + (space - 1) * np;
+         #pragma omp parallel for
+         for (int i = 0; i < np; i++) d_x0[i] = k * src[i];
+         // CPU fallback: Dscalplus_kernel
+         for (int s = space - 2; s >= 0; s--) {
+             double ks = v[s];
+             double* srcs = d_c_list + s * np;
+             #pragma omp parallel for
+             for (int i = 0; i < np; i++) d_x0[i] += ks * srcs[i];
+         }
+     } else {
+         int nthread=256;
+         int nblock=(np+nthread-1)/nthread;
+         Dscal_kernel<<<nblock, nthread>>>(d_c_list+(space - 1)*np, d_x0, v[space - 1], np);
+         for (int i = space - 2; i >= 0; i--) {
+             Dscalplus_kernel<<<nblock, nthread>>>(d_c_list+i*np, d_x0, v[i], np);
+         }
      }
      //cudaMemcpy(x0, d_x0, sizeof(double) * np, cudaMemcpyDeviceToHost);
 }
@@ -517,18 +701,37 @@ __global__ void Ddiv_kernel(double *in, double *out, double k,  int np){
 void normalize_xt_gpu(cublasHandle_t handle, double* d_ci0, double* d_ci0_list, double lindep, double norm_min, int space, int np){
      int i;
      double tmp, norm;
-     int nthread=256;
-     int nblock=(np+nthread-1)/nthread;
-     for (i=0; i<space; i++){
-           cublasDdot(handle, np, d_ci0_list+i*np, 1, d_ci0, 1, &tmp);
-	   Dscalminus_kernel<<<nblock, nthread>>>(d_ci0_list+i*np, d_ci0, tmp, np);
-     }
-     cublasDdot(handle, np, d_ci0, 1, d_ci0, 1, &tmp);
-     norm = sqrt(tmp); //pow(tmp, 0.5);
-     if (pow(norm, 2)>lindep){
-         Ddiv_kernel<<<nblock, nthread>>>(d_ci0, d_ci0, norm, np);
-     }
 
+     if (!gpu_available()) {
+         // CPU fallback
+         for (i = 0; i < space; i++) {
+             tmp = 0.0;
+             for (int j = 0; j < np; j++) tmp += d_ci0_list[i * np + j] * d_ci0[j];
+             // Dscalminus_kernel equivalent
+             #pragma omp parallel for
+             for (int j = 0; j < np; j++) d_ci0[j] -= tmp * d_ci0_list[i * np + j];
+         }
+         tmp = 0.0;
+         for (int j = 0; j < np; j++) tmp += d_ci0[j] * d_ci0[j];
+         norm = sqrt(tmp);
+         if (norm * norm > lindep) {
+             // Ddiv_kernel equivalent
+             #pragma omp parallel for
+             for (int j = 0; j < np; j++) d_ci0[j] = d_ci0[j] / norm;
+         }
+     } else {
+         int nthread=256;
+         int nblock=(np+nthread-1)/nthread;
+         for (i=0; i<space; i++){
+               cublasDdot(handle, np, d_ci0_list+i*np, 1, d_ci0, 1, &tmp);
+               Dscalminus_kernel<<<nblock, nthread>>>(d_ci0_list+i*np, d_ci0, tmp, np);
+         }
+         cublasDdot(handle, np, d_ci0, 1, d_ci0, 1, &tmp);
+         norm = sqrt(tmp); //pow(tmp, 0.5);
+         if (pow(norm, 2)>lindep){
+             Ddiv_kernel<<<nblock, nthread>>>(d_ci0, d_ci0, norm, np);
+         }
+     }
 }
 
 
@@ -614,47 +817,116 @@ __global__ void sigab_kernel(double* __restrict__ d_ci1,
 
 
 
-void contract_2e_spin1_gpu(cublasHandle_t handle, double* d_eri, double* d_ci0, double* d_ci1, 
-                                                  double* d_t1, double* d_vt1, int norb, int na, int nb, int nlink, 
-                                                  int reset_state, int* d_clink, int* d_link_nnorb, 
-                                                  double* d_ci0_list, double* d_ci1_list, int space, int nroots, 
+void contract_2e_spin1_gpu(cublasHandle_t handle, double* d_eri, double* d_ci0, double* d_ci1,
+                                                  double* d_t1, double* d_vt1, int norb, int na, int nb, int nlink,
+                                                  int reset_state, int* d_clink, int* d_link_nnorb,
+                                                  double* d_ci0_list, double* d_ci1_list, int space, int nroots,
                                                   int heff_size, int np)
 {
         if (reset_state == 1) {
                 printf("reset state space:%d\n", space);
                 return;
         }
-        
+
         const int nnorb = norb * (norb + 1) / 2;
         const int na_chunk = na;
         const int nb_chunk = na;
         const double D0 = 0.0, D1 = 1.0;
-        
-        // Optimize thread block size based on GPU occupancy
-        const int threadsPerBlock = min(256, na_chunk);
-        const int bcountn = nb_chunk * na_chunk;
-        const int newblocks_all = (bcountn + threadsPerBlock - 1) / threadsPerBlock;
-        
-        for (int strb_id = 0; strb_id < nb; strb_id += nb_chunk) {
-                int current_nb = min(nb - strb_id, nb_chunk);
-                
+
+        if (!gpu_available()) {
+            // CPU fallback
+            for (int strb_id = 0; strb_id < nb; strb_id += nb_chunk) {
+                int current_nb = std::min(nb - strb_id, nb_chunk);
+
                 for (int stra_id = 0; stra_id < na; stra_id += na_chunk) {
-                        int current_na = min(na - stra_id, na_chunk);
-                        
-                        // Compute intermediate tensor t1
-                        cab_kernel<<<newblocks_all, threadsPerBlock>>>(
-                                d_ci0, d_t1, current_nb, stra_id, strb_id, norb, 
-                                current_na, nb, nlink, nlink,  d_link_nnorb);
-                        
-                        // Contract with 2-electron integrals
-                        cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, bcountn, nnorb, nnorb, &D1,
-                                           d_t1, bcountn, d_eri, nnorb, &D0, d_vt1, bcountn);
-                        
-                        // Compute final result
-                        sigab_kernel<<<newblocks_all, threadsPerBlock>>>(
-                                d_ci1, d_vt1, current_nb, stra_id, strb_id, norb, 
-                                current_na, nb, nlink, nlink, d_clink);
+                    int current_na = std::min(na - stra_id, na_chunk);
+                    int bcount = current_nb;
+                    int bcountn = bcount * current_na;
+
+                    // CPU fallback: cab_kernel
+                    #pragma omp parallel for
+                    for (int tid = 0; tid < current_na * bcount; tid++) {
+                        int stra = tid / bcount;
+                        int str0 = tid % bcount;
+                        int ci0_base_stra = stra * na;
+                        int t1_base = stra * bcount + str0;
+                        for (int j = 0; j < nnorb; j++) {
+                            int str1b = d_link_nnorb[2 * (j * na + str0)];
+                            int signb = d_link_nnorb[2 * (j * na + str0) + 1];
+                            int str1a = d_link_nnorb[2 * (j * na + stra)];
+                            int signa = d_link_nnorb[2 * (j * na + stra) + 1];
+                            double val_a = signa * d_ci0[str1a * na + str0];
+                            double val_b = signb * d_ci0[ci0_base_stra + str1b];
+                            d_t1[j * na * bcount + t1_base] = val_a + val_b;
+                        }
+                    }
+
+                    // CPU fallback: cublasDgemm (d_vt1 = d_t1 * d_eri)
+                    // C(bcountn, nnorb) = A(bcountn, nnorb) * B(nnorb, nnorb)
+                    // Column-major: C_ij = sum_k A_ik * B_kj
+                    #pragma omp parallel for
+                    for (int col = 0; col < nnorb; col++) {
+                        for (int row = 0; row < bcountn; row++) {
+                            double sum = 0.0;
+                            for (int k = 0; k < nnorb; k++) {
+                                sum += d_t1[k * bcountn + row] * d_eri[col * nnorb + k];
+                            }
+                            d_vt1[col * bcountn + row] = sum;
+                        }
+                    }
+
+                    // CPU fallback: sigab_kernel
+                    int nlinka = nlink, nlinkb = nlink;
+                    #pragma omp parallel for
+                    for (int tid = 0; tid < current_na * bcount; tid++) {
+                        unsigned int stra = tid / bcount;
+                        unsigned int str0 = tid % bcount;
+                        const int* tabb = d_clink + (str0 + strb_id) * nlinkb * 3;
+                        const int* taba = d_clink + (stra + stra_id) * nlinka * 3;
+                        int vt1_base_stra = stra * bcount;
+                        int bcount_na = bcount * current_na;
+                        double val = 0.0;
+                        for (int j = 0; j < nlinkb; j++) {
+                            unsigned short iab = (unsigned short)tabb[j * 3 + 0];
+                            unsigned int str1b = (unsigned int)tabb[j * 3 + 1];
+                            int8_t signa_v = (int8_t)taba[j * 3 + 2];
+                            unsigned short iaa = (unsigned short)taba[j * 3 + 0];
+                            unsigned int str1a = (unsigned int)taba[j * 3 + 1];
+                            int8_t signb_v = (int8_t)tabb[j * 3 + 2];
+                            val += signb_v * d_vt1[vt1_base_stra + iab * bcount_na + str1b] +
+                                   signa_v * d_vt1[str1a * bcount + iaa * bcount_na + str0];
+                        }
+                        d_ci1[(stra + stra_id) * nb + str0] = val;
+                    }
                 }
+            }
+        } else {
+            // Optimize thread block size based on GPU occupancy
+            const int threadsPerBlock = min(256, na_chunk);
+            const int bcountn = nb_chunk * na_chunk;
+            const int newblocks_all = (bcountn + threadsPerBlock - 1) / threadsPerBlock;
+
+            for (int strb_id = 0; strb_id < nb; strb_id += nb_chunk) {
+                    int current_nb = min(nb - strb_id, nb_chunk);
+
+                    for (int stra_id = 0; stra_id < na; stra_id += na_chunk) {
+                            int current_na = min(na - stra_id, na_chunk);
+
+                            // Compute intermediate tensor t1
+                            cab_kernel<<<newblocks_all, threadsPerBlock>>>(
+                                    d_ci0, d_t1, current_nb, stra_id, strb_id, norb,
+                                    current_na, nb, nlink, nlink,  d_link_nnorb);
+
+                            // Contract with 2-electron integrals
+                            cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, bcountn, nnorb, nnorb, &D1,
+                                               d_t1, bcountn, d_eri, nnorb, &D0, d_vt1, bcountn);
+
+                            // Compute final result
+                            sigab_kernel<<<newblocks_all, threadsPerBlock>>>(
+                                    d_ci1, d_vt1, current_nb, stra_id, strb_id, norb,
+                                    current_na, nb, nlink, nlink, d_clink);
+                    }
+            }
         }
 }
 
@@ -723,8 +995,15 @@ void davidson(cublasHandle_t handle, cusolverDnHandle_t cusolverH,
                                 continue;
                         } else {
                                 // Compute residual: r = H*v - e*v
-                                dr_kernel<<<nblock, nthread>>>(e[0], np, d_ci0, d_ci1, dr);
-                                cublasDdot(handle, np, dr, 1, dr, 1, &dr_result);
+                                if (!gpu_available()) {
+                                    #pragma omp parallel for
+                                    for (int i = 0; i < np; i++) dr[i] = d_ci1[i] - e[0] * d_ci0[i];
+                                    dr_result = 0.0;
+                                    for (int i = 0; i < np; i++) dr_result += dr[i] * dr[i];
+                                } else {
+                                    dr_kernel<<<nblock, nthread>>>(e[0], np, d_ci0, d_ci1, dr);
+                                    cublasDdot(handle, np, dr, 1, dr, 1, &dr_result);
+                                }
                                 dx_norm = sqrt(fabs(dr_result));
                                 conv = (fabs(de) < tol && dx_norm < toloose) ? 1 : 0;
                                 printf("icyc:%d, dx_norm:%f, e:%f, de:%f\n", icyc, dx_norm, e[0], de);
@@ -737,26 +1016,49 @@ void davidson(cublasHandle_t handle, cusolverDnHandle_t cusolverH,
                                 }
                         }
                 }
-                
+
                 // Step 7: Compute residual and check convergence
-                dr_kernel<<<nblock, nthread>>>(e[0], np, d_ci0, d_ci1, d_ci0);
-                cublasDdot(handle, np, d_ci0, 1, d_ci0, 1, &dr_result);
+                if (!gpu_available()) {
+                    #pragma omp parallel for
+                    for (int i = 0; i < np; i++) d_ci0[i] = d_ci1[i] - e[0] * d_ci0[i];
+                    dr_result = 0.0;
+                    for (int i = 0; i < np; i++) dr_result += d_ci0[i] * d_ci0[i];
+                } else {
+                    dr_kernel<<<nblock, nthread>>>(e[0], np, d_ci0, d_ci1, d_ci0);
+                    cublasDdot(handle, np, d_ci0, 1, d_ci0, 1, &dr_result);
+                }
                 dx_norm = sqrt(fabs(dr_result));
                 conv = (fabs(de) < tol && dx_norm < toloose) ? 1 : 0;
                 printf("icyc:%d, dx_norm:%f, FCI_E:%.15f, Correction_E:%.15f, de:%.15f\n", icyc, dx_norm, e[0]+E_rhf, e[0], de);
-                
+
                 // Check for stable convergence (converged in consecutive iterations)
                 if (conv == 1 && conv_last == 0) {
                         printf("Converged: dx_norm:%f, FCI_E:%.15f, Correction_E:%.15f, de:%.15f\n", dx_norm, e[0]+E_rhf, e[0], de);
                         break;
                 }
-                
+
                 // Step 8: Apply preconditioner if not converged and residual is significant
                 if (conv == 0 && dx_norm * dx_norm > lindep) {
-                        precond_kernel<<<nblock, nthread>>>(d_hdiag, d_ci0, e[0], level_shift, np);
-                        cublasDdot(handle, np, d_ci0, 1, d_ci0, 1, &dr_result);
-                        double tmpk = 1.0 / sqrt(dr_result);
-                        cublasDscal(handle, np, &tmpk, d_ci0, 1);
+                        if (!gpu_available()) {
+                            // CPU fallback: precond_kernel
+                            #pragma omp parallel for
+                            for (int i = 0; i < np; i++) {
+                                double diag_val = d_hdiag[i] - (e[0] - level_shift);
+                                double abs_diag_val = fabs(diag_val);
+                                d_ci0[i] = d_ci0[i] / (abs_diag_val < 1e-8 ? 1e-8 : diag_val);
+                            }
+                            // CPU fallback: cublasDdot + cublasDscal
+                            dr_result = 0.0;
+                            for (int i = 0; i < np; i++) dr_result += d_ci0[i] * d_ci0[i];
+                            double tmpk = 1.0 / sqrt(dr_result);
+                            #pragma omp parallel for
+                            for (int i = 0; i < np; i++) d_ci0[i] *= tmpk;
+                        } else {
+                            precond_kernel<<<nblock, nthread>>>(d_hdiag, d_ci0, e[0], level_shift, np);
+                            cublasDdot(handle, np, d_ci0, 1, d_ci0, 1, &dr_result);
+                            double tmpk = 1.0 / sqrt(dr_result);
+                            cublasDscal(handle, np, &tmpk, d_ci0, 1);
+                        }
                 } else {
                         break;
                 }
@@ -804,7 +1106,18 @@ double fci(double* d_Gmo1e, double* d_Gmo, int norb, int nelec, int na, long lon
         tracked_cudaMalloc(&d_kdiag, norb_sq * sizeof(double));
         tracked_cudaMalloc(&d_hdiag, np * sizeof(double)); 
 
-        jkcopy_kernel<<<norb_sq, 1>>>(d_Gmo, d_jdiag, d_kdiag, norb, norb_sq, norb_t);
+        if (!gpu_available()) {
+            // CPU fallback: jkcopy_kernel
+            #pragma omp parallel for
+            for (int k = 0; k < norb_sq; k++) {
+                int i = k / norb;
+                int j = k % norb;
+                d_jdiag[i * norb + j] = d_Gmo[i * norb_t + i * norb_sq + j * norb + j];
+                d_kdiag[i * norb + j] = d_Gmo[i * norb_t + j * norb_sq + j * norb + i];
+            }
+        } else {
+            jkcopy_kernel<<<norb_sq, 1>>>(d_Gmo, d_jdiag, d_kdiag, norb, norb_sq, norb_t);
+        }
 
         // Compute hdiag
         int* d_occslst;
@@ -812,7 +1125,36 @@ double fci(double* d_Gmo1e, double* d_Gmo, int norb, int nelec, int na, long lon
         cudaMemcpy(d_occslst, occslst, na * neleca * sizeof(int), cudaMemcpyHostToDevice);
         int nthread = 256;
         int nblock = (np + nthread - 1) / nthread;
-        FCImake_hdiag_uhf_kernel<<<nblock, nthread>>>(d_hdiag, np, d_Gmo1e, d_jdiag, d_kdiag, norb, na, neleca, d_occslst);
+
+        if (!gpu_available()) {
+            // CPU fallback: FCImake_hdiag_uhf_kernel
+            #pragma omp parallel for
+            for (int i = 0; i < (int)np; i++) {
+                int ia = i / na;
+                int ib = i % na;
+                int *paocc = d_occslst + ia * neleca;
+                int *pbocc = d_occslst + ib * neleca;
+                double e1 = 0.0, e2 = 0.0;
+                for (int j0 = 0; j0 < neleca; j0++) {
+                    int j = paocc[j0];
+                    int jk0 = j * norb;
+                    int jb = pbocc[j0];
+                    int jb0 = jb * norb;
+                    e1 += d_Gmo1e[j * norb + j] + d_Gmo1e[jb * norb + jb];
+                    for (int k0 = 0; k0 < neleca; k0++) {
+                        int jk = jk0 + paocc[k0];
+                        e2 += d_jdiag[jk] - d_kdiag[jk];
+                        jk = jk0 + pbocc[k0];
+                        e2 += d_jdiag[jk] * 2;
+                        jk = jb0 + pbocc[k0];
+                        e2 += d_jdiag[jk] - d_kdiag[jk];
+                    }
+                }
+                d_hdiag[ia * na + ib] = e1 + e2 * .5;
+            }
+        } else {
+            FCImake_hdiag_uhf_kernel<<<nblock, nthread>>>(d_hdiag, np, d_Gmo1e, d_jdiag, d_kdiag, norb, na, neleca, d_occslst);
+        }
 
         // Generate link index
         int nlinka = neleca + neleca * (norb - neleca);
@@ -857,17 +1199,28 @@ double fci(double* d_Gmo1e, double* d_Gmo, int norb, int nelec, int na, long lon
 
         // Normalize ci0
         cublasHandle_t handle;
-        cublasCreate(&handle);
+        if (gpu_available()) cublasCreate(&handle);
         double innerprod;
-        cublasDdot(handle, np, d_ci0, 1, d_ci0, 1, &innerprod);
+        if (!gpu_available()) {
+            innerprod = 0.0;
+            for (long long i = 0; i < np; i++) innerprod += d_ci0[i] * d_ci0[i];
+        } else {
+            cublasDdot(handle, np, d_ci0, 1, d_ci0, 1, &innerprod);
+        }
         double norm = sqrt(innerprod);
         if (innerprod > lindep && norm > 1e-14) {
-            qr_decomposition_kernel<<<nblock, nthread>>>(d_ci0, np, lindep, norm);
-            cudaDeviceSynchronize();
+            if (!gpu_available()) {
+                // CPU fallback: qr_decomposition_kernel
+                #pragma omp parallel for
+                for (long long i = 0; i < np; i++) d_ci0[i] = d_ci0[i] / norm;
+            } else {
+                qr_decomposition_kernel<<<nblock, nthread>>>(d_ci0, np, lindep, norm);
+                cudaDeviceSynchronize();
+            }
         }
 
         cusolverDnHandle_t cusolverH;
-        cusolverDnCreate(&cusolverH);
+        if (gpu_available()) cusolverDnCreate(&cusolverH);
         struct timeval tv_davidson_begin, tv_davidson_end;
         gettimeofday(&tv_davidson_begin, NULL);
         
@@ -884,8 +1237,10 @@ double fci(double* d_Gmo1e, double* d_Gmo, int norb, int nelec, int na, long lon
         E_fci = e[0];
 
         // Cleanup
-        cublasDestroy(handle);
-        cusolverDnDestroy(cusolverH);
+        if (gpu_available()) {
+            cublasDestroy(handle);
+            cusolverDnDestroy(cusolverH);
+        }
 
    
         free(v);

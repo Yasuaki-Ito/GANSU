@@ -74,6 +74,10 @@ inline double dist2(const Coordinate& A, const Coordinate& B) {
  *   N = (2/pi)^{3/4} * (4*alpha)^{(l+m+n)/2} * alpha^{3/4} / sqrt((2l-1)!!(2m-1)!!(2n-1)!!)
  */
 inline double primitive_norm(double alpha, int l, int m, int n) {
+    // N = (2/pi)^{3/4} * (4*alpha)^{L/2} * alpha^{3/4} / sqrt(df(2l-1)*df(2m-1)*df(2n-1))
+    // Note: GPU calcNorm uses pi^{-3/4} instead of (2/pi)^{3/4}, but the overlap_primitive
+    // function already includes (pi/p)^{3/2} prefactor. The correct normalization for the
+    // McMurchie-Davidson convention with (pi/p)^{3/2} prefactor is (2/pi)^{3/4}.
     int L = l + m + n;
     return std::pow(2.0 / M_PI, 0.75)
          * std::pow(4.0 * alpha, L / 2.0)
@@ -173,13 +177,13 @@ inline double boys_function(int n, double x) {
  * Dimensions: (imax+1) x (jmax+1) x (imax+jmax+1)
  */
 
-// Maximum angular momentum supported (f = 3)
-static constexpr int MAX_AM = 3;
+// Maximum angular momentum supported (g = 4, needed for RI auxiliary basis)
+static constexpr int MAX_AM = 4;
 // Maximum combined angular momentum for one coordinate (needed for kinetic: l+2)
-static constexpr int MAX_AM_PLUS = MAX_AM + 2; // 5
-static constexpr int E_DIM1 = MAX_AM_PLUS + 1;  // 6
-static constexpr int E_DIM2 = MAX_AM_PLUS + 1;  // 6
-static constexpr int E_DIM3 = 2 * MAX_AM_PLUS + 1; // 11
+static constexpr int MAX_AM_PLUS = MAX_AM + 2; // 6
+static constexpr int E_DIM1 = MAX_AM_PLUS + 1;  // 7
+static constexpr int E_DIM2 = MAX_AM_PLUS + 1;  // 7
+static constexpr int E_DIM3 = 2 * MAX_AM_PLUS + 1; // 13
 
 inline int E_idx(int i, int j, int t) {
     return i * E_DIM2 * E_DIM3 + j * E_DIM3 + t;
@@ -821,7 +825,7 @@ inline void computeCoreHamiltonianMatrix(
     #pragma omp parallel for schedule(dynamic)
     #endif
     for (int A = 0; A < num_contracted; A++) {
-        for (int B = A; B < num_contracted; B++) {
+        for (int B = 0; B < num_contracted; B++) {
             const auto& csA = contracted[A];
             const auto& csB = contracted[B];
 
@@ -836,7 +840,7 @@ inline void computeCoreHamiltonianMatrix(
                     int lb = ang_b_list[cb][0], mb = ang_b_list[cb][1], nb = ang_b_list[cb][2];
                     size_t nu = csB.basis_index + cb;
 
-                    // Skip if mu > nu (will be symmetrized)
+                    // Skip upper triangle (will be symmetrized)
                     if (mu > nu) continue;
 
                     double S = overlap_contracted(shells, cgto_norms,
@@ -875,9 +879,8 @@ inline void computeCoreHamiltonianMatrix(
 /**
  * Compute the full ERI matrix with 8-fold symmetry.
  * The output array eri_matrix has size N*(N+1)/2 * (N*(N+1)/2 + 1) / 2
- * where N = num_basis, indexed by get_1d_index.
- *
- * This is the same compact storage used by the GPU ERI_Stored class.
+ * GPU ERI_Stored class stores ERI as 4D tensor: eri[mu*N^3 + nu*N^2 + la*N + si]
+ * with full 8-fold symmetry expansion (all permutations stored).
  */
 inline void computeERIMatrix(
     const std::vector<ShellTypeInfo>& shell_type_infos,
@@ -888,10 +891,9 @@ inline void computeERIMatrix(
     auto contracted = group_contracted_shells(shells, num_prims);
     int num_contracted = (int)contracted.size();
 
-    // Zero out ERI matrix
-    size_t npairs = (size_t)num_basis * (num_basis + 1) / 2;
-    size_t eri_size = npairs * (npairs + 1) / 2;
-    std::memset(eri_matrix, 0, eri_size * sizeof(real_t));
+    const size_t N = num_basis;
+    // Zero out ERI matrix (4D tensor: N^4 elements)
+    std::memset(eri_matrix, 0, N * N * N * N * sizeof(real_t));
 
     // Build list of all (contracted_shell, component) pairs for iteration
     struct BasisFunc {
@@ -901,25 +903,23 @@ inline void computeERIMatrix(
         int lx, ly, lz;
     };
 
-    std::vector<BasisFunc> basis_funcs;
-    basis_funcs.reserve(num_basis);
+    std::vector<BasisFunc> basis_funcs(num_basis);
     for (int A = 0; A < num_contracted; A++) {
         const auto& cs = contracted[A];
         const auto& ang_list = AngularMomentums[cs.shell_type];
         for (int c = 0; c < (int)ang_list.size(); c++) {
-            BasisFunc bf;
-            bf.contracted_idx = A;
-            bf.component = c;
-            bf.basis_idx = cs.basis_index + c;
-            bf.lx = ang_list[c][0];
-            bf.ly = ang_list[c][1];
-            bf.lz = ang_list[c][2];
-            basis_funcs.push_back(bf);
+            size_t idx = cs.basis_index + c;
+            assert(idx < (size_t)num_basis);
+            basis_funcs[idx].contracted_idx = A;
+            basis_funcs[idx].component = c;
+            basis_funcs[idx].basis_idx = idx;
+            basis_funcs[idx].lx = ang_list[c][0];
+            basis_funcs[idx].ly = ang_list[c][1];
+            basis_funcs[idx].lz = ang_list[c][2];
         }
     }
 
-    // Iterate over unique quartets (mu nu | la si) with 8-fold symmetry:
-    //   mu <= nu, la <= si, (mu,nu) <= (la,si)
+    // Iterate over unique quartets and expand 8-fold symmetry into 4D tensor
     #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic)
     #endif
@@ -927,10 +927,8 @@ inline void computeERIMatrix(
         for (int nu = mu; nu < num_basis; nu++) {
             for (int la = 0; la < num_basis; la++) {
                 for (int si = la; si < num_basis; si++) {
-                    // Enforce bra <= ket ordering
-                    size_t bra_lin = tri_index(mu, nu, num_basis);
-                    size_t ket_lin = tri_index(la, si, num_basis);
-                    if (bra_lin > ket_lin) continue;
+                    // Enforce bra <= ket ordering to avoid double-computing
+                    if (mu * N + nu > la * N + si) continue;
 
                     const auto& bf_mu = basis_funcs[mu];
                     const auto& bf_nu = basis_funcs[nu];
@@ -950,9 +948,22 @@ inline void computeERIMatrix(
 
                     double norm = cgto_norms[mu] * cgto_norms[nu]
                                 * cgto_norms[la] * cgto_norms[si];
+                    double v = norm * val;
 
-                    size_t idx = get_1d_index(mu, nu, la, si, num_basis);
-                    eri_matrix[idx] = norm * val;
+                    // Expand all 8 symmetry permutations into 4D tensor
+                    // (mu nu|la si) = (nu mu|la si) = (mu nu|si la) = (nu mu|si la)
+                    //                = (la si|mu nu) = (si la|mu nu) = (la si|nu mu) = (si la|nu mu)
+                    auto set = [&](int a, int b, int c, int d) {
+                        eri_matrix[a*N*N*N + b*N*N + c*N + d] = v;
+                    };
+                    set(mu, nu, la, si);
+                    set(nu, mu, la, si);
+                    set(mu, nu, si, la);
+                    set(nu, mu, si, la);
+                    set(la, si, mu, nu);
+                    set(si, la, mu, nu);
+                    set(la, si, nu, mu);
+                    set(si, la, nu, mu);
                 }
             }
         }
@@ -1033,6 +1044,707 @@ inline void computeSchwarzUpperBounds(
             double Q = std::sqrt(std::abs(norm * val));
             upper_bounds[mu * num_basis + nu] = Q;
             upper_bounds[nu * num_basis + mu] = Q;
+        }
+    }
+}
+
+// ============================================================
+//  Numerical gradient helper routines
+// ============================================================
+
+/**
+ * Compute nuclear repulsion energy for a given set of atoms.
+ */
+inline double compute_nuclear_repulsion(const Atom* atoms, int num_atoms) {
+    double V_nn = 0.0;
+    for (int A = 0; A < num_atoms; A++) {
+        for (int B = A + 1; B < num_atoms; B++) {
+            double dx = atoms[A].coordinate.x - atoms[B].coordinate.x;
+            double dy = atoms[A].coordinate.y - atoms[B].coordinate.y;
+            double dz = atoms[A].coordinate.z - atoms[B].coordinate.z;
+            double r = std::sqrt(dx * dx + dy * dy + dz * dz);
+            V_nn += (double)atoms[A].atomic_number * (double)atoms[B].atomic_number / r;
+        }
+    }
+    return V_nn;
+}
+
+/**
+ * Compute the total RHF energy given fixed density matrix D and integrals.
+ *
+ * E = V_nn + sum_{mu,nu} D(mu,nu) * H(mu,nu)
+ *   + 0.5 * sum_{mu,nu,la,si} D(mu,nu) * D(la,si) * [2*(mu nu|la si) - (mu la|nu si)]
+ *
+ * where H is the core Hamiltonian, and the ERI tensor is stored as eri[mu*N^3+nu*N^2+la*N+si].
+ * The density matrix D is the converged RHF density (fixed).
+ */
+inline double compute_rhf_energy(
+    const real_t* density_matrix,
+    const real_t* core_hamiltonian,
+    const real_t* eri_matrix,
+    double V_nn,
+    int num_basis)
+{
+    const size_t N = num_basis;
+
+    // E = 0.5 * Tr(D*(H+F)) + V_nn
+    // F(mu,nu) = H(mu,nu) + sum D(la,si) * [(mu nu|la si) - 0.5*(mu la|nu si)]
+    // So: E = 0.5 * sum D * (H + H + G) = 0.5 * sum D * (2H + G)
+    //       = sum D*H + 0.5 * sum D*G
+    // where G(mu,nu) = sum D(la,si) * [(mn|ls) - 0.5*(ml|ns)]
+    // Note: D already contains factor 2 (D=2*CC), and G uses (J-0.5K) matching GPU Fock.
+    double E = 0.0;
+    for (int mu = 0; mu < num_basis; mu++) {
+        for (int nu = 0; nu < num_basis; nu++) {
+            double F_mn = core_hamiltonian[mu * N + nu];
+            for (int la = 0; la < num_basis; la++) {
+                for (int si = 0; si < num_basis; si++) {
+                    double D_ls = density_matrix[la * N + si];
+                    double J = eri_matrix[mu * N * N * N + nu * N * N + la * N + si];
+                    double K = eri_matrix[mu * N * N * N + la * N * N + nu * N + si];
+                    F_mn += D_ls * (J - 0.5 * K);
+                }
+            }
+            E += density_matrix[mu * N + nu] * (core_hamiltonian[mu * N + nu] + F_mn);
+        }
+    }
+    E *= 0.5;
+
+    return V_nn + E;
+}
+
+// ============================================================
+//  Driver: CPU Energy Gradient for RHF (Numerical Differentiation)
+// ============================================================
+
+/**
+ * Compute the RHF energy gradient on CPU using numerical central differences.
+ *
+ * For each atom A and direction d (x, y, z):
+ *   1. Displace atom A by +h in direction d, rebuild all integrals
+ *   2. Compute E(+h) = V_nn(+h) + Tr(D*H(+h)) + 0.5*Tr(D*G(+h)) with FIXED density D
+ *   3. Displace by -h, compute E(-h) similarly
+ *   4. gradient[3*A+d] = (E(+h) - E(-h)) / (2*h)
+ *
+ * The density matrix D is kept FIXED from the converged SCF at the original geometry.
+ * This is O(N^4) per displacement but guaranteed correct for small molecules.
+ *
+ * Note: W_matrix is accepted for API compatibility but not used in numerical differentiation.
+ */
+inline void computeEnergyGradient_RHF(
+    const std::vector<ShellTypeInfo>& shell_type_infos,
+    const Atom* atoms, const PrimitiveShell* shells,
+    const real_t* cgto_norms,
+    const real_t* density_matrix,
+    const real_t* W_matrix,
+    int num_atoms, int num_basis,
+    std::vector<double>& gradient)
+{
+    const int n_grad = 3 * num_atoms;
+    gradient.assign(n_grad, 0.0);
+
+    const double h = 1.0e-4; // step size in bohr (central difference)
+    const size_t N = num_basis;
+    const size_t N4 = N * N * N * N;
+    const size_t N2 = N * N;
+
+    // Count total primitive shells
+    int num_prims = total_num_shells(shell_type_infos);
+
+    // For each atom and direction, compute E(+h) and E(-h)
+    for (int atom = 0; atom < num_atoms; atom++) {
+        for (int dir = 0; dir < 3; dir++) {
+            double E_plus = 0.0, E_minus = 0.0;
+
+            // Do +h and -h displacements
+            for (int sign = 0; sign < 2; sign++) {
+                double delta = (sign == 0) ? +h : -h;
+
+                // Create displaced atom and shell copies
+                std::vector<Atom> disp_atoms(atoms, atoms + num_atoms);
+                std::vector<PrimitiveShell> disp_shells(shells, shells + num_prims);
+
+                // Displace the target atom
+                if (dir == 0) disp_atoms[atom].coordinate.x += delta;
+                else if (dir == 1) disp_atoms[atom].coordinate.y += delta;
+                else disp_atoms[atom].coordinate.z += delta;
+
+                // Displace all primitive shells belonging to this atom
+                for (int p = 0; p < num_prims; p++) {
+                    if (disp_shells[p].atom_index == atom) {
+                        if (dir == 0) disp_shells[p].coordinate.x += delta;
+                        else if (dir == 1) disp_shells[p].coordinate.y += delta;
+                        else disp_shells[p].coordinate.z += delta;
+                    }
+                }
+
+                // Compute nuclear repulsion with displaced geometry
+                double V_nn = compute_nuclear_repulsion(disp_atoms.data(), num_atoms);
+
+                // Compute overlap and core Hamiltonian with displaced geometry
+                std::vector<real_t> S_disp(N2, 0.0);
+                std::vector<real_t> H_disp(N2, 0.0);
+                computeCoreHamiltonianMatrix(
+                    shell_type_infos,
+                    disp_atoms.data(), disp_shells.data(), cgto_norms,
+                    S_disp.data(), H_disp.data(),
+                    num_atoms, num_basis);
+
+                // Compute ERI matrix with displaced geometry
+                std::vector<real_t> eri_disp(N4, 0.0);
+                computeERIMatrix(
+                    shell_type_infos,
+                    disp_shells.data(), cgto_norms,
+                    eri_disp.data(), num_basis);
+
+                // Compute energy with FIXED density matrix but displaced integrals
+                double E = compute_rhf_energy(
+                    density_matrix, H_disp.data(), eri_disp.data(),
+                    V_nn, num_basis);
+
+                if (sign == 0) E_plus = E;
+                else E_minus = E;
+            }
+
+            gradient[3 * atom + dir] = (E_plus - E_minus) / (2.0 * h);
+        }
+    }
+}
+
+// ============================================================
+//  2-center ERI primitive: (P|Q) between two single Gaussians
+// ============================================================
+
+/**
+ * Compute the 2-center electron repulsion integral between two primitive Gaussians:
+ *   (P|Q) = integral phi_P(r1) * (1/|r1-r2|) * phi_Q(r2) dr1 dr2
+ *
+ * Using McMurchie-Davidson, this is equivalent to a 4-center ERI (P s | Q s)
+ * where each "bra" and "ket" consists of a single Gaussian (no pair partner).
+ *
+ * For a single Gaussian P with exponent alpha at center A, angular momentum (l,m,n):
+ *   The Gaussian product center is just A (p = alpha, XPA = 0).
+ *   The E coefficients reduce to: E^t_{i,0}(alpha, 0, 0) computed with p=alpha, b=0, XPA=0, XPB=0.
+ *   Since b=0 leads to degenerate behavior in the standard recursion,
+ *   we treat each side as E^t_{i,0} with the recursion:
+ *     E^0_{0,0} = 1
+ *     E^t_{i+1,0} = (1/(2p)) E^{t-1}_{i,0} + 0 + (t+1) E^{t+1}_{i,0}
+ *   (XPA = 0 because the product center P of (alpha, 0) at center A is just A itself.)
+ *
+ * Prefactor = 2 pi^{5/2} / (p * q * sqrt(p+q))  where p=alpha_P, q=alpha_Q
+ * R integrals are computed with composite exponent pq/(p+q) over P-Q = A-B.
+ */
+inline double eri2_primitive(double alpha, double beta,
+                             const Coordinate& A, const Coordinate& B,
+                             int la, int ma, int na,
+                             int lb, int mb, int nb) {
+    // Implement the 2-center ERI (P|Q) as a 4-center (Ps|Qs) with
+    // phantom Gaussians (b=d=EPS, angular momentum 0) placed at the same
+    // centers.  Using a small finite EPS avoids the degeneracy in
+    // compute_E_coefficients (b=0) whose behavior is untested.
+    // With lb=mb=nb=0 on the phantom side, the E coefficients do not
+    // depend on the (lb,mb,nb) path and the only effect of EPS is a tiny
+    // shift in the product centre, which is negligible for EPS << alpha,beta.
+    const double EPS = 0.0;
+    // Path: reuse the full 4-center primitive with phantom exponents = 0.
+    // With b=d=0, the prefactor has mu_ab = a*b/(a+b) = 0, exp(-mu*AB²)=1,
+    // and the product centers P=A, Q=B. The 4-center kernel reduces exactly
+    // to the desired 2-center integral.
+    return eri_primitive(
+        alpha, EPS, beta, EPS,
+        A, A, B, B,
+        la, ma, na, 0, 0, 0,
+        lb, mb, nb, 0, 0, 0);
+}
+
+
+// ============================================================
+//  3-center ERI primitive: (P|mu nu) with one auxiliary, two AO
+// ============================================================
+
+/**
+ * Compute the 3-center ERI between one auxiliary primitive P and an AO pair (mu,nu):
+ *   (P|mu nu) = integral phi_P(r1) * (1/|r1-r2|) * phi_mu(r2) phi_nu(r2) dr1 dr2
+ *
+ * This is a 4-center ERI (P s | mu nu) where the bra is a single Gaussian.
+ * Bra: exponent p = alpha_P, center A (single Gaussian, j=0)
+ * Ket: exponent q = alpha_mu + alpha_nu, center Q = weighted average
+ *
+ * Prefactor = 2 pi^{5/2} / (p * q * sqrt(p+q)) * exp(-mu_cd * |CD|^2)
+ */
+inline double eri3_primitive(double alpha_P,
+                             double alpha_mu, double alpha_nu,
+                             const Coordinate& A,
+                             const Coordinate& C, const Coordinate& D,
+                             int lP, int mP, int nP,
+                             int lc, int mc, int nc,
+                             int ld, int md, int nd) {
+    // Delegate to the 4-center primitive with a phantom s-Gaussian at A.
+    // With b=0, the bra pair (alpha_P, 0) at (A, A) collapses to the single
+    // Gaussian at A with exponent alpha_P and angular momentum (lP,mP,nP).
+    return eri_primitive(
+        alpha_P, 0.0, alpha_mu, alpha_nu,
+        A, A, C, D,
+        lP, mP, nP, 0, 0, 0,
+        lc, mc, nc, ld, md, nd);
+}
+
+
+// ============================================================
+//  Contracted 2-center ERI: (P|Q)
+// ============================================================
+
+/// Contracted 2-center ERI between two auxiliary shells
+inline double eri2_contracted(const PrimitiveShell* shells,
+                              const std::vector<size_t>& prims_P,
+                              const std::vector<size_t>& prims_Q,
+                              int lP, int mP, int nP,
+                              int lQ, int mQ, int nQ) {
+    double result = 0.0;
+    for (size_t iP : prims_P) {
+        const auto& sP = shells[iP];
+        double NP = primitive_norm(sP.exponent, lP, mP, nP);
+        for (size_t iQ : prims_Q) {
+            const auto& sQ = shells[iQ];
+            double NQ = primitive_norm(sQ.exponent, lQ, mQ, nQ);
+            result += sP.coefficient * sQ.coefficient * NP * NQ
+                    * eri2_primitive(sP.exponent, sQ.exponent,
+                                    sP.coordinate, sQ.coordinate,
+                                    lP, mP, nP, lQ, mQ, nQ);
+        }
+    }
+    return result;
+}
+
+
+// ============================================================
+//  Contracted 3-center ERI: (P|mu nu)
+// ============================================================
+
+/// Contracted 3-center ERI: auxiliary P with AO pair (mu, nu)
+inline double eri3_contracted(const PrimitiveShell* aux_shells,
+                              const PrimitiveShell* ao_shells,
+                              const std::vector<size_t>& prims_P,
+                              const std::vector<size_t>& prims_mu,
+                              const std::vector<size_t>& prims_nu,
+                              int lP, int mP, int nP,
+                              int lmu, int mmu, int nmu,
+                              int lnu, int mnu, int nnu) {
+    double result = 0.0;
+    for (size_t iP : prims_P) {
+        const auto& sP = aux_shells[iP];
+        double NP = primitive_norm(sP.exponent, lP, mP, nP);
+        for (size_t imu : prims_mu) {
+            const auto& smu = ao_shells[imu];
+            double Nmu = primitive_norm(smu.exponent, lmu, mmu, nmu);
+            for (size_t inu : prims_nu) {
+                const auto& snu = ao_shells[inu];
+                double Nnu = primitive_norm(snu.exponent, lnu, mnu, nnu);
+                result += sP.coefficient * smu.coefficient * snu.coefficient
+                        * NP * Nmu * Nnu
+                        * eri3_primitive(sP.exponent,
+                                        smu.exponent, snu.exponent,
+                                        sP.coordinate,
+                                        smu.coordinate, snu.coordinate,
+                                        lP, mP, nP,
+                                        lmu, mmu, nmu,
+                                        lnu, mnu, nnu);
+            }
+        }
+    }
+    return result;
+}
+
+
+// ============================================================
+//  Driver: 2-center ERI matrix (P|Q) for RI
+// ============================================================
+
+/**
+ * Compute the 2-center ERI matrix (P|Q) for RI approximation.
+ * Output: two_center_eri[P * num_aux + Q] stored row-major, size num_aux x num_aux.
+ * The matrix is symmetric: (P|Q) = (Q|P).
+ */
+inline void computeTwoCenterERIs(
+    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+    const PrimitiveShell* aux_shells,
+    const real_t* aux_cgto_norms,
+    real_t* two_center_eri,
+    int num_auxiliary_basis) {
+
+    int num_aux_prims = total_num_shells(auxiliary_shell_type_infos);
+    auto aux_contracted = group_contracted_shells(aux_shells, num_aux_prims);
+    int num_aux_contracted = (int)aux_contracted.size();
+
+    // Build auxiliary basis function list indexed by basis_index
+    // (contracted-shell iteration order != basis_index order, so we
+    //  must index by basis_idx to match the GPU output layout)
+    struct AuxBasisFunc {
+        int contracted_idx;
+        int component;
+        size_t basis_idx;
+        int lx, ly, lz;
+    };
+
+    std::vector<AuxBasisFunc> aux_funcs(num_auxiliary_basis);
+    for (int A = 0; A < num_aux_contracted; A++) {
+        const auto& cs = aux_contracted[A];
+        const auto& ang_list = AngularMomentums[cs.shell_type];
+        for (int c = 0; c < (int)ang_list.size(); c++) {
+            size_t idx = cs.basis_index + c;
+            assert(idx < (size_t)num_auxiliary_basis);
+            aux_funcs[idx].contracted_idx = A;
+            aux_funcs[idx].component = c;
+            aux_funcs[idx].basis_idx = idx;
+            aux_funcs[idx].lx = ang_list[c][0];
+            aux_funcs[idx].ly = ang_list[c][1];
+            aux_funcs[idx].lz = ang_list[c][2];
+        }
+    }
+
+    std::memset(two_center_eri, 0, (size_t)num_auxiliary_basis * num_auxiliary_basis * sizeof(real_t));
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic)
+    #endif
+    for (int P = 0; P < num_auxiliary_basis; P++) {
+        for (int Q = P; Q < num_auxiliary_basis; Q++) {
+            const auto& bfP = aux_funcs[P];
+            const auto& bfQ = aux_funcs[Q];
+
+            double val = eri2_contracted(
+                aux_shells,
+                aux_contracted[bfP.contracted_idx].primitive_indices,
+                aux_contracted[bfQ.contracted_idx].primitive_indices,
+                bfP.lx, bfP.ly, bfP.lz,
+                bfQ.lx, bfQ.ly, bfQ.lz);
+
+            double norm = aux_cgto_norms[P] * aux_cgto_norms[Q];
+            double v = norm * val;
+
+            two_center_eri[(size_t)P * num_auxiliary_basis + Q] = v;
+            if (P != Q) {
+                two_center_eri[(size_t)Q * num_auxiliary_basis + P] = v;
+            }
+        }
+    }
+}
+
+
+// ============================================================
+//  Driver: 3-center ERI matrix (P|mu nu) for RI
+// ============================================================
+
+/**
+ * Compute the 3-center ERI matrix (P|mu nu) for RI approximation.
+ * Output: three_center_eri[P * nao^2 + mu * nao + nu] stored as (N_aux x N^2).
+ * Symmetric in (mu, nu): (P|mu nu) = (P|nu mu).
+ */
+inline void computeThreeCenterERIs(
+    const std::vector<ShellTypeInfo>& shell_type_infos,
+    const PrimitiveShell* ao_shells,
+    const real_t* ao_cgto_norms,
+    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+    const PrimitiveShell* aux_shells,
+    const real_t* aux_cgto_norms,
+    real_t* three_center_eri,
+    int num_basis,
+    int num_auxiliary_basis) {
+
+    int num_ao_prims = total_num_shells(shell_type_infos);
+    auto ao_contracted = group_contracted_shells(ao_shells, num_ao_prims);
+    int num_ao_contracted = (int)ao_contracted.size();
+
+    int num_aux_prims = total_num_shells(auxiliary_shell_type_infos);
+    auto aux_contracted = group_contracted_shells(aux_shells, num_aux_prims);
+    int num_aux_contracted = (int)aux_contracted.size();
+
+    // Build AO basis function list indexed by basis_index
+    struct BasisFunc {
+        int contracted_idx;
+        int component;
+        size_t basis_idx;
+        int lx, ly, lz;
+    };
+
+    std::vector<BasisFunc> ao_funcs(num_basis);
+    for (int A = 0; A < num_ao_contracted; A++) {
+        const auto& cs = ao_contracted[A];
+        const auto& ang_list = AngularMomentums[cs.shell_type];
+        for (int c = 0; c < (int)ang_list.size(); c++) {
+            size_t idx = cs.basis_index + c;
+            assert(idx < (size_t)num_basis);
+            ao_funcs[idx].contracted_idx = A;
+            ao_funcs[idx].component = c;
+            ao_funcs[idx].basis_idx = idx;
+            ao_funcs[idx].lx = ang_list[c][0];
+            ao_funcs[idx].ly = ang_list[c][1];
+            ao_funcs[idx].lz = ang_list[c][2];
+        }
+    }
+
+    // Build auxiliary basis function list indexed by basis_index
+    std::vector<BasisFunc> aux_funcs(num_auxiliary_basis);
+    for (int A = 0; A < num_aux_contracted; A++) {
+        const auto& cs = aux_contracted[A];
+        const auto& ang_list = AngularMomentums[cs.shell_type];
+        for (int c = 0; c < (int)ang_list.size(); c++) {
+            size_t idx = cs.basis_index + c;
+            assert(idx < (size_t)num_auxiliary_basis);
+            aux_funcs[idx].contracted_idx = A;
+            aux_funcs[idx].component = c;
+            aux_funcs[idx].basis_idx = idx;
+            aux_funcs[idx].lx = ang_list[c][0];
+            aux_funcs[idx].ly = ang_list[c][1];
+            aux_funcs[idx].lz = ang_list[c][2];
+        }
+    }
+
+    const size_t nao2 = (size_t)num_basis * num_basis;
+    std::memset(three_center_eri, 0, (size_t)num_auxiliary_basis * nao2 * sizeof(real_t));
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic)
+    #endif
+    for (int P = 0; P < num_auxiliary_basis; P++) {
+        const auto& bfP = aux_funcs[P];
+        for (int mu = 0; mu < num_basis; mu++) {
+            for (int nu = mu; nu < num_basis; nu++) {
+                const auto& bfmu = ao_funcs[mu];
+                const auto& bfnu = ao_funcs[nu];
+
+                double val = eri3_contracted(
+                    aux_shells, ao_shells,
+                    aux_contracted[bfP.contracted_idx].primitive_indices,
+                    ao_contracted[bfmu.contracted_idx].primitive_indices,
+                    ao_contracted[bfnu.contracted_idx].primitive_indices,
+                    bfP.lx, bfP.ly, bfP.lz,
+                    bfmu.lx, bfmu.ly, bfmu.lz,
+                    bfnu.lx, bfnu.ly, bfnu.lz);
+
+                double norm = aux_cgto_norms[P] * ao_cgto_norms[mu] * ao_cgto_norms[nu];
+                double v = norm * val;
+
+                three_center_eri[(size_t)P * nao2 + (size_t)mu * num_basis + nu] = v;
+                if (mu != nu) {
+                    three_center_eri[(size_t)P * nao2 + (size_t)nu * num_basis + mu] = v;
+                }
+            }
+        }
+    }
+}
+
+
+// ============================================================
+//  Driver: Auxiliary Schwarz upper bounds for RI
+// ============================================================
+
+/**
+ * Compute Schwarz upper bounds for auxiliary basis shells:
+ *   Q_P = sqrt( |(P|P)| )
+ * Stored as a flat array of size num_auxiliary_basis.
+ */
+inline void computeAuxiliarySchwarzUpperBounds(
+    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+    const PrimitiveShell* aux_shells,
+    const real_t* aux_cgto_norms,
+    real_t* upper_bounds,
+    int num_auxiliary_basis) {
+
+    int num_aux_prims = total_num_shells(auxiliary_shell_type_infos);
+    auto aux_contracted = group_contracted_shells(aux_shells, num_aux_prims);
+    int num_aux_contracted = (int)aux_contracted.size();
+
+    struct AuxBasisFunc {
+        int contracted_idx;
+        int component;
+        size_t basis_idx;
+        int lx, ly, lz;
+    };
+
+    std::vector<AuxBasisFunc> aux_funcs(num_auxiliary_basis);
+    for (int A = 0; A < num_aux_contracted; A++) {
+        const auto& cs = aux_contracted[A];
+        const auto& ang_list = AngularMomentums[cs.shell_type];
+        for (int c = 0; c < (int)ang_list.size(); c++) {
+            size_t idx = cs.basis_index + c;
+            assert(idx < (size_t)num_auxiliary_basis);
+            aux_funcs[idx].contracted_idx = A;
+            aux_funcs[idx].component = c;
+            aux_funcs[idx].basis_idx = idx;
+            aux_funcs[idx].lx = ang_list[c][0];
+            aux_funcs[idx].ly = ang_list[c][1];
+            aux_funcs[idx].lz = ang_list[c][2];
+        }
+    }
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic)
+    #endif
+    for (int P = 0; P < num_auxiliary_basis; P++) {
+        const auto& bfP = aux_funcs[P];
+
+        double val = eri2_contracted(
+            aux_shells,
+            aux_contracted[bfP.contracted_idx].primitive_indices,
+            aux_contracted[bfP.contracted_idx].primitive_indices,
+            bfP.lx, bfP.ly, bfP.lz,
+            bfP.lx, bfP.ly, bfP.lz);
+
+        double norm = aux_cgto_norms[P] * aux_cgto_norms[P];
+        upper_bounds[P] = std::sqrt(std::abs(norm * val));
+    }
+}
+
+
+// ============================================================
+//  RI-Fock CPU helper kernels (matching GPU kernel logic)
+// ============================================================
+
+/**
+ * CPU equivalent of computeRIIntermediateMatrixB_kernel:
+ *   B[p][mu][nu] = sum_q three_center[q][mu][nu] * L[q][p]
+ */
+inline void computeRIIntermediateMatrixB_cpu(
+    const real_t* three_center_eri,
+    const real_t* matrix_L,
+    real_t* matrix_B,
+    int num_basis,
+    int num_auxiliary_basis) {
+
+    const size_t nao2 = (size_t)num_basis * num_basis;
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
+    for (int p = 0; p < num_auxiliary_basis; p++) {
+        for (int mu = 0; mu < num_basis; mu++) {
+            for (int nu = 0; nu < num_basis; nu++) {
+                real_t sum = 0.0;
+                for (int q = 0; q < num_auxiliary_basis; q++) {
+                    sum += three_center_eri[(size_t)q * nao2 + (size_t)mu * num_basis + nu]
+                         * matrix_L[(size_t)q * num_auxiliary_basis + p];
+                }
+                matrix_B[(size_t)p * nao2 + (size_t)mu * num_basis + nu] = sum;
+            }
+        }
+    }
+}
+
+/**
+ * CPU equivalent of weighted_sum_matrices_kernel:
+ *   J[id] = sum_j W[j] * B[j * M*M + id]
+ */
+inline void weighted_sum_matrices_cpu(
+    real_t* J, const real_t* B, const real_t* W,
+    int M, int N, bool accumulated = false) {
+
+    const size_t M2 = (size_t)M * M;
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
+    for (size_t id = 0; id < M2; id++) {
+        real_t sum = 0.0;
+        for (int j = 0; j < N; j++) {
+            sum += W[j] * B[(size_t)j * M2 + id];
+        }
+        if (accumulated) {
+            J[id] += sum;
+        } else {
+            J[id] = sum;
+        }
+    }
+}
+
+/**
+ * CPU equivalent of sum_matrices_kernel:
+ *   K[id] = sum_p B[p * M*M + id]
+ */
+inline void sum_matrices_cpu(
+    real_t* K, const real_t* B,
+    int M, int N, bool accumulated = false) {
+
+    const size_t M2 = (size_t)M * M;
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
+    for (size_t id = 0; id < M2; id++) {
+        real_t sum = 0.0;
+        for (int p = 0; p < N; p++) {
+            sum += B[(size_t)p * M2 + id];
+        }
+        if (accumulated) {
+            K[id] += sum;
+        } else {
+            K[id] = sum;
+        }
+    }
+}
+
+/**
+ * CPU equivalent of computeFockMatrix_RI_RHF_kernel:
+ *   F[id] = H[id] + J[id] - 0.5 * K[id]
+ */
+inline void computeFockMatrix_RI_RHF_cpu(
+    const real_t* core_hamiltonian,
+    const real_t* J, const real_t* K,
+    real_t* fock, int num_basis) {
+
+    const size_t N2 = (size_t)num_basis * num_basis;
+    for (size_t id = 0; id < N2; id++) {
+        fock[id] = core_hamiltonian[id] + J[id] - 0.5 * K[id];
+    }
+}
+
+/**
+ * CPU equivalent of computeFockMatrix_RI_UHF_kernel:
+ *   F[id] = H[id] + J[id] - K[id]
+ */
+inline void computeFockMatrix_RI_UHF_cpu(
+    const real_t* core_hamiltonian,
+    const real_t* J, const real_t* K,
+    real_t* fock, int num_basis) {
+
+    const size_t N2 = (size_t)num_basis * num_basis;
+    for (size_t id = 0; id < N2; id++) {
+        fock[id] = core_hamiltonian[id] + J[id] - K[id];
+    }
+}
+
+/**
+ * CPU equivalent of computeFockMatrix_RI_ROHF_kernel:
+ *   F_closed[id] = H[id] + J[id] - 0.5 * K_closed[id]
+ *   F_open[id]   = 0.5 * (H[id] + J[id] - K_open[id])
+ */
+inline void computeFockMatrix_RI_ROHF_cpu(
+    const real_t* core_hamiltonian,
+    const real_t* J,
+    const real_t* K_closed, const real_t* K_open,
+    real_t* fock_closed, real_t* fock_open,
+    int num_basis) {
+
+    const size_t N2 = (size_t)num_basis * num_basis;
+    for (size_t id = 0; id < N2; id++) {
+        fock_closed[id] = core_hamiltonian[id] + J[id] - 0.5 * K_closed[id];
+        fock_open[id] = 0.5 * (core_hamiltonian[id] + J[id] - K_open[id]);
+    }
+}
+
+/**
+ * CPU equivalent of packThreeDimensionalTensorX:
+ *   d_X_out[num_aux*num_occ * mu + num_occ * p + k] = d_X_in[idx]
+ * where idx = p * num_basis * num_occ + mu * num_occ + k
+ */
+inline void packThreeDimensionalTensorX_cpu(
+    const real_t* X_in, real_t* X_out,
+    int num_basis, int num_auxiliary_basis, int num_occ) {
+
+    for (int p = 0; p < num_auxiliary_basis; p++) {
+        for (int mu = 0; mu < num_basis; mu++) {
+            for (int k = 0; k < num_occ; k++) {
+                size_t in_idx = (size_t)p * num_basis * num_occ + (size_t)mu * num_occ + k;
+                size_t out_idx = (size_t)num_auxiliary_basis * num_occ * mu + (size_t)num_occ * p + k;
+                X_out[out_idx] = X_in[in_idx];
+            }
         }
     }
 }

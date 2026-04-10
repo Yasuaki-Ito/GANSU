@@ -259,34 +259,71 @@ ADC2XOperator::ADC2XOperator(const ADC2Operator& adc2_op,
       d_eri_oovv_(nullptr),
       d_diagonal_(nullptr)
 {
-    int threads = 256;
-    int blocks;
-
     // Extract additional ERI blocks needed for M22 first-order terms
     size_t oooo_size = (size_t)nocc_ * nocc_ * nocc_ * nocc_;
     tracked_cudaMalloc(&d_eri_oooo_, oooo_size * sizeof(real_t));
-    blocks = (oooo_size + threads - 1) / threads;
-    eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo_, nocc_, nao);
 
     size_t vvvv_size = (size_t)nvir_ * nvir_ * nvir_ * nvir_;
     tracked_cudaMalloc(&d_eri_vvvv_, vvvv_size * sizeof(real_t));
-    blocks = (vvvv_size + threads - 1) / threads;
-    eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv_, nocc_, nvir_, nao);
 
     size_t oovv_size = (size_t)nocc_ * nocc_ * nvir_ * nvir_;
     tracked_cudaMalloc(&d_eri_oovv_, oovv_size * sizeof(real_t));
-    blocks = (oovv_size + threads - 1) / threads;
-    eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv_, nocc_, nvir_, nao);
 
-    cudaDeviceSynchronize();
+    if (!gpu::gpu_available()) {
+        size_t nao2 = (size_t)nao * nao;
+        // Extract oooo: (ik|jl)
+        #pragma omp parallel for collapse(2)
+        for (int i = 0; i < nocc_; i++)
+            for (int j = 0; j < nocc_; j++)
+                for (int k = 0; k < nocc_; k++)
+                    for (int l = 0; l < nocc_; l++)
+                        d_eri_oooo_[((size_t)i*nocc_+j)*nocc_*nocc_ + (size_t)k*nocc_+l] =
+                            d_eri_mo[((size_t)i*nao+j)*nao2 + (size_t)k*nao+l];
+        // Extract vvvv: (ac|bd)
+        #pragma omp parallel for collapse(2)
+        for (int a = 0; a < nvir_; a++)
+            for (int b = 0; b < nvir_; b++)
+                for (int c = 0; c < nvir_; c++)
+                    for (int d = 0; d < nvir_; d++)
+                        d_eri_vvvv_[((size_t)a*nvir_+b)*nvir_*nvir_ + (size_t)c*nvir_+d] =
+                            d_eri_mo[((size_t)(a+nocc_)*nao+b+nocc_)*nao2 + (size_t)(c+nocc_)*nao+d+nocc_];
+        // Extract oovv: (ij|ab)
+        #pragma omp parallel for collapse(2)
+        for (int i = 0; i < nocc_; i++)
+            for (int j = 0; j < nocc_; j++)
+                for (int a = 0; a < nvir_; a++)
+                    for (int b = 0; b < nvir_; b++)
+                        d_eri_oovv_[((size_t)i*nocc_+j)*nvir_*nvir_ + (size_t)a*nvir_+b] =
+                            d_eri_mo[((size_t)i*nao+j)*nao2 + (size_t)(a+nocc_)*nao+b+nocc_];
+    } else {
+        int threads = 256;
+        int blocks;
+        blocks = (oooo_size + threads - 1) / threads;
+        eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo_, nocc_, nao);
+        blocks = (vvvv_size + threads - 1) / threads;
+        eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv_, nocc_, nvir_, nao);
+        blocks = (oovv_size + threads - 1) / threads;
+        eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv_, nocc_, nvir_, nao);
+        cudaDeviceSynchronize();
+    }
 
     // Build diagonal: [diag(M11) | D2]
     tracked_cudaMalloc(&d_diagonal_, (size_t)total_dim_ * sizeof(real_t));
-    blocks = (total_dim_ + threads - 1) / threads;
-    adc2x_build_diagonal_kernel<<<blocks, threads>>>(
-        adc2_op_.get_M11(), adc2_op_.get_D2(),
-        d_diagonal_, singles_dim_, doubles_dim_);
-    cudaDeviceSynchronize();
+    if (!gpu::gpu_available()) {
+        for (int idx = 0; idx < total_dim_; idx++) {
+            if (idx < singles_dim_) {
+                d_diagonal_[idx] = adc2_op_.get_M11()[(size_t)idx + (size_t)idx * singles_dim_];
+            } else {
+                d_diagonal_[idx] = adc2_op_.get_D2()[idx - singles_dim_];
+            }
+        }
+    } else {
+        int blocks = (total_dim_ + 255) / 256;
+        adc2x_build_diagonal_kernel<<<blocks, 256>>>(
+            adc2_op_.get_M11(), adc2_op_.get_D2(),
+            d_diagonal_, singles_dim_, doubles_dim_);
+        cudaDeviceSynchronize();
+    }
 }
 
 ADC2XOperator::~ADC2XOperator() {
@@ -298,12 +335,121 @@ ADC2XOperator::~ADC2XOperator() {
 
 
 void ADC2XOperator::apply(const real_t* d_input, real_t* d_output) const {
-    int threads = 256;
-
     const real_t* d_R1 = d_input;
     const real_t* d_R2 = d_input + singles_dim_;
     real_t* d_sigma1 = d_output;
     real_t* d_sigma2 = d_output + singles_dim_;
+
+    if (!gpu::gpu_available()) {
+        // CPU fallback: σ1 = M11 · R1
+        const real_t* M11 = adc2_op_.get_M11();
+        #pragma omp parallel for
+        for (int row = 0; row < singles_dim_; row++) {
+            real_t sum = 0.0;
+            for (int col = 0; col < singles_dim_; col++)
+                sum += M11[(size_t)col * singles_dim_ + row] * d_R1[col];
+            d_sigma1[row] = sum;
+        }
+
+        // CPU fallback: σ1 += M12 · R2 (same δ-structure as adc2_apply_M12_x2_kernel)
+        const real_t* d_eri_vvov = adc2_op_.get_eri_vvov();
+        const real_t* d_eri_ooov = adc2_op_.get_eri_ooov();
+        #pragma omp parallel for
+        for (int ia = 0; ia < singles_dim_; ia++) {
+            int i = ia / nvir_;
+            int a = ia % nvir_;
+            real_t sigma = 0.0;
+            for (int j = 0; j < nocc_; j++)
+                for (int b = 0; b < nvir_; b++) {
+                    real_t r2_ijab = d_R2[(size_t)i*nocc_*nvir_*nvir_ + (size_t)j*nvir_*nvir_ + (size_t)a*nvir_ + b];
+                    real_t r2_jiab = d_R2[(size_t)j*nocc_*nvir_*nvir_ + (size_t)i*nvir_*nvir_ + (size_t)a*nvir_ + b];
+                    for (int c = 0; c < nvir_; c++) {
+                        real_t vv = d_eri_vvov[(size_t)c*nvir_*nocc_*nvir_ + (size_t)b*nocc_*nvir_ + (size_t)j*nvir_ + a];
+                        sigma += vv * (2.0 * r2_ijab - r2_jiab);
+                    }
+                    for (int k = 0; k < nocc_; k++) {
+                        real_t oo = d_eri_ooov[(size_t)k*nocc_*nocc_*nvir_ + (size_t)j*nocc_*nvir_ + (size_t)i*nvir_ + b];
+                        sigma -= oo * (2.0 * r2_ijab - r2_jiab);
+                    }
+                }
+            d_sigma1[ia] += sigma;
+        }
+
+        // CPU fallback: σ2 = M21 · R1 (same δ-structure as adc2_apply_M21_x1_kernel)
+        #pragma omp parallel for
+        for (int idx = 0; idx < doubles_dim_; idx++) {
+            int ii = idx / (nocc_ * nvir_ * nvir_);
+            int rem = idx % (nocc_ * nvir_ * nvir_);
+            int jj = rem / (nvir_ * nvir_);
+            rem %= (nvir_ * nvir_);
+            int aa = rem / nvir_;
+            int bb = rem % nvir_;
+            real_t sigma = 0.0;
+            for (int c = 0; c < nvir_; c++) {
+                real_t vv1 = d_eri_vvov[(size_t)c*nvir_*nocc_*nvir_ + (size_t)aa*nocc_*nvir_ + (size_t)jj*nvir_ + bb];
+                real_t vv2 = d_eri_vvov[(size_t)c*nvir_*nocc_*nvir_ + (size_t)bb*nocc_*nvir_ + (size_t)ii*nvir_ + aa];
+                sigma += (2.0 * vv1 - vv2) * d_R1[ii * nvir_ + c];
+                sigma += (2.0 * vv2 - vv1) * d_R1[jj * nvir_ + c];
+            }
+            for (int k = 0; k < nocc_; k++) {
+                real_t oo1 = d_eri_ooov[(size_t)k*nocc_*nocc_*nvir_ + (size_t)jj*nocc_*nvir_ + (size_t)ii*nvir_ + bb];
+                real_t oo2 = d_eri_ooov[(size_t)k*nocc_*nocc_*nvir_ + (size_t)ii*nocc_*nvir_ + (size_t)jj*nvir_ + aa];
+                sigma -= (2.0 * oo1 - oo2) * d_R1[k * nvir_ + aa];
+                sigma -= (2.0 * oo2 - oo1) * d_R1[k * nvir_ + bb];
+            }
+            d_sigma2[idx] = sigma;
+        }
+
+        // CPU fallback: σ2 += D2·R2 + V·R2 (M22 with off-diagonal terms)
+        const real_t* d_D2 = adc2_op_.get_D2();
+        const real_t* d_eri_ovov = adc2_op_.get_eri_ovov();
+        #pragma omp parallel for
+        for (int idx = 0; idx < doubles_dim_; idx++) {
+            int i = idx / (nocc_ * nvir_ * nvir_);
+            int rem = idx % (nocc_ * nvir_ * nvir_);
+            int j = rem / (nvir_ * nvir_);
+            rem %= (nvir_ * nvir_);
+            int a = rem / nvir_;
+            int b = rem % nvir_;
+            real_t sigma = d_D2[idx] * d_R2[idx];
+            // oooo
+            for (int k = 0; k < nocc_; k++)
+                for (int l = 0; l < nocc_; l++) {
+                    real_t ik_jl = d_eri_oooo_[(size_t)i*nocc_*nocc_*nocc_ + (size_t)k*nocc_*nocc_ + (size_t)j*nocc_+l];
+                    sigma += ik_jl * d_R2[(size_t)k*nocc_*nvir_*nvir_ + (size_t)l*nvir_*nvir_ + (size_t)a*nvir_+b];
+                }
+            // vvvv
+            for (int c = 0; c < nvir_; c++)
+                for (int d = 0; d < nvir_; d++) {
+                    real_t ac_bd = d_eri_vvvv_[(size_t)a*nvir_*nvir_*nvir_ + (size_t)c*nvir_*nvir_ + (size_t)b*nvir_+d];
+                    sigma += ac_bd * d_R2[(size_t)i*nocc_*nvir_*nvir_ + (size_t)j*nvir_*nvir_ + (size_t)c*nvir_+d];
+                }
+            // voov 8 terms
+            size_t ovov_stride = (size_t)nvir_ * nocc_ * nvir_;
+            size_t oovv_stride = (size_t)nocc_ * nvir_ * nvir_;
+            for (int k = 0; k < nocc_; k++)
+                for (int c = 0; c < nvir_; c++) {
+                    real_t jb_kc = d_eri_ovov[(size_t)j*ovov_stride + (size_t)b*nocc_*nvir_ + (size_t)k*nvir_+c];
+                    real_t ia_kc = d_eri_ovov[(size_t)i*ovov_stride + (size_t)a*nocc_*nvir_ + (size_t)k*nvir_+c];
+                    real_t kj_bc = d_eri_oovv_[(size_t)k*oovv_stride + (size_t)j*nvir_*nvir_ + (size_t)b*nvir_+c];
+                    real_t kj_ac = d_eri_oovv_[(size_t)k*oovv_stride + (size_t)j*nvir_*nvir_ + (size_t)a*nvir_+c];
+                    real_t ki_ac = d_eri_oovv_[(size_t)k*oovv_stride + (size_t)i*nvir_*nvir_ + (size_t)a*nvir_+c];
+                    real_t ki_bc = d_eri_oovv_[(size_t)k*oovv_stride + (size_t)i*nvir_*nvir_ + (size_t)b*nvir_+c];
+                    real_t r2_ik_ac = d_R2[(size_t)i*nocc_*nvir_*nvir_ + (size_t)k*nvir_*nvir_ + (size_t)a*nvir_+c];
+                    real_t r2_ik_ca = d_R2[(size_t)i*nocc_*nvir_*nvir_ + (size_t)k*nvir_*nvir_ + (size_t)c*nvir_+a];
+                    real_t r2_ik_cb = d_R2[(size_t)i*nocc_*nvir_*nvir_ + (size_t)k*nvir_*nvir_ + (size_t)c*nvir_+b];
+                    real_t r2_jk_bc = d_R2[(size_t)j*nocc_*nvir_*nvir_ + (size_t)k*nvir_*nvir_ + (size_t)b*nvir_+c];
+                    real_t r2_jk_ca = d_R2[(size_t)j*nocc_*nvir_*nvir_ + (size_t)k*nvir_*nvir_ + (size_t)c*nvir_+a];
+                    real_t r2_jk_cb = d_R2[(size_t)j*nocc_*nvir_*nvir_ + (size_t)k*nvir_*nvir_ + (size_t)c*nvir_+b];
+                    sigma += 2.0*jb_kc*r2_ik_ac - kj_bc*r2_ik_ac - jb_kc*r2_ik_ca - kj_ac*r2_ik_cb
+                           + 2.0*ia_kc*r2_jk_bc - ki_ac*r2_jk_bc - ki_bc*r2_jk_ca - ia_kc*r2_jk_cb;
+                }
+            d_sigma2[idx] += sigma;
+        }
+        return;
+    }
+
+    int threads = 256;
 
     // --- σ1 = M11 · R1 (DGEMV) ---
     {
@@ -351,6 +497,14 @@ void ADC2XOperator::apply(const real_t* d_input, real_t* d_output) const {
 
 
 void ADC2XOperator::apply_preconditioner(const real_t* d_input, real_t* d_output) const {
+    if (!gpu::gpu_available()) {
+        #pragma omp parallel for
+        for (int idx = 0; idx < total_dim_; idx++) {
+            real_t diag = d_diagonal_[idx];
+            d_output[idx] = (fabs(diag) > 1e-12) ? d_input[idx] / diag : 0.0;
+        }
+        return;
+    }
     int threads = 256;
     int blocks = (total_dim_ + threads - 1) / threads;
     adc2x_preconditioner_kernel<<<blocks, threads>>>(

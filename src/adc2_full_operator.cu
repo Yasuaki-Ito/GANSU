@@ -107,12 +107,22 @@ ADC2FullOperator::ADC2FullOperator(const ADC2Operator& adc2_op)
     // Allocate and build diagonal
     tracked_cudaMalloc(&d_diagonal_, (size_t)total_dim_ * sizeof(real_t));
 
-    int threads = 256;
-    int blocks = (total_dim_ + threads - 1) / threads;
-    adc2_full_build_diagonal_kernel<<<blocks, threads>>>(
-        adc2_op_.get_M11(), adc2_op_.get_D2(),
-        d_diagonal_, singles_dim_, doubles_dim_);
-    cudaDeviceSynchronize();
+    if (!gpu::gpu_available()) {
+        for (int idx = 0; idx < total_dim_; idx++) {
+            if (idx < singles_dim_) {
+                d_diagonal_[idx] = adc2_op_.get_M11()[(size_t)idx + (size_t)idx * singles_dim_];
+            } else {
+                d_diagonal_[idx] = adc2_op_.get_D2()[idx - singles_dim_];
+            }
+        }
+    } else {
+        int threads = 256;
+        int blocks = (total_dim_ + threads - 1) / threads;
+        adc2_full_build_diagonal_kernel<<<blocks, threads>>>(
+            adc2_op_.get_M11(), adc2_op_.get_D2(),
+            d_diagonal_, singles_dim_, doubles_dim_);
+        cudaDeviceSynchronize();
+    }
 }
 
 ADC2FullOperator::~ADC2FullOperator() {
@@ -120,8 +130,6 @@ ADC2FullOperator::~ADC2FullOperator() {
 }
 
 void ADC2FullOperator::apply(const real_t* d_input, real_t* d_output) const {
-    int threads = 256;
-
     const real_t* d_R1 = d_input;                    // [singles_dim]
     const real_t* d_R2 = d_input + singles_dim_;     // [doubles_dim]
     real_t* d_sigma1 = d_output;                     // [singles_dim]
@@ -129,6 +137,87 @@ void ADC2FullOperator::apply(const real_t* d_input, real_t* d_output) const {
 
     int nocc = adc2_op_.get_nocc();
     int nvir = adc2_op_.get_nvir();
+
+    if (!gpu::gpu_available()) {
+        // CPU fallback: σ1 = M11 · R1
+        const real_t* M11 = adc2_op_.get_M11();
+        #pragma omp parallel for
+        for (int row = 0; row < singles_dim_; row++) {
+            real_t sum = 0.0;
+            for (int col = 0; col < singles_dim_; col++)
+                sum += M11[(size_t)col * singles_dim_ + row] * d_R1[col];
+            d_sigma1[row] = sum;
+        }
+
+        // CPU fallback: σ1 += M12 · R2
+        const real_t* d_eri_vvov = adc2_op_.get_eri_vvov();
+        const real_t* d_eri_ooov = adc2_op_.get_eri_ooov();
+        #pragma omp parallel for
+        for (int ia = 0; ia < singles_dim_; ia++) {
+            int i = ia / nvir;
+            int a = ia % nvir;
+            real_t sigma = 0.0;
+            for (int j = 0; j < nocc; j++)
+                for (int b = 0; b < nvir; b++) {
+                    real_t r2_ijab = d_R2[(size_t)i * nocc * nvir * nvir + (size_t)j * nvir * nvir + (size_t)a * nvir + b];
+                    real_t r2_jiab = d_R2[(size_t)j * nocc * nvir * nvir + (size_t)i * nvir * nvir + (size_t)a * nvir + b];
+                    for (int c = 0; c < nvir; c++) {
+                        real_t vvov_cb_j_a_val = d_eri_vvov[(size_t)c * nvir * nocc * nvir + (size_t)b * nocc * nvir + (size_t)j * nvir + a];
+                        sigma += vvov_cb_j_a_val * (2.0 * r2_ijab - r2_jiab);
+                    }
+                    for (int k = 0; k < nocc; k++) {
+                        real_t ooov_kj_i_b_val = d_eri_ooov[(size_t)k * nocc * nocc * nvir + (size_t)j * nocc * nvir + (size_t)i * nvir + b];
+                        sigma -= ooov_kj_i_b_val * (2.0 * r2_ijab - r2_jiab);
+                    }
+                }
+            d_sigma1[ia] += sigma;
+        }
+
+        // CPU fallback: σ2 = M21 · R1
+        #pragma omp parallel for
+        for (int idx = 0; idx < doubles_dim_; idx++) {
+            int ii = idx / (nocc * nvir * nvir);
+            int rem = idx % (nocc * nvir * nvir);
+            int jj = rem / (nvir * nvir);
+            rem %= (nvir * nvir);
+            int aa = rem / nvir;
+            int bb = rem % nvir;
+            real_t sigma = 0.0;
+            for (int c = 0; c < nvir; c++) {
+                real_t x1_ic = d_R1[ii * nvir + c];
+                real_t x1_jc = d_R1[jj * nvir + c];
+                real_t vvov_cab_j = d_eri_vvov[(size_t)c * nvir * nocc * nvir + (size_t)aa * nocc * nvir + (size_t)jj * nvir + bb];
+                real_t vvov_cba_i = d_eri_vvov[(size_t)c * nvir * nocc * nvir + (size_t)bb * nocc * nvir + (size_t)ii * nvir + aa];
+                sigma += vvov_cab_j * (2.0 * x1_ic - x1_jc) - vvov_cba_i * x1_jc + vvov_cab_j * x1_jc
+                       - vvov_cab_j * x1_jc;
+                // Simplified: follow the kernel logic exactly
+            }
+            // Re-do with proper kernel logic
+            sigma = 0.0;
+            for (int c = 0; c < nvir; c++) {
+                real_t vv_c_a_j_b = d_eri_vvov[(size_t)c * nvir * nocc * nvir + (size_t)aa * nocc * nvir + (size_t)jj * nvir + bb];
+                real_t vv_c_b_i_a = d_eri_vvov[(size_t)c * nvir * nocc * nvir + (size_t)bb * nocc * nvir + (size_t)ii * nvir + aa];
+                sigma += (2.0 * vv_c_a_j_b - vv_c_b_i_a) * d_R1[ii * nvir + c];
+                sigma += (2.0 * vv_c_b_i_a - vv_c_a_j_b) * d_R1[jj * nvir + c];
+            }
+            for (int k = 0; k < nocc; k++) {
+                real_t oo_k_j_i_b = d_eri_ooov[(size_t)k * nocc * nocc * nvir + (size_t)jj * nocc * nvir + (size_t)ii * nvir + bb];
+                real_t oo_k_i_j_a = d_eri_ooov[(size_t)k * nocc * nocc * nvir + (size_t)ii * nocc * nvir + (size_t)jj * nvir + aa];
+                sigma -= (2.0 * oo_k_j_i_b - oo_k_i_j_a) * d_R1[k * nvir + aa];
+                sigma -= (2.0 * oo_k_i_j_a - oo_k_j_i_b) * d_R1[k * nvir + bb];
+            }
+            d_sigma2[idx] = sigma;
+        }
+
+        // CPU fallback: σ2 += D2 · R2
+        #pragma omp parallel for
+        for (int idx = 0; idx < doubles_dim_; idx++)
+            d_sigma2[idx] += adc2_op_.get_D2()[idx] * d_R2[idx];
+
+        return;
+    }
+
+    int threads = 256;
 
     // --- σ1 = M11 · R1 ---
     {
@@ -171,6 +260,14 @@ void ADC2FullOperator::apply(const real_t* d_input, real_t* d_output) const {
 }
 
 void ADC2FullOperator::apply_preconditioner(const real_t* d_input, real_t* d_output) const {
+    if (!gpu::gpu_available()) {
+        #pragma omp parallel for
+        for (int idx = 0; idx < total_dim_; idx++) {
+            real_t diag = d_diagonal_[idx];
+            d_output[idx] = (fabs(diag) > 1e-12) ? d_input[idx] / diag : 0.0;
+        }
+        return;
+    }
     int threads = 256;
     int blocks = (total_dim_ + threads - 1) / threads;
     adc2_full_preconditioner_kernel<<<blocks, threads>>>(

@@ -28,6 +28,13 @@
 
 namespace gansu{
 
+// Forward declarations of stored-path helpers defined in eri_stored.cu.
+// These are used as CPU fallbacks by the RI-based post-HF methods.
+double mp2_from_full_moeri(
+    const double* d_eri_mo, const double* d_C, const double* d_eps,
+    int nao, int occ);
+
+
 // // #threads = M * Mvir * Maux
 __global__
 void nu2a_(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_B_p_mu_nu, double* d_B_p_mu_a)
@@ -549,6 +556,14 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
     real_t *d_eps = orbital_energies.device_ptr();
     const int num_auxiliary_basis = num_auxiliary_basis_;
 
+    // === CPU fallback: build full MO ERI from B and use stored MP2 ===
+    if (!gpu::gpu_available()) {
+        real_t* d_mo_eri = build_mo_eri(d_C, num_basis_);
+        real_t E = mp2_from_full_moeri(d_mo_eri, d_C, d_eps, num_basis_, nocc);
+        tracked_cudaFree(d_mo_eri);
+        return E;
+    }
+
     // Copy B matrix to avoid in-place destruction of intermediate_matrix_B_
     const size_t B_size = (size_t)num_auxiliary_basis * num_basis_ * num_basis_;
     real_t* d_B_copy = nullptr;
@@ -876,6 +891,14 @@ real_t ERI_RI_SemiDirect_RHF::compute_mp2_energy() {
     real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
     real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
 
+    // === CPU fallback: use stored B matrix cached in ERI_RI_Direct precomputation ===
+    if (!gpu::gpu_available()) {
+        real_t* d_mo_eri = build_mo_eri(d_C, num_basis_);
+        real_t E = mp2_from_full_moeri(d_mo_eri, d_C, d_eps, num_basis_, nocc);
+        tracked_cudaFree(d_mo_eri);
+        return E;
+    }
+
     std::cout << "  [Semi-Direct RI-MP2] Building temporary B matrix..." << std::endl;
 
     real_t* d_B = build_temporary_B_matrix(
@@ -907,6 +930,14 @@ real_t ERI_RI_Direct_RHF::compute_mp2_energy() {
     const int nvir = num_basis_ - nocc;
     real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
     real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+
+    // === CPU fallback: use stored B matrix cached in ERI_RI_Direct precomputation ===
+    if (!gpu::gpu_available()) {
+        real_t* d_mo_eri = build_mo_eri(d_C, num_basis_);
+        real_t E = mp2_from_full_moeri(d_mo_eri, d_C, d_eps, num_basis_, nocc);
+        tracked_cudaFree(d_mo_eri);
+        return E;
+    }
 
     std::cout << "  [Direct RI-MP2] Building temporary B matrix..." << std::endl;
 

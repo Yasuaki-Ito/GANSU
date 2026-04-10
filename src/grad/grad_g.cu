@@ -13,7 +13,11 @@
  */
 
 
+#ifdef GANSU_CPU_ONLY
+#include "cuda_compat.hpp"
+#else
 #include <cuda.h>
+#endif
 #include <cmath>
 
 #include "gradients.hpp"

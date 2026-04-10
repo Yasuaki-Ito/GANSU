@@ -13,6 +13,7 @@
 #include "device_host_memory.hpp"
 #include <iostream>
 #include <cmath>
+#include <cstring>
 
 namespace gansu {
 
@@ -101,6 +102,86 @@ void cphf_preconditioner_kernel(
 }
 
 // ============================================================
+//  CPU fallback helpers
+// ============================================================
+
+static void cphf_compute_diagonal_cpu(
+    real_t* d_diagonal, const real_t* d_orbital_energies,
+    int nocc, int nvir)
+{
+    for (int idx = 0; idx < nocc * nvir; idx++) {
+        int i = idx / nvir;
+        int a = idx % nvir;
+        d_diagonal[idx] = d_orbital_energies[nocc + a] - d_orbital_energies[i];
+    }
+}
+
+static void cphf_apply_cpu(
+    real_t* d_output, const real_t* d_input,
+    const real_t* d_orbital_energies, const real_t* d_eri_mo,
+    int nocc, int nvir, int nmo)
+{
+    int n = nocc * nvir;
+
+    // Diagonal part
+    for (int idx = 0; idx < n; idx++) {
+        int i = idx / nvir;
+        int a = idx % nvir;
+        double eps_diff = d_orbital_energies[nocc + a] - d_orbital_energies[i];
+        d_output[idx] = eps_diff * d_input[idx];
+    }
+
+    // 2-electron part
+    #pragma omp parallel for schedule(dynamic)
+    for (int idx = 0; idx < n; idx++) {
+        int i = idx / nvir;
+        int a = idx % nvir;
+        int a_mo = nocc + a;
+
+        double sum = 0.0;
+        for (int j = 0; j < nocc; j++) {
+            for (int b = 0; b < nvir; b++) {
+                int b_mo = nocc + b;
+                double U_bj = d_input[j * nvir + b];
+                double eri_aibj = d_eri_mo[((size_t)a_mo*nmo + i)*nmo*nmo + (size_t)b_mo*nmo + j];
+                double eri_abij = d_eri_mo[((size_t)a_mo*nmo + b_mo)*nmo*nmo + (size_t)i*nmo + j];
+                double eri_ajib = d_eri_mo[((size_t)a_mo*nmo + j)*nmo*nmo + (size_t)i*nmo + b_mo];
+                sum += (4.0 * eri_aibj - eri_abij - eri_ajib) * U_bj;
+            }
+        }
+        d_output[idx] += sum;
+    }
+}
+
+static void cphf_preconditioner_cpu(
+    real_t* d_output, const real_t* d_input, const real_t* d_diagonal, int n)
+{
+    for (int idx = 0; idx < n; idx++) {
+        double diag = d_diagonal[idx];
+        d_output[idx] = (fabs(diag) > 1e-12) ? d_input[idx] / diag : d_input[idx];
+    }
+}
+
+// Simple BLAS-1 CPU helpers
+static double cpu_ddot(int n, const real_t* x, const real_t* y) {
+    double s = 0.0;
+    for (int i = 0; i < n; i++) s += x[i] * y[i];
+    return s;
+}
+
+static double cpu_dnrm2(int n, const real_t* x) {
+    return std::sqrt(cpu_ddot(n, x, x));
+}
+
+static void cpu_daxpy(int n, double alpha, const real_t* x, real_t* y) {
+    for (int i = 0; i < n; i++) y[i] += alpha * x[i];
+}
+
+static void cpu_dscal(int n, double alpha, real_t* x) {
+    for (int i = 0; i < n; i++) x[i] *= alpha;
+}
+
+// ============================================================
 //  CPHFOperator implementation
 // ============================================================
 
@@ -111,6 +192,16 @@ CPHFOperator::CPHFOperator(const real_t* d_eri_mo, const real_t* d_orbital_energ
 {
     // Compute diagonal
     tracked_cudaMalloc(&d_diagonal_, nocc * nvir * sizeof(real_t));
+
+#ifndef GANSU_CPU_ONLY
+    if (!gpu::gpu_available()) {
+#endif
+        cphf_compute_diagonal_cpu(d_diagonal_, d_orbital_energies, nocc, nvir);
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+#endif
+
     int threads = 256;
     int blocks = (nocc * nvir + threads - 1) / threads;
     cphf_compute_diagonal_kernel<<<blocks, threads>>>(d_diagonal_, d_orbital_energies, nocc, nvir);
@@ -123,6 +214,16 @@ CPHFOperator::~CPHFOperator() {
 
 void CPHFOperator::apply(const real_t* d_input, real_t* d_output) const {
     int n = nocc_ * nvir_;
+
+#ifndef GANSU_CPU_ONLY
+    if (!gpu::gpu_available()) {
+#endif
+        cphf_apply_cpu(d_output, d_input, d_orbital_energies_, d_eri_mo_, nocc_, nvir_, nmo_);
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+#endif
+
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
 
@@ -137,6 +238,16 @@ void CPHFOperator::apply(const real_t* d_input, real_t* d_output) const {
 
 void CPHFOperator::apply_preconditioner(const real_t* d_input, real_t* d_output) const {
     int n = nocc_ * nvir_;
+
+#ifndef GANSU_CPU_ONLY
+    if (!gpu::gpu_available()) {
+#endif
+        cphf_preconditioner_cpu(d_output, d_input, d_diagonal_, n);
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+#endif
+
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     cphf_preconditioner_kernel<<<blocks, threads>>>(d_output, d_input, d_diagonal_, n);
@@ -151,7 +262,6 @@ void solve_cphf(const CPHFOperator& cphf_op,
                 int n_pert, double tol, int max_iter)
 {
     int n = cphf_op.dimension();
-    cublasHandle_t handle = gpu::GPUHandle::cublas();
 
     // Workspace per perturbation
     real_t *d_r, *d_z, *d_p, *d_Ap;
@@ -161,6 +271,61 @@ void solve_cphf(const CPHFOperator& cphf_op,
     tracked_cudaMalloc(&d_Ap, n * sizeof(real_t));
 
     std::cout << "  CPHF: solving " << n_pert << " perturbation directions (dim=" << n << ")" << std::endl;
+
+#ifndef GANSU_CPU_ONLY
+    if (!gpu::gpu_available()) {
+#endif
+        // === CPU CG solver ===
+        for (int pert = 0; pert < n_pert; pert++) {
+            const real_t* d_b = d_rhs + (size_t)pert * n;
+            real_t* d_x = d_U + (size_t)pert * n;
+
+            std::memset(d_x, 0, n * sizeof(real_t));
+            std::memcpy(d_r, d_b, n * sizeof(real_t));
+
+            cphf_op.apply_preconditioner(d_r, d_z);
+            std::memcpy(d_p, d_z, n * sizeof(real_t));
+
+            double rz = cpu_ddot(n, d_r, d_z);
+            double b_norm = cpu_dnrm2(n, d_r);
+
+            for (int iter = 0; iter < max_iter; iter++) {
+                cphf_op.apply(d_p, d_Ap);
+
+                double pAp = cpu_ddot(n, d_p, d_Ap);
+                double alpha_cg = rz / (fabs(pAp) > 1e-30 ? pAp : 1e-30);
+
+                cpu_daxpy(n, alpha_cg, d_p, d_x);
+                cpu_daxpy(n, -alpha_cg, d_Ap, d_r);
+
+                double r_norm = cpu_dnrm2(n, d_r);
+                if (r_norm / (b_norm > 1e-15 ? b_norm : 1.0) < tol) {
+                    if (pert == 0 || pert == n_pert - 1)
+                        std::cout << "    pert " << pert << ": converged in " << iter + 1 << " iterations (|r|=" << r_norm << ")" << std::endl;
+                    break;
+                }
+
+                cphf_op.apply_preconditioner(d_r, d_z);
+                double rz_new = cpu_ddot(n, d_r, d_z);
+                double beta_cg = rz_new / (fabs(rz) > 1e-30 ? rz : 1e-30);
+
+                cpu_dscal(n, beta_cg, d_p);
+                cpu_daxpy(n, 1.0, d_z, d_p);
+                rz = rz_new;
+            }
+        }
+
+        tracked_cudaFree(d_r);
+        tracked_cudaFree(d_z);
+        tracked_cudaFree(d_p);
+        tracked_cudaFree(d_Ap);
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+#endif
+
+    // === GPU CG solver ===
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
 
     for (int pert = 0; pert < n_pert; pert++) {
         const real_t* d_b = d_rhs + (size_t)pert * n;  // RHS for this perturbation

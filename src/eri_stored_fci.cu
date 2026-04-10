@@ -72,6 +72,26 @@ static void generate_combinations(int n, int k, std::vector<uint64_t>& result) {
 }
 
 // ========================================================================
+//  Portable bit intrinsics (work on both host and device)
+// ========================================================================
+static __host__ __device__ __forceinline__ int portable_popcll(uint64_t x) {
+#ifdef __CUDA_ARCH__
+    return __popcll(x);
+#else
+    int c = 0; while(x) { x &= x-1; c++; } return c;
+#endif
+}
+static __host__ __device__ __forceinline__ int portable_ffsll(uint64_t x) {
+#ifdef __CUDA_ARCH__
+    return __ffsll(x);
+#else
+    if (x == 0) return 0;
+    int pos = 0; while (!(x & 1ULL)) { x >>= 1; pos++; }
+    return pos + 1;
+#endif
+}
+
+// ========================================================================
 //  Device utility functions
 // ========================================================================
 
@@ -80,12 +100,12 @@ static void generate_combinations(int n, int k, std::vector<uint64_t>& result) {
  *
  * Phase = (-1)^(number of occupied orbitals between positions p and q)
  */
-static __device__ __forceinline__ real_t compute_phase(uint64_t str, int p, int q) {
+static __host__ __device__ __forceinline__ real_t compute_phase(uint64_t str, int p, int q) {
     int lo = min(p, q);
     int hi = max(p, q);
     // Mask for bits strictly between lo and hi
     uint64_t mask = ((1ULL << hi) - 1) & ~((1ULL << (lo + 1)) - 1);
-    int n_between = __popcll(str & mask);
+    int n_between = portable_popcll(str & mask);
     return (n_between % 2 == 0) ? 1.0 : -1.0;
 }
 
@@ -98,20 +118,20 @@ static __device__ __forceinline__ real_t compute_phase(uint64_t str, int p, int 
  * @param[out] p Orbital removed (in str1 but not str2)
  * @param[out] q Orbital added   (in str2 but not str1)
  */
-static __device__ __forceinline__ void find_single_excitation(
+static __host__ __device__ __forceinline__ void find_single_excitation(
     uint64_t str1, uint64_t str2, int& p, int& q)
 {
     uint64_t diff = str1 ^ str2;
     uint64_t removed = diff & str1;  // bits in str1 not in str2
     uint64_t added   = diff & str2;  // bits in str2 not in str1
-    p = __ffsll(removed) - 1;  // 0-indexed position of removed orbital
-    q = __ffsll(added)   - 1;  // 0-indexed position of added orbital
+    p = portable_ffsll(removed) - 1;  // 0-indexed position of removed orbital
+    q = portable_ffsll(added)   - 1;  // 0-indexed position of added orbital
 }
 
 /**
  * @brief Find the two differing orbitals for a double excitation
  */
-static __device__ __forceinline__ void find_double_excitation(
+static __host__ __device__ __forceinline__ void find_double_excitation(
     uint64_t str1, uint64_t str2,
     int& p1, int& p2, int& q1, int& q2)
 {
@@ -119,13 +139,13 @@ static __device__ __forceinline__ void find_double_excitation(
     uint64_t removed = diff & str1;
     uint64_t added   = diff & str2;
 
-    p1 = __ffsll(removed) - 1;
+    p1 = portable_ffsll(removed) - 1;
     removed &= removed - 1;  // clear lowest bit
-    p2 = __ffsll(removed) - 1;
+    p2 = portable_ffsll(removed) - 1;
 
-    q1 = __ffsll(added) - 1;
+    q1 = portable_ffsll(added) - 1;
     added &= added - 1;
-    q2 = __ffsll(added) - 1;
+    q2 = portable_ffsll(added) - 1;
 }
 
 /**
@@ -133,32 +153,32 @@ static __device__ __forceinline__ void find_double_excitation(
  *
  * The phase is the product of individual annihilation/creation phases.
  */
-static __device__ __forceinline__ real_t compute_double_phase(
+static __host__ __device__ __forceinline__ real_t compute_double_phase(
     uint64_t str, int p1, int p2, int q1, int q2)
 {
     // Phase for annihilating p1 from str
     real_t phase = compute_phase(str, p1, 0);
     // Count occupied orbitals below p1
     uint64_t mask_p1 = (1ULL << p1) - 1;
-    int n_below_p1 = __popcll(str & mask_p1);
+    int n_below_p1 = portable_popcll(str & mask_p1);
     phase = (n_below_p1 % 2 == 0) ? 1.0 : -1.0;
 
     // After removing p1
     uint64_t str2 = str & ~(1ULL << p1);
     uint64_t mask_p2 = (1ULL << p2) - 1;
-    int n_below_p2 = __popcll(str2 & mask_p2);
+    int n_below_p2 = portable_popcll(str2 & mask_p2);
     phase *= (n_below_p2 % 2 == 0) ? 1.0 : -1.0;
 
     // After removing p2
     uint64_t str3 = str2 & ~(1ULL << p2);
     uint64_t mask_q1 = (1ULL << q1) - 1;
-    int n_below_q1 = __popcll(str3 & mask_q1);
+    int n_below_q1 = portable_popcll(str3 & mask_q1);
     phase *= (n_below_q1 % 2 == 0) ? 1.0 : -1.0;
 
     // After adding q1
     uint64_t str4 = str3 | (1ULL << q1);
     uint64_t mask_q2 = (1ULL << q2) - 1;
-    int n_below_q2 = __popcll(str4 & mask_q2);
+    int n_below_q2 = portable_popcll(str4 & mask_q2);
     phase *= (n_below_q2 % 2 == 0) ? 1.0 : -1.0;
 
     return phase;
@@ -169,15 +189,15 @@ static __device__ __forceinline__ real_t compute_double_phase(
  *
  * Phase = (-1)^(number of occupied orbitals that must be anticommuted past)
  */
-static __device__ __forceinline__ real_t compute_single_phase(uint64_t str, int p, int q) {
+static __host__ __device__ __forceinline__ real_t compute_single_phase(uint64_t str, int p, int q) {
     // Annihilate p, then create q
     uint64_t mask_p = (1ULL << p) - 1;
-    int n_below_p = __popcll(str & mask_p);
+    int n_below_p = portable_popcll(str & mask_p);
     real_t phase = (n_below_p % 2 == 0) ? 1.0 : -1.0;
 
     uint64_t str2 = str & ~(1ULL << p);
     uint64_t mask_q = (1ULL << q) - 1;
-    int n_below_q = __popcll(str2 & mask_q);
+    int n_below_q = portable_popcll(str2 & mask_q);
     phase *= (n_below_q % 2 == 0) ? 1.0 : -1.0;
 
     return phase;
@@ -289,12 +309,12 @@ __global__ void fci_sigma_kernel(
     // Loop over all determinants J
     for (int ia_J = 0; ia_J < num_alpha_det; ++ia_J) {
         uint64_t alpha_J = d_alpha_strings[ia_J];
-        int exc_alpha = __popcll(alpha_I ^ alpha_J) / 2;
+        int exc_alpha = portable_popcll(alpha_I ^ alpha_J) / 2;
         if (exc_alpha > 2) continue;
 
         for (int ib_J = 0; ib_J < num_beta_det; ++ib_J) {
             uint64_t beta_J = d_beta_strings[ib_J];
-            int exc_beta = __popcll(beta_I ^ beta_J) / 2;
+            int exc_beta = portable_popcll(beta_I ^ beta_J) / 2;
 
             int total_exc = exc_alpha + exc_beta;
             if (total_exc > 2) continue;
@@ -488,8 +508,38 @@ void FCIHamiltonianOperator::generate_determinants() {
                num_beta_det_  * sizeof(uint64_t), cudaMemcpyHostToDevice);
 }
 
+// CPU host-side helpers for FCI
+static inline real_t h1_mo_host(const real_t* h1, int M, int p, int q) { return h1[(size_t)p * M + q]; }
+static inline real_t eri_mo_host(const real_t* eri, int M, int p, int q, int r, int s) { return eri[((size_t(p)*M+q)*M+r)*M+s]; }
+static inline int popcnt64(uint64_t x) { int c = 0; while(x) { x &= x-1; c++; } return c; }
+
 void FCIHamiltonianOperator::compute_diagonal() {
     tracked_cudaMalloc(&d_diagonal_, num_det_ * sizeof(real_t));
+
+    if (!gpu::gpu_available()) {
+        const int M = num_orbitals_;
+        #pragma omp parallel for
+        for (int idx = 0; idx < num_det_; idx++) {
+            int ia = idx / num_beta_det_, ib = idx % num_beta_det_;
+            uint64_t alpha = d_alpha_strings_[ia], beta = d_beta_strings_[ib];
+            real_t diag = 0.0;
+            for (int p = 0; p < M; p++) {
+                if (alpha & (1ULL<<p)) diag += h1_mo_host(d_h1_mo_, M, p, p);
+                if (beta  & (1ULL<<p)) diag += h1_mo_host(d_h1_mo_, M, p, p);
+            }
+            for (int p = 0; p < M; p++) { if (!(alpha&(1ULL<<p))) continue;
+                for (int q = p+1; q < M; q++) { if (!(alpha&(1ULL<<q))) continue;
+                    diag += eri_mo_host(d_eri_mo_,M,p,p,q,q) - eri_mo_host(d_eri_mo_,M,p,q,q,p); }}
+            for (int p = 0; p < M; p++) { if (!(beta&(1ULL<<p))) continue;
+                for (int q = p+1; q < M; q++) { if (!(beta&(1ULL<<q))) continue;
+                    diag += eri_mo_host(d_eri_mo_,M,p,p,q,q) - eri_mo_host(d_eri_mo_,M,p,q,q,p); }}
+            for (int p = 0; p < M; p++) { if (!(alpha&(1ULL<<p))) continue;
+                for (int q = 0; q < M; q++) { if (!(beta&(1ULL<<q))) continue;
+                    diag += eri_mo_host(d_eri_mo_,M,p,p,q,q); }}
+            d_diagonal_[idx] = diag;
+        }
+        return;
+    }
 
     int threads = 256;
     int blocks = (num_det_ + threads - 1) / threads;
@@ -502,6 +552,91 @@ void FCIHamiltonianOperator::compute_diagonal() {
 }
 
 void FCIHamiltonianOperator::apply(const real_t* d_input, real_t* d_output) const {
+    if (!gpu::gpu_available()) {
+        // CPU: mirrors fci_sigma_kernel exactly, using the same helper functions
+        const int M = num_orbitals_;
+        const real_t* d_h1 = d_h1_mo_;
+        const real_t* d_eri = d_eri_mo_;
+        #pragma omp parallel for
+        for (int idx_I = 0; idx_I < num_det_; idx_I++) {
+            int ia_I = idx_I / num_beta_det_, ib_I = idx_I % num_beta_det_;
+            uint64_t alpha_I = d_alpha_strings_[ia_I], beta_I = d_beta_strings_[ib_I];
+            real_t sigma_I = 0.0;
+            for (int ia_J = 0; ia_J < num_alpha_det_; ia_J++) {
+                uint64_t alpha_J = d_alpha_strings_[ia_J];
+                int exc_alpha = portable_popcll(alpha_I ^ alpha_J) / 2;
+                if (exc_alpha > 2) continue;
+                for (int ib_J = 0; ib_J < num_beta_det_; ib_J++) {
+                    uint64_t beta_J = d_beta_strings_[ib_J];
+                    int exc_beta = portable_popcll(beta_I ^ beta_J) / 2;
+                    int total_exc = exc_alpha + exc_beta;
+                    if (total_exc > 2) continue;
+                    int idx_J = ia_J * num_beta_det_ + ib_J;
+                    real_t C_J = d_input[idx_J];
+                    real_t H_IJ = 0.0;
+
+                    if (total_exc == 0) {
+                        for (int p = 0; p < M; ++p) {
+                            if (alpha_I & (1ULL << p)) H_IJ += h1_mo_host(d_h1, M, p, p);
+                            if (beta_I  & (1ULL << p)) H_IJ += h1_mo_host(d_h1, M, p, p);
+                        }
+                        for (int p = 0; p < M; ++p) { if (!(alpha_I & (1ULL<<p))) continue;
+                            for (int q = p+1; q < M; ++q) { if (!(alpha_I & (1ULL<<q))) continue;
+                                H_IJ += eri_mo_host(d_eri,M,p,p,q,q) - eri_mo_host(d_eri,M,p,q,q,p); }}
+                        for (int p = 0; p < M; ++p) { if (!(beta_I & (1ULL<<p))) continue;
+                            for (int q = p+1; q < M; ++q) { if (!(beta_I & (1ULL<<q))) continue;
+                                H_IJ += eri_mo_host(d_eri,M,p,p,q,q) - eri_mo_host(d_eri,M,p,q,q,p); }}
+                        for (int p = 0; p < M; ++p) { if (!(alpha_I & (1ULL<<p))) continue;
+                            for (int q = 0; q < M; ++q) { if (!(beta_I & (1ULL<<q))) continue;
+                                H_IJ += eri_mo_host(d_eri,M,p,p,q,q); }}
+
+                    } else if (exc_alpha == 1 && exc_beta == 0) {
+                        int p, q; find_single_excitation(alpha_I, alpha_J, p, q);
+                        real_t phase = compute_single_phase(alpha_I, p, q);
+                        H_IJ = h1_mo_host(d_h1, M, p, q);
+                        uint64_t common_alpha = alpha_I & alpha_J;
+                        for (int k = 0; k < M; ++k) {
+                            if (common_alpha & (1ULL<<k)) H_IJ += eri_mo_host(d_eri,M,p,q,k,k) - eri_mo_host(d_eri,M,p,k,k,q);
+                            if (beta_I & (1ULL<<k)) H_IJ += eri_mo_host(d_eri,M,p,q,k,k);
+                        }
+                        H_IJ *= phase;
+
+                    } else if (exc_alpha == 0 && exc_beta == 1) {
+                        int p, q; find_single_excitation(beta_I, beta_J, p, q);
+                        real_t phase = compute_single_phase(beta_I, p, q);
+                        H_IJ = h1_mo_host(d_h1, M, p, q);
+                        uint64_t common_beta = beta_I & beta_J;
+                        for (int k = 0; k < M; ++k) {
+                            if (common_beta & (1ULL<<k)) H_IJ += eri_mo_host(d_eri,M,p,q,k,k) - eri_mo_host(d_eri,M,p,k,k,q);
+                            if (alpha_I & (1ULL<<k)) H_IJ += eri_mo_host(d_eri,M,p,q,k,k);
+                        }
+                        H_IJ *= phase;
+
+                    } else if (exc_alpha == 2 && exc_beta == 0) {
+                        int p1,p2,q1,q2; find_double_excitation(alpha_I, alpha_J, p1,p2,q1,q2);
+                        real_t phase = compute_double_phase(alpha_I, p1,p2,q1,q2);
+                        H_IJ = phase * (eri_mo_host(d_eri,M,p1,q1,p2,q2) - eri_mo_host(d_eri,M,p1,q2,p2,q1));
+
+                    } else if (exc_alpha == 0 && exc_beta == 2) {
+                        int p1,p2,q1,q2; find_double_excitation(beta_I, beta_J, p1,p2,q1,q2);
+                        real_t phase = compute_double_phase(beta_I, p1,p2,q1,q2);
+                        H_IJ = phase * (eri_mo_host(d_eri,M,p1,q1,p2,q2) - eri_mo_host(d_eri,M,p1,q2,p2,q1));
+
+                    } else if (exc_alpha == 1 && exc_beta == 1) {
+                        int pa,qa; find_single_excitation(alpha_I, alpha_J, pa, qa);
+                        int pb,qb; find_single_excitation(beta_I, beta_J, pb, qb);
+                        real_t phase_a = compute_single_phase(alpha_I, pa, qa);
+                        real_t phase_b = compute_single_phase(beta_I, pb, qb);
+                        H_IJ = phase_a * phase_b * eri_mo_host(d_eri,M,pa,qa,pb,qb);
+                    }
+                    sigma_I += H_IJ * C_J;
+                }
+            }
+            d_output[idx_I] = sigma_I;
+        }
+        return;
+    }
+
     int threads = 128;
     int blocks = (num_det_ + threads - 1) / threads;
     fci_sigma_kernel<<<blocks, threads>>>(
@@ -512,6 +647,13 @@ void FCIHamiltonianOperator::apply(const real_t* d_input, real_t* d_output) cons
 }
 
 void FCIHamiltonianOperator::apply_preconditioner(const real_t* d_input, real_t* d_output) const {
+    if (!gpu::gpu_available()) {
+        for (int i = 0; i < num_det_; i++) {
+            real_t denom = d_diagonal_[i];
+            d_output[i] = (std::abs(denom) > 1e-12) ? d_input[i] / denom : 0.0;
+        }
+        return;
+    }
     int threads = 256;
     int blocks = (num_det_ + threads - 1) / threads;
     fci_preconditioner_kernel<<<blocks, threads>>>(
@@ -616,6 +758,12 @@ static real_t compute_fci_energy_impl(RHF& rhf, const real_t* d_eri_ao, real_t* 
 }
 
 real_t ERI_Stored_RHF::compute_fci_energy() {
+    if (!gpu::gpu_available()) {
+        real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
+        real_t result = compute_fci_energy_impl(rhf_, nullptr, d_mo_eri);
+        tracked_cudaFree(d_mo_eri);
+        return result;
+    }
     return compute_fci_energy_impl(rhf_, eri_matrix_.device_ptr());
 }
 

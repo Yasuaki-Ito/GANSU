@@ -499,85 +499,200 @@ EOMCCSDOperator::~EOMCCSDOperator() {
 }
 
 void EOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
-    int threads = 256;
-    int blocks;
+    int nocc = nocc_, nvir = nvir_, nao = nao_;
+    size_t nao2 = (size_t)nao * nao;
+    size_t N = (size_t)nao;
 
-    // Same 7 blocks as EOM-CC2
-    size_t ovov_size = (size_t)nocc_ * nvir_ * nocc_ * nvir_;
+    size_t ovov_size = (size_t)nocc * nvir * nocc * nvir;
     tracked_cudaMalloc(&d_eri_ovov_, ovov_size * sizeof(real_t));
-    blocks = (ovov_size + threads - 1) / threads;
-    eom_mp2_extract_eri_ovov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovov_, nocc_, nvir_, nao_);
 
-    size_t vvov_size = (size_t)nvir_ * nvir_ * nocc_ * nvir_;
+    size_t vvov_size = (size_t)nvir * nvir * nocc * nvir;
     tracked_cudaMalloc(&d_eri_vvov_, vvov_size * sizeof(real_t));
-    blocks = (vvov_size + threads - 1) / threads;
-    eom_mp2_extract_eri_vvov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvov_, nocc_, nvir_, nao_);
 
-    size_t ooov_size = (size_t)nocc_ * nocc_ * nocc_ * nvir_;
+    size_t ooov_size = (size_t)nocc * nocc * nocc * nvir;
     tracked_cudaMalloc(&d_eri_ooov_, ooov_size * sizeof(real_t));
-    blocks = (ooov_size + threads - 1) / threads;
-    eom_mp2_extract_eri_ooov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ooov_, nocc_, nvir_, nao_);
 
-    size_t oooo_size = (size_t)nocc_ * nocc_ * nocc_ * nocc_;
+    size_t oooo_size = (size_t)nocc * nocc * nocc * nocc;
     tracked_cudaMalloc(&d_eri_oooo_, oooo_size * sizeof(real_t));
-    blocks = (oooo_size + threads - 1) / threads;
-    eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo_, nocc_, nao_);
 
-    size_t vvvv_size = (size_t)nvir_ * nvir_ * nvir_ * nvir_;
+    size_t vvvv_size = (size_t)nvir * nvir * nvir * nvir;
     tracked_cudaMalloc(&d_eri_vvvv_, vvvv_size * sizeof(real_t));
-    blocks = (vvvv_size + threads - 1) / threads;
-    eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv_, nocc_, nvir_, nao_);
 
-    size_t oovv_size = (size_t)nocc_ * nocc_ * nvir_ * nvir_;
+    size_t oovv_size = (size_t)nocc * nocc * nvir * nvir;
     tracked_cudaMalloc(&d_eri_oovv_, oovv_size * sizeof(real_t));
-    blocks = (oovv_size + threads - 1) / threads;
-    eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv_, nocc_, nvir_, nao_);
 
-    size_t ovvo_size = (size_t)nocc_ * nvir_ * nvir_ * nocc_;
+    size_t ovvo_size = (size_t)nocc * nvir * nvir * nocc;
     tracked_cudaMalloc(&d_eri_ovvo_, ovvo_size * sizeof(real_t));
-    blocks = (ovvo_size + threads - 1) / threads;
-    eom_mp2_extract_eri_ovvo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvo_, nocc_, nvir_, nao_);
 
-    // NEW: OVVV block for EOM-CCSD
-    size_t ovvv_size = (size_t)nocc_ * nvir_ * nvir_ * nvir_;
+    size_t ovvv_size = (size_t)nocc * nvir * nvir * nvir;
     tracked_cudaMalloc(&d_eri_ovvv_, ovvv_size * sizeof(real_t));
-    blocks = (ovvv_size + threads - 1) / threads;
-    eom_ccsd_extract_eri_ovvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvv_, nocc_, nvir_, nao_);
 
-    cudaDeviceSynchronize();
+    if (!gpu::gpu_available()) {
+        #pragma omp parallel for
+        for (int idx = 0; idx < (int)ovov_size; idx++) {
+            int i = idx / (nvir * nocc * nvir);
+            int rem = idx % (nvir * nocc * nvir);
+            int a = rem / (nocc * nvir); rem %= (nocc * nvir);
+            int j = rem / nvir; int b = rem % nvir;
+            d_eri_ovov_[idx] = d_eri_mo[((size_t)i * nao + a + nocc) * nao2 + (size_t)j * nao + b + nocc];
+        }
+        #pragma omp parallel for
+        for (int idx = 0; idx < (int)vvov_size; idx++) {
+            int a = idx / (nvir * nocc * nvir);
+            int rem = idx % (nvir * nocc * nvir);
+            int b = rem / (nocc * nvir); rem %= (nocc * nvir);
+            int i = rem / nvir; int c = rem % nvir;
+            d_eri_vvov_[idx] = d_eri_mo[((size_t)(a+nocc) * nao + b+nocc) * nao2 + (size_t)i * nao + c+nocc];
+        }
+        #pragma omp parallel for
+        for (int idx = 0; idx < (int)ooov_size; idx++) {
+            int j = idx / (nocc * nocc * nvir);
+            int rem = idx % (nocc * nocc * nvir);
+            int i = rem / (nocc * nvir); rem %= (nocc * nvir);
+            int k = rem / nvir; int b = rem % nvir;
+            d_eri_ooov_[idx] = d_eri_mo[((size_t)j * nao + i) * nao2 + (size_t)k * nao + b+nocc];
+        }
+        #pragma omp parallel for
+        for (int idx = 0; idx < (int)oooo_size; idx++) {
+            int i = idx / (nocc * nocc * nocc);
+            int rem = idx % (nocc * nocc * nocc);
+            int j = rem / (nocc * nocc); rem %= (nocc * nocc);
+            int k = rem / nocc; int l = rem % nocc;
+            d_eri_oooo_[idx] = d_eri_mo[((size_t)i * nao + j) * nao2 + (size_t)k * nao + l];
+        }
+        #pragma omp parallel for
+        for (int idx = 0; idx < (int)vvvv_size; idx++) {
+            int a = idx / (nvir * nvir * nvir);
+            int rem = idx % (nvir * nvir * nvir);
+            int b = rem / (nvir * nvir); rem %= (nvir * nvir);
+            int c = rem / nvir; int d = rem % nvir;
+            d_eri_vvvv_[idx] = d_eri_mo[((size_t)(a+nocc)*nao + b+nocc)*nao2 + (size_t)(c+nocc)*nao + d+nocc];
+        }
+        #pragma omp parallel for
+        for (int idx = 0; idx < (int)oovv_size; idx++) {
+            int i = idx / (nocc * nvir * nvir);
+            int rem = idx % (nocc * nvir * nvir);
+            int j = rem / (nvir * nvir); rem %= (nvir * nvir);
+            int a = rem / nvir; int b = rem % nvir;
+            d_eri_oovv_[idx] = d_eri_mo[((size_t)i*nao + j)*nao2 + (size_t)(a+nocc)*nao + b+nocc];
+        }
+        #pragma omp parallel for
+        for (int idx = 0; idx < (int)ovvo_size; idx++) {
+            int i = idx / (nvir * nvir * nocc);
+            int rem = idx % (nvir * nvir * nocc);
+            int a = rem / (nvir * nocc); rem %= (nvir * nocc);
+            int b = rem / nocc; int j = rem % nocc;
+            d_eri_ovvo_[idx] = d_eri_mo[((size_t)i*nao + a+nocc)*nao2 + (size_t)(b+nocc)*nao + j];
+        }
+        // OVVV: eri_ovvv[i,a,b,c] = eri_mo[(i)*N^3 + (a+nocc)*N^2 + (b+nocc)*N + (c+nocc)]
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < ovvv_size; idx++) {
+            int i = (int)(idx / ((size_t)nvir * nvir * nvir));
+            size_t rem2 = idx % ((size_t)nvir * nvir * nvir);
+            int a = (int)(rem2 / ((size_t)nvir * nvir));
+            rem2 %= ((size_t)nvir * nvir);
+            int b = (int)(rem2 / nvir);
+            int c = (int)(rem2 % nvir);
+            size_t mo_idx = (size_t)i * N * N * N + (size_t)(a + nocc) * N * N + (size_t)(b + nocc) * N + (size_t)(c + nocc);
+            d_eri_ovvv_[idx] = d_eri_mo[mo_idx];
+        }
+    } else {
+        int threads = 256;
+        int blocks;
+
+        blocks = (ovov_size + threads - 1) / threads;
+        eom_mp2_extract_eri_ovov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovov_, nocc_, nvir_, nao_);
+
+        blocks = (vvov_size + threads - 1) / threads;
+        eom_mp2_extract_eri_vvov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvov_, nocc_, nvir_, nao_);
+
+        blocks = (ooov_size + threads - 1) / threads;
+        eom_mp2_extract_eri_ooov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ooov_, nocc_, nvir_, nao_);
+
+        blocks = (oooo_size + threads - 1) / threads;
+        eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo_, nocc_, nao_);
+
+        blocks = (vvvv_size + threads - 1) / threads;
+        eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv_, nocc_, nvir_, nao_);
+
+        blocks = (oovv_size + threads - 1) / threads;
+        eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv_, nocc_, nvir_, nao_);
+
+        blocks = (ovvo_size + threads - 1) / threads;
+        eom_mp2_extract_eri_ovvo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvo_, nocc_, nvir_, nao_);
+
+        blocks = (ovvv_size + threads - 1) / threads;
+        eom_ccsd_extract_eri_ovvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvv_, nocc_, nvir_, nao_);
+
+        cudaDeviceSynchronize();
+    }
 }
 
 void EOMCCSDOperator::compute_denominators_and_fock(const real_t* d_orbital_energies) {
-    int threads = 256;
+    int nocc = nocc_, nvir = nvir_;
 
-    // D2 = standard orbital energy denominator (NOT the Fock-only diagonal)
     tracked_cudaMalloc(&d_D2_, (size_t)doubles_dim_ * sizeof(real_t));
-    int blocks = (doubles_dim_ + threads - 1) / threads;
-    eom_ccsd_compute_D2_kernel<<<blocks, threads>>>(
-        d_orbital_energies, d_D2_, nocc_, nvir_);
-
     tracked_cudaMalloc(&d_D1_, (size_t)singles_dim_ * sizeof(real_t));
-    blocks = (singles_dim_ + threads - 1) / threads;
-    eom_mp2_compute_D1_kernel<<<blocks, threads>>>(
-        d_orbital_energies, d_D1_, nocc_, nvir_);
+    tracked_cudaMalloc(&d_f_oo_, (size_t)nocc * sizeof(real_t));
+    tracked_cudaMalloc(&d_f_vv_, (size_t)nvir * sizeof(real_t));
 
-    tracked_cudaMalloc(&d_f_oo_, (size_t)nocc_ * sizeof(real_t));
-    tracked_cudaMalloc(&d_f_vv_, (size_t)nvir_ * sizeof(real_t));
-    int nao = nocc_ + nvir_;
-    blocks = (nao + threads - 1) / threads;
-    eom_mp2_extract_fock_kernel<<<blocks, threads>>>(
-        d_orbital_energies, d_f_oo_, d_f_vv_, nocc_, nvir_);
+    if (!gpu::gpu_available()) {
+        // CPU fallback: D2 = eps_a + eps_b - eps_i - eps_j
+        #pragma omp parallel for
+        for (int idx = 0; idx < doubles_dim_; idx++) {
+            int i = idx / (nocc * nvir * nvir);
+            int rem = idx % (nocc * nvir * nvir);
+            int j = rem / (nvir * nvir);
+            rem %= (nvir * nvir);
+            int a = rem / nvir;
+            int b = rem % nvir;
+            d_D2_[idx] = d_orbital_energies[a + nocc] + d_orbital_energies[b + nocc]
+                       - d_orbital_energies[i] - d_orbital_energies[j];
+        }
+        // CPU fallback: D1
+        #pragma omp parallel for
+        for (int idx = 0; idx < singles_dim_; idx++) {
+            d_D1_[idx] = d_orbital_energies[idx % nvir + nocc] - d_orbital_energies[idx / nvir];
+        }
+        // CPU fallback: Fock diagonal
+        for (int idx = 0; idx < nocc; idx++)
+            d_f_oo_[idx] = d_orbital_energies[idx];
+        for (int idx = 0; idx < nvir; idx++)
+            d_f_vv_[idx] = d_orbital_energies[idx + nocc];
+    } else {
+        int threads = 256;
 
-    cudaDeviceSynchronize();
+        int blocks = (doubles_dim_ + threads - 1) / threads;
+        eom_ccsd_compute_D2_kernel<<<blocks, threads>>>(
+            d_orbital_energies, d_D2_, nocc_, nvir_);
+
+        blocks = (singles_dim_ + threads - 1) / threads;
+        eom_mp2_compute_D1_kernel<<<blocks, threads>>>(
+            d_orbital_energies, d_D1_, nocc_, nvir_);
+
+        int nao = nocc + nvir;
+        blocks = (nao + threads - 1) / threads;
+        eom_mp2_extract_fock_kernel<<<blocks, threads>>>(
+            d_orbital_energies, d_f_oo_, d_f_vv_, nocc_, nvir_);
+
+        cudaDeviceSynchronize();
+    }
 }
 
 void EOMCCSDOperator::build_diagonal() {
     tracked_cudaMalloc(&d_diagonal_, (size_t)total_dim_ * sizeof(real_t));
-    int threads = 256;
-    int blocks = (total_dim_ + threads - 1) / threads;
-    eom_mp2_build_diagonal_kernel<<<blocks, threads>>>(
-        d_D1_, d_D2_, d_diagonal_, singles_dim_, doubles_dim_);
-    cudaDeviceSynchronize();
+    if (!gpu::gpu_available()) {
+        #pragma omp parallel for
+        for (int idx = 0; idx < total_dim_; idx++) {
+            d_diagonal_[idx] = (idx < singles_dim_) ? d_D1_[idx] : d_D2_[idx - singles_dim_];
+        }
+    } else {
+        int threads = 256;
+        int blocks = (total_dim_ + threads - 1) / threads;
+        eom_mp2_build_diagonal_kernel<<<blocks, threads>>>(
+            d_D1_, d_D2_, d_diagonal_, singles_dim_, doubles_dim_);
+        cudaDeviceSynchronize();
+    }
 }
 
 // ========================================================================
@@ -1236,7 +1351,6 @@ __global__ void eom_ccsd_singlet_penalty_kernel(
 }
 
 void EOMCCSDOperator::apply(const real_t* d_input, real_t* d_output) const {
-    int threads = 256;
     const int NO = nocc_;
     const int NV = nvir_;
 
@@ -1245,30 +1359,131 @@ void EOMCCSDOperator::apply(const real_t* d_input, real_t* d_output) const {
     real_t* d_sigma1 = d_output;
     real_t* d_sigma2 = d_output + singles_dim_;
 
-    int blocks1 = (singles_dim_ + threads - 1) / threads;
-    int blocks2 = (doubles_dim_ + threads - 1) / threads;
-
     // Step 0: Symmetrize input r2 for singlet: r2_sym[ijab] = 0.5*(r2[ijab] + r2[jiba])
-    // Both σ1 and σ2 use symmetrized r2 to stay in the singlet subspace.
     real_t* d_r2_sym = nullptr;
     tracked_cudaMalloc(&d_r2_sym, (size_t)doubles_dim_ * sizeof(real_t));
-    eom_ccsd_symmetrize_r2_kernel<<<blocks2, threads>>>(
-        d_r2, d_r2_sym, NO, NV);
 
-    // σ1: 8 terms using dressed intermediates (Foo, Fvv, Fov, WoVVo, WoVvO, woOoV)
-    eom_ccsd_sigma1_kernel<<<blocks1, threads>>>(
-        d_Foo_, d_Fvv_, d_Fov_,
-        d_eri_ovov_, d_eri_ovvv_,
-        d_WoVVo_, d_WoVvO_, d_woOoV_,
-        d_t1_, d_r1, d_r2_sym, d_sigma1,
-        nocc_, nvir_);
+    if (!gpu::gpu_available()) {
+        // CPU: symmetrize r2
+        #pragma omp parallel for
+        for (int idx = 0; idx < doubles_dim_; idx++) {
+            int i = idx / (NO * NV * NV);
+            int rem = idx % (NO * NV * NV);
+            int j = rem / (NV * NV);
+            rem %= (NV * NV);
+            int a = rem / NV;
+            int b = rem % NV;
+            size_t jiba = (size_t)j * NO * NV * NV + (size_t)i * NV * NV + (size_t)b * NV + a;
+            d_r2_sym[idx] = 0.5 * (d_r2[idx] + d_r2[jiba]);
+        }
+    } else {
+        int threads = 256;
+        int blocks2 = (doubles_dim_ + threads - 1) / threads;
+        eom_ccsd_symmetrize_r2_kernel<<<blocks2, threads>>>(
+            d_r2, d_r2_sym, NO, NV);
+    }
 
-    // Step 1: Compute response tau on device (using symmetrized r2)
+    // sigma1 kernel
+    if (!gpu::gpu_available()) {
+        // CPU fallback for sigma1
+        #pragma omp parallel for
+        for (int ia = 0; ia < singles_dim_; ia++) {
+            int i = ia / NV;
+            int a = ia % NV;
+            real_t sigma = 0.0;
+            // T1: Fvv
+            for (int e = 0; e < NV; e++)
+                sigma += d_Fvv_[a * NV + e] * d_r1[i * NV + e];
+            // T2: -Foo
+            for (int m = 0; m < NO; m++)
+                sigma -= d_Foo_[m * NO + i] * d_r1[m * NV + a];
+            // T3+T4: Fov * r2
+            for (int m = 0; m < NO; m++)
+                for (int e = 0; e < NV; e++) {
+                    real_t fov_me = d_Fov_[m * NV + e];
+                    sigma += 2.0 * fov_me
+                           * d_r2_sym[(size_t)i * NO * NV * NV + (size_t)m * NV * NV + (size_t)a * NV + e];
+                    sigma -= fov_me
+                           * d_r2_sym[(size_t)i * NO * NV * NV + (size_t)m * NV * NV + (size_t)e * NV + a];
+                }
+            // T5: ovvv * theta_r2
+            for (int m = 0; m < NO; m++)
+                for (int f = 0; f < NV; f++)
+                    for (int e = 0; e < NV; e++) {
+                        real_t ovvv_mfae = d_eri_ovvv_[(size_t)m * NV * NV * NV + (size_t)f * NV * NV + (size_t)a * NV + e];
+                        size_t r2_base = (size_t)m * NO * NV * NV + (size_t)i * NV * NV;
+                        real_t theta = 2.0 * d_r2_sym[r2_base + (size_t)f * NV + e]
+                                     -       d_r2_sym[r2_base + (size_t)e * NV + f];
+                        sigma += ovvv_mfae * theta;
+                    }
+            // T6: combined * r1
+            for (int m = 0; m < NO; m++)
+                for (int e = 0; e < NV; e++) {
+                    size_t widx = (size_t)m * NV * NV * NO + (size_t)a * NV * NO + (size_t)e * NO + i;
+                    real_t combined = 0.5 * d_WoVVo_[widx] + d_WoVvO_[widx];
+                    sigma += 2.0 * combined * d_r1[m * NV + e];
+                }
+            // T7: -woOoV * theta_r2
+            for (int m = 0; m < NO; m++)
+                for (int n = 0; n < NO; n++)
+                    for (int e = 0; e < NV; e++) {
+                        real_t w_mnie = d_woOoV_[(size_t)m * NO * NO * NV + (size_t)n * NO * NV + (size_t)i * NV + e];
+                        size_t r2_base = (size_t)m * NO * NV * NV + (size_t)n * NV * NV;
+                        real_t theta = 2.0 * d_r2_sym[r2_base + (size_t)a * NV + e]
+                                     -       d_r2_sym[r2_base + (size_t)e * NV + a];
+                        sigma -= w_mnie * theta;
+                    }
+            // T8: -t1 * (ovov * theta_r2)
+            for (int n = 0; n < NO; n++) {
+                real_t tmp_ni = 0.0;
+                for (int e = 0; e < NV; e++)
+                    for (int m = 0; m < NO; m++)
+                        for (int f = 0; f < NV; f++) {
+                            real_t ovov_nemf = d_eri_ovov_[(size_t)n * NV * NO * NV + (size_t)e * NO * NV + (size_t)m * NV + f];
+                            size_t r2_base = (size_t)i * NO * NV * NV + (size_t)m * NV * NV;
+                            real_t theta = 2.0 * d_r2_sym[r2_base + (size_t)e * NV + f]
+                                         -       d_r2_sym[r2_base + (size_t)f * NV + e];
+                            tmp_ni += ovov_nemf * theta;
+                        }
+                sigma -= d_t1_[n * NV + a] * tmp_ni;
+            }
+            d_sigma1[ia] = sigma;
+        }
+    } else {
+        int threads = 256;
+        int blocks1 = (singles_dim_ + threads - 1) / threads;
+        eom_ccsd_sigma1_kernel<<<blocks1, threads>>>(
+            d_Foo_, d_Fvv_, d_Fov_,
+            d_eri_ovov_, d_eri_ovvv_,
+            d_WoVVo_, d_WoVvO_, d_woOoV_,
+            d_t1_, d_r1, d_r2_sym, d_sigma1,
+            nocc_, nvir_);
+    }
+
+    // Step 1: Compute response tau (using symmetrized r2)
     real_t* d_tau2 = nullptr;
     tracked_cudaMalloc(&d_tau2, (size_t)doubles_dim_ * sizeof(real_t));
-    eom_ccsd_response_tau_kernel<<<blocks2, threads>>>(
-        d_r1, d_r2_sym, d_t1_, d_tau2, NO, NV);
-    cudaDeviceSynchronize();
+
+    if (!gpu::gpu_available()) {
+        #pragma omp parallel for
+        for (int idx = 0; idx < doubles_dim_; idx++) {
+            int i = idx / (NO * NV * NV);
+            int rem = idx % (NO * NV * NV);
+            int j = rem / (NV * NV);
+            rem %= (NV * NV);
+            int a = rem / NV;
+            int b = rem % NV;
+            d_tau2[idx] = d_r2_sym[idx]
+                        + d_r1[i * NV + a] * d_t1_[j * NV + b]
+                        + d_t1_[i * NV + a] * d_r1[j * NV + b];
+        }
+    } else {
+        int threads = 256;
+        int blocks2 = (doubles_dim_ + threads - 1) / threads;
+        eom_ccsd_response_tau_kernel<<<blocks2, threads>>>(
+            d_r1, d_r2_sym, d_t1_, d_tau2, NO, NV);
+        cudaDeviceSynchronize();
+    }
 
     // Step 2: Compute small R-dependent intermediates on host
     size_t t1_sz = (size_t)NO * NV;
@@ -1412,26 +1627,154 @@ void EOMCCSDOperator::apply(const real_t* d_input, real_t* d_output) const {
     cudaMemcpy(d_tau_half, h_tau_half.data(), t2_sz*sizeof(real_t), cudaMemcpyHostToDevice);
 
     // Step 4: Launch half_sigma2 kernel
-    eom_ccsd_half_sigma2_kernel<<<blocks2, threads>>>(
-        d_eri_ovov_, d_eri_vvvv_, d_eri_ovvv_,
-        d_t1_, d_t2_, d_r1, d_r2_sym, d_tau2,
-        d_Foo_, d_Fvv_, d_Woooo_, d_WoVVo_, d_WoVvO_,
-        d_woOoV_, d_woVoO_, d_wvOvV_,
-        d_af_tmp, d_ni_tmp, d_eb_tmp, d_ni_tmp2, d_mnij_tmp, d_tau_half,
-        d_half_sigma2_, NO, NV);
+    if (!gpu::gpu_available()) {
+        // CPU fallback: half_sigma2 — replicate kernel logic
+        // Access macros for dressed intermediates and raw ERI
+        #define HS2_OVOV(i,a,j,b) d_eri_ovov_[(size_t)(i)*NV*NO*NV + (size_t)(a)*NO*NV + (size_t)(j)*NV + (b)]
+        #define HS2_VVVV(a,b,c,d_) d_eri_vvvv_[(size_t)(a)*NV*NV*NV + (size_t)(b)*NV*NV + (size_t)(c)*NV + (d_)]
+        #define HS2_OVVV(i,a,b,c) d_eri_ovvv_[(size_t)(i)*NV*NV*NV + (size_t)(a)*NV*NV + (size_t)(b)*NV + (c)]
+        #define HS2_T1(i,a) d_t1_[(i)*NV + (a)]
+        #define HS2_T2(i,j,a,b) d_t2_[(size_t)(i)*NO*NV*NV + (size_t)(j)*NV*NV + (size_t)(a)*NV + (b)]
+        #define HS2_R1(i,a) d_r1[(i)*NV + (a)]
+        #define HS2_R2(i,j,a,b) d_r2_sym[(size_t)(i)*NO*NV*NV + (size_t)(j)*NV*NV + (size_t)(a)*NV + (b)]
+        #define HS2_TAU2(i,j,a,b) d_tau2[(size_t)(i)*NO*NV*NV + (size_t)(j)*NV*NV + (size_t)(a)*NV + (b)]
+        #define HS2_FOO(m,i) d_Foo_[(m)*NO + (i)]
+        #define HS2_FVV(a,e) d_Fvv_[(a)*NV + (e)]
+        #define HS2_WOOOO(m,n,i,j) d_Woooo_[(size_t)(m)*NO*NO*NO + (size_t)(n)*NO*NO + (size_t)(i)*NO + (j)]
+        #define HS2_WoVVo(m,b,e,j) d_WoVVo_[(size_t)(m)*NV*NV*NO + (size_t)(b)*NV*NO + (size_t)(e)*NO + (j)]
+        #define HS2_WoVvO(m,b,e,j) d_WoVvO_[(size_t)(m)*NV*NV*NO + (size_t)(b)*NV*NO + (size_t)(e)*NO + (j)]
+        #define HS2_woVoO(m,b,i,j) d_woVoO_[(size_t)(m)*NV*NO*NO + (size_t)(b)*NO*NO + (size_t)(i)*NO + (j)]
+        #define HS2_wvOvV(e,j,a,b) d_wvOvV_[(size_t)(e)*NO*NV*NV + (size_t)(j)*NV*NV + (size_t)(a)*NV + (b)]
+        #define HS2_AF_TMP(a,f) d_af_tmp[(a)*NV + (f)]
+        #define HS2_NI_TMP(n,i) d_ni_tmp[(n)*NO + (i)]
+        #define HS2_EB_TMP(e,b) d_eb_tmp[(e)*NV + (b)]
+        #define HS2_NI_TMP2(n,i) d_ni_tmp2[(n)*NO + (i)]
+        #define HS2_MNIJ_TMP(m,n,i,j) d_mnij_tmp[(size_t)(m)*NO*NO*NO + (size_t)(n)*NO*NO + (size_t)(i)*NO + (j)]
+        #define HS2_TAU_HALF(m,n,a,b) d_tau_half[(size_t)(m)*NO*NV*NV + (size_t)(n)*NV*NV + (size_t)(a)*NV + (b)]
 
-    // Step 5: Symmetrize
-    eom_ccsd_symmetrize_kernel<<<blocks2, threads>>>(
-        d_half_sigma2_, d_sigma2, NO, NV);
+        #pragma omp parallel for
+        for (int idx = 0; idx < doubles_dim_; idx++) {
+            int i = idx / (NO * NV * NV);
+            int rem = idx % (NO * NV * NV);
+            int j = rem / (NV * NV);
+            rem %= (NV * NV);
+            int a = rem / NV;
+            int b = rem % NV;
+            real_t hr2 = 0.0;
+            // Term 1: 0.5 * VVVV * tau2
+            { real_t sum = 0.0;
+              for (int e = 0; e < NV; e++) for (int f = 0; f < NV; f++)
+                  sum += HS2_TAU2(i, j, e, f) * HS2_VVVV(a, e, b, f);
+              hr2 += 0.5 * sum; }
+            // Term 2: 0.5 * Woooo * r2
+            { real_t sum = 0.0;
+              for (int m = 0; m < NO; m++) for (int n = 0; n < NO; n++)
+                  sum += HS2_WOOOO(m, n, i, j) * HS2_R2(m, n, a, b);
+              hr2 += 0.5 * sum; }
+            // Term 3: Fvv * r2
+            for (int e = 0; e < NV; e++) hr2 += HS2_FVV(b, e) * HS2_R2(i, j, a, e);
+            // Term 4: -Foo * r2
+            for (int m = 0; m < NO; m++) hr2 -= HS2_FOO(m, j) * HS2_R2(i, m, a, b);
+            // Term 5: -t1 * (ovvv * tau2)
+            for (int m = 0; m < NO; m++) {
+                real_t inner = 0.0;
+                for (int e = 0; e < NV; e++) for (int f = 0; f < NV; f++)
+                    inner += HS2_OVVV(m, e, b, f) * HS2_TAU2(i, j, e, f);
+                hr2 -= HS2_T1(m, a) * inner;
+            }
+            // Term 6: af_tmp * t2
+            for (int f = 0; f < NV; f++) hr2 += HS2_AF_TMP(a, f) * HS2_T2(i, j, f, b);
+            // Term 7: -woVoO * r1
+            for (int m = 0; m < NO; m++) hr2 -= HS2_woVoO(m, b, i, j) * HS2_R1(m, a);
+            // Term 8: +wvOvV * r1
+            for (int e = 0; e < NV; e++) hr2 += HS2_wvOvV(e, j, a, b) * HS2_R1(i, e);
+            // Term 9: WoVVo * r2 (with 0.5*transpose)
+            { real_t sum_ab = 0.0, sum_ba = 0.0;
+              for (int m = 0; m < NO; m++) for (int e = 0; e < NV; e++) {
+                  sum_ab += HS2_WoVVo(m, b, e, i) * HS2_R2(j, m, e, a);
+                  sum_ba += HS2_WoVVo(m, a, e, i) * HS2_R2(j, m, e, b);
+              }
+              hr2 += sum_ab + 0.5 * sum_ba; }
+            // Term 10: (0.5*WoVVo + WoVvO) * theta
+            for (int m = 0; m < NO; m++) for (int e = 0; e < NV; e++) {
+                real_t combined = 0.5 * HS2_WoVVo(m, b, e, j) + HS2_WoVvO(m, b, e, j);
+                real_t theta_imae = 2.0 * HS2_R2(i, m, a, e) - HS2_R2(i, m, e, a);
+                hr2 += combined * theta_imae;
+            }
+            // Term 11: -ni_tmp * t2
+            for (int n = 0; n < NO; n++) hr2 -= HS2_NI_TMP(n, i) * HS2_T2(n, j, a, b);
+            // Term 12: -eb_tmp * t2
+            for (int e = 0; e < NV; e++) hr2 -= HS2_EB_TMP(e, b) * HS2_T2(j, i, e, a);
+            // Term 13: -ni_tmp2 * t2
+            for (int m = 0; m < NO; m++) hr2 -= HS2_NI_TMP2(m, j) * HS2_T2(m, i, b, a);
+            // Term 14: mnij_tmp * tau_half
+            for (int m = 0; m < NO; m++) for (int n = 0; n < NO; n++)
+                hr2 += HS2_MNIJ_TMP(m, n, i, j) * HS2_TAU_HALF(m, n, a, b);
+            d_half_sigma2_[idx] = hr2;
+        }
 
-    // Step 6: Penalty for anti-singlet r2 components
-    // The singlet subspace has r2[ijab] = r2[jiba]; the anti-singlet complement
-    // is projected away by our symmetrization but needs a large eigenvalue
-    // to prevent Davidson from finding spurious zero eigenvalues.
-    eom_ccsd_singlet_penalty_kernel<<<blocks2, threads>>>(
-        d_r2, d_r2_sym, d_sigma2, 1000.0, doubles_dim_);
+        #undef HS2_OVOV
+        #undef HS2_VVVV
+        #undef HS2_OVVV
+        #undef HS2_T1
+        #undef HS2_T2
+        #undef HS2_R1
+        #undef HS2_R2
+        #undef HS2_TAU2
+        #undef HS2_FOO
+        #undef HS2_FVV
+        #undef HS2_WOOOO
+        #undef HS2_WoVVo
+        #undef HS2_WoVvO
+        #undef HS2_woVoO
+        #undef HS2_wvOvV
+        #undef HS2_AF_TMP
+        #undef HS2_NI_TMP
+        #undef HS2_EB_TMP
+        #undef HS2_NI_TMP2
+        #undef HS2_MNIJ_TMP
+        #undef HS2_TAU_HALF
 
-    cudaDeviceSynchronize();
+        // CPU: Symmetrize
+        #pragma omp parallel for
+        for (int idx = 0; idx < doubles_dim_; idx++) {
+            int i = idx / (NO * NV * NV);
+            int rem = idx % (NO * NV * NV);
+            int j = rem / (NV * NV);
+            rem %= (NV * NV);
+            int a = rem / NV;
+            int b = rem % NV;
+            size_t jiba = (size_t)j * NO * NV * NV + (size_t)i * NV * NV + (size_t)b * NV + a;
+            d_sigma2[idx] = d_half_sigma2_[idx] + d_half_sigma2_[jiba];
+        }
+
+        // CPU: Singlet penalty
+        #pragma omp parallel for
+        for (int idx = 0; idx < doubles_dim_; idx++) {
+            d_sigma2[idx] += 1000.0 * (d_r2[idx] - d_r2_sym[idx]);
+        }
+    } else {
+        int threads = 256;
+        int blocks2 = (doubles_dim_ + threads - 1) / threads;
+
+        eom_ccsd_half_sigma2_kernel<<<blocks2, threads>>>(
+            d_eri_ovov_, d_eri_vvvv_, d_eri_ovvv_,
+            d_t1_, d_t2_, d_r1, d_r2_sym, d_tau2,
+            d_Foo_, d_Fvv_, d_Woooo_, d_WoVVo_, d_WoVvO_,
+            d_woOoV_, d_woVoO_, d_wvOvV_,
+            d_af_tmp, d_ni_tmp, d_eb_tmp, d_ni_tmp2, d_mnij_tmp, d_tau_half,
+            d_half_sigma2_, NO, NV);
+
+        // Step 5: Symmetrize
+        eom_ccsd_symmetrize_kernel<<<blocks2, threads>>>(
+            d_half_sigma2_, d_sigma2, NO, NV);
+
+        // Step 6: Penalty for anti-singlet r2 components
+        eom_ccsd_singlet_penalty_kernel<<<blocks2, threads>>>(
+            d_r2, d_r2_sym, d_sigma2, 1000.0, doubles_dim_);
+
+        cudaDeviceSynchronize();
+    }
 
     // Cleanup temporary device allocations
     tracked_cudaFree(d_r2_sym);
@@ -1445,10 +1788,18 @@ void EOMCCSDOperator::apply(const real_t* d_input, real_t* d_output) const {
 }
 
 void EOMCCSDOperator::apply_preconditioner(const real_t* d_input, real_t* d_output) const {
-    int threads = 256;
-    int blocks = (total_dim_ + threads - 1) / threads;
-    eom_mp2_preconditioner_kernel<<<blocks, threads>>>(
-        d_diagonal_, d_input, d_output, total_dim_);
+    if (!gpu::gpu_available()) {
+        #pragma omp parallel for
+        for (int idx = 0; idx < total_dim_; idx++) {
+            real_t diag = d_diagonal_[idx];
+            d_output[idx] = (fabs(diag) > 1e-12) ? d_input[idx] / diag : 0.0;
+        }
+    } else {
+        int threads = 256;
+        int blocks = (total_dim_ + threads - 1) / threads;
+        eom_mp2_preconditioner_kernel<<<blocks, threads>>>(
+            d_diagonal_, d_input, d_output, total_dim_);
+    }
 }
 
 } // namespace gansu

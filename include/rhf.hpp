@@ -243,8 +243,8 @@ public:
     void get_new_fock_matrix() override {
         if (first_iteration_) { // First iteration: no damping, just store the density matrix and the Fock matrix
             first_iteration_ = false;
-            cudaMemcpy(prev_density_matrix.device_ptr(), hf_.get_density_matrix().device_ptr(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyDeviceToDevice);
-            cudaMemcpy(prev_fock_matrix.device_ptr(),    hf_.get_fock_matrix().device_ptr(),    hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(prev_density_matrix.device_ptr(), hf_.get_density_matrix().device_ptr(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t));
+            cudaMemcpy(prev_fock_matrix.device_ptr(),    hf_.get_fock_matrix().device_ptr(),    hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t));
             return;
         }else{
             if (use_optimized_) { // Optimized damping factor
@@ -334,8 +334,8 @@ public:
 
         // Copy the previous error matrix and the previous Fock matrix to the new error matrix and the new Fock matrix at most num_prev matrices
         const int store_prev_index = iteration_ % num_prev_; // Overwrite the previous matrices cyclically
-        cudaMemcpy(&prev_error_matrices.device_ptr()[store_prev_index * num_basis_ * num_basis_], error_matrix.device_ptr(), num_basis_ * num_basis_ * sizeof(real_t), cudaMemcpyDeviceToDevice);
-        cudaMemcpy(&prev_fock_matrices.device_ptr()[store_prev_index * num_basis_ * num_basis_], hf_.get_fock_matrix().device_ptr(), num_basis_ * num_basis_ * sizeof(real_t), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(&prev_error_matrices.device_ptr()[store_prev_index * num_basis_ * num_basis_], error_matrix.device_ptr(), num_basis_ * num_basis_ * sizeof(real_t));
+        cudaMemcpy(&prev_fock_matrices.device_ptr()[store_prev_index * num_basis_ * num_basis_], hf_.get_fock_matrix().device_ptr(), num_basis_ * num_basis_ * sizeof(real_t));
 
         // Compute the DIIS coefficients
         const int num_prevs = std::min(iteration_+1, num_prev_);
@@ -572,9 +572,9 @@ public:
         // Step 7: Upload C and D to device, then rebuild Fock matrix
         // -----------------------------------------------
         cudaMemcpy(hf_.get_coefficient_matrix().device_ptr(), C_new.data(),
-                   nao * nao * sizeof(real_t), cudaMemcpyHostToDevice);
+                   nao * nao * sizeof(real_t));
         cudaMemcpy(hf_.get_density_matrix().device_ptr(), D_new.data(),
-                   nao * nao * sizeof(real_t), cudaMemcpyHostToDevice);
+                   nao * nao * sizeof(real_t));
 
         // Rebuild F from the SOSCF-improved density
         hf_.compute_fock_matrix();
@@ -735,7 +735,7 @@ public:
             density_matrix[i] = density_matrix_a_[i] + density_matrix_b_[i];
         }
 
-        cudaMemcpy(hf_.get_density_matrix().device_ptr(), density_matrix.get(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(hf_.get_density_matrix().device_ptr(), density_matrix.get(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t));
         hf_.compute_fock_matrix(); // compute the Fock matrix from the density matrix
 
     }
@@ -831,7 +831,7 @@ public:
         }
         
 
-        cudaMemcpy(hf_.get_density_matrix().device_ptr(), density_matrix.get(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(hf_.get_density_matrix().device_ptr(), density_matrix.get(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t));
         hf_.compute_fock_matrix(); // compute the Fock matrix from the density matrix
 
         // Since the above Fock matrix is not correct (the density matrix is not correct), the coefficient matrix is computed from the Fock matrix
@@ -1050,25 +1050,18 @@ public:
         const real_t schwarz_screening_threshold = rhf_.get_schwarz_screening_threshold();
         const int verbose = rhf_.get_verbose();
 
-        //gpu::computeFockMatrix_Direct_RHF(
-        //    density_matrix.device_ptr(),
-        //    core_hamiltonian_matrix.device_ptr(),
-        //    shell_type_infos, 
-        //    shell_pair_type_infos,
-        //    primitive_shells.device_ptr(), 
-        //    primitive_shell_pair_indices.device_ptr(),
-        //    cgto_normalization_factors.device_ptr(), 
-        //    boys_grid.device_ptr(), 
-        //    schwarz_upper_bound_factors.device_ptr(),
-        //    schwarz_screening_threshold,
-        //    fock_matrix.device_ptr(),
-        //    num_basis_,
-        //    global_counters_,
-        //    min_skipped_columns_,
-        //    fock_matrix_replicas_,
-        //    num_fock_replicas_,
-        //    verbose
-        //);
+        // === CPU path: use the cached 4D ERI tensor built in precomputation()
+        // and the stored-ERI Fock construction (which has a CPU implementation).
+        if (!gpu::gpu_available()) {
+            gpu::computeFockMatrix_RHF(
+                density_matrix.device_ptr(),
+                core_hamiltonian_matrix.device_ptr(),
+                get_eri_matrix_device(),
+                fock_matrix.device_ptr(),
+                num_basis_);
+            return;
+        }
+
         gpu::computeFockMatrix_Direct_RHF(
             density_matrix.device_ptr(),
             density_matrix_diff_.device_ptr(),
@@ -1137,6 +1130,17 @@ public:
         const DeviceHostMatrix<real_t>& core_hamiltonian_matrix = rhf_.get_core_hamiltonian_matrix();
         DeviceHostMatrix<real_t>& fock_matrix = rhf_.get_fock_matrix();
         const int verbose = rhf_.get_verbose();
+
+        // === CPU path: use the cached 4D ERI tensor built in precomputation().
+        if (!gpu::gpu_available()) {
+            gpu::computeFockMatrix_RHF(
+                density_matrix.device_ptr(),
+                core_hamiltonian_matrix.device_ptr(),
+                d_eri_cpu_tensor_,
+                fock_matrix.device_ptr(),
+                num_basis_);
+            return;
+        }
 
         if (hash_fock_method_ == HashFockMethod::Compact) {
             gpu::computeFockMatrix_Hash_RHF(
@@ -1208,6 +1212,40 @@ public:
         const DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
         const int num_electrons = rhf_.get_num_electrons();
 
+        // === CPU path: reuse the RI_RHF coefficient-matrix Fock builder
+        // using the cached intermediate_matrix_B_cpu_ built during precomputation().
+        if (!gpu::gpu_available()) {
+            const int num_occ = num_electrons / 2;
+            // Scratch buffers (host, calloc'd).
+            real_t* d_J = nullptr;
+            real_t* d_K = nullptr;
+            real_t* d_W = nullptr;
+            real_t* d_X = nullptr;
+            real_t* d_X_packed = nullptr;
+            const size_t nao2 = (size_t)num_basis_ * num_basis_;
+            tracked_cudaMalloc(&d_J, nao2 * sizeof(real_t));
+            tracked_cudaMalloc(&d_K, nao2 * sizeof(real_t));
+            tracked_cudaMalloc(&d_W, (size_t)num_auxiliary_basis_ * sizeof(real_t));
+            tracked_cudaMalloc(&d_X, (size_t)num_auxiliary_basis_ * num_basis_ * num_occ * sizeof(real_t));
+            tracked_cudaMalloc(&d_X_packed, (size_t)num_auxiliary_basis_ * num_basis_ * num_occ * sizeof(real_t));
+
+            gpu::computeFockMatrix_RI_RHF_with_coefficient_matrix(
+                coefficient_matrix.device_ptr(),
+                density_matrix.device_ptr(),
+                core_hamiltonian_matrix.device_ptr(),
+                intermediate_matrix_B_cpu_.device_ptr(),
+                fock_matrix.device_ptr(),
+                num_basis_, num_auxiliary_basis_, num_occ,
+                d_J, d_K, d_W, d_X, d_X_packed);
+
+            tracked_cudaFree(d_J);
+            tracked_cudaFree(d_K);
+            tracked_cudaFree(d_W);
+            tracked_cudaFree(d_X);
+            tracked_cudaFree(d_X_packed);
+            return;
+        }
+
         if(rhf_.get_hasMatrixC() == false){
             gpu::computeInitialFockMatrix_RI_Direct_RHF(
                 density_matrix.device_ptr(), coefficient_matrix.device_ptr(),
@@ -1278,6 +1316,37 @@ public:
         const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
         const DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
         const int num_occ = rhf_.get_num_electrons() / 2;
+
+        // === CPU path: use the cached B matrix (same approach as ERI_RI_Direct_RHF)
+        if (!gpu::gpu_available()) {
+            const size_t nao2 = (size_t)num_basis_ * num_basis_;
+            real_t* d_J = nullptr;
+            real_t* d_K = nullptr;
+            real_t* d_W = nullptr;
+            real_t* d_X = nullptr;
+            real_t* d_X_packed = nullptr;
+            tracked_cudaMalloc(&d_J, nao2 * sizeof(real_t));
+            tracked_cudaMalloc(&d_K, nao2 * sizeof(real_t));
+            tracked_cudaMalloc(&d_W, (size_t)num_auxiliary_basis_ * sizeof(real_t));
+            tracked_cudaMalloc(&d_X, (size_t)num_auxiliary_basis_ * num_basis_ * num_occ * sizeof(real_t));
+            tracked_cudaMalloc(&d_X_packed, (size_t)num_auxiliary_basis_ * num_basis_ * num_occ * sizeof(real_t));
+
+            gpu::computeFockMatrix_RI_RHF_with_coefficient_matrix(
+                coefficient_matrix.device_ptr(),
+                density_matrix.device_ptr(),
+                core_hamiltonian_matrix.device_ptr(),
+                intermediate_matrix_B_cpu_.device_ptr(),
+                fock_matrix.device_ptr(),
+                num_basis_, num_auxiliary_basis_, num_occ,
+                d_J, d_K, d_W, d_X, d_X_packed);
+
+            tracked_cudaFree(d_J);
+            tracked_cudaFree(d_K);
+            tracked_cudaFree(d_W);
+            tracked_cudaFree(d_X);
+            tracked_cudaFree(d_X_packed);
+            return;
+        }
 
         gpu::computeFockMatrix_RI_Direct_v2(
             density_matrix.device_ptr(), coefficient_matrix.device_ptr(),

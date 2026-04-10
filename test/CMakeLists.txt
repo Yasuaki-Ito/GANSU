@@ -26,8 +26,8 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(googletest)
 
 
-# Test source files
-set(TEST_SOURCES
+# GPU test source files
+set(GPU_TEST_SOURCES
     test_gpu_manager.cu
     test_gpu_kernels.cu
     test_davidson_solver.cu
@@ -35,17 +35,42 @@ set(TEST_SOURCES
     test_rys_quadrature.cu
 )
 
-# Create test executable
-add_executable(test_runner ${TEST_SOURCES})
-
-# Link against parent project's gansu library and Google Test
-target_link_libraries(test_runner
-    gansu          # Uses the gansu library from parent project
-    curand         # Required by Davidson solver
-    gtest
-    gtest_main
+# CPU backend test source files (separate executable to avoid GPU state pollution)
+set(CPU_TEST_SOURCES
+    test_cpu_backend.cu
 )
+
+if(NOT ENABLE_GPU)
+    set_source_files_properties(${GPU_TEST_SOURCES} ${CPU_TEST_SOURCES} PROPERTIES LANGUAGE CXX)
+endif()
+
+# GPU test executable
+add_executable(test_runner ${GPU_TEST_SOURCES})
+target_link_libraries(test_runner gansu gtest gtest_main)
+if(ENABLE_GPU)
+    target_link_libraries(test_runner curand)
+endif()
+
+# CPU backend test executable (no GPU state interference)
+add_executable(test_cpu ${CPU_TEST_SOURCES})
+target_link_libraries(test_cpu gansu gtest gtest_main)
+if(ENABLE_GPU)
+    target_link_libraries(test_cpu curand)
+endif()
 
 # Enable CTest framework
 enable_testing()
-add_test(NAME GANSU_Tests COMMAND test_runner)
+
+# Fast tests (daily use, ~1 min)
+add_test(NAME GANSU_GPU_Tests COMMAND test_runner
+    --gtest_filter=-Benchmark*:LargeBenchmark*:*ccpVTZ*:ValidationEOMCCSD.H2O_ccpVDZ:ValidationEOMCC2.H2O_ccpVDZ:ValidationEOMMP2.H2O_STO3G:ValidationRI_PostHF.H2O_EOM_CCSD*)
+add_test(NAME GANSU_CPU_Tests COMMAND test_cpu)
+
+# Slow tests (run separately when needed)
+add_test(NAME GANSU_Slow_Tests COMMAND test_runner
+    --gtest_filter=*ccpVTZ*:ValidationEOMCCSD.H2O_ccpVDZ:ValidationEOMCC2.H2O_ccpVDZ:ValidationEOMMP2.H2O_STO3G:ValidationRI_PostHF.H2O_EOM_CCSD*)
+set_tests_properties(GANSU_Slow_Tests PROPERTIES LABELS "slow")
+
+# Benchmarks (run separately)
+add_test(NAME GANSU_Benchmarks COMMAND test_runner --gtest_filter=Benchmark*:LargeBenchmark*)
+set_tests_properties(GANSU_Benchmarks PROPERTIES LABELS "benchmark")

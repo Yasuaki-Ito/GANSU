@@ -155,7 +155,14 @@ void EOMMP2SchurOperator::apply(const real_t* d_input, real_t* d_output) const {
 
     // Step 2: Scale doubles part by 1/(ω - D2)
     //   temp_R2 = (ωI - M22)⁻¹ × (M21 × R1)
-    {
+    if (!gpu::gpu_available()) {
+        #pragma omp parallel for
+        for (int idx = 0; idx < doubles_dim_; idx++) {
+            real_t denom = omega_ - d_D2_ptr_[idx];
+            (d_full_input2_ + singles_dim_)[idx] =
+                (fabs(denom) > 1e-12) ? (d_full_output1_ + singles_dim_)[idx] / denom : 0.0;
+        }
+    } else {
         int blocks = (doubles_dim_ + threads - 1) / threads;
         eom_mp2_schur_scale_kernel<<<blocks, threads>>>(
             d_full_output1_ + singles_dim_,
@@ -174,7 +181,11 @@ void EOMMP2SchurOperator::apply(const real_t* d_input, real_t* d_output) const {
     // Step 4: result = M11×R1 + M12×temp_R2
     cudaMemcpy(d_output, d_full_output1_,
                (size_t)singles_dim_ * sizeof(real_t), cudaMemcpyDeviceToDevice);
-    {
+    if (!gpu::gpu_available()) {
+        #pragma omp parallel for
+        for (int idx = 0; idx < singles_dim_; idx++)
+            d_output[idx] += d_full_output2_[idx];
+    } else {
         int blocks = (singles_dim_ + threads - 1) / threads;
         eom_mp2_schur_add_kernel<<<blocks, threads>>>(
             d_full_output2_, d_output, singles_dim_);
@@ -184,6 +195,14 @@ void EOMMP2SchurOperator::apply(const real_t* d_input, real_t* d_output) const {
 }
 
 void EOMMP2SchurOperator::apply_preconditioner(const real_t* d_input, real_t* d_output) const {
+    if (!gpu::gpu_available()) {
+        #pragma omp parallel for
+        for (int idx = 0; idx < singles_dim_; idx++) {
+            real_t diag = d_diagonal_[idx];
+            d_output[idx] = (fabs(diag) > 1e-12) ? d_input[idx] / diag : 0.0;
+        }
+        return;
+    }
     int threads = 256;
     int blocks = (singles_dim_ + threads - 1) / threads;
     eom_mp2_schur_preconditioner_kernel<<<blocks, threads>>>(

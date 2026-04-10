@@ -434,6 +434,12 @@ public:
     /// Build full MO ERI tensor from COO AO ERI
     real_t* build_mo_eri(const real_t* d_C, int nmo) const override;
 
+    /// On CPU the hash is not built; we instead return the cached dense tensor
+    /// that precomputation() produced via gpu::computeERIMatrix.
+    const real_t* get_eri_matrix_device() const override {
+        return d_eri_cpu_tensor_;  // nullptr on GPU (hash is used instead)
+    }
+
     bool supports_post_hf_method(PostHFMethod method) const override {
         // With build_mo_eri, all post-HF methods are supported
         if( method == PostHFMethod::None
@@ -475,6 +481,11 @@ protected:
     size_t              num_nonzero_;   ///< Number of non-empty slots
 
     HashFockMethod      hash_fock_method_ = HashFockMethod::Compact;
+
+    // CPU fallback: a full 4D AO ERI tensor built in precomputation() when
+    // gpu_available() is false.  The hash-table machinery above is skipped
+    // on CPU and the Fock path uses this tensor via computeFockMatrix_RHF.
+    real_t*             d_eri_cpu_tensor_ = nullptr;
 };
 
 
@@ -488,16 +499,21 @@ class ERI_RI_Direct: public ERI {
 public:
 
     ERI_RI_Direct(const HF& hf, const Molecular& auxiliary_molecular); ///< Constructor
-    
+
     ERI_RI_Direct(const ERI_RI_Direct&) = delete; ///< copy constructor is deleted
-    virtual ~ERI_RI_Direct() = default; ///< destructor
-    
+    virtual ~ERI_RI_Direct(); ///< destructor
+
     void precomputation() override;
 
     DeviceHostMemory<PrimitiveShell>& get_auxiliary_primitive_shells() { return auxiliary_primitive_shells_; } ///< Get the auxiliary primitive shells
     int get_num_auxiliary_basis() { return num_auxiliary_basis_; }
 
     std::string get_algorithm_name() override { return "Direct-RI"; } ///< Get the algorithm name
+
+    /// On CPU, lazily reconstruct the dense AO ERI tensor from
+    /// intermediate_matrix_B_cpu_ so the base-class build_mo_eri can be used
+    /// as a uniform post-HF fallback.  On GPU returns nullptr (unused).
+    const real_t* get_eri_matrix_device() const override;
 
     bool supports_post_hf_method(PostHFMethod method) const override {
         return method == PostHFMethod::None || method == PostHFMethod::MP2;
@@ -524,6 +540,17 @@ protected:
     // 初回用
     DeviceHostMemory<real_t> schwarz_upper_bound_factors_for_SAD_K_computation;
     DeviceHostMemory<size_t2> primitive_shell_pair_indices_for_SAD_K_computation;
+
+    // CPU-only: cached RI B matrix for the fallback Fock path.
+    // On GPU the specialized Direct/SemiDirect/Hash kernels do not need this
+    // buffer so we allocate it as a 1x1 placeholder; on CPU it is built in
+    // precomputation() and reused every SCF iteration.
+    DeviceHostMatrix<real_t> intermediate_matrix_B_cpu_;
+
+    // CPU-only: lazily reconstructed dense AO ERI tensor (nao² x nao²) built
+    // from intermediate_matrix_B_cpu_ via B^T * B.  Used by post-HF methods
+    // that go through get_eri_matrix_device() + base-class build_mo_eri.
+    mutable real_t* d_eri_reconstructed_cpu_ = nullptr;
 };
 
 

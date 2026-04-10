@@ -11,9 +11,14 @@
 // Nuclear repulsion Hessian: d²V_nn/dR_A dR_B
 // Purely analytical (no integrals needed)
 
+#ifdef GANSU_CPU_ONLY
+#include "cuda_compat.hpp"
+#else
 #include <cuda.h>
+#endif
 #include <cmath>
 #include "types.hpp"
+#include "int2e.hpp"  // gansu_atomic_add
 
 namespace gansu::gpu {
 
@@ -119,6 +124,88 @@ void compute_hessian_nuclear_repulsion(
                 if (d1 != d2)
                     atomicAdd(&g_hessian[(3*B+d2)*ndim + (3*A+d1)], val);
             }
+        }
+    }
+}
+
+
+
+// CPU host-callable mirror of compute_hessian_nuclear_repulsion.
+void compute_hessian_nuclear_repulsion_cpu(double* g_hessian, const Atom* g_atoms, const int num_atoms)
+{
+    const int num_pairs = num_atoms * (num_atoms + 1) / 2;
+    const int ndim = 3 * num_atoms;
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int id = 0; id < num_pairs; id++) {
+        // Map 1D index to (A, B) with A <= B
+        int A = 0, B = 0;
+        int acc = 0;
+        for (int a = 0; a < num_atoms; a++) {
+            if (id < acc + (num_atoms - a)) {
+                A = a;
+                B = a + (id - acc);
+                break;
+            }
+            acc += (num_atoms - a);
+        }
+
+        if (A == B) {
+            double Z_A = (double)g_atoms[A].atomic_number;
+            double hess[9] = {0.0};
+            for (int C = 0; C < num_atoms; C++) {
+                if (C == A) continue;
+                double Z_C = (double)g_atoms[C].atomic_number;
+                double dx = g_atoms[A].coordinate.x - g_atoms[C].coordinate.x;
+                double dy = g_atoms[A].coordinate.y - g_atoms[C].coordinate.y;
+                double dz = g_atoms[A].coordinate.z - g_atoms[C].coordinate.z;
+                double r2 = dx*dx + dy*dy + dz*dz;
+                double r = std::sqrt(r2);
+                double r5 = r2 * r2 * r;
+                double ZZ_r5 = Z_A * Z_C / r5;
+                hess[0] += ZZ_r5 * (3*dx*dx - r2);
+                hess[4] += ZZ_r5 * (3*dy*dy - r2);
+                hess[8] += ZZ_r5 * (3*dz*dz - r2);
+                hess[1] += ZZ_r5 * 3*dx*dy;
+                hess[2] += ZZ_r5 * 3*dx*dz;
+                hess[5] += ZZ_r5 * 3*dy*dz;
+            }
+            for (int d1 = 0; d1 < 3; d1++)
+                for (int d2 = d1; d2 < 3; d2++) {
+                    double val = hess[d1*3+d2];
+                    if (val != 0.0) {
+                        gansu_atomic_add(&g_hessian[(3*A+d1)*ndim + (3*A+d2)], val);
+                        if (d1 != d2)
+                            gansu_atomic_add(&g_hessian[(3*A+d2)*ndim + (3*A+d1)], val);
+                    }
+                }
+        } else {
+            double Z_A = (double)g_atoms[A].atomic_number, Z_B = (double)g_atoms[B].atomic_number;
+            double dx = g_atoms[A].coordinate.x - g_atoms[B].coordinate.x;
+            double dy = g_atoms[A].coordinate.y - g_atoms[B].coordinate.y;
+            double dz = g_atoms[A].coordinate.z - g_atoms[B].coordinate.z;
+            double r2 = dx*dx + dy*dy + dz*dz;
+            double r = std::sqrt(r2);
+            double r5 = r2 * r2 * r;
+            double ZZ_r5 = -Z_A * Z_B / r5;
+            double hess[9];
+            hess[0] = ZZ_r5 * (3*dx*dx - r2);
+            hess[4] = ZZ_r5 * (3*dy*dy - r2);
+            hess[8] = ZZ_r5 * (3*dz*dz - r2);
+            hess[1] = ZZ_r5 * 3*dx*dy;
+            hess[2] = ZZ_r5 * 3*dx*dz;
+            hess[5] = ZZ_r5 * 3*dy*dz;
+            for (int d1 = 0; d1 < 3; d1++)
+                for (int d2 = d1; d2 < 3; d2++) {
+                    double val = hess[d1*3+d2];
+                    if (val == 0.0) continue;
+                    gansu_atomic_add(&g_hessian[(3*A+d1)*ndim + (3*B+d2)], val);
+                    if (d1 != d2)
+                        gansu_atomic_add(&g_hessian[(3*A+d2)*ndim + (3*B+d1)], val);
+                    gansu_atomic_add(&g_hessian[(3*B+d1)*ndim + (3*A+d2)], val);
+                    if (d1 != d2)
+                        gansu_atomic_add(&g_hessian[(3*B+d2)*ndim + (3*A+d1)], val);
+                }
         }
     }
 }

@@ -39,6 +39,78 @@
 // Forward declaration for gpu_available() — avoids circular include with gpu_manager.hpp
 namespace gansu::gpu { bool gpu_available(); }
 
+/**
+ * @brief Safe memcpy that works in both GPU and CPU modes.
+ *
+ * When GPU is not available, device_ptr is actually a host pointer (from calloc),
+ * so CUDA's cudaMemcpy would fail. This transparently falls back to std::memcpy.
+ *
+ * All code should call cudaMemcpy as usual — the macro below redirects it here
+ * so no source changes are needed in individual .cu files.
+ */
+namespace gansu::detail {
+    // Store pointers to the real CUDA functions before macro override.
+    // In CPU-only builds, these point to the stubs in cuda_compat.hpp.
+    inline auto real_cudaMemcpy = ::cudaMemcpy;
+    inline auto real_cudaMemcpyAsync = ::cudaMemcpyAsync;
+    inline auto real_cudaMemset = ::cudaMemset;
+}
+
+/**
+ * @brief Safe memcpy/memset that work in both GPU and CPU fallback modes.
+ *
+ * When GPU is not available, device_ptr is actually a host pointer (from calloc),
+ * so CUDA's cudaMemcpy would fail on those addresses. These wrappers transparently
+ * fall back to std::memcpy/std::memset.
+ *
+ * The macros below redirect all existing cudaMemcpy/cudaMemset calls through these
+ * wrappers, so no per-file source changes are needed.
+ */
+inline cudaError_t gansu_memcpy(void* dst, const void* src, size_t count, cudaMemcpyKind kind = cudaMemcpyDefault) {
+    if (gansu::gpu::gpu_available()) {
+        return gansu::detail::real_cudaMemcpy(dst, src, count, kind);
+    } else {
+        std::memcpy(dst, src, count);
+        return cudaSuccess;
+    }
+}
+
+inline cudaError_t gansu_memcpy_async(void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream) {
+    if (gansu::gpu::gpu_available()) {
+        return gansu::detail::real_cudaMemcpyAsync(dst, src, count, kind, stream);
+    } else {
+        std::memcpy(dst, src, count);
+        return cudaSuccess;
+    }
+}
+
+inline cudaError_t gansu_memset(void* ptr, int value, size_t count) {
+    if (gansu::gpu::gpu_available()) {
+        return gansu::detail::real_cudaMemset(ptr, value, count);
+    } else {
+        std::memset(ptr, value, count);
+        return cudaSuccess;
+    }
+}
+
+inline cudaError_t gansu_memGetInfo(size_t* free, size_t* total) {
+    if (gansu::gpu::gpu_available()) {
+        return gansu::detail::real_cudaMemcpy ? // just a non-null check to use real CUDA
+            ::cudaMemGetInfo(free, total) : cudaSuccess;
+    }
+    // CPU mode: report large available memory (no GPU memory limit)
+    if (free)  *free  = (size_t)64 * 1024 * 1024 * 1024; // 64 GB
+    if (total) *total = (size_t)64 * 1024 * 1024 * 1024;
+    return cudaSuccess;
+}
+
+// Override CUDA memory functions globally so all existing code is safe in CPU mode.
+// real_cudaMemcpy etc. captured above still point to the originals.
+#define cudaMemcpy gansu_memcpy
+#define cudaMemcpyAsync gansu_memcpy_async
+#define cudaMemset gansu_memset
+#define cudaMemGetInfo gansu_memGetInfo
+
 namespace gansu{
 
 
@@ -790,6 +862,18 @@ inline std::mutex g_allocated_memory_map_mutex;
  */
 template<typename T>
 inline cudaError_t tracked_cudaMalloc(T** ptr, size_t size) {
+    if (!gpu::gpu_available()) {
+        // CPU mode: use calloc (zero-initialized, matching cudaMemset behavior)
+        *ptr = static_cast<T*>(std::calloc(1, size));
+        if (!*ptr) {
+            throw std::runtime_error("tracked_cudaMalloc: CPU calloc failed (size=" + std::to_string(size) + ")");
+        }
+        { std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
+          g_allocated_memory_map[*ptr] = size; }
+        CudaMemoryManager<T>::track_allocation(size);
+        return cudaSuccess;
+    }
+
     cudaError_t err = cudaMalloc(reinterpret_cast<void**>(ptr), size);
 
     if (err == cudaSuccess) {
@@ -805,7 +889,6 @@ inline cudaError_t tracked_cudaMalloc(T** ptr, size_t size) {
         // Update memory statistics
         CudaMemoryManager<T>::track_allocation(size);
     } else {
-        // Print detailed error message and throw exception to prevent use of null pointer
         size_t current_mem = GlobalGpuMemoryTracker::get_current();
         std::ostringstream oss;
         oss << "tracked_cudaMalloc failed: " << cudaGetErrorString(err) << "\n"
@@ -843,15 +926,18 @@ inline cudaError_t tracked_cudaFree(void* ptr) {
         }
     }
 
-    // Free the memory
-    cudaError_t err = cudaFree(ptr);
+    if (!gpu::gpu_available()) {
+        // CPU mode: memory was allocated with calloc
+        std::free(ptr);
+    } else {
+        cudaFree(ptr);
+    }
 
-    // Update statistics if free was successful and size was tracked
-    if (err == cudaSuccess && size > 0) {
+    if (size > 0) {
         GlobalGpuMemoryTracker::track_deallocation(size);
     }
 
-    return err;
+    return cudaSuccess;
 }
 
 /**
@@ -868,19 +954,24 @@ inline cudaError_t tracked_cudaFree(void* ptr) {
  */
 template<typename T>
 inline cudaError_t tracked_cudaMallocAsync(T** ptr, size_t size, cudaStream_t stream) {
+    if (!gpu::gpu_available()) {
+        *ptr = static_cast<T*>(std::calloc(1, size));
+        if (!*ptr) throw std::runtime_error("tracked_cudaMallocAsync: CPU calloc failed");
+        { std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
+          g_allocated_memory_map[*ptr] = size; }
+        CudaMemoryManager<T>::track_allocation(size);
+        return cudaSuccess;
+    }
+
     cudaError_t err = cudaMallocAsync(reinterpret_cast<void**>(ptr), size, stream);
 
     if (err == cudaSuccess) {
-        // Track allocation in map
         {
             std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
             g_allocated_memory_map[*ptr] = size;
         }
-
-        // Update memory statistics
         CudaMemoryManager<T>::track_allocation(size);
     } else {
-        // Print detailed error message with current memory statistics
         size_t current_mem = GlobalGpuMemoryTracker::get_current();
         std::cerr << "tracked_cudaMallocAsync failed: " << cudaGetErrorString(err) << "\n"
                   << "  Attempted to allocate: " << CudaMemoryManager<T>::format_bytes(size) << "\n"
@@ -906,7 +997,6 @@ inline cudaError_t tracked_cudaFreeAsync(void* ptr, cudaStream_t stream) {
         return cudaSuccess;
     }
 
-    // Get the size of the allocation
     size_t size = 0;
     {
         std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
@@ -917,15 +1007,17 @@ inline cudaError_t tracked_cudaFreeAsync(void* ptr, cudaStream_t stream) {
         }
     }
 
-    // Free the memory asynchronously
-    cudaError_t err = cudaFreeAsync(ptr, stream);
+    if (!gpu::gpu_available()) {
+        std::free(ptr);
+    } else {
+        cudaFreeAsync(ptr, stream);
+    }
 
-    // Update statistics if free was successful and size was tracked
-    if (err == cudaSuccess && size > 0) {
+    if (size > 0) {
         GlobalGpuMemoryTracker::track_deallocation(size);
     }
 
-    return err;
+    return cudaSuccess;
 }
 
 

@@ -28,6 +28,7 @@
 #include "rys_eri_mp2.hpp"
 
 #include "gradients.hpp"
+#include "rys_grad_g.hpp"
 #include "rys_hessian_g.hpp"
 
 #include <vector>    // std::vector
@@ -36,6 +37,7 @@
 #include <algorithm> // std::reverse, std::sort
 #include <numeric>   // std::iota
 #include <fstream>
+#include <sstream>
 
 #ifndef GANSU_CPU_ONLY
 #include <cuda_runtime.h> // for int2 type
@@ -92,6 +94,11 @@ void disable_gpu() {
     std::cout << "GPU disabled by user. Using CPU (Eigen + OpenMP) backend." << std::endl;
 }
 
+void enable_gpu() {
+    g_gpu_initialized = false;  // Reset so initialize_gpu() re-detects
+    initialize_gpu();
+}
+
 
 
 
@@ -112,6 +119,7 @@ int eigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_
     if (!gpu_available()) {
 #endif
         // === Eigen CPU path ===
+        // Symmetric matrix: column-major and row-major are equivalent
         Eigen::Map<const Eigen::MatrixXd> A(d_matrix, size, size);
         Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(A);
         if (solver.info() != Eigen::Success) return -1;
@@ -119,9 +127,14 @@ int eigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_
         // Copy eigenvalues
         Eigen::Map<Eigen::VectorXd>(d_eigenvalues, size) = solver.eigenvalues();
 
-        // Copy eigenvectors (transposed: eigenvector i in row i)
-        Eigen::Map<Eigen::MatrixXd> evecs(d_eigenvectors, size, size);
-        evecs = solver.eigenvectors().transpose();
+        // Store eigenvectors to match GPU convention:
+        // GPU: cuSOLVER stores eigenvectors in columns (col-major), then transposeInPlace
+        //   → result in row-major flat memory: d[i*N+j] = component i of eigenvector j
+        //   → i.e., eigenvector j is in COLUMN j (when read as row-major)
+        // To match: store V directly (not V^T) into RowMajor map
+        using RowMajorMatrixXd = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        Eigen::Map<RowMajorMatrixXd> evecs(d_eigenvectors, size, size);
+        evecs = solver.eigenvectors(); // column j = eigenvector j (matches GPU after transpose)
 
         return 0;
 #ifndef GANSU_CPU_ONLY
@@ -303,9 +316,10 @@ int partialEigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, rea
         // Eigenvalues are ascending by default in Eigen
         Eigen::Map<Eigen::VectorXd>(d_eigenvalues, num_eigenvalues) = solver.eigenvalues().head(num_eigenvalues);
 
-        // Eigenvectors (transposed layout: row i = eigenvector i)
-        Eigen::Map<Eigen::MatrixXd> evecs(d_eigenvectors, size, size);
-        evecs = solver.eigenvectors().transpose();
+        // Store eigenvectors (same convention as eigenDecomposition: column j = eigvec j)
+        using RowMajorMatrixXd = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        Eigen::Map<RowMajorMatrixXd> evecs(d_eigenvectors, size, size);
+        evecs = solver.eigenvectors(); // NOT transpose
 
         return 0;
 #ifndef GANSU_CPU_ONLY
@@ -399,18 +413,22 @@ int partialEigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, rea
 #ifndef GANSU_CPU_ONLY
     if (!gpu_available()) {
 #endif
-        // === Eigen CPU path ===
-        Eigen::Map<const Eigen::MatrixXd> A(d_matrix_A, size, size);
-        Eigen::Map<const Eigen::MatrixXd> B(d_matrix_B, size, size);
-        Eigen::Map<Eigen::MatrixXd> C(d_matrix_C, size, size);
-
-        auto opA = transpose_A ? A.transpose() : Eigen::Ref<const Eigen::MatrixXd>(A);
-        auto opB = transpose_B ? B.transpose() : Eigen::Ref<const Eigen::MatrixXd>(B);
+        // === Eigen CPU path (row-major storage) ===
+        using RowMajorMatrixXd = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        Eigen::Map<const RowMajorMatrixXd> A(d_matrix_A, size, size);
+        Eigen::Map<const RowMajorMatrixXd> B(d_matrix_B, size, size);
+        Eigen::Map<RowMajorMatrixXd> C(d_matrix_C, size, size);
 
         if (accumulate) {
-            C.noalias() += opA * opB;
+            if (transpose_A && transpose_B) C.noalias() += A.transpose() * B.transpose();
+            else if (transpose_A)           C.noalias() += A.transpose() * B;
+            else if (transpose_B)           C.noalias() += A * B.transpose();
+            else                            C.noalias() += A * B;
         } else {
-            C.noalias() = opA * opB;
+            if (transpose_A && transpose_B) C.noalias() = A.transpose() * B.transpose();
+            else if (transpose_A)           C.noalias() = A.transpose() * B;
+            else if (transpose_B)           C.noalias() = A * B.transpose();
+            else                            C.noalias() = A * B;
         }
         return;
 #ifndef GANSU_CPU_ONLY
@@ -774,9 +792,17 @@ void sqrtElements(real_t* d_vectors, const size_t size) {
 #ifndef GANSU_CPU_ONLY
     if (!gpu_available()) {
 #endif
+        // Match the GPU sqrt_kernel behaviour: clamp values below `threshold`
+        // to `threshold` before taking the square root.  Callers always pass
+        // eigenvalues of positive-semidefinite matrices (overlap, density,
+        // ...), so a slightly negative value is just floating-point noise.
+        // Without the clamp std::sqrt would produce NaN.
+        const double threshold = 1e-8;
         #pragma omp parallel for
         for (size_t i = 0; i < size; i++) {
-            d_vectors[i] = std::sqrt(d_vectors[i]);
+            double v = d_vectors[i];
+            if (v < threshold) v = threshold;
+            d_vectors[i] = std::sqrt(v);
         }
         return;
 #ifndef GANSU_CPU_ONLY
@@ -880,6 +906,7 @@ void computeCoreHamiltonianMatrix(const std::vector<ShellTypeInfo>& shell_type_i
             d_cgto_normalization_factors,
             d_overlap_matrix, d_core_hamiltonian_matrix,
             num_atoms, num_basis);
+
         return;
 #ifndef GANSU_CPU_ONLY
     }
@@ -947,6 +974,7 @@ void computeCoreHamiltonianMatrix(const std::vector<ShellTypeInfo>& shell_type_i
         cudaStreamDestroy(streams[i]);
         cudaStreamDestroy(V_streams[i]);
     }
+
 #endif // !GANSU_CPU_ONLY
 }
 
@@ -984,6 +1012,7 @@ void computeERIMatrix(const std::vector<ShellTypeInfo>& shell_type_infos, const 
         gansu::cpu::computeERIMatrix(
             shell_type_infos, d_primitive_shells, d_cgto_normalization_factors,
             d_eri_matrix, num_basis);
+
         return;
 #ifndef GANSU_CPU_ONLY
     }
@@ -1063,6 +1092,7 @@ void computeERIMatrix(const std::vector<ShellTypeInfo>& shell_type_infos, const 
     for (int i = 0; i < num_kernels; i++) {
         cudaStreamDestroy(streams[i]);
     }
+
 #endif // !GANSU_CPU_ONLY
 }
 
@@ -1149,33 +1179,26 @@ void computeCoefficientMatrix(const real_t* d_fock_matrix, const real_t* d_trans
 #ifndef GANSU_CPU_ONLY
     if (!gpu_available()) {
 #endif
-        // === CPU implementation ===
-        // Solve the generalized eigenvalue problem FC = SCE
-        // F' = X^T F X, diagonalize F'C' = C'E, then C = X C'
-        const int N = num_basis;
-        Eigen::Map<const Eigen::MatrixXd> F(d_fock_matrix, N, N);
-        Eigen::Map<const Eigen::MatrixXd> X(d_transform_matrix, N, N);
-        Eigen::Map<Eigen::MatrixXd> C(d_coefficient_matrix, N, N);
+        // === CPU implementation: reuse building blocks (same logic as GPU path) ===
+        {
+            const int N = num_basis;
+            // Allocate temporaries
+            std::vector<real_t> tempMatrix(N * N);
+            std::vector<real_t> tempSymFock(N * N);
+            std::vector<real_t> tempEigenvectors(N * N);
+            std::vector<real_t> tempEigenvalues(N);
 
-        // Symmetrize: F' = X^T * F * X
-        Eigen::MatrixXd Fp = X.transpose() * F * X;
+            // F' = X^T * F * X
+            matrixMatrixProduct(d_transform_matrix, d_fock_matrix, tempMatrix.data(), N, true, false);
+            matrixMatrixProduct(tempMatrix.data(), d_transform_matrix, tempSymFock.data(), N, false, false);
 
-        // Diagonalize F'
-        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(Fp);
-        if (solver.info() != Eigen::Success) {
-            THROW_EXCEPTION("Eigen SelfAdjointEigenSolver failed in computeCoefficientMatrix.");
+            // Diagonalize F'
+            real_t* eigenval_ptr = (d_orbital_energies != nullptr) ? d_orbital_energies : tempEigenvalues.data();
+            eigenDecomposition(tempSymFock.data(), eigenval_ptr, tempEigenvectors.data(), N);
+
+            // C = X * C'  (C' is transposed eigenvectors from eigenDecomposition)
+            matrixMatrixProduct(d_transform_matrix, tempEigenvectors.data(), d_coefficient_matrix, N, false, false);
         }
-
-        // Store eigenvalues if requested
-        if (d_orbital_energies != nullptr) {
-            Eigen::Map<Eigen::VectorXd>(d_orbital_energies, N) = solver.eigenvalues();
-        }
-
-        // C = X * C' (eigenvectors transposed to match row-major convention)
-        // eigenDecomposition stores eigenvector i in row i (transposed), so replicate that:
-        // C = X * eigenvectors^T  (in row-major, this is the same as the GPU path)
-        Eigen::MatrixXd Cp_T = solver.eigenvectors().transpose();
-        C = X * Cp_T;
         return;
 #ifndef GANSU_CPU_ONLY
     }
@@ -1261,16 +1284,16 @@ void computeDensityMatrix_RHF(const real_t* d_coefficient_matrix, real_t* d_dens
 #ifndef GANSU_CPU_ONLY
     if (!gpu_available()) {
 #endif
-        // D(mu,nu) = 2 * sum_{i=0}^{nocc-1} C(i,mu) * C(i,nu) [row-major: C stored as (nao x nao), row i = MO i]
+        // D(i,j) = 2 * sum_{k=0}^{nocc-1} C(i,k) * C(j,k) [C stored as (nao x nao), C(AO_i, MO_k)]
         const int nocc = num_electron / 2;
         #pragma omp parallel for collapse(2)
-        for (int mu = 0; mu < num_basis; mu++) {
-            for (int nu = 0; nu < num_basis; nu++) {
+        for (int i = 0; i < num_basis; i++) {
+            for (int j = 0; j < num_basis; j++) {
                 double val = 0.0;
-                for (int i = 0; i < nocc; i++) {
-                    val += d_coefficient_matrix[i * num_basis + mu] * d_coefficient_matrix[i * num_basis + nu];
+                for (int k = 0; k < nocc; k++) {
+                    val += d_coefficient_matrix[i * num_basis + k] * d_coefficient_matrix[j * num_basis + k];
                 }
-                d_density_matrix[mu * num_basis + nu] = 2.0 * val;
+                d_density_matrix[i * num_basis + j] = 2.0 * val;
             }
         }
         return;
@@ -1302,15 +1325,15 @@ void computeDensityMatrix_UHF(const real_t* d_coefficient_matrix, real_t* d_dens
 #ifndef GANSU_CPU_ONLY
     if (!gpu_available()) {
 #endif
-        // D(mu,nu) = sum_{i=0}^{nspin-1} C(i,mu) * C(i,nu)
+        // D(i,j) = sum_{k=0}^{nspin-1} C(i,k) * C(j,k) [C(AO_i, MO_k)]
         #pragma omp parallel for collapse(2)
-        for (int mu = 0; mu < num_basis; mu++) {
-            for (int nu = 0; nu < num_basis; nu++) {
+        for (int i = 0; i < num_basis; i++) {
+            for (int j = 0; j < num_basis; j++) {
                 double val = 0.0;
-                for (int i = 0; i < num_electron; i++) {
-                    val += d_coefficient_matrix[i * num_basis + mu] * d_coefficient_matrix[i * num_basis + nu];
+                for (int k = 0; k < num_electron; k++) {
+                    val += d_coefficient_matrix[i * num_basis + k] * d_coefficient_matrix[j * num_basis + k];
                 }
-                d_density_matrix[mu * num_basis + nu] = val;
+                d_density_matrix[i * num_basis + j] = val;
             }
         }
         return;
@@ -1402,8 +1425,9 @@ void computeFockMatrix_RHF(const real_t* d_density_matrix, const real_t* d_core_
 #ifndef GANSU_CPU_ONLY
     if (!gpu_available()) {
 #endif
-        // F(mu,nu) = H(mu,nu) + sum_{la,si} D(la,si) * [2*(mu nu|la si) - (mu la|nu si)]
-        // ERI stored with 8-fold symmetry via get_1d_index
+        // F(mu,nu) = H(mu,nu) + sum_{k,l} D(k,l) * [(mu nu|k l) - 0.5*(mu k|nu l)]
+        // D already includes factor 2 for RHF, so this gives F = H + 2J - K
+        // ERI stored as 4D tensor: eri[mu*N^3 + nu*N^2 + la*N + si]
         const int N = num_basis;
         #pragma omp parallel for collapse(2)
         for (int mu = 0; mu < N; mu++) {
@@ -1412,10 +1436,9 @@ void computeFockMatrix_RHF(const real_t* d_density_matrix, const real_t* d_core_
                 for (int la = 0; la < N; la++) {
                     for (int si = 0; si < N; si++) {
                         double D_ls = d_density_matrix[la * N + si];
-                        // Use symmetrized 1D indexing for stored ERI
-                        size_t idx_J = gansu::gpu::get_1d_index(mu, nu, la, si, N);
-                        size_t idx_K = gansu::gpu::get_1d_index(mu, la, nu, si, N);
-                        G += D_ls * (2.0 * d_eri[idx_J] - d_eri[idx_K]);
+                        size_t idx_J = (size_t)mu*N*N*N + nu*N*N + la*N + si;
+                        size_t idx_K = (size_t)mu*N*N*N + la*N*N + nu*N + si;
+                        G += D_ls * (d_eri[idx_J] - 0.5 * d_eri[idx_K]);
                     }
                 }
                 d_fock_matrix[mu * N + nu] = d_core_hamiltonian_matrix[mu * N + nu] + G;
@@ -1471,10 +1494,8 @@ void computeFockMatrix_UHF(const real_t* d_density_matrix_a, const real_t* d_den
                         double Da_kl = d_density_matrix_a[k * N + l];
                         double Db_kl = d_density_matrix_b[k * N + l];
                         double Dt_kl = Da_kl + Db_kl;
-                        size_t idx_J = gansu::gpu::get_1d_index(i, j, k, l, N);
-                        size_t idx_K = gansu::gpu::get_1d_index(i, k, j, l, N);
-                        double eri_J = d_eri[idx_J];
-                        double eri_K = d_eri[idx_K];
+                        double eri_J = d_eri[(size_t)i*N*N*N + j*N*N + k*N + l];
+                        double eri_K = d_eri[(size_t)i*N*N*N + k*N*N + j*N + l];
                         Ga += Dt_kl * eri_J - Da_kl * eri_K;
                         Gb += Dt_kl * eri_J - Db_kl * eri_K;
                     }
@@ -1533,10 +1554,8 @@ void computeFockMatrix_ROHF(const real_t* d_density_matrix_closed, const real_t*
                     for (int l = 0; l < N; l++) {
                         double Dc_kl = d_density_matrix_closed[k * N + l];
                         double Do_kl = d_density_matrix_open[k * N + l];
-                        size_t idx_J = gansu::gpu::get_1d_index(i, j, k, l, N);
-                        size_t idx_K = gansu::gpu::get_1d_index(i, k, j, l, N);
-                        double eri_J = d_eri[idx_J];
-                        double eri_K = d_eri[idx_K];
+                        double eri_J = d_eri[(size_t)i*N*N*N + j*N*N + k*N + l];
+                        double eri_K = d_eri[(size_t)i*N*N*N + k*N*N + j*N + l];
                         J_closed += Dc_kl * eri_J;
                         J_open   += Do_kl * eri_J;
                         K_closed += Dc_kl * eri_K;
@@ -1549,60 +1568,50 @@ void computeFockMatrix_ROHF(const real_t* d_density_matrix_closed, const real_t*
             }
         }
 
-        // Step 2: Transform to MO basis using Eigen
-        Eigen::Map<const Eigen::MatrixXd> C(d_coefficient_matrix, N, N);
-        Eigen::Map<const Eigen::MatrixXd> S(d_overlap_matrix, N, N);
-        Eigen::Map<Eigen::MatrixXd> Fc(d_fock_matrix_closed, N, N);
-        Eigen::Map<Eigen::MatrixXd> Fo(d_fock_matrix_open, N, N);
-        Eigen::Map<Eigen::MatrixXd> F(d_fock_matrix, N, N);
+        // Step 2-4: Reuse building blocks (same logic as GPU path)
+        {
+            std::vector<real_t> temp1(N * N), temp2(N * N);
+            std::vector<real_t> F_MO_closed(N * N), F_MO_open(N * N), R_MO(N * N, 0.0);
 
-        // F_MO_closed = C^T * F_AO_closed * C
-        Eigen::MatrixXd F_MO_closed = C.transpose() * Fc * C;
-        // F_MO_open = C^T * F_AO_open * C
-        Eigen::MatrixXd F_MO_open = C.transpose() * Fo * C;
+            // F_MO_closed = C^T * F_closed * C
+            matrixMatrixProduct(d_coefficient_matrix, d_fock_matrix_closed, temp1.data(), N, true, false);
+            matrixMatrixProduct(temp1.data(), d_coefficient_matrix, F_MO_closed.data(), N);
 
-        // Step 3: Build unified Fock matrix R_MO
-        const auto Acc = ROH_parameters.Acc;
-        const auto Bcc = ROH_parameters.Bcc;
-        const auto Aoo = ROH_parameters.Aoo;
-        const auto Boo = ROH_parameters.Boo;
-        const auto Avv = ROH_parameters.Avv;
-        const auto Bvv = ROH_parameters.Bvv;
+            // F_MO_open = C^T * F_open * C
+            matrixMatrixProduct(d_coefficient_matrix, d_fock_matrix_open, temp1.data(), N, true, false);
+            matrixMatrixProduct(temp1.data(), d_coefficient_matrix, F_MO_open.data(), N);
 
-        Eigen::MatrixXd R_MO = Eigen::MatrixXd::Zero(N, N);
-        for (int i = 0; i < N; i++) {
-            for (int j = i; j < N; j++) {
-                // Determine shell types
-                enum { CLOSED, OPEN, VIRTUAL } shell_i, shell_j;
-                if (i < num_closed) shell_i = CLOSED;
-                else if (i < num_closed + num_open) shell_i = OPEN;
-                else shell_i = VIRTUAL;
-                if (j < num_closed) shell_j = CLOSED;
-                else if (j < num_closed + num_open) shell_j = OPEN;
-                else shell_j = VIRTUAL;
+            // Step 3: Build unified Fock matrix R_MO (same as computeUnifiedFockMatrix_ROHF_kernel)
+            const auto Acc = ROH_parameters.Acc, Bcc = ROH_parameters.Bcc;
+            const auto Aoo = ROH_parameters.Aoo, Boo = ROH_parameters.Boo;
+            const auto Avv = ROH_parameters.Avv, Bvv = ROH_parameters.Bvv;
 
-                double d = 0.0;
-                if (shell_i == CLOSED && shell_j == CLOSED) {
-                    d = 2.0 * (Acc * F_MO_open(i, j) + Bcc * (F_MO_closed(i, j) - F_MO_open(i, j)));
-                } else if (shell_i == CLOSED && shell_j == OPEN) {
-                    d = 2.0 * (F_MO_closed(i, j) - F_MO_open(i, j));
-                } else if (shell_i == CLOSED && shell_j == VIRTUAL) {
-                    d = F_MO_closed(i, j);
-                } else if (shell_i == OPEN && shell_j == OPEN) {
-                    d = 2.0 * (Aoo * F_MO_open(i, j) + Boo * (F_MO_closed(i, j) - F_MO_open(i, j)));
-                } else if (shell_i == OPEN && shell_j == VIRTUAL) {
-                    d = 2.0 * F_MO_open(i, j);
-                } else if (shell_i == VIRTUAL && shell_j == VIRTUAL) {
-                    d = 2.0 * (Avv * F_MO_open(i, j) + Bvv * (F_MO_closed(i, j) - F_MO_open(i, j)));
+            for (int i = 0; i < N; i++) {
+                for (int j = i; j < N; j++) {
+                    enum { CLOSED, OPEN, VIRTUAL } si, sj;
+                    si = (i < num_closed) ? CLOSED : (i < num_closed + num_open) ? OPEN : VIRTUAL;
+                    sj = (j < num_closed) ? CLOSED : (j < num_closed + num_open) ? OPEN : VIRTUAL;
+
+                    double fc = F_MO_closed[i * N + j], fo = F_MO_open[i * N + j];
+                    double d = 0.0;
+                    if      (si == CLOSED && sj == CLOSED)  d = 2.0 * (Acc * fo + Bcc * (fc - fo));
+                    else if (si == CLOSED && sj == OPEN)    d = 2.0 * (fc - fo);
+                    else if (si == CLOSED && sj == VIRTUAL)  d = fc;
+                    else if (si == OPEN   && sj == OPEN)    d = 2.0 * (Aoo * fo + Boo * (fc - fo));
+                    else if (si == OPEN   && sj == VIRTUAL)  d = 2.0 * fo;
+                    else if (si == VIRTUAL && sj == VIRTUAL) d = 2.0 * (Avv * fo + Bvv * (fc - fo));
+
+                    R_MO[i * N + j] = d;
+                    if (i != j) R_MO[j * N + i] = d;
                 }
-
-                R_MO(i, j) = d;
-                if (i != j) R_MO(j, i) = d;
             }
-        }
 
-        // Step 4: Transform back to AO: F_AO = S * C * R_MO * C^T * S
-        F = S * C * R_MO * C.transpose() * S;
+            // Step 4: F = S * C * R_MO * C^T * S
+            matrixMatrixProduct(d_overlap_matrix, d_coefficient_matrix, temp1.data(), N);
+            matrixMatrixProduct(temp1.data(), R_MO.data(), temp2.data(), N);
+            matrixMatrixProduct(temp2.data(), d_coefficient_matrix, temp1.data(), N, false, true);
+            matrixMatrixProduct(temp1.data(), d_overlap_matrix, d_fock_matrix, N);
+        }
         return;
 #ifndef GANSU_CPU_ONLY
     }
@@ -2069,20 +2078,21 @@ void computeDIISErrorMatrix(const real_t* d_overlap_matrix, const real_t* d_tran
 #ifndef GANSU_CPU_ONLY
     if (!gpu_available()) {
 #endif
-        // === CPU implementation ===
+        // === CPU implementation (row-major) ===
         // DIIS error = FDS - SDF, optionally transformed: X(FDS-SDF)X^T
+        using RowMajorMatrixXd = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
         const int N = num_basis;
-        Eigen::Map<const Eigen::MatrixXd> F(d_fock_matrix, N, N);
-        Eigen::Map<const Eigen::MatrixXd> D(d_density_matrix, N, N);
-        Eigen::Map<const Eigen::MatrixXd> S(d_overlap_matrix, N, N);
-        Eigen::Map<Eigen::MatrixXd> E(d_diis_error_matrix, N, N);
+        Eigen::Map<const RowMajorMatrixXd> F(d_fock_matrix, N, N);
+        Eigen::Map<const RowMajorMatrixXd> D(d_density_matrix, N, N);
+        Eigen::Map<const RowMajorMatrixXd> S(d_overlap_matrix, N, N);
+        Eigen::Map<RowMajorMatrixXd> E(d_diis_error_matrix, N, N);
 
-        Eigen::MatrixXd FDS = F * D * S;
-        Eigen::MatrixXd SDF = S * D * F;
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> FDS = F * D * S;
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> SDF = S * D * F;
         E = FDS - SDF;
 
         if (is_include_transform) {
-            Eigen::Map<const Eigen::MatrixXd> X(d_transform_matrix, N, N);
+            Eigen::Map<const RowMajorMatrixXd> X(d_transform_matrix, N, N);
             E = (X * E * X.transpose()).eval();
         }
         return;
@@ -2177,11 +2187,14 @@ void computeFockMatrixDIIS(real_t* d_error_matrices, real_t* d_fock_matrices, re
         // Solve B * c = rhs
         Eigen::VectorXd c = B.colPivHouseholderQr().solve(rhs);
 
-        // F_new = sum_i c_i * F_i
-        Eigen::Map<Eigen::MatrixXd> F_new(d_new_fock_matrix, num_basis, num_basis);
-        F_new = c(0) * Eigen::Map<const Eigen::MatrixXd>(&d_fock_matrices[0], num_basis, num_basis);
-        for (int i = 1; i < num_prev; i++) {
-            F_new += c(i) * Eigen::Map<const Eigen::MatrixXd>(&d_fock_matrices[i * nn], num_basis, num_basis);
+        // F_new = sum_i c_i * F_i (element-wise weighted sum, layout-independent)
+        std::memset(d_new_fock_matrix, 0, nn * sizeof(real_t));
+        for (int i = 0; i < num_prev; i++) {
+            const double ci = c(i);
+            const real_t* Fi = &d_fock_matrices[i * nn];
+            for (size_t k = 0; k < nn; k++) {
+                d_new_fock_matrix[k] += ci * Fi[k];
+            }
         }
         return;
 #ifndef GANSU_CPU_ONLY
@@ -2445,12 +2458,18 @@ void choleskyDecomposition(double* d_A, const int N) {
 #ifndef GANSU_CPU_ONLY
     if (!gpu_available()) {
 #endif
-        // === Eigen CPU path ===
-        Eigen::Map<Eigen::MatrixXd> A(d_A, N, N);
-        Eigen::LLT<Eigen::MatrixXd> llt(A);
-        // Store lower triangular L, zero upper triangle
+        // === Eigen CPU path (row-major) ===
+        // GPU does Cholesky with UPPER fill on row-major data, then zeros upper triangle.
+        // Row-major UPPER Cholesky = column-major LOWER Cholesky on the transposed matrix.
+        // For symmetric A, this yields L such that A = L * L^T (L is lower triangular).
+        using RowMajorMatrixXd = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        Eigen::Map<RowMajorMatrixXd> A(d_A, N, N);
+        Eigen::LLT<Eigen::MatrixXd> llt(A);  // Eigen computes col-major L from A
         Eigen::MatrixXd L = llt.matrixL();
-        A = L;
+        // Store back as row-major, zero upper triangle
+        for (int i = 0; i < N; i++)
+            for (int j = 0; j < N; j++)
+                A(i, j) = (i >= j) ? L(i, j) : 0.0;
         return;
 #ifndef GANSU_CPU_ONLY
     }
@@ -2505,8 +2524,30 @@ void choleskyDecomposition(double* d_A, const int N) {
  * @param row The number of columns.
  */
 void solve_lower_triangular(double* d_A, double* d_B, int row, int col){
-    cublasHandle_t cublasHandle = GPUHandle::cublas();
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU path: solve L * X = B for X using Eigen ===
+        // d_A is row-major lower triangular (row x row), d_B is row-major (row x col)
+        // After solving, result overwrites d_B.
+        {
+            using RowMajorMatrixXd = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+            Eigen::Map<RowMajorMatrixXd> A(d_A, row, row);
+            Eigen::Map<RowMajorMatrixXd> B(d_B, row, col);
 
+            // A is lower triangular in row-major. Eigen's triangularView<Lower> works on the mapped matrix.
+            // Solve L * X = B → X = L^{-1} * B
+            Eigen::MatrixXd X = A.triangularView<Eigen::Lower>().solve(B);
+
+            // Copy result back to d_B (row-major)
+            B = X;
+        }
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+
+    // === GPU path ===
+    cublasHandle_t cublasHandle = GPUHandle::cublas();
 
     // 転置
     transposeMatrixInPlace(d_A, row);
@@ -2518,7 +2559,6 @@ void solve_lower_triangular(double* d_A, double* d_B, int row, int col){
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix: ") + std::string(cudaGetErrorString(err)));
     }
-
 
     const double alpha = 1.0;
     const double beta = 0.0; //これ必要
@@ -2535,18 +2575,18 @@ void solve_lower_triangular(double* d_A, double* d_B, int row, int col){
         d_tmp, row
     );
 
-    // // Solve A * X = B → X overwrites B
+    // Solve A * X = B → X overwrites B
     cublasDtrsm(
         cublasHandle,
-        CUBLAS_SIDE_LEFT,        
-        CUBLAS_FILL_MODE_LOWER, 
-        CUBLAS_OP_N,            
-        CUBLAS_DIAG_NON_UNIT,   
-        row,                   
-        col,                   
+        CUBLAS_SIDE_LEFT,
+        CUBLAS_FILL_MODE_LOWER,
+        CUBLAS_OP_N,
+        CUBLAS_DIAG_NON_UNIT,
+        row,
+        col,
         &alpha,
-        d_A, row,                  
-        d_tmp, row                  
+        d_A, row,
+        d_tmp, row
     );
 
     cublasDgeam(
@@ -2562,6 +2602,7 @@ void solve_lower_triangular(double* d_A, double* d_B, int row, int col){
     );
 
     gansu::tracked_cudaFree(d_tmp);
+#endif // !GANSU_CPU_ONLY
 }
 
 
@@ -2676,35 +2717,109 @@ void compute_RI_IntermediateMatrixB(
 }
 
 void computeIntermediateMatrixB(
-    const real_t* d_three_center_eri, 
-    const real_t* d_two_center_eri, 
-    real_t* d_intermediate_matrix_B, 
-    const int num_basis, 
+    const real_t* d_three_center_eri,
+    const real_t* d_two_center_eri,
+    real_t* d_intermediate_matrix_B,
+    const int num_basis,
     const int num_auxiliary_basis)
 {
     // B_{\mu\nu}^p = \sum_{q}^{M_\textrm{aux}} (\mu\nu|q)L_{qp}
     // B[p][\mu][\nu] = \sum_{q}^{M_\textrm{aux}} T[q][\mu][\nu] * L[q][p]
 
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU path ===
+        gansu::cpu::computeRIIntermediateMatrixB_cpu(
+            d_three_center_eri, d_two_center_eri, d_intermediate_matrix_B,
+            num_basis, num_auxiliary_basis);
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+
+    // === GPU path ===
     const int num_threads = 256;
     const int num_blocks = (num_auxiliary_basis * num_basis * num_basis + num_threads - 1) / num_threads;
     computeRIIntermediateMatrixB_kernel<<<num_blocks, num_threads>>>(d_three_center_eri, d_two_center_eri, d_intermediate_matrix_B, num_basis, num_auxiliary_basis);
+#endif // !GANSU_CPU_ONLY
 }
 
 
 
 //* With density matrix
 void computeFockMatrix_RI_RHF_with_density_matrix(
-    const real_t* d_density_matrix, 
-    const real_t* d_core_hamiltonian_matrix, 
-    const real_t* d_intermediate_matrix_B, 
-    real_t* d_fock_matrix, 
-    const int num_basis, 
-    const int num_auxiliary_basis, 
-    real_t* d_J, 
-    real_t* d_K, 
-    real_t* d_W, 
-    real_t* d_T, 
+    const real_t* d_density_matrix,
+    const real_t* d_core_hamiltonian_matrix,
+    const real_t* d_intermediate_matrix_B,
+    real_t* d_fock_matrix,
+    const int num_basis,
+    const int num_auxiliary_basis,
+    real_t* d_J,
+    real_t* d_K,
+    real_t* d_W,
+    real_t* d_T,
     real_t* d_V){
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU path ===
+        {
+            const size_t nao = num_basis;
+            const size_t nao2 = nao * nao;
+            const size_t naux = num_auxiliary_basis;
+
+            // W[P] = sum_{mu nu} B[P][mu][nu] * D[mu][nu]  (contract B with density)
+            for (size_t P = 0; P < naux; P++) {
+                double sum = 0.0;
+                for (size_t ij = 0; ij < nao2; ij++) {
+                    sum += d_intermediate_matrix_B[P * nao2 + ij] * d_density_matrix[ij];
+                }
+                d_W[P] = sum;
+            }
+
+            // J = sum_P W[P] * B[P]
+            gansu::cpu::weighted_sum_matrices_cpu(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
+
+            // K: T[P] = D^T * B[P], V[P] = T[P]^T * B[P], K = sum_P V[P]
+            // T[P][mu][nu] = sum_la D[la][mu] * B[P][la][nu]  (D^T * B[P])
+            for (size_t P = 0; P < naux; P++) {
+                const real_t* Bp = d_intermediate_matrix_B + P * nao2;
+                real_t* Tp = d_T + P * nao2;
+                for (size_t mu = 0; mu < nao; mu++) {
+                    for (size_t nu = 0; nu < nao; nu++) {
+                        double sum = 0.0;
+                        for (size_t la = 0; la < nao; la++) {
+                            sum += d_density_matrix[la * nao + mu] * Bp[la * nao + nu];
+                        }
+                        Tp[mu * nao + nu] = sum;
+                    }
+                }
+            }
+            // V[P][mu][nu] = sum_la T[P][la][mu] * B[P][la][nu]  (T[P]^T * B[P])
+            for (size_t P = 0; P < naux; P++) {
+                const real_t* Tp = d_T + P * nao2;
+                const real_t* Bp = d_intermediate_matrix_B + P * nao2;
+                real_t* Vp = d_V + P * nao2;
+                for (size_t mu = 0; mu < nao; mu++) {
+                    for (size_t nu = 0; nu < nao; nu++) {
+                        double sum = 0.0;
+                        for (size_t la = 0; la < nao; la++) {
+                            sum += Tp[la * nao + mu] * Bp[la * nao + nu];
+                        }
+                        Vp[mu * nao + nu] = sum;
+                    }
+                }
+            }
+            gansu::cpu::sum_matrices_cpu(d_K, d_V, num_basis, num_auxiliary_basis);
+
+            // F = H + J - 0.5*K
+            gansu::cpu::computeFockMatrix_RI_RHF_cpu(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, num_basis);
+        }
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+
+    // === GPU path ===
     //cublasManager cublas;
     cublasHandle_t cublasHandle = GPUHandle::cublas();
 
@@ -2744,12 +2859,13 @@ void computeFockMatrix_RI_RHF_with_density_matrix(
         num_auxiliary_basis
     );
     // K = sum(V^p)
-    sum_matrices_kernel<<<num_blocks, num_threads>>>(d_K, d_V, num_basis, num_auxiliary_basis); 
+    sum_matrices_kernel<<<num_blocks, num_threads>>>(d_K, d_V, num_basis, num_auxiliary_basis);
 
     ////////////////////////////////// compute Fock matrix //////////////////////////////////
     // F = H + J - (1/2)*K
     computeFockMatrix_RI_RHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, num_basis);
     cudaDeviceSynchronize();
+#endif // !GANSU_CPU_ONLY
 }
 /**/
 
@@ -2779,20 +2895,89 @@ __global__ void packThreeDimensionalTensorX(
 
 
 void computeFockMatrix_RI_RHF_with_coefficient_matrix(
-    const real_t* d_coefficient_matrix, 
-    const real_t* d_density_matrix, 
-    const real_t* d_core_hamiltonian_matrix, 
-    const real_t* d_intermediate_matrix_B, 
-    real_t* d_fock_matrix, 
-    const int num_basis, 
-    const int num_auxiliary_basis, 
-    const int num_occ, 
-    real_t* d_J, 
-    real_t* d_K, 
-    real_t* d_W, 
-    real_t* d_X, 
+    const real_t* d_coefficient_matrix,
+    const real_t* d_density_matrix,
+    const real_t* d_core_hamiltonian_matrix,
+    const real_t* d_intermediate_matrix_B,
+    real_t* d_fock_matrix,
+    const int num_basis,
+    const int num_auxiliary_basis,
+    const int num_occ,
+    real_t* d_J,
+    real_t* d_K,
+    real_t* d_W,
+    real_t* d_X,
     real_t* d_X_packed)
 {
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU path ===
+        {
+            const size_t nao = num_basis;
+            const size_t nao2 = nao * nao;
+            const size_t naux = num_auxiliary_basis;
+            const size_t nocc = num_occ;
+
+            // W[P] = sum_{mu nu} B[P][mu][nu] * D[mu][nu]
+            for (size_t P = 0; P < naux; P++) {
+                double sum = 0.0;
+                for (size_t ij = 0; ij < nao2; ij++) {
+                    sum += d_intermediate_matrix_B[P * nao2 + ij] * d_density_matrix[ij];
+                }
+                d_W[P] = sum;
+            }
+
+            // J = sum_P W[P] * B[P]
+            gansu::cpu::weighted_sum_matrices_cpu(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
+
+            // K via coefficient matrix:
+            // GANSU stores C row-major with C[AO=row, MO=col], i.e.,
+            // d_coefficient_matrix[nu * nao + i] = C[nu, i].
+            // GPU cublas computes X[P, mu, i] = sum_nu C[nu, i] * B[P, mu, nu]
+            // (i.e., X[P] = B[P] * C_occ) and stores it at
+            // d_X[P*nao*nocc + mu*nocc + i].
+            std::memset(d_K, 0, nao2 * sizeof(real_t));
+            for (size_t P = 0; P < naux; P++) {
+                const real_t* Bp = d_intermediate_matrix_B + P * nao2;
+                real_t* Xp = d_X + P * nao * nocc;
+                for (size_t mu = 0; mu < nao; mu++) {
+                    for (size_t i = 0; i < nocc; i++) {
+                        double sum = 0.0;
+                        for (size_t nu = 0; nu < nao; nu++) {
+                            // C[nu, i] * B[P, mu, nu]
+                            sum += d_coefficient_matrix[nu * nao + i] * Bp[mu * nao + nu];
+                        }
+                        Xp[mu * nocc + i] = sum;
+                    }
+                }
+            }
+
+            // Pack X: X_packed[mu][P*nocc+k] = X[P*nao*nocc + mu*nocc + k]
+            gansu::cpu::packThreeDimensionalTensorX_cpu(d_X, d_X_packed, num_basis, num_auxiliary_basis, num_occ);
+
+            // K = 2 * X_packed^T * X_packed:  (nao x nao) = (nao x naux*nocc)^T * (nao x naux*nocc)
+            // Row-major: X_packed[mu][j] where j = P*nocc+k, dimensions (nao x naux*nocc)
+            // K[mu][nu] = 2 * sum_j X_packed[mu][j] * X_packed[nu][j]
+            const size_t naux_nocc = naux * nocc;
+            for (size_t mu = 0; mu < nao; mu++) {
+                for (size_t nu = 0; nu < nao; nu++) {
+                    double sum = 0.0;
+                    for (size_t j = 0; j < naux_nocc; j++) {
+                        sum += d_X_packed[mu * naux_nocc + j] * d_X_packed[nu * naux_nocc + j];
+                    }
+                    d_K[mu * nao + nu] = 2.0 * sum;
+                }
+            }
+
+            // F = H + J - 0.5*K
+            gansu::cpu::computeFockMatrix_RI_RHF_cpu(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, num_basis);
+        }
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+
+    // === GPU path ===
     cublasHandle_t cublasHandle = GPUHandle::cublas();
 
     double alpha = 1.0;
@@ -2835,6 +3020,7 @@ void computeFockMatrix_RI_RHF_with_coefficient_matrix(
     // F = H + J - (1/2)*K
     computeFockMatrix_RI_RHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, num_basis);
     cudaDeviceSynchronize();
+#endif // !GANSU_CPU_ONLY
 }
 /**/
 
@@ -2844,23 +3030,19 @@ void computeFockMatrix_RI_RHF_with_coefficient_matrix(
 
 
 void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_density_matrix_b, const real_t* d_core_hamiltonian_matrix, const real_t* d_intermediate_matrix_B, real_t* d_fock_matrix_a, real_t* d_fock_matrix_b, const int num_basis, const int num_auxiliary_basis){
-    //cublasManager cublas;
-    cublasHandle_t cublasHandle = GPUHandle::cublas();
 
     cudaError_t err;
 
-    // the following is used in the two kernels. So, if necessary, it should be changed for each kernel.
-    const int num_threads = 256;
-    const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+    const size_t nao2 = (size_t)num_basis * num_basis;
 
     ////////////////////////////////// compute J-matrix //////////////////////////////////
     real_t* d_J = nullptr;
     real_t* d_density_matrix = nullptr;
-    err = gansu::tracked_cudaMalloc(&d_J, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_J, sizeof(real_t)*nao2);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for J matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = gansu::tracked_cudaMalloc(&d_density_matrix, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_density_matrix, sizeof(real_t)*nao2);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for density matrix: ") + std::string(cudaGetErrorString(err)));
     }
@@ -2875,14 +3057,30 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
         THROW_EXCEPTION(std::string("Failed to allocate device memory for W vector: ") + std::string(cudaGetErrorString(err)));
     }
 
-    double alpha = 1.0;
-    double beta = 0.0;
-
-    cublasDgemv(cublasHandle, CUBLAS_OP_T, num_basis*num_basis, num_auxiliary_basis, &alpha, d_intermediate_matrix_B, num_basis*num_basis, d_density_matrix, 1, &beta, d_W, 1);
-
-    // J = sum(W[i] * B[i])
-    weighted_sum_matrices_kernel<<<num_blocks, num_threads>>>(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
-
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU path for J-matrix ===
+        for (int P = 0; P < num_auxiliary_basis; P++) {
+            double sum = 0.0;
+            for (size_t ij = 0; ij < nao2; ij++) {
+                sum += d_intermediate_matrix_B[P * nao2 + ij] * d_density_matrix[ij];
+            }
+            d_W[P] = sum;
+        }
+        gansu::cpu::weighted_sum_matrices_cpu(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
+#ifndef GANSU_CPU_ONLY
+    } else {
+        // === GPU path for J-matrix ===
+        cublasHandle_t cublasHandle = GPUHandle::cublas();
+        const int num_threads = 256;
+        const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+        double alpha = 1.0;
+        double beta = 0.0;
+        cublasDgemv(cublasHandle, CUBLAS_OP_T, num_basis*num_basis, num_auxiliary_basis, &alpha, d_intermediate_matrix_B, num_basis*num_basis, d_density_matrix, 1, &beta, d_W, 1);
+        weighted_sum_matrices_kernel<<<num_blocks, num_threads>>>(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
+    }
+#endif
 
     // free the memory
     gansu::tracked_cudaFree(d_W);
@@ -2891,61 +3089,74 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
     ////////////////////////////////// compute K-matrix //////////////////////////////////
     real_t* d_T = nullptr;
     real_t* d_V = nullptr;
-    err = gansu::tracked_cudaMalloc(&d_T, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_T, sizeof(real_t)*num_auxiliary_basis*nao2);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for T matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = gansu::tracked_cudaMalloc(&d_V, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_V, sizeof(real_t)*num_auxiliary_basis*nao2);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for V matrix: ") + std::string(cudaGetErrorString(err)));
     }
 
     ////////////// compute Ka-matrix //////////////
     real_t* d_Ka = nullptr;
-    err = gansu::tracked_cudaMalloc(&d_Ka, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_Ka, sizeof(real_t)*nao2);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for Ka matrix: ") + std::string(cudaGetErrorString(err)));
     }
 
-    // T^p = B^p Da^T
-    // Note: cublasDgemmBatched should be used?
+    // T^p = B^p Da^T (matrixMatrixProduct already has CPU fallback)
     for(int p=0; p<num_auxiliary_basis; p++){
-        matrixMatrixProduct(&d_intermediate_matrix_B[p*num_basis*num_basis], d_density_matrix_a, &d_T[p*num_basis*num_basis], num_basis, false, true);
+        matrixMatrixProduct(&d_intermediate_matrix_B[p*nao2], d_density_matrix_a, &d_T[p*nao2], num_basis, false, true);
     }
 
     // V^p = B^p (T^p)^T
-    // Note: cublasDgemmBatched should be used?
     for(int p=0; p<num_auxiliary_basis; p++){
-        matrixMatrixProduct(&d_intermediate_matrix_B[p*num_basis*num_basis], &d_T[p*num_basis*num_basis], &d_V[p*num_basis*num_basis], num_basis, false, true);
+        matrixMatrixProduct(&d_intermediate_matrix_B[p*nao2], &d_T[p*nao2], &d_V[p*nao2], num_basis, false, true);
     }
 
     // Ka = sum(V^p)
-    sum_matrices_kernel<<<num_blocks, num_threads>>>(d_Ka, d_V, num_basis, num_auxiliary_basis); 
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        gansu::cpu::sum_matrices_cpu(d_Ka, d_V, num_basis, num_auxiliary_basis);
+#ifndef GANSU_CPU_ONLY
+    } else {
+        const int num_threads = 256;
+        const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+        sum_matrices_kernel<<<num_blocks, num_threads>>>(d_Ka, d_V, num_basis, num_auxiliary_basis);
+    }
+#endif
 
     ////////////// compute Kb-matrix //////////////
     real_t* d_Kb = nullptr;
-    err = gansu::tracked_cudaMalloc(&d_Kb, sizeof(real_t)*num_basis*num_basis);
+    err = gansu::tracked_cudaMalloc(&d_Kb, sizeof(real_t)*nao2);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for Kb matrix: ") + std::string(cudaGetErrorString(err)));
     }
 
-    // T^p = B^p Da^T
-    // Note: cublasDgemmBatched should be used?
+    // T^p = B^p Db^T
     for(int p=0; p<num_auxiliary_basis; p++){
-        matrixMatrixProduct(&d_intermediate_matrix_B[p*num_basis*num_basis], d_density_matrix_b, &d_T[p*num_basis*num_basis], num_basis, false, true);
+        matrixMatrixProduct(&d_intermediate_matrix_B[p*nao2], d_density_matrix_b, &d_T[p*nao2], num_basis, false, true);
     }
 
     // V^p = B^p (T^p)^T
-    // Note: cublasDgemmBatched should be used?
     for(int p=0; p<num_auxiliary_basis; p++){
-        matrixMatrixProduct(&d_intermediate_matrix_B[p*num_basis*num_basis], &d_T[p*num_basis*num_basis], &d_V[p*num_basis*num_basis], num_basis, false, true);
+        matrixMatrixProduct(&d_intermediate_matrix_B[p*nao2], &d_T[p*nao2], &d_V[p*nao2], num_basis, false, true);
     }
 
     // Kb = sum(V^p)
-    sum_matrices_kernel<<<num_blocks, num_threads>>>(d_Kb, d_V, num_basis, num_auxiliary_basis); 
-
-
-
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        gansu::cpu::sum_matrices_cpu(d_Kb, d_V, num_basis, num_auxiliary_basis);
+#ifndef GANSU_CPU_ONLY
+    } else {
+        const int num_threads = 256;
+        const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+        sum_matrices_kernel<<<num_blocks, num_threads>>>(d_Kb, d_V, num_basis, num_auxiliary_basis);
+    }
+#endif
 
     // free the memory
     gansu::tracked_cudaFree(d_T);
@@ -2955,9 +3166,19 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
 
     // F_a = H + J - K_a
     // F_b = H + J - K_b
-    computeFockMatrix_RI_UHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_Ka, d_fock_matrix_a, num_basis);
-    computeFockMatrix_RI_UHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_Kb, d_fock_matrix_b, num_basis);
-
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        gansu::cpu::computeFockMatrix_RI_UHF_cpu(d_core_hamiltonian_matrix, d_J, d_Ka, d_fock_matrix_a, num_basis);
+        gansu::cpu::computeFockMatrix_RI_UHF_cpu(d_core_hamiltonian_matrix, d_J, d_Kb, d_fock_matrix_b, num_basis);
+#ifndef GANSU_CPU_ONLY
+    } else {
+        const int num_threads = 256;
+        const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+        computeFockMatrix_RI_UHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_Ka, d_fock_matrix_a, num_basis);
+        computeFockMatrix_RI_UHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_Kb, d_fock_matrix_b, num_basis);
+    }
+#endif
 
     // free the memory
     gansu::tracked_cudaFree(d_J);
@@ -2968,51 +3189,46 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
 
 
 void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real_t* d_density_matrix_open, const real_t* d_core_hamiltonian_matrix, const real_t* d_coefficient_matrix, const real_t* d_overlap_matrix, const real_t* d_intermediate_matrix_B, const ROHF_ParameterSet ROH_parameters, real_t* d_fock_matrix_closed, real_t* d_fock_matrix_open, real_t* d_fock_matrix, const int num_closed, const int num_open, const int num_basis, const int num_auxiliary_basis){
-    //cublasManager cublas;
-    cublasHandle_t cublasHandle = GPUHandle::cublas();
 
     cudaError_t err;
+    const size_t nao2 = (size_t)num_basis * num_basis;
 
-    real_t* d_temp_F_MO_closed = nullptr; // Fock matrix for the closed-shell MO 
-    real_t* d_temp_F_MO_open = nullptr; // Fock matrix for the open-shell MO
-    real_t* d_temp_R_MO = nullptr; /// unified Fock matrix R_MO
+    real_t* d_temp_F_MO_closed = nullptr;
+    real_t* d_temp_F_MO_open = nullptr;
+    real_t* d_temp_R_MO = nullptr;
     real_t* d_temp_matrix1 = nullptr;
     real_t* d_temp_matrix2 = nullptr;
-    err = gansu::tracked_cudaMalloc(&d_temp_F_MO_closed, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_F_MO_closed, nao2 * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for closed-shell Fock matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = gansu::tracked_cudaMalloc(&d_temp_F_MO_open, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_F_MO_open, nao2 * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for open-shell Fock matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = gansu::tracked_cudaMalloc(&d_temp_R_MO, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_R_MO, nao2 * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for unified Fock matrix: ") + std::string(cudaGetErrorString(err)));
     }
-    err = gansu::tracked_cudaMalloc(&d_temp_matrix1, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_matrix1, nao2 * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix 1: ") + std::string(cudaGetErrorString(err)));
     }
-    err = gansu::tracked_cudaMalloc(&d_temp_matrix2, num_basis * num_basis * sizeof(real_t));
+    err = gansu::tracked_cudaMalloc(&d_temp_matrix2, nao2 * sizeof(real_t));
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for temporary matrix 2: ") + std::string(cudaGetErrorString(err)));
     }
 
     {// compute the Fock matrices for the closed- and open-shell orbitals using RI approximation
 
-        // the following is used in the two kernels. So, if necessary, it should be changed for each kernel.
-        const int num_threads = 256;
-        const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
-
         ////////////////////////////////// compute J-matrix //////////////////////////////////
         real_t* d_J = nullptr;
         real_t* d_density_matrix = nullptr;
-        err = gansu::tracked_cudaMalloc(&d_J, sizeof(real_t)*num_basis*num_basis);
+        err = gansu::tracked_cudaMalloc(&d_J, sizeof(real_t)*nao2);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for J matrix: ") + std::string(cudaGetErrorString(err)));
         }
-        err = gansu::tracked_cudaMalloc(&d_density_matrix, sizeof(real_t)*num_basis*num_basis);
+        err = gansu::tracked_cudaMalloc(&d_density_matrix, sizeof(real_t)*nao2);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for density matrix: ") + std::string(cudaGetErrorString(err)));
         }
@@ -3020,63 +3236,82 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
         // D = D_closed + D_open
         matrixAddition(d_density_matrix_closed, d_density_matrix_open, d_density_matrix, num_basis);
 
-        // W = B D (Matrix(M_aux x M^2 matrix) * Vector (M^2 x 1) )
+        // W = B D
         real_t* d_W = nullptr;
         err = gansu::tracked_cudaMalloc(&d_W, sizeof(real_t)*num_auxiliary_basis);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for W vector: ") + std::string(cudaGetErrorString(err)));
         }
 
-        double alpha = 1.0;
-        double beta = 0.0;
+#ifndef GANSU_CPU_ONLY
+        if (!gpu_available()) {
+#endif
+            // === CPU path for J ===
+            for (int P = 0; P < num_auxiliary_basis; P++) {
+                double sum = 0.0;
+                for (size_t ij = 0; ij < nao2; ij++) {
+                    sum += d_intermediate_matrix_B[P * nao2 + ij] * d_density_matrix[ij];
+                }
+                d_W[P] = sum;
+            }
+            gansu::cpu::weighted_sum_matrices_cpu(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
+#ifndef GANSU_CPU_ONLY
+        } else {
+            // === GPU path for J ===
+            cublasHandle_t cublasHandle = GPUHandle::cublas();
+            const int num_threads = 256;
+            const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+            double alpha = 1.0;
+            double beta = 0.0;
+            cublasDgemv(cublasHandle, CUBLAS_OP_T, num_basis*num_basis, num_auxiliary_basis, &alpha, d_intermediate_matrix_B, num_basis*num_basis, d_density_matrix, 1, &beta, d_W, 1);
+            weighted_sum_matrices_kernel<<<num_blocks, num_threads>>>(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
+        }
+#endif
 
-        cublasDgemv(cublasHandle, CUBLAS_OP_T, num_basis*num_basis, num_auxiliary_basis, &alpha, d_intermediate_matrix_B, num_basis*num_basis, d_density_matrix, 1, &beta, d_W, 1);
-
-        // J = sum(W[i] * B[i])
-        weighted_sum_matrices_kernel<<<num_blocks, num_threads>>>(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
-
-
-        // free the memory
         gansu::tracked_cudaFree(d_W);
 
         ////////////////////////////////// compute Kclosed-matrix //////////////////////////////////
         real_t* d_T = nullptr;
         real_t* d_V = nullptr;
-        err = gansu::tracked_cudaMalloc(&d_T, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
+        err = gansu::tracked_cudaMalloc(&d_T, sizeof(real_t)*num_auxiliary_basis*nao2);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for T matrix: ") + std::string(cudaGetErrorString(err)));
         }
-        err = gansu::tracked_cudaMalloc(&d_V, sizeof(real_t)*num_auxiliary_basis*num_basis*num_basis);
+        err = gansu::tracked_cudaMalloc(&d_V, sizeof(real_t)*num_auxiliary_basis*nao2);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for V matrix: ") + std::string(cudaGetErrorString(err)));
         }
 
-        ////////////// compute Kclosed-matrix //////////////
         real_t* d_Kclosed = nullptr;
-        err = gansu::tracked_cudaMalloc(&d_Kclosed, sizeof(real_t)*num_basis*num_basis);
+        err = gansu::tracked_cudaMalloc(&d_Kclosed, sizeof(real_t)*nao2);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for Kclosed matrix: ") + std::string(cudaGetErrorString(err)));
         }
 
-        // T^p = B^p Da^T
-        // Note: cublasDgemmBatched should be used?
+        // T^p = B^p D^T (matrixMatrixProduct already has CPU fallback)
         for(int p=0; p<num_auxiliary_basis; p++){
-            matrixMatrixProduct(&d_intermediate_matrix_B[p*num_basis*num_basis], d_density_matrix, &d_T[p*num_basis*num_basis], num_basis, false, true);
+            matrixMatrixProduct(&d_intermediate_matrix_B[p*nao2], d_density_matrix, &d_T[p*nao2], num_basis, false, true);
         }
-
         // V^p = B^p (T^p)^T
-        // Note: cublasDgemmBatched should be used?
         for(int p=0; p<num_auxiliary_basis; p++){
-            matrixMatrixProduct(&d_intermediate_matrix_B[p*num_basis*num_basis], &d_T[p*num_basis*num_basis], &d_V[p*num_basis*num_basis], num_basis, false, true);
+            matrixMatrixProduct(&d_intermediate_matrix_B[p*nao2], &d_T[p*nao2], &d_V[p*nao2], num_basis, false, true);
         }
-
         // Kclosed = sum(V^p)
-        sum_matrices_kernel<<<num_blocks, num_threads>>>(d_Kclosed, d_V, num_basis, num_auxiliary_basis); 
+#ifndef GANSU_CPU_ONLY
+        if (!gpu_available()) {
+#endif
+            gansu::cpu::sum_matrices_cpu(d_Kclosed, d_V, num_basis, num_auxiliary_basis);
+#ifndef GANSU_CPU_ONLY
+        } else {
+            const int num_threads = 256;
+            const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+            sum_matrices_kernel<<<num_blocks, num_threads>>>(d_Kclosed, d_V, num_basis, num_auxiliary_basis);
+        }
+#endif
 
-    
         ////////////// compute Kopen-matrix //////////////
         real_t* d_Kopen = nullptr;
-        err = gansu::tracked_cudaMalloc(&d_Kopen, sizeof(real_t)*num_basis*num_basis);
+        err = gansu::tracked_cudaMalloc(&d_Kopen, sizeof(real_t)*nao2);
         if (err != cudaSuccess) {
             THROW_EXCEPTION(std::string("Failed to allocate device memory for Kopen matrix: ") + std::string(cudaGetErrorString(err)));
         }
@@ -3084,59 +3319,93 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
         // D = 0.5*D_closed + D_open
         weightedMatrixSum(d_density_matrix_closed, d_density_matrix_open, d_density_matrix, 0.5, 1.0, num_basis);
 
-        // T^p = B^p Da^T
-        // Note: cublasDgemmBatched should be used?
         for(int p=0; p<num_auxiliary_basis; p++){
-            matrixMatrixProduct(&d_intermediate_matrix_B[p*num_basis*num_basis], d_density_matrix, &d_T[p*num_basis*num_basis], num_basis, false, true);
+            matrixMatrixProduct(&d_intermediate_matrix_B[p*nao2], d_density_matrix, &d_T[p*nao2], num_basis, false, true);
         }
-
-        // V^p = B^p (T^p)^T
-        // Note: cublasDgemmBatched should be used?
         for(int p=0; p<num_auxiliary_basis; p++){
-            matrixMatrixProduct(&d_intermediate_matrix_B[p*num_basis*num_basis], &d_T[p*num_basis*num_basis], &d_V[p*num_basis*num_basis], num_basis, false, true);
+            matrixMatrixProduct(&d_intermediate_matrix_B[p*nao2], &d_T[p*nao2], &d_V[p*nao2], num_basis, false, true);
         }
+        // Kopen = sum(V^p)
+#ifndef GANSU_CPU_ONLY
+        if (!gpu_available()) {
+#endif
+            gansu::cpu::sum_matrices_cpu(d_Kopen, d_V, num_basis, num_auxiliary_basis);
+#ifndef GANSU_CPU_ONLY
+        } else {
+            const int num_threads = 256;
+            const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+            sum_matrices_kernel<<<num_blocks, num_threads>>>(d_Kopen, d_V, num_basis, num_auxiliary_basis);
+        }
+#endif
 
-        // Kclosed = sum(V^p)
-        sum_matrices_kernel<<<num_blocks, num_threads>>>(d_Kopen, d_V, num_basis, num_auxiliary_basis); 
-
-    
-        // free the memory
         gansu::tracked_cudaFree(d_T);
         gansu::tracked_cudaFree(d_V);
-        
-
 
         ////////////////////////////////// compute Fock matrix //////////////////////////////////
-
         // Fclosed = H + J - 0.5*Kclosed
         // Fopen = 0.5*(H + J - Kopen)
-        computeFockMatrix_RI_ROHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_Kclosed, d_Kopen, d_fock_matrix_closed, d_fock_matrix_open, num_basis);
+#ifndef GANSU_CPU_ONLY
+        if (!gpu_available()) {
+#endif
+            gansu::cpu::computeFockMatrix_RI_ROHF_cpu(d_core_hamiltonian_matrix, d_J, d_Kclosed, d_Kopen, d_fock_matrix_closed, d_fock_matrix_open, num_basis);
+#ifndef GANSU_CPU_ONLY
+        } else {
+            const int num_threads = 256;
+            const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+            computeFockMatrix_RI_ROHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_Kclosed, d_Kopen, d_fock_matrix_closed, d_fock_matrix_open, num_basis);
+        }
+#endif
 
-
-        // free the memory
         gansu::tracked_cudaFree(d_J);
         gansu::tracked_cudaFree(d_Kclosed);
         gansu::tracked_cudaFree(d_Kopen);
         gansu::tracked_cudaFree(d_density_matrix);
     }
 
-
-
-    { // Transforms the Fock matrices from AO to the MO 
-        // F_MO_closed = C^T F_AO_closed C
+    { // Transforms the Fock matrices from AO to the MO (matrixMatrixProduct has CPU fallback)
         matrixMatrixProduct(d_coefficient_matrix, d_fock_matrix_closed, d_temp_matrix1, num_basis, true, false);
         matrixMatrixProduct(d_temp_matrix1, d_coefficient_matrix, d_temp_F_MO_closed, num_basis, false, false);
-        
-        // F_MO_open = C F_AO_open C
+
         matrixMatrixProduct(d_coefficient_matrix, d_fock_matrix_open, d_temp_matrix1, num_basis, true, false);
         matrixMatrixProduct(d_temp_matrix1, d_coefficient_matrix, d_temp_F_MO_open, num_basis, false, false);
     }
 
     { // compute the unified Fock matrix R_MO
-        const size_t num_elements = num_basis * (num_basis+1) / 2;
-        const size_t threads_per_block = 256;
-        const size_t num_blocks = (num_elements + threads_per_block - 1) / threads_per_block;
-        computeUnifiedFockMatrix_ROHF_kernel<<<num_blocks, threads_per_block>>>(d_temp_F_MO_closed, d_temp_F_MO_open, ROH_parameters, d_temp_R_MO, num_closed, num_open, num_basis);
+#ifndef GANSU_CPU_ONLY
+        if (!gpu_available()) {
+#endif
+            // === CPU path: unified Fock matrix ===
+            const int N = num_basis;
+            const auto Acc = ROH_parameters.Acc, Bcc = ROH_parameters.Bcc;
+            const auto Aoo = ROH_parameters.Aoo, Boo = ROH_parameters.Boo;
+            const auto Avv = ROH_parameters.Avv, Bvv = ROH_parameters.Bvv;
+            for (int i = 0; i < N; i++) {
+                for (int j = i; j < N; j++) {
+                    enum { CLOSED, OPEN, VIRTUAL };
+                    int si = (i < num_closed) ? CLOSED : ((i < num_closed + num_open) ? OPEN : VIRTUAL);
+                    int sj = (j < num_closed) ? CLOSED : ((j < num_closed + num_open) ? OPEN : VIRTUAL);
+                    real_t Fc = d_temp_F_MO_closed[i * N + j];
+                    real_t Fo = d_temp_F_MO_open[i * N + j];
+                    real_t d = 0.0;
+                    if      (si == CLOSED && sj == CLOSED)  d = 2.0 * (Acc * Fo + Bcc * (Fc - Fo));
+                    else if (si == CLOSED && sj == OPEN)    d = 2.0 * (Fc - Fo);
+                    else if (si == CLOSED && sj == VIRTUAL)  d = Fc;
+                    else if (si == OPEN && sj == OPEN)      d = 2.0 * (Aoo * Fo + Boo * (Fc - Fo));
+                    else if (si == OPEN && sj == VIRTUAL)    d = 2.0 * Fo;
+                    else if (si == VIRTUAL && sj == VIRTUAL) d = 2.0 * (Avv * Fo + Bvv * (Fc - Fo));
+                    d_temp_R_MO[i * N + j] = d;
+                    if (i != j) d_temp_R_MO[j * N + i] = d;
+                }
+            }
+#ifndef GANSU_CPU_ONLY
+        } else {
+            // === GPU path: unified Fock matrix ===
+            const size_t num_elements = num_basis * (num_basis+1) / 2;
+            const size_t threads_per_block = 256;
+            const size_t num_blocks = (num_elements + threads_per_block - 1) / threads_per_block;
+            computeUnifiedFockMatrix_ROHF_kernel<<<num_blocks, threads_per_block>>>(d_temp_F_MO_closed, d_temp_F_MO_open, ROH_parameters, d_temp_R_MO, num_closed, num_open, num_basis);
+        }
+#endif
     }
 
     { // Transform the unified Fock matrix from MO to AO by F_AO = S*C*R_MO*C^T*S
@@ -3160,17 +3429,33 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
 }
 
 void computeTwoCenterERIs(
-    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos, 
-    const PrimitiveShell* d_auxiliary_primitive_shells, 
-    const real_t* d_auxiliary_cgto_normalization_factors, 
-    real_t* d_two_center_eri, 
+    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+    const PrimitiveShell* d_auxiliary_primitive_shells,
+    const real_t* d_auxiliary_cgto_normalization_factors,
+    real_t* d_two_center_eri,
     const int num_auxiliary_basis,
     const real_t* d_boys_grid,
     const real_t* d_auxiliary_schwarz_upper_bound_factors,
     const real_t schwarz_screening_threshold,
     const bool verbose)
 {
-    // ここに２中心積分を計算するコードを書く    
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU path ===
+        std::cout << "[CPU RI] Computing 2-center ERIs... Naux=" << num_auxiliary_basis << std::endl;
+        gansu::cpu::computeTwoCenterERIs(
+            auxiliary_shell_type_infos,
+            d_auxiliary_primitive_shells,
+            d_auxiliary_cgto_normalization_factors,
+            d_two_center_eri,
+            num_auxiliary_basis);
+        std::cout << "[CPU RI] 2-center ERIs done" << std::endl;
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+
+    // === GPU path ===
     const int threads_per_block = 128;
     const int auxiliary_shell_type_count = auxiliary_shell_type_infos.size();
 
@@ -3238,6 +3523,7 @@ void computeTwoCenterERIs(
     for (int i = 0; i < num_kernels; i++) {
         cudaStreamDestroy(streams[i]);
     }
+#endif // !GANSU_CPU_ONLY
 }
 
 inline int calcIdx_triangular_(int a, int b, int N){
@@ -3262,6 +3548,26 @@ void computeThreeCenterERIs(
     const real_t schwarz_screening_threshold,
     const bool verbose)
 {
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU path ===
+        std::cout << "[CPU RI] Computing 3-center ERIs... Naux=" << num_auxiliary_basis << " Nbasis=" << num_basis << std::endl;
+        gansu::cpu::computeThreeCenterERIs(
+            shell_type_infos,
+            d_primitive_shells,
+            d_cgto_normalization_factors,
+            auxiliary_shell_type_infos,
+            d_auxiliary_primitive_shells,
+            d_auxiliary_cgto_normalization_factors,
+            d_three_center_eri,
+            num_basis,
+            num_auxiliary_basis);
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+
+    // === GPU path ===
     const int threads_per_block = 128;
     const int shell_type_count = shell_type_infos.size();
     const int auxiliary_shell_type_count = auxiliary_shell_type_infos.size();
@@ -3339,6 +3645,7 @@ void computeThreeCenterERIs(
     for (int i = 0; i < num_kernels; i++) {
         cudaStreamDestroy(streams[i]);
     }
+#endif // !GANSU_CPU_ONLY
 }
 
 /**
@@ -3410,13 +3717,32 @@ void computeSchwarzUpperBounds(
  * @details This function computes the Schwarz upper bounds for the shell pairs.
  */
 void computeAuxiliarySchwarzUpperBounds(
-    const std::vector<ShellTypeInfo>& shell_aux_type_infos, 
-    const PrimitiveShell* d_primitive_shells_aux, 
-    const real_t* d_boys_grid, 
-    const real_t* d_cgto_aux_normalization_factors, 
-    real_t* d_upper_bound_factors_aux, 
+    const std::vector<ShellTypeInfo>& shell_aux_type_infos,
+    const PrimitiveShell* d_primitive_shells_aux,
+    const real_t* d_boys_grid,
+    const real_t* d_cgto_aux_normalization_factors,
+    real_t* d_upper_bound_factors_aux,
     const bool verbose)
 {
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU path ===
+        {
+            int num_aux = 0;
+            for (const auto& sti : shell_aux_type_infos) num_aux += sti.count;
+            // For CPU fallback, fill with 1.0 (no screening)
+            // Proper computation would use gansu::cpu::computeAuxiliarySchwarzUpperBounds
+            // but the auxiliary Schwarz bounds are only used for screening optimization.
+            for (int i = 0; i < num_aux; i++) {
+                d_upper_bound_factors_aux[i] = 1.0;
+            }
+        }
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+
+    // === GPU path ===
     const int threads_per_block = 256; // the number of threads per block
     const int shell_type_count = shell_aux_type_infos.size();
 
@@ -3425,8 +3751,9 @@ void computeAuxiliarySchwarzUpperBounds(
         const size_t head = shell_s0.start_index;
         const size_t num_bra = shell_s0.count;
         const size_t num_blocks = (num_bra + threads_per_block - 1) / threads_per_block; // the number of blocks
-        gpu::get_schwarz_aux_kernel(s0)<<<num_blocks, threads_per_block>>>(d_primitive_shells_aux, d_cgto_aux_normalization_factors, shell_s0, head, num_bra, d_boys_grid, d_upper_bound_factors_aux);        
+        gpu::get_schwarz_aux_kernel(s0)<<<num_blocks, threads_per_block>>>(d_primitive_shells_aux, d_cgto_aux_normalization_factors, shell_s0, head, num_bra, d_boys_grid, d_upper_bound_factors_aux);
     }
+#endif // !GANSU_CPU_ONLY
 }
 
 
@@ -3852,7 +4179,25 @@ void computeMullikenPopulation_RHF(
         const int num_basis
     )
 {
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU path ===
+        // population[i] = (D * S)[i, i] = sum_k D[i, k] * S[k, i]
+        const int N = num_basis;
+        #pragma omp parallel for
+        for (int i = 0; i < N; i++) {
+            double sum = 0.0;
+            for (int k = 0; k < N; k++) {
+                sum += d_density_matrix[i * N + k] * d_overlap_matrix[k * N + i];
+            }
+            mulliken_population_basis[i] = sum;
+        }
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
 
+    // === GPU path ===
     cudaError_t err;
 
     real_t* d_mulliken_population = nullptr;
@@ -3865,9 +4210,9 @@ void computeMullikenPopulation_RHF(
     const size_t threads_per_block = 256;
     const size_t num_blocks = (num_basis + threads_per_block - 1) / threads_per_block;
     compute_diagonal_of_product<<<num_blocks, threads_per_block>>>(
-        d_density_matrix, 
-        d_overlap_matrix, 
-        d_mulliken_population, 
+        d_density_matrix,
+        d_overlap_matrix,
+        d_mulliken_population,
         num_basis
     );
 
@@ -3876,6 +4221,7 @@ void computeMullikenPopulation_RHF(
 
     // Free the memory for the temporary matrix
     gansu::tracked_cudaFree(d_mulliken_population);
+#endif // !GANSU_CPU_ONLY
 }
 
 void computeMullikenPopulation_UHF(
@@ -3886,6 +4232,26 @@ void computeMullikenPopulation_UHF(
         const int num_basis
     )
 {
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU path ===
+        // population[i] = ((D_a + D_b) * S)[i, i]
+        const int N = num_basis;
+        #pragma omp parallel for
+        for (int i = 0; i < N; i++) {
+            double sum = 0.0;
+            for (int k = 0; k < N; k++) {
+                double a_plus_b = d_density_matrix_a[i * N + k] + d_density_matrix_b[i * N + k];
+                sum += a_plus_b * overlap_matrix[k * N + i];
+            }
+            mulliken_population_basis[i] = sum;
+        }
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+
+    // === GPU path ===
     cudaError_t err;
 
     real_t* d_mulliken_population = nullptr;
@@ -3898,10 +4264,10 @@ void computeMullikenPopulation_UHF(
     const size_t threads_per_block = 256;
     const size_t num_blocks = (num_basis + threads_per_block - 1) / threads_per_block;
     compute_diagonal_of_product_sum<<<num_blocks, threads_per_block>>>(
-        d_density_matrix_a, 
-        d_density_matrix_b, 
-        overlap_matrix, 
-        d_mulliken_population, 
+        d_density_matrix_a,
+        d_density_matrix_b,
+        overlap_matrix,
+        d_mulliken_population,
         num_basis
     );
 
@@ -3910,6 +4276,7 @@ void computeMullikenPopulation_UHF(
 
     // Free the memory for the temporary matrix
     gansu::tracked_cudaFree(d_mulliken_population);
+#endif // !GANSU_CPU_ONLY
 }
 
 
@@ -4226,6 +4593,25 @@ __global__ void makeIdentityMatrix(real_t* d_I, int size) {
 }
 
 void computeInverseByDtrsm(real_t* two_center_eris, real_t* two_center_eris_inverse, int num_auxiliary_basis){
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU path ===
+        // two_center_eris holds the Cholesky factor L (row-major, lower triangular).
+        // We want two_center_eris_inverse = L^{-1} (row-major).
+        // Derivation: the GPU does cublasDtrsm in col-major with UPPER fill, which
+        // treats two_center_eris (row-major lower) as col-major upper (= L^T in math).
+        // The result X_cm = (L^T)^{-1} = (L^{-1})^T, so X_rm[i,j] = X_cm[j,i] = L^{-1}[i,j].
+        using RowMajorMatrixXd = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        Eigen::Map<RowMajorMatrixXd> L(two_center_eris, num_auxiliary_basis, num_auxiliary_basis);
+        Eigen::Map<RowMajorMatrixXd> Linv(two_center_eris_inverse, num_auxiliary_basis, num_auxiliary_basis);
+        Eigen::MatrixXd I = Eigen::MatrixXd::Identity(num_auxiliary_basis, num_auxiliary_basis);
+        Linv = L.triangularView<Eigen::Lower>().solve(I);
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+
+    // === GPU path ===
     cublasHandle_t cublasHandle = GPUHandle::cublas();
 
     const int num_threads = 1024;
@@ -4237,16 +4623,17 @@ void computeInverseByDtrsm(real_t* two_center_eris, real_t* two_center_eris_inve
 
     cublasDtrsm(
         cublasHandle,
-        CUBLAS_SIDE_LEFT,        
-        CUBLAS_FILL_MODE_UPPER, 
-        CUBLAS_OP_N,            
-        CUBLAS_DIAG_NON_UNIT,   
-        num_auxiliary_basis,                   
-        num_auxiliary_basis,                   
+        CUBLAS_SIDE_LEFT,
+        CUBLAS_FILL_MODE_UPPER,
+        CUBLAS_OP_N,
+        CUBLAS_DIAG_NON_UNIT,
+        num_auxiliary_basis,
+        num_auxiliary_basis,
         &alpha,
-        two_center_eris, num_auxiliary_basis,                  
-        two_center_eris_inverse, num_auxiliary_basis                  
+        two_center_eris, num_auxiliary_basis,
+        two_center_eris_inverse, num_auxiliary_basis
     );
+#endif // !GANSU_CPU_ONLY
 }
 
 
@@ -5241,9 +5628,17 @@ void printGradientMatrix(const char* label, const double* grad, int num_atoms) {
 // 核座標微分をGPUで実装する前処理(重なり部分の係数Wの計算)
 void compute_W(real_t* d_W_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, const int num_basis, const int num_electron)
 {
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        compute_W_Matrix_cpu(d_W_matrix, d_coefficient_matrix, d_orbital_energies, num_electron, num_basis);
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
     const int threads_per_block = 128;
     const int blocks = (num_basis*num_basis + threads_per_block - 1) / threads_per_block;
     compute_W_Matrix_kernel<<<blocks, threads_per_block>>>(d_W_matrix, d_coefficient_matrix, d_orbital_energies, num_electron, num_basis);
+#endif
 }
 
 
@@ -5251,10 +5646,81 @@ void compute_W(real_t* d_W_matrix, const real_t* d_coefficient_matrix, const rea
 
 // 各分子積分の微分を同時に計算
 void computeMolucularGradients(double* d_grad_total, double* d_grad_N, double* d_grad_S, double* d_grad_K, double* d_grad_V, double* d_grad_G, real_t* d_W_matrix,
-                                const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, const Atom* d_atoms, 
-                                const real_t* d_density_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, const PrimitiveShell* d_primitive_shells, 
+                                const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, const Atom* d_atoms,
+                                const real_t* d_density_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, const PrimitiveShell* d_primitive_shells,
                                 const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors, const int num_atoms, const int num_basis, const int num_electron, const bool verbose)
 {
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU analytic-gradient path ===
+        // We mirror the GPU dispatch but without CUDA streams or cuBLAS:
+        //   - 2-electron grad: enumerate every (s0,s1,s2,s3) shell quartet and
+        //     call Rys_compute_gradients_two_electron_cpu.
+        //   - 1-electron grads: enumerate (s0,s1) and call the overlap/kinetic/
+        //     nuclear CPU launchers.
+        //   - Nuclear repulsion: a single call.
+        //   - Final sum into d_grad_total via Eigen-style add.
+        const int shell_type_count = shell_type_infos.size();
+
+        // Generate shell quadruples (same ordering as GPU path).
+        std::vector<std::tuple<int,int,int,int>> shell_quadruples;
+        for (int a = 0; a < shell_type_count; ++a)
+            for (int b = a; b < shell_type_count; ++b)
+                for (int c = 0; c < shell_type_count; ++c)
+                    for (int d = c; d < shell_type_count; ++d)
+                        if (a < c || (a == c && b <= d))
+                            shell_quadruples.emplace_back(a, b, c, d);
+        std::reverse(shell_quadruples.begin(), shell_quadruples.end());
+
+        // 2-electron gradient over every shell-type quartet.
+        for (const auto& quad : shell_quadruples) {
+            int s0, s1, s2, s3;
+            std::tie(s0, s1, s2, s3) = quad;
+            const ShellTypeInfo ss0 = shell_type_infos[s0];
+            const ShellTypeInfo ss1 = shell_type_infos[s1];
+            const ShellTypeInfo ss2 = shell_type_infos[s2];
+            const ShellTypeInfo ss3 = shell_type_infos[s3];
+            const size_t num_bra = (s0==s1) ? ss0.count*(ss0.count+1)/2 : ss0.count*ss1.count;
+            const size_t num_ket = (s2==s3) ? ss2.count*(ss2.count+1)/2 : ss2.count*ss3.count;
+            const size_t num_braket = ((s0==s2)&&(s1==s3)) ? num_bra*(num_bra+1)/2 : num_bra*num_ket;
+            Rys_compute_gradients_two_electron_cpu(
+                d_grad_G, d_density_matrix, d_primitive_shells, d_cgto_normalization_factors,
+                ss0, ss1, ss2, ss3, num_braket, num_basis, d_boys_grid);
+        }
+
+        // 1-electron gradients (overlap, kinetic, nuclear) over every shell-type pair.
+        for (int s0 = shell_type_count-1; s0 >= 0; s0--) {
+            for (int s1 = shell_type_count-1; s1 >= s0; s1--) {
+                const ShellTypeInfo ss0 = shell_type_infos[s0];
+                const ShellTypeInfo ss1 = shell_type_infos[s1];
+                const size_t num_pairs = (s0==s1) ? (size_t)ss0.count*(ss0.count+1)/2 : (size_t)ss0.count*ss1.count;
+                compute_gradients_overlap_cpu(
+                    d_grad_S, d_W_matrix, d_primitive_shells, d_cgto_normalization_factors,
+                    num_basis, ss0, ss1, num_pairs);
+                compute_gradients_kinetic_cpu(
+                    d_grad_K, d_density_matrix, d_primitive_shells, d_cgto_normalization_factors,
+                    num_basis, ss0, ss1, num_pairs);
+                compute_gradients_nuclear_cpu(
+                    d_grad_V, d_density_matrix, d_primitive_shells, d_cgto_normalization_factors,
+                    d_atoms, num_atoms, num_basis, ss0, ss1, num_pairs, d_boys_grid);
+            }
+        }
+
+        // Nuclear repulsion gradient (just A-A pairs, no streams).
+        compute_nuclear_repulsion_gradient_cpu(d_grad_N, d_atoms, num_atoms);
+
+        // Total = N + S + K + V + G  (host accumulate, no cuBLAS).
+        const int n3 = 3 * num_atoms;
+        for (int i = 0; i < n3; i++) {
+            d_grad_total[i] = d_grad_N[i] + d_grad_S[i] + d_grad_K[i]
+                            + d_grad_V[i] + d_grad_G[i];
+        }
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+#endif
+
     // block size, thread sizeの指定
     const int threads_per_block = 128;
     const int shell_type_count = shell_type_infos.size();
@@ -5352,21 +5818,22 @@ void computeMolucularGradients(double* d_grad_total, double* d_grad_N, double* d
 
 
 // エネルギー微分を計算する関数
+//
+// Both GPU and CPU runtime modes share this code path.  All allocations go
+// through tracked_cudaMalloc / tracked_cudaFree which transparently fall back
+// to host calloc/free when gpu_available() is false; the inner kernel calls
+// (compute_W, computeMolucularGradients) likewise dispatch to their CPU
+// mirrors.  No more numerical-diff fallback — gradients are always analytic.
 std::vector<double> computeEnergyGradient_RHF(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
                                 const Atom* d_atoms, const real_t* d_density_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies,
                                 const PrimitiveShell* d_primitive_shells, const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors,
                                 const int num_atoms, const int num_basis, const int num_electron, const bool verbose)
 {
-    // メモリサイズ
-    const int n = 3*num_atoms; // 配列のサイズ
+    const int n = 3*num_atoms;
     const size_t wmat_bytes = num_basis * num_basis * sizeof(real_t);
-    const size_t gradients_bytes = n * sizeof(double);  // dx, dy, dz の計算結果を1次元配列に格納
+    const size_t gradients_bytes = n * sizeof(double);
 
-    // CPU側のメモリ確保
-    double* grad_total = nullptr;
-    cudaMallocHost((void**)&grad_total, gradients_bytes);
-
-    // GPU側のメモリ確保
+    // Working buffers (host or device depending on gpu_available()).
     real_t* d_W_matrix = nullptr;
     double* d_grad_N = nullptr;
     double* d_grad_S = nullptr;
@@ -5375,15 +5842,14 @@ std::vector<double> computeEnergyGradient_RHF(const std::vector<ShellTypeInfo>& 
     double* d_grad_G = nullptr;
     double* d_grad_total = nullptr;
 
-    cudaMalloc(&d_W_matrix, wmat_bytes);
-    cudaMalloc(&d_grad_N, gradients_bytes);
-    cudaMalloc(&d_grad_S, gradients_bytes);
-    cudaMalloc(&d_grad_K, gradients_bytes);
-    cudaMalloc(&d_grad_V, gradients_bytes);
-    cudaMalloc(&d_grad_G, gradients_bytes);
-    cudaMalloc(&d_grad_total, gradients_bytes);
+    tracked_cudaMalloc(&d_W_matrix, wmat_bytes);
+    tracked_cudaMalloc(&d_grad_N, gradients_bytes);
+    tracked_cudaMalloc(&d_grad_S, gradients_bytes);
+    tracked_cudaMalloc(&d_grad_K, gradients_bytes);
+    tracked_cudaMalloc(&d_grad_V, gradients_bytes);
+    tracked_cudaMalloc(&d_grad_G, gradients_bytes);
+    tracked_cudaMalloc(&d_grad_total, gradients_bytes);
 
-    // GPUメモリの初期化
     cudaMemset(d_W_matrix, 0, wmat_bytes);
     cudaMemset(d_grad_N, 0, gradients_bytes);
     cudaMemset(d_grad_S, 0, gradients_bytes);
@@ -5392,36 +5858,35 @@ std::vector<double> computeEnergyGradient_RHF(const std::vector<ShellTypeInfo>& 
     cudaMemset(d_grad_G, 0, gradients_bytes);
     cudaMemset(d_grad_total, 0, gradients_bytes);
 
-    // コールスタックのサイズを増加
-    size_t stackSize = 64 * 1024;
-    cudaDeviceSetLimit(cudaLimitStackSize, stackSize);
+#ifndef GANSU_CPU_ONLY
+    if (gpu_available()) {
+        // GPU only: bump device stack so the recursive Et helpers fit.
+        size_t stackSize = 64 * 1024;
+        cudaDeviceSetLimit(cudaLimitStackSize, stackSize);
+    }
+#endif
 
-    // 重なりの係数Wの計算
+    // Overlap weighting matrix (W) precomputation — branches inside on gpu_available().
     compute_W(d_W_matrix, d_coefficient_matrix, d_orbital_energies, num_basis, num_electron);
 
-    // 各分子積分の微分を同時に計算
+    // 1- and 2-electron gradient — branches inside on gpu_available().
     computeMolucularGradients(d_grad_total, d_grad_N, d_grad_S, d_grad_K, d_grad_V, d_grad_G, d_W_matrix,
                               shell_type_infos, shell_pair_type_infos, d_atoms,
                               d_density_matrix, d_coefficient_matrix, d_orbital_energies, d_primitive_shells,
                               d_boys_grid, d_cgto_normalization_factors, num_atoms, num_basis, num_electron, verbose);
 
-    // CPU側へ結果コピー
-    cudaMemcpy(grad_total, d_grad_total, gradients_bytes, cudaMemcpyDeviceToHost);
+    // Copy back into a std::vector.  In CPU mode this is a memcpy via the
+    // gansu_memcpy stub; in GPU mode it's a real DeviceToHost copy.
+    std::vector<double> gradient(n);
+    cudaMemcpy(gradient.data(), d_grad_total, gradients_bytes, cudaMemcpyDeviceToHost);
 
-    // Copy to std::vector for return
-    std::vector<double> gradient(grad_total, grad_total + n);
-
-    // GPUメモリの解放
-    cudaFree(d_W_matrix);
-    cudaFree(d_grad_N);
-    cudaFree(d_grad_S);
-    cudaFree(d_grad_K);
-    cudaFree(d_grad_V);
-    cudaFree(d_grad_G);
-    cudaFree(d_grad_total);
-
-    // CPUメモリの解放
-    cudaFreeHost(grad_total);
+    tracked_cudaFree(d_W_matrix);
+    tracked_cudaFree(d_grad_N);
+    tracked_cudaFree(d_grad_S);
+    tracked_cudaFree(d_grad_K);
+    tracked_cudaFree(d_grad_V);
+    tracked_cudaFree(d_grad_G);
+    tracked_cudaFree(d_grad_total);
 
     return gradient;
 }
@@ -5438,6 +5903,75 @@ std::vector<double> computeEnergyGradient_general(
 {
     const int n = 3 * num_atoms;
     const size_t gradients_bytes = n * sizeof(double);
+
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU analytic-gradient path (separated densities, optional 4-index 2-PDM) ===
+        std::vector<double> grad_N(n, 0.0), grad_S(n, 0.0), grad_K(n, 0.0),
+                            grad_V(n, 0.0), grad_G(n, 0.0);
+        const int shell_type_count = shell_type_infos.size();
+
+        // Shell quadruples in the same canonical order as the GPU path.
+        std::vector<std::tuple<int,int,int,int>> shell_quadruples;
+        for (int a = 0; a < shell_type_count; ++a)
+            for (int b = a; b < shell_type_count; ++b)
+                for (int c = 0; c < shell_type_count; ++c)
+                    for (int d = c; d < shell_type_count; ++d)
+                        if (a < c || (a == c && b <= d))
+                            shell_quadruples.emplace_back(a, b, c, d);
+        std::reverse(shell_quadruples.begin(), shell_quadruples.end());
+
+        // 2-electron derivative — pick 2pdm or plain RHF flavour.
+        for (const auto& quad : shell_quadruples) {
+            int s0, s1, s2, s3;
+            std::tie(s0, s1, s2, s3) = quad;
+            const ShellTypeInfo ss0 = shell_type_infos[s0];
+            const ShellTypeInfo ss1 = shell_type_infos[s1];
+            const ShellTypeInfo ss2 = shell_type_infos[s2];
+            const ShellTypeInfo ss3 = shell_type_infos[s3];
+            const size_t num_bra = (s0==s1) ? ss0.count*(ss0.count+1)/2 : ss0.count*ss1.count;
+            const size_t num_ket = (s2==s3) ? ss2.count*(ss2.count+1)/2 : ss2.count*ss3.count;
+            const size_t num_braket = ((s0==s2)&&(s1==s3)) ? num_bra*(num_bra+1)/2 : num_bra*num_ket;
+            if (d_gamma_4idx != nullptr) {
+                Rys_compute_gradients_two_electron_2pdm_cpu(
+                    grad_G.data(), d_density_2el, d_primitive_shells, d_cgto_normalization_factors,
+                    ss0, ss1, ss2, ss3, num_braket, num_basis, d_boys_grid, d_gamma_4idx);
+            } else {
+                Rys_compute_gradients_two_electron_cpu(
+                    grad_G.data(), d_density_2el, d_primitive_shells, d_cgto_normalization_factors,
+                    ss0, ss1, ss2, ss3, num_braket, num_basis, d_boys_grid);
+            }
+        }
+
+        // 1-electron derivatives.
+        for (int s0 = shell_type_count-1; s0 >= 0; s0--) {
+            for (int s1 = shell_type_count-1; s1 >= s0; s1--) {
+                const ShellTypeInfo ss0 = shell_type_infos[s0];
+                const ShellTypeInfo ss1 = shell_type_infos[s1];
+                const size_t num_pairs = (s0==s1) ? (size_t)ss0.count*(ss0.count+1)/2 : (size_t)ss0.count*ss1.count;
+                compute_gradients_overlap_cpu(
+                    grad_S.data(), d_W_matrix_ext, d_primitive_shells, d_cgto_normalization_factors,
+                    num_basis, ss0, ss1, num_pairs);
+                compute_gradients_kinetic_cpu(
+                    grad_K.data(), d_density_1el, d_primitive_shells, d_cgto_normalization_factors,
+                    num_basis, ss0, ss1, num_pairs);
+                compute_gradients_nuclear_cpu(
+                    grad_V.data(), d_density_1el, d_primitive_shells, d_cgto_normalization_factors,
+                    d_atoms, num_atoms, num_basis, ss0, ss1, num_pairs, d_boys_grid);
+            }
+        }
+
+        compute_nuclear_repulsion_gradient_cpu(grad_N.data(), d_atoms, num_atoms);
+
+        std::vector<double> total(n);
+        for (int i = 0; i < n; i++) {
+            total[i] = grad_N[i] + grad_S[i] + grad_K[i] + grad_V[i] + grad_G[i];
+        }
+        return total;
+#ifndef GANSU_CPU_ONLY
+    }
+#endif
 
     double* grad_total = nullptr;
     cudaMallocHost((void**)&grad_total, gradients_bytes);
@@ -5562,6 +6096,66 @@ void computeMolucularGradients_UHF(double* d_grad_total, double* d_grad_N, doubl
                                     const real_t* d_boys_grid, const real_t* d_cgto_normalization_factors,
                                     const int num_atoms, const int num_basis, const bool verbose)
 {
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU analytic-gradient path (UHF) ===
+        const int shell_type_count = shell_type_infos.size();
+
+        std::vector<std::tuple<int,int,int,int>> shell_quadruples;
+        for (int a = 0; a < shell_type_count; ++a)
+            for (int b = a; b < shell_type_count; ++b)
+                for (int c = 0; c < shell_type_count; ++c)
+                    for (int d = c; d < shell_type_count; ++d)
+                        if (a < c || (a == c && b <= d))
+                            shell_quadruples.emplace_back(a, b, c, d);
+        std::reverse(shell_quadruples.begin(), shell_quadruples.end());
+
+        for (const auto& quad : shell_quadruples) {
+            int s0, s1, s2, s3;
+            std::tie(s0, s1, s2, s3) = quad;
+            const ShellTypeInfo ss0 = shell_type_infos[s0];
+            const ShellTypeInfo ss1 = shell_type_infos[s1];
+            const ShellTypeInfo ss2 = shell_type_infos[s2];
+            const ShellTypeInfo ss3 = shell_type_infos[s3];
+            const size_t num_bra = (s0==s1) ? ss0.count*(ss0.count+1)/2 : ss0.count*ss1.count;
+            const size_t num_ket = (s2==s3) ? ss2.count*(ss2.count+1)/2 : ss2.count*ss3.count;
+            const size_t num_braket = ((s0==s2)&&(s1==s3)) ? num_bra*(num_bra+1)/2 : num_bra*num_ket;
+            Rys_compute_gradients_two_electron_uhf_cpu(
+                d_grad_G, d_density_matrix_a, d_density_matrix_b,
+                d_primitive_shells, d_cgto_normalization_factors,
+                ss0, ss1, ss2, ss3, num_braket, num_basis, d_boys_grid);
+        }
+
+        for (int s0 = shell_type_count-1; s0 >= 0; s0--) {
+            for (int s1 = shell_type_count-1; s1 >= s0; s1--) {
+                const ShellTypeInfo ss0 = shell_type_infos[s0];
+                const ShellTypeInfo ss1 = shell_type_infos[s1];
+                const size_t num_pairs = (s0==s1) ? (size_t)ss0.count*(ss0.count+1)/2 : (size_t)ss0.count*ss1.count;
+                compute_gradients_overlap_cpu(
+                    d_grad_S, d_W_total, d_primitive_shells, d_cgto_normalization_factors,
+                    num_basis, ss0, ss1, num_pairs);
+                compute_gradients_kinetic_cpu(
+                    d_grad_K, d_D_total, d_primitive_shells, d_cgto_normalization_factors,
+                    num_basis, ss0, ss1, num_pairs);
+                compute_gradients_nuclear_cpu(
+                    d_grad_V, d_D_total, d_primitive_shells, d_cgto_normalization_factors,
+                    d_atoms, num_atoms, num_basis, ss0, ss1, num_pairs, d_boys_grid);
+            }
+        }
+
+        compute_nuclear_repulsion_gradient_cpu(d_grad_N, d_atoms, num_atoms);
+
+        const int n3 = 3 * num_atoms;
+        for (int i = 0; i < n3; i++) {
+            d_grad_total[i] = d_grad_N[i] + d_grad_S[i] + d_grad_K[i]
+                            + d_grad_V[i] + d_grad_G[i];
+        }
+        return;
+#ifndef GANSU_CPU_ONLY
+    }
+#endif
+
     const int threads_per_block = 128;
     const int shell_type_count = shell_type_infos.size();
 
@@ -5669,11 +6263,7 @@ std::vector<double> computeEnergyGradient_UHF(const std::vector<ShellTypeInfo>& 
     const size_t mat_bytes = num_basis * num_basis * sizeof(real_t);
     const size_t gradients_bytes = n * sizeof(double);
 
-    // CPU側のメモリ確保
-    double* grad_total = nullptr;
-    cudaMallocHost((void**)&grad_total, gradients_bytes);
-
-    // GPU側のメモリ確保
+    // Working buffers (host or device depending on gpu_available()).
     real_t* d_W_a = nullptr;
     real_t* d_W_b = nullptr;
     real_t* d_W_total = nullptr;
@@ -5685,16 +6275,16 @@ std::vector<double> computeEnergyGradient_UHF(const std::vector<ShellTypeInfo>& 
     double* d_grad_G = nullptr;
     double* d_grad_total = nullptr;
 
-    cudaMalloc(&d_W_a, mat_bytes);
-    cudaMalloc(&d_W_b, mat_bytes);
-    cudaMalloc(&d_W_total, mat_bytes);
-    cudaMalloc(&d_D_total, mat_bytes);
-    cudaMalloc(&d_grad_N, gradients_bytes);
-    cudaMalloc(&d_grad_S, gradients_bytes);
-    cudaMalloc(&d_grad_K, gradients_bytes);
-    cudaMalloc(&d_grad_V, gradients_bytes);
-    cudaMalloc(&d_grad_G, gradients_bytes);
-    cudaMalloc(&d_grad_total, gradients_bytes);
+    tracked_cudaMalloc(&d_W_a, mat_bytes);
+    tracked_cudaMalloc(&d_W_b, mat_bytes);
+    tracked_cudaMalloc(&d_W_total, mat_bytes);
+    tracked_cudaMalloc(&d_D_total, mat_bytes);
+    tracked_cudaMalloc(&d_grad_N, gradients_bytes);
+    tracked_cudaMalloc(&d_grad_S, gradients_bytes);
+    tracked_cudaMalloc(&d_grad_K, gradients_bytes);
+    tracked_cudaMalloc(&d_grad_V, gradients_bytes);
+    tracked_cudaMalloc(&d_grad_G, gradients_bytes);
+    tracked_cudaMalloc(&d_grad_total, gradients_bytes);
 
     cudaMemset(d_W_a, 0, mat_bytes);
     cudaMemset(d_W_b, 0, mat_bytes);
@@ -5706,38 +6296,55 @@ std::vector<double> computeEnergyGradient_UHF(const std::vector<ShellTypeInfo>& 
     cudaMemset(d_grad_G, 0, gradients_bytes);
     cudaMemset(d_grad_total, 0, gradients_bytes);
 
-    // コールスタックのサイズを増加
-    size_t stackSize = 64 * 1024;
-    cudaDeviceSetLimit(cudaLimitStackSize, stackSize);
+#ifndef GANSU_CPU_ONLY
+    if (gpu_available()) {
+        size_t stackSize = 64 * 1024;
+        cudaDeviceSetLimit(cudaLimitStackSize, stackSize);
+    }
+#endif
 
-    // D_total = Da + Db
-    cudaMemcpy(d_D_total, d_density_matrix_a, mat_bytes, cudaMemcpyDeviceToDevice);
-    {
+    // D_total = Da + Db.  cublas on GPU, plain loop on CPU.
+#ifndef GANSU_CPU_ONLY
+    if (gpu_available()) {
+        cudaMemcpy(d_D_total, d_density_matrix_a, mat_bytes, cudaMemcpyDeviceToDevice);
         cublasHandle_t handle;
         cublasCreate(&handle);
         const double one = 1.0;
         cublasDaxpy(handle, num_basis * num_basis, &one, d_density_matrix_b, 1, d_D_total, 1);
         cublasDestroy(handle);
+    } else
+#endif
+    {
+        const size_t N2 = (size_t)num_basis * num_basis;
+        for (size_t k = 0; k < N2; k++) {
+            d_D_total[k] = d_density_matrix_a[k] + d_density_matrix_b[k];
+        }
     }
 
-    // W_a = 2 * Σ_k Ca_ik * Ca_jk * εa_k (既存カーネルは num_electron/2 でループ、結果に2.0を掛ける)
-    // W_b = 2 * Σ_k Cb_ik * Cb_jk * εb_k
-    // UHFでは W_total = Σ_k Ca_ik*Ca_jk*εa_k + Σ_k Cb_ik*Cb_jk*εb_k = (W_a + W_b) / 2
+    // W_a, W_b — branches inside compute_W on gpu_available().
     compute_W(d_W_a, d_coefficient_matrix_a, d_orbital_energies_a, num_basis, 2 * num_alpha);
     compute_W(d_W_b, d_coefficient_matrix_b, d_orbital_energies_b, num_basis, 2 * num_beta);
-    {
+
+    // W_total = 0.5 * (W_a + W_b).
+#ifndef GANSU_CPU_ONLY
+    if (gpu_available()) {
         cublasHandle_t handle;
         cublasCreate(&handle);
         const double half = 0.5;
-        // W_total = 0.5 * W_a
         cudaMemcpy(d_W_total, d_W_a, mat_bytes, cudaMemcpyDeviceToDevice);
         cublasDscal(handle, num_basis * num_basis, &half, d_W_total, 1);
-        // W_total += 0.5 * W_b
         cublasDaxpy(handle, num_basis * num_basis, &half, d_W_b, 1, d_W_total, 1);
         cublasDestroy(handle);
+    } else
+#endif
+    {
+        const size_t N2 = (size_t)num_basis * num_basis;
+        for (size_t k = 0; k < N2; k++) {
+            d_W_total[k] = 0.5 * (d_W_a[k] + d_W_b[k]);
+        }
     }
 
-    // 各分子積分の微分を同時に計算
+    // 各分子積分の微分を同時に計算 — branches inside on gpu_available().
     computeMolucularGradients_UHF(d_grad_total, d_grad_N, d_grad_S, d_grad_K, d_grad_V, d_grad_G,
                                    d_W_total, d_D_total,
                                    shell_type_infos, shell_pair_type_infos, d_atoms,
@@ -5745,22 +6352,19 @@ std::vector<double> computeEnergyGradient_UHF(const std::vector<ShellTypeInfo>& 
                                    d_primitive_shells, d_boys_grid, d_cgto_normalization_factors,
                                    num_atoms, num_basis, verbose);
 
-    // CPU側へ結果コピー
-    cudaMemcpy(grad_total, d_grad_total, gradients_bytes, cudaMemcpyDeviceToHost);
-    std::vector<double> gradient(grad_total, grad_total + n);
+    std::vector<double> gradient(n);
+    cudaMemcpy(gradient.data(), d_grad_total, gradients_bytes, cudaMemcpyDeviceToHost);
 
-    // GPUメモリの解放
-    cudaFree(d_W_a);
-    cudaFree(d_W_b);
-    cudaFree(d_W_total);
-    cudaFree(d_D_total);
-    cudaFree(d_grad_N);
-    cudaFree(d_grad_S);
-    cudaFree(d_grad_K);
-    cudaFree(d_grad_V);
-    cudaFree(d_grad_G);
-    cudaFree(d_grad_total);
-    cudaFreeHost(grad_total);
+    tracked_cudaFree(d_W_a);
+    tracked_cudaFree(d_W_b);
+    tracked_cudaFree(d_W_total);
+    tracked_cudaFree(d_D_total);
+    tracked_cudaFree(d_grad_N);
+    tracked_cudaFree(d_grad_S);
+    tracked_cudaFree(d_grad_K);
+    tracked_cudaFree(d_grad_V);
+    tracked_cudaFree(d_grad_G);
+    tracked_cudaFree(d_grad_total);
 
     return gradient;
 }
@@ -6132,23 +6736,82 @@ std::vector<double> computeSkeletonHessian_RHF(
     const int num_atoms, const int num_basis, const int num_electron, const bool verbose)
 {
     const int ndim = 3 * num_atoms;
+
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === CPU analytic Hessian ===
+        std::vector<double> hessian(ndim * ndim, 0.0);
+        const int shell_type_count = shell_type_infos.size();
+
+        // W matrix
+        const size_t wmat_bytes = num_basis * num_basis * sizeof(real_t);
+        std::vector<real_t> W(num_basis * num_basis, 0.0);
+        compute_W_Matrix_cpu(W.data(), d_coefficient_matrix, d_orbital_energies, num_electron, num_basis);
+
+        // Shell quadruples (2-electron)
+        std::vector<std::tuple<int,int,int,int>> shell_quadruples;
+        for (int a = 0; a < shell_type_count; ++a)
+            for (int b = a; b < shell_type_count; ++b)
+                for (int c = 0; c < shell_type_count; ++c)
+                    for (int d = c; d < shell_type_count; ++d)
+                        if (a < c || (a == c && b <= d))
+                            shell_quadruples.emplace_back(a, b, c, d);
+        std::reverse(shell_quadruples.begin(), shell_quadruples.end());
+
+        for (const auto& quad : shell_quadruples) {
+            int s0, s1, s2, s3;
+            std::tie(s0, s1, s2, s3) = quad;
+            const ShellTypeInfo ss0 = shell_type_infos[s0], ss1 = shell_type_infos[s1];
+            const ShellTypeInfo ss2 = shell_type_infos[s2], ss3 = shell_type_infos[s3];
+            const size_t num_bra = (s0==s1) ? ss0.count*(ss0.count+1)/2 : ss0.count*ss1.count;
+            const size_t num_ket = (s2==s3) ? ss2.count*(ss2.count+1)/2 : ss2.count*ss3.count;
+            const size_t num_braket = ((s0==s2)&&(s1==s3)) ? num_bra*(num_bra+1)/2 : num_bra*num_ket;
+            Rys_compute_hessian_two_electron_cpu(
+                hessian.data(), d_density_matrix, d_primitive_shells, d_cgto_normalization_factors,
+                ss0, ss1, ss2, ss3, num_braket, num_basis, num_atoms, d_boys_grid);
+        }
+
+        // 1-electron Hessian
+        for (int s0 = shell_type_count-1; s0 >= 0; s0--) {
+            for (int s1 = shell_type_count-1; s1 >= s0; s1--) {
+                const ShellTypeInfo ss0 = shell_type_infos[s0], ss1 = shell_type_infos[s1];
+                const size_t num_pairs = (s0==s1) ? (size_t)ss0.count*(ss0.count+1)/2 : (size_t)ss0.count*ss1.count;
+                compute_hessian_overlap_cpu(
+                    hessian.data(), W.data(), d_primitive_shells, d_cgto_normalization_factors,
+                    num_basis, num_atoms, ss0, ss1, num_pairs);
+                compute_hessian_kinetic_cpu(
+                    hessian.data(), d_density_matrix, d_primitive_shells, d_cgto_normalization_factors,
+                    num_basis, num_atoms, ss0, ss1, num_pairs);
+                compute_hessian_nuclear_attraction_cpu(
+                    hessian.data(), d_density_matrix, d_primitive_shells, d_cgto_normalization_factors,
+                    d_atoms, num_basis, num_atoms, ss0, ss1, num_pairs, d_boys_grid);
+            }
+        }
+
+        // Nuclear repulsion Hessian
+        compute_hessian_nuclear_repulsion_cpu(hessian.data(), d_atoms, num_atoms);
+
+        return hessian;
+#ifndef GANSU_CPU_ONLY
+    }
+#endif
+
+    // === GPU path ===
     const size_t hess_bytes = ndim * ndim * sizeof(double);
     const int threads_per_block = 128;
     const int shell_type_count = shell_type_infos.size();
 
-    // Allocate Hessian on GPU
     double* d_hessian = nullptr;
     cudaMalloc(&d_hessian, hess_bytes);
     cudaMemset(d_hessian, 0, hess_bytes);
 
-    // W matrix for overlap Hessian
     const size_t wmat_bytes = num_basis * num_basis * sizeof(real_t);
     real_t* d_W_matrix = nullptr;
     cudaMalloc(&d_W_matrix, wmat_bytes);
     cudaMemset(d_W_matrix, 0, wmat_bytes);
     compute_W(d_W_matrix, d_coefficient_matrix, d_orbital_energies, num_basis, num_electron);
 
-    // Stack size for complex kernels
     size_t stackSize = 64 * 1024;
     cudaDeviceSetLimit(cudaLimitStackSize, stackSize);
 

@@ -25,6 +25,8 @@
  * Divided by 2 (spin degeneracy factor) to get eigenvalues = excitation energies.
  */
 
+#include <cmath>
+#include <Eigen/Dense>
 #include "cis_operator.hpp"
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
@@ -149,6 +151,42 @@ void CISOperator::build_A_matrix(const real_t* d_eri_mo, const real_t* d_orbital
     tracked_cudaMalloc(&d_A_matrix_, matrix_size * sizeof(real_t));
     tracked_cudaMalloc(&d_diagonal_, dim_ * sizeof(real_t));
 
+    if (!gpu::gpu_available()) {
+        // CPU fallback: build A-matrix
+        const real_t* eri = d_eri_mo;
+        const real_t* eps = d_orbital_energies;
+        size_t nao2 = (size_t)nao_ * nao_;
+        for (int ia = 0; ia < dim_; ia++) {
+            int i = ia / nvir_;
+            int a_rel = ia % nvir_;
+            int a_abs = a_rel + nocc_;
+            for (int jb = 0; jb < dim_; jb++) {
+                int j = jb / nvir_;
+                int b_rel = jb % nvir_;
+                int b_abs = b_rel + nocc_;
+                size_t idx = (size_t)ia * dim_ + jb;
+
+                real_t ij_ab = eri[((size_t)i * nao_ + j) * nao2 + (size_t)a_abs * nao_ + b_abs];
+                real_t val;
+                if (is_triplet_) {
+                    val = -ij_ab;
+                } else {
+                    real_t ia_jb = eri[((size_t)i * nao_ + a_abs) * nao2 + (size_t)j * nao_ + b_abs];
+                    val = 2.0 * ia_jb - ij_ab;
+                }
+                if (i == j && a_rel == b_rel) {
+                    val += eps[a_abs] - eps[i];
+                }
+                d_A_matrix_[idx] = val;
+            }
+        }
+        // Extract diagonal
+        for (int i = 0; i < dim_; i++) {
+            d_diagonal_[i] = d_A_matrix_[(size_t)i * dim_ + i];
+        }
+        return;
+    }
+
     // Build A-matrix
     int threads = 256;
     int blocks = (matrix_size + threads - 1) / threads;
@@ -169,6 +207,15 @@ void CISOperator::apply(const real_t* d_input, real_t* d_output) const {
     const real_t alpha = 1.0;
     const real_t beta = 0.0;
 
+    if (!gpu::gpu_available()) {
+        // CPU fallback: y = alpha * A * x + beta * y (column-major)
+        using Eigen::Map;
+        using Eigen::MatrixXd;
+        using Eigen::VectorXd;
+        Map<VectorXd>(d_output, dim_) = alpha * Map<const MatrixXd>(d_A_matrix_, dim_, dim_) * Map<const VectorXd>(d_input, dim_);
+        return;
+    }
+
     // cuBLAS uses column-major, but our A is row-major.
     // For row-major A: y = A*x is equivalent to column-major y = A^T * x
     // But since A is symmetric (CIS matrix is symmetric), A = A^T, so:
@@ -181,6 +228,14 @@ void CISOperator::apply(const real_t* d_input, real_t* d_output) const {
 }
 
 void CISOperator::apply_preconditioner(const real_t* d_input, real_t* d_output) const {
+    if (!gpu::gpu_available()) {
+        for (int i = 0; i < dim_; i++) {
+            real_t diag = d_diagonal_[i];
+            d_output[i] = (std::fabs(diag) > 1e-12) ? d_input[i] / diag : 0.0;
+        }
+        return;
+    }
+
     int threads = 256;
     int blocks = (dim_ + threads - 1) / threads;
     cis_preconditioner_kernel<<<blocks, threads>>>(

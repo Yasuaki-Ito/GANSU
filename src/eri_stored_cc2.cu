@@ -98,50 +98,120 @@ static real_t compute_cc2_energy_impl(RHF& rhf, const real_t* d_eri_ao, real_t* 
     size_t ovov_size = (size_t)num_occ * num_vir * num_occ * num_vir;
     real_t* d_eri_ovov = nullptr;
     tracked_cudaMalloc(&d_eri_ovov, ovov_size * sizeof(real_t));
-    blocks = (ovov_size + threads - 1) / threads;
-    eom_mp2_extract_eri_ovov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovov, num_occ, num_vir, num_basis);
 
     // VVOV
     size_t vvov_size = (size_t)num_vir * num_vir * num_occ * num_vir;
     real_t* d_eri_vvov = nullptr;
     tracked_cudaMalloc(&d_eri_vvov, vvov_size * sizeof(real_t));
-    blocks = (vvov_size + threads - 1) / threads;
-    eom_mp2_extract_eri_vvov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvov, num_occ, num_vir, num_basis);
 
     // OOOV
     size_t ooov_size = (size_t)num_occ * num_occ * num_occ * num_vir;
     real_t* d_eri_ooov = nullptr;
     tracked_cudaMalloc(&d_eri_ooov, ooov_size * sizeof(real_t));
-    blocks = (ooov_size + threads - 1) / threads;
-    eom_mp2_extract_eri_ooov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ooov, num_occ, num_vir, num_basis);
 
     // OOVV
     size_t oovv_size = (size_t)num_occ * num_occ * num_vir * num_vir;
     real_t* d_eri_oovv = nullptr;
     tracked_cudaMalloc(&d_eri_oovv, oovv_size * sizeof(real_t));
-    blocks = (oovv_size + threads - 1) / threads;
-    eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv, num_occ, num_vir, num_basis);
 
     // OVVO
     size_t ovvo_size = (size_t)num_occ * num_vir * num_vir * num_occ;
     real_t* d_eri_ovvo = nullptr;
     tracked_cudaMalloc(&d_eri_ovvo, ovvo_size * sizeof(real_t));
-    blocks = (ovvo_size + threads - 1) / threads;
-    eom_mp2_extract_eri_ovvo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvo, num_occ, num_vir, num_basis);
 
     // VVVV
     size_t vvvv_size = (size_t)num_vir * num_vir * num_vir * num_vir;
     real_t* d_eri_vvvv = nullptr;
     tracked_cudaMalloc(&d_eri_vvvv, vvvv_size * sizeof(real_t));
-    blocks = (vvvv_size + threads - 1) / threads;
-    eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv, num_occ, num_vir, num_basis);
 
     // OOOO
     size_t oooo_size = (size_t)num_occ * num_occ * num_occ * num_occ;
     real_t* d_eri_oooo = nullptr;
     tracked_cudaMalloc(&d_eri_oooo, oooo_size * sizeof(real_t));
-    blocks = (oooo_size + threads - 1) / threads;
-    eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo, num_occ, num_basis);
+
+    if (!gpu::gpu_available()) {
+        // CPU fallback for all ERI block extractions
+        // eri_mo[p*N³ + r*N² + q*N + s] (chemist notation, 2nd/3rd swapped)
+        size_t nao2 = (size_t)num_basis * num_basis;
+        // OVOV: (ia|jb)
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < ovov_size; idx++) {
+            int i = (int)(idx / (num_vir * num_occ * num_vir));
+            int rem = (int)(idx % (num_vir * num_occ * num_vir));
+            int a = rem / (num_occ * num_vir); rem %= (num_occ * num_vir);
+            int j = rem / num_vir; int b = rem % num_vir;
+            d_eri_ovov[idx] = d_eri_mo[((size_t)i*num_basis + a+num_occ)*nao2 + (size_t)j*num_basis + b+num_occ];
+        }
+        // VVOV: (ab|ic)
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < vvov_size; idx++) {
+            int a = (int)(idx / (num_vir * num_occ * num_vir));
+            int rem = (int)(idx % (num_vir * num_occ * num_vir));
+            int b = rem / (num_occ * num_vir); rem %= (num_occ * num_vir);
+            int i = rem / num_vir; int c = rem % num_vir;
+            d_eri_vvov[idx] = d_eri_mo[((size_t)(a+num_occ)*num_basis + b+num_occ)*nao2 + (size_t)i*num_basis + c+num_occ];
+        }
+        // OOOV: (ji|kb)
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < ooov_size; idx++) {
+            int j = (int)(idx / (num_occ * num_occ * num_vir));
+            int rem = (int)(idx % (num_occ * num_occ * num_vir));
+            int i = rem / (num_occ * num_vir); rem %= (num_occ * num_vir);
+            int k = rem / num_vir; int b = rem % num_vir;
+            d_eri_ooov[idx] = d_eri_mo[((size_t)j*num_basis + i)*nao2 + (size_t)k*num_basis + b+num_occ];
+        }
+        // OOVV: (ij|ab)
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < oovv_size; idx++) {
+            int i = (int)(idx / (num_occ * num_vir * num_vir));
+            int rem = (int)(idx % (num_occ * num_vir * num_vir));
+            int j = rem / (num_vir * num_vir); rem %= (num_vir * num_vir);
+            int a = rem / num_vir; int b = rem % num_vir;
+            d_eri_oovv[idx] = d_eri_mo[((size_t)i*num_basis + j)*nao2 + (size_t)(a+num_occ)*num_basis + b+num_occ];
+        }
+        // OVVO: (ia|bj)
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < ovvo_size; idx++) {
+            int i = (int)(idx / (num_vir * num_vir * num_occ));
+            int rem = (int)(idx % (num_vir * num_vir * num_occ));
+            int a = rem / (num_vir * num_occ); rem %= (num_vir * num_occ);
+            int b = rem / num_occ; int j = rem % num_occ;
+            d_eri_ovvo[idx] = d_eri_mo[((size_t)i*num_basis + a+num_occ)*nao2 + (size_t)(b+num_occ)*num_basis + j];
+        }
+        // VVVV: (ab|cd)
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < vvvv_size; idx++) {
+            int a = (int)(idx / (num_vir * num_vir * num_vir));
+            int rem = (int)(idx % (num_vir * num_vir * num_vir));
+            int b = rem / (num_vir * num_vir); rem %= (num_vir * num_vir);
+            int c = rem / num_vir; int d = rem % num_vir;
+            d_eri_vvvv[idx] = d_eri_mo[((size_t)(a+num_occ)*num_basis + b+num_occ)*nao2 + (size_t)(c+num_occ)*num_basis + d+num_occ];
+        }
+        // OOOO: (ij|kl)
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < oooo_size; idx++) {
+            int i = (int)(idx / (num_occ * num_occ * num_occ));
+            int rem = (int)(idx % (num_occ * num_occ * num_occ));
+            int j = rem / (num_occ * num_occ); rem %= (num_occ * num_occ);
+            int k = rem / num_occ; int l = rem % num_occ;
+            d_eri_oooo[idx] = d_eri_mo[((size_t)i*num_basis + j)*nao2 + (size_t)k*num_basis + l];
+        }
+    } else {
+        blocks = (ovov_size + threads - 1) / threads;
+        eom_mp2_extract_eri_ovov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovov, num_occ, num_vir, num_basis);
+        blocks = (vvov_size + threads - 1) / threads;
+        eom_mp2_extract_eri_vvov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvov, num_occ, num_vir, num_basis);
+        blocks = (ooov_size + threads - 1) / threads;
+        eom_mp2_extract_eri_ooov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ooov, num_occ, num_vir, num_basis);
+        blocks = (oovv_size + threads - 1) / threads;
+        eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv, num_occ, num_vir, num_basis);
+        blocks = (ovvo_size + threads - 1) / threads;
+        eom_mp2_extract_eri_ovvo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvo, num_occ, num_vir, num_basis);
+        blocks = (vvvv_size + threads - 1) / threads;
+        eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv, num_occ, num_vir, num_basis);
+        blocks = (oooo_size + threads - 1) / threads;
+        eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo, num_occ, num_basis);
+    }
 
     // Free full MO ERIs
     if (free_eri_mo) tracked_cudaFree(d_eri_mo);
@@ -150,20 +220,39 @@ static real_t compute_cc2_energy_impl(RHF& rhf, const real_t* d_eri_ao, real_t* 
     // D1, D2, Fock
     real_t* d_D1 = nullptr;
     tracked_cudaMalloc(&d_D1, (size_t)singles_dim * sizeof(real_t));
-    blocks = (singles_dim + threads - 1) / threads;
-    eom_mp2_compute_D1_kernel<<<blocks, threads>>>(d_orbital_energies, d_D1, num_occ, num_vir);
 
     real_t* d_D2 = nullptr;
     tracked_cudaMalloc(&d_D2, (size_t)doubles_dim * sizeof(real_t));
-    blocks = (doubles_dim + threads - 1) / threads;
-    cc2_standard_D2_kernel<<<blocks, threads>>>(d_orbital_energies, d_D2, num_occ, num_vir);
 
     real_t* d_f_oo = nullptr;
     real_t* d_f_vv = nullptr;
     tracked_cudaMalloc(&d_f_oo, (size_t)num_occ * sizeof(real_t));
     tracked_cudaMalloc(&d_f_vv, (size_t)num_vir * sizeof(real_t));
-    blocks = (num_basis + threads - 1) / threads;
-    eom_mp2_extract_fock_kernel<<<blocks, threads>>>(d_orbital_energies, d_f_oo, d_f_vv, num_occ, num_vir);
+
+    if (!gpu::gpu_available()) {
+        // D1
+        for (int idx = 0; idx < singles_dim; idx++)
+            d_D1[idx] = d_orbital_energies[idx % num_vir + num_occ] - d_orbital_energies[idx / num_vir];
+        // D2 (standard: eps_a + eps_b - eps_i - eps_j)
+        for (int idx = 0; idx < doubles_dim; idx++) {
+            int i = idx / (num_occ * num_vir * num_vir);
+            int rem = idx % (num_occ * num_vir * num_vir);
+            int j = rem / (num_vir * num_vir); rem %= (num_vir * num_vir);
+            int a = rem / num_vir; int b = rem % num_vir;
+            d_D2[idx] = d_orbital_energies[a+num_occ] + d_orbital_energies[b+num_occ]
+                      - d_orbital_energies[i] - d_orbital_energies[j];
+        }
+        // Fock
+        for (int i = 0; i < num_occ; i++) d_f_oo[i] = d_orbital_energies[i];
+        for (int a = 0; a < num_vir; a++) d_f_vv[a] = d_orbital_energies[a + num_occ];
+    } else {
+        blocks = (singles_dim + threads - 1) / threads;
+        eom_mp2_compute_D1_kernel<<<blocks, threads>>>(d_orbital_energies, d_D1, num_occ, num_vir);
+        blocks = (doubles_dim + threads - 1) / threads;
+        cc2_standard_D2_kernel<<<blocks, threads>>>(d_orbital_energies, d_D2, num_occ, num_vir);
+        blocks = (num_basis + threads - 1) / threads;
+        eom_mp2_extract_fock_kernel<<<blocks, threads>>>(d_orbital_energies, d_f_oo, d_f_vv, num_occ, num_vir);
+    }
 
     cudaDeviceSynchronize();
 

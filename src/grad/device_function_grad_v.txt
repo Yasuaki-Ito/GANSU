@@ -1,4 +1,4 @@
-inline __device__ double compute_grad_Ax(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+inline __host__ __device__ double compute_grad_Ax(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
                                          const double alpha, const double beta,
                                          const double Dx, const double Dy, const double Dz, 
                                          const double3& P, const Coordinate& atom_pos, double* R)
@@ -20,7 +20,7 @@ inline __device__ double compute_grad_Ax(const int l1, const int m1, const int n
     return temp;
 }
 
-inline __device__ double compute_grad_Ay(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+inline __host__ __device__ double compute_grad_Ay(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
                                          const double alpha, const double beta,
                                          const double Dx, const double Dy, const double Dz, 
                                          const double3& P, const Coordinate& atom_pos, double* R)
@@ -42,7 +42,7 @@ inline __device__ double compute_grad_Ay(const int l1, const int m1, const int n
     return temp;
 }
 
-inline __device__ double compute_grad_Az(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+inline __host__ __device__ double compute_grad_Az(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
                                          const double alpha, const double beta,
                                          const double Dx, const double Dy, const double Dz, 
                                          const double3& P, const Coordinate& atom_pos, double* R)
@@ -65,7 +65,7 @@ inline __device__ double compute_grad_Az(const int l1, const int m1, const int n
 }
 
 
-inline __device__ double compute_grad_Bx(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+inline __host__ __device__ double compute_grad_Bx(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
                                          const double alpha, const double beta,
                                          const double Dx, const double Dy, const double Dz, 
                                          const double3& P, const Coordinate& atom_pos, double* R)
@@ -87,7 +87,7 @@ inline __device__ double compute_grad_Bx(const int l1, const int m1, const int n
     return temp;
 }
 
-inline __device__ double compute_grad_By(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+inline __host__ __device__ double compute_grad_By(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
                                          const double alpha, const double beta,
                                          const double Dx, const double Dy, const double Dz, 
                                          const double3& P, const Coordinate& atom_pos, double* R)
@@ -109,7 +109,7 @@ inline __device__ double compute_grad_By(const int l1, const int m1, const int n
     return temp;
 }
 
-inline __device__ double compute_grad_Bz(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+inline __host__ __device__ double compute_grad_Bz(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
                                          const double alpha, const double beta,
                                          const double Dx, const double Dy, const double Dz, 
                                          const double3& P, const Coordinate& atom_pos, double* R)
@@ -134,7 +134,7 @@ inline __device__ double compute_grad_Bz(const int l1, const int m1, const int n
 
 
 
-inline __device__ double compute_grad_Cx(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+inline __host__ __device__ double compute_grad_Cx(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
                                          const double alpha, const double beta,
                                          const double Dx, const double Dy, const double Dz, 
                                          const double3& P, const Coordinate& atom_pos, double* R)
@@ -156,7 +156,7 @@ inline __device__ double compute_grad_Cx(const int l1, const int m1, const int n
     return temp;
 }
 
-inline __device__ double compute_grad_Cy(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+inline __host__ __device__ double compute_grad_Cy(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
                                          const double alpha, const double beta,
                                          const double Dx, const double Dy, const double Dz, 
                                          const double3& P, const Coordinate& atom_pos, double* R)
@@ -178,7 +178,7 @@ inline __device__ double compute_grad_Cy(const int l1, const int m1, const int n
     return temp;
 }
 
-inline __device__ double compute_grad_Cz(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
+inline __host__ __device__ double compute_grad_Cz(const int l1, const int m1, const int n1, const int l2, const int m2, const int n2,
                                          const double alpha, const double beta,
                                          const double Dx, const double Dy, const double Dz, 
                                          const double3& P, const Coordinate& atom_pos, double* R)

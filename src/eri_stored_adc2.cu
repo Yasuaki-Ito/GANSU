@@ -448,8 +448,28 @@ static void build_adc2_blocks(
         half_transform_steps234(d_half, d_C, d_tmp_block,
             d_Ki, d_Li, nao, bs, p_start, n_p, q_start, n_q, r_start, n_r);
         const size_t block_total = (size_t)n_p * n_q * n_r * bs;
-        scatter_s_block_kernel<<<(block_total + scatter_threads - 1) / scatter_threads, scatter_threads>>>(
-            d_tmp_block, d_dst, n_p, n_q, n_r, n_s, s_blk, bs);
+        if (!gpu::gpu_available()) {
+            // CPU fallback for scatter_s_block_kernel
+            #pragma omp parallel for
+            for (size_t idx = 0; idx < block_total; idx++) {
+                int s_local = (int)(idx % bs);
+                size_t rem = idx / bs;
+                int r_local = (int)(rem % n_r); rem /= n_r;
+                int q_local = (int)(rem % n_q); rem /= n_q;
+                int p_local = (int)rem;
+                int s_global = s_blk + s_local;
+                if (s_global < n_s) {
+                    size_t dst_idx = (size_t)p_local * n_q * n_r * n_s
+                                   + (size_t)q_local * n_r * n_s
+                                   + (size_t)r_local * n_s
+                                   + s_global;
+                    d_dst[dst_idx] = d_tmp_block[idx];
+                }
+            }
+        } else {
+            scatter_s_block_kernel<<<(block_total + scatter_threads - 1) / scatter_threads, scatter_threads>>>(
+                d_tmp_block, d_dst, n_p, n_q, n_r, n_s, s_blk, bs);
+        }
     };
 
     std::cout << "  Building ADC(2) sub-blocks via half-transform..." << std::flush;
@@ -665,23 +685,83 @@ void ERI_Hash_RHF::compute_adc2(int n_states) {
         if (block_s > 8) block_s = 8;
 
         auto step1 = [&](real_t* d_half, int nao_arg, const real_t* d_C, int s_abs, int bs) {
-            const int threads = 256;
-            if (hash_fock_method_ == HashFockMethod::Compact) {
-                const int blocks = ((int)num_entries_ + threads - 1) / threads;
-                hash_half_transform_compact_kernel<<<blocks, threads>>>(
-                    d_coo_keys_, d_coo_values_, num_entries_, d_C, d_half, nao_arg, s_abs, bs);
-            } else if (hash_fock_method_ == HashFockMethod::Indexed) {
-                const int blocks = ((int)num_nonzero_ + threads - 1) / threads;
-                hash_half_transform_indexed_kernel<<<blocks, threads>>>(
-                    d_hash_keys_, d_hash_values_, d_nonzero_indices_, num_nonzero_,
-                    d_C, d_half, nao_arg, s_abs, bs);
+            if (!gpu::gpu_available()) {
+                // CPU fallback for hash half-transform
+                // half[mu * nao * nao * bs + nu * nao * bs + la * bs + s_local]
+                //   = sum_si C[si, s_abs + s_local] * (mu nu | la si)
+                // Use compact COO format on CPU (same data accessible via host)
+                if (hash_fock_method_ == HashFockMethod::Compact) {
+                    for (size_t e = 0; e < num_entries_; e++) {
+                        unsigned long long key = d_coo_keys_[e];
+                        double val = d_coo_values_[e];
+                        int si = (int)(key & 0xFFFF);
+                        int la = (int)((key >> 16) & 0xFFFF);
+                        int nu = (int)((key >> 32) & 0xFFFF);
+                        int mu = (int)((key >> 48) & 0xFFFF);
+                        for (int s_local = 0; s_local < bs; s_local++) {
+                            double c_val = d_C[(s_abs + s_local) * nao_arg + si];
+                            size_t half_idx = (size_t)mu * nao_arg * nao_arg * bs
+                                            + (size_t)nu * nao_arg * bs
+                                            + (size_t)la * bs + s_local;
+                            d_half[half_idx] += val * c_val;
+                        }
+                    }
+                } else if (hash_fock_method_ == HashFockMethod::Indexed) {
+                    for (size_t n = 0; n < num_nonzero_; n++) {
+                        size_t slot = d_nonzero_indices_[n];
+                        unsigned long long key = d_hash_keys_[slot];
+                        if (key == 0xFFFFFFFFFFFFFFFFULL) continue;
+                        double val = d_hash_values_[slot];
+                        int si = (int)(key & 0xFFFF);
+                        int la = (int)((key >> 16) & 0xFFFF);
+                        int nu = (int)((key >> 32) & 0xFFFF);
+                        int mu = (int)((key >> 48) & 0xFFFF);
+                        for (int s_local = 0; s_local < bs; s_local++) {
+                            double c_val = d_C[(s_abs + s_local) * nao_arg + si];
+                            size_t half_idx = (size_t)mu * nao_arg * nao_arg * bs
+                                            + (size_t)nu * nao_arg * bs
+                                            + (size_t)la * bs + s_local;
+                            d_half[half_idx] += val * c_val;
+                        }
+                    }
+                } else {
+                    const size_t capacity = hash_capacity_mask_ + 1;
+                    for (size_t slot = 0; slot < capacity; slot++) {
+                        unsigned long long key = d_hash_keys_[slot];
+                        if (key == 0xFFFFFFFFFFFFFFFFULL) continue;
+                        double val = d_hash_values_[slot];
+                        int si = (int)(key & 0xFFFF);
+                        int la = (int)((key >> 16) & 0xFFFF);
+                        int nu = (int)((key >> 32) & 0xFFFF);
+                        int mu = (int)((key >> 48) & 0xFFFF);
+                        for (int s_local = 0; s_local < bs; s_local++) {
+                            double c_val = d_C[(s_abs + s_local) * nao_arg + si];
+                            size_t half_idx = (size_t)mu * nao_arg * nao_arg * bs
+                                            + (size_t)nu * nao_arg * bs
+                                            + (size_t)la * bs + s_local;
+                            d_half[half_idx] += val * c_val;
+                        }
+                    }
+                }
             } else {
-                const size_t capacity = hash_capacity_mask_ + 1;
-                const int blocks = ((int)capacity + threads - 1) / threads;
-                hash_half_transform_fullscan_kernel<<<blocks, threads>>>(
-                    d_hash_keys_, d_hash_values_, capacity, d_C, d_half, nao_arg, s_abs, bs);
+                const int threads = 256;
+                if (hash_fock_method_ == HashFockMethod::Compact) {
+                    const int blocks = ((int)num_entries_ + threads - 1) / threads;
+                    hash_half_transform_compact_kernel<<<blocks, threads>>>(
+                        d_coo_keys_, d_coo_values_, num_entries_, d_C, d_half, nao_arg, s_abs, bs);
+                } else if (hash_fock_method_ == HashFockMethod::Indexed) {
+                    const int blocks = ((int)num_nonzero_ + threads - 1) / threads;
+                    hash_half_transform_indexed_kernel<<<blocks, threads>>>(
+                        d_hash_keys_, d_hash_values_, d_nonzero_indices_, num_nonzero_,
+                        d_C, d_half, nao_arg, s_abs, bs);
+                } else {
+                    const size_t capacity = hash_capacity_mask_ + 1;
+                    const int blocks = ((int)capacity + threads - 1) / threads;
+                    hash_half_transform_fullscan_kernel<<<blocks, threads>>>(
+                        d_hash_keys_, d_hash_values_, capacity, d_C, d_half, nao_arg, s_abs, bs);
+                }
+                cudaDeviceSynchronize();
             }
-            cudaDeviceSynchronize();
         };
 
         build_adc2_blocks(rhf_, step1, block_s, d_ovov, d_vvov, d_ooov, d_oovv);

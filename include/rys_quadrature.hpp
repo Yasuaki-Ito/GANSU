@@ -28,7 +28,7 @@ namespace gansu::gpu {
 // ============================================================
 
 // --- N = 1: Analytical ---
-inline __device__
+inline __host__ __device__
 void rysRoots1(double T, const double* g_boys_grid, double* roots, double* weights) {
     double F[2];
     getIncrementalBoys(1, T, g_boys_grid, F);
@@ -38,7 +38,7 @@ void rysRoots1(double T, const double* g_boys_grid, double* roots, double* weigh
 }
 
 // --- N = 2: Analytical 2x2 eigenvalue ---
-inline __device__
+inline __host__ __device__
 void rysRoots2(double T, const double* g_boys_grid, double* roots, double* weights) {
     double F[4];
     getIncrementalBoys(3, T, g_boys_grid, F);
@@ -99,7 +99,7 @@ void rysRoots2(double T, const double* g_boys_grid, double* roots, double* weigh
 
 // --- N = 3..9: General tridiagonal eigenvalue solver ---
 // Modified Chebyshev algorithm + implicit QR iteration
-inline __device__
+inline __host__ __device__
 void rysRootsGeneral(int N, double T, const double* g_boys_grid, double* roots, double* weights) {
     // Compute Boys function values F_0..F_{2N-1}
     const int max_moments = 18; // 2*9 for N=9
@@ -319,7 +319,7 @@ void rysRootsGeneral(int N, double T, const double* g_boys_grid, double* roots, 
 }
 
 // --- Dispatcher ---
-inline __device__
+inline __host__ __device__
 void computeRysRootsAndWeights(int N, double T, const double* g_boys_grid,
                                 double* roots, double* weights) {
     switch (N) {

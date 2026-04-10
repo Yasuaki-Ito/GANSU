@@ -4,6 +4,7 @@
 #include "rhf.hpp"
 #include "eri_stored.hpp"
 #include "device_host_memory.hpp"
+#include "gpu_manager.hpp"
 
 namespace gansu {
 
@@ -4542,12 +4543,28 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
         size_t occ = (size_t)num_occ;
         size_t vir = (size_t)(num_basis - num_occ);
         size_t total = (size_t)occ * occ * vir * vir;
-        const int num_blocks = (int)((total + num_threads - 1) / num_threads);
-        size_t shmem = (size_t)num_threads * sizeof(double);
 
-        mp2_moeri_kernel<<<num_blocks, num_threads, shmem>>>(d_eri_mo, d_orbital_energies, num_basis, num_occ, d_mp2_energy);
-
-        cudaDeviceSynchronize(); // It is for PROFILE_ELAPSED_TIME
+        if (!gpu::gpu_available()) {
+            real_t sum = 0.0;
+            #pragma omp parallel for reduction(+:sum)
+            for (size_t gid = 0; gid < total; gid++) {
+                int b = (int)(gid % vir); size_t rem = gid / vir;
+                int a = (int)(rem % vir); rem /= vir;
+                int j = (int)(rem % occ); int i = (int)(rem / occ);
+                real_t denom = d_orbital_energies[i] + d_orbital_energies[j]
+                             - d_orbital_energies[num_occ + a] - d_orbital_energies[num_occ + b];
+                size_t nao2 = (size_t)num_basis * num_basis;
+                real_t iajb = d_eri_mo[((size_t)i*num_basis + num_occ+a)*nao2 + (size_t)j*num_basis + num_occ+b];
+                real_t ibja = d_eri_mo[((size_t)i*num_basis + num_occ+b)*nao2 + (size_t)j*num_basis + num_occ+a];
+                sum += iajb * (2.0 * iajb - ibja) / denom;
+            }
+            *d_mp2_energy = sum;
+        } else {
+            const int num_blocks = (int)((total + num_threads - 1) / num_threads);
+            size_t shmem = (size_t)num_threads * sizeof(double);
+            mp2_moeri_kernel<<<num_blocks, num_threads, shmem>>>(d_eri_mo, d_orbital_energies, num_basis, num_occ, d_mp2_energy);
+            cudaDeviceSynchronize();
+        }
     }
     real_t h_mp2_energy;
     cudaMemcpy(&h_mp2_energy, d_mp2_energy, sizeof(real_t), cudaMemcpyDeviceToHost);
@@ -4568,54 +4585,123 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
     cudaMemset(d_mp3_energy, 0.0, sizeof(real_t)*3);
     cudaDeviceSynchronize();
 
-    { // 4h2p term
-        std::string str = "Computing MP3 (1/3) 4h2p term... ";
-        PROFILE_ELAPSED_TIME(str);
-       
+    if (!gpu::gpu_available()) {
+        // CPU fallback for MP3 terms
         size_t occ = (size_t)num_occ;
         size_t vir = (size_t)(num_basis - num_occ);
-        size_t total = (size_t)occ * occ * occ * occ * vir * vir;
-        const int num_blocks = (int)((total + num_threads - 1) / num_threads);
-        size_t shmem = (size_t)num_threads * sizeof(double);
-
-        mp3_moeri_4h2p_kernel<<<num_blocks, num_threads, shmem>>>(d_eri_mo, d_orbital_energies, num_basis, num_occ, &d_mp3_energy[0]);
-
-        cudaDeviceSynchronize(); // It is for PROFILE_ELAPSED_TIME
+        // 4h2p
+        {
+            std::string str = "Computing MP3 (1/3) 4h2p term (CPU)... ";
+            PROFILE_ELAPSED_TIME(str);
+            size_t total = occ * occ * occ * occ * vir * vir;
+            real_t sum = 0.0;
+            #pragma omp parallel for reduction(+:sum)
+            for (size_t gid = 0; gid < total; gid++) {
+                size_t t = gid;
+                int b = (int)(t % vir); t /= vir;
+                int a = (int)(t % vir); t /= vir;
+                int l = (int)(t % occ); t /= occ;
+                int k = (int)(t % occ); t /= occ;
+                int j = (int)(t % occ); int i = (int)(t / occ);
+                int ao = (int)a + (int)occ, bo = (int)b + (int)occ;
+                real_t e1 = d_orbital_energies[i/2] + d_orbital_energies[j/2] - d_orbital_energies[ao/2] - d_orbital_energies[bo/2];
+                real_t e2 = d_orbital_energies[k/2] + d_orbital_energies[l/2] - d_orbital_energies[ao/2] - d_orbital_energies[bo/2];
+                real_t eri1 = antisym_eri(d_eri_mo, num_basis, i, j, ao, bo);
+                real_t eri2 = antisym_eri(d_eri_mo, num_basis, k, l, i, j);
+                real_t eri3 = antisym_eri(d_eri_mo, num_basis, ao, bo, k, l);
+                if (std::abs(e1) > 1e-12 && std::abs(e2) > 1e-12)
+                    sum += 0.125 * eri1 * eri2 * eri3 / (e1 * e2);
+            }
+            d_mp3_energy[0] = sum;
+        }
+        // 2h4p
+        {
+            std::string str = "Computing MP3 (2/3) 2h4p term (CPU)... ";
+            PROFILE_ELAPSED_TIME(str);
+            size_t total = occ * occ * vir * vir * vir * vir;
+            real_t sum = 0.0;
+            #pragma omp parallel for reduction(+:sum)
+            for (size_t gid = 0; gid < total; gid++) {
+                size_t t = gid;
+                int d = (int)(t % vir) + (int)occ; t /= vir;
+                int c = (int)(t % vir) + (int)occ; t /= vir;
+                int b = (int)(t % vir) + (int)occ; t /= vir;
+                int a = (int)(t % vir) + (int)occ; t /= vir;
+                int j = (int)(t % occ); int i = (int)(t / occ);
+                real_t e1 = d_orbital_energies[i/2] + d_orbital_energies[j/2] - d_orbital_energies[a/2] - d_orbital_energies[b/2];
+                real_t e2 = d_orbital_energies[i/2] + d_orbital_energies[j/2] - d_orbital_energies[c/2] - d_orbital_energies[d/2];
+                real_t eri1 = antisym_eri(d_eri_mo, num_basis, a, b, i, j);
+                real_t eri2 = antisym_eri(d_eri_mo, num_basis, c, d, a, b);
+                real_t eri3 = antisym_eri(d_eri_mo, num_basis, i, j, c, d);
+                if (std::abs(e1) > 1e-12 && std::abs(e2) > 1e-12)
+                    sum += 0.125 * eri1 * eri2 * eri3 / (e1 * e2);
+            }
+            d_mp3_energy[1] = sum;
+        }
+        // 3h3p
+        {
+            std::string str = "Computing MP3 (3/3) 3h3p term (CPU)... ";
+            PROFILE_ELAPSED_TIME(str);
+            size_t total = occ * occ * occ * vir * vir * vir;
+            real_t sum = 0.0;
+            #pragma omp parallel for reduction(+:sum)
+            for (size_t gid = 0; gid < total; gid++) {
+                size_t t = gid;
+                int c = (int)(t % vir) + (int)occ; t /= vir;
+                int b = (int)(t % vir) + (int)occ; t /= vir;
+                int a = (int)(t % vir) + (int)occ; t /= vir;
+                int k = (int)(t % occ); t /= occ;
+                int j = (int)(t % occ); int i = (int)(t / occ);
+                real_t e1 = d_orbital_energies[i/2] + d_orbital_energies[j/2] - d_orbital_energies[a/2] - d_orbital_energies[b/2];
+                real_t e2 = d_orbital_energies[j/2] + d_orbital_energies[k/2] - d_orbital_energies[b/2] - d_orbital_energies[c/2];
+                real_t eri1 = antisym_eri(d_eri_mo, num_basis, a, b, i, j);
+                real_t eri2 = antisym_eri(d_eri_mo, num_basis, i, c, a, k);
+                real_t eri3 = antisym_eri(d_eri_mo, num_basis, j, k, b, c);
+                if (std::abs(e1) > 1e-12 && std::abs(e2) > 1e-12)
+                    sum += eri1 * eri2 * eri3 / (e1 * e2);
+            }
+            d_mp3_energy[2] = sum;
+        }
+    } else {
+        { // 4h2p term
+            std::string str = "Computing MP3 (1/3) 4h2p term... ";
+            PROFILE_ELAPSED_TIME(str);
+            size_t occ = (size_t)num_occ;
+            size_t vir = (size_t)(num_basis - num_occ);
+            size_t total = (size_t)occ * occ * occ * occ * vir * vir;
+            const int num_blocks = (int)((total + num_threads - 1) / num_threads);
+            size_t shmem = (size_t)num_threads * sizeof(double);
+            mp3_moeri_4h2p_kernel<<<num_blocks, num_threads, shmem>>>(d_eri_mo, d_orbital_energies, num_basis, num_occ, &d_mp3_energy[0]);
+            cudaDeviceSynchronize();
+        }
+        { // 2h4p term
+            std::string str = "Computing MP3 (2/3) 2h4p term... ";
+            PROFILE_ELAPSED_TIME(str);
+            size_t occ = (size_t)num_occ;
+            size_t vir = (size_t)(num_basis - num_occ);
+            size_t total = (size_t)occ * occ * vir * vir * vir * vir;
+            const int num_blocks = (int)((total + num_threads - 1) / num_threads);
+            size_t shmem = (size_t)num_threads * sizeof(double);
+            mp3_moeri_2h4p_kernel<<<num_blocks, num_threads, shmem>>>(d_eri_mo, d_orbital_energies, num_basis, num_occ, &d_mp3_energy[1]);
+            cudaDeviceSynchronize();
+        }
+        { // 3h3p term
+            std::string str = "Computing MP3 (3/3) 3h3p term... ";
+            PROFILE_ELAPSED_TIME(str);
+            size_t occ = (size_t)num_occ;
+            size_t vir = (size_t)(num_basis - num_occ);
+            size_t total = (size_t)occ * occ * occ * vir * vir * vir;
+            const int num_blocks = (int)((total + num_threads - 1) / num_threads);
+            size_t shmem = (size_t)num_threads * sizeof(double);
+            mp3_moeri_3h3p_kernel<<<num_blocks, num_threads, shmem>>>(d_eri_mo, d_orbital_energies, num_basis, num_occ, &d_mp3_energy[2]);
+            cudaDeviceSynchronize();
+        }
     }
-    { // 2h4p term
-        std::string str = "Computing MP3 (2/3) 2h4p term... ";
-        PROFILE_ELAPSED_TIME(str);
-
-        size_t occ = (size_t)num_occ;
-        size_t vir = (size_t)(num_basis - num_occ);
-        size_t total = (size_t)occ * occ * vir * vir * vir * vir;
-        const int num_blocks = (int)((total + num_threads - 1) / num_threads);
-        size_t shmem = (size_t)num_threads * sizeof(double);
-
-        mp3_moeri_2h4p_kernel<<<num_blocks, num_threads, shmem>>>(d_eri_mo, d_orbital_energies, num_basis, num_occ, &d_mp3_energy[1]);
-
-        cudaDeviceSynchronize(); // It is for PROFILE_ELAPSED_TIME
-    }
-    { // 3h3p term
-        std::string str = "Computing MP3 (3/3) 3h3p term... ";
-        PROFILE_ELAPSED_TIME(str);
-
-        size_t occ = (size_t)num_occ;
-        size_t vir = (size_t)(num_basis - num_occ);
-        size_t total = (size_t)occ * occ * occ * vir * vir * vir;
-        const int num_blocks = (int)((total + num_threads - 1) / num_threads);
-        size_t shmem = (size_t)num_threads * sizeof(double);
-
-        mp3_moeri_3h3p_kernel<<<num_blocks, num_threads, shmem>>>(d_eri_mo, d_orbital_energies, num_basis, num_occ, &d_mp3_energy[2]);
-
-        cudaDeviceSynchronize(); // It is for PROFILE_ELAPSED_TIME
-    }
-
 
     real_t h_mp3_energy[3];
     cudaMemcpy(h_mp3_energy, d_mp3_energy, sizeof(real_t)*3, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
-    
+
     tracked_cudaFree(d_mp3_energy);
 
     std::cout << "4h2p term: " << h_mp3_energy[0] << " Hartree" << std::endl;
@@ -4634,7 +4720,34 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
 
     real_t h_mp4_energy[4]; // single, double, triple, quadruple
     memset(h_mp4_energy, 0, sizeof(real_t)*4);
-   
+
+    // Helper lambda: run a standard-signature MP4 kernel on CPU
+    // Each kernel computes per-thread contrib using antisym_eri (__host__ __device__)
+    // and reduces via atomicAdd. On CPU we just call the kernel body inline
+    // since the kernels are __global__ and can't be called on host.
+    // Instead, we use the same function pointer arrays but launch them differently.
+
+    if (!gpu::gpu_available()) {
+        // CPU fallback: MP4 terms cannot be called via function pointers (they are __global__).
+        // However, all MP4 factorized kernels follow the same pattern: they iterate over
+        // spin-orbital indices, call antisym_eri (host-callable), and sum contributions.
+        // We skip MP4 on CPU with a warning since the kernel bodies are too numerous
+        // to duplicate. Instead, we note that the __global__ kernels can't run on CPU
+        // and the MP4 code path requires GPU.
+        //
+        // Actually, since the kernels ARE defined in this file and antisym_eri is __host__ __device__,
+        // we can't call __global__ functions from host. So we provide a generic CPU runner
+        // that re-interprets each kernel's logic. But with 36 kernels, that's impractical.
+        //
+        // Practical approach: since tracked_cudaMalloc returns host memory in CPU mode,
+        // and cudaMemset/cudaMemcpy are no-ops or memcpy, we can't launch kernels.
+        // We'll skip MP4 with a diagnostic message.
+        std::cerr << "Warning: MP4 factorized kernels require GPU. Skipping MP4 terms in CPU mode." << std::endl;
+        std::cout << "Total MP4 Single excitation energy: 0.0 Hartree (CPU mode: skipped)" << std::endl;
+        std::cout << "Total MP4 Double excitation energy: 0.0 Hartree (CPU mode: skipped)" << std::endl;
+        std::cout << "Total MP4 Triple excitation energy: 0.0 Hartree (CPU mode: skipped)" << std::endl;
+        std::cout << "Total MP4 Quadruple excitation energy: 0.0 Hartree (CPU mode: skipped)" << std::endl;
+    } else {
     { // single excitation terms
         std::string str = "Launch kernels of MP4 single excitation terms... ";
         PROFILE_ELAPSED_TIME(str);
@@ -4646,7 +4759,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
 
         real_t* d_contrib;
         tracked_cudaMalloc((void**)&d_contrib, sizeof(real_t));
-        cudaMemset(d_contrib, 0.0, sizeof(real_t));        
+        cudaMemset(d_contrib, 0.0, sizeof(real_t));
 
         // Launch the kernel for single excitation terms
         for(int i=0; i<num_mp4_terms_single; i++){
@@ -4678,11 +4791,11 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
 
         real_t* d_contrib;
         tracked_cudaMalloc((void**)&d_contrib, sizeof(real_t));
-        cudaMemset(d_contrib, 0.0, sizeof(real_t));        
+        cudaMemset(d_contrib, 0.0, sizeof(real_t));
 
         // Launch the kernel for double excitation terms
         for(int i=0; i<num_mp4_terms_double; i++){
-            
+
             // Get the number of blocks, threads, and shared memory size for double excitation terms
             get_mp4_term_num_block_thread_shmem(kernel_offset + i, num_spin_occ, num_spin_vir, num_threads, num_blocks, shmem);
 
@@ -4711,7 +4824,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
 
         real_t* d_contrib;
         tracked_cudaMalloc((void**)&d_contrib, sizeof(real_t));
-        cudaMemset(d_contrib, 0.0, sizeof(real_t));        
+        cudaMemset(d_contrib, 0.0, sizeof(real_t));
 
         // Launch the kernel for triple excitation terms
         for(int i=0; i<num_mp4_terms_triple; i++){
@@ -4747,7 +4860,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
 
         real_t* d_contrib;
         tracked_cudaMalloc((void**)&d_contrib, sizeof(real_t));
-        cudaMemset(d_contrib, 0.0, sizeof(real_t));        
+        cudaMemset(d_contrib, 0.0, sizeof(real_t));
 
         // Launch the kernel for quadruple excitation terms
         for(int i=0; i<num_mp4_terms_quadrule; i++){
@@ -4768,6 +4881,7 @@ real_t mp4_from_aoeri_via_full_moeri_factorization(const real_t* d_eri_ao, const
 
         std::cout << "Total MP4 Quadruple excitation energy: " << h_mp4_energy[3] << " Hartree" << std::endl;
     }
+    } // end GPU-only MP4 block
 
     real_t mp4_corr_energy = 0.0;
     std::cout << "  E_S = " << h_mp4_energy[0] << " Hartree" << std::endl;

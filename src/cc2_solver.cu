@@ -590,6 +590,25 @@ CC2Result solve_cc2(
 
     // Compute initial CC2 energy (= MP2 energy at this point)
     auto compute_cc2_energy = [&](const real_t* d_t1_curr, const real_t* d_t2_curr) -> real_t {
+        if (!gpu::gpu_available()) {
+            // CPU fallback: compute CC2 correlation energy directly
+            real_t sum = 0.0;
+            #pragma omp parallel for reduction(+:sum)
+            for (int idx = 0; idx < doubles_dim; idx++) {
+                int i = idx / (nocc * nvir * nvir);
+                int rem = idx % (nocc * nvir * nvir);
+                int j = rem / (nvir * nvir);
+                rem %= (nvir * nvir);
+                int a = rem / nvir;
+                int b = rem % nvir;
+                real_t ia_jb = d_eri_ovov[(size_t)i * nvir * nocc * nvir + (size_t)a * nocc * nvir + (size_t)j * nvir + b];
+                real_t ib_ja = d_eri_ovov[(size_t)i * nvir * nocc * nvir + (size_t)b * nocc * nvir + (size_t)j * nvir + a];
+                real_t tau = d_t2_curr[(size_t)i * nocc * nvir * nvir + (size_t)j * nvir * nvir + (size_t)a * nvir + b]
+                           + d_t1_curr[i * nvir + a] * d_t1_curr[j * nvir + b];
+                sum += (2.0 * ia_jb - ib_ja) * tau;
+            }
+            return sum;
+        }
         int threads = 256;
         int blocks = (doubles_dim + threads - 1) / threads;
         real_t* d_partial = nullptr;
@@ -623,7 +642,112 @@ CC2Result solve_cc2(
 
     for (int iter = 0; iter < max_iter; iter++) {
         // Compute new T1
-        {
+        if (!gpu::gpu_available()) {
+            // CPU fallback for T1 update
+            // Macros for CPU access matching kernel conventions
+            #define OVOV_CPU(i,a,j,b) d_eri_ovov[(size_t)(i)*nvir*nocc*nvir + (size_t)(a)*nocc*nvir + (size_t)(j)*nvir + (b)]
+            #define VVOV_CPU(a,b,i,c) d_eri_vvov[(size_t)(a)*nvir*nocc*nvir + (size_t)(b)*nocc*nvir + (size_t)(i)*nvir + (c)]
+            #define OOOV_CPU(j,i,k,b) d_eri_ooov[(size_t)(j)*nocc*nocc*nvir + (size_t)(i)*nocc*nvir + (size_t)(k)*nvir + (b)]
+            #define OOVV_CPU(i,j,a,b) d_eri_oovv[(size_t)(i)*nocc*nvir*nvir + (size_t)(j)*nvir*nvir + (size_t)(a)*nvir + (b)]
+            #define T1_CPU(i,a) d_t1[(i)*nvir + (a)]
+            #define T2_CPU(i,j,a,b) d_t2[(size_t)(i)*nocc*nvir*nvir + (size_t)(j)*nvir*nvir + (size_t)(a)*nvir + (b)]
+            #pragma omp parallel for
+            for (int ia = 0; ia < singles_dim; ia++) {
+                int i = ia / nvir;
+                int a = ia % nvir;
+                real_t val = 0.0;
+                // T3
+                for (int m = 0; m < nocc; m++)
+                    for (int e = 0; e < nvir; e++) {
+                        real_t ai_me = OVOV_CPU(i, a, m, e);
+                        real_t ae_mi = OOVV_CPU(m, i, a, e);
+                        val += T1_CPU(m, e) * (2.0 * ai_me - ae_mi);
+                    }
+                // T4
+                for (int m = 0; m < nocc; m++) {
+                    real_t t1_ma = T1_CPU(m, a);
+                    real_t inner = 0.0;
+                    for (int n = 0; n < nocc; n++)
+                        for (int e = 0; e < nvir; e++)
+                            inner += T1_CPU(n, e) * (-2.0 * OOOV_CPU(m, i, n, e) + OOOV_CPU(n, i, m, e));
+                    val += t1_ma * inner;
+                }
+                // T5
+                for (int e = 0; e < nvir; e++) {
+                    real_t t1_ie = T1_CPU(i, e);
+                    real_t inner = 0.0;
+                    for (int m = 0; m < nocc; m++)
+                        for (int f = 0; f < nvir; f++)
+                            inner += T1_CPU(m, f) * (2.0 * VVOV_CPU(a, e, m, f) - VVOV_CPU(a, f, m, e));
+                    val += t1_ie * inner;
+                }
+                // T6
+                {
+                    real_t inner = 0.0;
+                    for (int m = 0; m < nocc; m++)
+                        for (int n = 0; n < nocc; n++)
+                            for (int e = 0; e < nvir; e++)
+                                for (int f = 0; f < nvir; f++) {
+                                    real_t K = -OVOV_CPU(m, e, n, f) + 0.5 * OVOV_CPU(m, f, n, e);
+                                    inner += T1_CPU(m, e) * T1_CPU(n, f) * K;
+                                }
+                    val += T1_CPU(i, a) * inner;
+                }
+                // T7
+                for (int m = 0; m < nocc; m++)
+                    for (int n = 0; n < nocc; n++)
+                        for (int e = 0; e < nvir; e++) {
+                            real_t K = -2.0 * OOOV_CPU(m, i, n, e) + OOOV_CPU(n, i, m, e);
+                            val += T2_CPU(m, n, a, e) * K;
+                        }
+                // T8
+                for (int m = 0; m < nocc; m++)
+                    for (int e = 0; e < nvir; e++)
+                        for (int f = 0; f < nvir; f++)
+                            val += (2.0 * VVOV_CPU(a, e, m, f) - VVOV_CPU(a, f, m, e)) * T2_CPU(i, m, e, f);
+                // T9
+                for (int m = 0; m < nocc; m++) {
+                    real_t t1_ma = T1_CPU(m, a);
+                    real_t inner = 0.0;
+                    for (int n = 0; n < nocc; n++)
+                        for (int e = 0; e < nvir; e++)
+                            for (int f = 0; f < nvir; f++) {
+                                real_t K = -2.0 * OVOV_CPU(m, e, n, f) + OVOV_CPU(m, f, n, e);
+                                inner += T2_CPU(i, n, e, f) * K;
+                            }
+                    val += t1_ma * inner;
+                }
+                // T10
+                for (int e = 0; e < nvir; e++) {
+                    real_t t1_ie = T1_CPU(i, e);
+                    real_t inner = 0.0;
+                    for (int m = 0; m < nocc; m++)
+                        for (int n = 0; n < nocc; n++)
+                            for (int f = 0; f < nvir; f++) {
+                                real_t K = -2.0 * OVOV_CPU(m, e, n, f) + OVOV_CPU(m, f, n, e);
+                                inner += T2_CPU(m, n, a, f) * K;
+                            }
+                    val += t1_ie * inner;
+                }
+                // T11
+                for (int k = 0; k < nocc; k++)
+                    for (int c = 0; c < nvir; c++) {
+                        real_t fkc = 0.0;
+                        for (int l = 0; l < nocc; l++)
+                            for (int d = 0; d < nvir; d++)
+                                fkc += (2.0 * OVOV_CPU(k, c, l, d) - OVOV_CPU(k, d, l, c)) * T1_CPU(l, d);
+                        val += fkc * (2.0 * T2_CPU(k, i, c, a) - T2_CPU(i, k, c, a) + T1_CPU(i, c) * T1_CPU(k, a));
+                    }
+                real_t d1 = d_D1[ia];
+                d_t1_new[ia] = (std::abs(d1) > 1e-12) ? -val / d1 : 0.0;
+            }
+            #undef OVOV_CPU
+            #undef VVOV_CPU
+            #undef OOOV_CPU
+            #undef OOVV_CPU
+            #undef T1_CPU
+            #undef T2_CPU
+        } else {
             int threads = 256;
             int blocks = (singles_dim + threads - 1) / threads;
             cc2_t1_update_kernel<<<blocks, threads>>>(
@@ -632,7 +756,73 @@ CC2Result solve_cc2(
         }
 
         // Compute new T2
-        {
+        if (!gpu::gpu_available()) {
+            // CPU fallback for T2 update (dressed integral formulation)
+            #define OVOV_CPU(i,a,j,b) d_eri_ovov[(size_t)(i)*nvir*nocc*nvir + (size_t)(a)*nocc*nvir + (size_t)(j)*nvir + (b)]
+            #define VVOV_CPU(a,b,i,c) d_eri_vvov[(size_t)(a)*nvir*nocc*nvir + (size_t)(b)*nocc*nvir + (size_t)(i)*nvir + (c)]
+            #define OOOV_CPU(j,i,k,b) d_eri_ooov[(size_t)(j)*nocc*nocc*nvir + (size_t)(i)*nocc*nvir + (size_t)(k)*nvir + (b)]
+            #define OOVV_CPU(i,j,a,b) d_eri_oovv[(size_t)(i)*nocc*nvir*nvir + (size_t)(j)*nvir*nvir + (size_t)(a)*nvir + (b)]
+            #define OVVO_CPU(i,a,b,j) d_eri_ovvo[(size_t)(i)*nvir*nvir*nocc + (size_t)(a)*nvir*nocc + (size_t)(b)*nocc + (j)]
+            #define VVVV_CPU(a,b,c,d) d_eri_vvvv[(size_t)(a)*nvir*nvir*nvir + (size_t)(b)*nvir*nvir + (size_t)(c)*nvir + (d)]
+            #define OOOO_CPU(i,j,k,l) d_eri_oooo[(size_t)(i)*nocc*nocc*nocc + (size_t)(j)*nocc*nocc + (size_t)(k)*nocc + (l)]
+            #define T1_CPU(i,a) d_t1[(i)*nvir + (a)]
+            #pragma omp parallel for
+            for (int idx = 0; idx < doubles_dim; idx++) {
+                int i = idx / (nocc * nvir * nvir);
+                int rem = idx % (nocc * nvir * nvir);
+                int j = rem / (nvir * nvir);
+                rem %= (nvir * nvir);
+                int a = rem / nvir;
+                int b = rem % nvir;
+                real_t val = -OVOV_CPU(i, a, j, b);
+                // Order 1
+                for (int c = 0; c < nvir; c++) val -= T1_CPU(i, c) * VVOV_CPU(c, a, j, b);
+                for (int k = 0; k < nocc; k++) val += T1_CPU(k, a) * OOOV_CPU(i, k, j, b);
+                for (int d = 0; d < nvir; d++) val -= T1_CPU(j, d) * VVOV_CPU(d, b, i, a);
+                for (int l = 0; l < nocc; l++) val += T1_CPU(l, b) * OOOV_CPU(j, l, i, a);
+                // Order 2
+                for (int c = 0; c < nvir; c++) { real_t t1_ic = T1_CPU(i, c);
+                    for (int k = 0; k < nocc; k++) val += t1_ic * T1_CPU(k, a) * OVOV_CPU(k, c, j, b); }
+                for (int c = 0; c < nvir; c++) { real_t t1_ic = T1_CPU(i, c);
+                    for (int d = 0; d < nvir; d++) val -= t1_ic * T1_CPU(j, d) * VVVV_CPU(c, a, d, b); }
+                for (int c = 0; c < nvir; c++) { real_t t1_ic = T1_CPU(i, c);
+                    for (int l = 0; l < nocc; l++) val += t1_ic * T1_CPU(l, b) * OOVV_CPU(j, l, c, a); }
+                for (int k = 0; k < nocc; k++) { real_t t1_ka = T1_CPU(k, a);
+                    for (int d = 0; d < nvir; d++) val += t1_ka * T1_CPU(j, d) * OOVV_CPU(i, k, d, b); }
+                for (int k = 0; k < nocc; k++) { real_t t1_ka = T1_CPU(k, a);
+                    for (int l = 0; l < nocc; l++) val -= t1_ka * T1_CPU(l, b) * OOOO_CPU(i, k, j, l); }
+                for (int d = 0; d < nvir; d++) { real_t t1_jd = T1_CPU(j, d);
+                    for (int l = 0; l < nocc; l++) val += t1_jd * T1_CPU(l, b) * OVVO_CPU(i, a, d, l); }
+                // Order 3
+                for (int c = 0; c < nvir; c++) { real_t t1_ic = T1_CPU(i, c);
+                    for (int k = 0; k < nocc; k++) { real_t t1_ic_ka = t1_ic * T1_CPU(k, a);
+                        for (int d = 0; d < nvir; d++) val += t1_ic_ka * T1_CPU(j, d) * VVOV_CPU(d, b, k, c); } }
+                for (int c = 0; c < nvir; c++) { real_t t1_ic = T1_CPU(i, c);
+                    for (int k = 0; k < nocc; k++) { real_t t1_ic_ka = t1_ic * T1_CPU(k, a);
+                        for (int l = 0; l < nocc; l++) val -= t1_ic_ka * T1_CPU(l, b) * OOOV_CPU(j, l, k, c); } }
+                for (int c = 0; c < nvir; c++) { real_t t1_ic = T1_CPU(i, c);
+                    for (int d = 0; d < nvir; d++) { real_t t1_ic_jd = t1_ic * T1_CPU(j, d);
+                        for (int l = 0; l < nocc; l++) val += t1_ic_jd * T1_CPU(l, b) * VVOV_CPU(c, a, l, d); } }
+                for (int k = 0; k < nocc; k++) { real_t t1_ka = T1_CPU(k, a);
+                    for (int d = 0; d < nvir; d++) { real_t t1_ka_jd = t1_ka * T1_CPU(j, d);
+                        for (int l = 0; l < nocc; l++) val -= t1_ka_jd * T1_CPU(l, b) * OOOV_CPU(i, k, l, d); } }
+                // Order 4
+                for (int c = 0; c < nvir; c++) { real_t t1_ic = T1_CPU(i, c);
+                    for (int k = 0; k < nocc; k++) { real_t t1_ic_ka = t1_ic * T1_CPU(k, a);
+                        for (int d = 0; d < nvir; d++) { real_t t1_ic_ka_jd = t1_ic_ka * T1_CPU(j, d);
+                            for (int l = 0; l < nocc; l++) val -= t1_ic_ka_jd * T1_CPU(l, b) * OVOV_CPU(k, c, l, d); } } }
+                real_t d2 = d_D2[idx];
+                d_t2_new[idx] = (std::abs(d2) > 1e-12) ? val / d2 : 0.0;
+            }
+            #undef OVOV_CPU
+            #undef VVOV_CPU
+            #undef OOOV_CPU
+            #undef OOVV_CPU
+            #undef OVVO_CPU
+            #undef VVVV_CPU
+            #undef OOOO_CPU
+            #undef T1_CPU
+        } else {
             int threads = 256;
             int blocks = (doubles_dim + threads - 1) / threads;
             cc2_t2_update_kernel<<<blocks, threads>>>(

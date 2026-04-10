@@ -10,6 +10,12 @@
 
 namespace gansu {
 
+// Forward declaration: defined in eri_stored.cu
+double mp2_from_full_moeri(
+    const double* d_eri_mo, const double* d_C, const double* d_eps,
+    int nao, int occ);
+
+
 // 3-center COO key: Q(21bit) | μ(21bit) | ν(21bit), μ ≤ ν
 __device__ __host__ inline unsigned long long encode_3c_key(int Q, int mu, int nu) {
     if (mu > nu) { int t = mu; mu = nu; nu = t; }
@@ -51,6 +57,11 @@ ERI_RI_Hash_RHF::~ERI_RI_Hash_RHF() {
 // ============================================================
 void ERI_RI_Hash_RHF::precomputation() {
     ERI_RI_Direct::precomputation();
+
+    // CPU fallback: the base class already cached intermediate_matrix_B_cpu_;
+    // the Hash COO storage uses GPU-only kernels so we skip it.  Fock/MP2
+    // code paths check gpu_available() and use the cached B instead.
+    if (!gpu::gpu_available()) return;
 
     const int nao = num_basis_;
     const int naux = num_auxiliary_basis_;
@@ -151,6 +162,27 @@ void ERI_RI_Hash_RHF::compute_fock_matrix() {
     const int naux = num_auxiliary_basis_;
     const size_t nao2 = (size_t)nao * nao;
 
+    // === CPU path: use the cached B matrix from ERI_RI_Direct::precomputation.
+    if (!gpu::gpu_available()) {
+        real_t *d_J, *d_K, *d_W, *d_T, *d_V;
+        tracked_cudaMalloc(&d_J, nao2 * sizeof(real_t));
+        tracked_cudaMalloc(&d_K, nao2 * sizeof(real_t));
+        tracked_cudaMalloc(&d_W, (size_t)naux * sizeof(real_t));
+        tracked_cudaMalloc(&d_T, (size_t)naux * nao2 * sizeof(real_t));
+        tracked_cudaMalloc(&d_V, (size_t)naux * nao2 * sizeof(real_t));
+
+        gpu::computeFockMatrix_RI_RHF_with_density_matrix(
+            rhf_.get_density_matrix().device_ptr(),
+            rhf_.get_core_hamiltonian_matrix().device_ptr(),
+            intermediate_matrix_B_cpu_.device_ptr(),
+            rhf_.get_fock_matrix().device_ptr(),
+            nao, naux, d_J, d_K, d_W, d_T, d_V);
+
+        tracked_cudaFree(d_J); tracked_cudaFree(d_K);
+        tracked_cudaFree(d_W); tracked_cudaFree(d_T); tracked_cudaFree(d_V);
+        return;
+    }
+
     real_t* d_B = build_B_from_3c_coo(
         d_3c_coo_keys_, d_3c_coo_values_, num_3c_entries_,
         two_center_eris.device_ptr(), nao, naux);
@@ -187,6 +219,16 @@ real_t ERI_RI_Hash_RHF::compute_mp2_energy() {
     const int naux = num_auxiliary_basis_;
     const int nocc = rhf_.get_num_electrons() / 2;
     const int nvir = nao - nocc;
+
+    // === CPU fallback: use cached B → build MO ERI → stored MP2 ===
+    if (!gpu::gpu_available()) {
+        real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+        real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+        real_t* d_mo_eri = build_mo_eri(d_C, nao);
+        real_t E = mp2_from_full_moeri(d_mo_eri, d_C, d_eps, nao, nocc);
+        tracked_cudaFree(d_mo_eri);
+        return E;
+    }
 
     std::cout << "  [Hash RI-MP2] Expanding COO to B..." << std::endl;
 

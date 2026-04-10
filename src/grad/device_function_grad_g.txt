@@ -1,4 +1,4 @@
-inline __device__ double compute_two_grad_Ax(
+inline __host__ __device__ double compute_two_grad_Ax(
     const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
     const double alpha, const double beta, const double gamma, const double delta,
     const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
@@ -38,7 +38,7 @@ inline __device__ double compute_two_grad_Ax(
 }
 
 
-inline __device__ double compute_two_grad_Ay(
+inline __host__ __device__ double compute_two_grad_Ay(
     const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
     const double alpha, const double beta, const double gamma, const double delta,
     const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
@@ -78,7 +78,7 @@ inline __device__ double compute_two_grad_Ay(
 }
 
 
-inline __device__ double compute_two_grad_Az(
+inline __host__ __device__ double compute_two_grad_Az(
     const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
     const double alpha, const double beta, const double gamma, const double delta,
     const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
@@ -118,7 +118,7 @@ inline __device__ double compute_two_grad_Az(
 }
 
 
-inline __device__ double compute_two_grad_Bx(
+inline __host__ __device__ double compute_two_grad_Bx(
     const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
     const double alpha, const double beta, const double gamma, const double delta,
     const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
@@ -158,7 +158,7 @@ inline __device__ double compute_two_grad_Bx(
 }
 
 
-inline __device__ double compute_two_grad_By(
+inline __host__ __device__ double compute_two_grad_By(
     const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
     const double alpha, const double beta, const double gamma, const double delta,
     const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
@@ -198,7 +198,7 @@ inline __device__ double compute_two_grad_By(
 }
 
 
-inline __device__ double compute_two_grad_Bz(
+inline __host__ __device__ double compute_two_grad_Bz(
     const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
     const double alpha, const double beta, const double gamma, const double delta,
     const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
@@ -238,7 +238,7 @@ inline __device__ double compute_two_grad_Bz(
 }
 
 
-inline __device__ double compute_two_grad_Cx(
+inline __host__ __device__ double compute_two_grad_Cx(
     const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
     const double alpha, const double beta, const double gamma, const double delta,
     const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
@@ -278,7 +278,7 @@ inline __device__ double compute_two_grad_Cx(
 }
 
 
-inline __device__ double compute_two_grad_Cy(
+inline __host__ __device__ double compute_two_grad_Cy(
     const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
     const double alpha, const double beta, const double gamma, const double delta,
     const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
@@ -318,7 +318,7 @@ inline __device__ double compute_two_grad_Cy(
 }
 
 
-inline __device__ double compute_two_grad_Cz(
+inline __host__ __device__ double compute_two_grad_Cz(
     const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
     const double alpha, const double beta, const double gamma, const double delta,
     const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
@@ -358,7 +358,7 @@ inline __device__ double compute_two_grad_Cz(
 }
 
 
-inline __device__ double compute_two_grad_Dx(
+inline __host__ __device__ double compute_two_grad_Dx(
     const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
     const double alpha, const double beta, const double gamma, const double delta,
     const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
@@ -398,7 +398,7 @@ inline __device__ double compute_two_grad_Dx(
 }
 
 
-inline __device__ double compute_two_grad_Dy(
+inline __host__ __device__ double compute_two_grad_Dy(
     const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
     const double alpha, const double beta, const double gamma, const double delta,
     const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 
@@ -438,7 +438,7 @@ inline __device__ double compute_two_grad_Dy(
 }
 
 
-inline __device__ double compute_two_grad_Dz(
+inline __host__ __device__ double compute_two_grad_Dz(
     const int3 A_ang, const int3 B_ang, const int3 C_ang, const int3 D_ang,
     const double alpha, const double beta, const double gamma, const double delta,
     const double AB_Dx, const double AB_Dy, const double AB_Dz, const double CD_Dx, const double CD_Dy, const double CD_Dz, 

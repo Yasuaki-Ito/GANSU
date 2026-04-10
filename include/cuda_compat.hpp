@@ -108,6 +108,8 @@ struct double4 {
 inline int2 make_int2(int x, int y) { return {x, y}; }
 inline int3 make_int3(int x, int y, int z) { return {x, y, z}; }
 inline double2 make_double2(double x, double y) { return {x, y}; }
+inline double3 make_double3(double x, double y, double z) { return {x, y, z}; }
+inline double4 make_double4(double x, double y, double z, double w) { return {x, y, z, w}; }
 
 
 // ============================================================================
@@ -278,12 +280,15 @@ inline int __popc(int x) {
 // Synchronization — no-op on CPU (single-threaded kernel execution)
 inline void __syncthreads() {}
 
-// Atomic operations — no atomicity needed for single-threaded kernel execution.
-// For multi-threaded CPU integral kernels, use OpenMP atomics instead.
+// Atomic operations — when a CUDA-style kernel is launched as an OpenMP
+// parallel loop (see cpu_kernel_launch.hpp), multiple host threads can hit
+// the same `atomicAdd` simultaneously, so we MUST honour atomicity here or
+// gradient accumulation races will silently corrupt results.
 template <typename T>
 inline T atomicAdd(T* address, T val) {
-    T old = *address;
-    *address += val;
+    T old;
+    #pragma omp atomic capture
+    { old = *address; *address += val; }
     return old;
 }
 
@@ -295,19 +300,19 @@ inline T atomicCAS(T* address, T compare, T val) {
 }
 
 // Thread/block indexing — used by CUDA kernels, stubbed for CPU.
-// On CPU, kernels are NOT launched with <<<>>>. Instead, the wrapper functions
-// in gpu_manager.cu use OpenMP loops and call the kernel body directly.
-// These globals exist to make __global__ function BODIES compile on CPU.
-// They are NOT usable for meaningful computation — only for compilation.
-namespace {
-    struct _cuda_dim3_stub {
-        unsigned int x = 0, y = 0, z = 0;
-    };
-    thread_local _cuda_dim3_stub blockIdx;
-    thread_local _cuda_dim3_stub blockDim;
-    thread_local _cuda_dim3_stub threadIdx;
-    thread_local _cuda_dim3_stub gridDim;
-}
+// On CPU, __global__ kernels are invoked via the GANSU_CPU_LAUNCH_* macros
+// (see cpu_kernel_launch.hpp) which iterate a plain OpenMP loop and assign
+// these thread_local stubs on each iteration, mimicking a CUDA grid.
+// They are shared across translation units via `inline` linkage so the
+// launcher macro (in any .cu) and the kernel body (in another .cu) refer to
+// the same thread-local instance per OpenMP thread.
+struct _cuda_dim3_stub {
+    unsigned int x = 0, y = 0, z = 0;
+};
+inline thread_local _cuda_dim3_stub blockIdx;
+inline thread_local _cuda_dim3_stub blockDim;
+inline thread_local _cuda_dim3_stub threadIdx;
+inline thread_local _cuda_dim3_stub gridDim;
 
 
 // ============================================================================

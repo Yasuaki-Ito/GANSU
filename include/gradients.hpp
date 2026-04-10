@@ -64,6 +64,17 @@ __global__ void compute_nuclear_repulsion_gradient_kernel(double* g_grad, const 
 __global__ void compute_W_Matrix_kernel(real_t* d_W_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, const int num_electron, const int num_basis);
 
 
+// CPU host-callable mirrors of the analytic gradient kernels.  These run on
+// the host (parallelised with OpenMP) and are wired into the analytic CPU
+// gradient path in gpu_manager.cu.  They write into the same gradient
+// accumulators as the GPU kernels would, so callers can mix-and-match.
+void compute_W_Matrix_cpu(real_t* d_W_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, const int num_electron, const int num_basis);
+void compute_nuclear_repulsion_gradient_cpu(double* g_grad, const Atom* g_atom, const int num_atoms);
+void compute_gradients_overlap_cpu(double* g_gradients, const real_t* g_W_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const int num_basis, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, const size_t num_threads);
+void compute_gradients_kinetic_cpu(double* g_gradients, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const int num_basis, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, const size_t num_threads);
+void compute_gradients_nuclear_cpu(double* g_gradients, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atom, const int num_atoms, const int num_basis, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, const size_t num_threads, const real_t* g_boys_grid);
+
+
 // define the kernel to calculate the gradients of moliucular integrals
 __global__ void compute_gradients_overlap(double* g_gradients, const real_t* g_W_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const int num_basis, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, const size_t num_threads);
 __global__ void compute_gradients_kinetic(double* g_gradients, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const int num_basis, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, const size_t num_threads);
@@ -97,38 +108,50 @@ using compute_basis_deriv_repulsion_2pdm = void (*)(double*, const real_t*, cons
 
 
 // 2点間の距離を求める関数（2乗済み）・・・関数のオーバーロードを使用
-__device__ __forceinline__ double calc_dist_GPU(const Coordinate& coord1, const Coordinate& coord2){
+__host__ __device__ __forceinline__ double calc_dist_GPU(const Coordinate& coord1, const Coordinate& coord2){
     return (coord1.x-coord2.x)*(coord1.x-coord2.x) + (coord1.y-coord2.y)*(coord1.y-coord2.y) + (coord1.z-coord2.z)*(coord1.z-coord2.z);
 }
 
-__device__ __forceinline__ double calc_dist_GPU(const double3& coord1, const Coordinate& coord2){
+__host__ __device__ __forceinline__ double calc_dist_GPU(const double3& coord1, const Coordinate& coord2){
     return (coord1.x-coord2.x)*(coord1.x-coord2.x) + (coord1.y-coord2.y)*(coord1.y-coord2.y) + (coord1.z-coord2.z)*(coord1.z-coord2.z);
 }
 
-__device__ __forceinline__ double calc_dist_GPU(const double3& coord1, const double3& coord2){
+__host__ __device__ __forceinline__ double calc_dist_GPU(const double3& coord1, const double3& coord2){
     return (coord1.x-coord2.x)*(coord1.x-coord2.x) + (coord1.y-coord2.y)*(coord1.y-coord2.y) + (coord1.z-coord2.z)*(coord1.z-coord2.z);
 }
 
 
 
 // 該当箇所に排他的に加算する関数
-inline 
-__device__ void AddToResult(double* g_result, size_t index, double result, bool flag) {
+inline
+__host__ __device__ void AddToResult(double* g_result, size_t index, double result, bool flag) {
     double val = flag ? 2.0 * result : result;
+#ifdef __CUDA_ARCH__
     atomicAdd(&g_result[index], val);
+#else
+    // Host side: serialise via OpenMP atomic so the kernel body is safe to
+    // call from a parallel CPU launcher loop.
+    #pragma omp atomic
+    g_result[index] += val;
+#endif
 }
 
 
 // TEI・・・Two Electron Integral
-inline __device__
+inline __host__ __device__
 void AddToResult_TEI(double* g_result, size_t index, double result, bool sym_bra, bool sym_ket, bool sym_braket) {
     int f = 1 + static_cast<int>(!sym_bra) + static_cast<int>(!sym_ket) + static_cast<int>(!sym_bra && !sym_ket) + static_cast<int>(!sym_braket) * ( 1 + static_cast<int>(!sym_bra) + static_cast<int>(!sym_ket) + static_cast<int>(!sym_bra && !sym_ket) );
+#ifdef __CUDA_ARCH__
     atomicAdd(&g_result[index], result * f);
+#else
+    #pragma omp atomic
+    g_result[index] += result * f;
+#endif
 }
 
 // // 係数部E_t(i,l)を計算する関数
 inline 
-__device__ double Et_GPU_Recursion(int i, int l, int t, const double alpha, const double beta, const double dist){
+__host__ __device__ double Et_GPU_Recursion(int i, int l, int t, const double alpha, const double beta, const double dist){
     if(t==0 && i==0 && l==0){
         // return 1.0;
         return exp(-(alpha*beta/(alpha + beta))*dist*dist);  
@@ -144,7 +167,7 @@ __device__ double Et_GPU_Recursion(int i, int l, int t, const double alpha, cons
 
 // // 係数部E_t(i,l)の微分に関する影響を計算する関数
 inline 
-__device__ double Et_GPU_gradients(int i, int l, int t, const double alpha, const double beta, const double dist){
+__host__ __device__ double Et_GPU_gradients(int i, int l, int t, const double alpha, const double beta, const double dist){
     if(t==0 && i==0 && l==0){
         return -2*alpha*beta/(alpha+beta)*dist*exp(-(alpha*beta/(alpha + beta))*dist*dist);
     }else if(t<0 || i+l<t){ // 範囲外の処理
@@ -159,7 +182,7 @@ __device__ double Et_GPU_gradients(int i, int l, int t, const double alpha, cons
 
 // R(t,u,v)の計算
 inline 
-__device__ double R_GPU_Recursion(int n, int t, int u, int v, const double3& P, const Coordinate& atom_pos, double* Boys){
+__host__ __device__ double R_GPU_Recursion(int n, int t, int u, int v, const double3& P, const Coordinate& atom_pos, double* Boys){
     if(t==0 and u==0 and v==0){
         return Boys[n];
     }else if(t>0){
@@ -175,7 +198,7 @@ __device__ double R_GPU_Recursion(int n, int t, int u, int v, const double3& P, 
 
 
 inline 
-__device__ double R_GPU_Recursion(int n, int t, int u, int v, const double3& P, const double3& Q, double* Boys){
+__host__ __device__ double R_GPU_Recursion(int n, int t, int u, int v, const double3& P, const double3& Q, double* Boys){
     if(t==0 and u==0 and v==0){
         return Boys[n];
     }else if(t>0){
@@ -190,9 +213,22 @@ __device__ double R_GPU_Recursion(int n, int t, int u, int v, const double3& P, 
 }
 
 
+// `tuv_list` is a __constant__ on the device side and `tuv_list_host` is a
+// `static const` mirror for the host side.  Both compute_R_TripleBuffer
+// overloads below are __host__ __device__, so we wrap the table access in
+// this small accessor that picks the correct copy at compile time.
+__host__ __device__ inline int tuv_list_get(int idx, int axis) {
+#ifdef __CUDA_ARCH__
+    return tuv_list[idx][axis];
+#else
+    return tuv_list_host[idx][axis];
+#endif
+}
+
+
 // MD法のRの再帰関係をトリプルバッファリングで計算
-inline 
-__device__ void compute_R_TripleBuffer(real_t* R, real_t* R_mid, const real_t* Boys, const double3& P, const Coordinate& coord, const int K, const int t_max, const int u_max, const int v_max){
+inline
+__host__ __device__ void compute_R_TripleBuffer(real_t* R, real_t* R_mid, const real_t* Boys, const double3& P, const Coordinate& coord, const int K, const int t_max, const int u_max, const int v_max){
     //Step 0: Boys関数評価
     R[0]=Boys[0];
     for(int i=0; i <= K; i++){
@@ -204,9 +240,9 @@ __device__ void compute_R_TripleBuffer(real_t* R, real_t* R_mid, const real_t* B
         for(int z=0; z<=(K+1)*comb_max(k); z++){
             int i = z/comb_max(k);
             if(i <= K-k){
-                int t = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][0];
-                int u = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][1];
-                int v = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][2];
+                int t = tuv_list_get((k*(k+1)*(k+2))/6 + z%comb_max(k), 0);
+                int u = tuv_list_get((k*(k+1)*(k+2))/6 + z%comb_max(k), 1);
+                int v = tuv_list_get((k*(k+1)*(k+2))/6 + z%comb_max(k), 2);
                 if((t <= t_max) && (u <= u_max) && (v <= v_max)){
                     if(t >= 1){
                         R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_one_Rmid)] = (P.x-coord.x)*R_mid[calc_Idx_Rmid(k-1,u,v,i+1,comb_max(k-1),size_one_Rmid)] + (t-1)*R_mid[calc_Idx_Rmid(k-2,u,v,i+1,comb_max(k-2),size_one_Rmid)];
@@ -230,7 +266,7 @@ __device__ void compute_R_TripleBuffer(real_t* R, real_t* R_mid, const real_t* B
 
 
 inline 
-__device__ void compute_R_TripleBuffer(double* R, double* R_mid, const double* Boys, const double3& P, const double3& Q, const int K, const int t_max, const int u_max, const int v_max){
+__host__ __device__ void compute_R_TripleBuffer(double* R, double* R_mid, const double* Boys, const double3& P, const double3& Q, const int K, const int t_max, const int u_max, const int v_max){
     //Step 0: Boys関数評価
     R[0]=Boys[0];
     for(int i=0; i <= K; i++){
@@ -242,9 +278,9 @@ __device__ void compute_R_TripleBuffer(double* R, double* R_mid, const double* B
         for(int z=0; z<=(K+1)*comb_max(k); z++){
             int i = z/comb_max(k);
             if(i <= K-k){
-                int t = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][0];
-                int u = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][1];
-                int v = tuv_list[(k*(k+1)*(k+2))/6 + z%comb_max(k)][2];
+                int t = tuv_list_get((k*(k+1)*(k+2))/6 + z%comb_max(k), 0);
+                int u = tuv_list_get((k*(k+1)*(k+2))/6 + z%comb_max(k), 1);
+                int v = tuv_list_get((k*(k+1)*(k+2))/6 + z%comb_max(k), 2);
                 if((t <= t_max) && (u <= u_max) && (v <= v_max)){
                     if(t >= 1){
                         R_mid[calc_Idx_Rmid(k,u,v,i,comb_max(k),size_Rmid)] = (P.x - Q.x)*R_mid[calc_Idx_Rmid(k-1,u,v,i+1,comb_max(k-1),size_Rmid)] + (t-1)*R_mid[calc_Idx_Rmid(k-2,u,v,i+1,comb_max(k-2),size_Rmid)];
@@ -301,6 +337,16 @@ __global__ void compute_hessian_overlap(double* g_hessian, const real_t* g_W_mat
 __global__ void compute_hessian_kinetic(double* g_hessian, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const int num_basis, const int num_atoms, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, const size_t num_threads);
 __global__ void compute_hessian_nuclear_attraction(double* g_hessian, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atoms, const int num_basis, const int num_atoms, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, const size_t num_threads, const double* g_boys_grid);
 __global__ void compute_hessian_nuclear_repulsion(double* g_hessian, const Atom* g_atoms, const int num_atoms);
+
+// Hessian: 2-electron (Rys quadrature)
+__global__ void Rys_compute_hessian_two_electron(double* g_hessian, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const int num_basis, const int num_atoms, const double* g_boys_grid);
+
+// CPU host-callable mirrors of the Hessian kernels.
+void compute_hessian_overlap_cpu(double* g_hessian, const real_t* g_W_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const int num_basis, const int num_atoms, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, const size_t num_threads);
+void compute_hessian_kinetic_cpu(double* g_hessian, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const int num_basis, const int num_atoms, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, const size_t num_threads);
+void compute_hessian_nuclear_attraction_cpu(double* g_hessian, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const Atom* g_atoms, const int num_basis, const int num_atoms, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, const size_t num_threads, const double* g_boys_grid);
+void compute_hessian_nuclear_repulsion_cpu(double* g_hessian, const Atom* g_atoms, const int num_atoms);
+void Rys_compute_hessian_two_electron_cpu(double* g_hessian, const real_t* g_density_matrix, const PrimitiveShell* g_shell, const real_t* g_cgto_normalization_factors, const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3, const size_t num_threads, const int num_basis, const int num_atoms, const double* g_boys_grid);
 
 } // namespace gansu::gpu
 
