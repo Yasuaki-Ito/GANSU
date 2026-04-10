@@ -3,9 +3,12 @@
 ## Overview
 GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum chemistry software designed for high-performance computations on modern computing architectures. This software aims to accelerate quantum chemistry simulations using advanced computational techniques such as GPU parallelization and efficient algorithms.
 
+GANSU also supports a **CPU-only mode** for systems without NVIDIA GPUs, providing the same functionality using Eigen and OpenMP parallelization.
+
 ## Features
 * Hartree-Fock Methods: Includes RHF, UHF, and ROHF implementations.
 * Parallel computing: Accelerates almost all operations on the GPU, achieving true speedup through custom implementations from scratch.
+* CPU backend: Full CPU-only execution via `--cpu` flag (Eigen + OpenMP), supporting all HF methods, post-HF, gradient, Hessian, and geometry optimization.
 * Flexible Input Options: Supports standard file formats such as XYZ and Gaussian basis set files.
 * The numerical calculations in this software are performed using 64-bit double precision floating-point arithmetic.
 * etc.
@@ -92,6 +95,14 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
         * Tested by [MOrbVis](https://yasuaki-ito.github.io/morbvis/), [Avogadro](https://avogadro.cc/), and [Pegamoid](https://github.com/Jellby/Pegamoid)
       ![Orbital renderred by MOrbVis](/doc/images/orbital.png)
       *Resulting molecular orbital of Benzene by MOrbVis*
+* CPU-only Backend (`--cpu`)
+    * All HF methods (RHF, UHF, ROHF) with all ERI storage methods
+    * All post-HF methods (MP2, MP3, MP4, CC2, CCSD, CCSD(T), FCI)
+    * All excited state methods (CIS, ADC(2), ADC(2)-x, EOM-MP2, EOM-CC2, EOM-CCSD)
+    * Analytical energy gradient (RHF, UHF) and geometry optimization
+    * Analytical Hessian (RHF) with CPHF response, vibrational frequencies, and Newton-Raphson optimization
+    * Population/bond order analysis and Molden export
+    * Parallelized with OpenMP
 
 
 
@@ -120,6 +131,8 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 ## Installation
 
 ### Prerequisites
+
+#### GPU mode (default)
 * Hardware
   * NVIDIA GPU with CUDA Compute Capability 8.0, 8.6, 9.0 or later
   * x86_64 / ARM architecture
@@ -129,7 +142,10 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
   * NVIDIA CUDA Toolkit 12.9 or later
   * cuBLAS 12.9 or later
   * cuSOLVER 11.7 or later
-  * LAPACK (e.g., `sudo apt install liblapack-dev` on Ubuntu)
+
+#### CPU-only mode (`--cpu`)
+When a GPU is available, pass `--cpu` to force CPU execution. All features are supported with OpenMP parallelization.
+No additional dependencies beyond the GPU mode prerequisites are required.
 
 
 ### Directory Structure
@@ -226,6 +242,7 @@ Short options:
 | `-ag` | `--auxiliary_gbsfilename` | Gaussian auxiliary basis set file |
 | `-c` | `--charge` | Charge of the molecule |
 | `-r` | `--run_type` | Run type (energy, gradient, optimize, hessian) |
+| | `--cpu` | Force CPU-only execution (no GPU) |
 
 #### Examples
 
@@ -328,7 +345,19 @@ Available optimizers: `bfgs` (default), `dfp`, `sr1`, `gdiis`, `newton`, `cg-fr`
 ./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method eom_ccsd
 ```
 
-##### Example 11: Fullerene (C60) molecule using RI approximation
+##### Example 11: CPU-only mode
+``` bash
+# RHF energy on CPU
+./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs --cpu
+
+# Geometry optimization with Newton-Raphson on CPU
+./HF_main -x ../xyz/optimization/H2O_distorted.xyz -g ../basis/sto-3g.gbs -r optimize --optimizer newton --cpu
+
+# Post-HF on CPU
+./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method ccsd --cpu
+```
+
+##### Example 12: Fullerene (C60) molecule using RI approximation
 If the molecule is large, it is recommended to use the RI approximation (density fitting) to reduce the memory usage.
 
 With an explicit auxiliary basis set file:
