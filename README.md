@@ -142,6 +142,7 @@ GANSU also supports a **CPU-only mode** for systems without NVIDIA GPUs, providi
   * NVIDIA CUDA Toolkit 12.9 or later
   * cuBLAS 12.9 or later
   * cuSOLVER 11.7 or later
+  * [Eigen](https://eigen.tuxfamily.org/) 3.4+ (automatically downloaded via CMake FetchContent)
 
 #### CPU-only mode (`--cpu`)
 When a GPU is available, pass `--cpu` to force CPU execution. All features are supported with OpenMP parallelization.
