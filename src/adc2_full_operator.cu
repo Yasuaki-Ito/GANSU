@@ -149,64 +149,60 @@ void ADC2FullOperator::apply(const real_t* d_input, real_t* d_output) const {
             d_sigma1[row] = sum;
         }
 
-        // CPU fallback: σ1 += M12 · R2
+        // CPU fallback: σ1 += M12 · R2  (matches adc2_apply_M12_x2_kernel)
         const real_t* d_eri_vvov = adc2_op_.get_eri_vvov();
         const real_t* d_eri_ooov = adc2_op_.get_eri_ooov();
+        int vov = nvir * nocc * nvir;
+        int vv = nvir * nvir;
         #pragma omp parallel for
-        for (int ia = 0; ia < singles_dim_; ia++) {
-            int i = ia / nvir;
-            int a = ia % nvir;
-            real_t sigma = 0.0;
-            for (int j = 0; j < nocc; j++)
-                for (int b = 0; b < nvir; b++) {
-                    real_t r2_ijab = d_R2[(size_t)i * nocc * nvir * nvir + (size_t)j * nvir * nvir + (size_t)a * nvir + b];
-                    real_t r2_jiab = d_R2[(size_t)j * nocc * nvir * nvir + (size_t)i * nvir * nvir + (size_t)a * nvir + b];
-                    for (int c = 0; c < nvir; c++) {
-                        real_t vvov_cb_j_a_val = d_eri_vvov[(size_t)c * nvir * nocc * nvir + (size_t)b * nocc * nvir + (size_t)j * nvir + a];
-                        sigma += vvov_cb_j_a_val * (2.0 * r2_ijab - r2_jiab);
+        for (int idx = 0; idx < singles_dim_; idx++) {
+            int K = idx / nvir;
+            int E = idx % nvir;
+            real_t val = 0.0;
+            // Term A: Σ_{J,C,D} [2·(EC|JD) - (DE|JC)] · R2(K,J,C,D)
+            for (int J = 0; J < nocc; J++)
+                for (int C = 0; C < nvir; C++)
+                    for (int D = 0; D < nvir; D++) {
+                        real_t eri1 = d_eri_vvov[(size_t)E * vov + (size_t)C * nocc * nvir + J * nvir + D];
+                        real_t eri2 = d_eri_vvov[(size_t)D * vov + (size_t)E * nocc * nvir + J * nvir + C];
+                        real_t x2v = d_R2[(size_t)K * nocc * vv + (size_t)J * vv + C * nvir + D];
+                        val += (2.0 * eri1 - eri2) * x2v;
                     }
-                    for (int k = 0; k < nocc; k++) {
-                        real_t ooov_kj_i_b_val = d_eri_ooov[(size_t)k * nocc * nocc * nvir + (size_t)j * nocc * nvir + (size_t)i * nvir + b];
-                        sigma -= ooov_kj_i_b_val * (2.0 * r2_ijab - r2_jiab);
+            // Term B: Σ_{I,J,D} [(JK|ID) - 2·(IK|JD)] · R2(I,J,E,D)
+            for (int I = 0; I < nocc; I++)
+                for (int J = 0; J < nocc; J++)
+                    for (int D = 0; D < nvir; D++) {
+                        real_t eri1 = d_eri_ooov[(size_t)J * nocc * nocc * nvir + (size_t)K * nocc * nvir + I * nvir + D];
+                        real_t eri2 = d_eri_ooov[(size_t)I * nocc * nocc * nvir + (size_t)K * nocc * nvir + J * nvir + D];
+                        real_t x2v = d_R2[(size_t)I * nocc * vv + (size_t)J * vv + E * nvir + D];
+                        val += (eri1 - 2.0 * eri2) * x2v;
                     }
-                }
-            d_sigma1[ia] += sigma;
+            d_sigma1[idx] += val;
         }
 
-        // CPU fallback: σ2 = M21 · R1
+        // CPU fallback: σ2 = M21 · R1  (matches adc2_apply_M21_x1_kernel)
         #pragma omp parallel for
         for (int idx = 0; idx < doubles_dim_; idx++) {
-            int ii = idx / (nocc * nvir * nvir);
-            int rem = idx % (nocc * nvir * nvir);
-            int jj = rem / (nvir * nvir);
-            rem %= (nvir * nvir);
-            int aa = rem / nvir;
-            int bb = rem % nvir;
-            real_t sigma = 0.0;
-            for (int c = 0; c < nvir; c++) {
-                real_t x1_ic = d_R1[ii * nvir + c];
-                real_t x1_jc = d_R1[jj * nvir + c];
-                real_t vvov_cab_j = d_eri_vvov[(size_t)c * nvir * nocc * nvir + (size_t)aa * nocc * nvir + (size_t)jj * nvir + bb];
-                real_t vvov_cba_i = d_eri_vvov[(size_t)c * nvir * nocc * nvir + (size_t)bb * nocc * nvir + (size_t)ii * nvir + aa];
-                sigma += vvov_cab_j * (2.0 * x1_ic - x1_jc) - vvov_cba_i * x1_jc + vvov_cab_j * x1_jc
-                       - vvov_cab_j * x1_jc;
-                // Simplified: follow the kernel logic exactly
-            }
-            // Re-do with proper kernel logic
-            sigma = 0.0;
-            for (int c = 0; c < nvir; c++) {
-                real_t vv_c_a_j_b = d_eri_vvov[(size_t)c * nvir * nocc * nvir + (size_t)aa * nocc * nvir + (size_t)jj * nvir + bb];
-                real_t vv_c_b_i_a = d_eri_vvov[(size_t)c * nvir * nocc * nvir + (size_t)bb * nocc * nvir + (size_t)ii * nvir + aa];
-                sigma += (2.0 * vv_c_a_j_b - vv_c_b_i_a) * d_R1[ii * nvir + c];
-                sigma += (2.0 * vv_c_b_i_a - vv_c_a_j_b) * d_R1[jj * nvir + c];
-            }
-            for (int k = 0; k < nocc; k++) {
-                real_t oo_k_j_i_b = d_eri_ooov[(size_t)k * nocc * nocc * nvir + (size_t)jj * nocc * nvir + (size_t)ii * nvir + bb];
-                real_t oo_k_i_j_a = d_eri_ooov[(size_t)k * nocc * nocc * nvir + (size_t)ii * nocc * nvir + (size_t)jj * nvir + aa];
-                sigma -= (2.0 * oo_k_j_i_b - oo_k_i_j_a) * d_R1[k * nvir + aa];
-                sigma -= (2.0 * oo_k_i_j_a - oo_k_j_i_b) * d_R1[k * nvir + bb];
-            }
-            d_sigma2[idx] = sigma;
+            int I = idx / (nocc * vv);
+            int rem = idx % (nocc * vv);
+            int J = rem / vv;
+            rem = rem % vv;
+            int C = rem / nvir;
+            int D = rem % nvir;
+            real_t val = 0.0;
+            // Term 1: Σ_E (EC|JD)·R1[I,E]
+            for (int E = 0; E < nvir; E++)
+                val += d_eri_vvov[(size_t)E * vov + (size_t)C * nocc * nvir + J * nvir + D] * d_R1[I * nvir + E];
+            // Term 2: Σ_E (ED|IC)·R1[J,E]
+            for (int E = 0; E < nvir; E++)
+                val += d_eri_vvov[(size_t)E * vov + (size_t)D * nocc * nvir + I * nvir + C] * d_R1[J * nvir + E];
+            // Term 3: -Σ_K (IK|JD)·R1[K,C]
+            for (int K = 0; K < nocc; K++)
+                val -= d_eri_ooov[(size_t)I * nocc * nocc * nvir + (size_t)K * nocc * nvir + J * nvir + D] * d_R1[K * nvir + C];
+            // Term 4: -Σ_K (JK|IC)·R1[K,D]
+            for (int K = 0; K < nocc; K++)
+                val -= d_eri_ooov[(size_t)J * nocc * nocc * nvir + (size_t)K * nocc * nvir + I * nvir + C] * d_R1[K * nvir + D];
+            d_sigma2[idx] = val;
         }
 
         // CPU fallback: σ2 += D2 · R2
@@ -230,24 +226,46 @@ void ADC2FullOperator::apply(const real_t* d_input, real_t* d_output) const {
                     &beta, d_sigma1, 1);
     }
 
-    // --- σ1 += M12 · R2 --- (via δ-structure kernel, accumulates into d_sigma1)
-    {
-        int blocks = (singles_dim_ + threads - 1) / threads;
-        adc2_apply_M12_x2_kernel<<<blocks, threads>>>(
-            adc2_op_.get_eri_vvov(), adc2_op_.get_eri_ooov(),
-            d_R2, d_sigma1,
-            nocc, nvir);
-        cudaDeviceSynchronize();
-    }
-
-    // --- σ2 = M21 · R1 --- (via δ-structure kernel)
-    {
-        int blocks = (doubles_dim_ + threads - 1) / threads;
-        adc2_apply_M21_x1_kernel<<<blocks, threads>>>(
-            adc2_op_.get_eri_vvov(), adc2_op_.get_eri_ooov(),
-            d_R1, d_sigma2,
-            nocc, nvir);
-        cudaDeviceSynchronize();
+    if (adc2_op_.is_dense_M12()) {
+        // --- Dense path: σ1 += M12 · R2, σ2 = M21 · R1 via cuBLAS DGEMV ---
+        {
+            const real_t alpha = 1.0;
+            const real_t beta = 1.0;  // accumulate onto σ1
+            cublasDgemv(gpu::GPUHandle::cublas(), CUBLAS_OP_N,
+                        singles_dim_, doubles_dim_, &alpha,
+                        adc2_op_.get_M12(), singles_dim_,
+                        d_R2, 1,
+                        &beta, d_sigma1, 1);
+        }
+        {
+            const real_t alpha = 1.0;
+            const real_t beta = 0.0;
+            cublasDgemv(gpu::GPUHandle::cublas(), CUBLAS_OP_N,
+                        doubles_dim_, singles_dim_, &alpha,
+                        adc2_op_.get_M21(), doubles_dim_,
+                        d_R1, 1,
+                        &beta, d_sigma2, 1);
+        }
+    } else {
+        // --- Kernel-based path: exploit δ-structure ---
+        // σ1 += M12 · R2
+        {
+            int blocks = (singles_dim_ + threads - 1) / threads;
+            adc2_apply_M12_x2_kernel<<<blocks, threads>>>(
+                adc2_op_.get_eri_vvov(), adc2_op_.get_eri_ooov(),
+                d_R2, d_sigma1,
+                nocc, nvir);
+            cudaDeviceSynchronize();
+        }
+        // σ2 = M21 · R1
+        {
+            int blocks = (doubles_dim_ + threads - 1) / threads;
+            adc2_apply_M21_x1_kernel<<<blocks, threads>>>(
+                adc2_op_.get_eri_vvov(), adc2_op_.get_eri_ooov(),
+                d_R1, d_sigma2,
+                nocc, nvir);
+            cudaDeviceSynchronize();
+        }
     }
 
     // --- σ2 += D2 · R2 --- (diagonal)

@@ -236,59 +236,172 @@ int eigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_
  * @param size Matrix dimension
  * @return 0 if successful
  */
-int eigenDecompositionNonSymmetric(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size) {
-    // Copy matrix to host for Eigen
-    std::vector<real_t> h_A((size_t)size * size);
-    cudaMemcpy(h_A.data(), d_matrix, (size_t)size * size * sizeof(real_t), cudaMemcpyDeviceToHost);
-
-    // Eigen EigenSolver (replaces LAPACK dgeev)
-    Eigen::Map<Eigen::MatrixXd> A(h_A.data(), size, size);
-    Eigen::EigenSolver<Eigen::MatrixXd> solver(A);
-    if (solver.info() != Eigen::Success) {
-        return -1;
-    }
-
-    // Filter: keep only eigenvalues with negligible imaginary part
+// Helper: sort eigenvalues (real parts) ascending and reorder eigenvectors
+static void sort_eigenvalues_and_eigenvectors(
+    real_t* h_evals_real, real_t* h_evals_imag, real_t* h_evecs,
+    int size, real_t* h_sorted_evals, real_t* h_sorted_evecs)
+{
     double imag_threshold = 1e-6;
     std::vector<int> real_indices;
     real_indices.reserve(size);
     for (int i = 0; i < size; i++) {
-        if (std::abs(solver.eigenvalues()(i).imag()) < imag_threshold) {
+        if (std::abs(h_evals_imag[i]) < imag_threshold)
             real_indices.push_back(i);
-        }
     }
-
-    // Sort real eigenvalues by real part (ascending)
     std::sort(real_indices.begin(), real_indices.end(),
-              [&solver](int a, int b) {
-                  return solver.eigenvalues()(a).real() < solver.eigenvalues()(b).real();
-              });
+              [&](int a, int b) { return h_evals_real[a] < h_evals_real[b]; });
 
     int n_real = (int)real_indices.size();
-
-    // Build sorted eigenvalue array and reordered eigenvector matrix
-    // Output layout: transposed, eigenvector i at stride=size, offset=i
-    std::vector<real_t> h_sorted_evals(size, 1e30);
-    std::vector<real_t> h_sorted_evecs((size_t)size * size, 0.0);
+    std::fill(h_sorted_evals, h_sorted_evals + size, 1e30);
+    std::fill(h_sorted_evecs, h_sorted_evecs + (size_t)size * size, 0.0);
 
     for (int i = 0; i < n_real; i++) {
         int orig = real_indices[i];
-        h_sorted_evals[i] = solver.eigenvalues()(orig).real();
-        // Eigen eigenvectors: column orig = eigenvector orig
-        // Transposed output: row i = eigenvector i
-        // Column-major element (i, j) = h_sorted_evecs[i + j*size]
-        for (int j = 0; j < size; j++) {
-            h_sorted_evecs[i + j * size] = solver.eigenvectors()(j, orig).real();
+        h_sorted_evals[i] = h_evals_real[orig];
+        // cuSOLVER geev: right eigenvectors in columns of VR (column-major)
+        // Output layout: transposed — row i = eigenvector i
+        for (int j = 0; j < size; j++)
+            h_sorted_evecs[i + j * size] = h_evecs[j + orig * size];
+    }
+}
+
+int eigenDecompositionNonSymmetric(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size) {
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) {
+#endif
+        // === Eigen CPU path ===
+        std::vector<real_t> h_A((size_t)size * size);
+        cudaMemcpy(h_A.data(), d_matrix, (size_t)size * size * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+        Eigen::Map<Eigen::MatrixXd> A(h_A.data(), size, size);
+        Eigen::EigenSolver<Eigen::MatrixXd> solver(A);
+        if (solver.info() != Eigen::Success) return -1;
+
+        std::vector<real_t> h_evals_real(size), h_evals_imag(size);
+        for (int i = 0; i < size; i++) {
+            h_evals_real[i] = solver.eigenvalues()(i).real();
+            h_evals_imag[i] = solver.eigenvalues()(i).imag();
         }
+
+        // Build eigenvector matrix in column-major (column i = eigenvector i)
+        std::vector<real_t> h_evecs((size_t)size * size);
+        for (int i = 0; i < size; i++)
+            for (int j = 0; j < size; j++)
+                h_evecs[j + i * size] = solver.eigenvectors()(j, i).real();
+
+        std::vector<real_t> h_sorted_evals(size);
+        std::vector<real_t> h_sorted_evecs((size_t)size * size);
+        sort_eigenvalues_and_eigenvectors(
+            h_evals_real.data(), h_evals_imag.data(), h_evecs.data(),
+            size, h_sorted_evals.data(), h_sorted_evecs.data());
+
+        cudaMemcpy(d_eigenvalues, h_sorted_evals.data(), size * sizeof(real_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_eigenvectors, h_sorted_evecs.data(), (size_t)size * size * sizeof(real_t), cudaMemcpyHostToDevice);
+        return 0;
+#ifndef GANSU_CPU_ONLY
     }
 
-    // Copy sorted results to device (or host in CPU mode)
-    cudaMemcpy(d_eigenvalues, h_sorted_evals.data(),
-               size * sizeof(real_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_eigenvectors, h_sorted_evecs.data(),
-               (size_t)size * size * sizeof(real_t), cudaMemcpyHostToDevice);
+    // === GPU path: cusolverDnXgeev ===
+    cusolverDnHandle_t cusolverHandle = GPUHandle::cusolver();
+    cusolverDnParams_t cusolverParams = GPUHandle::cusolverParams();
+
+    // cusolverDnXgeev uses CUDA_C_64F for eigenvalues (complex double)
+    // and CUDA_R_64F for the real matrix A and real eigenvectors VR.
+    // W is complex: array of size n, each element is (real, imag) pair.
+    real_t* d_A = nullptr;
+    double2* d_W = nullptr;   // complex eigenvalues (real, imag pairs)
+    real_t* d_VR = nullptr;   // right eigenvectors
+    tracked_cudaMalloc(&d_A, (size_t)size * size * sizeof(real_t));
+    tracked_cudaMalloc(&d_W, size * sizeof(double2));
+    tracked_cudaMalloc(&d_VR, (size_t)size * size * sizeof(real_t));
+
+    cudaMemcpy(d_A, d_matrix, (size_t)size * size * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+    // Query workspace size
+    size_t workspaceInBytesOnDevice = 0, workspaceInBytesOnHost = 0;
+    cusolverDnXgeev_bufferSize(
+        cusolverHandle, cusolverParams,
+        CUSOLVER_EIG_MODE_NOVECTOR,  // jobvl: no left eigenvectors
+        CUSOLVER_EIG_MODE_VECTOR,    // jobvr: compute right eigenvectors
+        (int64_t)size,
+        CUDA_R_64F, d_A, (int64_t)size,          // A (n×n real)
+        CUDA_C_64F, d_W,                          // W (n complex eigenvalues)
+        CUDA_R_64F, nullptr, (int64_t)size,       // VL (not computed)
+        CUDA_R_64F, d_VR, (int64_t)size,          // VR (n×n real)
+        CUDA_R_64F,                                // computeType
+        &workspaceInBytesOnDevice, &workspaceInBytesOnHost);
+
+    void* d_workspace = nullptr;
+    void* h_workspace = nullptr;
+    if (workspaceInBytesOnDevice > 0)
+        tracked_cudaMalloc(&d_workspace, workspaceInBytesOnDevice);
+    if (workspaceInBytesOnHost > 0)
+        h_workspace = malloc(workspaceInBytesOnHost);
+
+    int* d_info = nullptr;
+    tracked_cudaMalloc(&d_info, sizeof(int));
+
+    // Compute eigenvalues and right eigenvectors
+    cusolverStatus_t status = cusolverDnXgeev(
+        cusolverHandle, cusolverParams,
+        CUSOLVER_EIG_MODE_NOVECTOR,  // jobvl
+        CUSOLVER_EIG_MODE_VECTOR,    // jobvr
+        (int64_t)size,
+        CUDA_R_64F, d_A, (int64_t)size,
+        CUDA_C_64F, d_W,
+        CUDA_R_64F, nullptr, (int64_t)size,
+        CUDA_R_64F, d_VR, (int64_t)size,
+        CUDA_R_64F,
+        d_workspace, workspaceInBytesOnDevice,
+        h_workspace, workspaceInBytesOnHost,
+        d_info);
+
+    cudaDeviceSynchronize();
+
+    int h_info = 0;
+    cudaMemcpy(&h_info, d_info, sizeof(int), cudaMemcpyDeviceToHost);
+
+    if (status != CUSOLVER_STATUS_SUCCESS || h_info != 0) {
+        tracked_cudaFree(d_A);
+        tracked_cudaFree(d_W);
+        tracked_cudaFree(d_VR);
+        if (d_workspace) tracked_cudaFree(d_workspace);
+        tracked_cudaFree(d_info);
+        if (h_workspace) free(h_workspace);
+        return -1;
+    }
+
+    // Copy eigenvalues (complex) and eigenvectors to host for sorting
+    std::vector<double2> h_W(size);
+    std::vector<real_t> h_evals_real(size), h_evals_imag(size);
+    std::vector<real_t> h_evecs((size_t)size * size);
+    cudaMemcpy(h_W.data(), d_W, size * sizeof(double2), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_evecs.data(), d_VR, (size_t)size * size * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+    for (int i = 0; i < size; i++) {
+        h_evals_real[i] = h_W[i].x;
+        h_evals_imag[i] = h_W[i].y;
+    }
+
+    // Sort by real part ascending, filter imaginary, transpose
+    std::vector<real_t> h_sorted_evals(size);
+    std::vector<real_t> h_sorted_evecs((size_t)size * size);
+    sort_eigenvalues_and_eigenvectors(
+        h_evals_real.data(), h_evals_imag.data(), h_evecs.data(),
+        size, h_sorted_evals.data(), h_sorted_evecs.data());
+
+    cudaMemcpy(d_eigenvalues, h_sorted_evals.data(), size * sizeof(real_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_eigenvectors, h_sorted_evecs.data(), (size_t)size * size * sizeof(real_t), cudaMemcpyHostToDevice);
+
+    tracked_cudaFree(d_A);
+    tracked_cudaFree(d_W);
+    tracked_cudaFree(d_VR);
+    if (d_workspace) tracked_cudaFree(d_workspace);
+    tracked_cudaFree(d_info);
+    if (h_workspace) free(h_workspace);
 
     return 0;
+#endif // !GANSU_CPU_ONLY
 }
 
 /**

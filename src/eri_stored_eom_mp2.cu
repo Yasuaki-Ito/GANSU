@@ -283,21 +283,27 @@ static void compute_eom_mp2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
     DeviceHostMatrix<real_t>& coefficient_matrix = rhf.get_coefficient_matrix();
     const real_t* d_C = coefficient_matrix.device_ptr();
 
-    // Auto solver selection: use full Davidson if GPU memory is sufficient, else schur_omega
+    // Auto solver selection: schur_static is the fastest default.
+    // For higher accuracy, use --eom_mp2_solver schur_omega.
     if (solver_mode == "auto") {
+        solver_mode = "schur_static";
+        std::cout << "  Auto solver: schur_static" << std::endl;
+    }
+
+    if (false) {  // Legacy auto selection (kept for reference)
         int total_dim = singles_dim + doubles_dim;
         int max_sub = std::min(total_dim, std::max(100, 10 * n_states));
         size_t davidson_bytes = (
-            static_cast<size_t>(total_dim) * max_sub * 2 +   // subspace + sigma vectors
-            static_cast<size_t>(max_sub) * max_sub * 2 +     // subspace matrix + eigvecs
-            static_cast<size_t>(total_dim) * n_states * 2 +  // residuals + eigenvectors
+            static_cast<size_t>(total_dim) * max_sub * 2 +
+            static_cast<size_t>(max_sub) * max_sub * 2 +
+            static_cast<size_t>(total_dim) * n_states * 2 +
             max_sub
         ) * sizeof(real_t);
 
         size_t free_mem, total_mem;
         cudaMemGetInfo(&free_mem, &total_mem);
 
-        if (davidson_bytes < free_mem * 0.8) {  // 80% threshold for safety margin
+        if (davidson_bytes < free_mem * 0.8) {
             solver_mode = "full";
             std::cout << "  Auto solver: full Davidson ("
                       << CudaMemoryManager<real_t>::format_bytes(davidson_bytes)

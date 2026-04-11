@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <Eigen/Dense>
 
 // CPU replacement for thrust::sort_by_key (descending order).
 // Always defined so runtime (ENABLE_GPU=ON + --cpu) can use it too.
@@ -291,7 +292,6 @@ real_t* ERI::build_mo_eri(const real_t* d_C, int nmo) const {
         // CPU: 4-index AO→MO transform using O(N^5) algorithm
         // (pq|rs) = sum_{mu,nu,la,si} C(mu,p)*C(nu,q)*(mu nu|la si)*C(la,r)*C(si,s)
         // Step-by-step quarter transforms to keep O(N^5):
-        // Step 1: (mu nu|la s) = sum_si (mu nu|la si) * C(si,s)
         real_t* tmp1 = nullptr;
         real_t* tmp2 = nullptr;
         tracked_cudaMalloc(&tmp1, n4 * sizeof(real_t));

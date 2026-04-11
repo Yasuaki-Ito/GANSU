@@ -324,6 +324,7 @@ private:
      * @note Matrix is symmetric, but both triangles are filled for cuSOLVER
      */
     void build_subspace_matrix();
+    void build_subspace_matrix_incremental(int old_dim);
 
     /**
      * @brief Solve dense eigenvalue problem in subspace

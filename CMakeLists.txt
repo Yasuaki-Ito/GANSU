@@ -84,6 +84,15 @@ set(EIGEN_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(eigen)
 
+# BLAS (optional): Eigen uses it automatically for DGEMM etc. if available
+find_package(BLAS QUIET)
+if(BLAS_FOUND)
+    message(STATUS "BLAS found: ${BLAS_LIBRARIES}")
+    add_definitions(-DEIGEN_USE_BLAS)
+else()
+    message(STATUS "BLAS not found — Eigen will use built-in (slower) implementations")
+endif()
+
 find_package(OpenMP REQUIRED)
 
 
@@ -198,6 +207,7 @@ target_compile_definitions(gansu PRIVATE CONSOLE_COLOR_ENABLED)
 target_link_libraries(gansu
         Eigen3::Eigen
         OpenMP::OpenMP_CXX
+        $<$<BOOL:${BLAS_FOUND}>:${BLAS_LIBRARIES}>
         int1e
         int2e
         int2e_hash

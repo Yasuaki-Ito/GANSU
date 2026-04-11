@@ -135,8 +135,8 @@ static void compute_eom_ccsd_impl(RHF& rhf, const real_t* d_eri_ao, int n_states
     DavidsonConfig config;
     config.num_eigenvalues = n_states;
     config.convergence_threshold = 1e-6;
-    // Use large subspace to avoid restart instability in non-symmetric dgeev.
-    // For non-Hermitian EOM problems, restarts can cause eigenvalue collapse.
+    // Moderate subspace size: balance between restart cost and eigenDecomposition O(n³)
+    // Collapse detection (min_eigenvalue) handles restart instability for non-Hermitian problems
     config.max_subspace_size = std::min(total_dim, std::max(500, 40 * n_states));
     config.max_iterations = 500;
     config.use_preconditioner = true;

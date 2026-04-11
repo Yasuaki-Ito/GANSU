@@ -89,6 +89,7 @@ public:
 
     // --- ω management ---
     void set_omega(real_t omega) { omega_ = omega; }
+    void recompute_diagonal() { compute_diagonal(); }
     real_t get_omega() const { return omega_; }
 
     /**
@@ -130,6 +131,8 @@ public:
     const real_t* get_eri_vvov() const { return d_eri_vvov_; }
     const real_t* get_eri_ooov() const { return d_eri_ooov_; }
     bool is_dense_M12() const { return use_dense_M12_; }
+    const real_t* get_M12() const { return d_M12_; }
+    const real_t* get_M21() const { return d_M21_; }
 
 private:
     int nocc_;

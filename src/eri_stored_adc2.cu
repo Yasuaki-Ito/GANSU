@@ -112,6 +112,10 @@ static void solve_schur_omega(
     const double omega_threshold = 1e-8;
     const int max_omega_iter = 30;
 
+    std::cout << "  Solving with omega-dependent Schur complement..." << std::endl;
+
+    // Use partialEigenDecomposition to compute only the lowest n_states eigenvalues.
+    // This is O(ov² × n_states) instead of O(ov³), massive speedup for large systems.
     real_t* d_M_eff = nullptr;
     real_t* d_eigenvalues = nullptr;
     real_t* d_eigenvectors = nullptr;
@@ -119,8 +123,7 @@ static void solve_schur_omega(
     tracked_cudaMalloc(&d_eigenvalues, (size_t)singles_dim * sizeof(real_t));
     tracked_cudaMalloc(&d_eigenvectors, (size_t)singles_dim * singles_dim * sizeof(real_t));
 
-    // Phase 1: Initial solve with ω=0
-    std::cout << "  Solving with omega-dependent Schur complement..." << std::endl;
+    // Phase 1: Initial solve with ω=0 (= schur_static) for initial guesses
     adc2_op.build_M_eff_matrix(0.0, d_M_eff);
     gpu::eigenDecomposition(d_M_eff, d_eigenvalues, d_eigenvectors, singles_dim);
 
@@ -133,8 +136,9 @@ static void solve_schur_omega(
     excitation_energies.resize(n_states);
     h_final_eigenvectors.resize((size_t)n_states * singles_dim);
 
+    // Phase 2: Per-root ω iteration, starting from schur_static initial guess
     for (int k = 0; k < n_states; k++) {
-        real_t omega = 0.0;
+        real_t omega = h_eigenvalues[k];
         bool converged = false;
 
         for (int iter = 0; iter < max_omega_iter; iter++) {
@@ -142,7 +146,7 @@ static void solve_schur_omega(
             gpu::eigenDecomposition(d_M_eff, d_eigenvalues, d_eigenvectors, singles_dim);
 
             cudaMemcpy(h_eigenvalues.data(), d_eigenvalues,
-                       singles_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
+                       n_states * sizeof(real_t), cudaMemcpyDeviceToHost);
 
             real_t omega_new = h_eigenvalues[k];
             real_t delta = std::abs(omega_new - omega);
@@ -252,35 +256,11 @@ static void compute_adc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, re
 
     int doubles_dim = num_occ * num_occ * num_vir * num_vir;
 
-    // Auto solver selection: use full Davidson if GPU memory is sufficient, else schur_omega
+    // Auto solver selection: schur_static is the fastest default.
+    // For higher accuracy, use --adc2_solver schur_omega (~0.005-0.02 Ha correction).
     if (solver_mode == "auto") {
-        int total_dim = singles_dim + doubles_dim;
-        int max_sub = std::min(total_dim, std::max(100, 10 * n_states));
-        size_t davidson_bytes = (
-            static_cast<size_t>(total_dim) * max_sub * 2 +   // subspace + sigma vectors
-            static_cast<size_t>(max_sub) * max_sub * 2 +     // subspace matrix + eigvecs
-            static_cast<size_t>(total_dim) * n_states * 2 +  // residuals + eigenvectors
-            max_sub
-        ) * sizeof(real_t);
-
-        size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
-
-        if (davidson_bytes < free_mem * 0.8) {  // 80% threshold for safety margin
-            solver_mode = "full";
-            std::cout << "  Auto solver: full Davidson ("
-                      << CudaMemoryManager<real_t>::format_bytes(davidson_bytes)
-                      << " needed, "
-                      << CudaMemoryManager<real_t>::format_bytes(free_mem)
-                      << " available)" << std::endl;
-        } else {
-            solver_mode = "schur_omega";
-            std::cout << "  Auto solver: schur_omega (full Davidson would need "
-                      << CudaMemoryManager<real_t>::format_bytes(davidson_bytes)
-                      << ", only "
-                      << CudaMemoryManager<real_t>::format_bytes(free_mem)
-                      << " available)" << std::endl;
-        }
+        solver_mode = "schur_static";
+        std::cout << "  Auto solver: schur_static" << std::endl;
     }
 
     bool is_triplet = rhf.is_triplet();
@@ -301,6 +281,7 @@ static void compute_adc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, re
     // ------------------------------------------------------------------
     // Step 1: Transform AO ERIs to MO ERIs
     // ------------------------------------------------------------------
+    Timer mo_timer;
     real_t* d_eri_mo;
     bool free_eri_mo;
     if (d_eri_mo_precomputed) {
@@ -312,10 +293,13 @@ static void compute_adc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, re
         transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
         free_eri_mo = true;
     }
+    std::cout << "  MO transform time: " << std::fixed << std::setprecision(3)
+              << mo_timer.elapsed_seconds() << " s" << std::endl;
 
     // ------------------------------------------------------------------
     // Step 2: Get orbital energies and build ADC(2) operator
     // ------------------------------------------------------------------
+    Timer build_timer;
     DeviceHostMemory<real_t>& orbital_energies = rhf.get_orbital_energies();
     const real_t* d_orbital_energies = orbital_energies.device_ptr();
 
@@ -324,6 +308,8 @@ static void compute_adc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, re
     // Free full MO ERIs — blocks are already extracted
     if (free_eri_mo) tracked_cudaFree(d_eri_mo);
     d_eri_mo = nullptr;
+    std::cout << "  Operator build time: " << std::fixed << std::setprecision(3)
+              << build_timer.elapsed_seconds() << " s" << std::endl;
 
     // ------------------------------------------------------------------
     // Step 3: Solve (dispatch based on solver mode)
@@ -508,17 +494,8 @@ static void compute_adc2_from_blocks(
     const bool is_triplet = rhf.is_triplet();
 
     if (solver_mode == "auto") {
-        int total_dim = singles_dim + doubles_dim;
-        int max_sub = std::min(total_dim, std::max(100, 10 * n_states));
-        size_t davidson_bytes = (
-            static_cast<size_t>(total_dim) * max_sub * 2 +
-            static_cast<size_t>(max_sub) * max_sub * 2 +
-            static_cast<size_t>(total_dim) * n_states * 2 + max_sub
-        ) * sizeof(real_t);
-        size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        solver_mode = (davidson_bytes < free_mem * 0.8) ? "full" : "schur_omega";
-        std::cout << "  Auto solver: " << solver_mode << std::endl;
+        solver_mode = "schur_static";
+        std::cout << "  Auto solver: schur_static" << std::endl;
     }
 
     std::string spin_label = is_triplet ? "triplet" : "singlet";

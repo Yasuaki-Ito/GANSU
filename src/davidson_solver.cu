@@ -18,6 +18,7 @@
 #include "utils.hpp"
 
 #include <Eigen/Dense>
+#include <chrono>
 
 #ifndef GANSU_CPU_ONLY
 #include <cublas_v2.h>
@@ -221,6 +222,7 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
     initialize_subspace(d_initial_guess);
     num_iterations_ = 0;
     int sigma_computed_ = 0;  // Track how many sigma vectors are up-to-date
+    int subspace_matrix_built_ = 0;  // Track how many columns of H are up-to-date
 
     // Eigenvalue-stability convergence tracking for non-Hermitian problems.
     // The residual can oscillate near the threshold without converging,
@@ -246,8 +248,9 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
         sigma_computed_ = subspace_dim_;
         cudaDeviceSynchronize();
 
-        // Build subspace matrix
-        build_subspace_matrix();
+        // Build subspace matrix (incremental: only new columns)
+        build_subspace_matrix_incremental(subspace_matrix_built_);
+        subspace_matrix_built_ = subspace_dim_;
 
         // Solve subspace eigenvalue problem
         solve_subspace_eigenproblem();
@@ -321,6 +324,7 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
             }
             restart_subspace();
             sigma_computed_ = 0;  // Ritz vectors replaced old basis — recompute sigma
+            subspace_matrix_built_ = 0;  // Subspace matrix must be rebuilt after restart
 
             // Detect eigenvalue collapse after restart for non-Hermitian problems
             if (config_.min_eigenvalue > 0.0) {
@@ -536,6 +540,115 @@ void DavidsonSolver::orthogonalize_vectors(int start_index, int num_vectors) {
 }
 
 // ========== Subspace Matrix Construction ==========
+
+void DavidsonSolver::build_subspace_matrix_incremental(int old_dim) {
+    using Eigen::Map;
+    using Eigen::MatrixXd;
+
+    if (old_dim <= 0 || old_dim >= subspace_dim_) {
+        // Full rebuild needed (first call or after restart)
+        build_subspace_matrix();
+        return;
+    }
+
+    // Incremental update: only compute entries involving new vectors.
+    // H is subspace_dim_ × subspace_dim_ (packed, lda = subspace_dim_).
+    // Old H was old_dim × old_dim (packed, lda = old_dim).
+    // We need to:
+    //   1. Repack old entries from lda=old_dim to lda=subspace_dim_
+    //   2. Compute new column block: H[0:subspace_dim_, old_dim:subspace_dim_] = V_all^T * Σ_new
+    //   3. Compute new row block: H[old_dim:subspace_dim_, 0:old_dim] = V_new^T * Σ_old
+
+    int new_cols = subspace_dim_ - old_dim;
+
+    if (!gpu::gpu_available()) {
+        // Step 1: Repack old H (old_dim × old_dim, lda=old_dim) → top-left of new H (lda=subspace_dim_)
+        // Work backwards to avoid overwriting data we still need
+        std::vector<real_t> old_H(old_dim * old_dim);
+        std::memcpy(old_H.data(), d_subspace_matrix_, old_dim * old_dim * sizeof(real_t));
+        for (int j = old_dim - 1; j >= 0; j--)
+            for (int i = old_dim - 1; i >= 0; i--)
+                d_subspace_matrix_[i + j * subspace_dim_] = old_H[i + j * old_dim];
+
+        Map<MatrixXd> V_all(d_subspace_vectors_, dim_, subspace_dim_);
+        Map<MatrixXd> S_all(d_sigma_vectors_, dim_, subspace_dim_);
+
+        // Step 2: H[:, old_dim:] = V_all^T * Σ_new
+        Map<MatrixXd> S_new(d_sigma_vectors_ + (size_t)old_dim * dim_, dim_, new_cols);
+        Map<MatrixXd> H_right(d_subspace_matrix_ + (size_t)old_dim * subspace_dim_, subspace_dim_, new_cols);
+        H_right.noalias() = V_all.transpose() * S_new;
+
+        // Step 3: H[old_dim:, :old_dim] = V_new^T * Σ_old
+        Map<MatrixXd> V_new(d_subspace_vectors_ + (size_t)old_dim * dim_, dim_, new_cols);
+        Map<MatrixXd> S_old(d_sigma_vectors_, dim_, old_dim);
+        for (int j = 0; j < old_dim; j++)
+            for (int i = 0; i < new_cols; i++) {
+                real_t val = 0.0;
+                for (int k = 0; k < dim_; k++)
+                    val += V_new(k, i) * S_old(k, j);
+                d_subspace_matrix_[(old_dim + i) + j * subspace_dim_] = val;
+            }
+
+        // Symmetrize if needed
+        if (config_.symmetric && subspace_dim_ > 1) {
+            Map<MatrixXd> H(d_subspace_matrix_, subspace_dim_, subspace_dim_);
+            H = (H + H.transpose().eval()) * 0.5;
+        }
+        return;
+    }
+
+    // GPU path
+    cublasHandle_t handle = gansu::gpu::GPUHandle::cublas();
+    const real_t alpha = 1.0;
+    const real_t beta = 0.0;
+
+    // Step 1: Repack old H
+    std::vector<real_t> old_H(old_dim * old_dim);
+    cudaMemcpy(old_H.data(), d_subspace_matrix_, old_dim * old_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
+    // Zero the new matrix area
+    cudaMemset(d_subspace_matrix_, 0, (size_t)subspace_dim_ * subspace_dim_ * sizeof(real_t));
+    // Copy old columns back with new stride
+    for (int j = 0; j < old_dim; j++)
+        cudaMemcpy(d_subspace_matrix_ + j * subspace_dim_,
+                   old_H.data() + j * old_dim,
+                   old_dim * sizeof(real_t), cudaMemcpyHostToDevice);
+
+    // Step 2: H[:, old_dim:] = V_all^T * Σ_new
+    cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                subspace_dim_, new_cols, dim_,
+                &alpha,
+                d_subspace_vectors_, dim_,
+                d_sigma_vectors_ + (size_t)old_dim * dim_, dim_,
+                &beta,
+                d_subspace_matrix_ + (size_t)old_dim * subspace_dim_, subspace_dim_);
+
+    // Step 3: H[old_dim:, :old_dim] = V_new^T * Σ_old
+    // Write into rows [old_dim..subspace_dim_) of columns [0..old_dim)
+    // Use a temp buffer since lda of the destination is subspace_dim_
+    real_t* d_temp = nullptr;
+    tracked_cudaMalloc(&d_temp, (size_t)new_cols * old_dim * sizeof(real_t));
+    cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                new_cols, old_dim, dim_,
+                &alpha,
+                d_subspace_vectors_ + (size_t)old_dim * dim_, dim_,
+                d_sigma_vectors_, dim_,
+                &beta,
+                d_temp, new_cols);
+    // Copy rows into H
+    for (int j = 0; j < old_dim; j++)
+        cudaMemcpy(d_subspace_matrix_ + old_dim + j * subspace_dim_,
+                   d_temp + j * new_cols,
+                   new_cols * sizeof(real_t), cudaMemcpyDeviceToDevice);
+    tracked_cudaFree(d_temp);
+
+    // Symmetrize if needed
+    if (config_.symmetric && subspace_dim_ > 1) {
+        dim3 threads(16, 16);
+        dim3 blocks((subspace_dim_ + 15) / 16, (subspace_dim_ + 15) / 16);
+        symmetrize_matrix_kernel<<<blocks, threads>>>(d_subspace_matrix_, subspace_dim_);
+        cudaDeviceSynchronize();
+    }
+}
 
 void DavidsonSolver::build_subspace_matrix() {
     using Eigen::Map;

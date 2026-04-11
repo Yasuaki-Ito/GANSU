@@ -249,35 +249,11 @@ static void compute_eom_cc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
 
     std::string solver_mode = rhf.get_eom_cc2_solver();
 
-    // Auto solver selection: use schur_omega (exact & efficient) unless full is feasible and small
+    // Auto solver selection: schur_static is the fastest default.
+    // For higher accuracy, use --eom_cc2_solver schur_omega (exact for CC2 since M22 is diagonal).
     if (solver_mode == "auto") {
-        int total_dim = singles_dim + doubles_dim;
-        int max_sub = std::min(total_dim, std::max(200, 20 * n_states));
-        size_t davidson_bytes = (
-            static_cast<size_t>(total_dim) * max_sub * 2 +
-            static_cast<size_t>(max_sub) * max_sub * 2 +
-            static_cast<size_t>(total_dim) * n_states * 2 +
-            max_sub
-        ) * sizeof(real_t);
-
-        size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
-
-        if (davidson_bytes < free_mem * 0.8) {
-            solver_mode = "full";
-            std::cout << "  Auto solver: full Davidson ("
-                      << CudaMemoryManager<real_t>::format_bytes(davidson_bytes)
-                      << " needed, "
-                      << CudaMemoryManager<real_t>::format_bytes(free_mem)
-                      << " available)" << std::endl;
-        } else {
-            solver_mode = "schur_omega";
-            std::cout << "  Auto solver: schur_omega (full Davidson would need "
-                      << CudaMemoryManager<real_t>::format_bytes(davidson_bytes)
-                      << ", only "
-                      << CudaMemoryManager<real_t>::format_bytes(free_mem)
-                      << " available)" << std::endl;
-        }
+        solver_mode = "schur_static";
+        std::cout << "  Auto solver: schur_static" << std::endl;
     }
 
     std::cout << "\n  EOM-CC2 solver=" << solver_mode

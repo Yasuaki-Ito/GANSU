@@ -143,6 +143,7 @@ GANSU also supports a **CPU-only mode** for systems without NVIDIA GPUs, providi
   * cuBLAS 12.9 or later
   * cuSOLVER 11.7 or later
   * [Eigen](https://eigen.tuxfamily.org/) 3.4+ (automatically downloaded via CMake FetchContent)
+  * [OpenBLAS](https://www.openblas.net/) (optional but recommended, `sudo apt install libopenblas-dev` on Ubuntu) — automatically detected by CMake; significantly accelerates CPU-mode computation
 
 #### CPU-only mode (`--cpu`)
 When a GPU is available, pass `--cpu` to force CPU execution. All features are supported with OpenMP parallelization.
