@@ -105,8 +105,42 @@ private:
     real_t* d_f_oo_;       // f_oo[i] = eps_i [nocc]
     real_t* d_f_vv_;       // f_vv[a] = eps_{a+nocc} [nvir]
 
+    void build_intermediates();
+
     // === Diagonal for preconditioner ===
     real_t* d_diagonal_;   // [total_dim] = [D1 | D2]
+
+    // === Pre-contracted intermediates (t2-dependent, computed once in constructor) ===
+    // W1[i,m] = Σ_{n,e,f} t2[i,n,e,f] × K[m,e,n,f]  where K = -ovov + ovov_swap
+    // Used in sigma1 T4, sigma2 S11
+    real_t* d_W1_;         // [nocc * nocc]
+    // W2[a,e] = Σ_{m,n,f} t2[m,n,a,f] × K[m,e,n,f]
+    // Used in sigma1 T5
+    real_t* d_W2_;         // [nvir * nvir]
+    // V12[me,nf] = 8*ovov[m,e,n,f] - 5*ovov[m,f,n,e]  (dressed ERI for S12)
+    real_t* d_V12_;        // [ov * ov] where ov = nocc*nvir
+    // U12[me,jb] = Σ_{nf} V12[me,nf] × r2[j,n,b,f]  (workspace, computed per apply)
+    mutable real_t* d_U12_;  // [ov * ov]
+    // K_sum[m,e,f] = Σ_n K[m,e,n,f] = Σ_n (-ovov[m,e,n,f] + ovov[m,f,n,e])
+    // Used in S5 and T4 sigma1 (through W5)
+    real_t* d_K_sum_;      // [nocc * nvir * nvir]
+    // W5[ij,m] = Σ_{ef} t2[i,j,e,f] × K_sum[m,e,f] — precomputed (nocc² × nocc)
+    // S5: sigma += 1.5 × Σ_m r1[m,a] × W5[ij,m]
+    real_t* d_W5_;         // [nocc * nocc * nocc]
+    // K_mn[mn,ef] = K[m,e,n,f] reshaped for S13 DGEMM
+    real_t* d_K_mn_;       // [nocc*nocc * nvir*nvir]
+    // U13[mn,ij] workspace for S13 (computed per apply)
+    mutable real_t* d_U13_;  // [nocc*nocc * nocc*nocc]
+    // V7[m,e] = Σ_{n,f} r1[n,f] × K2[m,e,n,f] workspace (computed per apply)
+    // K2[me,nf] = 2*ovov[m,e,n,f] - ovov[m,f,n,e]  (dressed ERI for S7)
+    real_t* d_K2_;           // [ov * ov]
+    mutable real_t* d_V7_;   // [nocc * nvir]
+    // W6[ab,e] = Σ_{m,n} t2[m,n,a,b] × K_sum2[m,e,n] — precomputed (nvir² × nvir)
+    real_t* d_W6_;           // [nvir * nvir * nvir]
+    // VVVV_dressed[ab,ef] = vvvv[a,e,b,f] - vvvv[a,f,b,e] — precomputed (nvir² × nvir²)
+    real_t* d_VVVV_dressed_; // [nvir*nvir * nvir*nvir]
+    // U10[ab,ij] workspace for S10 (computed per apply)
+    mutable real_t* d_U10_;  // [nvir*nvir * nocc*nocc]
 
     // === Workspace for apply() ===
     mutable real_t* d_work1_;  // [singles_dim] workspace

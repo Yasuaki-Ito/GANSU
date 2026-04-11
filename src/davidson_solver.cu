@@ -241,12 +241,23 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
         }
 
         // Apply operator only to NEW subspace vectors (not already computed)
-        for (int i = sigma_computed_; i < subspace_dim_; ++i) {
-            linear_op_.apply(&d_subspace_vectors_[static_cast<size_t>(i) * dim_],
-                           &d_sigma_vectors_[static_cast<size_t>(i) * dim_]);
+        {
+            int n_new = subspace_dim_ - sigma_computed_;
+            auto t_start = std::chrono::high_resolution_clock::now();
+            for (int i = sigma_computed_; i < subspace_dim_; ++i) {
+                linear_op_.apply(&d_subspace_vectors_[static_cast<size_t>(i) * dim_],
+                               &d_sigma_vectors_[static_cast<size_t>(i) * dim_]);
+            }
+            sigma_computed_ = subspace_dim_;
+            cudaDeviceSynchronize();
+            if (config_.verbose > 1 && n_new > 0) {
+                auto t_end = std::chrono::high_resolution_clock::now();
+                double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+                std::cout << "  sigma: " << n_new << " vecs, "
+                          << std::fixed << std::setprecision(0) << ms << "ms ("
+                          << std::setprecision(0) << ms / n_new << "ms/vec)" << std::endl;
+            }
         }
-        sigma_computed_ = subspace_dim_;
-        cudaDeviceSynchronize();
 
         // Build subspace matrix (incremental: only new columns)
         build_subspace_matrix_incremental(subspace_matrix_built_);

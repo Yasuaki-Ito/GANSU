@@ -303,7 +303,6 @@ static void compute_eom_cc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
 
     } else if (solver_mode == "schur_static") {
         // ---- Schur complement with ω=0 (approximate but fast) ----
-        // M22 is exactly diagonal → only ω=0 approximation, no M22 diagonal approximation
         std::cout << "  Solving with Schur complement (ω=0, dim=" << singles_dim << ")..." << std::endl;
 
         EOMMP2SchurOperator schur_op(eom_cc2_op);

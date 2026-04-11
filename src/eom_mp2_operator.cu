@@ -47,6 +47,7 @@
 #include <algorithm>
 
 #include "eom_mp2_operator.hpp"
+#include <Eigen/Dense>
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
 #include "utils.hpp"
@@ -292,6 +293,8 @@ __global__ void eom_mp2_sigma1_kernel(
     const real_t* __restrict__ d_eri_ooov,
     const real_t* __restrict__ d_eri_oovv,
     const real_t* __restrict__ d_t2,
+    const real_t* __restrict__ d_W1,
+    const real_t* __restrict__ d_W2,
     const real_t* __restrict__ d_r1,
     const real_t* __restrict__ d_r2,
     real_t* __restrict__ d_sigma1,
@@ -321,37 +324,13 @@ __global__ void eom_mp2_sigma1_kernel(
         }
     }
 
-    // T4: +2 Σ_{m,n,e,f} t^{ef}_{in} r^a_m [-(me|nf) + (mf|ne)]
-    //   (me|nf) = OVOV(m,e,n,f) ✓
-    //   (mf|ne) = OVOV(m,f,n,e) ✓
-    for (int m = 0; m < nocc; m++) {
-        real_t r1_am = R1(m, a);
-        real_t sum_inner = 0.0;
-        for (int n = 0; n < nocc; n++) {
-            for (int e = 0; e < nvir; e++) {
-                for (int f = 0; f < nvir; f++) {
-                    real_t K = -OVOV(m,e,n,f) + OVOV(m,f,n,e);
-                    sum_inner += T2(i,n,e,f) * K;
-                }
-            }
-        }
-        sigma += 1.0 * r1_am * sum_inner;
-    }
+    // T4: +1 Σ_m r^a_m × W1[i,m]  (W1 precomputed)
+    for (int m = 0; m < nocc; m++)
+        sigma += R1(m, a) * d_W1[i * nocc + m];
 
-    // T5: +1 Σ_{m,n,e,f} t^{af}_{mn} r^e_i [-(me|nf) + (mf|ne)]
-    for (int e = 0; e < nvir; e++) {
-        real_t r1_ei = R1(i, e);
-        real_t sum_inner = 0.0;
-        for (int m = 0; m < nocc; m++) {
-            for (int n = 0; n < nocc; n++) {
-                for (int f = 0; f < nvir; f++) {
-                    real_t K = -OVOV(m,e,n,f) + OVOV(m,f,n,e);
-                    sum_inner += T2(m,n,a,f) * K;
-                }
-            }
-        }
-        sigma += 1.0 * r1_ei * sum_inner;
-    }
+    // T5: +1 Σ_e r^e_i × W2[a,e]  (W2 precomputed)
+    for (int e = 0; e < nvir; e++)
+        sigma += R1(i, e) * d_W2[a * nvir + e];
 
     // T6: +1 Σ_{m,n,e} r^{ae}_{mn} [-(mi|ne) + (me|ni)]
     //   (mi|ne): m∈occ,i∈occ,n∈occ,e∈vir → OOOV(m,i,n,e) ✓
@@ -420,6 +399,14 @@ __global__ void eom_mp2_sigma2_kernel(
     const real_t* __restrict__ d_eri_oovv,
     const real_t* __restrict__ d_eri_ovvo,
     const real_t* __restrict__ d_t2,
+    const real_t* __restrict__ d_W1,
+    const real_t* __restrict__ d_W2,
+    const real_t* __restrict__ d_U12,
+    const real_t* __restrict__ d_W5,
+    const real_t* __restrict__ d_U13,
+    const real_t* __restrict__ d_V7,
+    const real_t* __restrict__ d_W6,
+    const real_t* __restrict__ d_U10,
     const real_t* __restrict__ d_r1,
     const real_t* __restrict__ d_r2,
     real_t* __restrict__ d_sigma2,
@@ -467,62 +454,30 @@ __global__ void eom_mp2_sigma2_kernel(
         sigma += 2.0 * R1(j, e) * (ai_be - ae_bi);
     }
 
-    // S5: +1.5 Σ_{m,n,e,f} t^{ef}_{ij} r^a_m [-(me|nf) + (mf|ne)]
-    //   Depends on a,i,j only (constant in b).
-    //   Precompute: K5 = Σ_{n,e,f} t^{ef}_{ij} Σ_m r^a_m [-(me|nf) + (mf|ne)]
-    //   Actually, restructure: Σ_m r^a_m × Σ_{n,e,f} t^{ef}_{ij} × [-(me|nf) + (mf|ne)]
+    // S5: +1.5 Σ_m r1[m,a] × W5[ij,m]  (W5 precomputed)
     {
+        int ij = i * nocc + j;
         real_t sum5 = 0.0;
-        for (int m = 0; m < nocc; m++) {
-            real_t r1_am = R1(m, a);
-            real_t inner = 0.0;
-            for (int n = 0; n < nocc; n++) {
-                for (int e = 0; e < nvir; e++) {
-                    for (int f = 0; f < nvir; f++) {
-                        real_t K = -OVOV(m,e,n,f) + OVOV(m,f,n,e);
-                        inner += T2(i,j,e,f) * K;
-                    }
-                }
-            }
-            sum5 += r1_am * inner;
-        }
+        for (int m = 0; m < nocc; m++)
+            sum5 += R1(m, a) * d_W5[ij * nocc + m];
         sigma += 1.5 * sum5;
     }
 
-    // S6: +1.5 Σ_{m,n,e,f} t^{ab}_{mn} r^e_j [-(me|nf) + (mf|ne)]
-    //   Depends on a,b,j only (constant in i).
+    // S6: +1.5 Σ_e r1[j,e] × W6[ab,e]  (W6 precomputed)
     {
+        int ab = a * nvir + b;
         real_t sum6 = 0.0;
-        for (int e = 0; e < nvir; e++) {
-            real_t r1_ej = R1(j, e);
-            real_t inner = 0.0;
-            for (int m = 0; m < nocc; m++) {
-                for (int n = 0; n < nocc; n++) {
-                    for (int f = 0; f < nvir; f++) {
-                        real_t K = -OVOV(m,e,n,f) + OVOV(m,f,n,e);
-                        inner += T2(m,n,a,b) * K;
-                    }
-                }
-            }
-            sum6 += r1_ej * inner;
-        }
+        for (int e = 0; e < nvir; e++)
+            sum6 += R1(j, e) * d_W6[ab * nvir + e];
         sigma += 1.5 * sum6;
     }
 
-    // S7: +2 Σ_{m,n,e,f} t^{ae}_{im} r^f_n [2(me|nf) - (mf|ne)]
-    //   Depends on a,i only (constant in b,j).
+    // S7: +2 Σ_{m,e} t2[i,m,a,e] × V7[m,e]  (V7 precomputed via DGEMV)
     {
         real_t sum7 = 0.0;
-        for (int m = 0; m < nocc; m++) {
-            for (int n = 0; n < nocc; n++) {
-                for (int e = 0; e < nvir; e++) {
-                    for (int f = 0; f < nvir; f++) {
-                        real_t K = 2.0 * OVOV(m,e,n,f) - OVOV(m,f,n,e);
-                        sum7 += T2(i,m,a,e) * R1(n, f) * K;
-                    }
-                }
-            }
-        }
+        for (int m = 0; m < nocc; m++)
+            for (int e = 0; e < nvir; e++)
+                sum7 += T2(i,m,a,e) * d_V7[m * nvir + e];
         sigma += 2.0 * sum7;
     }
 
@@ -547,63 +502,42 @@ __global__ void eom_mp2_sigma2_kernel(
         }
     }
 
-    // S10: +1.5 Σ_{e,f} r^{ef}_{ij} [(ae|bf) - (af|be)]
-    //   (ae|bf) = VVVV(a,e,b,f) ✓
-    //   (af|be) = VVVV(a,f,b,e) ✓
-    for (int e = 0; e < nvir; e++) {
-        for (int f = 0; f < nvir; f++) {
-            sigma += 1.5 * R2(i, j, e, f) * (VVVV(a,e,b,f) - VVVV(a,f,b,e));
-        }
+    // S10: +1.5 × U10[ab, ij]  (U10 precomputed via DGEMM)
+    {
+        int ab = a * nvir + b;
+        int ij = i * nocc + j;
+        int oo = nocc * nocc;
+        sigma += 1.5 * d_U10[ab * oo + ij];
     }
 
-    // S11: +3 Σ_{m,n,e,f} t^{ef}_{in} r^{ab}_{mj} [-(me|nf) + (mf|ne)]
+    // S11: +3 Σ_m r2[m,j,a,b] × W1[i,m]  (W1 precomputed)
     {
         real_t sum11 = 0.0;
-        for (int m = 0; m < nocc; m++) {
-            real_t r2_ab_mj = R2(m, j, a, b);
-            for (int n = 0; n < nocc; n++) {
-                for (int e = 0; e < nvir; e++) {
-                    for (int f = 0; f < nvir; f++) {
-                        real_t K = -OVOV(m,e,n,f) + OVOV(m,f,n,e);
-                        sum11 += T2(i,n,e,f) * r2_ab_mj * K;
-                    }
-                }
-            }
-        }
+        for (int m = 0; m < nocc; m++)
+            sum11 += R2(m, j, a, b) * d_W1[i * nocc + m];
         sigma += 3.0 * sum11;
     }
 
-    // S12: +1 Σ_{m,n,e,f} t^{ae}_{im} r^{bf}_{jn} [8(me|nf) - 5(mf|ne)]
+    // S12: +1 Σ_{m,e} t2[i,m,a,e] × U12[me,jb]
+    //   where U12[me,jb] = Σ_{nf} V12[me,nf] × r2[j,n,b,f] (precomputed via DGEMM)
     {
+        int ov = nocc * nvir;
+        int jb = j * nvir + b;
         real_t sum12 = 0.0;
-        for (int m = 0; m < nocc; m++) {
-            for (int n = 0; n < nocc; n++) {
-                for (int e = 0; e < nvir; e++) {
-                    real_t t2_ae_im = T2(i,m,a,e);
-                    for (int f = 0; f < nvir; f++) {
-                        real_t K = 8.0 * OVOV(m,e,n,f) - 5.0 * OVOV(m,f,n,e);
-                        sum12 += t2_ae_im * R2(j,n,b,f) * K;
-                    }
-                }
-            }
-        }
+        for (int m = 0; m < nocc; m++)
+            for (int e = 0; e < nvir; e++)
+                sum12 += T2(i,m,a,e) * d_U12[(m*nvir+e)*ov + jb];
         sigma += 1.0 * sum12;
     }
 
-    // S13: +2.5 Σ_{m,n,e,f} t^{ab}_{mn} r^{ef}_{ij} [-(me|nf) + (mf|ne)]
+    // S13: +2.5 Σ_{mn} t2[m,n,a,b] × U13[mn,ij]  (U13 precomputed via DGEMM)
     {
+        int ij = i * nocc + j;
+        int oo = nocc * nocc;
         real_t sum13 = 0.0;
-        for (int m = 0; m < nocc; m++) {
-            for (int n = 0; n < nocc; n++) {
-                real_t t2_ab_mn = T2(m,n,a,b);
-                for (int e = 0; e < nvir; e++) {
-                    for (int f = 0; f < nvir; f++) {
-                        real_t K = -OVOV(m,e,n,f) + OVOV(m,f,n,e);
-                        sum13 += t2_ab_mn * R2(i,j,e,f) * K;
-                    }
-                }
-            }
-        }
+        for (int m = 0; m < nocc; m++)
+            for (int n = 0; n < nocc; n++)
+                sum13 += T2(m,n,a,b) * d_U13[(m*nocc+n)*oo + ij];
         sigma += 2.5 * sum13;
     }
 
@@ -638,11 +572,17 @@ EOMMP2Operator::EOMMP2Operator(
       d_eri_ovvo_(nullptr),
       d_t2_(nullptr), d_D1_(nullptr), d_D2_(nullptr),
       d_f_oo_(nullptr), d_f_vv_(nullptr),
-      d_diagonal_(nullptr), d_work1_(nullptr), d_work2_(nullptr)
+      d_diagonal_(nullptr), d_W1_(nullptr), d_W2_(nullptr),
+      d_V12_(nullptr), d_U12_(nullptr),
+      d_K_sum_(nullptr), d_W5_(nullptr), d_K_mn_(nullptr), d_U13_(nullptr),
+      d_K2_(nullptr), d_V7_(nullptr), d_W6_(nullptr),
+      d_VVVV_dressed_(nullptr), d_U10_(nullptr),
+      d_work1_(nullptr), d_work2_(nullptr)
 {
     extract_eri_blocks(d_eri_mo);
     compute_t2_and_denominators(d_orbital_energies);
     build_diagonal();
+    build_intermediates();
 
     tracked_cudaMalloc(&d_work1_, (size_t)singles_dim_ * sizeof(real_t));
     tracked_cudaMalloc(&d_work2_, (size_t)doubles_dim_ * sizeof(real_t));
@@ -662,6 +602,19 @@ EOMMP2Operator::~EOMMP2Operator() {
     if (d_f_oo_) tracked_cudaFree(d_f_oo_);
     if (d_f_vv_) tracked_cudaFree(d_f_vv_);
     if (d_diagonal_) tracked_cudaFree(d_diagonal_);
+    if (d_W1_) tracked_cudaFree(d_W1_);
+    if (d_W2_) tracked_cudaFree(d_W2_);
+    if (d_V12_) tracked_cudaFree(d_V12_);
+    if (d_U12_) tracked_cudaFree(d_U12_);
+    if (d_K_sum_) tracked_cudaFree(d_K_sum_);
+    if (d_W5_) tracked_cudaFree(d_W5_);
+    if (d_K_mn_) tracked_cudaFree(d_K_mn_);
+    if (d_U13_) tracked_cudaFree(d_U13_);
+    if (d_K2_) tracked_cudaFree(d_K2_);
+    if (d_V7_) tracked_cudaFree(d_V7_);
+    if (d_W6_) tracked_cudaFree(d_W6_);
+    if (d_VVVV_dressed_) tracked_cudaFree(d_VVVV_dressed_);
+    if (d_U10_) tracked_cudaFree(d_U10_);
     if (d_work1_) tracked_cudaFree(d_work1_);
     if (d_work2_) tracked_cudaFree(d_work2_);
 }
@@ -867,6 +820,336 @@ void EOMMP2Operator::build_diagonal() {
     }
 }
 
+// GPU kernel: compute W1[i,m] = Σ_{n,e,f} t2[i,n,e,f] × K[m,e,n,f]
+__global__ void eom_mp2_build_W1_kernel(
+    const real_t* __restrict__ d_t2,
+    const real_t* __restrict__ d_ovov,
+    real_t* __restrict__ d_W1,
+    int nocc, int nvir)
+{
+    int im = blockIdx.x * blockDim.x + threadIdx.x;
+    if (im >= nocc * nocc) return;
+    int i = im / nocc;
+    int m = im % nocc;
+    size_t ovov_stride = (size_t)nvir * nocc * nvir;
+    real_t val = 0.0;
+    for (int n = 0; n < nocc; n++)
+        for (int e = 0; e < nvir; e++)
+            for (int f = 0; f < nvir; f++) {
+                real_t K = -d_ovov[m*ovov_stride + e*nocc*nvir + n*nvir + f]
+                          + d_ovov[m*ovov_stride + f*nocc*nvir + n*nvir + e];
+                val += d_t2[(size_t)i*nocc*nvir*nvir + n*nvir*nvir + e*nvir + f] * K;
+            }
+    d_W1[im] = val;
+}
+
+// GPU kernel: compute W2[a,e] = Σ_{m,n,f} t2[m,n,a,f] × K[m,e,n,f]
+__global__ void eom_mp2_build_W2_kernel(
+    const real_t* __restrict__ d_t2,
+    const real_t* __restrict__ d_ovov,
+    real_t* __restrict__ d_W2,
+    int nocc, int nvir)
+{
+    int ae = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ae >= nvir * nvir) return;
+    int a = ae / nvir;
+    int e = ae % nvir;
+    size_t ovov_stride = (size_t)nvir * nocc * nvir;
+    real_t val = 0.0;
+    for (int m = 0; m < nocc; m++)
+        for (int n = 0; n < nocc; n++)
+            for (int f = 0; f < nvir; f++) {
+                real_t K = -d_ovov[m*ovov_stride + e*nocc*nvir + n*nvir + f]
+                          + d_ovov[m*ovov_stride + f*nocc*nvir + n*nvir + e];
+                val += d_t2[(size_t)m*nocc*nvir*nvir + n*nvir*nvir + a*nvir + f] * K;
+            }
+    d_W2[ae] = val;
+}
+
+void EOMMP2Operator::build_intermediates() {
+    int nocc = nocc_, nvir = nvir_;
+    size_t oo_size = (size_t)nocc * nocc;
+    size_t vv_size = (size_t)nvir * nvir;
+
+    tracked_cudaMalloc(&d_W1_, oo_size * sizeof(real_t));
+    tracked_cudaMalloc(&d_W2_, vv_size * sizeof(real_t));
+
+    if (!gpu::gpu_available()) {
+        size_t ovov_stride = (size_t)nvir * nocc * nvir;
+        #pragma omp parallel for
+        for (int im = 0; im < (int)oo_size; im++) {
+            int i = im / nocc;
+            int m = im % nocc;
+            real_t val = 0.0;
+            for (int n = 0; n < nocc; n++)
+                for (int e = 0; e < nvir; e++)
+                    for (int f = 0; f < nvir; f++) {
+                        real_t K = -d_eri_ovov_[m*ovov_stride + e*nocc*nvir + n*nvir + f]
+                                  + d_eri_ovov_[m*ovov_stride + f*nocc*nvir + n*nvir + e];
+                        val += d_t2_[(size_t)i*nocc*nvir*nvir + n*nvir*nvir + e*nvir + f] * K;
+                    }
+            d_W1_[im] = val;
+        }
+        #pragma omp parallel for
+        for (int ae = 0; ae < (int)vv_size; ae++) {
+            int a = ae / nvir;
+            int e = ae % nvir;
+            real_t val = 0.0;
+            for (int m = 0; m < nocc; m++)
+                for (int n = 0; n < nocc; n++)
+                    for (int f = 0; f < nvir; f++) {
+                        real_t K = -d_eri_ovov_[m*ovov_stride + e*nocc*nvir + n*nvir + f]
+                                  + d_eri_ovov_[m*ovov_stride + f*nocc*nvir + n*nvir + e];
+                        val += d_t2_[(size_t)m*nocc*nvir*nvir + n*nvir*nvir + a*nvir + f] * K;
+                    }
+            d_W2_[ae] = val;
+        }
+    } else {
+        int threads = 256;
+        int blocks1 = ((int)oo_size + threads - 1) / threads;
+        eom_mp2_build_W1_kernel<<<blocks1, threads>>>(d_t2_, d_eri_ovov_, d_W1_, nocc, nvir);
+        int blocks2 = ((int)vv_size + threads - 1) / threads;
+        eom_mp2_build_W2_kernel<<<blocks2, threads>>>(d_t2_, d_eri_ovov_, d_W2_, nocc, nvir);
+        cudaDeviceSynchronize();
+    }
+
+    // K_sum[m,e,f] = Σ_n (-ovov[m,e,n,f] + ovov[m,f,n,e])
+    // Used for S5 (via W5) and S6
+    size_t mef_size = (size_t)nocc * nvir * nvir;
+    // Copy ovov to host for intermediate construction
+    size_t ovov_total = (size_t)nocc * nvir * nocc * nvir;
+    size_t ovov_stride = (size_t)nvir * nocc * nvir;
+    std::vector<real_t> h_ovov(ovov_total);
+    if (gpu::gpu_available())
+        cudaMemcpy(h_ovov.data(), d_eri_ovov_, ovov_total * sizeof(real_t), cudaMemcpyDeviceToHost);
+    else
+        std::memcpy(h_ovov.data(), d_eri_ovov_, ovov_total * sizeof(real_t));
+
+    tracked_cudaMalloc(&d_K_sum_, mef_size * sizeof(real_t));
+    {
+        std::vector<real_t> h_K_sum(mef_size);
+        #pragma omp parallel for
+        for (int idx = 0; idx < (int)mef_size; idx++) {
+            int m = idx / (nvir * nvir);
+            int rem = idx % (nvir * nvir);
+            int e = rem / nvir;
+            int f = rem % nvir;
+            real_t val = 0.0;
+            for (int n = 0; n < nocc; n++)
+                val += -h_ovov[m*ovov_stride + e*nocc*nvir + n*nvir + f]
+                      + h_ovov[m*ovov_stride + f*nocc*nvir + n*nvir + e];
+            h_K_sum[idx] = val;
+        }
+        if (gpu::gpu_available())
+            cudaMemcpy(d_K_sum_, h_K_sum.data(), mef_size * sizeof(real_t), cudaMemcpyHostToDevice);
+        else
+            std::memcpy(d_K_sum_, h_K_sum.data(), mef_size * sizeof(real_t));
+    }
+
+    // W5[ij, m] = Σ_{ef} t2[i,j,e,f] × K_sum[m,e,f]
+    // Reshape: t2 as (nocc², nvir²), K_sum as (nocc, nvir²) → K_sum^T as (nvir², nocc)
+    // W5 = t2 × K_sum^T → (nocc² × nocc) via DGEMM
+    size_t oo_nocc = (size_t)nocc * nocc * nocc;
+    tracked_cudaMalloc(&d_W5_, oo_nocc * sizeof(real_t));
+    {
+        int vv = nvir * nvir;
+        int oo = nocc * nocc;
+        if (!gpu::gpu_available()) {
+            // CPU: Eigen DGEMM
+            using Eigen::Map;
+            using Eigen::MatrixXd;
+            Map<MatrixXd> T2_mat(d_t2_, oo, vv);        // (nocc², nvir²) row-major but Eigen col-major...
+            // Actually t2 is stored row-major as t2[i*nocc*nvir*nvir + j*nvir*nvir + a*nvir + b]
+            // Treat as (oo × vv) row-major → for Eigen col-major, transpose
+            // W5[ij,m] = Σ_{ef} t2[ij,ef] × K_sum[m,ef]
+            // = t2_mat × K_sum_mat^T where both are row-major
+            // In Eigen col-major: W5 = K_sum × t2^T then transpose
+            // Simpler: just do it with loops
+            #pragma omp parallel for
+            for (int ij = 0; ij < oo; ij++) {
+                for (int m = 0; m < nocc; m++) {
+                    real_t val = 0.0;
+                    for (int ef = 0; ef < vv; ef++)
+                        val += d_t2_[(size_t)ij * vv + ef] * d_K_sum_[(size_t)m * vv + ef];
+                    d_W5_[(size_t)ij * nocc + m] = val;
+                }
+            }
+        } else {
+            // GPU: use matrixMatrixProductRect
+            // t2: (oo × vv), K_sum: (nocc × vv) → W5 = t2 × K_sum^T = (oo × nocc)
+            gpu::matrixMatrixProductRect(d_t2_, d_K_sum_, d_W5_, oo, nocc, vv,
+                                         false, true);  // A × B^T
+        }
+    }
+
+    // K_mn[(mn), (ef)] = K[m,e,n,f] reshaped for S13 DGEMM
+    // S13 = Σ_{mn} t2[m,n,a,b] × Σ_{ef} K[m,e,n,f] × r2[i,j,e,f]
+    // W13[mn,ij] = Σ_{ef} K_mn[mn,ef] × r2[ij,ef]  (DGEMM per apply)
+    // Then S13 += 2.5 × Σ_{mn} t2[mn,ab] × W13[mn,ij]
+    size_t oo_vv = (size_t)nocc * nocc * nvir * nvir;
+    tracked_cudaMalloc(&d_K_mn_, oo_vv * sizeof(real_t));
+    tracked_cudaMalloc(&d_U13_, (size_t)nocc * nocc * nocc * nocc * sizeof(real_t));
+    {
+        size_t ovov_stride = (size_t)nvir * nocc * nvir;
+        // h_ovov already computed above, reuse
+        std::vector<real_t> h_K_mn(oo_vv);
+        #pragma omp parallel for
+        for (int idx = 0; idx < (int)oo_vv; idx++) {
+            int mn = idx / (nvir * nvir);
+            int ef = idx % (nvir * nvir);
+            int m = mn / nocc, n = mn % nocc;
+            int e = ef / nvir, f = ef % nvir;
+            h_K_mn[idx] = -h_ovov[m*ovov_stride + e*nocc*nvir + n*nvir + f]
+                         + h_ovov[m*ovov_stride + f*nocc*nvir + n*nvir + e];
+        }
+        if (gpu::gpu_available())
+            cudaMemcpy(d_K_mn_, h_K_mn.data(), oo_vv * sizeof(real_t), cudaMemcpyHostToDevice);
+        else
+            std::memcpy(d_K_mn_, h_K_mn.data(), oo_vv * sizeof(real_t));
+    }
+
+    // K_sum2[m,e,n] = Σ_f (-ovov[m,e,n,f] + ovov[m,f,n,e])
+    // Then W6[ab,e] = Σ_{m,n} t2[m,n,a,b] × K_sum2[m,e,n]
+    // = t2_reshape(nvir², nocc²) × K_sum2_reshape(nocc², nvir) → (nvir² × nvir) via DGEMM
+    {
+        int oo = nocc * nocc;
+        int vv = nvir * nvir;
+        size_t men_size = (size_t)nocc * nvir * nocc;
+
+        // Build K_sum2 on host: K_sum2[m*nvir*nocc + e*nocc + n] = Σ_f K[m,e,n,f]
+        // Reshape as K_sum2_mn_e[(m*nocc+n), e] for DGEMM: (nocc², nvir)
+        std::vector<real_t> h_K_sum2_mn_e((size_t)oo * nvir, 0.0);
+        #pragma omp parallel for
+        for (int mn = 0; mn < oo; mn++) {
+            int m = mn / nocc, n = mn % nocc;
+            for (int e = 0; e < nvir; e++) {
+                real_t val = 0.0;
+                for (int f = 0; f < nvir; f++)
+                    val += -h_ovov[m*ovov_stride + e*nocc*nvir + n*nvir + f]
+                          + h_ovov[m*ovov_stride + f*nocc*nvir + n*nvir + e];
+                h_K_sum2_mn_e[mn * nvir + e] = val;
+            }
+        }
+
+        // W6[ab,e] = Σ_{mn} t2[mn,ab] × K_sum2[mn,e]
+        // t2: (oo × vv), K_sum2: (oo × nvir) → W6 = t2^T × K_sum2 = (vv × nvir)
+        size_t w6_size = (size_t)vv * nvir;
+        tracked_cudaMalloc(&d_W6_, w6_size * sizeof(real_t));
+
+        if (!gpu::gpu_available()) {
+            #pragma omp parallel for
+            for (int ab = 0; ab < vv; ab++) {
+                for (int e = 0; e < nvir; e++) {
+                    real_t val = 0.0;
+                    for (int mn = 0; mn < oo; mn++)
+                        val += d_t2_[(size_t)mn * vv + ab] * h_K_sum2_mn_e[mn * nvir + e];
+                    d_W6_[(size_t)ab * nvir + e] = val;
+                }
+            }
+        } else {
+            // Upload K_sum2 to GPU and DGEMM
+            real_t* d_K_sum2 = nullptr;
+            tracked_cudaMalloc(&d_K_sum2, (size_t)oo * nvir * sizeof(real_t));
+            cudaMemcpy(d_K_sum2, h_K_sum2_mn_e.data(), (size_t)oo * nvir * sizeof(real_t), cudaMemcpyHostToDevice);
+            // W6 = t2^T × K_sum2: (vv × oo) × (oo × nvir) → (vv × nvir)
+            gpu::matrixMatrixProductRect(d_t2_, d_K_sum2, d_W6_, vv, nvir, oo,
+                                         true, false);  // A^T × B
+            tracked_cudaFree(d_K_sum2);
+        }
+    }
+
+    // VVVV_dressed[ab,ef] = vvvv[a,e,b,f] - vvvv[a,f,b,e] (for S10)
+    {
+        int vv = nvir * nvir;
+        size_t vv2 = (size_t)vv * vv;
+        tracked_cudaMalloc(&d_VVVV_dressed_, vv2 * sizeof(real_t));
+        tracked_cudaMalloc(&d_U10_, (size_t)vv * nocc * nocc * sizeof(real_t));
+
+        std::vector<real_t> h_vvvv((size_t)nvir * nvir * nvir * nvir);
+        if (gpu::gpu_available())
+            cudaMemcpy(h_vvvv.data(), d_eri_vvvv_, h_vvvv.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+        else
+            std::memcpy(h_vvvv.data(), d_eri_vvvv_, h_vvvv.size() * sizeof(real_t));
+
+        std::vector<real_t> h_VD(vv2);
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < vv2; idx++) {
+            int ab = (int)(idx / vv);
+            int ef = (int)(idx % vv);
+            int a = ab / nvir, b = ab % nvir;
+            int e = ef / nvir, f = ef % nvir;
+            // vvvv[a,e,b,f]: (a*nvir+e)*nvir*nvir + b*nvir + f
+            // vvvv[a,f,b,e]: (a*nvir+f)*nvir*nvir + b*nvir + e
+            h_VD[idx] = h_vvvv[(size_t)(a*nvir+e)*nvir*nvir + b*nvir + f]
+                      - h_vvvv[(size_t)(a*nvir+f)*nvir*nvir + b*nvir + e];
+        }
+        if (gpu::gpu_available())
+            cudaMemcpy(d_VVVV_dressed_, h_VD.data(), vv2 * sizeof(real_t), cudaMemcpyHostToDevice);
+        else
+            std::memcpy(d_VVVV_dressed_, h_VD.data(), vv2 * sizeof(real_t));
+    }
+
+    // K2[me,nf] = 2*ovov[m,e,n,f] - ovov[m,f,n,e]  (for S7)
+    size_t ov = (size_t)nocc * nvir;
+    size_t ov2 = ov * ov;
+    tracked_cudaMalloc(&d_K2_, ov2 * sizeof(real_t));
+    tracked_cudaMalloc(&d_V7_, ov * sizeof(real_t));
+    {
+        std::vector<real_t> h_K2(ov2);
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < ov2; idx++) {
+            int me = (int)(idx / ov);
+            int nf = (int)(idx % ov);
+            int m = me / nvir, e = me % nvir;
+            int n = nf / nvir, f = nf % nvir;
+            h_K2[idx] = 2.0 * h_ovov[m*ovov_stride + e*nocc*nvir + n*nvir + f]
+                       - h_ovov[m*ovov_stride + f*nocc*nvir + n*nvir + e];
+        }
+        if (gpu::gpu_available())
+            cudaMemcpy(d_K2_, h_K2.data(), ov2 * sizeof(real_t), cudaMemcpyHostToDevice);
+        else
+            std::memcpy(d_K2_, h_K2.data(), ov2 * sizeof(real_t));
+    }
+
+    // V12[me, nf] = 8*ovov[m,e,n,f] - 5*ovov[m,f,n,e]
+    // Stored as (ov × ov) matrix for DGEMM in S12
+    tracked_cudaMalloc(&d_V12_, ov2 * sizeof(real_t));
+    tracked_cudaMalloc(&d_U12_, ov2 * sizeof(real_t));
+
+    if (!gpu::gpu_available()) {
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < ov2; idx++) {
+            int me = (int)(idx / ov);
+            int nf = (int)(idx % ov);
+            int m = me / nvir, e = me % nvir;
+            int n = nf / nvir, f = nf % nvir;
+            size_t ovov_stride = (size_t)nvir * nocc * nvir;
+            d_V12_[idx] = 8.0 * d_eri_ovov_[m*ovov_stride + e*nocc*nvir + n*nvir + f]
+                        - 5.0 * d_eri_ovov_[m*ovov_stride + f*nocc*nvir + n*nvir + e];
+        }
+    } else {
+        // Build V12 on GPU: simple element-wise kernel
+        size_t ovov_stride = (size_t)nvir * nocc * nvir;
+        // Use a lambda-like approach via small kernel
+        int threads = 256;
+        int blocks = ((int)ov2 + threads - 1) / threads;
+        // Inline: copy ovov and compute V12 on host, upload
+        std::vector<real_t> h_ovov((size_t)nocc*nvir*nocc*nvir);
+        cudaMemcpy(h_ovov.data(), d_eri_ovov_, h_ovov.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+        std::vector<real_t> h_V12(ov2);
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < ov2; idx++) {
+            int me = (int)(idx / ov);
+            int nf = (int)(idx % ov);
+            int m = me / nvir, e = me % nvir;
+            int n = nf / nvir, f = nf % nvir;
+            h_V12[idx] = 8.0 * h_ovov[m*ovov_stride + e*nocc*nvir + n*nvir + f]
+                       - 5.0 * h_ovov[m*ovov_stride + f*nocc*nvir + n*nvir + e];
+        }
+        cudaMemcpy(d_V12_, h_V12.data(), ov2 * sizeof(real_t), cudaMemcpyHostToDevice);
+    }
+}
+
 void EOMMP2Operator::apply(const real_t* d_input, real_t* d_output) const {
     const real_t* d_r1 = d_input;
     const real_t* d_r2 = d_input + singles_dim_;
@@ -898,24 +1181,12 @@ void EOMMP2Operator::apply(const real_t* d_input, real_t* d_output) const {
             for (int m = 0; m < nocc; m++)
                 for (int e = 0; e < nvir; e++)
                     sigma += 1.0 * CPU_R1(m, e) * (2.0 * CPU_OVOV(i, a, m, e) - CPU_OOVV(m, i, a, e));
-            for (int m = 0; m < nocc; m++) {
-                real_t r1_am = CPU_R1(m, a);
-                real_t sum_inner = 0.0;
-                for (int n = 0; n < nocc; n++)
-                    for (int e = 0; e < nvir; e++)
-                        for (int f = 0; f < nvir; f++)
-                            sum_inner += CPU_T2(i,n,e,f) * (-CPU_OVOV(m,e,n,f) + CPU_OVOV(m,f,n,e));
-                sigma += 1.0 * r1_am * sum_inner;
-            }
-            for (int e = 0; e < nvir; e++) {
-                real_t r1_ei = CPU_R1(i, e);
-                real_t sum_inner = 0.0;
-                for (int m = 0; m < nocc; m++)
-                    for (int n = 0; n < nocc; n++)
-                        for (int f = 0; f < nvir; f++)
-                            sum_inner += CPU_T2(m,n,a,f) * (-CPU_OVOV(m,e,n,f) + CPU_OVOV(m,f,n,e));
-                sigma += 1.0 * r1_ei * sum_inner;
-            }
+            // T4: use precomputed W1
+            for (int m = 0; m < nocc; m++)
+                sigma += CPU_R1(m, a) * d_W1_[i * nocc + m];
+            // T5: use precomputed W2
+            for (int e = 0; e < nvir; e++)
+                sigma += CPU_R1(i, e) * d_W2_[a * nvir + e];
             for (int m = 0; m < nocc; m++)
                 for (int n = 0; n < nocc; n++)
                     for (int e = 0; e < nvir; e++)
@@ -925,6 +1196,63 @@ void EOMMP2Operator::apply(const real_t* d_input, real_t* d_output) const {
                     for (int f = 0; f < nvir; f++)
                         sigma += 2.0 * CPU_R2(i, m, e, f) * (CPU_VVOV(a, e, m, f) - CPU_VVOV(a, f, m, e));
             d_sigma1[ia] = sigma;
+        }
+
+        // CPU: Pre-compute U10 for S10
+        {
+            int vv = nvir * nvir;
+            int oo2 = nocc * nocc;
+            using Eigen::Map;
+            using Eigen::MatrixXd;
+            Map<MatrixXd> VD(d_VVVV_dressed_, vv, vv);
+            Map<MatrixXd> R2_mat(const_cast<real_t*>(d_r2), oo2, vv);
+            Map<MatrixXd> U10(d_U10_, vv, oo2);
+            U10.noalias() = VD * R2_mat.transpose();
+        }
+
+        // CPU: Pre-compute V7 for S7
+        {
+            int ov_int = nocc * nvir;
+            using Eigen::Map;
+            using Eigen::MatrixXd;
+            using Eigen::VectorXd;
+            Map<MatrixXd> K2(d_K2_, ov_int, ov_int);
+            Map<VectorXd> r1_vec(const_cast<real_t*>(d_r1), ov_int);
+            Map<VectorXd> v7(d_V7_, ov_int);
+            v7.noalias() = K2 * r1_vec;
+        }
+
+        // CPU: Pre-compute U13 for S13
+        {
+            int oo = nocc * nocc;
+            int vv = nvir * nvir;
+            // U13[mn,ij] = Σ_{ef} K_mn[mn,ef] × r2[ij,ef]
+            using Eigen::Map;
+            using Eigen::MatrixXd;
+            Map<MatrixXd> K_mn(d_K_mn_, oo, vv);
+            // r2 is (oo × vv) row-major
+            Map<MatrixXd> R2_mat(const_cast<real_t*>(d_r2), oo, vv);
+            Map<MatrixXd> U13(d_U13_, oo, oo);
+            U13.noalias() = K_mn * R2_mat.transpose();
+        }
+
+        // CPU: Pre-compute U12 for S12
+        {
+            int ov = nocc * nvir;
+            // Transpose r2[j,n,b,f] → r2_T[nf, jb]
+            std::vector<real_t> r2_T((size_t)ov * ov);
+            #pragma omp parallel for
+            for (int idx2 = 0; idx2 < ov * ov; idx2++) {
+                int nf = idx2 / ov, jb = idx2 % ov;
+                int n = nf / nvir, f = nf % nvir;
+                int j2 = jb / nvir, b2 = jb % nvir;
+                r2_T[idx2] = d_r2[(size_t)j2*nocc*nvir*nvir + n*nvir*nvir + b2*nvir + f];
+            }
+            // U12 = V12 × r2_T via Eigen
+            Eigen::Map<Eigen::MatrixXd> V12(d_V12_, ov, ov);
+            Eigen::Map<Eigen::MatrixXd> R2T(r2_T.data(), ov, ov);
+            Eigen::Map<Eigen::MatrixXd> U12(d_U12_, ov, ov);
+            U12.noalias() = V12 * R2T;
         }
 
         // CPU sigma2
@@ -943,39 +1271,25 @@ void EOMMP2Operator::apply(const real_t* d_input, real_t* d_output) const {
                 sigma += 2.0 * CPU_R1(m, a) * (-CPU_OOOV(i, m, j, b) + CPU_OOOV(j, m, i, b));
             for (int e = 0; e < nvir; e++)
                 sigma += 2.0 * CPU_R1(j, e) * (CPU_VVOV(b, e, i, a) - CPU_VVOV(a, e, i, b));
-            { // S5
+            { // S5: use precomputed W5
+                int ij = i * nocc + j;
                 real_t sum5 = 0.0;
-                for (int m = 0; m < nocc; m++) {
-                    real_t r1_am = CPU_R1(m, a);
-                    real_t inner = 0.0;
-                    for (int n = 0; n < nocc; n++)
-                        for (int e = 0; e < nvir; e++)
-                            for (int f = 0; f < nvir; f++)
-                                inner += CPU_T2(i,j,e,f) * (-CPU_OVOV(m,e,n,f) + CPU_OVOV(m,f,n,e));
-                    sum5 += r1_am * inner;
-                }
+                for (int m = 0; m < nocc; m++)
+                    sum5 += CPU_R1(m, a) * d_W5_[ij * nocc + m];
                 sigma += 1.5 * sum5;
             }
-            { // S6
+            { // S6: use precomputed W6
+                int ab = a * nvir + b;
                 real_t sum6 = 0.0;
-                for (int e = 0; e < nvir; e++) {
-                    real_t r1_ej = CPU_R1(j, e);
-                    real_t inner = 0.0;
-                    for (int m = 0; m < nocc; m++)
-                        for (int n = 0; n < nocc; n++)
-                            for (int f = 0; f < nvir; f++)
-                                inner += CPU_T2(m,n,a,b) * (-CPU_OVOV(m,e,n,f) + CPU_OVOV(m,f,n,e));
-                    sum6 += r1_ej * inner;
-                }
+                for (int e = 0; e < nvir; e++)
+                    sum6 += CPU_R1(j, e) * d_W6_[(size_t)ab * nvir + e];
                 sigma += 1.5 * sum6;
             }
-            { // S7
+            { // S7: use precomputed V7
                 real_t sum7 = 0.0;
                 for (int m = 0; m < nocc; m++)
-                    for (int n = 0; n < nocc; n++)
-                        for (int e = 0; e < nvir; e++)
-                            for (int f = 0; f < nvir; f++)
-                                sum7 += CPU_T2(i,m,a,e) * CPU_R1(n, f) * (2.0 * CPU_OVOV(m,e,n,f) - CPU_OVOV(m,f,n,e));
+                    for (int e = 0; e < nvir; e++)
+                        sum7 += CPU_T2(i,m,a,e) * d_V7_[m * nvir + e];
                 sigma += 2.0 * sum7;
             }
             for (int m = 0; m < nocc; m++)
@@ -984,40 +1298,34 @@ void EOMMP2Operator::apply(const real_t* d_input, real_t* d_output) const {
             for (int m = 0; m < nocc; m++)
                 for (int e = 0; e < nvir; e++)
                     sigma += 1.0 * CPU_R2(i, m, a, e) * (-3.0 * CPU_OOVV(m, j, b, e) + 4.0 * CPU_OVVO(m, e, b, j));
-            for (int e = 0; e < nvir; e++)
-                for (int f = 0; f < nvir; f++)
-                    sigma += 1.5 * CPU_R2(i, j, e, f) * (CPU_VVVV(a,e,b,f) - CPU_VVVV(a,f,b,e));
-            { // S11
+            { // S10: use precomputed U10
+                int ab = a * nvir + b;
+                int ij2 = i * nocc + j;
+                int oo2 = nocc * nocc;
+                sigma += 1.5 * d_U10_[ab * oo2 + ij2];
+            }
+            { // S11: use precomputed W1
                 real_t sum11 = 0.0;
-                for (int m = 0; m < nocc; m++) {
-                    real_t r2_ab_mj = CPU_R2(m, j, a, b);
-                    for (int n = 0; n < nocc; n++)
-                        for (int e = 0; e < nvir; e++)
-                            for (int f = 0; f < nvir; f++)
-                                sum11 += CPU_T2(i,n,e,f) * r2_ab_mj * (-CPU_OVOV(m,e,n,f) + CPU_OVOV(m,f,n,e));
-                }
+                for (int m = 0; m < nocc; m++)
+                    sum11 += CPU_R2(m, j, a, b) * d_W1_[i * nocc + m];
                 sigma += 3.0 * sum11;
             }
-            { // S12
+            { // S12: use precomputed U12
+                int ov = nocc * nvir;
+                int jb = j * nvir + b;
                 real_t sum12 = 0.0;
                 for (int m = 0; m < nocc; m++)
-                    for (int n = 0; n < nocc; n++)
-                        for (int e = 0; e < nvir; e++) {
-                            real_t t2_ae_im = CPU_T2(i,m,a,e);
-                            for (int f = 0; f < nvir; f++)
-                                sum12 += t2_ae_im * CPU_R2(j,n,b,f) * (8.0 * CPU_OVOV(m,e,n,f) - 5.0 * CPU_OVOV(m,f,n,e));
-                        }
+                    for (int e = 0; e < nvir; e++)
+                        sum12 += CPU_T2(i,m,a,e) * d_U12_[(m*nvir+e)*ov + jb];
                 sigma += 1.0 * sum12;
             }
-            { // S13
+            { // S13: use precomputed U13
+                int ij = i * nocc + j;
+                int oo = nocc * nocc;
                 real_t sum13 = 0.0;
                 for (int m = 0; m < nocc; m++)
-                    for (int n = 0; n < nocc; n++) {
-                        real_t t2_ab_mn = CPU_T2(m,n,a,b);
-                        for (int e = 0; e < nvir; e++)
-                            for (int f = 0; f < nvir; f++)
-                                sum13 += t2_ab_mn * CPU_R2(i,j,e,f) * (-CPU_OVOV(m,e,n,f) + CPU_OVOV(m,f,n,e));
-                    }
+                    for (int n = 0; n < nocc; n++)
+                        sum13 += CPU_T2(m,n,a,b) * d_U13_[(m*nocc+n)*oo + ij];
                 sigma += 2.5 * sum13;
             }
             d_sigma2[idx] = sigma;
@@ -1040,15 +1348,86 @@ void EOMMP2Operator::apply(const real_t* d_input, real_t* d_output) const {
         eom_mp2_sigma1_kernel<<<blocks1, threads>>>(
             d_f_oo_, d_f_vv_,
             d_eri_ovov_, d_eri_vvov_, d_eri_ooov_, d_eri_oovv_,
-            d_t2_, d_r1, d_r2, d_sigma1,
+            d_t2_, d_W1_, d_W2_,
+            d_r1, d_r2, d_sigma1,
             nocc_, nvir_);
+
+        // Pre-compute U12[me,jb] = Σ_{nf} V12[me,nf] × r2_reshape[nf,jb] via DGEMM
+        // r2 is stored as r2[j,n,b,f] = r2[(j*nocc+n)*nvir*nvir + b*nvir + f]
+        // We need r2 reshaped as (nf, jb) = (nocc*nvir, nocc*nvir)
+        // r2[j,n,b,f] → index nf = n*nvir+f, jb = j*nvir+b
+        // But r2 layout is [j][n][b][f] → for fixed (n,f), stride over (j,b) is non-contiguous
+        // Need to transpose r2: r2_T[n,f,j,b] from r2[j,n,b,f]
+        {
+            int ov = nocc_ * nvir_;
+            real_t* d_r2_T = nullptr;
+            tracked_cudaMalloc(&d_r2_T, (size_t)ov * ov * sizeof(real_t));
+
+            // Transpose: r2_T[nf,jb] = r2[j,n,b,f] where nf=n*nvir+f, jb=j*nvir+b
+            if (!gpu::gpu_available()) {
+                #pragma omp parallel for
+                for (int idx = 0; idx < ov * ov; idx++) {
+                    int nf = idx / ov, jb = idx % ov;
+                    int n = nf / nvir_, f = nf % nvir_;
+                    int j = jb / nvir_, b = jb % nvir_;
+                    d_r2_T[idx] = d_r2[(size_t)j*nocc_*nvir_*nvir_ + n*nvir_*nvir_ + b*nvir_ + f];
+                }
+            } else {
+                // Copy r2 to host, transpose, upload
+                std::vector<real_t> h_r2((size_t)doubles_dim_);
+                cudaMemcpy(h_r2.data(), d_r2, (size_t)doubles_dim_ * sizeof(real_t), cudaMemcpyDeviceToHost);
+                std::vector<real_t> h_r2_T((size_t)ov * ov);
+                #pragma omp parallel for
+                for (int idx = 0; idx < ov * ov; idx++) {
+                    int nf = idx / ov, jb = idx % ov;
+                    int n = nf / nvir_, f = nf % nvir_;
+                    int j = jb / nvir_, b = jb % nvir_;
+                    h_r2_T[idx] = h_r2[(size_t)j*nocc_*nvir_*nvir_ + n*nvir_*nvir_ + b*nvir_ + f];
+                }
+                cudaMemcpy(d_r2_T, h_r2_T.data(), (size_t)ov * ov * sizeof(real_t), cudaMemcpyHostToDevice);
+            }
+
+            // U12 = V12 × r2_T  (ov×ov) × (ov×ov) → (ov×ov)
+            gpu::matrixMatrixProduct(d_V12_, d_r2_T, d_U12_, nocc_ * nvir_);
+            tracked_cudaFree(d_r2_T);
+        }
+
+        // Pre-compute U10[ab,ij] = Σ_{ef} VVVV_dressed[ab,ef] × r2[ij,ef]^T via DGEMM
+        {
+            int vv = nvir_ * nvir_;
+            int oo = nocc_ * nocc_;
+            // VVVV_dressed: (vv × vv), r2: (oo × vv) → U10 = VVVV_dressed × r2^T = (vv × oo)
+            gpu::matrixMatrixProductRect(d_VVVV_dressed_, d_r2, d_U10_, vv, oo, vv,
+                                         false, true);
+        }
+
+        // Pre-compute V7[me] = Σ_{nf} K2[me,nf] × r1[nf] via DGEMV
+        {
+            int ov_int = nocc_ * nvir_;
+            const real_t alpha = 1.0, beta_zero = 0.0;
+            cublasDgemv(gpu::GPUHandle::cublas(), CUBLAS_OP_N,
+                        ov_int, ov_int, &alpha,
+                        d_K2_, ov_int,
+                        d_r1, 1,
+                        &beta_zero, d_V7_, 1);
+        }
+
+        // Pre-compute U13[mn,ij] = Σ_{ef} K_mn[mn,ef] × r2[ij,ef] via DGEMM
+        {
+            int oo = nocc_ * nocc_;
+            int vv = nvir_ * nvir_;
+            // K_mn: (oo × vv), r2: (oo × vv) → U13 = K_mn × r2^T = (oo × oo)
+            gpu::matrixMatrixProductRect(d_K_mn_, d_r2, d_U13_, oo, oo, vv,
+                                         false, true);
+        }
 
         int blocks2 = (doubles_dim_ + threads - 1) / threads;
         eom_mp2_sigma2_kernel<<<blocks2, threads>>>(
             d_f_oo_, d_f_vv_,
             d_eri_ovov_, d_eri_vvov_, d_eri_ooov_,
             d_eri_oooo_, d_eri_vvvv_, d_eri_oovv_, d_eri_ovvo_,
-            d_t2_, d_r1, d_r2, d_sigma2,
+            d_t2_, d_W1_, d_W2_, d_U12_, d_W5_, d_U13_, d_V7_, d_W6_, d_U10_,
+            d_r1, d_r2, d_sigma2,
             nocc_, nvir_);
 
         cudaDeviceSynchronize();

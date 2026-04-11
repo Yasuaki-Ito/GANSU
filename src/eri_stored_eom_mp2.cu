@@ -105,6 +105,9 @@ static void solve_eom_mp2_full(
 }
 
 
+// Forward declaration
+static void build_dense_from_operator(LinearOperator& op, real_t* d_dense, int dim);
+
 // ========================================================================
 //  Solver mode: schur_static — approximate Schur complement (ω=0)
 // ========================================================================
@@ -125,7 +128,7 @@ static void solve_eom_mp2_schur_static(
     config.max_subspace_size = std::min(singles_dim, std::max(100, 10 * n_states));
     config.max_iterations = 500;
     config.use_preconditioner = true;
-    config.symmetric = false;  // EOM-MP2 Schur complement is not guaranteed symmetric
+    config.symmetric = false;
     config.verbose = 2;
 
     DavidsonSolver solver(schur_op, config);
