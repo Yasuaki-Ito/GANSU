@@ -213,9 +213,9 @@ static void solve_eom_mp2_schur_omega(
     excitation_energies.resize(n_states);
     h_eigenvectors.resize((size_t)n_states * singles_dim);
 
-    // Phase 2: Per-root ω iteration
+    // Phase 2: Per-root ω iteration, starting from schur_static (Phase 1) initial guess
     for (int k = 0; k < n_states; k++) {
-        real_t omega = 0.0;
+        real_t omega = h_eigenvalues[k];  // Skip redundant ω=0 rebuild per root
         bool converged = false;
 
         for (int iter = 0; iter < max_omega_iter; iter++) {

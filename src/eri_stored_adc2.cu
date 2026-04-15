@@ -114,8 +114,6 @@ static void solve_schur_omega(
 
     std::cout << "  Solving with omega-dependent Schur complement..." << std::endl;
 
-    // Use partialEigenDecomposition to compute only the lowest n_states eigenvalues.
-    // This is O(ov² × n_states) instead of O(ov³), massive speedup for large systems.
     real_t* d_M_eff = nullptr;
     real_t* d_eigenvalues = nullptr;
     real_t* d_eigenvectors = nullptr;
@@ -124,6 +122,7 @@ static void solve_schur_omega(
     tracked_cudaMalloc(&d_eigenvectors, (size_t)singles_dim * singles_dim * sizeof(real_t));
 
     // Phase 1: Initial solve with ω=0 (= schur_static) for initial guesses
+    // Use partial eigendecomposition (cusolverDnXsyevdx) — only need n_states lowest.
     adc2_op.build_M_eff_matrix(0.0, d_M_eff);
     gpu::eigenDecomposition(d_M_eff, d_eigenvalues, d_eigenvectors, singles_dim);
 
