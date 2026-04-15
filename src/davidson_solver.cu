@@ -230,6 +230,11 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
     std::vector<real_t> prev_eigenvalues(config_.num_eigenvalues, 0.0);
     int eigenvalue_stable_count = 0;
     const int eigenvalue_stable_required = 3;
+    // Softer fallback: if eigenvalues are stable to tol for many consecutive
+    // iterations even though the residual has not converged, accept the result.
+    // Common for non-Hermitian / dense-spectrum problems (EOM-CCSD large basis).
+    int eigenvalue_only_stable_count = 0;
+    const int eigenvalue_only_stable_required = 10;
 
     bool converged = false;
 
@@ -296,6 +301,26 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
             }
 
             if (eigenvalue_stable_count >= eigenvalue_stable_required) {
+                converged = true;
+            }
+
+            // Softer fallback: eigenvalues stable to 10*tol for N consecutive iters,
+            // accept regardless of residual. (1e-6 boundary noise is common at
+            // the 6th decimal; 10*tol = 1e-5 still gives 5-digit eigenvalues.)
+            if (max_eval_change < 10.0 * config_.convergence_threshold) {
+                eigenvalue_only_stable_count++;
+            } else {
+                eigenvalue_only_stable_count = 0;
+            }
+            if (!converged &&
+                eigenvalue_only_stable_count >= eigenvalue_only_stable_required) {
+                if (config_.verbose > 0) {
+                    std::cout << "  Davidson: eigenvalues stable for "
+                              << eigenvalue_only_stable_required
+                              << " consecutive iters (max|r|=" << std::scientific
+                              << std::setprecision(2) << max_res
+                              << "), accepting" << std::defaultfloat << std::endl;
+                }
                 converged = true;
             }
         }

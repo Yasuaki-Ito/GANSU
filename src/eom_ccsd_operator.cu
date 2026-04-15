@@ -256,6 +256,148 @@ __global__ void eom_ccsd_symmetrize_r2_kernel(
 #define TAU_HALF(m,n,a,b) d_tau_half[(size_t)(m)*nocc*nvir*nvir + (size_t)(n)*nvir*nvir + (size_t)(a)*nvir + (b)]
 
 // ========================================================================
+//  R-dependent small intermediates (af_tmp, ni_tmp, eb_tmp, ni_tmp2,
+//  mnij_tmp, tau_half). Each kernel parallelizes over output indices and
+//  reduces internally — direct port of the host loops.
+// ========================================================================
+
+__global__ void eom_ccsd_af_tmp_kernel(
+    const real_t* __restrict__ d_eri_ovvv,
+    const real_t* __restrict__ d_r1,
+    real_t* __restrict__ d_af_tmp,
+    int nocc, int nvir)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nvir * nvir) return;
+    int a = idx / nvir;
+    int f = idx % nvir;
+    real_t val = 0.0;
+    for (int m = 0; m < nocc; m++)
+        for (int e = 0; e < nvir; e++) {
+            real_t r = R1(m, e);
+            val += (2.0 * OVVV(m, e, a, f) - OVVV(m, f, a, e)) * r;
+        }
+    d_af_tmp[idx] = val;
+}
+
+__global__ void eom_ccsd_ni_tmp_kernel(
+    const real_t* __restrict__ d_woOoV,
+    const real_t* __restrict__ d_r1,
+    real_t* __restrict__ d_ni_tmp,
+    int nocc, int nvir)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nocc * nocc) return;
+    int n = idx / nocc;
+    int i = idx % nocc;
+    real_t val = 0.0;
+    for (int m = 0; m < nocc; m++)
+        for (int e = 0; e < nvir; e++) {
+            real_t r = R1(m, e);
+            val += (2.0 * woOoV(n, m, i, e) - woOoV(m, n, i, e)) * r;
+        }
+    d_ni_tmp[idx] = val;
+}
+
+// eb_tmp[e,b] = Σ_n en_tmp[e,n]*t1[n,b]
+//             + Σ_{m,n,f} ovov[m,e,n,f] * (2*r2[m,n,b,f] - r2[m,n,f,b])
+//   where en_tmp[e,n] = Σ_{m,f} (2*ovov[m,f,n,e] - ovov[m,e,n,f]) * r1[m,f]
+__global__ void eom_ccsd_eb_tmp_kernel(
+    const real_t* __restrict__ d_eri_ovov,
+    const real_t* __restrict__ d_t1,
+    const real_t* __restrict__ d_r1,
+    const real_t* __restrict__ d_r2,
+    real_t* __restrict__ d_eb_tmp,
+    int nocc, int nvir)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nvir * nvir) return;
+    int e = idx / nvir;
+    int b = idx % nvir;
+    real_t val = 0.0;
+    // Part A: Σ_n en_tmp[e,n]*t1[n,b]
+    for (int n = 0; n < nocc; n++) {
+        real_t en_tmp = 0.0;
+        for (int m = 0; m < nocc; m++)
+            for (int f = 0; f < nvir; f++) {
+                real_t r = R1(m, f);
+                en_tmp += (2.0 * OVOV(m, f, n, e) - OVOV(m, e, n, f)) * r;
+            }
+        val += en_tmp * T1(n, b);
+    }
+    // Part B: Σ_{m,n,f} ovov[m,e,n,f] * theta_r[m,n,b,f]
+    for (int m = 0; m < nocc; m++)
+        for (int n = 0; n < nocc; n++)
+            for (int f = 0; f < nvir; f++) {
+                real_t theta = 2.0 * R2(m, n, b, f) - R2(m, n, f, b);
+                val += OVOV(m, e, n, f) * theta;
+            }
+    d_eb_tmp[idx] = val;
+}
+
+__global__ void eom_ccsd_ni_tmp2_kernel(
+    const real_t* __restrict__ d_eri_ovov,
+    const real_t* __restrict__ d_r2,
+    real_t* __restrict__ d_ni_tmp2,
+    int nocc, int nvir)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nocc * nocc) return;
+    int n = idx / nocc;
+    int i = idx % nocc;
+    real_t val = 0.0;
+    for (int e = 0; e < nvir; e++)
+        for (int m = 0; m < nocc; m++)
+            for (int f = 0; f < nvir; f++) {
+                real_t theta = 2.0 * R2(i, m, e, f) - R2(i, m, f, e);
+                val += OVOV(n, e, m, f) * theta;
+            }
+    d_ni_tmp2[idx] = val;
+}
+
+__global__ void eom_ccsd_mnij_tmp_kernel(
+    const real_t* __restrict__ d_eri_ovov,
+    const real_t* __restrict__ d_tau2,
+    real_t* __restrict__ d_mnij_tmp,
+    int nocc, int nvir)
+{
+    size_t total = (size_t)nocc * nocc * nocc * nocc;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int m = idx / (nocc * nocc * nocc);
+    int rem = idx % (nocc * nocc * nocc);
+    int n = rem / (nocc * nocc);
+    rem %= (nocc * nocc);
+    int i = rem / nocc;
+    int j = rem % nocc;
+    real_t val = 0.0;
+    for (int e = 0; e < nvir; e++)
+        for (int f = 0; f < nvir; f++)
+            val += OVOV(m, e, n, f) * TAU2(i, j, e, f);
+    d_mnij_tmp[idx] = val;
+}
+
+// tau_half[m,n,a,b] = 0.5*t2[m,n,a,b] + 0.25*(t1[m,a]*t1[n,b] + t1[n,a]*t1[m,b])
+__global__ void eom_ccsd_tau_half_kernel(
+    const real_t* __restrict__ d_t1,
+    const real_t* __restrict__ d_t2,
+    real_t* __restrict__ d_tau_half,
+    int nocc, int nvir)
+{
+    size_t total = (size_t)nocc * nocc * nvir * nvir;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int m = idx / (nocc * nvir * nvir);
+    int rem = idx % (nocc * nvir * nvir);
+    int n = rem / (nvir * nvir);
+    rem %= (nvir * nvir);
+    int a = rem / nvir;
+    int b = rem % nvir;
+    d_tau_half[idx] = 0.5 * T2(m, n, a, b)
+                    + 0.25 * (T1(m, a) * T1(n, b) + T1(n, a) * T1(m, b));
+}
+
+// ========================================================================
 //  Half σ2 kernel — PySCF eeccsd_matvec_singlet algorithm
 // ========================================================================
 
@@ -1485,12 +1627,42 @@ void EOMCCSDOperator::apply(const real_t* d_input, real_t* d_output) const {
         cudaDeviceSynchronize();
     }
 
-    // Step 2: Compute small R-dependent intermediates on host
+    // Step 2: Compute small R-dependent intermediates
     size_t t1_sz = (size_t)NO * NV;
     size_t t2_sz = (size_t)NO * NO * NV * NV;
     size_t ovov_sz = (size_t)NO * NV * NO * NV;
     size_t ooov_sz = (size_t)NO * NO * NO * NV;
+    size_t oooo_sz = (size_t)NO * NO * NO * NO;
 
+    // Allocate device intermediates (used by both paths)
+    real_t *d_af_tmp, *d_ni_tmp, *d_eb_tmp, *d_ni_tmp2, *d_mnij_tmp, *d_tau_half;
+    tracked_cudaMalloc(&d_af_tmp, NV * NV * sizeof(real_t));
+    tracked_cudaMalloc(&d_ni_tmp, NO * NO * sizeof(real_t));
+    tracked_cudaMalloc(&d_eb_tmp, NV * NV * sizeof(real_t));
+    tracked_cudaMalloc(&d_ni_tmp2, NO * NO * sizeof(real_t));
+    tracked_cudaMalloc(&d_mnij_tmp, oooo_sz * sizeof(real_t));
+    tracked_cudaMalloc(&d_tau_half, t2_sz * sizeof(real_t));
+
+    if (gpu::gpu_available()) {
+        // GPU path: launch kernels directly on device buffers (no host roundtrip)
+        int threads = 256;
+        eom_ccsd_af_tmp_kernel<<<(NV*NV + threads-1)/threads, threads>>>(
+            d_eri_ovvv_, d_r1, d_af_tmp, NO, NV);
+        eom_ccsd_ni_tmp_kernel<<<(NO*NO + threads-1)/threads, threads>>>(
+            d_woOoV_, d_r1, d_ni_tmp, NO, NV);
+        eom_ccsd_eb_tmp_kernel<<<(NV*NV + threads-1)/threads, threads>>>(
+            d_eri_ovov_, d_t1_, d_r1, d_r2_sym, d_eb_tmp, NO, NV);
+        eom_ccsd_ni_tmp2_kernel<<<(NO*NO + threads-1)/threads, threads>>>(
+            d_eri_ovov_, d_r2_sym, d_ni_tmp2, NO, NV);
+        size_t mnij_blocks = (oooo_sz + threads - 1) / threads;
+        eom_ccsd_mnij_tmp_kernel<<<mnij_blocks, threads>>>(
+            d_eri_ovov_, d_tau2, d_mnij_tmp, NO, NV);
+        size_t tau_blocks = (t2_sz + threads - 1) / threads;
+        eom_ccsd_tau_half_kernel<<<tau_blocks, threads>>>(
+            d_t1_, d_t2_, d_tau_half, NO, NV);
+        cudaDeviceSynchronize();
+    } else {
+    // ----- CPU host fallback (kept verbatim) -----
     std::vector<real_t> h_r1(t1_sz), h_r2(t2_sz), h_t1(t1_sz), h_t2(t2_sz);
     std::vector<real_t> h_ovov(ovov_sz), h_ovvv((size_t)NO*NV*NV*NV);
     std::vector<real_t> h_tau2(t2_sz);
@@ -1586,7 +1758,6 @@ void EOMCCSDOperator::apply(const real_t* d_input, real_t* d_output) const {
         }
 
     // mnij_tmp[m,n,i,j] = Σ_{e,f} ovov[m,e,n,f] * tau2[i,j,e,f]
-    size_t oooo_sz = (size_t)NO * NO * NO * NO;
     std::vector<real_t> h_mnij_tmp(oooo_sz, 0.0);
     for (int m = 0; m < NO; m++)
         for (int n = 0; n < NO; n++)
@@ -1610,21 +1781,14 @@ void EOMCCSDOperator::apply(const real_t* d_input, real_t* d_output) const {
                         0.5 * h_t2[t2_idx(m,n,a,b)]
                         + 0.25 * (h_t1[m*NV+a]*h_t1[n*NV+b] + h_t1[n*NV+a]*h_t1[m*NV+b]);
 
-    // Step 3: Upload small intermediates to device
-    real_t *d_af_tmp, *d_ni_tmp, *d_eb_tmp, *d_ni_tmp2, *d_mnij_tmp, *d_tau_half;
-    tracked_cudaMalloc(&d_af_tmp, NV * NV * sizeof(real_t));
-    tracked_cudaMalloc(&d_ni_tmp, NO * NO * sizeof(real_t));
-    tracked_cudaMalloc(&d_eb_tmp, NV * NV * sizeof(real_t));
-    tracked_cudaMalloc(&d_ni_tmp2, NO * NO * sizeof(real_t));
-    tracked_cudaMalloc(&d_mnij_tmp, oooo_sz * sizeof(real_t));
-    tracked_cudaMalloc(&d_tau_half, t2_sz * sizeof(real_t));
-
+    // Upload host-computed intermediates to (already-allocated) device buffers
     cudaMemcpy(d_af_tmp, h_af_tmp.data(), NV*NV*sizeof(real_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_ni_tmp, h_ni_tmp.data(), NO*NO*sizeof(real_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_eb_tmp, h_eb_tmp.data(), NV*NV*sizeof(real_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_ni_tmp2, h_ni_tmp2.data(), NO*NO*sizeof(real_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_mnij_tmp, h_mnij_tmp.data(), oooo_sz*sizeof(real_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_tau_half, h_tau_half.data(), t2_sz*sizeof(real_t), cudaMemcpyHostToDevice);
+    }  // end CPU host-fallback block
 
     // Step 4: Launch half_sigma2 kernel
     if (!gpu::gpu_available()) {
