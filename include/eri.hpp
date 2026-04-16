@@ -140,6 +140,16 @@ public:
     }
 
     /**
+     * @brief Compute CCSD 1-RDM (non-relaxed correlation density)
+     * @details Solves CCSD Lambda equations and constructs the spin-traced
+     *          1-RDM D_pq in MO basis, then transforms to AO. Stored via
+     *          RHF::set_ccsd_1rdm_{ao,mo}. Mainly for DMET solver use.
+     */
+    virtual void compute_ccsd_density(){
+        THROW_EXCEPTION("CCSD density is not supported for the selected ERI method.");
+    }
+
+    /**
      * @brief Compute CCSD(T) energy
         * @return CCSD(T) energy
         * @details This function computes the CCSD(T) energy.
@@ -237,6 +247,7 @@ public:
             || method == PostHFMethod::CC2  // The stored ERI method supports CC2
             || method == PostHFMethod::CCSD // The stored ERI method supports CCSD
             || method == PostHFMethod::CCSD_T // The stored ERI method supports CCSD(T)
+            || method == PostHFMethod::CCSD_DENSITY // CCSD + 1-RDM (Lambda)
             || method == PostHFMethod::CIS  // The stored ERI method supports CIS
             || method == PostHFMethod::ADC2 // The stored ERI method supports ADC(2)
             || method == PostHFMethod::ADC2X // The stored ERI method supports ADC(2)-x

@@ -187,6 +187,8 @@ set(SOURCES
     src/eri_stored_eom_cc2.cu
     src/eom_ccsd_operator.cu
     src/eri_stored_eom_ccsd.cu
+    src/ccsd_lambda.cu
+    src/ccsd_lambda_gpu.cu
     src/oscillator_strength.cu
     src/eri_stored_mp4.cu
     src/cphf_solver.cu

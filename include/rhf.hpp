@@ -881,6 +881,7 @@ public:
     real_t compute_cc2_energy() override;
     real_t compute_ccsd_energy() override;
     real_t compute_ccsd_t_energy() override;
+    void compute_ccsd_density() override;
     real_t compute_fci_energy() override;
     void compute_cis(int n_states) override;
     void compute_adc2(int n_states) override;

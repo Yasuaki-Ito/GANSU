@@ -25,6 +25,7 @@ enum class PostHFMethod {
     CC2,
     CCSD,
     CCSD_T,
+    CCSD_DENSITY,  // CCSD + Lambda + 1-RDM (DMET / property analysis)
     CIS,
     ADC2,
     ADC2X,

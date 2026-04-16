@@ -199,6 +199,10 @@ void RHF::post_process_after_scf() {
         post_hf_energy_ = eri_method_->compute_ccsd_energy();
     }else if(post_hf_method == PostHFMethod::CCSD_T){
         post_hf_energy_ = eri_method_->compute_ccsd_t_energy();
+    }else if(post_hf_method == PostHFMethod::CCSD_DENSITY){
+        // compute_ccsd_density() runs CCSD internally and stores energy via
+        // set_post_hf_energy(); avoid redundant CCSD solve.
+        eri_method_->compute_ccsd_density();
     }else if(post_hf_method == PostHFMethod::CIS){
         eri_method_->compute_cis(get_n_excited_states());
     }else if(post_hf_method == PostHFMethod::ADC2){

@@ -23,6 +23,7 @@
 #include "eri_stored.hpp"
 #include "device_host_memory.hpp"
 #include "cphf_solver.hpp"
+#include "ccsd_lambda.hpp"
 
 #include "ao2mo.cuh"
 
@@ -8109,6 +8110,133 @@ real_t ERI_Stored_RHF::compute_ccsd_energy() {
         return result;
     }
     return compute_ccsd_energy_impl(rhf_, eri_matrix_.device_ptr(), ccsd_algorithm_);
+}
+
+// ----------------------------------------------------------------------------
+//  CCSD 1-RDM (Lambda density) for ERI_Stored_RHF — DMET / property analysis
+// ----------------------------------------------------------------------------
+
+void ERI_Stored_RHF::compute_ccsd_density() {
+    PROFILE_FUNCTION();
+
+    const int num_basis = rhf_.get_num_basis();
+    const int num_occ = rhf_.get_num_electrons() / 2;
+    const int num_vir = num_basis - num_occ;
+    const size_t N4 = (size_t)num_basis * num_basis * num_basis * num_basis;
+    const size_t t1_sz = (size_t)num_occ * num_vir;
+    const size_t t2_sz = (size_t)num_occ * num_occ * num_vir * num_vir;
+
+    std::cout << "\n---- CCSD 1-RDM (Lambda density) ----" << std::endl;
+    std::cout << "  nocc=" << num_occ << " nvir=" << num_vir
+              << " nao=" << num_basis << std::endl;
+
+    const real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+    const real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+
+    // Step 1: Build full MO ERI (used by both CCSD solver and Lambda step)
+    real_t* d_eri_mo = nullptr;
+    if (gpu::gpu_available()) {
+        tracked_cudaMalloc(&d_eri_mo, N4 * sizeof(real_t));
+        transform_ao_eri_to_mo_eri_4stage(eri_matrix_.device_ptr(), d_C, num_basis, d_eri_mo);
+    } else {
+        d_eri_mo = build_mo_eri(d_C, num_basis);  // CPU AO->MO via Eigen
+    }
+
+    // Step 2: Solve CCSD T amplitudes (returned as device pointers)
+    real_t* d_t1 = nullptr;
+    real_t* d_t2 = nullptr;
+    real_t E_CCSD = ccsd_spatial_orbital(eri_matrix_.device_ptr(), d_C, d_eps,
+                                          num_basis, num_occ, false, nullptr,
+                                          &d_t1, &d_t2, d_eri_mo);
+    rhf_.set_post_hf_energy(E_CCSD);
+    std::cout << "  CCSD energy: " << std::fixed << std::setprecision(10)
+              << E_CCSD << " Ha" << std::endl;
+
+    // Step 3: Lambda solver (GPU when available, CPU fallback)
+    auto& D_mo = rhf_.get_ccsd_1rdm_mo();
+    auto& D_ao = rhf_.get_ccsd_1rdm_ao();
+    D_mo.assign((size_t)num_basis * num_basis, 0.0);
+    D_ao.assign((size_t)num_basis * num_basis, 0.0);
+
+    if (gpu::gpu_available()) {
+        // GPU path: keep amplitudes/eri on device, no host roundtrip
+        real_t *d_l1=nullptr, *d_l2=nullptr, *d_D_mo=nullptr;
+        tracked_cudaMalloc(&d_l1, t1_sz * sizeof(real_t));
+        tracked_cudaMalloc(&d_l2, t2_sz * sizeof(real_t));
+        tracked_cudaMalloc(&d_D_mo, (size_t)num_basis * num_basis * sizeof(real_t));
+
+        bool conv = solve_ccsd_lambda_gpu(num_occ, num_vir, d_eps, d_eri_mo,
+                                          d_t1, d_t2, d_l1, d_l2,
+                                          100, 1e-8, 1);
+        if (!conv) std::cout << "  Warning: Lambda did not fully converge" << std::endl;
+
+        // Diagnostic ||λ|| via cuBLAS
+        {
+            real_t n1, n2;
+            cublasDnrm2(gpu::GPUHandle::cublas(), (int)t1_sz, d_l1, 1, &n1);
+            cublasDnrm2(gpu::GPUHandle::cublas(), (int)t2_sz, d_l2, 1, &n2);
+            std::cout << "  ||l1||=" << std::scientific << std::setprecision(8) << n1
+                      << "  ||l2||=" << n2 << std::defaultfloat << std::endl;
+        }
+
+        build_ccsd_1rdm_mo_gpu(num_occ, num_vir, d_t1, d_t2, d_l1, d_l2, d_D_mo);
+
+        // Download D_MO and AO transform on host (cheap)
+        cudaMemcpy(D_mo.data(), d_D_mo, (size_t)num_basis * num_basis * sizeof(real_t),
+                   cudaMemcpyDeviceToHost);
+        std::vector<real_t> h_C(num_basis * num_basis);
+        cudaMemcpy(h_C.data(), d_C, num_basis * num_basis * sizeof(real_t), cudaMemcpyDeviceToHost);
+        transform_density_mo_to_ao_cpu(num_basis, h_C.data(), D_mo.data(), D_ao.data());
+
+        tracked_cudaFree(d_l1); tracked_cudaFree(d_l2); tracked_cudaFree(d_D_mo);
+    } else {
+        // CPU fallback
+        std::vector<real_t> h_t1(t1_sz), h_t2(t2_sz), h_eri_mo(N4), h_eps(num_basis), h_C(num_basis*num_basis);
+        cudaMemcpy(h_t1.data(),     d_t1,     t1_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_t2.data(),     d_t2,     t2_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_eri_mo.data(), d_eri_mo, N4    * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_eps.data(),    d_eps,    num_basis * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_C.data(),      d_C,      num_basis*num_basis * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+        std::vector<real_t> h_l1(t1_sz), h_l2(t2_sz);
+        bool conv = solve_ccsd_lambda_cpu(num_occ, num_vir, h_eps.data(), h_eri_mo.data(),
+                                          h_t1.data(), h_t2.data(),
+                                          h_l1.data(), h_l2.data(), 100, 1e-8, 1);
+        if (!conv) std::cout << "  Warning: Lambda did not fully converge" << std::endl;
+        {
+            real_t n1 = 0.0, n2 = 0.0;
+            for (size_t k = 0; k < t1_sz; k++) n1 += h_l1[k]*h_l1[k];
+            for (size_t k = 0; k < t2_sz; k++) n2 += h_l2[k]*h_l2[k];
+            std::cout << "  ||l1||=" << std::scientific << std::setprecision(8)
+                      << std::sqrt(n1) << "  ||l2||=" << std::sqrt(n2)
+                      << std::defaultfloat << std::endl;
+        }
+        build_ccsd_1rdm_mo_cpu(num_occ, num_vir, h_t1.data(), h_t2.data(),
+                               h_l1.data(), h_l2.data(), D_mo.data());
+        transform_density_mo_to_ao_cpu(num_basis, h_C.data(), D_mo.data(), D_ao.data());
+    }
+
+    // Step 6: Sanity check — Tr(D_AO @ S) should equal Ne = 2*nocc
+    const real_t* d_S = rhf_.get_overlap_matrix().device_ptr();
+    std::vector<real_t> h_S((size_t)num_basis * num_basis);
+    cudaMemcpy(h_S.data(), d_S, num_basis*num_basis*sizeof(real_t), cudaMemcpyDeviceToHost);
+    real_t trace = 0.0;
+    for (int p = 0; p < num_basis; p++)
+      for (int q = 0; q < num_basis; q++)
+        trace += D_ao[p*num_basis + q] * h_S[q*num_basis + p];
+    std::cout << "  Tr(D_AO·S) = " << std::fixed << std::setprecision(8) << trace
+              << " (expected " << (2*num_occ) << ")" << std::endl;
+
+    // Diagnostic: D_MO diagonal (for PySCF comparison)
+    std::cout << "  D_MO diagonal:";
+    for (int p = 0; p < num_basis; p++)
+        std::cout << " " << std::fixed << std::setprecision(6) << D_mo[p*num_basis + p];
+    std::cout << std::endl;
+
+    // Cleanup
+    tracked_cudaFree(d_t1);
+    tracked_cudaFree(d_t2);
+    tracked_cudaFree(d_eri_mo);
 }
 
 real_t ERI_RI_RHF::compute_ccsd_energy() {

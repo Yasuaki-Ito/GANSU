@@ -274,6 +274,12 @@ public:
      */
     void set_post_hf_energy(real_t energy) { post_hf_energy_ = energy; }
 
+    /// CCSD 1-RDM accessors (for DMET / property post-analysis)
+    std::vector<real_t>& get_ccsd_1rdm_mo() { return ccsd_1rdm_mo_; }
+    std::vector<real_t>& get_ccsd_1rdm_ao() { return ccsd_1rdm_ao_; }
+    const std::vector<real_t>& get_ccsd_1rdm_mo() const { return ccsd_1rdm_mo_; }
+    const std::vector<real_t>& get_ccsd_1rdm_ao() const { return ccsd_1rdm_ao_; }
+
     /**
      * @brief Get the number of excited states to compute
      */
@@ -403,6 +409,10 @@ protected:
     std::vector<real_t> excitation_energies_; ///< Excitation energies (CIS/EOM)
     std::vector<real_t> oscillator_strengths_; ///< Oscillator strengths (CIS/EOM)
     std::string excited_state_report_; ///< Formatted excited state report for final summary
+
+    // CCSD 1-RDM (correlation density, non-relaxed). Filled by CCSD_DENSITY method.
+    std::vector<real_t> ccsd_1rdm_mo_; ///< [nao*nao] row-major, MO basis (incl. HF reference)
+    std::vector<real_t> ccsd_1rdm_ao_; ///< [nao*nao] row-major, AO basis
 
 
     // for Diect SCF

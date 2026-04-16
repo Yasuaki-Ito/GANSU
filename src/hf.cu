@@ -140,6 +140,9 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     }else if(post_hf_method_str == "ccsd_t"){
         std::cout << "Message: Post-HF method is CCSD(T)." << std::endl;
         post_hf_method_ = PostHFMethod::CCSD_T;
+    }else if(post_hf_method_str == "ccsd_density"){
+        std::cout << "Message: Post-HF method is CCSD + 1-RDM (Lambda density)." << std::endl;
+        post_hf_method_ = PostHFMethod::CCSD_DENSITY;
     }else if(post_hf_method_str == "cis"){
         std::cout << "Message: Post-HF method is CIS." << std::endl;
         post_hf_method_ = PostHFMethod::CIS;
