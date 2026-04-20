@@ -44,10 +44,12 @@ public:
 
         ParameterManager parameters; // Create a new ParameterManager without setting default values
 
-        // Load the parameters if the parameter file is given
+        // Load the parameters if the parameter file is given (skip empty string)
         if(arg_parameters.contains("parameter_file")){
             const std::string parameter_file = arg_parameters.get<std::string>(std::string("parameter_file"));
-            parameters.load_from_file(parameter_file);
+            if(!parameter_file.empty()){
+                parameters.load_from_file(parameter_file);
+            }
         }
 
         // add the command line arguments, which will overwrite the parameters from the file if the same parameter is specified.
@@ -108,10 +110,12 @@ public:
     static real_t buildOptimizer(const ParameterManager& arg_parameters){
         ParameterManager parameters; // Create a new ParameterManager without setting default values
 
-        // Load the parameters if the parameter file is given
+        // Load the parameters if the parameter file is given (skip empty string)
         if(arg_parameters.contains("parameter_file")){
             const std::string parameter_file = arg_parameters.get<std::string>(std::string("parameter_file"));
-            parameters.load_from_file(parameter_file);
+            if(!parameter_file.empty()){
+                parameters.load_from_file(parameter_file);
+            }
         }
 
         // add the command line arguments, which will overwrite the parameters from the file if the same parameter is specified.

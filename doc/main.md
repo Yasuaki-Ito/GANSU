@@ -129,13 +129,13 @@ make
 ```
 4. Run the H2 molecule example:
 ``` bash
-./HF_main -x ../xyz/H2.xyz -g ../basis/sto-3g.gbs -m RHF
+./gansu -x ../xyz/H2.xyz -g ../basis/sto-3g.gbs -m RHF
 ```
 
 ### Usage
 Usage
 ```
-./HF_main [options]
+./gansu [options]
 ```
 
 Please see \ref parameters for [options].
@@ -155,7 +155,7 @@ Short options:
 
 ##### Example 1: H2 molecule
 ``` bash
-./HF_main -x ../xyz/H2.xyz -g ../basis/sto-3g.gbs -m RHF
+./gansu -x ../xyz/H2.xyz -g ../basis/sto-3g.gbs -m RHF
 ```
 
 ##### Example 2: H2O molecule using a parameter recipe file
@@ -163,11 +163,11 @@ Command-line option "-p" specifies the parameter recipe file that contains pre-d
 
 How to give the parameter recipe file:
 ``` bash
-./HF_main -p ../parameter_recipe/RHF_OptimalDamping.txt -x ../xyz/H2.xyz -g ../basis/cc-pvdz.gbs
+./gansu -p ../parameter_recipe/RHF_OptimalDamping.txt -x ../xyz/H2.xyz -g ../basis/cc-pvdz.gbs
 ```
 This command is equivalent to the following command:
 ``` bash
-./HF_main --parameter_file ../parameter_recipe/RHF_OptimalDamping.txt --xyzfilename ../xyz/H2.xyz --gbsfilename ../basis/cc-pvdz.gbs
+./gansu --parameter_file ../parameter_recipe/RHF_OptimalDamping.txt --xyzfilename ../xyz/H2.xyz --gbsfilename ../basis/cc-pvdz.gbs
 ```
 
 

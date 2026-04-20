@@ -23,6 +23,9 @@ else()
 endif()
 
 
+# Enable PIC globally (required for shared library libgansu.so)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Uncomment the following line if f- or g-orbital basis functions are present.
 # add_definitions(-DENABLE_F_INT1E)
 # add_definitions(-DENABLE_G_INT1E)
@@ -204,6 +207,7 @@ if(NOT ENABLE_GPU)
 endif()
 
 add_library(gansu STATIC ${SOURCES})
+set_target_properties(gansu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(gansu PRIVATE PROFILE_ENABLED)
 target_compile_definitions(gansu PRIVATE CONSOLE_COLOR_ENABLED)
 target_link_libraries(gansu
@@ -245,6 +249,21 @@ endif()
 
 
 # ============================================================================
+# Shared library for C API / Python binding
+# ============================================================================
+set(API_SOURCE src/gansu_api.cu)
+if(NOT ENABLE_GPU)
+    set_source_files_properties(${API_SOURCE} PROPERTIES LANGUAGE CXX)
+endif()
+
+add_library(gansu_shared SHARED ${API_SOURCE})
+target_compile_definitions(gansu_shared PRIVATE PROFILE_ENABLED)
+target_link_libraries(gansu_shared gansu)
+set_target_properties(gansu_shared PROPERTIES
+    OUTPUT_NAME "gansu"
+    POSITION_INDEPENDENT_CODE ON)
+
+# ============================================================================
 # Main executable
 # ============================================================================
 set(MAIN_SOURCE src/HF_main.cu)
@@ -252,6 +271,13 @@ if(NOT ENABLE_GPU)
     set_source_files_properties(${MAIN_SOURCE} PROPERTIES LANGUAGE CXX)
 endif()
 
+add_executable(gansu_cli ${MAIN_SOURCE})
+set_target_properties(gansu_cli PROPERTIES OUTPUT_NAME "gansu")
+target_compile_definitions(gansu_cli PRIVATE PROFILE_ENABLED)
+target_compile_definitions(gansu_cli PRIVATE CONSOLE_COLOR_ENABLED)
+target_link_libraries(gansu_cli gansu)
+
+# Legacy name (backward compatibility)
 add_executable(HF_main ${MAIN_SOURCE})
 target_compile_definitions(HF_main PRIVATE PROFILE_ENABLED)
 target_compile_definitions(HF_main PRIVATE CONSOLE_COLOR_ENABLED)

@@ -5,13 +5,16 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 
 GANSU also supports a **CPU-only mode** for systems without NVIDIA GPUs, providing the same functionality using Eigen and OpenMP parallelization.
 
+GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
+
 ## Features
 * Hartree-Fock Methods: Includes RHF, UHF, and ROHF implementations.
 * Parallel computing: Accelerates almost all operations on the GPU, achieving true speedup through custom implementations from scratch.
 * CPU backend: Full CPU-only execution via `--cpu` flag (Eigen + OpenMP), supporting all HF methods, post-HF, gradient, Hessian, and geometry optimization.
+* Python API: Call GANSU from Python via `import gansu` with automatic basis set resolution.
+* C API: Stable ABI for external bindings (`libgansu.so`).
 * Flexible Input Options: Supports standard file formats such as XYZ and Gaussian basis set files.
 * The numerical calculations in this software are performed using 64-bit double precision floating-point arithmetic.
-* etc.
 
 
 ### Supported computations
@@ -30,6 +33,7 @@ GANSU also supports a **CPU-only mode** for systems without NVIDIA GPUs, providi
 * Post-Hartree-Fock methods
     * Møller-Plesset Perturbation Theory (RMP2, RMP3, RMP4, UMP2, UMP3)
     * Coupled Cluster (RCC2, RCCSD, RCCSD(T))
+    * CCSD Lambda equations and 1-RDM (non-relaxed correlation density for DMET)
     * Full Configuration Interaction (RFCI)
     * RI support for all post-HF methods (AO ERI reconstructed from B matrix, nao⁴ intermediate skipped via direct MO ERI construction)
     * Semi-Direct RI and Direct-RI MP2 (B matrix built on-the-fly, no persistent naux×nao² storage)
@@ -161,6 +165,8 @@ No additional dependencies beyond the GPU mode prerequisites are required.
 │   └─ html/
 ├─ include/
 ├─ parameter_recipe/
+├─ python/
+│   └─ gansu/
 ├─ script/
 ├─ src/
 │   └─ boys/
@@ -171,8 +177,9 @@ No additional dependencies beyond the GPU mode prerequisites are required.
 │   ├─ monatomic/
 │   └─ optimization/
 ├─ CMakeLists.txt
+├─ pyproject.toml
 ├─ LICENSE
-├─ Parameter.md
+├─ doc/parameters.md
 └─ README.md
 ```
 
@@ -185,6 +192,7 @@ No additional dependencies beyond the GPU mode prerequisites are required.
 | `doc/html/` | Contains the Doxygen-generated documentation |
 | `include/` | Contains the header files |
 | `parameter_recipe/` | Contains the parameter recipes for convenience |
+| `python/gansu/` | Python package (`import gansu`) |
 | `script/` | Script files |
 | `src/` | Contains the source files |
 | `src/boys/` | Contains a precomputed file for the Boys function |
@@ -195,8 +203,9 @@ No additional dependencies beyond the GPU mode prerequisites are required.
 | `xyz/monatomic/` | Contains the XYZ files for monatomic molecules (e.g., H.xyz) |
 | `xyz/optimization/` | Contains the XYZ files with distorted geometries for geometry optimization tests (e.g., H2_stretched.xyz) |
 | `CMakeLists.txt` | CMake configuration file |
+| `pyproject.toml` | Python package configuration for pip |
 | `LICENSE` | License file |
-| `Parameter.md` | Parameter overview and description |
+| `doc/parameters.md` | Parameter overview and description |
 | `README.md` | Project overview and installation instructions |
 
 ### Build instructions
@@ -218,19 +227,20 @@ make
 ```
 4. Run the H2 molecule example:
 ``` bash
-./HF_main -x ../xyz/H2.xyz -g ../basis/sto-3g.gbs -m RHF
+./gansu -x ../xyz/H2.xyz -g sto-3g -m RHF
 ```
 
 > [!NOTE]
 > To enable support for higher angular momentum orbitals in the RI approximation, uncomment the relevant lines in CMakeLists.txt. Be aware that doing so may result in a substantially longer compilation time.
 
 ### Usage
-Usage
+
+#### C++ CLI
 ```
-./HF_main [options]
+./gansu [options]
 ```
 
-Please see [Parameters](/Parameter.md) for options.
+Please see [Parameters](doc/parameters.md) for all options.
 
 Short options:
 
@@ -240,17 +250,56 @@ Short options:
 | `-v` | `--verbose` | Verbose mode |
 | `-p` | `--parameter_file` | Parameter recipe file |
 | `-x` | `--xyzfilename` | XYZ file |
-| `-g` | `--gbsfilename` | Gaussian basis set file |
-| `-ag` | `--auxiliary_gbsfilename` | Gaussian auxiliary basis set file |
+| `-g` | `--gbsfilename` | Basis set name or file path |
+| `-ag` | `--auxiliary_gbsfilename` | Auxiliary basis set file |
 | `-c` | `--charge` | Charge of the molecule |
 | `-r` | `--run_type` | Run type (energy, gradient, optimize, hessian) |
 | | `--cpu` | Force CPU-only execution (no GPU) |
+| | `--list-basis` | List available basis sets and exit |
+
+> [!TIP]
+> Basis sets can be specified by name (e.g., `-g cc-pvdz`) or by full path (e.g., `-g ../basis/cc-pvdz.gbs`). GANSU automatically searches for `.gbs` files in standard locations relative to the executable.
+
+#### Python API
+
+Build the shared library:
+```bash
+cd build
+cmake ..
+make gansu_shared
+```
+
+Usage:
+```python
+import gansu
+
+gansu.init()
+
+# List available basis sets
+print(gansu.list_basis_sets())
+
+# Run RHF + CCSD
+mol = gansu.Molecule("H2O.xyz", basis="cc-pvdz")
+result = mol.run(method="RHF", post_hf="ccsd")
+print(f"Total energy: {result.total_energy + result.post_hf_energy:.8f} Hartree")
+
+# Access orbital energies and MO coefficients
+print(result.orbital_energies)
+print(result.mo_coefficients)
+
+gansu.finalize()
+```
+
+Set the library path if needed:
+```bash
+GANSU_LIB=/path/to/build/libgansu.so python3 my_script.py
+```
 
 #### Examples
 
 ##### Example 1: H2 molecule
 ``` bash
-./HF_main -x ../xyz/H2.xyz -g ../basis/sto-3g.gbs -m RHF
+./gansu -x ../xyz/H2.xyz -g sto-3g -m RHF
 ```
 
 ##### Example 2: H2O molecule using a parameter recipe file
@@ -258,11 +307,11 @@ Command-line option "-p" specifies the parameter recipe file that contains pre-d
 
 How to give the parameter recipe file:
 ``` bash
-./HF_main -p ../parameter_recipe/RHF_OptimalDamping.txt -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs
+./gansu -p ../parameter_recipe/RHF_OptimalDamping.txt -x ../xyz/H2O.xyz -g cc-pvdz
 ```
 This command is equivalent to the following command:
 ``` bash
-./HF_main --parameter_file ../parameter_recipe/RHF_OptimalDamping.txt --xyzfilename ../xyz/H2O.xyz --gbsfilename ../basis/cc-pvdz.gbs
+./gansu --parameter_file ../parameter_recipe/RHF_OptimalDamping.txt --xyzfilename ../xyz/H2O.xyz --gbsfilename ../basis/cc-pvdz.gbs
 ```
 
 
@@ -280,83 +329,83 @@ convergence_method = OptimalDamping
 
 ##### Example 3: Energy gradient calculation
 ``` bash
-./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs -r gradient
+./gansu -x ../xyz/H2O.xyz -g sto-3g -r gradient
 ```
 
 ##### Example 4: Geometry optimization
 ``` bash
-./HF_main -x ../xyz/optimization/H2_stretched.xyz -g ../basis/sto-3g.gbs -r optimize
+./gansu -x ../xyz/optimization/H2_stretched.xyz -g sto-3g -r optimize
 ```
 
 To specify the optimization algorithm:
 ``` bash
-./HF_main -x ../xyz/optimization/H2_stretched.xyz -g ../basis/sto-3g.gbs -r optimize --optimizer cg-fr
+./gansu -x ../xyz/optimization/H2_stretched.xyz -g sto-3g -r optimize --optimizer cg-fr
 ```
 
 Available optimizers: `bfgs` (default), `dfp`, `sr1`, `gdiis`, `newton`, `cg-fr`, `cg-pr`, `cg-hs`, `cg-dy`, `sd`
 
 ##### Example 5: CC2 correlation energy
 ``` bash
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method cc2
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method cc2
 ```
 
 ##### Example 6: Excited state calculations
 ``` bash
 # CIS (Configuration Interaction Singles)
-./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs --post_hf_method cis --n_excited_states 10
+./gansu -x ../xyz/H2O.xyz -g sto-3g --post_hf_method cis --n_excited_states 10
 
 # ADC(2)
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method adc2
 
 # ADC(2)-x (extended ADC(2) with first-order M22 terms)
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2x
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method adc2x
 
 # Triplet excited states
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2 --spin_type triplet
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method adc2 --spin_type triplet
 
 # EOM-MP2
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_mp2
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method eom_mp2
 
 # EOM-CC2
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_cc2
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method eom_cc2
 
 # EOM-CCSD
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_ccsd
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method eom_ccsd
 
 # EOM-MP2 with specific solver
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_mp2 --eom_mp2_solver schur_omega
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method eom_mp2 --eom_mp2_solver schur_omega
 ```
 
 ##### Example 7: Hessian and vibrational frequencies
 ``` bash
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs -r hessian
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz -r hessian
 ```
 
 ##### Example 8: Geometry optimization with Newton-Raphson (analytical Hessian)
 ``` bash
-./HF_main -x ../xyz/optimization/H2O_distorted.xyz -g ../basis/cc-pvdz.gbs -r optimize --optimizer newton
+./gansu -x ../xyz/optimization/H2O_distorted.xyz -g cc-pvdz -r optimize --optimizer newton
 ```
 
 ##### Example 9: Hash-based ERI storage
 ``` bash
-./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs --eri_method hash --hash_fock_method compact
+./gansu -x ../xyz/H2O.xyz -g sto-3g --eri_method hash --hash_fock_method compact
 ```
 
 ##### Example 10: RI with post-HF excited states
 ``` bash
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method eom_ccsd
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method eom_ccsd
 ```
 
 ##### Example 11: CPU-only mode
 ``` bash
 # RHF energy on CPU
-./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs --cpu
+./gansu -x ../xyz/H2O.xyz -g sto-3g --cpu
 
 # Geometry optimization with Newton-Raphson on CPU
-./HF_main -x ../xyz/optimization/H2O_distorted.xyz -g ../basis/sto-3g.gbs -r optimize --optimizer newton --cpu
+./gansu -x ../xyz/optimization/H2O_distorted.xyz -g sto-3g -r optimize --optimizer newton --cpu
 
 # Post-HF on CPU
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method ccsd --cpu
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method ccsd --cpu
 ```
 
 ##### Example 12: Fullerene (C60) molecule using RI approximation
@@ -364,12 +413,30 @@ If the molecule is large, it is recommended to use the RI approximation (density
 
 With an explicit auxiliary basis set file:
 ``` bash
-./HF_main -x ../xyz/large_molecular/fullerene.xyz -g ../basis/sto-3g.gbs --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs
+./gansu -x ../xyz/large_molecular/fullerene.xyz -g sto-3g --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs
 ```
 
 If no auxiliary basis set file is specified, an auxiliary basis is automatically generated from the primary basis set:
 ``` bash
-./HF_main -x ../xyz/large_molecular/fullerene.xyz -g ../basis/sto-3g.gbs --eri_method ri
+./gansu -x ../xyz/large_molecular/fullerene.xyz -g sto-3g --eri_method ri
+```
+
+##### Example 13: CCSD 1-RDM (correlation density for DMET)
+``` bash
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method ccsd_density
+```
+
+##### Example 14: Python scripting (H2 dissociation curve)
+```python
+import gansu
+import numpy as np
+
+gansu.init()
+for R in np.linspace(0.5, 5.0, 20):
+    open("h2.xyz", "w").write(f"2\nH2\nH 0 0 0\nH 0 0 {R}\n")
+    r = gansu.Molecule("h2.xyz", basis="cc-pvdz").run(post_hf="ccsd")
+    print(f"R={R:.2f}  E={r.total_energy + r.post_hf_energy:.8f}")
+gansu.finalize()
 ```
 
 

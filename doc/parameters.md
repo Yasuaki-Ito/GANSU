@@ -349,30 +349,30 @@ ADC(2)-x includes explicit electron correlation in the doubles space, generally 
 
 ```bash
 # CIS with 10 excited states
-./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs --post_hf_method cis --n_excited_states 10
+./gansu -x ../xyz/H2O.xyz -g sto-3g --post_hf_method cis --n_excited_states 10
 
 # ADC(2) with auto solver selection (default)
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method adc2
 
 # ADC(2)-x (extended)
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2x
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method adc2x
 
 # ADC(2) with explicit full Davidson solver
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2 --adc2_solver full
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method adc2 --adc2_solver full
 
 # Triplet excited states
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method cis --spin_type triplet
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2 --spin_type triplet
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method adc2x --spin_type triplet
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method cis --spin_type triplet
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method adc2 --spin_type triplet
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method adc2x --spin_type triplet
 
 # EOM-MP2 with schur_omega solver
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_mp2 --eom_mp2_solver schur_omega
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method eom_mp2 --eom_mp2_solver schur_omega
 
 # EOM-CC2 with full Davidson solver
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_cc2 --eom_cc2_solver full
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method eom_cc2 --eom_cc2_solver full
 
 # EOM-CCSD
-./HF_main -x ../xyz/H2O.xyz -g ../basis/cc-pvdz.gbs --post_hf_method eom_ccsd
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method eom_ccsd
 ```
 
 ## Geometry optimization parameters
@@ -391,13 +391,13 @@ ADC(2)-x includes explicit electron correlation in the doubles space, generally 
 
 ```bash
 # Single-point energy (default)
-./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs
+./gansu -x ../xyz/H2O.xyz -g sto-3g
 
 # Energy gradient
-./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs -r gradient
+./gansu -x ../xyz/H2O.xyz -g sto-3g -r gradient
 
 # Geometry optimization
-./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs -r optimize
+./gansu -x ../xyz/H2O.xyz -g sto-3g -r optimize
 ```
 
 #### optimizer - Optimization algorithm for geometry optimization
@@ -494,14 +494,14 @@ At each optimization step, the translational and rotational components are proje
 
 ```bash
 # Geometry optimization with BFGS (default)
-./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs -r optimize
+./gansu -x ../xyz/H2O.xyz -g sto-3g -r optimize
 
 # Geometry optimization with Polak-Ribière conjugate gradient
-./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs -r optimize --optimizer cg-pr
+./gansu -x ../xyz/H2O.xyz -g sto-3g -r optimize --optimizer cg-pr
 
 # Geometry optimization with GDIIS
-./HF_main -x ../xyz/H2O.xyz -g ../basis/sto-3g.gbs -r optimize --optimizer gdiis
+./gansu -x ../xyz/H2O.xyz -g sto-3g -r optimize --optimizer gdiis
 
 # UHF geometry optimization with SAD initial guess
-./HF_main -x ../xyz/O2.xyz -g ../basis/sto-3g.gbs -m UHF --initial_guess sad -r optimize
+./gansu -x ../xyz/O2.xyz -g sto-3g -m UHF --initial_guess sad -r optimize
 ```
