@@ -19,6 +19,7 @@
  */
 
 #include "ccsd_lambda.hpp"
+#include "progress.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -1108,6 +1109,7 @@ bool solve_ccsd_lambda_cpu(
                       << ": ||Δλ|| = " << std::scientific << std::setprecision(3)
                       << resid << std::defaultfloat << std::endl;
         }
+        { double vals[] = {resid}; report_progress("ccsd_lambda", iter + 1, 1, vals); }
 
         if (resid < tol) {
             if (verbose > 0) {

@@ -119,6 +119,63 @@ int gansu_get_ccsd_1rdm_mo(gansu_handle_t h, double* buf, int buf_size);
 /** Get excited state report string. Returns pointer to internal buffer (valid until destroy). */
 const char* gansu_get_excited_state_report(gansu_handle_t h);
 
+/* ---- Atom coordinates ---- */
+
+/** Get atomic number of atom i (0-indexed). Returns 0 on error. */
+int gansu_get_atomic_number(gansu_handle_t h, int i);
+
+/** Get atom coordinates (x, y, z in Bohr) for atom i. Returns 0 on success. */
+int gansu_get_atom_coords(gansu_handle_t h, int i, double* x, double* y, double* z);
+
+/* ---- Analysis ---- */
+
+/** Compute Mulliken charges. Writes to buf (size >= num_atoms).
+ *  @return num_atoms, or -1 on error. */
+int gansu_get_mulliken_charges(gansu_handle_t h, double* buf, int buf_size);
+
+/** Compute Mayer bond order matrix (num_atoms x num_atoms, row-major).
+ *  @return num_atoms*num_atoms, or -1 on error. */
+int gansu_get_mayer_bond_order(gansu_handle_t h, double* buf, int buf_size);
+
+/** Compute Wiberg bond order matrix (num_atoms x num_atoms, row-major).
+ *  @return num_atoms*num_atoms, or -1 on error. */
+int gansu_get_wiberg_bond_order(gansu_handle_t h, double* buf, int buf_size);
+
+/** Get density matrix in AO basis (nao x nao, row-major).
+ *  @return nao*nao, or -1 on error. */
+int gansu_get_density_matrix(gansu_handle_t h, double* buf, int buf_size);
+
+/** Get overlap matrix (nao x nao, row-major).
+ *  @return nao*nao, or -1 on error. */
+int gansu_get_overlap_matrix(gansu_handle_t h, double* buf, int buf_size);
+
+/* ---- Progress callback ---- */
+
+/**
+ * @brief Progress callback type.
+ *
+ * Called during iterative procedures (SCF, CCSD, Davidson, optimization, etc.)
+ * to report current progress.
+ *
+ * @param stage     Identifier: "scf", "ccsd", "ccsd_lambda", "davidson",
+ *                  "optimize", or method-specific name.
+ * @param iter      Current iteration number (0-indexed).
+ * @param n_values  Number of doubles in the values array.
+ * @param values    Progress data (meaning depends on stage):
+ *                    scf:          [total_energy, delta_e]
+ *                    ccsd:         [correlation_energy, delta_e]
+ *                    ccsd_lambda:  [residual_norm]
+ *                    davidson:     [eigenvalue_0, ..., eigenvalue_k, max_residual]
+ *                    optimize:     [energy, max_gradient, rms_gradient]
+ * @param user_data User pointer passed to gansu_set_progress_callback.
+ */
+typedef void (*gansu_progress_fn)(const char* stage, int iter, int n_values,
+                                  const double* values, void* user_data);
+
+/** Set progress callback. Pass NULL to disable.
+ *  Callback is invoked from the thread that calls gansu_run(). */
+void gansu_set_progress_callback(gansu_handle_t h, gansu_progress_fn fn, void* user_data);
+
 #ifdef __cplusplus
 }
 #endif

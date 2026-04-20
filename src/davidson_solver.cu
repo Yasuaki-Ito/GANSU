@@ -16,6 +16,7 @@
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
 #include "utils.hpp"
+#include "progress.hpp"
 
 #include <Eigen/Dense>
 #include <chrono>
@@ -326,16 +327,24 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
         }
         prev_eigenvalues = h_eigenvalues_;
 
-        if (config_.verbose > 1) {
+        {
             // Find max residual norm
             real_t max_res = *std::max_element(residual_norms_.begin(), residual_norms_.end());
-            std::cout << "---- Davidson iteration " << std::setw(3) << (iter + 1) << " ---- ";
-            for (int i = 0; i < std::min(5, config_.num_eigenvalues); ++i) {
-                std::cout << std::fixed << std::setprecision(6) << h_eigenvalues_[i];
-                if (i < std::min(5, config_.num_eigenvalues) - 1) std::cout << ", ";
+            if (config_.verbose > 1) {
+                std::cout << "---- Davidson iteration " << std::setw(3) << (iter + 1) << " ---- ";
+                for (int i = 0; i < std::min(5, config_.num_eigenvalues); ++i) {
+                    std::cout << std::fixed << std::setprecision(6) << h_eigenvalues_[i];
+                    if (i < std::min(5, config_.num_eigenvalues) - 1) std::cout << ", ";
+                }
+                std::cout << "  max|r|=" << std::scientific << std::setprecision(2) << max_res
+                          << std::defaultfloat << std::endl;
             }
-            std::cout << "  max|r|=" << std::scientific << std::setprecision(2) << max_res
-                      << std::defaultfloat << std::endl;
+            // Progress callback: [eigenvalue_0, ..., eigenvalue_k, max_residual]
+            int nev = std::min(config_.num_eigenvalues, (int)h_eigenvalues_.size());
+            std::vector<real_t> vals(nev + 1);
+            for (int i = 0; i < nev; i++) vals[i] = h_eigenvalues_[i];
+            vals[nev] = max_res;
+            report_progress("davidson", iter + 1, nev + 1, vals.data());
         }
 
         if (converged) {

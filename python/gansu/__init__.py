@@ -33,10 +33,19 @@ from gansu._basis import resolve_basis, resolve_auxiliary_basis, list_basis_sets
 
 def _find_lib():
     """Find libgansu.so in standard locations."""
+    _pkg = os.path.dirname(__file__)
+    _root = os.path.join(_pkg, "..", "..")
     candidates = [
         os.environ.get("GANSU_LIB", ""),
-        os.path.join(os.path.dirname(__file__), "..", "..", "build", "libgansu.so"),
-        os.path.join(os.path.dirname(__file__), "..", "..", "build", "libgansu.dylib"),
+        # Development: build/libgansu.so
+        os.path.join(_root, "build", "libgansu.so"),
+        os.path.join(_root, "build", "libgansu.dylib"),
+        # Binary distribution: lib/libgansu.so
+        os.path.join(_root, "lib", "libgansu.so"),
+        os.path.join(_root, "lib", "libgansu.dylib"),
+        # Bundled inside package: gansu/lib/
+        os.path.join(_pkg, "lib", "libgansu.so"),
+        os.path.join(_pkg, "lib", "libgansu.dylib"),
         "libgansu.so",
     ]
     for p in candidates:
@@ -127,6 +136,34 @@ def _setup_signatures(lib):
 
     lib.gansu_get_excited_state_report.argtypes = [c_handle]
     lib.gansu_get_excited_state_report.restype = c_str
+
+    lib.gansu_get_atomic_number.argtypes = [c_handle, c_int]
+    lib.gansu_get_atomic_number.restype = c_int
+
+    lib.gansu_get_atom_coords.argtypes = [c_handle, c_int, ctypes.POINTER(c_double), ctypes.POINTER(c_double), ctypes.POINTER(c_double)]
+    lib.gansu_get_atom_coords.restype = c_int
+
+    lib.gansu_get_mulliken_charges.argtypes = [c_handle, c_double_p, c_int]
+    lib.gansu_get_mulliken_charges.restype = c_int
+
+    lib.gansu_get_mayer_bond_order.argtypes = [c_handle, c_double_p, c_int]
+    lib.gansu_get_mayer_bond_order.restype = c_int
+
+    lib.gansu_get_wiberg_bond_order.argtypes = [c_handle, c_double_p, c_int]
+    lib.gansu_get_wiberg_bond_order.restype = c_int
+
+    lib.gansu_get_density_matrix.argtypes = [c_handle, c_double_p, c_int]
+    lib.gansu_get_density_matrix.restype = c_int
+
+    lib.gansu_get_overlap_matrix.argtypes = [c_handle, c_double_p, c_int]
+    lib.gansu_get_overlap_matrix.restype = c_int
+
+    # Progress callback: void(const char*, int, int, const double*, void*)
+    global PROGRESS_FUNC_TYPE
+    PROGRESS_FUNC_TYPE = ctypes.CFUNCTYPE(
+        None, ctypes.c_char_p, c_int, c_int, c_double_p, ctypes.c_void_p)
+    lib.gansu_set_progress_callback.argtypes = [c_handle, PROGRESS_FUNC_TYPE, ctypes.c_void_p]
+    lib.gansu_set_progress_callback.restype = None
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +265,73 @@ class Result:
         s = self._lib.gansu_get_excited_state_report(self._h)
         return s.decode("utf-8") if s else ""
 
+    @property
+    def atoms(self):
+        """List of (atomic_number, x, y, z) tuples (coordinates in Bohr)."""
+        n = self.num_atoms
+        result = []
+        x, y, z = ctypes.c_double(), ctypes.c_double(), ctypes.c_double()
+        for i in range(n):
+            Z = self._lib.gansu_get_atomic_number(self._h, i)
+            self._lib.gansu_get_atom_coords(self._h, i,
+                ctypes.byref(x), ctypes.byref(y), ctypes.byref(z))
+            result.append((Z, x.value, y.value, z.value))
+        return result
+
+    @property
+    def mulliken_charges(self):
+        """Mulliken atomic charges as numpy array."""
+        n = self.num_atoms
+        buf = (ctypes.c_double * n)()
+        ret = self._lib.gansu_get_mulliken_charges(self._h, buf, n)
+        if ret < 0:
+            raise RuntimeError("Failed to compute Mulliken charges")
+        return np.array(buf[:n])
+
+    @property
+    def mayer_bond_order(self):
+        """Mayer bond order matrix (natom x natom)."""
+        n = self.num_atoms
+        n2 = n * n
+        buf = (ctypes.c_double * n2)()
+        ret = self._lib.gansu_get_mayer_bond_order(self._h, buf, n2)
+        if ret < 0:
+            raise RuntimeError("Failed to compute Mayer bond order")
+        return np.array(buf[:n2]).reshape(n, n)
+
+    @property
+    def wiberg_bond_order(self):
+        """Wiberg bond order matrix (natom x natom)."""
+        n = self.num_atoms
+        n2 = n * n
+        buf = (ctypes.c_double * n2)()
+        ret = self._lib.gansu_get_wiberg_bond_order(self._h, buf, n2)
+        if ret < 0:
+            raise RuntimeError("Failed to compute Wiberg bond order")
+        return np.array(buf[:n2]).reshape(n, n)
+
+    @property
+    def density_matrix(self):
+        """Density matrix in AO basis (nao x nao)."""
+        n = self.num_basis
+        n2 = n * n
+        buf = (ctypes.c_double * n2)()
+        ret = self._lib.gansu_get_density_matrix(self._h, buf, n2)
+        if ret < 0:
+            raise RuntimeError("Failed to get density matrix")
+        return np.array(buf[:n2]).reshape(n, n)
+
+    @property
+    def overlap_matrix(self):
+        """Overlap matrix (nao x nao)."""
+        n = self.num_basis
+        n2 = n * n
+        buf = (ctypes.c_double * n2)()
+        ret = self._lib.gansu_get_overlap_matrix(self._h, buf, n2)
+        if ret < 0:
+            raise RuntimeError("Failed to get overlap matrix")
+        return np.array(buf[:n2]).reshape(n, n)
+
 
 class Molecule:
     """GANSU calculation setup."""
@@ -251,13 +355,16 @@ class Molecule:
             self._lib.gansu_destroy(self._h)
             self._h = None
 
-    def run(self, method="RHF", post_hf="none", quiet=True, **kwargs):
+    def run(self, method="RHF", post_hf="none", quiet=True, on_progress=None, **kwargs):
         """Run the calculation.
 
         Args:
             method: HF method (RHF, UHF, ROHF).
             post_hf: Post-HF method (none, mp2, mp3, ccsd, ccsd_t, fci, ...).
             quiet: If True (default), suppress GANSU stdout output.
+            on_progress: Optional callback fn(stage: str, iter: int, values: list[float]).
+                         Called during SCF/CCSD/Davidson iterations with progress data.
+                         Stage is "scf", "ccsd", "ccsd_lambda", "davidson", etc.
             **kwargs: Extra parameters to set before running.
 
         Returns:
@@ -268,6 +375,18 @@ class Molecule:
         self._lib.gansu_set_post_hf(self._h, post_hf.encode())
         for k, v in kwargs.items():
             self._lib.gansu_set(self._h, k.encode(), str(v).encode())
+
+        # Set up progress callback
+        self._progress_ref = None  # prevent GC
+        if on_progress is not None:
+            def _c_callback(stage, iter_num, n_values, values_ptr, _user):
+                stage_str = stage.decode("utf-8") if stage else ""
+                vals = [values_ptr[i] for i in range(n_values)]
+                on_progress(stage_str, iter_num, vals)
+            self._progress_ref = PROGRESS_FUNC_TYPE(_c_callback)
+            self._lib.gansu_set_progress_callback(self._h, self._progress_ref, None)
+        else:
+            self._lib.gansu_set_progress_callback(self._h, PROGRESS_FUNC_TYPE(), None)
 
         ret = self._lib.gansu_run(self._h)
         if ret != 0:

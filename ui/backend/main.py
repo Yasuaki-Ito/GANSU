@@ -1,9 +1,8 @@
-"""FastAPI backend for GANSU-UI."""
+"""FastAPI backend for GANSU-UI — Python API backend (no subprocess, no parser)."""
 
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -12,20 +11,21 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from parser import parse_output
-from runner import HF_MAIN, GANSU_PATH, XYZ_DIR, RunParams, list_basis_sets, list_auxiliary_basis_sets, list_sample_dirs, list_samples, run_hf_main, stream_hf_main
+from runner import (RunParams, list_basis_sets, list_auxiliary_basis_sets,
+                    list_sample_dirs, list_samples, run_hf_main, stream_hf_main, XYZ_DIR)
 
 app = FastAPI(title="GANSU-UI API")
 
 
 @app.on_event("startup")
 async def startup_check():
-    print(f"GANSU_PATH: {GANSU_PATH}")
-    print(f"HF_MAIN:    {HF_MAIN}")
-    if not os.path.isfile(HF_MAIN):
-        print(f"WARNING: HF_main not found at {HF_MAIN}")
-    else:
-        print("HF_main found.")
+    try:
+        import gansu
+        basis = gansu.list_basis_sets()
+        print(f"GANSU-UI ready: {len(basis)} basis sets available")
+    except Exception as e:
+        print(f"WARNING: gansu not available: {e}")
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -79,14 +79,10 @@ def get_samples(dir: str = "."):
 
 @app.get("/api/samples/{filename}")
 def get_sample_content(filename: str, dir: str = "."):
-    """Return the content of a sample XYZ file."""
-    # Security: reject path traversal
     for part in [filename, dir]:
         if ".." in part or "\\" in part:
             return {"error": "Invalid path"}
-    if "/" in filename:
-        return {"error": "Invalid filename"}
-    if not filename.endswith(".xyz"):
+    if "/" in filename or not filename.endswith(".xyz"):
         return {"error": "Not found"}
     base = XYZ_DIR if dir == "." else XYZ_DIR / dir
     path = base / filename
@@ -108,14 +104,7 @@ def get_auxiliary_basis():
 @app.post("/api/run")
 async def run_calculation(req: CalcRequest):
     params = RunParams(**req.model_dump())
-    stdout, stderr, code, molden = await run_hf_main(params)
-    if code != 0:
-        return {"ok": False, "error": stderr or f"HF_main exited with code {code}", "raw_output": stdout}
-    result = parse_output(stdout)
-    data = {"ok": True, **result.to_dict()}
-    if molden:
-        data["molden_content"] = molden
-    return data
+    return await run_hf_main(params)
 
 
 @app.post("/api/run/stream")
@@ -123,29 +112,8 @@ async def stream_calculation(req: CalcRequest):
     params = RunParams(**req.model_dump())
 
     async def event_generator():
-        full_output: list[str] = []
-        stderr_text = ""
-        returncode = 0
-        molden_content = ""
-        async for kind, text, code in stream_hf_main(params):
-            if kind == "stdout":
-                full_output.append(text)
-                yield f"data: {json.dumps({'type': 'line', 'text': text.rstrip()})}\n\n"
-            elif kind == "exit":
-                stderr_text = text
-                returncode = code
-            elif kind == "molden":
-                molden_content = text
-        if returncode != 0:
-            error_msg = stderr_text or f"HF_main exited with code {returncode}"
-            yield f"data: {json.dumps({'type': 'error', 'error': error_msg, 'raw_output': ''.join(full_output)})}\n\n"
-        else:
-            result = parse_output("".join(full_output))
-            data = result.to_dict()
-            if molden_content:
-                data["molden_content"] = molden_content
-            yield f"data: {json.dumps({'type': 'result', 'data': data})}\n\n"
-        yield "data: {\"type\": \"done\"}\n\n"
+        async for item in stream_hf_main(params):
+            yield f"data: {json.dumps(item)}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -154,9 +122,7 @@ async def stream_calculation(req: CalcRequest):
     )
 
 
-# Serve frontend static files (npm run build -> frontend/dist/)
-# Local: backend/main.py -> ../../frontend/dist
-# Remote: gansu-ui/main.py -> ../frontend/dist
+# Serve frontend static files
 _HERE = Path(__file__).resolve().parent
 for _base in [_HERE.parent, _HERE]:
     _dist = _base / "frontend" / "dist"

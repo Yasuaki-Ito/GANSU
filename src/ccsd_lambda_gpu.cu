@@ -35,6 +35,7 @@
 #include "ccsd_lambda.hpp"
 #include "gpu_manager.hpp"
 #include "device_host_memory.hpp"
+#include "progress.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -1348,6 +1349,7 @@ bool solve_ccsd_lambda_gpu(
                       << ": ||Δλ|| = " << std::scientific << std::setprecision(3) << resid
                       << std::defaultfloat << std::endl;
         }
+        { double vals[] = {resid}; gansu::report_progress("ccsd_lambda", iter + 1, 1, vals); }
         if (resid < tol) {
             converged = true;
             if (verbose > 0)

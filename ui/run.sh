@@ -11,11 +11,10 @@ if [ ! -f .env ]; then
 # Edit this file then run ./run.sh again.
 
 GANSU_PATH=$HOME/GANSU
-HF_MAIN_PATH=$HOME/GANSU/build/HF_main
 PORT=8000
 TEMPLATE
     echo ".env was not found. A template has been created."
-    echo "Edit .env to set GANSU_PATH, HF_MAIN_PATH, etc., then run again."
+    echo "Edit .env to set GANSU_PATH, etc., then run again."
     exit 1
 fi
 
@@ -26,11 +25,21 @@ set +a
 
 PORT="${1:-${PORT:-8000}}"
 
-# Check HF_main exists
-HF_MAIN_PATH="${HF_MAIN_PATH:-${GANSU_PATH:-$HOME/GANSU}/build/HF_main}"
-if [ ! -f "$HF_MAIN_PATH" ]; then
-    echo "WARNING: HF_main not found at $HF_MAIN_PATH"
-    echo "Set GANSU_PATH or HF_MAIN_PATH in .env"
+# Auto-detect libgansu.so
+GANSU_PATH="${GANSU_PATH:-$HOME/GANSU}"
+if [ -z "$GANSU_LIB" ]; then
+    for lib in "$GANSU_PATH/build/libgansu.so" "$GANSU_PATH/build/libgansu.dylib"; do
+        if [ -f "$lib" ]; then
+            export GANSU_LIB="$lib"
+            break
+        fi
+    done
+fi
+
+if [ -z "$GANSU_LIB" ] || [ ! -f "$GANSU_LIB" ]; then
+    echo "WARNING: libgansu.so not found."
+    echo "Build it: cd $GANSU_PATH/build && make gansu_shared"
+    echo "Or set GANSU_LIB in .env"
 fi
 
 # Setup venv
@@ -47,5 +56,10 @@ if ! python3 -c "import fastapi" 2>/dev/null; then
     pip install -q -r backend/requirements.txt
 fi
 
-echo "Starting GANSU-UI backend on 0.0.0.0:$PORT"
+# Add gansu Python module to path
+export PYTHONPATH="$GANSU_PATH/python:$PYTHONPATH"
+
+echo "Starting GANSU-UI on 0.0.0.0:$PORT"
+echo "  GANSU_PATH: $GANSU_PATH"
+echo "  GANSU_LIB:  $GANSU_LIB"
 python3 -m uvicorn main:app --app-dir backend --host 0.0.0.0 --port "$PORT"

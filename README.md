@@ -265,10 +265,27 @@ print(f"Energy: {r.total_energy + r.post_hf_energy:.8f} Hartree")
 gansu.finalize()
 ```
 
+#### Web UI (GANSU-UI)
+
+```bash
+# 1. Build C++ (if not already done)
+make
+
+# 2. Build frontend (first time only, requires npm)
+make ui
+
+# 3. Start server
+make serve
+# → Open http://localhost:8000 in browser
+```
+
+The Web UI provides a browser-based interface for running calculations on a remote GPU server. No local GPU required on the client.
+
 #### Documentation
 
 - **[CLI Usage Guide](doc/usage_cli.md)** — Full command-line reference with copy-paste examples
 - **[Python API Guide](doc/usage_python.md)** — Python interface with scripting examples
+- **[C API Reference](doc/usage_c_api.md)** — Language-agnostic C interface (C/Rust/Julia/JS/...)
 - **[Parameters](doc/parameters.md)** — Complete parameter list and defaults
 
 

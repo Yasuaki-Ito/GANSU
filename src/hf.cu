@@ -31,6 +31,7 @@
 #include "gpu_manager.hpp"
 
 #include "profiler.hpp"
+#include "progress.hpp"
 #include "geometry_optimizer.hpp"
 
 #include <Eigen/Dense>
@@ -419,6 +420,12 @@ real_t HF::single_point_energy(const real_t* density_matrix_alpha, const real_t*
                 std::cout << "Energy difference: " << std::setprecision(10) << energy_difference_ << " ";
             }
             std::cout << std::endl;
+        }
+
+        // Progress callback
+        {
+            double vals[] = {get_total_energy(), energy_difference_};
+            report_progress("scf", iter_, 2, vals);
         }
 
         if(energy_difference_ < convergence_energy_threshold){

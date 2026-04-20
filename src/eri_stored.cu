@@ -24,6 +24,7 @@
 #include "device_host_memory.hpp"
 #include "cphf_solver.hpp"
 #include "ccsd_lambda.hpp"
+#include "progress.hpp"
 
 #include "ao2mo.cuh"
 
@@ -7512,6 +7513,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                   << ": E = " << std::fixed << std::setprecision(12) << Ecc
                   << ", dE = " << std::scientific << std::setprecision(4) << deltaE
                   << std::endl;
+
+        { double vals[] = {Ecc, deltaE}; report_progress("ccsd", iter, 2, vals); }
 
         if (std::abs(deltaE) < CONV) {
             std::cout << "CCSD converged after " << iter << " iterations" << std::endl;

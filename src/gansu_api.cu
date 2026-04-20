@@ -18,6 +18,7 @@
 #include "gpu_manager.hpp"
 #include "rhf.hpp"
 #include "uhf.hpp"
+#include "progress.hpp"
 
 #include <map>
 #include <memory>
@@ -37,7 +38,9 @@ struct GansuContext {
     std::unique_ptr<HF> hf;
     std::string excited_state_report_cache;
     bool solved = false;
-    bool quiet = false;  // suppress stdout during run
+    bool quiet = false;
+    gansu_progress_fn progress_fn = nullptr;
+    void* progress_userdata = nullptr;
 };
 
 static bool g_initialized = false;
@@ -115,6 +118,11 @@ extern "C" int gansu_run(gansu_handle_t h) {
     }
 
     try {
+        // Install progress callback for this thread
+        if (ctx->progress_fn) {
+            gansu::set_progress_callback(ctx->progress_fn, ctx->progress_userdata);
+        }
+
         ParameterManager params(false);
         for (const auto& kv : ctx->user_params) {
             if (kv.first != "parameter_file" || !kv.second.empty()) {
@@ -126,9 +134,11 @@ extern "C" int gansu_run(gansu_handle_t h) {
         ctx->hf->solve();
         ctx->solved = true;
 
+        gansu::clear_progress_callback();
         if (orig_cout) std::cout.rdbuf(orig_cout);
         return 0;
     } catch (const std::exception& e) {
+        gansu::clear_progress_callback();
         if (orig_cout) std::cout.rdbuf(orig_cout);
         std::cerr << "gansu_run error: " << e.what() << std::endl;
         return -1;
@@ -230,4 +240,116 @@ extern "C" const char* gansu_get_excited_state_report(gansu_handle_t h) {
     if (!ctx->hf) return "";
     ctx->excited_state_report_cache = ctx->hf->get_excited_state_report();
     return ctx->excited_state_report_cache.c_str();
+}
+
+// ---- Atom coordinates ----
+
+extern "C" int gansu_get_atomic_number(gansu_handle_t h, int i) {
+    if (!h) return 0;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (!ctx->hf) return 0;
+    auto& atoms = const_cast<DeviceHostMemory<Atom>&>(ctx->hf->get_atoms());
+    if (i < 0 || i >= (int)atoms.size()) return 0;
+    atoms.toHost();
+    return atoms.host_ptr()[i].atomic_number;
+}
+
+extern "C" int gansu_get_atom_coords(gansu_handle_t h, int i, double* x, double* y, double* z) {
+    if (!h || !x || !y || !z) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (!ctx->hf) return -1;
+    auto& atoms = const_cast<DeviceHostMemory<Atom>&>(ctx->hf->get_atoms());
+    if (i < 0 || i >= (int)atoms.size()) return -1;
+    atoms.toHost();
+    const auto& coord = atoms.host_ptr()[i].coordinate;
+    *x = coord.x; *y = coord.y; *z = coord.z;
+    return 0;
+}
+
+// ---- Analysis ----
+// Mulliken/bond order are protected in HF base. Access via RHF downcast.
+
+extern "C" int gansu_get_mulliken_charges(gansu_handle_t h, double* buf, int buf_size) {
+    if (!h || !buf) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (!ctx->solved || !ctx->hf) return -1;
+    RHF* rhf = as_rhf(ctx->hf.get());
+    if (!rhf) return -1;
+    int natom = (int)ctx->hf->get_atoms().size();
+    if (buf_size < natom) return -1;
+    try {
+        auto charges = rhf->analyze_mulliken_population();
+        for (int i = 0; i < natom && i < (int)charges.size(); i++)
+            buf[i] = charges[i];
+        return natom;
+    } catch (...) { return -1; }
+}
+
+extern "C" int gansu_get_mayer_bond_order(gansu_handle_t h, double* buf, int buf_size) {
+    if (!h || !buf) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (!ctx->solved || !ctx->hf) return -1;
+    RHF* rhf = as_rhf(ctx->hf.get());
+    if (!rhf) return -1;
+    int natom = (int)ctx->hf->get_atoms().size();
+    if (buf_size < natom * natom) return -1;
+    try {
+        auto bo = rhf->compute_mayer_bond_order();
+        for (int i = 0; i < natom; i++)
+            for (int j = 0; j < natom; j++)
+                buf[i * natom + j] = bo[i][j];
+        return natom * natom;
+    } catch (...) { return -1; }
+}
+
+extern "C" int gansu_get_wiberg_bond_order(gansu_handle_t h, double* buf, int buf_size) {
+    if (!h || !buf) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (!ctx->solved || !ctx->hf) return -1;
+    RHF* rhf = as_rhf(ctx->hf.get());
+    if (!rhf) return -1;
+    int natom = (int)ctx->hf->get_atoms().size();
+    if (buf_size < natom * natom) return -1;
+    try {
+        auto bo = rhf->compute_wiberg_bond_order();
+        for (int i = 0; i < natom; i++)
+            for (int j = 0; j < natom; j++)
+                buf[i * natom + j] = bo[i][j];
+        return natom * natom;
+    } catch (...) { return -1; }
+}
+
+extern "C" int gansu_get_density_matrix(gansu_handle_t h, double* buf, int buf_size) {
+    if (!h || !buf) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (!ctx->solved || !ctx->hf) return -1;
+    RHF* rhf = as_rhf(ctx->hf.get());
+    if (!rhf) return -1;
+    int nao = ctx->hf->get_num_basis();
+    int n2 = nao * nao;
+    if (buf_size < n2) return -1;
+    auto& D = rhf->get_density_matrix();
+    D.toHost();
+    for (int i = 0; i < n2; i++) buf[i] = D.host_ptr()[i];
+    return n2;
+}
+
+extern "C" void gansu_set_progress_callback(gansu_handle_t h, gansu_progress_fn fn, void* user_data) {
+    if (!h) return;
+    auto* ctx = static_cast<GansuContext*>(h);
+    ctx->progress_fn = fn;
+    ctx->progress_userdata = user_data;
+}
+
+extern "C" int gansu_get_overlap_matrix(gansu_handle_t h, double* buf, int buf_size) {
+    if (!h || !buf) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (!ctx->solved || !ctx->hf) return -1;
+    int nao = ctx->hf->get_num_basis();
+    int n2 = nao * nao;
+    if (buf_size < n2) return -1;
+    auto& S = ctx->hf->get_overlap_matrix();
+    S.toHost();
+    for (int i = 0; i < n2; i++) buf[i] = S.host_ptr()[i];
+    return n2;
 }
