@@ -18,6 +18,7 @@
 #include "rys_eri.hpp"
 #include "gpu_kernels.hpp"
 #include "gpu_manager.hpp"
+#include "progress.hpp"
 #include "ao2mo.cuh"
 #include <cassert>
 #include <cmath>
@@ -1355,10 +1356,12 @@ void ERI_RI_Direct::precomputation() {
 
 
 
+    report_progress("integrals_ri", 0, 0, nullptr);
+    std::cout << "[RI] Computing 2-center ERIs (Naux=" << num_auxiliary_basis_ << ")..." << std::endl;
     gpu::computeTwoCenterERIs(
-        auxiliary_shell_type_infos_, 
-        auxiliary_primitive_shells_.device_ptr(), 
-        auxiliary_cgto_normalization_factors_.device_ptr(), 
+        auxiliary_shell_type_infos_,
+        auxiliary_primitive_shells_.device_ptr(),
+        auxiliary_cgto_normalization_factors_.device_ptr(),
         two_center_eris.device_ptr(),
         num_auxiliary_basis_,
         boys_grid.device_ptr(),
@@ -1366,16 +1369,18 @@ void ERI_RI_Direct::precomputation() {
         schwarz_screening_threshold,
         verbose
     );
+    std::cout << "[RI] 2-center ERIs done." << std::endl;
 
-
+    report_progress("integrals_ri", 1, 0, nullptr);
+    std::cout << "[RI] Cholesky decomposition + inverse..." << std::endl;
     gpu::choleskyDecomposition(two_center_eris.device_ptr(), num_auxiliary_basis_);
     gpu::computeInverseByDtrsm(two_center_eris.device_ptr(), two_center_eris_inverse.device_ptr(), num_auxiliary_basis_);
+    std::cout << "[RI] Cholesky done." << std::endl;
+    report_progress("integrals_ri", 2, 0, nullptr);
 
     // === CPU fallback: also precompute the full B matrix ===
-    // Direct-RI on GPU avoids storing B for memory reasons, but on CPU we
-    // reuse the stored RHF Fock path which needs B.  Build it once here
-    // (3-center ERI + triangular solve against the Cholesky factor L).
     if (!gpu::gpu_available()) {
+        std::cout << "[RI] Computing 3-center ERIs + B matrix (CPU)..." << std::endl;
         const size_t naux2_times_nao2 =
             (size_t)num_auxiliary_basis_ * num_basis_ * num_basis_;
         // Allocate a scratch buffer for the 3-center ERIs.  On CPU,

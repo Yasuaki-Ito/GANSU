@@ -9,7 +9,7 @@ export function createMoleculePanel(
   sampleDirs: string[],
   initialSamples: SampleMolecule[],
   onXyzChange: (xyz: string) => void,
-): { getXyz: () => string; getXyzFile: () => string; getXyzDir: () => string } {
+): { getXyz: () => string; getXyzFile: () => string; getXyzDir: () => string; setXyz: (xyz: string) => void } {
   let selectedFile = '';
   let currentDir = sampleDirs[0] || '.';
 
@@ -73,7 +73,7 @@ export function createMoleculePanel(
     debounceTimer = window.setTimeout(() => {
       const xyz = textarea.value.trim();
       if (xyz) {
-        renderMoleculePreview(preview, xyz);
+        renderMoleculePreview(preview, xyz, []);
       } else {
         preview.innerHTML = '';
       }
@@ -89,7 +89,7 @@ export function createMoleculePanel(
       // Fetch XYZ content for 3D preview
       fetchSampleContent(selectedFile, currentDir).then(content => {
         if (content && select.value === selectedFile) {
-          renderMoleculePreview(preview, content);
+          renderMoleculePreview(preview, content, []);
         }
       }).catch(() => {
         preview.innerHTML = '<p style="color:var(--color-text-dim)">Sample file selected</p>';
@@ -132,5 +132,13 @@ export function createMoleculePanel(
     getXyz: () => textarea.value.trim(),
     getXyzFile: () => selectedFile,
     getXyzDir: () => currentDir,
+    setXyz: (xyz: string) => {
+      textarea.value = xyz;
+      selectedFile = '';
+      onXyzChange(xyz);
+      // Update 3D preview
+      const previewEl = container.querySelector<HTMLElement>('#mol-preview');
+      if (previewEl) renderMoleculePreview(previewEl, xyz, []);
+    },
   };
 }

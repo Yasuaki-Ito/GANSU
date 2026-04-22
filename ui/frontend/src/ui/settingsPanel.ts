@@ -9,7 +9,7 @@ export function createSettingsPanel(
   container: HTMLElement,
   basisSets: string[],
   auxBasisSets: AuxBasis[] = [],
-): { getParams: () => Partial<CalculationParams> } {
+): { getParams: () => Partial<CalculationParams>; setParams: (p: Record<string, string | undefined>) => void } {
   container.innerHTML = `
     <div class="panel">
       <h2>Settings</h2>
@@ -300,5 +300,36 @@ export function createSettingsPanel(
       schwarz_screening_threshold: getNumValue('schwarz-thresh', DEFAULT_PARAMS.schwarz_screening_threshold),
       timeout: getNumValue('timeout', DEFAULT_PARAMS.timeout),
     }),
+    setParams: (p: Record<string, string | undefined>) => {
+      // Set toggle groups and selects from key-value pairs
+      if (p.method) setToggleValue('method-group', p.method);
+      if (p.basis) {
+        const sel = container.querySelector<HTMLSelectElement>('#basis-select');
+        if (sel) sel.value = p.basis;
+      }
+      if (p.post_hf_method) {
+        const excited = ['cis', 'adc2', 'adc2x', 'eom_mp2', 'eom_cc2', 'eom_ccsd'];
+        if (excited.includes(p.post_hf_method)) {
+          setToggleValue('posthf-group', 'none');
+          setToggleValue('excited-group', p.post_hf_method);
+        } else {
+          setToggleValue('posthf-group', p.post_hf_method);
+          setToggleValue('excited-group', 'none');
+        }
+      }
+      if (p.initial_guess) setToggleValue('guess-group', p.initial_guess);
+      if (p.eri_method) setToggleValue('eri-group', p.eri_method);
+      if (p.n_excited_states) {
+        const el = container.querySelector<HTMLInputElement>('#n-excited-states');
+        if (el) el.value = p.n_excited_states;
+      }
+    },
   };
+
+  function setToggleValue(groupId: string, value: string) {
+    const btns = container.querySelectorAll<HTMLButtonElement>(`[data-group="${groupId}"]`);
+    btns.forEach(b => {
+      b.classList.toggle('active', b.dataset.value === value);
+    });
+  }
 }

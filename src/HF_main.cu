@@ -24,9 +24,11 @@
 #include <vector>
 #include <memory>
 #include <filesystem>
+#include <fstream>
 #include <set>
 
 #include "hf.hpp"
+#include "rhf.hpp"
 #include "parameter_manager.hpp"
 #include "builder.hpp"
 #include "gpu_manager.hpp"
@@ -78,17 +80,27 @@ static std::string resolve_basis_path(const std::string& name_or_path, const cha
  * @details This function reads the command line arguments and calls the RHF or UHF class.
  */
 int main(int argc, char* argv[]){
+  // Force line-buffered stdout (subprocess pipes default to full-buffered,
+  // which delays progress output to the UI)
+  setvbuf(stdout, NULL, _IOLBF, 0);
+
   try {
     // Check for special flags before parameter parsing
     bool force_cpu = false;
     bool list_basis = false;
+    std::string save_density_path, load_density_path;
     std::vector<char*> filtered_argv;
     filtered_argv.push_back(argv[0]);
     for (int i = 1; i < argc; i++) {
-        if (std::string(argv[i]) == "--cpu") {
+        std::string arg(argv[i]);
+        if (arg == "--cpu") {
             force_cpu = true;
-        } else if (std::string(argv[i]) == "--list-basis") {
+        } else if (arg == "--list-basis") {
             list_basis = true;
+        } else if (arg == "--save_density" && i + 1 < argc) {
+            save_density_path = argv[++i];
+        } else if (arg == "--load_density" && i + 1 < argc) {
+            load_density_path = argv[++i];
         } else {
             filtered_argv.push_back(argv[i]);
         }
@@ -137,8 +149,46 @@ int main(int argc, char* argv[]){
 
     std::unique_ptr<HF> hf = HFBuilder::buildHF(parameters);
 
-    hf->solve(); // Solve the HF equation (SCF procedure)
+    // Load density matrix from previous run (for PES chaining)
+    if (!load_density_path.empty()) {
+        std::ifstream din(load_density_path, std::ios::binary);
+        if (din.good()) {
+            int nao = hf->get_num_basis();
+            size_t n2 = (size_t)nao * nao;
+            std::vector<real_t> D(n2);
+            din.read(reinterpret_cast<char*>(D.data()), n2 * sizeof(real_t));
+            if (din.good()) {
+                // RHF: D_total = D_alpha + D_beta. InitialGuess expects (D_alpha, D_beta).
+                // Pass D/2 for both.
+                std::vector<real_t> half_D(n2);
+                for (size_t k = 0; k < n2; k++) half_D[k] = D[k] * 0.5;
+                hf->solve(half_D.data(), half_D.data(), true);
+                std::cout << "[PES] Loaded density from " << load_density_path << std::endl;
+            } else {
+                std::cerr << "[PES] Warning: failed to read density file, using default guess" << std::endl;
+                hf->solve();
+            }
+        } else {
+            hf->solve();
+        }
+    } else {
+        hf->solve(); // Solve the HF equation (SCF procedure)
+    }
     hf->report(); // Print the HF results
+
+    // Save density matrix for next PES point
+    if (!save_density_path.empty()) {
+        RHF* rhf = dynamic_cast<RHF*>(hf.get());
+        if (rhf) {
+            int nao = hf->get_num_basis();
+            size_t n2 = (size_t)nao * nao;
+            auto& D = rhf->get_density_matrix();
+            D.toHost();
+            std::ofstream dout(save_density_path, std::ios::binary);
+            dout.write(reinterpret_cast<const char*>(D.host_ptr()), n2 * sizeof(real_t));
+            std::cout << "[PES] Saved density to " << save_density_path << std::endl;
+        }
+    }
 
     // Export the SAD density matrix to a file
     if (parameters.contains("export_sad_cache")) {

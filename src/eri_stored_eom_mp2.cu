@@ -43,6 +43,7 @@
 #include "eom_mp2_operator.hpp"
 #include "eom_mp2_schur_operator.hpp"
 #include "davidson_solver.hpp"
+#include "progress.hpp"
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
 #include "utils.hpp"
@@ -122,31 +123,45 @@ static void solve_eom_mp2_schur_static(
 
     EOMMP2SchurOperator schur_op(eom_mp2_op);
 
-    DavidsonConfig config;
-    config.num_eigenvalues = n_states;
-    config.convergence_threshold = 1e-6;
-    config.max_subspace_size = std::min(singles_dim, std::max(100, 10 * n_states));
-    config.max_iterations = 500;
-    config.use_preconditioner = true;
-    config.symmetric = false;
-    config.verbose = 2;
+    // Build dense Schur complement matrix and diagonalize directly
+    // (non-symmetric eigendecomposition, no Davidson needed)
+    real_t* d_M_eff = nullptr;
+    real_t* d_eigenvalues = nullptr;
+    real_t* d_eigenvectors_all = nullptr;
+    tracked_cudaMalloc(&d_M_eff, (size_t)singles_dim * singles_dim * sizeof(real_t));
+    tracked_cudaMalloc(&d_eigenvalues, (size_t)singles_dim * sizeof(real_t));
+    tracked_cudaMalloc(&d_eigenvectors_all, (size_t)singles_dim * singles_dim * sizeof(real_t));
 
-    DavidsonSolver solver(schur_op, config);
-    bool converged = solver.solve();
+    { double v[] = {0.0}; report_progress("schur", 0, 1, v); }
 
-    if (!converged) {
-        std::cout << "  Warning: Davidson did not fully converge" << std::endl;
-    }
+    schur_op.set_omega(0.0);
+    build_dense_from_operator(schur_op, d_M_eff, singles_dim);
+    gpu::eigenDecompositionNonSymmetric(d_M_eff, d_eigenvalues, d_eigenvectors_all, singles_dim);
 
-    const auto& eigenvalues = solver.get_eigenvalues();
+    std::vector<real_t> h_eigenvalues(singles_dim);
+    cudaMemcpy(h_eigenvalues.data(), d_eigenvalues,
+               singles_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+    std::vector<real_t> h_all_eigenvectors((size_t)singles_dim * singles_dim);
+    cudaMemcpy(h_all_eigenvectors.data(), d_eigenvectors_all,
+               (size_t)singles_dim * singles_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
+
     excitation_energies.resize(n_states);
     h_eigenvectors.resize((size_t)n_states * singles_dim);
-
-    solver.copy_eigenvectors_to_host(h_eigenvectors.data());
-
     for (int k = 0; k < n_states; k++) {
-        excitation_energies[k] = eigenvalues[k];
+        excitation_energies[k] = h_eigenvalues[k];
+        std::copy(&h_all_eigenvectors[k * singles_dim],
+                  &h_all_eigenvectors[(k + 1) * singles_dim],
+                  &h_eigenvectors[k * singles_dim]);
     }
+
+    { double v[] = {(double)n_states}; report_progress("schur", 1, 1, v); }
+
+    tracked_cudaFree(d_M_eff);
+    tracked_cudaFree(d_eigenvalues);
+    tracked_cudaFree(d_eigenvectors_all);
+
+    std::cout << "  (approximate: non-symmetric Schur complement with omega=0)" << std::endl;
 }
 
 
@@ -228,6 +243,9 @@ static void solve_eom_mp2_schur_omega(
 
             real_t omega_new = h_eigenvalues[k];
             real_t delta = std::abs(omega_new - omega);
+
+            { double v[] = {(double)(k+1), omega_new, delta};
+              report_progress("schur_omega", k * max_omega_iter + iter, 3, v); }
 
             std::cout << "  Root " << k + 1 << " iter " << std::setw(2) << iter + 1
                       << ": omega=" << std::fixed << std::setprecision(8) << omega_new
@@ -336,6 +354,7 @@ static void compute_eom_mp2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
     }
 
     // Step 1: Transform AO ERIs to MO ERIs
+    report_progress("excited", 0, 0, nullptr);
     real_t* d_eri_mo;
     bool free_eri_mo;
     if (d_eri_mo_precomputed) {
@@ -348,6 +367,7 @@ static void compute_eom_mp2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
         free_eri_mo = true;
     }
 
+    report_progress("excited", 1, 0, nullptr);
     // Step 2: Build EOM-MP2 operator
     DeviceHostMemory<real_t>& orbital_energies = rhf.get_orbital_energies();
     const real_t* d_orbital_energies = orbital_energies.device_ptr();
@@ -359,6 +379,7 @@ static void compute_eom_mp2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
     d_eri_mo = nullptr;
 
     // Step 3: Solve (dispatch based on solver mode)
+    report_progress("excited", 2, 0, nullptr);
     Timer solve_timer;
 
     std::vector<real_t> excitation_energies;

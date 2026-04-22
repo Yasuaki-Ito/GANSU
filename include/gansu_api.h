@@ -149,6 +149,10 @@ int gansu_get_density_matrix(gansu_handle_t h, double* buf, int buf_size);
  *  @return nao*nao, or -1 on error. */
 int gansu_get_overlap_matrix(gansu_handle_t h, double* buf, int buf_size);
 
+/** Set initial density matrix for next run (enables density reuse for PES).
+ *  Pass NULL to clear. buf is nao*nao doubles, row-major. */
+int gansu_set_initial_density(gansu_handle_t h, const double* buf, int buf_size);
+
 /* ---- Progress callback ---- */
 
 /**

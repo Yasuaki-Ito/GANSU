@@ -150,9 +150,23 @@ export interface SampleMolecule {
   name: string;
 }
 
+/** Progress event from structured callback */
+export interface ProgressEvent {
+  type: 'progress';
+  stage: string;
+  iteration: number;
+  total_energy?: number;
+  delta_e?: number;
+  correlation_energy?: number;
+  eigenvalues?: number[];
+  max_residual?: number;
+  residual?: number;
+}
+
 /** SSE event types */
 export type StreamEvent =
   | { type: 'line'; text: string }
+  | ProgressEvent
   | { type: 'result'; data: CalculationResult }
   | { type: 'error'; error: string; raw_output: string }
   | { type: 'done' };

@@ -34,13 +34,14 @@ static UHF* as_uhf(HF* hf) { return dynamic_cast<UHF*>(hf); }
 
 // Internal context held by each handle
 struct GansuContext {
-    std::map<std::string, std::string> user_params;  // raw user settings
+    std::map<std::string, std::string> user_params;
     std::unique_ptr<HF> hf;
     std::string excited_state_report_cache;
     bool solved = false;
     bool quiet = false;
     gansu_progress_fn progress_fn = nullptr;
     void* progress_userdata = nullptr;
+    std::vector<real_t> initial_density;  // for PES density reuse
 };
 
 static bool g_initialized = false;
@@ -48,7 +49,6 @@ static bool g_initialized = false;
 // ---- Lifecycle ----
 
 extern "C" void gansu_init(int force_cpu) {
-    if (g_initialized) return;
     if (force_cpu) {
         gpu::disable_gpu();
     } else {
@@ -118,6 +118,10 @@ extern "C" int gansu_run(gansu_handle_t h) {
     }
 
     try {
+        // Clean up previous run (release GPU memory)
+        ctx->hf.reset();
+        ctx->solved = false;
+
         // Install progress callback for this thread
         if (ctx->progress_fn) {
             gansu::set_progress_callback(ctx->progress_fn, ctx->progress_userdata);
@@ -131,13 +135,46 @@ extern "C" int gansu_run(gansu_handle_t h) {
         }
 
         ctx->hf = HFBuilder::buildHF(params);
-        ctx->hf->solve();
+        if (!ctx->initial_density.empty()) {
+            // RHF density is D_total = D_alpha + D_beta = 2*D_alpha.
+            // InitialGuess_RHF_Density expects (D_alpha, D_beta) and sums them.
+            // So pass D/2 for both alpha and beta.
+            size_t n = ctx->initial_density.size();
+            std::vector<real_t> half_density(n);
+            for (size_t i = 0; i < n; i++) half_density[i] = ctx->initial_density[i] * 0.5;
+            ctx->hf->solve(half_density.data(), half_density.data(), true);
+        } else {
+            ctx->hf->solve();
+        }
         ctx->solved = true;
 
         gansu::clear_progress_callback();
         if (orig_cout) std::cout.rdbuf(orig_cout);
         return 0;
     } catch (const std::exception& e) {
+        // Release all resources on error — no stale state
+        ctx->hf.reset();
+        ctx->solved = false;
+        ctx->initial_density.clear();
+        ctx->progress_fn = nullptr;
+        ctx->progress_userdata = nullptr;
+        ctx->excited_state_report_cache.clear();
+
+        // Only reset CUDA device if there's an actual CUDA error (OOM, kernel failure, etc.)
+        // Avoid cudaDeviceReset for non-GPU errors (parsing, parameter, convergence)
+        // as it destroys all GPU state and is very expensive to recover from.
+        if (gpu::gpu_available()) {
+            cudaError_t cuda_err = cudaGetLastError();
+            if (cuda_err != cudaSuccess) {
+                std::cerr << "gansu_run: CUDA error detected (" << cudaGetErrorString(cuda_err)
+                          << "), resetting device..." << std::endl;
+                cudaDeviceReset();
+                gpu::enable_gpu();
+                gpu::initialize_gpu();
+                gpu::GPUHandle::reset();  // Recreate cuBLAS/cuSOLVER handles
+            }
+        }
+
         gansu::clear_progress_callback();
         if (orig_cout) std::cout.rdbuf(orig_cout);
         std::cerr << "gansu_run error: " << e.what() << std::endl;
@@ -332,6 +369,17 @@ extern "C" int gansu_get_density_matrix(gansu_handle_t h, double* buf, int buf_s
     D.toHost();
     for (int i = 0; i < n2; i++) buf[i] = D.host_ptr()[i];
     return n2;
+}
+
+extern "C" int gansu_set_initial_density(gansu_handle_t h, const double* buf, int buf_size) {
+    if (!h) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (buf && buf_size > 0) {
+        ctx->initial_density.assign(buf, buf + buf_size);
+    } else {
+        ctx->initial_density.clear();
+    }
+    return 0;
 }
 
 extern "C" void gansu_set_progress_callback(gansu_handle_t h, gansu_progress_fn fn, void* user_data) {

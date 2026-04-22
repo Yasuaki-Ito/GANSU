@@ -168,10 +168,9 @@ export function createResultsPanel(container: HTMLElement): {
     html += '</div>';
     el.innerHTML = html;
 
-    // Molden download handler
+    // Molden download handler — auto-download + manual button
     if (result.molden_content) {
-      const dlBtn = el.querySelector<HTMLButtonElement>('#download-molden');
-      dlBtn?.addEventListener('click', () => {
+      const downloadMolden = () => {
         const blob = new Blob([result.molden_content!], { type: 'chemical/x-molden' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -179,7 +178,12 @@ export function createResultsPanel(container: HTMLElement): {
         a.download = 'output.molden';
         a.click();
         URL.revokeObjectURL(url);
-      });
+      };
+      // Auto-download
+      downloadMolden();
+      // Also attach to button for re-download
+      const dlBtn = el.querySelector<HTMLButtonElement>('#download-molden');
+      dlBtn?.addEventListener('click', downloadMolden);
     }
 
     // Render orbital diagram
@@ -283,6 +287,10 @@ function renderOrbitalTable(orbitals: OrbitalEnergy[]): string {
   return html;
 }
 
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-9;]*m/g, '');
+}
+
 function escapeHtml(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return stripAnsi(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }

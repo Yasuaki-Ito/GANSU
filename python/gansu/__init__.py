@@ -158,6 +158,9 @@ def _setup_signatures(lib):
     lib.gansu_get_overlap_matrix.argtypes = [c_handle, c_double_p, c_int]
     lib.gansu_get_overlap_matrix.restype = c_int
 
+    lib.gansu_set_initial_density.argtypes = [c_handle, c_double_p, c_int]
+    lib.gansu_set_initial_density.restype = c_int
+
     # Progress callback: void(const char*, int, int, const double*, void*)
     global PROGRESS_FUNC_TYPE
     PROGRESS_FUNC_TYPE = ctypes.CFUNCTYPE(
@@ -354,6 +357,16 @@ class Molecule:
         if hasattr(self, '_h') and self._h:
             self._lib.gansu_destroy(self._h)
             self._h = None
+
+    def set_initial_density(self, density):
+        """Set initial density matrix for next run (PES density reuse).
+        Args: density — numpy array (nao x nao) or None to clear."""
+        if density is None:
+            self._lib.gansu_set_initial_density(self._h, None, 0)
+        else:
+            flat = np.ascontiguousarray(density.ravel(), dtype=np.float64)
+            self._lib.gansu_set_initial_density(
+                self._h, flat.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), len(flat))
 
     def run(self, method="RHF", post_hf="none", quiet=True, on_progress=None, **kwargs):
         """Run the calculation.

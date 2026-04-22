@@ -373,23 +373,31 @@ real_t HF::single_point_energy(const real_t* density_matrix_alpha, const real_t*
 
     Timer timer;
 
+    // Setup
+    report_progress("setup", 0, 0, nullptr);
+
     // compute the nuclear repulsion energy
     compute_nuclear_repulsion_energy();
     if(verbose){
         std::cout << "Nuclear repulsion energy: " << nuclear_repulsion_energy_ << std::endl;
     }
 
-
+    report_progress("setup", 1, 0, nullptr);
 
     // compute the core Hamiltonian matrix
     compute_core_hamiltonian_matrix();
 
+    // Integrals
+    report_progress("integrals", 0, 0, nullptr);
+
     // precompute the electron repulsion integrals
     precompute_eri_matrix();
 
+    report_progress("integrals", 1, 0, nullptr);
+
     // compute the transformation matrix
     compute_transform_matrix();
-    
+
 
     guess_initial_fock_matrix(density_matrix_alpha, density_matrix_beta, force_density); // guess the initial Fock matrix
 
@@ -593,6 +601,20 @@ real_t HF::solve(const real_t* density_matrix_alpha, const real_t* density_matri
             std::cout << std::scientific << std::setprecision(6);
             std::cout << "Max gradient: " << max_grad << " Hartree/Bohr" << std::endl;
             std::cout << "RMS gradient: " << rms_grad << " Hartree/Bohr" << std::endl;
+            // Per-atom coordinates and gradient (Bohr, for UI visualization)
+            std::cout << "[Geometry Step " << iter << "]" << std::endl;
+            for(int i = 0; i < num_atoms_val; i++){
+                std::cout << std::setw(4) << atomic_number_to_element_name(current_atoms[i].atomic_number)
+                          << std::fixed << std::setprecision(10)
+                          << std::setw(16) << coords[3*i+0]
+                          << std::setw(16) << coords[3*i+1]
+                          << std::setw(16) << coords[3*i+2]
+                          << std::scientific << std::setprecision(6)
+                          << std::setw(14) << -grad[3*i+0]
+                          << std::setw(14) << -grad[3*i+1]
+                          << std::setw(14) << -grad[3*i+2]
+                          << std::endl;
+            }
 
             // --- Check gradient convergence ---
             if(max_grad < grad_threshold && rms_grad < rms_grad_threshold){

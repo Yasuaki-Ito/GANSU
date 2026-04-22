@@ -24,6 +24,7 @@
 #include "rys_eri_direct.hpp"
 #include "device_host_memory.hpp" // For tracked_gansu::tracked_cudaMalloc/tracked_cudaFree
 #include "gpu_kernels.hpp"
+#include "progress.hpp"
 #include "rys_eri.hpp"
 #include "rys_eri_mp2.hpp"
 
@@ -2776,19 +2777,23 @@ void compute_RI_IntermediateMatrixB(
     cudaMemset(d_two_center_eri, 0.0, num_auxiliary_basis * num_auxiliary_basis * sizeof(real_t));
 
     // Compute the two-center ERIs of the auxiliary basis functions
+    gansu::report_progress("integrals_ri", 0, 0, nullptr);  // 2-center start
+    std::cout << "[RI] Computing 2-center ERIs (Naux=" << num_auxiliary_basis << ")..." << std::endl;
     computeTwoCenterERIs(
-        auxiliary_shell_type_infos, 
-        d_auxiliary_primitive_shells, 
-        d_auxiliary_cgto_normalization_factors, 
-        d_two_center_eri, 
+        auxiliary_shell_type_infos,
+        d_auxiliary_primitive_shells,
+        d_auxiliary_cgto_normalization_factors,
+        d_two_center_eri,
         num_auxiliary_basis,
         d_boys_grid,
         d_auxiliary_schwarz_upper_bound_factors,
         schwarz_screening_threshold,
         verbose);
-
+    std::cout << "[RI] 2-center ERIs done." << std::endl;
 
     // Cholesky decomposition of the inverse of the two-center ERI matrix (it is overwritten with the result)
+    gansu::report_progress("integrals_ri", 1, 0, nullptr);  // Cholesky
+    std::cout << "[RI] Cholesky decomposition..." << std::endl;
     choleskyDecomposition(d_two_center_eri, num_auxiliary_basis);
 
     // Allocate device memory for the three-center ERIs
@@ -2800,15 +2805,17 @@ void compute_RI_IntermediateMatrixB(
     cudaMemset(d_three_center_eri, 0.0, num_basis * num_basis * (size_t)num_auxiliary_basis * sizeof(real_t));
 
     // Compute the three-center ERIs of the auxiliary basis functions and the basis functions
+    gansu::report_progress("integrals_ri", 2, 0, nullptr);  // 3-center start
+    std::cout << "[RI] Computing 3-center ERIs (Naux=" << num_auxiliary_basis << ", Nbasis=" << num_basis << ")..." << std::endl;
     computeThreeCenterERIs(
-        shell_type_infos, 
+        shell_type_infos,
         shell_pair_type_infos,
-        d_primitive_shells, 
-        d_cgto_normalization_factors, 
-        auxiliary_shell_type_infos, 
-        d_auxiliary_primitive_shells, 
-        d_auxiliary_cgto_normalization_factors, 
-        d_three_center_eri, 
+        d_primitive_shells,
+        d_cgto_normalization_factors,
+        auxiliary_shell_type_infos,
+        d_auxiliary_primitive_shells,
+        d_auxiliary_cgto_normalization_factors,
+        d_three_center_eri,
         d_primitive_shell_pair_indices,
         num_basis,
         num_auxiliary_basis,
@@ -2817,11 +2824,16 @@ void compute_RI_IntermediateMatrixB(
         d_auxiliary_schwarz_upper_bound_factors,
         schwarz_screening_threshold,
         verbose);
+    std::cout << "[RI] 3-center ERIs done." << std::endl;
 
-   
+
     // Compute the intermediate matrix B
+    gansu::report_progress("integrals_ri", 3, 0, nullptr);  // B matrix
+    std::cout << "[RI] Building B matrix (L^-1 * 3c-ERI)..." << std::endl;
     solve_lower_triangular(d_two_center_eri, d_three_center_eri, num_auxiliary_basis, num_basis*num_basis);
     cudaMemcpy(d_intermediate_matrix_B, d_three_center_eri, sizeof(real_t) * num_auxiliary_basis*num_basis*num_basis, cudaMemcpyDeviceToDevice);
+    std::cout << "[RI] B matrix done." << std::endl;
+    gansu::report_progress("integrals_ri", 4, 0, nullptr);  // RI done
 
 
     gansu::tracked_cudaFree(d_two_center_eri);

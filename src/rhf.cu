@@ -19,6 +19,7 @@
 
 #include "rhf.hpp"
 #include "cphf_solver.hpp"
+#include "progress.hpp"
 #include <cassert>
 #include "ao2mo.cuh"
 
@@ -185,7 +186,12 @@ void RHF::post_process_after_scf() {
     if(post_hf_method == PostHFMethod::None){
         post_hf_energy_ = 0.0;
         return; // do nothing
-    }else if(post_hf_method == PostHFMethod::FCI){
+    }
+
+    // Report post-HF start
+    report_progress("posthf", 0, 0, nullptr);
+
+    if(post_hf_method == PostHFMethod::FCI){
         post_hf_energy_ = eri_method_->compute_fci_energy();
     }else if(post_hf_method == PostHFMethod::MP2){
         post_hf_energy_ = eri_method_->compute_mp2_energy();
@@ -218,6 +224,9 @@ void RHF::post_process_after_scf() {
     }else{
         THROW_EXCEPTION("Invalid post-HF method.");
     }
+
+    // Report post-HF done
+    report_progress("posthf", 1, 0, nullptr);
 }
 
 

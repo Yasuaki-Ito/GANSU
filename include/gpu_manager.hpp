@@ -290,6 +290,22 @@ private:
 class GPUHandle {
 public:
     /**
+     * @brief Recreate all handles after cudaDeviceReset().
+     * Must be called from the same thread that uses the handles.
+     */
+    static void reset() {
+        auto& inst = instance();
+        // Old handles are invalid after cudaDeviceReset — don't destroy them
+        inst.cublas_ = nullptr;
+        inst.cusolver_ = nullptr;
+        inst.cusolver_params_ = nullptr;
+        if (!gpu_available()) return;
+        cublasCreate(&inst.cublas_);
+        cusolverDnCreate(&inst.cusolver_);
+        cusolverDnCreateParams(&inst.cusolver_params_);
+    }
+
+    /**
      * @brief Get thread-local cuBLAS handle.
      */
     static cublasHandle_t cublas() {

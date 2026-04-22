@@ -1,4 +1,8 @@
-/** Main application — in-process calculation via Python API */
+/**
+ * GANSU-UI — In-Process Calculation page.
+ * Same UI as the main Calculation page, but uses Python API directly (no subprocess).
+ * Streams progress via SSE for real-time ProgressTracker popup.
+ */
 
 import { fetchSampleDirs, fetchSamples, fetchBasisSets, fetchAuxiliaryBasisSets } from './api';
 import { DEFAULT_PARAMS } from './types';
@@ -9,7 +13,7 @@ import { createResultsPanel } from './ui/resultsPanel';
 import { toggleTheme } from './ui/theme';
 import { ProgressTracker, buildSteps } from './ui/progressTracker';
 
-export async function initApp(root: HTMLElement) {
+async function initApp(root: HTMLElement) {
   let sampleDirs = ['.'];
   let samples = [{ filename: 'H2.xyz', name: 'H2' }, { filename: 'H2O.xyz', name: 'H2O' }];
   let basisSets = ['sto-3g', '3-21g', '6-31g', 'cc-pvdz', 'cc-pvtz'];
@@ -34,10 +38,11 @@ export async function initApp(root: HTMLElement) {
           <span id="theme-icon">&#9790;</span>
         </button>
       </div>
-      <nav class="demo-nav">
-        <a class="demo-tab active">Calculation</a>
+      <nav class="demo-nav" id="demo-nav">
+        <a href="./" class="demo-tab">Calculation (subprocess)</a>
         <a href="./pes.html" class="demo-tab">PES</a>
         <a href="./geomopt.html" class="demo-tab">Geometry Opt</a>
+        <a class="demo-tab active">In-Process</a>
       </nav>
     </header>
     <div class="main-grid">
@@ -139,7 +144,6 @@ export async function initApp(root: HTMLElement) {
           eri_method: params.eri_method,
           auxiliary_basis: params.auxiliary_basis,
           auxiliary_basis_dir: params.auxiliary_basis_dir,
-          excited_solver: params.excited_solver,
           mulliken: params.mulliken,
           mayer: params.mayer,
           wiberg: params.wiberg,
@@ -173,29 +177,13 @@ export async function initApp(root: HTMLElement) {
           const E = vals[2] !== undefined ? Number(vals[2]).toFixed(10) : '';
           const dE = vals[1] !== undefined ? Number(vals[1]).toExponential(2) : '';
           logLines.push(`[${elapsed}s] SCF iter ${iter}  E=${E}  ΔE=${dE}`);
-        } else if (stage === 'posthf') {
-          logLines.push(`[${elapsed}s] ${iter === 0 ? 'Post-HF: Starting...' : 'Post-HF: Done'}`);
         } else if (stage === 'ccsd') {
           const dE = vals[1] !== undefined ? Number(vals[1]).toExponential(2) : '';
           logLines.push(`[${elapsed}s] CCSD iter ${iter}  ΔE=${dE}`);
         } else if (stage === 'ccsd_lambda') {
           logLines.push(`[${elapsed}s] Lambda iter ${iter}  residual=${vals[0] !== undefined ? Number(vals[0]).toExponential(2) : ''}`);
-        } else if (stage === 'excited') {
-          const labels: Record<number, string> = { 0: 'MO transform', 1: 'Building operator', 2: 'Solving eigenstates' };
-          logLines.push(`[${elapsed}s] Excited: ${labels[iter] || `step ${iter}`}`);
-        } else if (stage === 'schur') {
-          logLines.push(`[${elapsed}s] Schur ${iter === 0 ? 'diagonalization...' : 'done'}`);
-        } else if (stage === 'schur_omega') {
-          const root = vals[0] !== undefined ? Math.floor(Number(vals[0])) : '?';
-          const omega = vals[1] !== undefined ? Number(vals[1]).toFixed(8) : '';
-          const delta = vals[2] !== undefined ? Number(vals[2]).toExponential(2) : '';
-          logLines.push(`[${elapsed}s] Schur-omega Root ${root}  omega=${omega}  d_omega=${delta}`);
         } else if (stage === 'davidson') {
-          // vals = [eig_0, eig_1, ..., eig_k, max_residual]
-          const nvals = vals.length;
-          const maxRes = nvals > 0 ? Number(vals[nvals - 1]).toExponential(2) : '';
-          const eigs = vals.slice(0, nvals - 1).map((v: number) => Number(v).toFixed(6));
-          logLines.push(`[${elapsed}s] Davidson iter ${iter}  max|r|=${maxRes}  eigs=[${eigs.join(', ')}]`);
+          logLines.push(`[${elapsed}s] Davidson iter ${iter}  max|r|=${vals[0] !== undefined ? Number(vals[0]).toExponential(2) : ''}`);
         } else {
           logLines.push(`[${elapsed}s] ${stage} iter ${iter}`);
         }
@@ -285,3 +273,12 @@ export async function initApp(root: HTMLElement) {
     cancelBtn.classList.add('hidden');
   });
 }
+
+// Bootstrap
+import { initTheme } from './ui/theme';
+import './ui/styles.css';
+
+document.addEventListener('DOMContentLoaded', () => {
+  initTheme();
+  initApp(document.getElementById('app')!);
+});

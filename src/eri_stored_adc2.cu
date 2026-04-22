@@ -41,6 +41,7 @@
 #include "adc2_operator.hpp"
 #include "adc2_full_operator.hpp"
 #include "davidson_solver.hpp"
+#include "progress.hpp"
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
 #include "utils.hpp"
@@ -72,6 +73,7 @@ static void solve_schur_static(
     tracked_cudaMalloc(&d_eigenvalues, (size_t)singles_dim * sizeof(real_t));
     tracked_cudaMalloc(&d_eigenvectors, (size_t)singles_dim * singles_dim * sizeof(real_t));
 
+    { double v[] = {0.0}; report_progress("schur", 0, 1, v); }  // diagonalization
     adc2_op.build_M_eff_matrix(0.0, d_M_eff);
     gpu::eigenDecomposition(d_M_eff, d_eigenvalues, d_eigenvectors, singles_dim);
 
@@ -91,6 +93,7 @@ static void solve_schur_static(
                   &h_all_eigenvectors[(k + 1) * singles_dim],
                   &h_final_eigenvectors[k * singles_dim]);
     }
+    { double v[] = {(double)n_states}; report_progress("schur", 1, 1, v); }  // done
 
     tracked_cudaFree(d_M_eff);
     tracked_cudaFree(d_eigenvalues);
@@ -149,6 +152,9 @@ static void solve_schur_omega(
 
             real_t omega_new = h_eigenvalues[k];
             real_t delta = std::abs(omega_new - omega);
+
+            { double v[] = {(double)(k+1), omega_new, delta};
+              report_progress("schur_omega", k * max_omega_iter + iter, 3, v); }
 
             std::cout << "  Root " << k + 1 << " iter " << std::setw(2) << iter + 1
                       << ": omega=" << std::fixed << std::setprecision(8) << omega_new
@@ -280,6 +286,7 @@ static void compute_adc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, re
     // ------------------------------------------------------------------
     // Step 1: Transform AO ERIs to MO ERIs
     // ------------------------------------------------------------------
+    report_progress("excited", 0, 0, nullptr);  // MO transform start
     Timer mo_timer;
     real_t* d_eri_mo;
     bool free_eri_mo;
@@ -298,6 +305,7 @@ static void compute_adc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, re
     // ------------------------------------------------------------------
     // Step 2: Get orbital energies and build ADC(2) operator
     // ------------------------------------------------------------------
+    report_progress("excited", 1, 0, nullptr);  // Operator build
     Timer build_timer;
     DeviceHostMemory<real_t>& orbital_energies = rhf.get_orbital_energies();
     const real_t* d_orbital_energies = orbital_energies.device_ptr();
@@ -313,6 +321,7 @@ static void compute_adc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, re
     // ------------------------------------------------------------------
     // Step 3: Solve (dispatch based on solver mode)
     // ------------------------------------------------------------------
+    report_progress("excited", 2, 0, nullptr);  // Solver start
     Timer adc2_timer;
 
     std::vector<real_t> excitation_energies;

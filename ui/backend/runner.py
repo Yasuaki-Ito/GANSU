@@ -1,56 +1,26 @@
-"""Execute GANSU calculations via Python API (libgansu.so) with progress callbacks."""
+"""Execute GANSU calculations via subprocess (process isolation for GPU stability)."""
 
 from __future__ import annotations
 
 import asyncio
 import os
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
-# ---------------------------------------------------------------------------
-#  GANSU Python API import
-# ---------------------------------------------------------------------------
+# Path configuration
+GANSU_PATH = Path(os.environ.get("GANSU_PATH", Path.home() / "GANSU"))
+GANSU_BIN = os.environ.get("GANSU_BIN", str(GANSU_PATH / "build" / "gansu"))
+# Fallback to HF_main if gansu binary not found
+if not os.path.isfile(GANSU_BIN):
+    alt = str(GANSU_PATH / "build" / "HF_main")
+    if os.path.isfile(alt):
+        GANSU_BIN = alt
+XYZ_DIR = GANSU_PATH / "xyz"
+BASIS_DIR = GANSU_PATH / "basis"
+AUX_BASIS_DIR = GANSU_PATH / "auxiliary_basis"
 
-_GANSU_PATH = Path(os.environ.get("GANSU_PATH", Path.home() / "GANSU"))
-_PYTHON_PATH = _GANSU_PATH / "python"
-if _PYTHON_PATH.is_dir() and str(_PYTHON_PATH) not in sys.path:
-    sys.path.insert(0, str(_PYTHON_PATH))
-
-if "GANSU_LIB" not in os.environ:
-    for candidate in [
-        _GANSU_PATH / "build" / "libgansu.so",
-        _GANSU_PATH / "build" / "libgansu.dylib",
-    ]:
-        if candidate.exists():
-            os.environ["GANSU_LIB"] = str(candidate)
-            break
-
-import gansu  # noqa: E402
-
-XYZ_DIR = _GANSU_PATH / "xyz"
-
-_initialized = False
-
-# Element symbols for atomic numbers
-_ELEMENTS = ["", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne",
-             "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca",
-             "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
-             "Ga", "Ge", "As", "Se", "Br", "Kr"]
-
-
-def _ensure_init():
-    global _initialized
-    if not _initialized:
-        gansu.init()
-        _initialized = True
-
-
-# ---------------------------------------------------------------------------
-#  RunParams (unchanged — frontend compatibility)
-# ---------------------------------------------------------------------------
 
 @dataclass
 class RunParams:
@@ -82,12 +52,126 @@ class RunParams:
     wiberg: bool = False
     export_molden: bool = False
     verbose: bool = False
+    run_type: str = "energy"
+    optimizer: str = "bfgs"
     timeout: int = 600
 
 
-# ---------------------------------------------------------------------------
-#  XYZ / kwargs helpers
-# ---------------------------------------------------------------------------
+def build_command(params: RunParams, xyz_path: str) -> list[str]:
+    """Build gansu command-line arguments."""
+    cmd = [GANSU_BIN]
+    cmd.extend(["-x", xyz_path])
+    cmd.extend(["-g", params.basis])  # gansu resolves basis name automatically
+    cmd.extend(["-m", params.method])
+    cmd.extend(["-c", str(params.charge)])
+
+    if params.beta_to_alpha:
+        cmd.extend(["--beta_to_alpha", str(params.beta_to_alpha)])
+    if params.convergence_method != "diis":
+        conv_map = {"optimal_damping": "OptimalDamping", "damping": "Damping", "diis": "DIIS"}
+        cmd.extend(["--convergence_method", conv_map.get(params.convergence_method, params.convergence_method)])
+    if params.diis_size != 8:
+        cmd.extend(["--diis_size", str(params.diis_size)])
+    if params.diis_include_transform:
+        cmd.extend(["--diis_include_transform", "true"])
+    if params.damping_factor != 0.9:
+        cmd.extend(["--damping_factor", str(params.damping_factor)])
+    if params.method == "ROHF" and params.rohf_parameter_name != "Roothaan":
+        cmd.extend(["--rohf_parameter_name", params.rohf_parameter_name])
+    if params.maxiter != 100:
+        cmd.extend(["--maxiter", str(params.maxiter)])
+    if params.convergence_energy_threshold != 1e-6:
+        cmd.extend(["--convergence_energy_threshold", str(params.convergence_energy_threshold)])
+    if params.schwarz_screening_threshold != 1e-12:
+        cmd.extend(["--schwarz_screening_threshold", str(params.schwarz_screening_threshold)])
+    if params.initial_guess != "core":
+        cmd.extend(["--initial_guess", params.initial_guess])
+    if params.post_hf_method != "none":
+        cmd.extend(["--post_hf_method", params.post_hf_method])
+    if params.post_hf_method in ("cis", "adc2", "adc2x", "eom_mp2", "eom_cc2", "eom_ccsd"):
+        cmd.extend(["--n_excited_states", str(params.n_excited_states)])
+    if params.spin_type != "singlet":
+        cmd.extend(["--spin_type", params.spin_type])
+    if params.excited_solver != "auto":
+        solver_param_map = {
+            "adc2": "adc2_solver", "adc2x": "adc2_solver",
+            "eom_mp2": "eom_mp2_solver", "eom_cc2": "eom_cc2_solver",
+        }
+        solver_key = solver_param_map.get(params.post_hf_method)
+        if solver_key:
+            cmd.extend([f"--{solver_key}", params.excited_solver])
+    if params.eri_method != "stored":
+        eri_map = {"ri": "RI", "direct": "Direct", "direct_ri": "Direct_RI", "stored": "stored"}
+        cmd.extend(["--eri_method", eri_map.get(params.eri_method, params.eri_method)])
+    if params.auxiliary_basis:
+        aux_dir = AUX_BASIS_DIR if params.auxiliary_basis_dir == "auxiliary_basis" else BASIS_DIR
+        cmd.extend(["-ag", str(aux_dir / f"{params.auxiliary_basis}.gbs")])
+    if params.run_type != "energy":
+        cmd.extend(["-r", params.run_type])
+    if params.run_type == "optimize" and params.optimizer != "bfgs":
+        cmd.extend(["--optimizer", params.optimizer])
+    if params.mulliken:
+        cmd.extend(["--mulliken", "1"])
+    if params.mayer:
+        cmd.extend(["--mayer", "1"])
+    if params.wiberg:
+        cmd.extend(["--wiberg", "1"])
+    if params.export_molden:
+        cmd.extend(["--export_molden", "1"])
+    if params.verbose:
+        cmd.extend(["-v", "1"])
+
+    return cmd
+
+
+async def run_pes_point(params: RunParams, density_file: str | None = None) -> tuple[str, str, int, str]:
+    """Run a single PES point with optional density chaining.
+    Uses --save_density to write density for the next point,
+    and --load_density to read from previous point."""
+    xyz_path, tmp = _resolve_xyz(params)
+    workdir = tempfile.mkdtemp(prefix="gansu_pes_")
+    save_path = os.path.join(workdir, "density.bin")
+    try:
+        cmd = build_command(params, xyz_path)
+        cmd.extend(["--save_density", save_path])
+        if density_file and os.path.isfile(density_file):
+            cmd.extend(["--load_density", density_file])
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=workdir,
+        )
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=params.timeout
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return "", "Timeout", -1, ""
+
+        # Copy saved density for chaining
+        new_density = ""
+        if os.path.isfile(save_path):
+            import shutil
+            persistent = tempfile.mktemp(suffix=".bin", prefix="gansu_density_")
+            shutil.copy2(save_path, persistent)
+            new_density = persistent
+
+        return (
+            stdout_bytes.decode("utf-8", errors="replace"),
+            stderr_bytes.decode("utf-8", errors="replace"),
+            proc.returncode or 0,
+            new_density,
+        )
+    finally:
+        if tmp:
+            try: os.unlink(tmp)
+            except OSError: pass
+        import shutil
+        shutil.rmtree(workdir, ignore_errors=True)
+
 
 def _resolve_xyz(params: RunParams) -> tuple[str, str | None]:
     if params.xyz_file:
@@ -99,278 +183,83 @@ def _resolve_xyz(params: RunParams) -> tuple[str, str | None]:
     return tmp, tmp
 
 
-def _build_kwargs(params: RunParams) -> dict[str, str]:
-    kw: dict[str, str] = {}
-    kw["charge"] = str(params.charge)
-    if params.beta_to_alpha:
-        kw["beta_to_alpha"] = str(params.beta_to_alpha)
-    conv_map = {"optimal_damping": "OptimalDamping", "damping": "Damping", "diis": "DIIS"}
-    kw["convergence_method"] = conv_map.get(params.convergence_method, params.convergence_method)
-    if params.diis_size != 8:
-        kw["diis_size"] = str(params.diis_size)
-    if params.diis_include_transform:
-        kw["diis_include_transform"] = "true"
-    if params.damping_factor != 0.9:
-        kw["damping_factor"] = str(params.damping_factor)
-    if params.method == "ROHF" and params.rohf_parameter_name != "Roothaan":
-        kw["rohf_parameter_name"] = params.rohf_parameter_name
-    if params.maxiter != 100:
-        kw["maxiter"] = str(params.maxiter)
-    if params.convergence_energy_threshold != 1e-6:
-        kw["convergence_energy_threshold"] = str(params.convergence_energy_threshold)
-    if params.schwarz_screening_threshold != 1e-12:
-        kw["schwarz_screening_threshold"] = str(params.schwarz_screening_threshold)
-    if params.initial_guess != "core":
-        kw["initial_guess"] = params.initial_guess
-    if params.post_hf_method in ("cis", "adc2", "adc2x", "eom_mp2", "eom_cc2", "eom_ccsd"):
-        kw["n_excited_states"] = str(params.n_excited_states)
-    if params.spin_type != "singlet":
-        kw["spin_type"] = params.spin_type
-    if params.excited_solver != "auto":
-        solver_map = {"adc2": "adc2_solver", "adc2x": "adc2_solver",
-                      "eom_mp2": "eom_mp2_solver", "eom_cc2": "eom_cc2_solver"}
-        key = solver_map.get(params.post_hf_method)
-        if key:
-            kw[key] = params.excited_solver
-    eri_map = {"ri": "RI", "direct": "Direct", "direct_ri": "Direct_RI", "stored": "stored"}
-    if params.eri_method != "stored":
-        kw["eri_method"] = eri_map.get(params.eri_method, params.eri_method)
-    if params.auxiliary_basis:
-        aux_dir = _GANSU_PATH / ("auxiliary_basis" if params.auxiliary_basis_dir == "auxiliary_basis" else "basis")
-        kw["auxiliary_gbsfilename"] = str(aux_dir / f"{params.auxiliary_basis}.gbs")
-    if params.mulliken:
-        kw["mulliken"] = "1"
-    if params.mayer:
-        kw["mayer"] = "1"
-    if params.wiberg:
-        kw["wiberg"] = "1"
-    if params.export_molden:
-        kw["export_molden"] = "1"
-    if params.verbose:
-        kw["verbose"] = "1"
-    return kw
-
-
-# ---------------------------------------------------------------------------
-#  Build structured result from gansu.Result (replaces parser.py)
-# ---------------------------------------------------------------------------
-
-def _build_result_dict(r: gansu.Result, params: RunParams,
-                       scf_iterations: list[dict]) -> dict[str, Any]:
-    """Build frontend-compatible result dict from gansu.Result."""
-    data: dict[str, Any] = {"ok": True}
-
-    # Molecule info
-    atoms_list = []
-    try:
-        for i, (Z, x, y, z) in enumerate(r.atoms):
-            elem = _ELEMENTS[Z] if Z < len(_ELEMENTS) else f"Z{Z}"
-            atoms_list.append({"index": i, "element": elem, "coords": [x, y, z]})
-    except Exception:
-        pass
-    data["molecule"] = {
-        "num_atoms": r.num_atoms,
-        "num_electrons": r.num_electrons,
-        "atoms": atoms_list,
-    }
-
-    # Basis set
-    data["basis_set"] = {"num_basis": r.num_basis}
-
-    # SCF iterations (from progress callback)
-    data["scf_iterations"] = scf_iterations
-
-    # Summary
-    data["summary"] = {
-        "method": params.method,
-        "total_energy": r.total_energy,
-        "iterations": len(scf_iterations),
-    }
-
-    # Orbital energies
-    try:
-        nocc = r.num_electrons // 2
-        eps = r.orbital_energies
-        data["orbital_energies"] = [
-            {"index": i + 1, "occupation": "occ" if i < nocc else "vir", "energy": float(e)}
-            for i, e in enumerate(eps)
-        ]
-    except Exception:
-        data["orbital_energies"] = []
-
-    # Post-HF
-    if params.post_hf_method != "none":
-        corr = r.post_hf_energy
-        data["post_hf"] = {
-            "method": params.post_hf_method.upper(),
-            "correction": corr,
-            "total_energy": r.total_energy + corr,
-        }
-
-    # Excited states
-    report = r.excited_state_report
-    if report:
-        data["excited_state_report"] = report
-
-    # Mulliken charges
-    if params.mulliken:
-        try:
-            charges = r.mulliken_charges
-            data["mulliken"] = [
-                {"index": i, "element": atoms_list[i]["element"] if i < len(atoms_list) else "?",
-                 "charge": float(c)}
-                for i, c in enumerate(charges)
-            ]
-        except Exception:
-            pass
-
-    # Bond orders
-    if params.mayer:
-        try:
-            data["mayer_bond_order"] = r.mayer_bond_order.tolist()
-        except Exception:
-            pass
-    if params.wiberg:
-        try:
-            data["wiberg_bond_order"] = r.wiberg_bond_order.tolist()
-        except Exception:
-            pass
-
-    return data
-
-
-# ---------------------------------------------------------------------------
-#  Main execution — Python API with progress callback
-# ---------------------------------------------------------------------------
-
-async def run_hf_main(params: RunParams) -> dict[str, Any]:
-    """Run GANSU and return structured result dict."""
-    _ensure_init()
+async def run_hf_main(params: RunParams) -> tuple[str, str, int, str]:
+    """Run gansu and return (stdout, stderr, returncode, molden_content)."""
     xyz_path, tmp = _resolve_xyz(params)
-
-    scf_iters: list[dict] = []
-    ccsd_iters: list[dict] = []
-
-    def _on_progress(stage, iter_num, values):
-        if stage == "scf" and iter_num > 0:
-            scf_iters.append({
-                "iteration": iter_num,
-                "total_energy": values[0],
-                "delta_e": values[1] if len(values) > 1 else 0,
-            })
-        elif stage == "ccsd":
-            ccsd_iters.append({
-                "iteration": iter_num,
-                "correlation_energy": values[0],
-                "delta_e": values[1] if len(values) > 1 else 0,
-            })
-
+    workdir = tempfile.mkdtemp(prefix="gansu_run_")
     try:
-        kwargs = _build_kwargs(params)
-
-        def _run():
-            mol = gansu.Molecule(xyz_path, basis=params.basis, **kwargs)
-            return mol.run(method=params.method, post_hf=params.post_hf_method,
-                           quiet=True, on_progress=_on_progress)
-
-        loop = asyncio.get_event_loop()
-        result = await asyncio.wait_for(
-            loop.run_in_executor(None, _run),
-            timeout=params.timeout,
+        cmd = build_command(params, xyz_path)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=workdir,
         )
-
-        data = _build_result_dict(result, params, scf_iters)
-        if ccsd_iters:
-            data["ccsd_iterations"] = ccsd_iters
-        return data
-
-    except asyncio.TimeoutError:
-        return {"ok": False, "error": "Timeout: calculation exceeded time limit"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    finally:
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-
-
-async def stream_hf_main(params: RunParams) -> AsyncGenerator[dict[str, Any], None]:
-    """Stream calculation progress as dicts, then yield final result."""
-    _ensure_init()
-    xyz_path, tmp = _resolve_xyz(params)
-
-    progress_queue: asyncio.Queue = asyncio.Queue()
-    scf_iters: list[dict] = []
-
-    def _on_progress(stage, iter_num, values):
-        if stage == "scf":
-            entry = {"stage": "scf", "iteration": iter_num,
-                     "total_energy": values[0],
-                     "delta_e": values[1] if len(values) > 1 else 0}
-            if iter_num > 0:
-                scf_iters.append(entry)
-            progress_queue.put_nowait(entry)
-        elif stage == "ccsd":
-            progress_queue.put_nowait({
-                "stage": "ccsd", "iteration": iter_num,
-                "correlation_energy": values[0],
-                "delta_e": values[1] if len(values) > 1 else 0})
-        elif stage == "davidson":
-            progress_queue.put_nowait({
-                "stage": "davidson", "iteration": iter_num,
-                "eigenvalues": values[:-1],
-                "max_residual": values[-1] if values else 0})
-        elif stage == "ccsd_lambda":
-            progress_queue.put_nowait({
-                "stage": "ccsd_lambda", "iteration": iter_num,
-                "residual": values[0] if values else 0})
-
-    result_holder: list = [None, None]  # [result, error]
-
-    def _run():
         try:
-            kwargs = _build_kwargs(params)
-            mol = gansu.Molecule(xyz_path, basis=params.basis, **kwargs)
-            r = mol.run(method=params.method, post_hf=params.post_hf_method,
-                        quiet=True, on_progress=_on_progress)
-            result_holder[0] = r
-        except Exception as e:
-            result_holder[1] = str(e)
-        finally:
-            progress_queue.put_nowait(None)  # sentinel
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=params.timeout
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return "", "Timeout: calculation exceeded time limit", -1, ""
 
-    loop = asyncio.get_event_loop()
-    task = loop.run_in_executor(None, _run)
+        molden = ""
+        molden_path = Path(workdir) / "output.molden"
+        if molden_path.exists():
+            molden = molden_path.read_text(errors="replace")
 
-    try:
-        while True:
-            item = await progress_queue.get()
-            if item is None:
-                break
-            yield {"type": "progress", **item}
-
-        await task
-
-        if result_holder[1]:
-            yield {"type": "error", "error": result_holder[1]}
-        elif result_holder[0]:
-            data = _build_result_dict(result_holder[0], params, scf_iters)
-            yield {"type": "result", "data": data}
-        yield {"type": "done"}
-
+        return (
+            stdout_bytes.decode("utf-8", errors="replace"),
+            stderr_bytes.decode("utf-8", errors="replace"),
+            proc.returncode or 0,
+            molden,
+        )
     finally:
         if tmp:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+        import shutil
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
-# ---------------------------------------------------------------------------
-#  Utility functions
-# ---------------------------------------------------------------------------
+async def stream_hf_main(params: RunParams) -> AsyncGenerator[tuple[str, str, int], None]:
+    """Stream gansu stdout line by line."""
+    xyz_path, tmp = _resolve_xyz(params)
+    workdir = tempfile.mkdtemp(prefix="gansu_run_")
+    try:
+        cmd = build_command(params, xyz_path)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=workdir,
+        )
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            yield ("stdout", line.decode("utf-8", errors="replace"), 0)
+        await proc.wait()
+        stderr = await proc.stderr.read()
+        stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
+        yield ("exit", stderr_text, proc.returncode or 0)
+        molden_path = Path(workdir) / "output.molden"
+        if molden_path.exists():
+            yield ("molden", molden_path.read_text(errors="replace"), 0)
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        import shutil
+        shutil.rmtree(workdir, ignore_errors=True)
+
 
 def list_sample_dirs() -> list[str]:
     dirs: list[str] = []
@@ -400,20 +289,20 @@ def list_samples(subdir: str = ".") -> list[dict[str, str]]:
 
 
 def list_basis_sets() -> list[str]:
-    return gansu.list_basis_sets()
+    if BASIS_DIR.exists():
+        return sorted({f.stem for f in BASIS_DIR.glob("*.gbs")})
+    return []
 
 
 def list_auxiliary_basis_sets() -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     seen: set[str] = set()
-    aux_dir = _GANSU_PATH / "auxiliary_basis"
-    basis_dir = _GANSU_PATH / "basis"
-    if aux_dir.exists():
-        for f in sorted(aux_dir.glob("*.gbs")):
+    if AUX_BASIS_DIR.exists():
+        for f in sorted(AUX_BASIS_DIR.glob("*.gbs")):
             result.append({"name": f.stem, "dir": "auxiliary_basis"})
             seen.add(f.stem)
-    if basis_dir.exists():
-        for f in sorted(basis_dir.glob("*.gbs")):
+    if BASIS_DIR.exists():
+        for f in sorted(BASIS_DIR.glob("*.gbs")):
             if f.stem not in seen:
                 result.append({"name": f.stem, "dir": "basis"})
     return result

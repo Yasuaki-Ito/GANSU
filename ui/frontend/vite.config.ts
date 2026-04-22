@@ -8,4 +8,13 @@ export default defineConfig({
     port: 5173,
   },
   cacheDir: path.join(os.tmpdir(), 'gansu-ui-vite-cache'),
+  build: {
+    rollupOptions: {
+      input: {
+        main: 'index.html',
+        pes: 'pes.html',
+        geomopt: 'geomopt.html',
+      },
+    },
+  },
 });
