@@ -34,6 +34,7 @@
 #include "davidson_solver.hpp"
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
+#include "progress.hpp"
 #include "utils.hpp"
 #include "profiler.hpp"
 #include "oscillator_strength.hpp"
@@ -96,32 +97,106 @@ static void compute_cis_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, rea
     // ------------------------------------------------------------------
     CISOperator cis_op(d_eri_mo, d_orbital_energies, num_occ, num_vir, num_basis, is_triplet);
 
-    DavidsonConfig config;
-    config.num_eigenvalues = n_states;
-    config.max_subspace_size = std::min(cis_dim, std::max(30, 4 * n_states));
-    config.convergence_threshold = 1e-6;
-    config.max_iterations = 100;
-    config.use_preconditioner = true;
-    config.verbose = 2;
+    std::vector<real_t> excitation_energies;
+    std::vector<real_t> h_eigenvectors;
 
-    DavidsonSolver solver(cis_op, config);
-    bool converged = solver.solve();
+    // Try direct diagonalization if the dense CIS matrix fits in GPU memory
+    size_t dense_bytes = (size_t)cis_dim * cis_dim * sizeof(real_t);
+    size_t eigen_bytes = (size_t)cis_dim * sizeof(real_t);
+    size_t total_needed = dense_bytes * 2 + eigen_bytes;  // matrix + eigenvectors + eigenvalues
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
 
-    if (!converged) {
-        std::cout << "Warning: Davidson solver did not converge for all states." << std::endl;
+    if (total_needed < free_mem * 0.8) {
+        // Direct diagonalization (symmetric eigendecomposition)
+        std::cout << "  Solver: direct diagonalization (dense "
+                  << CudaMemoryManager<real_t>::format_bytes(dense_bytes) << ")" << std::endl;
+
+        report_progress("excited", 2, 0, nullptr);  // solver start
+
+        real_t* d_dense = nullptr;
+        real_t* d_eigenvalues = nullptr;
+        real_t* d_eigenvectors_all = nullptr;
+        tracked_cudaMalloc(&d_dense, dense_bytes);
+        tracked_cudaMalloc(&d_eigenvalues, eigen_bytes);
+        tracked_cudaMalloc(&d_eigenvectors_all, dense_bytes);
+
+        // Build dense CIS matrix column by column
+        real_t* d_unit = nullptr;
+        real_t* d_col = nullptr;
+        tracked_cudaMalloc(&d_unit, (size_t)cis_dim * sizeof(real_t));
+        tracked_cudaMalloc(&d_col, (size_t)cis_dim * sizeof(real_t));
+        for (int j = 0; j < cis_dim; j++) {
+            cudaMemset(d_unit, 0, (size_t)cis_dim * sizeof(real_t));
+            real_t one = 1.0;
+            cudaMemcpy(d_unit + j, &one, sizeof(real_t), cudaMemcpyHostToDevice);
+            cis_op.apply(d_unit, d_col);
+            cudaMemcpy(d_dense + (size_t)j * cis_dim, d_col,
+                       (size_t)cis_dim * sizeof(real_t), cudaMemcpyDeviceToDevice);
+        }
+        tracked_cudaFree(d_unit);
+        tracked_cudaFree(d_col);
+
+        // Symmetric eigendecomposition
+        gpu::eigenDecomposition(d_dense, d_eigenvalues, d_eigenvectors_all, cis_dim);
+
+        // Copy results to host
+        std::vector<real_t> h_all_eigenvalues(cis_dim);
+        cudaMemcpy(h_all_eigenvalues.data(), d_eigenvalues,
+                   cis_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+        std::vector<real_t> h_all_eigvecs((size_t)cis_dim * cis_dim);
+        cudaMemcpy(h_all_eigvecs.data(), d_eigenvectors_all,
+                   (size_t)cis_dim * cis_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+        excitation_energies.resize(n_states);
+        h_eigenvectors.resize((size_t)n_states * cis_dim);
+        for (int k = 0; k < n_states; k++) {
+            excitation_energies[k] = h_all_eigenvalues[k];
+            std::copy(&h_all_eigvecs[k * cis_dim],
+                      &h_all_eigvecs[(k + 1) * cis_dim],
+                      &h_eigenvectors[k * cis_dim]);
+        }
+
+        tracked_cudaFree(d_dense);
+        tracked_cudaFree(d_eigenvalues);
+        tracked_cudaFree(d_eigenvectors_all);
+    } else {
+        // Fall back to Davidson for large systems
+        std::cout << "  Solver: Davidson (dense matrix too large: "
+                  << CudaMemoryManager<real_t>::format_bytes(total_needed)
+                  << " needed, " << CudaMemoryManager<real_t>::format_bytes(free_mem)
+                  << " available)" << std::endl;
+
+        report_progress("excited", 2, 0, nullptr);
+
+        DavidsonConfig config;
+        config.num_eigenvalues = n_states;
+        config.max_subspace_size = std::min(cis_dim, std::max(30, 4 * n_states));
+        config.convergence_threshold = 1e-6;
+        config.max_iterations = 100;
+        config.use_preconditioner = true;
+        config.verbose = 2;
+
+        DavidsonSolver solver(cis_op, config);
+        bool converged = solver.solve();
+
+        if (!converged) {
+            std::cout << "Warning: Davidson solver did not converge for all states." << std::endl;
+        }
+
+        const auto& eigenvalues = solver.get_eigenvalues();
+        excitation_energies.assign(eigenvalues.begin(), eigenvalues.end());
+        h_eigenvectors.resize((size_t)n_states * cis_dim);
+        solver.copy_eigenvectors_to_host(h_eigenvectors.data());
     }
 
-    const auto& eigenvalues = solver.get_eigenvalues();
-
-    // Store excitation energies for external access (e.g., tests)
-    rhf.set_excitation_energies(eigenvalues);
+    // Store excitation energies for external access
+    rhf.set_excitation_energies(excitation_energies);
 
     // ------------------------------------------------------------------
     // Step 4: Analyze and print results with oscillator strengths
     // ------------------------------------------------------------------
-    std::vector<real_t> h_eigenvectors(cis_dim * n_states);
-    solver.copy_eigenvectors_to_host(h_eigenvectors.data());
-
     // Get host data for oscillator strength computation
     coefficient_matrix.toHost();
     const auto& prim_shells = rhf.get_primitive_shells();
@@ -136,7 +211,7 @@ static void compute_cis_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, rea
         cgto_norms.host_ptr(),
         rhf.get_shell_type_infos(),
         coefficient_matrix.host_ptr(),
-        eigenvalues, h_eigenvectors.data(),
+        excitation_energies, h_eigenvectors.data(),
         n_states, num_basis, num_occ, num_vir);
     rhf.set_oscillator_strengths(es_result.oscillator_strengths);
     rhf.set_excited_state_report(es_result.report);

@@ -152,27 +152,47 @@ extern "C" int gansu_run(gansu_handle_t h) {
         if (orig_cout) std::cout.rdbuf(orig_cout);
         return 0;
     } catch (const std::exception& e) {
-        // Release all resources on error — no stale state
-        ctx->hf.reset();
+        // Release all resources on error — no stale state.
+        // hf.reset() calls destructors that free GPU memory.
+        // After OOM, some frees may fail, so clear CUDA errors first.
+        if (gpu::gpu_available()) {
+            cudaGetLastError();  // clear pending error before destructor frees
+        }
+        try {
+            ctx->hf.reset();
+        } catch (...) {
+            // If destructor throws (shouldn't, but safety net), abandon the pointer
+            ctx->hf.release();
+        }
         ctx->solved = false;
         ctx->initial_density.clear();
         ctx->progress_fn = nullptr;
         ctx->progress_userdata = nullptr;
         ctx->excited_state_report_cache.clear();
 
-        // Only reset CUDA device if there's an actual CUDA error (OOM, kernel failure, etc.)
-        // Avoid cudaDeviceReset for non-GPU errors (parsing, parameter, convergence)
-        // as it destroys all GPU state and is very expensive to recover from.
+        // Clear CUDA error flag without resetting or syncing the device.
+        // cudaDeviceReset() and cudaDeviceSynchronize() can segfault after OOM.
         if (gpu::gpu_available()) {
             cudaError_t cuda_err = cudaGetLastError();
             if (cuda_err != cudaSuccess) {
-                std::cerr << "gansu_run: CUDA error detected (" << cudaGetErrorString(cuda_err)
-                          << "), resetting device..." << std::endl;
-                cudaDeviceReset();
-                gpu::enable_gpu();
-                gpu::initialize_gpu();
-                gpu::GPUHandle::reset();  // Recreate cuBLAS/cuSOLVER handles
+                std::cerr << "gansu_run: CUDA error cleared (" << cudaGetErrorString(cuda_err)
+                          << ")" << std::endl;
             }
+        }
+
+        // Reset memory tracking counters — after hf.reset() freed everything,
+        // counters should be near zero. Recalculate from the authoritative map.
+        {
+            size_t actual = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
+                for (const auto& kv : g_allocated_memory_map) actual += kv.second;
+            }
+            {
+                std::lock_guard<std::mutex> lock(GlobalGpuMemoryTracker::mutex_);
+                GlobalGpuMemoryTracker::current_bytes_ = actual;
+            }
+            CudaMemoryManager<real_t>::reset_memory_statistics();
         }
 
         gansu::clear_progress_callback();
