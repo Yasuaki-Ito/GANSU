@@ -286,6 +286,16 @@ public:
     int get_n_excited_states() const { return n_excited_states_; }
 
     /**
+     * @brief Get the number of frozen core orbitals
+     */
+    int get_num_frozen_core() const { return num_frozen_core_; }
+
+    /**
+     * @brief Get the number of active (non-frozen) occupied orbitals
+     */
+    int get_num_active_occ() const { return num_electrons / 2 - num_frozen_core_; }
+
+    /**
      * @brief Get ADC(2) solver mode: "schur_static", "schur_omega", or "full"
      */
     const std::string& get_adc2_solver() const { return adc2_solver_; }
@@ -406,6 +416,7 @@ protected:
     std::string eom_mp2_solver_; ///< EOM-MP2 solver mode: full, schur
     std::string eom_cc2_solver_; ///< EOM-CC2 solver mode: auto, schur_static, schur_omega, full
     std::string spin_type_; ///< Spin type for excited states: "singlet" or "triplet"
+    int num_frozen_core_; ///< Number of frozen core orbitals (0 = no frozen core)
     std::vector<real_t> excitation_energies_; ///< Excitation energies (CIS/EOM)
     std::vector<real_t> oscillator_strengths_; ///< Oscillator strengths (CIS/EOM)
     std::string excited_state_report_; ///< Formatted excited state report for final summary

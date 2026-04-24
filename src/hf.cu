@@ -181,6 +181,33 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     // Set the spin type for excited states
     spin_type_ = toLowerCase(parameters.get<std::string>("spin_type"));
 
+    // Frozen core
+    {
+        std::string fc_str = toLowerCase(parameters.get<std::string>("frozen_core"));
+        if (fc_str == "none" || fc_str == "0") {
+            num_frozen_core_ = 0;
+        } else if (fc_str == "auto") {
+            num_frozen_core_ = 0;
+            for (size_t i = 0; i < atoms.size(); i++) {
+                int Z = atoms[i].atomic_number;
+                if      (Z >= 3  && Z <= 10) num_frozen_core_ += 1;  // Li-Ne: 1s
+                else if (Z >= 11 && Z <= 18) num_frozen_core_ += 5;  // Na-Ar: 1s2s2p
+                else if (Z >= 19 && Z <= 36) num_frozen_core_ += 9;  // K-Kr: 1s2s2p3s3p
+                else if (Z >= 37 && Z <= 54) num_frozen_core_ += 18; // Rb-Xe: +3d4s4p
+            }
+        } else {
+            num_frozen_core_ = std::stoi(fc_str);
+        }
+        if (num_frozen_core_ < 0 || num_frozen_core_ >= num_electrons / 2) {
+            throw std::runtime_error("Invalid frozen_core: " + fc_str +
+                " (must be < " + std::to_string(num_electrons / 2) + " occupied orbitals)");
+        }
+        if (num_frozen_core_ > 0 && post_hf_method_ != PostHFMethod::None) {
+            std::cout << "Frozen core: " << num_frozen_core_ << " orbitals frozen, "
+                      << (num_electrons / 2 - num_frozen_core_) << " active occupied, "
+                      << (num_basis - num_electrons / 2) << " virtual" << std::endl;
+        }
+    }
 
     // print all the values of boys function for the test (temporary implementation)
     if(verbose){

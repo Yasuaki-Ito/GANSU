@@ -32,7 +32,7 @@ namespace gansu{
 // These are used as CPU fallbacks by the RI-based post-HF methods.
 double mp2_from_full_moeri(
     const double* d_eri_mo, const double* d_C, const double* d_eps,
-    int nao, int occ);
+    int nao, int occ, int frozen = 0);
 
 
 // // #threads = M * Mvir * Maux

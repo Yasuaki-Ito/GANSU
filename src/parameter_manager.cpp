@@ -73,7 +73,8 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"adc2_solver", "auto"},                     // string (auto, schur_static, schur_omega, full)
         {"eom_mp2_solver", "auto"},                  // string (auto, schur_static, schur_omega, full)
         {"eom_cc2_solver", "auto"},                    // string (auto, schur_static, schur_omega, full)
-        {"spin_type", "singlet"}                        // string (singlet, triplet)
+        {"spin_type", "singlet"},                       // string (singlet, triplet)
+        {"frozen_core", "none"}                         // string: "none", "auto", or integer
     };
 
 

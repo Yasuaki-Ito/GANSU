@@ -38,7 +38,7 @@ namespace gansu {
 // Referenced by the CPU fallback in ERI_Hash_RHF / ERI_Direct_RHF compute_mp2_energy.
 double mp2_from_full_moeri(
     const double* d_eri_mo, const double* d_C, const double* d_eps,
-    int nao, int occ);
+    int nao, int occ, int frozen = 0);
 
 // Atomic max for double precision (since CUDA does not provide atomicMax for double)
 __device__ double atomicMaxDouble(double* address, double val) {
@@ -707,11 +707,13 @@ __global__ void mp2_from_moeri_kernel(
     const double* __restrict__ eri_mo,  // device, nao^4, row-major
     const double* __restrict__ eps,     // device, nao
     int nao, int occ,
-    double* __restrict__ E_out)
+    double* __restrict__ E_out,
+    int frozen = 0)
 {
+    const int active_occ = occ - frozen;
     const int vir = nao - occ;
 
-    size_t total = (size_t)occ * occ * (size_t)vir * (size_t)vir;
+    size_t total = (size_t)active_occ * active_occ * (size_t)vir * (size_t)vir;
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
 
     double contrib = 0.0;
@@ -721,9 +723,12 @@ __global__ void mp2_from_moeri_kernel(
 
         int b_ = (int)(t % vir); t /= vir;
         int a_ = (int)(t % vir); t /= vir;
-        int j  = (int)(t % occ); t /= occ;
-        int i  = (int)(t % occ);
+        int j  = (int)(t % active_occ); t /= active_occ;
+        int i  = (int)(t % active_occ);
 
+        // Offset by frozen core
+        i += frozen;
+        j += frozen;
         int a = occ + a_;
         int b = occ + b_;
 
@@ -1299,6 +1304,7 @@ double mp2_from_aoeri_via_required_moeri(
 real_t ERI_Stored_RHF::compute_mp2_energy() {
     PROFILE_FUNCTION();
 
+    const int num_frozen = rhf_.get_num_frozen_core();
     const int num_occ = rhf_.get_num_electrons() / 2;
     const int num_basis = rhf_.get_num_basis();
     DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();
@@ -1407,13 +1413,13 @@ real_t ERI_Stored_RHF::compute_mp2_energy() {
         }
         std::vector<double>().swap(T3);
 
-        // Step 5: accumulate MP2 energy.
+        // Step 5: accumulate MP2 energy (skip frozen core orbitals).
         // E_MP2 = sum_{iajb} (ia|jb) * [2*(ia|jb) - (ib|ja)] / (eps_i + eps_j - eps_a - eps_b)
         // Index convention: G[((i*nvir+a)*nocc+j)*nvir + b]
         double E_MP2 = 0.0;
         #pragma omp parallel for collapse(2) reduction(+:E_MP2) schedule(static)
-        for (int i = 0; i < nocc; i++) {
-            for (int j = 0; j < nocc; j++) {
+        for (int i = num_frozen; i < nocc; i++) {
+            for (int j = num_frozen; j < nocc; j++) {
                 const double ei_plus_ej = d_eps[i] + d_eps[j];
                 for (int a = 0; a < nvir; a++) {
                     const double ea = d_eps[nocc + a];
@@ -1433,7 +1439,18 @@ real_t ERI_Stored_RHF::compute_mp2_energy() {
 #endif
 
     // === GPU path ===
-    real_t E_MP2 = mp2_from_aoeri_via_required_moeri(d_eri, d_C, d_eps, num_basis, num_occ);
+    // For OVOV transform, frozen core needs active C columns — use full MO-ERI path when frozen
+    real_t E_MP2;
+    if (num_frozen > 0) {
+        // Full MO-ERI path with frozen core offset
+        real_t* d_eri_mo = nullptr;
+        tracked_cudaMalloc(&d_eri_mo, (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
+        transform_ao_eri_to_mo_eri_full(d_eri, d_C, num_basis, d_eri_mo);
+        E_MP2 = mp2_from_full_moeri(d_eri_mo, d_C, d_eps, num_basis, num_occ, num_frozen);
+        tracked_cudaFree(d_eri_mo);
+    } else {
+        E_MP2 = mp2_from_aoeri_via_required_moeri(d_eri, d_C, d_eps, num_basis, num_occ);
+    }
 
 //    if(fabs(E_MP2_naive - E_MP2_stored) > 1e-8){
 //        std::cerr << "Warning: MP2 energy mismatch between naive and stored MOERI methods." << std::endl;
@@ -3104,10 +3121,12 @@ double mp2_from_full_moeri(
     const double* d_C,        // device, size nao*nao, row-major (mu,p)
     const double* d_eps,      // device, size nao
     int nao,
-    int occ)
+    int occ,
+    int frozen)
 {
+    int active_occ = occ - frozen;
     int vir = nao - occ;
-    size_t total = (size_t)occ * (size_t)occ * (size_t)vir * (size_t)vir;
+    size_t total = (size_t)active_occ * (size_t)active_occ * (size_t)vir * (size_t)vir;
 
     double* d_E = nullptr;
     tracked_cudaMalloc((void**)&d_E, sizeof(double));
@@ -3128,8 +3147,10 @@ double mp2_from_full_moeri(
                 size_t t = gid;
                 int b_ = (int)(t % vir); t /= vir;
                 int a_ = (int)(t % vir); t /= vir;
-                int j  = (int)(t % occ); t /= occ;
-                int i  = (int)(t % occ);
+                int j  = (int)(t % active_occ); t /= active_occ;
+                int i  = (int)(t % active_occ);
+                i += frozen;
+                j += frozen;
                 int a = occ + a_, b = occ + b_;
                 double denom = d_eps[i] + d_eps[j] - d_eps[a] - d_eps[b];
                 if (fabs(denom) > 1e-14) {
@@ -3142,7 +3163,7 @@ double mp2_from_full_moeri(
             }
             *d_E = cpu_E;
         } else {
-            mp2_from_moeri_kernel<<<blocks, threads, shmem>>>(d_eri_mo, d_eps, nao, occ, d_E);
+            mp2_from_moeri_kernel<<<blocks, threads, shmem>>>(d_eri_mo, d_eps, nao, occ, d_E, frozen);
             cudaDeviceSynchronize();
         }
     }
@@ -3296,7 +3317,7 @@ void contract_iajb_tensors(   // 4h2p, 2h4p, 3h3p
 real_t mp3_from_aoeri_via_full_moeri_dgemm(
     real_t* d_eri_ao, const real_t* d_coefficient_matrix,
     const real_t* d_orbital_energies, const int num_basis, const int num_occ,
-    real_t* d_eri_mo_precomputed = nullptr)
+    real_t* d_eri_mo_precomputed = nullptr, int num_frozen = 0)
 {
     cudaDeviceProp prop;
     int device = 0;
@@ -3330,7 +3351,7 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
     }
 
     // MP2 energy from full MO ERI
-    real_t E_MP2 = mp2_from_full_moeri(d_eri_mo, d_coefficient_matrix, d_orbital_energies, num_basis, num_occ);
+    real_t E_MP2 = mp2_from_full_moeri(d_eri_mo, d_coefficient_matrix, d_orbital_energies, num_basis, num_occ, num_frozen);
     printf("MP2 energy from full MO ERI: %.12f\n", E_MP2);
     //return E_MP2;
 
@@ -3651,6 +3672,7 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
 real_t compute_mp3_energy_impl(RHF& rhf, real_t* d_eri, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
+    const int num_frozen = rhf.get_num_frozen_core();
     const int num_occ = rhf.get_num_electrons() / 2;
     const int num_basis = rhf.get_num_basis();
     DeviceHostMatrix<real_t>& coefficient_matrix = rhf.get_coefficient_matrix();
@@ -3658,7 +3680,7 @@ real_t compute_mp3_energy_impl(RHF& rhf, real_t* d_eri, real_t* d_eri_mo_precomp
     const real_t* d_C = coefficient_matrix.device_ptr();
     const real_t* d_eps = orbital_energies.device_ptr();
 
-    real_t E_MP3 = mp3_from_aoeri_via_full_moeri_dgemm(d_eri, d_C, d_eps, num_basis, num_occ, d_eri_mo_precomputed);
+    real_t E_MP3 = mp3_from_aoeri_via_full_moeri_dgemm(d_eri, d_C, d_eps, num_basis, num_occ, d_eri_mo_precomputed, num_frozen);
 
     std::cout << "MP3 energy: " << E_MP3 << " Hartree" << std::endl;
     return E_MP3;
@@ -8086,6 +8108,7 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
 static real_t compute_ccsd_energy_impl(RHF& rhf, const real_t* d_eri, int ccsd_algorithm, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
+    const int num_frozen = rhf.get_num_frozen_core();
     const int num_occ = rhf.get_num_electrons() / 2;
     const int num_basis = rhf.get_num_basis();
     const real_t* d_C = rhf.get_coefficient_matrix().device_ptr();
@@ -8093,11 +8116,11 @@ static real_t compute_ccsd_energy_impl(RHF& rhf, const real_t* d_eri, int ccsd_a
 
     real_t E_CCSD;
     if (ccsd_algorithm == 2) {
-        E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, d_eri_mo_precomputed);
+        E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, d_eri_mo_precomputed, num_frozen);
     } else if (ccsd_algorithm == 1) {
         E_CCSD = ccsd_spatial_orbital_naive(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, d_eri_mo_precomputed);
     } else {
-        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, nullptr, nullptr, d_eri_mo_precomputed);
+        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, nullptr, nullptr, d_eri_mo_precomputed, num_frozen);
     }
 
     std::cout << "CCSD energy: " << E_CCSD << " Hartree" << std::endl;

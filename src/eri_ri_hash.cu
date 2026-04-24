@@ -13,7 +13,7 @@ namespace gansu {
 // Forward declaration: defined in eri_stored.cu
 double mp2_from_full_moeri(
     const double* d_eri_mo, const double* d_C, const double* d_eps,
-    int nao, int occ);
+    int nao, int occ, int frozen = 0);
 
 
 // 3-center COO key: Q(21bit) | μ(21bit) | ν(21bit), μ ≤ ν
