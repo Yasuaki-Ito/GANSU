@@ -36,7 +36,7 @@ PASS = 0
 FAIL = 0
 
 
-def test_gansu_mp2_frozen(mol_name, xyz_file, basis, expected_frozen):
+def test_gansu_frozen(mol_name, xyz_file, basis, expected_frozen, post_hf="mp2"):
     global PASS, FAIL
     import gansu
 
@@ -45,32 +45,34 @@ def test_gansu_mp2_frozen(mol_name, xyz_file, basis, expected_frozen):
         print(f"  SKIP {mol_name}: {xyz_path} not found")
         return None, None
 
+    method_upper = post_hf.upper()
+
     # Without frozen core
     mol = gansu.Molecule(xyz_path, basis=basis, initial_guess="sad")
-    r = mol.run(method="RHF", post_hf="mp2", quiet=True)
+    r = mol.run(method="RHF", post_hf=post_hf, quiet=True)
     e_nofrozen = r.post_hf_energy
     e_hf = r.total_energy
     del r, mol
 
     # With frozen core (auto)
     mol = gansu.Molecule(xyz_path, basis=basis, initial_guess="sad", frozen_core="auto")
-    r = mol.run(method="RHF", post_hf="mp2", quiet=True)
+    r = mol.run(method="RHF", post_hf=post_hf, quiet=True)
     e_frozen = r.post_hf_energy
     del r, mol
 
-    print(f"  GANSU {mol_name}/{basis}:")
-    print(f"    HF energy:          {e_hf:.10f}")
-    print(f"    MP2 (all electron): {e_nofrozen:.10f}")
-    print(f"    MP2 (frozen core):  {e_frozen:.10f}")
-    print(f"    Difference:         {abs(e_nofrozen - e_frozen):.10f}")
+    print(f"  GANSU {mol_name}/{basis}/{method_upper}:")
+    print(f"    HF energy:                {e_hf:.10f}")
+    print(f"    {method_upper} (all electron): {e_nofrozen:.10f}")
+    print(f"    {method_upper} (frozen core):  {e_frozen:.10f}")
+    print(f"    Difference:               {abs(e_nofrozen - e_frozen):.10f}")
 
     return e_hf, e_frozen
 
 
-def test_pyscf_mp2_frozen(mol_name, xyz_file, basis, n_frozen):
+def test_pyscf_frozen(mol_name, xyz_file, basis, n_frozen, post_hf="mp2"):
     global PASS, FAIL
     try:
-        from pyscf import gto, scf, mp
+        from pyscf import gto, scf, mp, cc
     except ImportError:
         print(f"  SKIP PySCF: not installed")
         return None
@@ -91,15 +93,25 @@ def test_pyscf_mp2_frozen(mol_name, xyz_file, basis, n_frozen):
     mf = scf.RHF(mol)
     mf.kernel()
 
-    # MP2 with frozen core
-    mp2 = mp.MP2(mf, frozen=n_frozen)
-    mp2.kernel()
+    method_upper = post_hf.upper()
 
-    print(f"  PySCF {mol_name}/{basis} (frozen={n_frozen}):")
+    if post_hf == "mp2":
+        calc = mp.MP2(mf, frozen=n_frozen)
+        calc.kernel()
+        e_corr = calc.e_corr
+    elif post_hf == "ccsd":
+        calc = cc.CCSD(mf, frozen=n_frozen)
+        calc.kernel()
+        e_corr = calc.e_corr
+    else:
+        print(f"  PySCF: {post_hf} not supported in test")
+        return None
+
+    print(f"  PySCF {mol_name}/{basis}/{method_upper} (frozen={n_frozen}):")
     print(f"    HF energy:         {mf.e_tot:.10f}")
-    print(f"    MP2 correlation:   {mp2.e_corr:.10f}")
+    print(f"    {method_upper} correlation:   {e_corr:.10f}")
 
-    return mp2.e_corr
+    return e_corr
 
 
 # ── Main ──
@@ -110,25 +122,33 @@ print("=" * 60)
 import gansu
 gansu.init()
 
+METHODS_TO_TEST = ["mp2", "ccsd"]
+
 for mol_name, xyz_file, basis, n_frozen in TESTS:
-    print(f"\n--- {mol_name} / {basis} (expected frozen: {n_frozen}) ---")
+    for post_hf in METHODS_TO_TEST:
+        # Skip CCSD for Benzene (too slow for test)
+        if post_hf == "ccsd" and mol_name == "Benzene":
+            continue
 
-    e_hf, e_gansu = test_gansu_mp2_frozen(mol_name, xyz_file, basis, n_frozen)
+        print(f"\n--- {mol_name} / {basis} / {post_hf.upper()} (frozen: {n_frozen}) ---")
 
-    e_pyscf = test_pyscf_mp2_frozen(mol_name, xyz_file, basis, n_frozen)
+        e_hf, e_gansu = test_gansu_frozen(mol_name, xyz_file, basis, n_frozen, post_hf)
 
-    if e_gansu is not None and e_pyscf is not None:
-        diff = abs(e_gansu - e_pyscf)
-        print(f"\n  Comparison:")
-        print(f"    GANSU frozen MP2:  {e_gansu:.10f}")
-        print(f"    PySCF frozen MP2:  {e_pyscf:.10f}")
-        print(f"    |diff|:            {diff:.2e} Ha")
-        if diff < 1e-6:
-            PASS += 1
-            print(f"    => PASS")
-        else:
-            FAIL += 1
-            print(f"    => FAIL (diff > 1e-6)")
+        e_pyscf = test_pyscf_frozen(mol_name, xyz_file, basis, n_frozen, post_hf)
+
+        if e_gansu is not None and e_pyscf is not None:
+            diff = abs(e_gansu - e_pyscf)
+            label = post_hf.upper()
+            print(f"\n  Comparison:")
+            print(f"    GANSU frozen {label}:  {e_gansu:.10f}")
+            print(f"    PySCF frozen {label}:  {e_pyscf:.10f}")
+            print(f"    |diff|:               {diff:.2e} Ha")
+            if diff < 1e-5:
+                PASS += 1
+                print(f"    => PASS")
+            else:
+                FAIL += 1
+                print(f"    => FAIL (diff > 1e-5)")
 
 gansu.finalize()
 

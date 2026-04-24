@@ -52,7 +52,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             const int num_basis, const int num_occ,
                             const bool computing_ccsd_t, real_t* ccsd_t_energy,
                             real_t** d_t1_out, real_t** d_t2_out,
-                            real_t* d_eri_mo_precomputed = nullptr);
+                            real_t* d_eri_mo_precomputed = nullptr,
+                            int num_frozen = 0);
 
 
 static void compute_eom_ccsd_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, real_t* d_eri_mo_precomputed = nullptr) {

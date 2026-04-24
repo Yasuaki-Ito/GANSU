@@ -242,7 +242,9 @@ __global__ void extract_subblock_4d(const double* __restrict__ eri_mo,
  */
 __global__ void extract_w_oovv_kernel(const double* __restrict__ eri_mo,
                                        double* __restrict__ w_oovv,
-                                       int N, int nocc, int nvir) {
+                                       int N, int nocc, int nvir,
+                                       int occ_off = 0, int vir_off = -1) {
+    if (vir_off < 0) vir_off = occ_off + nocc;  // default: virtual starts after occupied
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = (size_t)nocc * nocc * nvir * nvir;
     if (gid >= total) return;
@@ -254,9 +256,10 @@ __global__ void extract_w_oovv_kernel(const double* __restrict__ eri_mo,
 
     size_t N3 = (size_t)N * N * N;
     size_t N2 = (size_t)N * N;
-    int oc = nocc + c, od = nocc + d;
-    double v_cd = eri_mo[(size_t)k * N3 + (size_t)oc * N2 + (size_t)l * N + od];
-    double v_dc = eri_mo[(size_t)k * N3 + (size_t)od * N2 + (size_t)l * N + oc];
+    int ki = occ_off + k, li = occ_off + l;
+    int oc = vir_off + c, od = vir_off + d;
+    double v_cd = eri_mo[(size_t)ki * N3 + (size_t)oc * N2 + (size_t)li * N + od];
+    double v_dc = eri_mo[(size_t)ki * N3 + (size_t)od * N2 + (size_t)li * N + oc];
     w_oovv[gid] = 2.0 * v_cd - v_dc;
 }
 
@@ -5144,9 +5147,12 @@ __global__ void compute_ccsd_energy_kernel(const real_t* __restrict__ d_eri_mo,
                                             const int num_spin_vir,
                                             const real_t* __restrict__ t_ia,
                                             const real_t* __restrict__ t_ijab,
-                                            real_t* d_ccsd_energy)
+                                            real_t* d_ccsd_energy,
+                                            int occ_offset = 0,
+                                            int vir_start = -1)
 {
     assert(blockDim.x <= 256); // ensure local_sum size is sufficient
+    if (vir_start < 0) vir_start = occ_offset + num_spin_occ;
 
     size_t total = (size_t)num_spin_occ * num_spin_occ * num_spin_vir * num_spin_vir;
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -5161,8 +5167,11 @@ __global__ void compute_ccsd_energy_kernel(const real_t* __restrict__ d_eri_mo,
         int j  = (int)(t % num_spin_occ); t /= num_spin_occ;
         int i  = (int)(t % num_spin_occ);
 
-        int a = num_spin_occ + a_;
-        int b = num_spin_occ + b_;
+        // Offset i,j by frozen core, and a,b by full occupied count
+        i += occ_offset;
+        j += occ_offset;
+        int a = vir_start + a_;
+        int b = vir_start + b_;
 
         
         // <ij||ab> = (ia|jb) - (ib|ja)
@@ -5188,9 +5197,12 @@ real_t compute_ccsd_energy(const real_t* __restrict__ d_eri_mo,
                             const int num_spin_occ,
                             const int num_spin_vir,
                             const real_t* __restrict__ t_ia,
-                            const real_t* __restrict__ t_ijab)
+                            const real_t* __restrict__ t_ijab,
+                            int occ_offset = 0,
+                            int vir_start = -1)
 {
     using namespace cpu_helpers;
+    if (vir_start < 0) vir_start = occ_offset + num_spin_occ;
 
     if (!gpu::gpu_available()) {
         real_t energy = 0.0;
@@ -5201,9 +5213,10 @@ real_t compute_ccsd_energy(const real_t* __restrict__ d_eri_mo,
             int a_ = (int)(t % num_spin_vir); t /= num_spin_vir;
             int j  = (int)(t % num_spin_occ); t /= num_spin_occ;
             int i  = (int)(t % num_spin_occ);
-            int a = num_spin_occ + a_;
-            int b = num_spin_occ + b_;
-            real_t ijab = antisym_eri_host(d_eri_mo, num_basis, i, j, a, b);
+            int ii = occ_offset + i, jj = occ_offset + j;
+            int a = vir_start + a_;
+            int b = vir_start + b_;
+            real_t ijab = antisym_eri_host(d_eri_mo, num_basis, ii, jj, a, b);
             real_t t_ijab_val = t2_host(t_ijab, num_spin_occ, num_spin_vir, i, j, a_, b_);
             real_t t_ia_val = t1_host(t_ia, num_spin_occ, num_spin_vir, i, a_);
             real_t t_jb_val = t1_host(t_ia, num_spin_occ, num_spin_vir, j, b_);
@@ -5224,7 +5237,7 @@ real_t compute_ccsd_energy(const real_t* __restrict__ d_eri_mo,
         const int num_threads = 256;
         const int num_blocks = (total + num_threads - 1) / num_threads;
         const int shmem_size = num_threads * sizeof(real_t);
-        compute_ccsd_energy_kernel<<<num_blocks, num_threads, shmem_size>>>(d_eri_mo, num_basis, num_spin_occ, num_spin_vir, t_ia, t_ijab, d_ccsd_energy);
+        compute_ccsd_energy_kernel<<<num_blocks, num_threads, shmem_size>>>(d_eri_mo, num_basis, num_spin_occ, num_spin_vir, t_ia, t_ijab, d_ccsd_energy, occ_offset, vir_start);
         cudaDeviceSynchronize();
 
         cudaMemcpy(&h_ccsd_energy, d_ccsd_energy, sizeof(real_t), cudaMemcpyDeviceToHost);
@@ -6675,15 +6688,17 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             const int num_basis, const int num_occ,
                             const bool computing_ccsd_t, real_t* ccsd_t_energy,
                             real_t** d_t1_out, real_t** d_t2_out,
-                            real_t* d_eri_mo_precomputed = nullptr)
+                            real_t* d_eri_mo_precomputed = nullptr,
+                            int num_frozen = 0)
 {
     const int N = num_basis;
-    const int nocc = num_occ;
-    const int nvir = N - nocc;
+    const int nocc = num_occ - num_frozen;  // active occupied orbitals
+    const int nvir = N - num_occ;           // virtual orbitals (unchanged)
+    const int occ_start = num_frozen;       // MO-ERI index where active occ starts
+    const int O = occ_start;               // shorthand for frozen offset
+    const int V = num_occ;                 // virtual start in MO-ERI indices (= full occ count)
     const size_t N4 = (size_t)N * N * N * N;
 
-    std::cout << "CCSD spatial-orbital: N=" << N << " nocc=" << nocc
-              << " nvir=" << nvir << std::endl;
 
     // AO->MO transform on GPU (4-stage half-transform, O(N^5))
     real_t* d_eri_mo;
@@ -6703,29 +6718,34 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         free_eri_mo = true;
     }
 
+    std::cout << "CCSD spatial-orbital: N=" << N << " nocc=" << nocc
+              << " nvir=" << nvir;
+    if (num_frozen > 0) std::cout << " frozen=" << num_frozen;
+    std::cout << std::endl;
+
     std::vector<real_t> eps(N);
     cudaMemcpy(eps.data(), d_orbital_energies, N * sizeof(real_t), cudaMemcpyDeviceToHost);
 
-    // t2[i,j,a,b] index
+    // t2[i,j,a,b] index — i,j are active occupied (0..nocc-1), a,b are virtual (0..nvir-1)
     auto T2 = [&](int i, int j, int a, int b) -> size_t {
         return ((size_t)i * nocc + j) * nvir * nvir + (size_t)a * nvir + b;
     };
 
-    // Denominators
+    // Denominators — use eps[occ_start + i] for active occupied, eps[num_occ + a] for virtual
     const size_t t1Size = (size_t)nocc * nvir;
     const size_t t2Size = (size_t)nocc * nocc * nvir * nvir;
 
     std::vector<real_t> Dia(t1Size);
     for (int i = 0; i < nocc; i++)
         for (int a = 0; a < nvir; a++)
-            Dia[i*nvir+a] = eps[i] - eps[nocc+a];
+            Dia[i*nvir+a] = eps[occ_start + i] - eps[num_occ+a];
 
     std::vector<real_t> Dijab(t2Size);
     for (int i = 0; i < nocc; i++)
         for (int j = 0; j < nocc; j++)
             for (int a = 0; a < nvir; a++)
                 for (int b = 0; b < nvir; b++)
-                    Dijab[T2(i,j,a,b)] = eps[i] + eps[j] - eps[nocc+a] - eps[nocc+b];
+                    Dijab[T2(i,j,a,b)] = eps[occ_start+i] + eps[occ_start+j] - eps[num_occ+a] - eps[num_occ+b];
 
     DIIS diis(8, 2);
     size_t num_amps = t1Size + t2Size;
@@ -6763,7 +6783,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         PROFILE_ELAPSED_TIME(str);
 
     // --- GPU-extract CPU-needed sub-blocks → download ---
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, 0,nocc, 0,nocc, nocc,nvir, nocc,nvir);
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, O,nocc, O,nocc, V,nvir, V,nvir);
     cudaMemcpy(v_oovv.data(), d_extract_tmp, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
 
     if (!gpu::gpu_available()) {
@@ -6775,44 +6795,45 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             for (int l = 0; l < nocc; l++)
                 for (int c = 0; c < nvir; c++)
                     for (int d = 0; d < nvir; d++) {
-                        int oc = nocc + c, od = nocc + d;
-                        double v_cd = d_eri_mo[(size_t)k * N3 + (size_t)oc * N2 + (size_t)l * N + od];
-                        double v_dc = d_eri_mo[(size_t)k * N3 + (size_t)od * N2 + (size_t)l * N + oc];
+                        int ki = O + k, li = O + l;
+                        int oc = V + c, od = V + d;
+                        double v_cd = d_eri_mo[(size_t)ki * N3 + (size_t)oc * N2 + (size_t)li * N + od];
+                        double v_dc = d_eri_mo[(size_t)ki * N3 + (size_t)od * N2 + (size_t)li * N + oc];
                         size_t gid = ((size_t)k * nocc + l) * vv + (size_t)c * nvir + d;
                         d_extract_tmp[gid] = 2.0 * v_cd - v_dc;
                     }
     } else {
         int threads = 256;
         int blocks = (int)((oo*vv + threads - 1) / threads);
-        extract_w_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_extract_tmp, N, nocc, nvir);
+        extract_w_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_extract_tmp, N, nocc, nvir, O, V);
     }
     cudaMemcpy(w_oovv.data(), d_extract_tmp, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, 0,nocc, nocc,nvir, nocc,nvir, nocc,nvir);
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, O,nocc, V,nvir, V,nvir, V,nvir);
     cudaMemcpy(v_ovvv.data(), d_extract_tmp, (size_t)nocc*vvv*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, nocc,nvir, 0,nocc, 0,nocc, nocc,nvir);
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, V,nvir, O,nocc, O,nocc, V,nvir);
     cudaMemcpy(v_voov.data(), d_extract_tmp, (size_t)nvir*nocc*nocc*nvir*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, 0,nocc, 0,nocc, nocc,nvir, 0,nocc);
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, O,nocc, O,nocc, V,nvir, O,nocc);
     cudaMemcpy(v_oovo.data(), d_extract_tmp, (size_t)nocc*nocc*nvir*nocc*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, 0,nocc, 0,nocc, 0,nocc, 0,nocc);
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, O,nocc, O,nocc, O,nocc, O,nocc);
     cudaMemcpy(v_oooo.data(), d_extract_tmp, oooo*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, nocc,nvir, 0,nocc, nocc,nvir, 0,nocc);
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, V,nvir, O,nocc, V,nvir, O,nocc);
     cudaMemcpy(v_vovo.data(), d_extract_tmp, vo*vo*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, nocc,nvir, nocc,nvir, 0,nocc, nocc,nvir);
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, V,nvir, V,nvir, O,nocc, V,nvir);
     cudaMemcpy(v_vvov.data(), d_extract_tmp, vv*ov*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, 0,nocc, nocc,nvir, 0,nocc, nocc,nvir);
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, O,nocc, V,nvir, O,nocc, V,nvir);
     cudaMemcpy(v_ovov.data(), d_extract_tmp, ov*ov*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, nocc,nvir, 0,nocc, 0,nocc, 0,nocc);
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, V,nvir, O,nocc, O,nocc, O,nocc);
     cudaMemcpy(v_vooo.data(), d_extract_tmp, vo*oo*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, 0,nocc, 0,nocc, 0,nocc, nocc,nvir);
+    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, O,nocc, O,nocc, O,nocc, V,nvir);
     cudaMemcpy(v_ooov.data(), d_extract_tmp, oo*ov*sizeof(double), cudaMemcpyDeviceToHost);
 
     cudaDeviceSynchronize();
@@ -6943,10 +6964,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     }
 
     // GPU-direct extraction for GPU-resident sub-blocks (no CPU round-trip)
-    // v_vvvv: v(nocc+a, nocc+b, nocc+c, nocc+d) → d_v_vvvv (largest: nvir⁴)
-    gpu_extract_subblock(d_eri_mo, d_v_vvvv, N, nocc,nvir, nocc,nvir, nocc,nvir, nocc,nvir);
+    // v_vvvv: v(V+a, V+b, V+c, V+d) → d_v_vvvv (largest: nvir⁴)
+    gpu_extract_subblock(d_eri_mo, d_v_vvvv, N, V,nvir, V,nvir, V,nvir, V,nvir);
     // v_oovv and w_oovv → d_v_oovv, d_w_oovv
-    gpu_extract_subblock(d_eri_mo, d_v_oovv, N, 0,nocc, 0,nocc, nocc,nvir, nocc,nvir);
+    gpu_extract_subblock(d_eri_mo, d_v_oovv, N, O,nocc, O,nocc, V,nvir, V,nvir);
     if (!gpu::gpu_available()) {
         // CPU fallback: w_oovv[k,l,c,d] = 2*(kc|ld) - (kd|lc)
         const size_t N3 = (size_t)N * N * N;
@@ -6956,16 +6977,17 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             for (int l = 0; l < nocc; l++)
                 for (int c = 0; c < nvir; c++)
                     for (int d = 0; d < nvir; d++) {
-                        int oc = nocc + c, od = nocc + d;
-                        double v_cd = d_eri_mo[(size_t)k * N3 + (size_t)oc * N2 + (size_t)l * N + od];
-                        double v_dc = d_eri_mo[(size_t)k * N3 + (size_t)od * N2 + (size_t)l * N + oc];
+                        int ki = O + k, li = O + l;
+                        int oc = V + c, od = V + d;
+                        double v_cd = d_eri_mo[(size_t)ki * N3 + (size_t)oc * N2 + (size_t)li * N + od];
+                        double v_dc = d_eri_mo[(size_t)ki * N3 + (size_t)od * N2 + (size_t)li * N + oc];
                         size_t gid = ((size_t)k * nocc + l) * vv + (size_t)c * nvir + d;
                         d_w_oovv[gid] = 2.0 * v_cd - v_dc;
                     }
     } else {
         int threads = 256;
         int blocks_w = (int)((oo*vv + threads - 1) / threads);
-        extract_w_oovv_kernel<<<blocks_w, threads>>>(d_eri_mo, d_w_oovv, N, nocc, nvir);
+        extract_w_oovv_kernel<<<blocks_w, threads>>>(d_eri_mo, d_w_oovv, N, nocc, nvir, O, V);
     }
     cudaDeviceSynchronize();
     // Now d_eri_mo is no longer needed — free it
@@ -8115,12 +8137,15 @@ static real_t compute_ccsd_energy_impl(RHF& rhf, const real_t* d_eri, int ccsd_a
     const real_t* d_eps = rhf.get_orbital_energies().device_ptr();
 
     real_t E_CCSD;
-    if (ccsd_algorithm == 2) {
-        E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, d_eri_mo_precomputed, num_frozen);
+    // Frozen core only supported by ccsd_spatial_orbital (algorithm 0)
+    if (num_frozen > 0) {
+        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, nullptr, nullptr, d_eri_mo_precomputed, num_frozen);
+    } else if (ccsd_algorithm == 2) {
+        E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, d_eri_mo_precomputed);
     } else if (ccsd_algorithm == 1) {
         E_CCSD = ccsd_spatial_orbital_naive(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, d_eri_mo_precomputed);
     } else {
-        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, nullptr, nullptr, d_eri_mo_precomputed, num_frozen);
+        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, nullptr, nullptr, d_eri_mo_precomputed);
     }
 
     std::cout << "CCSD energy: " << E_CCSD << " Hartree" << std::endl;
