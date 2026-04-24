@@ -60,13 +60,13 @@ extern __global__ void eom_mp2_extract_eri_vvov_kernel(
 extern __global__ void eom_mp2_extract_eri_ooov_kernel(
     const real_t*, real_t*, int, int, int);
 extern __global__ void eom_mp2_extract_eri_oovv_kernel(
-    const real_t*, real_t*, int, int, int);
+    const real_t*, real_t*, int, int, int, int, int);
 extern __global__ void eom_mp2_extract_eri_ovvo_kernel(
     const real_t*, real_t*, int, int, int);
 extern __global__ void eom_mp2_extract_eri_vvvv_kernel(
-    const real_t*, real_t*, int, int, int);
+    const real_t*, real_t*, int, int, int, int, int);
 extern __global__ void eom_mp2_extract_eri_oooo_kernel(
-    const real_t*, real_t*, int, int);  // (d_eri_mo, d_out, nocc, nao)
+    const real_t*, real_t*, int, int, int);  // (d_eri_mo, d_out, nocc, nao, O)
 extern __global__ void eom_mp2_compute_D1_kernel(
     const real_t*, real_t*, int, int);
 extern __global__ void eom_mp2_extract_fock_kernel(
@@ -166,7 +166,7 @@ static void compute_eom_cc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
     real_t* d_eri_oovv = nullptr;
     tracked_cudaMalloc(&d_eri_oovv, oovv_size * sizeof(real_t));
     blocks = (oovv_size + threads - 1) / threads;
-    eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv, num_occ, num_vir, num_basis);
+    eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv, num_occ, num_vir, num_basis, 0, -1);
 
     // OVVO
     size_t ovvo_size = (size_t)num_occ * num_vir * num_vir * num_occ;
@@ -180,14 +180,14 @@ static void compute_eom_cc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
     real_t* d_eri_vvvv = nullptr;
     tracked_cudaMalloc(&d_eri_vvvv, vvvv_size * sizeof(real_t));
     blocks = (vvvv_size + threads - 1) / threads;
-    eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv, num_occ, num_vir, num_basis);
+    eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv, num_occ, num_vir, num_basis, 0, -1);
 
     // OOOO (for CC2 T2 dressed integrals)
     size_t oooo_size = (size_t)num_occ * num_occ * num_occ * num_occ;
     real_t* d_eri_oooo = nullptr;
     tracked_cudaMalloc(&d_eri_oooo, oooo_size * sizeof(real_t));
     blocks = (oooo_size + threads - 1) / threads;
-    eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo, num_occ, num_basis);
+    eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo, num_occ, num_basis, 0);
 
     // D1, D2, Fock
     real_t* d_D1 = nullptr;

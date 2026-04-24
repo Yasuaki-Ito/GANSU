@@ -43,11 +43,11 @@ namespace gansu {
 
 // Reuse ERI extraction kernels from eom_mp2_operator.cu
 extern __global__ void eom_mp2_extract_eri_oooo_kernel(
-    const real_t*, real_t*, int, int);
+    const real_t*, real_t*, int, int, int);
 extern __global__ void eom_mp2_extract_eri_vvvv_kernel(
-    const real_t*, real_t*, int, int, int);
+    const real_t*, real_t*, int, int, int, int, int);
 extern __global__ void eom_mp2_extract_eri_oovv_kernel(
-    const real_t*, real_t*, int, int, int);
+    const real_t*, real_t*, int, int, int, int, int);
 
 // Forward declarations of kernels defined in adc2_operator.cu
 __global__ void adc2_apply_M21_x1_kernel(
@@ -269,41 +269,44 @@ ADC2XOperator::ADC2XOperator(const ADC2Operator& adc2_op,
     size_t oovv_size = (size_t)nocc_ * nocc_ * nvir_ * nvir_;
     tracked_cudaMalloc(&d_eri_oovv_, oovv_size * sizeof(real_t));
 
+    const int O = adc2_op.get_occ_offset();
+    const int V = adc2_op.get_vir_start();
+
     if (!gpu::gpu_available()) {
         size_t nao2 = (size_t)nao * nao;
-        // Extract oooo: (ik|jl)
+        // Extract oooo: (O+i, O+j | O+k, O+l)
         #pragma omp parallel for collapse(2)
         for (int i = 0; i < nocc_; i++)
             for (int j = 0; j < nocc_; j++)
                 for (int k = 0; k < nocc_; k++)
                     for (int l = 0; l < nocc_; l++)
                         d_eri_oooo_[((size_t)i*nocc_+j)*nocc_*nocc_ + (size_t)k*nocc_+l] =
-                            d_eri_mo[((size_t)i*nao+j)*nao2 + (size_t)k*nao+l];
-        // Extract vvvv: (ac|bd)
+                            d_eri_mo[((size_t)(O+i)*nao+O+j)*nao2 + (size_t)(O+k)*nao+O+l];
+        // Extract vvvv: (V+a, V+b | V+c, V+d)
         #pragma omp parallel for collapse(2)
         for (int a = 0; a < nvir_; a++)
             for (int b = 0; b < nvir_; b++)
                 for (int c = 0; c < nvir_; c++)
                     for (int d = 0; d < nvir_; d++)
                         d_eri_vvvv_[((size_t)a*nvir_+b)*nvir_*nvir_ + (size_t)c*nvir_+d] =
-                            d_eri_mo[((size_t)(a+nocc_)*nao+b+nocc_)*nao2 + (size_t)(c+nocc_)*nao+d+nocc_];
-        // Extract oovv: (ij|ab)
+                            d_eri_mo[((size_t)(V+a)*nao+V+b)*nao2 + (size_t)(V+c)*nao+V+d];
+        // Extract oovv: (O+i, O+j | V+a, V+b)
         #pragma omp parallel for collapse(2)
         for (int i = 0; i < nocc_; i++)
             for (int j = 0; j < nocc_; j++)
                 for (int a = 0; a < nvir_; a++)
                     for (int b = 0; b < nvir_; b++)
                         d_eri_oovv_[((size_t)i*nocc_+j)*nvir_*nvir_ + (size_t)a*nvir_+b] =
-                            d_eri_mo[((size_t)i*nao+j)*nao2 + (size_t)(a+nocc_)*nao+b+nocc_];
+                            d_eri_mo[((size_t)(O+i)*nao+O+j)*nao2 + (size_t)(V+a)*nao+V+b];
     } else {
         int threads = 256;
         int blocks;
         blocks = (oooo_size + threads - 1) / threads;
-        eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo_, nocc_, nao);
+        eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo_, nocc_, nao, O);
         blocks = (vvvv_size + threads - 1) / threads;
-        eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv_, nocc_, nvir_, nao);
+        eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv_, nocc_, nvir_, nao, O, V);
         blocks = (oovv_size + threads - 1) / threads;
-        eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv_, nocc_, nvir_, nao);
+        eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv_, nocc_, nvir_, nao, O, V);
         cudaDeviceSynchronize();
     }
 

@@ -122,6 +122,9 @@ def _setup_signatures(lib):
     lib.gansu_get_num_electrons.argtypes = [c_handle]
     lib.gansu_get_num_electrons.restype = c_int
 
+    lib.gansu_get_num_frozen_core.argtypes = [c_handle]
+    lib.gansu_get_num_frozen_core.restype = c_int
+
     lib.gansu_get_num_atoms.argtypes = [c_handle]
     lib.gansu_get_num_atoms.restype = c_int
 
@@ -225,6 +228,10 @@ class Result:
     @property
     def num_electrons(self):
         return self._lib.gansu_get_num_electrons(self._h)
+
+    @property
+    def num_frozen_core(self):
+        return self._lib.gansu_get_num_frozen_core(self._h)
 
     @property
     def num_atoms(self):

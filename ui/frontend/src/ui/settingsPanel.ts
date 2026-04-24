@@ -156,6 +156,14 @@ export function createSettingsPanel(
       </div>
 
       <div class="setting-row">
+        <label>Frozen Core</label>
+        <div class="toggle-group" id="frozen-core-group">
+          <button class="toggle active" data-value="none">None</button>
+          <button class="toggle" data-value="auto">Auto</button>
+        </div>
+      </div>
+
+      <div class="setting-row">
         <label>Analysis</label>
         <div class="checkbox-group">
           <label class="checkbox-label"><input type="checkbox" id="chk-mulliken"> Mulliken</label>
@@ -291,6 +299,7 @@ export function createSettingsPanel(
       n_excited_states: getNumValue('n-excited-states', DEFAULT_PARAMS.n_excited_states),
       spin_type: getToggleValue('spin-type-group') || DEFAULT_PARAMS.spin_type,
       excited_solver: getToggleValue('solver-group') || 'auto',
+      frozen_core: getToggleValue('frozen-core-group') || 'none',
       mulliken: getChecked('chk-mulliken'),
       mayer: getChecked('chk-mayer'),
       wiberg: getChecked('chk-wiberg'),

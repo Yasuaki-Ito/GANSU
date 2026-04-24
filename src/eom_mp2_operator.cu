@@ -106,7 +106,7 @@ __global__ void eom_mp2_extract_eri_ooov_kernel(
 
 __global__ void eom_mp2_extract_eri_oooo_kernel(
     const real_t* __restrict__ d_eri_mo, real_t* __restrict__ d_out,
-    int nocc, int nao) {
+    int nocc, int nao, int O = 0) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nocc * nocc * nocc * nocc) return;
     int i = idx / (nocc * nocc * nocc);
@@ -116,12 +116,13 @@ __global__ void eom_mp2_extract_eri_oooo_kernel(
     int k = rem / nocc;
     int l = rem % nocc;
     size_t nao2 = (size_t)nao * nao;
-    d_out[idx] = d_eri_mo[((size_t)i * nao + j) * nao2 + (size_t)k * nao + l];
+    d_out[idx] = d_eri_mo[((size_t)(O+i) * nao + O+j) * nao2 + (size_t)(O+k) * nao + O+l];
 }
 
 __global__ void eom_mp2_extract_eri_vvvv_kernel(
     const real_t* __restrict__ d_eri_mo, real_t* __restrict__ d_out,
-    int nocc, int nvir, int nao) {
+    int nocc, int nvir, int nao, int O = 0, int V = -1) {
+    if (V < 0) V = O + nocc;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nvir * nvir * nvir * nvir) return;
     int a = idx / (nvir * nvir * nvir);
@@ -131,12 +132,13 @@ __global__ void eom_mp2_extract_eri_vvvv_kernel(
     int c = rem / nvir;
     int d = rem % nvir;
     size_t nao2 = (size_t)nao * nao;
-    d_out[idx] = d_eri_mo[((size_t)(a+nocc)*nao + b+nocc)*nao2 + (size_t)(c+nocc)*nao + d+nocc];
+    d_out[idx] = d_eri_mo[((size_t)(V+a)*nao + V+b)*nao2 + (size_t)(V+c)*nao + V+d];
 }
 
 __global__ void eom_mp2_extract_eri_oovv_kernel(
     const real_t* __restrict__ d_eri_mo, real_t* __restrict__ d_out,
-    int nocc, int nvir, int nao) {
+    int nocc, int nvir, int nao, int O = 0, int V = -1) {
+    if (V < 0) V = O + nocc;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nocc * nocc * nvir * nvir) return;
     int i = idx / (nocc * nvir * nvir);
@@ -146,7 +148,7 @@ __global__ void eom_mp2_extract_eri_oovv_kernel(
     int a = rem / nvir;
     int b = rem % nvir;
     size_t nao2 = (size_t)nao * nao;
-    d_out[idx] = d_eri_mo[((size_t)i*nao + j)*nao2 + (size_t)(a+nocc)*nao + b+nocc];
+    d_out[idx] = d_eri_mo[((size_t)(O+i)*nao + O+j)*nao2 + (size_t)(V+a)*nao + V+b];
 }
 
 __global__ void eom_mp2_extract_eri_ovvo_kernel(
@@ -730,13 +732,13 @@ void EOMMP2Operator::extract_eri_blocks(const real_t* d_eri_mo) {
         eom_mp2_extract_eri_ooov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ooov_, nocc_, nvir_, nao_);
 
         blocks = (oooo_size + threads - 1) / threads;
-        eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo_, nocc_, nao_);
+        eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo_, nocc_, nao_, 0);
 
         blocks = (vvvv_size + threads - 1) / threads;
-        eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv_, nocc_, nvir_, nao_);
+        eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv_, nocc_, nvir_, nao_, 0, -1);
 
         blocks = (oovv_size + threads - 1) / threads;
-        eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv_, nocc_, nvir_, nao_);
+        eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv_, nocc_, nvir_, nao_, 0, -1);
 
         blocks = (ovvo_size + threads - 1) / threads;
         eom_mp2_extract_eri_ovvo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvo_, nocc_, nvir_, nao_);

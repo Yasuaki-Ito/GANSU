@@ -62,6 +62,7 @@ class CalcRequest(BaseModel):
     n_excited_states: int = 5
     spin_type: str = "singlet"
     excited_solver: str = "auto"
+    frozen_core: str = "none"
     eri_method: str = "stored"
     auxiliary_basis: str = ""
     auxiliary_basis_dir: str = "auxiliary_basis"
@@ -300,6 +301,7 @@ class InProcessCalcRequest(BaseModel):
     n_excited_states: int = 5
     spin_type: str = "singlet"
     excited_solver: str = "auto"
+    frozen_core: str = "none"
     eri_method: str = "stored"
     auxiliary_basis: str = ""
     auxiliary_basis_dir: str = "auxiliary_basis"
@@ -352,6 +354,8 @@ async def run_inprocess(req: InProcessCalcRequest):
                 extra_params["n_excited_states"] = str(req.n_excited_states)
             if req.spin_type != "singlet":
                 extra_params["spin_type"] = req.spin_type
+            if req.frozen_core != "none":
+                extra_params["frozen_core"] = req.frozen_core
             if req.eri_method != "stored":
                 eri_map = {"ri": "RI", "direct": "Direct", "direct_ri": "Direct_RI"}
                 extra_params["eri_method"] = eri_map.get(req.eri_method, req.eri_method)
@@ -387,7 +391,14 @@ async def run_inprocess(req: InProcessCalcRequest):
                     "iterations": len(scf_iterations),
                     "method": req.method,
                 },
-                "molecule": {"num_atoms": r.num_atoms, "num_electrons": r.num_electrons},
+                "molecule": {
+                    "num_atoms": r.num_atoms,
+                    "num_electrons": r.num_electrons,
+                    "num_occ": r.num_electrons // 2,
+                    "num_vir": r.num_basis - r.num_electrons // 2,
+                    "num_frozen": r.num_frozen_core,
+                    "frozen_core": req.frozen_core if req.frozen_core != "none" else None,
+                },
                 "basis_set": {"num_basis": r.num_basis},
                 "scf_iterations": scf_iterations,
                 "orbital_energies": [],
@@ -522,6 +533,8 @@ async def run_inprocess_stream(req: InProcessCalcRequest):
                     extra_params[solver_param] = req.excited_solver
             if req.spin_type != "singlet":
                 extra_params["spin_type"] = req.spin_type
+            if req.frozen_core != "none":
+                extra_params["frozen_core"] = req.frozen_core
 
             mol = g.Molecule(
                 xyz_path, basis=req.basis, charge=str(req.charge),
@@ -565,7 +578,14 @@ async def run_inprocess_stream(req: InProcessCalcRequest):
                     "initial_guess": req.initial_guess,
                     "computing_time_ms": elapsed_ms,
                 },
-                "molecule": {"num_atoms": r.num_atoms, "num_electrons": r.num_electrons},
+                "molecule": {
+                    "num_atoms": r.num_atoms,
+                    "num_electrons": r.num_electrons,
+                    "num_occ": r.num_electrons // 2,
+                    "num_vir": r.num_basis - r.num_electrons // 2,
+                    "num_frozen": r.num_frozen_core,
+                    "frozen_core": req.frozen_core if req.frozen_core != "none" else None,
+                },
                 "basis_set": {"num_basis": r.num_basis},
                 "scf_iterations": scf_iterations,
                 "orbital_energies": [],

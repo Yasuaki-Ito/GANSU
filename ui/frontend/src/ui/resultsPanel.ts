@@ -67,10 +67,17 @@ export function createResultsPanel(container: HTMLElement): {
 
     // Post-HF (hide when only method is set, e.g. excited state methods)
     if (result.post_hf && (result.post_hf.correction !== undefined || result.post_hf.total_energy !== undefined)) {
+      const mol = result.molecule as any;
+      const nfrozen = mol?.num_frozen || 0;
+      const nocc = mol?.num_occ;
+      const nvir = mol?.num_vir;
+      const activeOcc = nfrozen > 0 ? nocc - nfrozen : nocc;
       html += `
         <div class="panel result-card">
-          <h3>Post-HF: ${result.post_hf.method || ''}</h3>
+          <h3>Post-HF: ${result.post_hf.method || ''}${nfrozen > 0 ? ' (frozen core)' : ''}</h3>
           <table class="result-table">
+            ${nocc !== undefined ? row('Occupied / Virtual', `${nocc} / ${nvir}`) : ''}
+            ${nfrozen > 0 ? row('Frozen Core', `${nfrozen} orbitals frozen, ${activeOcc} active occupied`) : ''}
             ${result.post_hf.correction !== undefined ? row('Correlation Energy', formatEnergy(result.post_hf.correction) + ' Hartree') : ''}
             ${result.post_hf.total_energy !== undefined ? row('Total Energy', formatEnergy(result.post_hf.total_energy) + ' Hartree') : ''}
           </table>

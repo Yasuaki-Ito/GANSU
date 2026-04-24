@@ -140,6 +140,7 @@ export async function initApp(root: HTMLElement) {
           auxiliary_basis: params.auxiliary_basis,
           auxiliary_basis_dir: params.auxiliary_basis_dir,
           excited_solver: params.excited_solver,
+          frozen_core: params.frozen_core,
           mulliken: params.mulliken,
           mayer: params.mayer,
           wiberg: params.wiberg,
@@ -233,7 +234,9 @@ export async function initApp(root: HTMLElement) {
             } else if (event.type === 'result') {
               const elapsed = ((performance.now() - t0) / 1000).toFixed(3);
               const s = event.data.summary || {};
+              const mol = event.data.molecule || {};
               logLines.push(`[${elapsed}s] Done. Total energy: ${(s.total_energy ?? 0).toFixed(10)} Ha`);
+              logLines.push(`  Basis: ${event.data.basis_set?.num_basis ?? '?'} functions, Occ: ${mol.num_occ ?? '?'}, Vir: ${mol.num_vir ?? '?'}${mol.frozen_core ? `, Frozen core: ${mol.frozen_core}` : ''}`);
               if (event.data.post_hf) {
                 logLines.push(`  Post-HF (${event.data.post_hf.method}): correction=${event.data.post_hf.correction.toFixed(10)}, total=${event.data.post_hf.total_energy.toFixed(10)}`);
               }

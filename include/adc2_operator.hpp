@@ -122,6 +122,8 @@ public:
 
     // --- Accessors ---
     int get_nocc() const { return nocc_; }
+    int get_occ_offset() const { return occ_offset_; }
+    int get_vir_start() const { return vir_start_; }
     int get_nvir() const { return nvir_; }
     int get_singles_dim() const { return singles_dim_; }
     int get_doubles_dim() const { return doubles_dim_; }

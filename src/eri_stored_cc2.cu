@@ -44,13 +44,13 @@ extern __global__ void eom_mp2_extract_eri_vvov_kernel(
 extern __global__ void eom_mp2_extract_eri_ooov_kernel(
     const real_t*, real_t*, int, int, int);
 extern __global__ void eom_mp2_extract_eri_oovv_kernel(
-    const real_t*, real_t*, int, int, int);
+    const real_t*, real_t*, int, int, int, int, int);
 extern __global__ void eom_mp2_extract_eri_ovvo_kernel(
     const real_t*, real_t*, int, int, int);
 extern __global__ void eom_mp2_extract_eri_vvvv_kernel(
-    const real_t*, real_t*, int, int, int);
+    const real_t*, real_t*, int, int, int, int, int);
 extern __global__ void eom_mp2_extract_eri_oooo_kernel(
-    const real_t*, real_t*, int, int);
+    const real_t*, real_t*, int, int, int);
 extern __global__ void eom_mp2_compute_D1_kernel(
     const real_t*, real_t*, int, int);
 extern __global__ void eom_mp2_extract_fock_kernel(
@@ -204,13 +204,13 @@ static real_t compute_cc2_energy_impl(RHF& rhf, const real_t* d_eri_ao, real_t* 
         blocks = (ooov_size + threads - 1) / threads;
         eom_mp2_extract_eri_ooov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ooov, num_occ, num_vir, num_basis);
         blocks = (oovv_size + threads - 1) / threads;
-        eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv, num_occ, num_vir, num_basis);
+        eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv, num_occ, num_vir, num_basis, 0, -1);
         blocks = (ovvo_size + threads - 1) / threads;
         eom_mp2_extract_eri_ovvo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvo, num_occ, num_vir, num_basis);
         blocks = (vvvv_size + threads - 1) / threads;
-        eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv, num_occ, num_vir, num_basis);
+        eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv, num_occ, num_vir, num_basis, 0, -1);
         blocks = (oooo_size + threads - 1) / threads;
-        eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo, num_occ, num_basis);
+        eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo, num_occ, num_basis, 0);
     }
 
     // Free full MO ERIs

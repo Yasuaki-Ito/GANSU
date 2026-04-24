@@ -1016,6 +1016,12 @@ void HF::report(){
     std::cout << "Number of electrons: " << num_electrons << std::endl;
     std::cout << "Number of alpha-spin electrons: " << num_alpha_spins << std::endl;
     std::cout << "Number of beta-spin electrons: " << num_beta_spins << std::endl;
+    std::cout << "Occupied orbitals: " << num_electrons / 2 << std::endl;
+    std::cout << "Virtual orbitals: " << num_basis - num_electrons / 2 << std::endl;
+    if (num_frozen_core_ > 0) {
+        std::cout << "Frozen core orbitals: " << num_frozen_core_ << std::endl;
+        std::cout << "Active occupied orbitals: " << get_num_active_occ() << std::endl;
+    }
 
     std::cout << std::endl;
     std::cout << "[Basis Set Summary]" << std::endl;

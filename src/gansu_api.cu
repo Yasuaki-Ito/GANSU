@@ -239,6 +239,13 @@ extern "C" int gansu_get_num_electrons(gansu_handle_t h) {
     return ctx->hf->get_num_electrons();
 }
 
+extern "C" int gansu_get_num_frozen_core(gansu_handle_t h) {
+    if (!h) return 0;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (!ctx->hf) return 0;
+    return ctx->hf->get_num_frozen_core();
+}
+
 extern "C" int gansu_get_num_atoms(gansu_handle_t h) {
     if (!h) return 0;
     auto* ctx = static_cast<GansuContext*>(h);

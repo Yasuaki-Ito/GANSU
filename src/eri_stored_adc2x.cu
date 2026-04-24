@@ -47,13 +47,11 @@ void transform_ao_eri_to_mo_eri_full(
 static void compute_adc2x_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
-    if (rhf.get_num_frozen_core() > 0) {
-        THROW_EXCEPTION("ADC(2)-x does not yet support frozen core approximation. Use ADC(2) with frozen_core instead.");
-    }
-
+    const int num_frozen = rhf.get_num_frozen_core();
     const int num_basis = rhf.get_num_basis();
-    const int num_occ = rhf.get_num_electrons() / 2;
-    const int num_vir = num_basis - num_occ;
+    const int full_occ = rhf.get_num_electrons() / 2;
+    const int num_occ = full_occ - num_frozen;
+    const int num_vir = num_basis - full_occ;
     const int singles_dim = num_occ * num_vir;
     const int doubles_dim = num_occ * num_occ * num_vir * num_vir;
     const int total_dim = singles_dim + doubles_dim;
@@ -98,7 +96,7 @@ static void compute_adc2x_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, r
     DeviceHostMemory<real_t>& orbital_energies = rhf.get_orbital_energies();
     const real_t* d_orbital_energies = orbital_energies.device_ptr();
 
-    ADC2Operator adc2_op(d_eri_mo, d_orbital_energies, num_occ, num_vir, num_basis, is_triplet);
+    ADC2Operator adc2_op(d_eri_mo, d_orbital_energies, num_occ, num_vir, num_basis, is_triplet, num_frozen, full_occ);
 
     // Build ADC(2)-x operator (extracts oooo/vvvv/oovv blocks, needs d_eri_mo)
     ADC2XOperator adc2x_op(adc2_op, d_eri_mo, num_basis);
@@ -173,7 +171,7 @@ static void compute_adc2x_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, r
         rhf.get_shell_type_infos(),
         coefficient_matrix.host_ptr(),
         excitation_energies, h_final_eigenvectors.data(),
-        n_states, num_basis, num_occ, num_vir);
+        n_states, num_basis, num_occ, num_vir, num_frozen, full_occ);
     rhf.set_oscillator_strengths(es_result.oscillator_strengths);
     rhf.set_excited_state_report(es_result.report);
 }

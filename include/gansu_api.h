@@ -101,6 +101,9 @@ int gansu_get_num_basis(gansu_handle_t h);
 /** Get number of electrons. */
 int gansu_get_num_electrons(gansu_handle_t h);
 
+/** Get number of frozen core orbitals (0 if no frozen core). */
+int gansu_get_num_frozen_core(gansu_handle_t h);
+
 /** Get number of atoms. */
 int gansu_get_num_atoms(gansu_handle_t h);
 

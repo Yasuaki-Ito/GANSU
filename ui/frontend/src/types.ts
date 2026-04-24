@@ -21,6 +21,7 @@ export interface CalculationParams {
   n_excited_states: number;
   spin_type: string;
   excited_solver: string;
+  frozen_core: string;
   eri_method: string;
   auxiliary_basis: string;
   auxiliary_basis_dir: string;
@@ -53,6 +54,7 @@ export const DEFAULT_PARAMS: CalculationParams = {
   n_excited_states: 5,
   spin_type: 'singlet',
   excited_solver: 'auto',
+  frozen_core: 'none',
   eri_method: 'stored',
   auxiliary_basis: '',
   auxiliary_basis_dir: 'auxiliary_basis',
