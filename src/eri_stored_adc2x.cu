@@ -47,6 +47,10 @@ void transform_ao_eri_to_mo_eri_full(
 static void compute_adc2x_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
+    if (rhf.get_num_frozen_core() > 0) {
+        THROW_EXCEPTION("ADC(2)-x does not yet support frozen core approximation. Use ADC(2) with frozen_core instead.");
+    }
+
     const int num_basis = rhf.get_num_basis();
     const int num_occ = rhf.get_num_electrons() / 2;
     const int num_vir = num_basis - num_occ;

@@ -209,30 +209,32 @@ void compute_ao_dipole_integrals(
 
 std::vector<real_t> transform_dipole_ao_to_mo_ov(
     const std::vector<real_t>& dipole_ao,
-    const real_t* C, int nao, int nocc, int nvir)
+    const real_t* C, int nao, int nocc, int nvir,
+    int occ_offset = 0, int vir_start = -1)
 {
-    // μ^MO_{ia} = Σ_{μν} C_{μi} μ^AO_{μν} C_{νa}
+    if (vir_start < 0) vir_start = occ_offset + nocc;
+    // μ^MO_{ia} = Σ_{μν} C_{μ,occ_offset+i} μ^AO_{μν} C_{ν,vir_start+a}
     // C is row-major: C[mu * nao + p]
     std::vector<real_t> dipole_ov(nocc * nvir, 0.0);
 
-    // First: tmp[μ][a] = Σ_ν μ^AO_{μν} C_{ν,nocc+a}
+    // First: tmp[μ][a] = Σ_ν μ^AO_{μν} C_{ν,vir_start+a}
     std::vector<real_t> tmp(nao * nvir, 0.0);
     for (int mu = 0; mu < nao; mu++) {
         for (int a = 0; a < nvir; a++) {
             double val = 0.0;
             for (int nu = 0; nu < nao; nu++) {
-                val += dipole_ao[mu * nao + nu] * C[nu * nao + (nocc + a)];
+                val += dipole_ao[mu * nao + nu] * C[nu * nao + (vir_start + a)];
             }
             tmp[mu * nvir + a] = val;
         }
     }
 
-    // Then: dipole_ov[i][a] = Σ_μ C_{μi} tmp[μ][a]
+    // Then: dipole_ov[i][a] = Σ_μ C_{μ,occ_offset+i} tmp[μ][a]
     for (int i = 0; i < nocc; i++) {
         for (int a = 0; a < nvir; a++) {
             double val = 0.0;
             for (int mu = 0; mu < nao; mu++) {
-                val += C[mu * nao + i] * tmp[mu * nvir + a];
+                val += C[mu * nao + (occ_offset + i)] * tmp[mu * nvir + a];
             }
             dipole_ov[i * nvir + a] = val;
         }
@@ -286,8 +288,10 @@ ExcitedStateResult compute_excited_state_properties(
     const real_t* C_host,
     const std::vector<real_t>& excitation_energies,
     const real_t* h_eigenvectors,
-    int n_states, int nao, int nocc, int nvir)
+    int n_states, int nao, int nocc, int nvir,
+    int occ_offset, int vir_start)
 {
+    if (vir_start < 0) vir_start = occ_offset + nocc;
     const int singles_dim = nocc * nvir;
 
     // --- Compute AO dipole integrals ---
@@ -297,9 +301,9 @@ ExcitedStateResult compute_excited_state_properties(
         dip_ao_x, dip_ao_y, dip_ao_z);
 
     // --- Transform to MO ov block ---
-    auto dip_mo_x = transform_dipole_ao_to_mo_ov(dip_ao_x, C_host, nao, nocc, nvir);
-    auto dip_mo_y = transform_dipole_ao_to_mo_ov(dip_ao_y, C_host, nao, nocc, nvir);
-    auto dip_mo_z = transform_dipole_ao_to_mo_ov(dip_ao_z, C_host, nao, nocc, nvir);
+    auto dip_mo_x = transform_dipole_ao_to_mo_ov(dip_ao_x, C_host, nao, nocc, nvir, occ_offset, vir_start);
+    auto dip_mo_y = transform_dipole_ao_to_mo_ov(dip_ao_y, C_host, nao, nocc, nvir, occ_offset, vir_start);
+    auto dip_mo_z = transform_dipole_ao_to_mo_ov(dip_ao_z, C_host, nao, nocc, nvir, occ_offset, vir_start);
 
     // --- Compute oscillator strengths ---
     // Triplet→singlet electric dipole transitions are spin-forbidden (f=0)

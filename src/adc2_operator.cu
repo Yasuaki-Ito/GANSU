@@ -66,8 +66,10 @@ namespace gansu {
 __global__ void adc2_extract_eri_ovov_kernel(
     const real_t* __restrict__ d_eri_mo,
     real_t* __restrict__ d_eri_ovov,
-    int nocc, int nvir, int nao)
+    int nocc, int nvir, int nao,
+    int O = 0, int V = -1)
 {
+    if (V < 0) V = O + nocc;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = nocc * nvir * nocc * nvir;
     if (idx >= total) return;
@@ -80,9 +82,7 @@ __global__ void adc2_extract_eri_ovov_kernel(
     int b = rem % nvir;
 
     size_t nao2 = (size_t)nao * nao;
-    int a_abs = a + nocc;
-    int b_abs = b + nocc;
-    d_eri_ovov[idx] = d_eri_mo[((size_t)i * nao + a_abs) * nao2 + (size_t)j * nao + b_abs];
+    d_eri_ovov[idx] = d_eri_mo[((size_t)(O+i) * nao + V+a) * nao2 + (size_t)(O+j) * nao + V+b];
 }
 
 /**
@@ -92,8 +92,10 @@ __global__ void adc2_extract_eri_ovov_kernel(
 __global__ void adc2_extract_eri_vvov_kernel(
     const real_t* __restrict__ d_eri_mo,
     real_t* __restrict__ d_eri_vvov,
-    int nocc, int nvir, int nao)
+    int nocc, int nvir, int nao,
+    int O = 0, int V = -1)
 {
+    if (V < 0) V = O + nocc;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = nvir * nvir * nocc * nvir;
     if (idx >= total) return;
@@ -106,10 +108,7 @@ __global__ void adc2_extract_eri_vvov_kernel(
     int c = rem % nvir;
 
     size_t nao2 = (size_t)nao * nao;
-    int a_abs = a + nocc;
-    int b_abs = b + nocc;
-    int c_abs = c + nocc;
-    d_eri_vvov[idx] = d_eri_mo[((size_t)a_abs * nao + b_abs) * nao2 + (size_t)i * nao + c_abs];
+    d_eri_vvov[idx] = d_eri_mo[((size_t)(V+a) * nao + V+b) * nao2 + (size_t)(O+i) * nao + V+c];
 }
 
 /**
@@ -119,8 +118,10 @@ __global__ void adc2_extract_eri_vvov_kernel(
 __global__ void adc2_extract_eri_ooov_kernel(
     const real_t* __restrict__ d_eri_mo,
     real_t* __restrict__ d_eri_ooov,
-    int nocc, int nvir, int nao)
+    int nocc, int nvir, int nao,
+    int O = 0, int V = -1)
 {
+    if (V < 0) V = O + nocc;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = nocc * nocc * nocc * nvir;
     if (idx >= total) return;
@@ -133,8 +134,7 @@ __global__ void adc2_extract_eri_ooov_kernel(
     int b = rem % nvir;
 
     size_t nao2 = (size_t)nao * nao;
-    int b_abs = b + nocc;
-    d_eri_ooov[idx] = d_eri_mo[((size_t)j * nao + i) * nao2 + (size_t)k * nao + b_abs];
+    d_eri_ooov[idx] = d_eri_mo[((size_t)(O+j) * nao + O+i) * nao2 + (size_t)(O+k) * nao + V+b];
 }
 
 // ========================================================================
@@ -151,8 +151,10 @@ __global__ void adc2_compute_mp1_t2_and_D2_kernel(
     const real_t* __restrict__ d_orbital_energies,
     real_t* __restrict__ d_t2,
     real_t* __restrict__ d_D2,
-    int nocc, int nvir)
+    int nocc, int nvir,
+    int O = 0, int V = -1)
 {
+    if (V < 0) V = O + nocc;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = nocc * nocc * nvir * nvir;
     if (idx >= total) return;
@@ -164,10 +166,10 @@ __global__ void adc2_compute_mp1_t2_and_D2_kernel(
     int a = rem / nvir;
     int b = rem % nvir;
 
-    real_t eps_i = d_orbital_energies[i];
-    real_t eps_j = d_orbital_energies[j];
-    real_t eps_a = d_orbital_energies[a + nocc];
-    real_t eps_b = d_orbital_energies[b + nocc];
+    real_t eps_i = d_orbital_energies[O + i];
+    real_t eps_j = d_orbital_energies[O + j];
+    real_t eps_a = d_orbital_energies[V + a];
+    real_t eps_b = d_orbital_energies[V + b];
 
     real_t denom = eps_i + eps_j - eps_a - eps_b;
     real_t D2_val = eps_a + eps_b - eps_i - eps_j;
@@ -187,13 +189,15 @@ __global__ void adc2_compute_mp1_t2_and_D2_kernel(
 __global__ void adc2_compute_D1_kernel(
     const real_t* __restrict__ d_orbital_energies,
     real_t* __restrict__ d_D1,
-    int nocc, int nvir)
+    int nocc, int nvir,
+    int O = 0, int V = -1)
 {
+    if (V < 0) V = O + nocc;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nocc * nvir) return;
     int i = idx / nvir;
     int a = idx % nvir;
-    d_D1[idx] = d_orbital_energies[a + nocc] - d_orbital_energies[i];
+    d_D1[idx] = d_orbital_energies[V + a] - d_orbital_energies[O + i];
 }
 
 // ========================================================================
@@ -210,13 +214,14 @@ __global__ void adc2_build_cis_matrix_kernel(
     const real_t* __restrict__ d_orbital_energies,
     real_t* __restrict__ d_cis,
     int nocc, int nvir, int nao,
-    bool is_triplet)
+    bool is_triplet,
+    int O = 0, int V = -1)
 {
+    if (V < 0) V = O + nocc;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int ov = nocc * nvir;
     if (idx >= ov * ov) return;
 
-    // Column-major: idx = row + col * ov
     int ia_idx = idx % ov;
     int jb_idx = idx / ov;
 
@@ -225,24 +230,21 @@ __global__ void adc2_build_cis_matrix_kernel(
     int j = jb_idx / nvir;
     int b = jb_idx % nvir;
 
-    int a_abs = a + nocc;
-    int b_abs = b + nocc;
+    int i_abs = O + i, j_abs = O + j;
+    int a_abs = V + a, b_abs = V + b;
     size_t nao2 = (size_t)nao * nao;
 
     real_t val = 0.0;
 
-    // Diagonal: δ_ij·δ_ab·(eps_a - eps_i)
     if (i == j && a == b) {
-        val += d_orbital_energies[a_abs] - d_orbital_energies[i];
+        val += d_orbital_energies[a_abs] - d_orbital_energies[i_abs];
     }
 
-    // -(ij|ab)
-    real_t ij_ab = d_eri_mo[((size_t)i * nao + j) * nao2 + (size_t)a_abs * nao + b_abs];
+    real_t ij_ab = d_eri_mo[((size_t)i_abs * nao + j_abs) * nao2 + (size_t)a_abs * nao + b_abs];
     val -= ij_ab;
 
     if (!is_triplet) {
-        // Singlet: +2(ia|jb)
-        real_t ia_jb = d_eri_mo[((size_t)i * nao + a_abs) * nao2 + (size_t)j * nao + b_abs];
+        real_t ia_jb = d_eri_mo[((size_t)i_abs * nao + a_abs) * nao2 + (size_t)j_abs * nao + b_abs];
         val += 2.0 * ia_jb;
     }
 
@@ -1033,10 +1035,13 @@ ADC2Operator::ADC2Operator(
     const real_t* d_eri_mo,
     const real_t* d_orbital_energies,
     int nocc, int nvir, int nao,
-    bool is_triplet)
+    bool is_triplet,
+    int occ_offset, int vir_start)
     : nocc_(nocc), nvir_(nvir), nao_(nao),
       singles_dim_(nocc * nvir),
       doubles_dim_(nocc * nocc * nvir * nvir),
+      occ_offset_(occ_offset),
+      vir_start_(vir_start < 0 ? occ_offset + nocc : vir_start),
       omega_(0.0),
       is_triplet_(is_triplet),
       d_eri_ovov_(nullptr), d_eri_vvov_(nullptr), d_eri_ooov_(nullptr),
@@ -1379,31 +1384,33 @@ ADC2Operator::~ADC2Operator() {
 }
 
 void ADC2Operator::extract_eri_blocks(const real_t* d_eri_mo) {
+    const int O = occ_offset_;
+    const int V = vir_start_;
     if (!gpu::gpu_available()) {
         size_t nao2 = (size_t)nao_ * nao_;
-        // Extract ovov
+        // Extract ovov: (O+i, V+a | O+j, V+b)
         for (int i = 0; i < nocc_; i++)
             for (int a = 0; a < nvir_; a++)
                 for (int j = 0; j < nocc_; j++)
                     for (int b = 0; b < nvir_; b++) {
                         int idx = ((i * nvir_ + a) * nocc_ + j) * nvir_ + b;
-                        d_eri_ovov_[idx] = d_eri_mo[((size_t)i * nao_ + a + nocc_) * nao2 + (size_t)j * nao_ + b + nocc_];
+                        d_eri_ovov_[idx] = d_eri_mo[((size_t)(O+i) * nao_ + V+a) * nao2 + (size_t)(O+j) * nao_ + V+b];
                     }
-        // Extract vvov
+        // Extract vvov: (V+a, V+b | O+i, V+c)
         for (int a = 0; a < nvir_; a++)
             for (int b = 0; b < nvir_; b++)
                 for (int i = 0; i < nocc_; i++)
                     for (int c = 0; c < nvir_; c++) {
                         int idx = ((a * nvir_ + b) * nocc_ + i) * nvir_ + c;
-                        d_eri_vvov_[idx] = d_eri_mo[((size_t)(a + nocc_) * nao_ + b + nocc_) * nao2 + (size_t)i * nao_ + c + nocc_];
+                        d_eri_vvov_[idx] = d_eri_mo[((size_t)(V+a) * nao_ + V+b) * nao2 + (size_t)(O+i) * nao_ + V+c];
                     }
-        // Extract ooov
+        // Extract ooov: (O+j, O+i | O+k, V+b)
         for (int j = 0; j < nocc_; j++)
             for (int i = 0; i < nocc_; i++)
                 for (int k = 0; k < nocc_; k++)
                     for (int b = 0; b < nvir_; b++) {
                         int idx = ((j * nocc_ + i) * nocc_ + k) * nvir_ + b;
-                        d_eri_ooov_[idx] = d_eri_mo[((size_t)j * nao_ + i) * nao2 + (size_t)k * nao_ + b + nocc_];
+                        d_eri_ooov_[idx] = d_eri_mo[((size_t)(O+j) * nao_ + O+i) * nao2 + (size_t)(O+k) * nao_ + V+b];
                     }
         return;
     }
@@ -1412,15 +1419,15 @@ void ADC2Operator::extract_eri_blocks(const real_t* d_eri_mo) {
 
     int n_ovov = nocc_ * nvir_ * nocc_ * nvir_;
     adc2_extract_eri_ovov_kernel<<<(n_ovov + threads - 1) / threads, threads>>>(
-        d_eri_mo, d_eri_ovov_, nocc_, nvir_, nao_);
+        d_eri_mo, d_eri_ovov_, nocc_, nvir_, nao_, O, V);
 
     int n_vvov = nvir_ * nvir_ * nocc_ * nvir_;
     adc2_extract_eri_vvov_kernel<<<(n_vvov + threads - 1) / threads, threads>>>(
-        d_eri_mo, d_eri_vvov_, nocc_, nvir_, nao_);
+        d_eri_mo, d_eri_vvov_, nocc_, nvir_, nao_, O, V);
 
     int n_ooov = nocc_ * nocc_ * nocc_ * nvir_;
     adc2_extract_eri_ooov_kernel<<<(n_ooov + threads - 1) / threads, threads>>>(
-        d_eri_mo, d_eri_ooov_, nocc_, nvir_, nao_);
+        d_eri_mo, d_eri_ooov_, nocc_, nvir_, nao_, O, V);
 
     cudaDeviceSynchronize();
 }
@@ -1432,10 +1439,10 @@ void ADC2Operator::compute_mp1_t2_and_D2(const real_t* d_orbital_energies) {
                 for (int a = 0; a < nvir_; a++)
                     for (int b = 0; b < nvir_; b++) {
                         int idx = ((i * nocc_ + j) * nvir_ + a) * nvir_ + b;
-                        real_t eps_i = d_orbital_energies[i];
-                        real_t eps_j = d_orbital_energies[j];
-                        real_t eps_a = d_orbital_energies[a + nocc_];
-                        real_t eps_b = d_orbital_energies[b + nocc_];
+                        real_t eps_i = d_orbital_energies[occ_offset_ + i];
+                        real_t eps_j = d_orbital_energies[occ_offset_ + j];
+                        real_t eps_a = d_orbital_energies[vir_start_ + a];
+                        real_t eps_b = d_orbital_energies[vir_start_ + b];
                         real_t denom = eps_i + eps_j - eps_a - eps_b;
                         real_t ia_jb = d_eri_ovov_[(size_t)i * nvir_ * nocc_ * nvir_ +
                                                     (size_t)a * nocc_ * nvir_ +
@@ -1449,7 +1456,7 @@ void ADC2Operator::compute_mp1_t2_and_D2(const real_t* d_orbital_energies) {
     int threads = 256;
     int blocks = (doubles_dim_ + threads - 1) / threads;
     adc2_compute_mp1_t2_and_D2_kernel<<<blocks, threads>>>(
-        d_eri_ovov_, d_orbital_energies, d_t2_, d_D2_, nocc_, nvir_);
+        d_eri_ovov_, d_orbital_energies, d_t2_, d_D2_, nocc_, nvir_, occ_offset_, vir_start_);
     cudaDeviceSynchronize();
 }
 
@@ -1457,14 +1464,14 @@ void ADC2Operator::compute_D1(const real_t* d_orbital_energies) {
     if (!gpu::gpu_available()) {
         for (int i = 0; i < nocc_; i++)
             for (int a = 0; a < nvir_; a++)
-                d_D1_[i * nvir_ + a] = d_orbital_energies[a + nocc_] - d_orbital_energies[i];
+                d_D1_[i * nvir_ + a] = d_orbital_energies[vir_start_ + a] - d_orbital_energies[occ_offset_ + i];
         return;
     }
 
     int threads = 256;
     int blocks = (singles_dim_ + threads - 1) / threads;
     adc2_compute_D1_kernel<<<blocks, threads>>>(
-        d_orbital_energies, d_D1_, nocc_, nvir_);
+        d_orbital_energies, d_D1_, nocc_, nvir_, occ_offset_, vir_start_);
     cudaDeviceSynchronize();
 }
 
@@ -1480,22 +1487,26 @@ void ADC2Operator::build_M11(const real_t* d_eri_mo, const real_t* d_orbital_ene
         size_t nao2 = (size_t)nao_ * nao_;
 
         // Step 1: Build CIS A-matrix (column-major)
+        const int O = occ_offset_;
+        const int V = vir_start_;
         for (int ia_idx = 0; ia_idx < ov; ia_idx++) {
             int i = ia_idx / nvir_;
             int a = ia_idx % nvir_;
-            int a_abs = a + nocc_;
+            int i_abs = O + i;
+            int a_abs = V + a;
             for (int jb_idx = 0; jb_idx < ov; jb_idx++) {
                 int j = jb_idx / nvir_;
                 int b = jb_idx % nvir_;
-                int b_abs = b + nocc_;
+                int j_abs = O + j;
+                int b_abs = V + b;
                 size_t idx = (size_t)jb_idx * ov + ia_idx;  // column-major
 
                 real_t val = 0.0;
                 if (i == j && a == b)
-                    val += d_orbital_energies[a_abs] - d_orbital_energies[i];
-                val -= d_eri_mo[((size_t)i * nao_ + j) * nao2 + (size_t)a_abs * nao_ + b_abs];
+                    val += d_orbital_energies[a_abs] - d_orbital_energies[i_abs];
+                val -= d_eri_mo[((size_t)i_abs * nao_ + j_abs) * nao2 + (size_t)a_abs * nao_ + b_abs];
                 if (!is_triplet_) {
-                    real_t ia_jb = d_eri_mo[((size_t)i * nao_ + a_abs) * nao2 + (size_t)j * nao_ + b_abs];
+                    real_t ia_jb = d_eri_mo[((size_t)i_abs * nao_ + a_abs) * nao2 + (size_t)j_abs * nao_ + b_abs];
                     val += 2.0 * ia_jb;
                 }
                 d_M11_[idx] = val;
@@ -1616,7 +1627,7 @@ void ADC2Operator::build_M11(const real_t* d_eri_mo, const real_t* d_orbital_ene
     // Step 1: Build CIS A-matrix into d_M11_
     adc2_build_cis_matrix_kernel<<<blocks, threads>>>(
         d_eri_mo, d_orbital_energies, d_M11_,
-        nocc_, nvir_, nao_, is_triplet_);
+        nocc_, nvir_, nao_, is_triplet_, occ_offset_, vir_start_);
     cudaDeviceSynchronize();
 
     // Step 2: Compute ISR full-block correction into temp

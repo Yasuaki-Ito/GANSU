@@ -93,6 +93,7 @@ ExcitedStateResult compute_excited_state_properties(
     const real_t* C_host,
     const std::vector<real_t>& excitation_energies,
     const real_t* h_eigenvectors,
-    int n_states, int nao, int nocc, int nvir);
+    int n_states, int nao, int nocc, int nvir,
+    int occ_offset = 0, int vir_start = -1);
 
 } // namespace gansu

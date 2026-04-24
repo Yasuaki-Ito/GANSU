@@ -60,7 +60,8 @@ public:
     ADC2Operator(const real_t* d_eri_mo,
                  const real_t* d_orbital_energies,
                  int nocc, int nvir, int nao,
-                 bool is_triplet = false);
+                 bool is_triplet = false,
+                 int occ_offset = 0, int vir_start = -1);
 
     /**
      * @brief Construct ADC(2) operator from pre-built MO ERI sub-blocks
@@ -140,6 +141,8 @@ private:
     int nao_;
     int singles_dim_;   // nocc * nvir
     int doubles_dim_;   // nocc * nocc * nvir * nvir
+    int occ_offset_;    // frozen core offset (0 = no frozen core)
+    int vir_start_;     // virtual orbital start in MO-ERI indices
 
     real_t omega_ = 0.0;
     bool is_triplet_ = false;    // true for triplet excited states

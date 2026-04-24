@@ -215,7 +215,8 @@ static void compute_cis_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, rea
             rhf.get_shell_type_infos(),
             coefficient_matrix.host_ptr(),
             excitation_energies, h_eigenvectors.data(),
-            n_states, num_basis, num_occ, num_vir);
+            n_states, num_basis, num_occ, num_vir,
+            num_frozen, full_occ);
         rhf.set_oscillator_strengths(es_result.oscillator_strengths);
         rhf.set_excited_state_report(es_result.report);
     } catch (const std::exception& e) {

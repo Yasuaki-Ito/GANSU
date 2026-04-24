@@ -3676,6 +3676,9 @@ real_t compute_mp3_energy_impl(RHF& rhf, real_t* d_eri, real_t* d_eri_mo_precomp
     PROFILE_FUNCTION();
 
     const int num_frozen = rhf.get_num_frozen_core();
+    if (num_frozen > 0) {
+        THROW_EXCEPTION("MP3 does not yet support frozen core approximation. Use MP2 or CCSD with frozen_core instead.");
+    }
     const int num_occ = rhf.get_num_electrons() / 2;
     const int num_basis = rhf.get_num_basis();
     DeviceHostMatrix<real_t>& coefficient_matrix = rhf.get_coefficient_matrix();

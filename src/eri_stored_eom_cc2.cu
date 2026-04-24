@@ -96,6 +96,10 @@ __global__ void cc2_standard_D2_kernel(
 static void compute_eom_cc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
+    if (rhf.get_num_frozen_core() > 0) {
+        THROW_EXCEPTION("EOM-CC2 does not yet support frozen core approximation. Use ADC(2) with frozen_core instead.");
+    }
+
     const int num_basis = rhf.get_num_basis();
     const int num_occ = rhf.get_num_electrons() / 2;
     const int num_vir = num_basis - num_occ;
