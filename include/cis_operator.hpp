@@ -52,7 +52,8 @@ public:
     CISOperator(const real_t* d_eri_mo,
                 const real_t* d_orbital_energies,
                 int nocc, int nvir, int nao,
-                bool is_triplet = false);
+                bool is_triplet = false,
+                int occ_offset = 0, int vir_start = -1);
 
     ~CISOperator();
 
@@ -70,6 +71,8 @@ private:
     int nvir_;
     int nao_;
     int dim_;  // nocc * nvir
+    int occ_offset_;  // frozen core offset (0 = no frozen core)
+    int vir_start_;   // virtual orbital start in MO-ERI indices
 
     bool is_triplet_;      // true for triplet CIS
     real_t* d_A_matrix_;   // CIS A-matrix [dim x dim], row-major

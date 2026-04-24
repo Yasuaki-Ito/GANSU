@@ -7670,13 +7670,19 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         double *d_block_ET=nullptr;
         tracked_cudaMalloc((void**)&d_v_oovv_t, oo * vv * sizeof(double));
         tracked_cudaMalloc((void**)&d_t1_t, ov * sizeof(double));
-        tracked_cudaMalloc((void**)&d_eps_t, N * sizeof(double));
+        // Build active-space eps: eps_active[0..nocc-1] = active occ, [nocc..nocc+nvir-1] = virtual
+        const int nactive = nocc + nvir;
+        std::vector<real_t> eps_active(nactive);
+        for (int i = 0; i < nocc; i++) eps_active[i] = eps[O + i];
+        for (int a = 0; a < nvir; a++) eps_active[nocc + a] = eps[V + a];
+
+        tracked_cudaMalloc((void**)&d_eps_t, nactive * sizeof(double));
         tracked_cudaMalloc((void**)&d_abc, num_triples * 3 * sizeof(int));
         tracked_cudaMalloc((void**)&d_block_ET, num_triples * sizeof(double));
 
         cudaMemcpy(d_v_oovv_t, v_oovv.data(), oo * vv * sizeof(double), cudaMemcpyHostToDevice);
         cudaMemcpy(d_t1_t, t1.data(), ov * sizeof(double), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_eps_t, eps.data(), N * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_eps_t, eps_active.data(), nactive * sizeof(double), cudaMemcpyHostToDevice);
         cudaMemcpy(d_abc, abc_triples.data(), num_triples * 3 * sizeof(int), cudaMemcpyHostToDevice);
 
         // Allocate global memory for wt/zt (6 * o3 per triple)
@@ -8317,6 +8323,7 @@ real_t ERI_Hash_RHF::compute_ccsd_energy() {
 static real_t compute_ccsd_t_energy_impl(RHF& rhf, const real_t* d_eri, int ccsd_algorithm, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
+    const int num_frozen = rhf.get_num_frozen_core();
     const int num_occ = rhf.get_num_electrons() / 2;
     const int num_basis = rhf.get_num_basis();
     const real_t* d_C = rhf.get_coefficient_matrix().device_ptr();
@@ -8324,7 +8331,10 @@ static real_t compute_ccsd_t_energy_impl(RHF& rhf, const real_t* d_eri, int ccsd
 
     real_t ccsd_t_energy = 0.0;
     real_t E_CCSD;
-    if (ccsd_algorithm == 2) {
+    // Frozen core only supported by ccsd_spatial_orbital (algorithm 0)
+    if (num_frozen > 0) {
+        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy, nullptr, nullptr, d_eri_mo_precomputed, num_frozen);
+    } else if (ccsd_algorithm == 2) {
         E_CCSD = ccsd_from_aoeri_via_full_moeri(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy, d_eri_mo_precomputed);
     } else if (ccsd_algorithm == 1) {
         E_CCSD = ccsd_spatial_orbital_naive(d_eri, d_C, d_eps, num_basis, num_occ, true, &ccsd_t_energy, d_eri_mo_precomputed);

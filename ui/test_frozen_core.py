@@ -47,24 +47,49 @@ def test_gansu_frozen(mol_name, xyz_file, basis, expected_frozen, post_hf="mp2")
 
     method_upper = post_hf.upper()
 
+    is_excited = post_hf in ("cis", "adc2", "eom_ccsd")
+
     # Without frozen core
     mol = gansu.Molecule(xyz_path, basis=basis, initial_guess="sad")
     r = mol.run(method="RHF", post_hf=post_hf, quiet=True)
-    e_nofrozen = r.post_hf_energy
     e_hf = r.total_energy
+    if is_excited:
+        import re
+        report = r.excited_state_report or ""
+        e_nofrozen = None
+        for line in report.split('\n'):
+            m = re.match(r'\s*1\s+([-+]?\d+\.?\d*)', line)
+            if m:
+                e_nofrozen = float(m.group(1))
+                break
+    else:
+        e_nofrozen = r.post_hf_energy
     del r, mol
 
     # With frozen core (auto)
     mol = gansu.Molecule(xyz_path, basis=basis, initial_guess="sad", frozen_core="auto")
     r = mol.run(method="RHF", post_hf=post_hf, quiet=True)
-    e_frozen = r.post_hf_energy
+    if is_excited:
+        report = r.excited_state_report or ""
+        e_frozen = None
+        for line in report.split('\n'):
+            m = re.match(r'\s*1\s+([-+]?\d+\.?\d*)', line)
+            if m:
+                e_frozen = float(m.group(1))
+                break
+    else:
+        e_frozen = r.post_hf_energy
     del r, mol
 
     print(f"  GANSU {mol_name}/{basis}/{method_upper}:")
     print(f"    HF energy:                {e_hf:.10f}")
-    print(f"    {method_upper} (all electron): {e_nofrozen:.10f}")
-    print(f"    {method_upper} (frozen core):  {e_frozen:.10f}")
-    print(f"    Difference:               {abs(e_nofrozen - e_frozen):.10f}")
+    if e_nofrozen is not None and e_frozen is not None:
+        label = "E1 excit." if is_excited else method_upper
+        print(f"    {label} (all electron): {e_nofrozen:.10f}")
+        print(f"    {label} (frozen core):  {e_frozen:.10f}")
+        print(f"    Difference:               {abs(e_nofrozen - e_frozen):.10f}")
+    else:
+        print(f"    Could not parse excited state energies")
 
     return e_hf, e_frozen
 
@@ -103,6 +128,18 @@ def test_pyscf_frozen(mol_name, xyz_file, basis, n_frozen, post_hf="mp2"):
         calc = cc.CCSD(mf, frozen=n_frozen)
         calc.kernel()
         e_corr = calc.e_corr
+    elif post_hf == "ccsd_t":
+        calc = cc.CCSD(mf, frozen=n_frozen)
+        calc.kernel()
+        et = calc.ccsd_t()
+        e_corr = calc.e_corr + et
+    elif post_hf == "cis":
+        from pyscf import tdscf
+        td = tdscf.TDA(mf)
+        td.nstates = 3
+        # TDA doesn't support frozen core directly — compare excitation energies instead
+        td.kernel()
+        e_corr = td.e[0]  # first excitation energy
     else:
         print(f"  PySCF: {post_hf} not supported in test")
         return None
@@ -122,7 +159,7 @@ print("=" * 60)
 import gansu
 gansu.init()
 
-METHODS_TO_TEST = ["mp2", "ccsd"]
+METHODS_TO_TEST = ["mp2", "ccsd", "ccsd_t", "cis"]
 
 for mol_name, xyz_file, basis, n_frozen in TESTS:
     for post_hf in METHODS_TO_TEST:

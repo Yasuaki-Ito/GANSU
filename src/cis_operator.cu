@@ -52,7 +52,8 @@ __global__ void cis_build_A_matrix_kernel(
     const real_t* __restrict__ d_orbital_energies,
     real_t* __restrict__ d_A_matrix,
     int nocc, int nvir, int nao,
-    bool is_triplet)
+    bool is_triplet,
+    int occ_offset, int vir_start)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int dim = nocc * nvir;
@@ -67,13 +68,16 @@ __global__ void cis_build_A_matrix_kernel(
     int j = jb / nvir;
     int b_rel = jb % nvir;
 
-    int a_abs = a_rel + nocc;
-    int b_abs = b_rel + nocc;
+    // Apply frozen core offsets for MO-ERI and orbital energy indexing
+    int i_abs = occ_offset + i;
+    int j_abs = occ_offset + j;
+    int a_abs = vir_start + a_rel;
+    int b_abs = vir_start + b_rel;
 
     size_t nao2 = (size_t)nao * nao;
 
     // (ij|ab) = eri_mo[(i*nao + j)*nao*nao + a_abs*nao + b_abs]
-    real_t ij_ab = d_eri_mo[((size_t)i * nao + j) * nao2 + (size_t)a_abs * nao + b_abs];
+    real_t ij_ab = d_eri_mo[((size_t)i_abs * nao + j_abs) * nao2 + (size_t)a_abs * nao + b_abs];
 
     real_t val;
     if (is_triplet) {
@@ -81,13 +85,13 @@ __global__ void cis_build_A_matrix_kernel(
         val = -ij_ab;
     } else {
         // Singlet: 2*(ia|jb) - (ij|ab)
-        real_t ia_jb = d_eri_mo[((size_t)i * nao + a_abs) * nao2 + (size_t)j * nao + b_abs];
+        real_t ia_jb = d_eri_mo[((size_t)i_abs * nao + a_abs) * nao2 + (size_t)j_abs * nao + b_abs];
         val = 2.0 * ia_jb - ij_ab;
     }
 
     // Diagonal contribution
     if (i == j && a_rel == b_rel) {
-        val += d_orbital_energies[a_abs] - d_orbital_energies[i];
+        val += d_orbital_energies[a_abs] - d_orbital_energies[i_abs];
     }
 
     d_A_matrix[idx] = val;
@@ -129,9 +133,12 @@ CISOperator::CISOperator(
     const real_t* d_eri_mo,
     const real_t* d_orbital_energies,
     int nocc, int nvir, int nao,
-    bool is_triplet)
+    bool is_triplet,
+    int occ_offset, int vir_start)
     : nocc_(nocc), nvir_(nvir), nao_(nao),
       dim_(nocc * nvir),
+      occ_offset_(occ_offset),
+      vir_start_(vir_start < 0 ? occ_offset + nocc : vir_start),
       is_triplet_(is_triplet),
       d_A_matrix_(nullptr),
       d_diagonal_(nullptr)
@@ -159,23 +166,25 @@ void CISOperator::build_A_matrix(const real_t* d_eri_mo, const real_t* d_orbital
         for (int ia = 0; ia < dim_; ia++) {
             int i = ia / nvir_;
             int a_rel = ia % nvir_;
-            int a_abs = a_rel + nocc_;
+            int i_abs = occ_offset_ + i;
+            int a_abs = vir_start_ + a_rel;
             for (int jb = 0; jb < dim_; jb++) {
                 int j = jb / nvir_;
                 int b_rel = jb % nvir_;
-                int b_abs = b_rel + nocc_;
+                int j_abs = occ_offset_ + j;
+                int b_abs = vir_start_ + b_rel;
                 size_t idx = (size_t)ia * dim_ + jb;
 
-                real_t ij_ab = eri[((size_t)i * nao_ + j) * nao2 + (size_t)a_abs * nao_ + b_abs];
+                real_t ij_ab = eri[((size_t)i_abs * nao_ + j_abs) * nao2 + (size_t)a_abs * nao_ + b_abs];
                 real_t val;
                 if (is_triplet_) {
                     val = -ij_ab;
                 } else {
-                    real_t ia_jb = eri[((size_t)i * nao_ + a_abs) * nao2 + (size_t)j * nao_ + b_abs];
+                    real_t ia_jb = eri[((size_t)i_abs * nao_ + a_abs) * nao2 + (size_t)j_abs * nao_ + b_abs];
                     val = 2.0 * ia_jb - ij_ab;
                 }
                 if (i == j && a_rel == b_rel) {
-                    val += eps[a_abs] - eps[i];
+                    val += eps[a_abs] - eps[i_abs];
                 }
                 d_A_matrix_[idx] = val;
             }
@@ -192,7 +201,7 @@ void CISOperator::build_A_matrix(const real_t* d_eri_mo, const real_t* d_orbital
     int blocks = (matrix_size + threads - 1) / threads;
     cis_build_A_matrix_kernel<<<blocks, threads>>>(
         d_eri_mo, d_orbital_energies, d_A_matrix_,
-        nocc_, nvir_, nao_, is_triplet_);
+        nocc_, nvir_, nao_, is_triplet_, occ_offset_, vir_start_);
     cudaDeviceSynchronize();
 
     // Extract diagonal
