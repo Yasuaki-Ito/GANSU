@@ -93,16 +93,20 @@ __global__ void cc2_standard_D2_kernel(
 }
 
 
+// GPU kernel for trimming MO ERI (defined in eri_stored.cu)
+__global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ eri_full,
+                                            real_t* __restrict__ eri_trimmed,
+                                            int N_full, int na_active, int offset);
+
 static void compute_eom_cc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
-    if (rhf.get_num_frozen_core() > 0) {
-        THROW_EXCEPTION("EOM-CC2 does not yet support frozen core approximation. Use ADC(2) with frozen_core instead.");
-    }
-
+    const int num_frozen = rhf.get_num_frozen_core();
     const int num_basis = rhf.get_num_basis();
-    const int num_occ = rhf.get_num_electrons() / 2;
-    const int num_vir = num_basis - num_occ;
+    const int full_occ = rhf.get_num_electrons() / 2;
+    const int num_occ = full_occ - num_frozen;   // active occupied
+    const int num_vir = num_basis - full_occ;
+    const int na_active = num_occ + num_vir;
     const int singles_dim = num_occ * num_vir;
     const int doubles_dim = num_occ * num_occ * num_vir * num_vir;
 
@@ -110,7 +114,9 @@ static void compute_eom_cc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
     const real_t* d_C = coefficient_matrix.device_ptr();
 
     std::cout << "\n---- EOM-CC2 excited states ---- "
-              << "nocc=" << num_occ << ", nvir=" << num_vir
+              << "nocc=" << num_occ;
+    if (num_frozen > 0) std::cout << " (frozen=" << num_frozen << ")";
+    std::cout << ", nvir=" << num_vir
               << ", singles=" << singles_dim << ", doubles=" << doubles_dim
               << ", nstates=" << n_states << std::endl;
 
@@ -133,10 +139,42 @@ static void compute_eom_cc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
         free_eri_mo = true;
     }
 
-    // Step 2: Extract ERI blocks for CC2 solver
+    // Step 2: For frozen core, trim ERI and shift epsilon
     DeviceHostMemory<real_t>& orbital_energies = rhf.get_orbital_energies();
     const real_t* d_orbital_energies = orbital_energies.device_ptr();
 
+    real_t* d_eri_trimmed = d_eri_mo;
+    bool free_eri_trimmed = false;
+    const real_t* d_eps_shifted = d_orbital_energies;
+
+    if (num_frozen > 0) {
+        const size_t na4 = (size_t)na_active * na_active * na_active * na_active;
+        tracked_cudaMalloc(&d_eri_trimmed, na4 * sizeof(real_t));
+        free_eri_trimmed = true;
+
+        if (!gpu::gpu_available()) {
+            const size_t N = num_basis;
+            #pragma omp parallel for collapse(2)
+            for (int p = 0; p < na_active; p++)
+                for (int q = 0; q < na_active; q++)
+                    for (int r = 0; r < na_active; r++)
+                        for (int s = 0; s < na_active; s++) {
+                            size_t src = ((size_t)(num_frozen+p)*N + (num_frozen+q))*N*N
+                                       + (size_t)(num_frozen+r)*N + (num_frozen+s);
+                            size_t dst = ((size_t)p*na_active*na_active + (size_t)q*na_active + r)*(size_t)na_active + s;
+                            d_eri_trimmed[dst] = d_eri_mo[src];
+                        }
+        } else {
+            int thr = 256;
+            int blk = (int)((na4 + thr - 1) / thr);
+            trim_eri_frozen_core_kernel<<<blk, thr>>>(d_eri_mo, d_eri_trimmed,
+                                                       num_basis, na_active, num_frozen);
+            cudaDeviceSynchronize();
+        }
+        d_eps_shifted = d_orbital_energies + num_frozen;
+    }
+
+    // Extract ERI sub-blocks from (possibly trimmed) MO ERI
     int threads = 256;
     int blocks;
 
@@ -145,68 +183,68 @@ static void compute_eom_cc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
     real_t* d_eri_ovov = nullptr;
     tracked_cudaMalloc(&d_eri_ovov, ovov_size * sizeof(real_t));
     blocks = (ovov_size + threads - 1) / threads;
-    eom_mp2_extract_eri_ovov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovov, num_occ, num_vir, num_basis);
+    eom_mp2_extract_eri_ovov_kernel<<<blocks, threads>>>(d_eri_trimmed, d_eri_ovov, num_occ, num_vir, na_active);
 
     // VVOV
     size_t vvov_size = (size_t)num_vir * num_vir * num_occ * num_vir;
     real_t* d_eri_vvov = nullptr;
     tracked_cudaMalloc(&d_eri_vvov, vvov_size * sizeof(real_t));
     blocks = (vvov_size + threads - 1) / threads;
-    eom_mp2_extract_eri_vvov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvov, num_occ, num_vir, num_basis);
+    eom_mp2_extract_eri_vvov_kernel<<<blocks, threads>>>(d_eri_trimmed, d_eri_vvov, num_occ, num_vir, na_active);
 
     // OOOV
     size_t ooov_size = (size_t)num_occ * num_occ * num_occ * num_vir;
     real_t* d_eri_ooov = nullptr;
     tracked_cudaMalloc(&d_eri_ooov, ooov_size * sizeof(real_t));
     blocks = (ooov_size + threads - 1) / threads;
-    eom_mp2_extract_eri_ooov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ooov, num_occ, num_vir, num_basis);
+    eom_mp2_extract_eri_ooov_kernel<<<blocks, threads>>>(d_eri_trimmed, d_eri_ooov, num_occ, num_vir, na_active);
 
     // OOVV
     size_t oovv_size = (size_t)num_occ * num_occ * num_vir * num_vir;
     real_t* d_eri_oovv = nullptr;
     tracked_cudaMalloc(&d_eri_oovv, oovv_size * sizeof(real_t));
     blocks = (oovv_size + threads - 1) / threads;
-    eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv, num_occ, num_vir, num_basis, 0, -1);
+    eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_trimmed, d_eri_oovv, num_occ, num_vir, na_active, 0, -1);
 
     // OVVO
     size_t ovvo_size = (size_t)num_occ * num_vir * num_vir * num_occ;
     real_t* d_eri_ovvo = nullptr;
     tracked_cudaMalloc(&d_eri_ovvo, ovvo_size * sizeof(real_t));
     blocks = (ovvo_size + threads - 1) / threads;
-    eom_mp2_extract_eri_ovvo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvo, num_occ, num_vir, num_basis);
+    eom_mp2_extract_eri_ovvo_kernel<<<blocks, threads>>>(d_eri_trimmed, d_eri_ovvo, num_occ, num_vir, na_active);
 
     // VVVV (for CC2 T2 dressed integrals)
     size_t vvvv_size = (size_t)num_vir * num_vir * num_vir * num_vir;
     real_t* d_eri_vvvv = nullptr;
     tracked_cudaMalloc(&d_eri_vvvv, vvvv_size * sizeof(real_t));
     blocks = (vvvv_size + threads - 1) / threads;
-    eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv, num_occ, num_vir, num_basis, 0, -1);
+    eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_trimmed, d_eri_vvvv, num_occ, num_vir, na_active, 0, -1);
 
     // OOOO (for CC2 T2 dressed integrals)
     size_t oooo_size = (size_t)num_occ * num_occ * num_occ * num_occ;
     real_t* d_eri_oooo = nullptr;
     tracked_cudaMalloc(&d_eri_oooo, oooo_size * sizeof(real_t));
     blocks = (oooo_size + threads - 1) / threads;
-    eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo, num_occ, num_basis, 0);
+    eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_trimmed, d_eri_oooo, num_occ, na_active, 0);
 
-    // D1, D2, Fock
+    // D1, D2, Fock (use shifted epsilon)
     real_t* d_D1 = nullptr;
     tracked_cudaMalloc(&d_D1, (size_t)singles_dim * sizeof(real_t));
     blocks = (singles_dim + threads - 1) / threads;
-    eom_mp2_compute_D1_kernel<<<blocks, threads>>>(d_orbital_energies, d_D1, num_occ, num_vir);
+    eom_mp2_compute_D1_kernel<<<blocks, threads>>>(d_eps_shifted, d_D1, num_occ, num_vir);
 
     real_t* d_D2 = nullptr;
     tracked_cudaMalloc(&d_D2, (size_t)doubles_dim * sizeof(real_t));
     blocks = (doubles_dim + threads - 1) / threads;
     // Standard D2 for CC2 solver (NOT the M22 diagonal used by Schur complement)
-    cc2_standard_D2_kernel<<<blocks, threads>>>(d_orbital_energies, d_D2, num_occ, num_vir);
+    cc2_standard_D2_kernel<<<blocks, threads>>>(d_eps_shifted, d_D2, num_occ, num_vir);
 
     real_t* d_f_oo = nullptr;
     real_t* d_f_vv = nullptr;
     tracked_cudaMalloc(&d_f_oo, (size_t)num_occ * sizeof(real_t));
     tracked_cudaMalloc(&d_f_vv, (size_t)num_vir * sizeof(real_t));
-    blocks = (num_basis + threads - 1) / threads;
-    eom_mp2_extract_fock_kernel<<<blocks, threads>>>(d_orbital_energies, d_f_oo, d_f_vv, num_occ, num_vir);
+    blocks = (na_active + threads - 1) / threads;
+    eom_mp2_extract_fock_kernel<<<blocks, threads>>>(d_eps_shifted, d_f_oo, d_f_vv, num_occ, num_vir);
 
     cudaDeviceSynchronize();
 
@@ -238,11 +276,12 @@ static void compute_eom_cc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
     tracked_cudaFree(d_f_vv);
 
     // Step 4: Build EOM-CC2 operator (takes ownership of T1, T2)
-    EOMCC2Operator eom_cc2_op(d_eri_mo, d_orbital_energies,
+    EOMCC2Operator eom_cc2_op(d_eri_trimmed, d_eps_shifted,
                               cc2.d_t1, cc2.d_t2,
-                              num_occ, num_vir, num_basis);
+                              num_occ, num_vir, na_active);
 
-    // Free full MO ERIs
+    // Free MO ERIs
+    if (free_eri_trimmed) tracked_cudaFree(d_eri_trimmed);
     if (free_eri_mo) tracked_cudaFree(d_eri_mo);
     d_eri_mo = nullptr;
 
@@ -449,7 +488,8 @@ static void compute_eom_cc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
         rhf.get_shell_type_infos(),
         coefficient_matrix.host_ptr(),
         excitation_energies, h_eigenvectors.data(),
-        n_states, num_basis, num_occ, num_vir);
+        n_states, num_basis, num_occ, num_vir,
+        num_frozen, full_occ);
     rhf.set_oscillator_strengths(es_result.oscillator_strengths);
     rhf.set_excited_state_report(es_result.report);
 }

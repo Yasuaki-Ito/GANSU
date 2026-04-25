@@ -285,16 +285,20 @@ static void solve_eom_mp2_schur_omega(
 //  Main entry point: compute_eom_mp2
 // ========================================================================
 
+// GPU kernel for trimming MO ERI (defined in eri_stored.cu)
+__global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ eri_full,
+                                            real_t* __restrict__ eri_trimmed,
+                                            int N_full, int na_active, int offset);
+
 static void compute_eom_mp2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
-    if (rhf.get_num_frozen_core() > 0) {
-        THROW_EXCEPTION("EOM-MP2 does not yet support frozen core approximation. Use ADC(2) with frozen_core instead.");
-    }
-
+    const int num_frozen = rhf.get_num_frozen_core();
     const int num_basis = rhf.get_num_basis();
-    const int num_occ = rhf.get_num_electrons() / 2;
-    const int num_vir = num_basis - num_occ;
+    const int full_occ = rhf.get_num_electrons() / 2;
+    const int num_occ = full_occ - num_frozen;   // active occupied
+    const int num_vir = num_basis - full_occ;
+    const int na_active = num_occ + num_vir;
     const int singles_dim = num_occ * num_vir;
     const int doubles_dim = num_occ * num_occ * num_vir * num_vir;
 
@@ -346,7 +350,9 @@ static void compute_eom_mp2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
     }
 
     std::cout << "\n---- EOM-MP2 excited states ---- "
-              << "nocc=" << num_occ << ", nvir=" << num_vir
+              << "nocc=" << num_occ;
+    if (num_frozen > 0) std::cout << " (frozen=" << num_frozen << ")";
+    std::cout << ", nvir=" << num_vir
               << ", singles=" << singles_dim << ", doubles=" << doubles_dim
               << ", solver=" << solver_mode
               << ", nstates=" << n_states << std::endl;
@@ -372,13 +378,45 @@ static void compute_eom_mp2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
     }
 
     report_progress("excited", 1, 0, nullptr);
-    // Step 2: Build EOM-MP2 operator
+    // Step 2: For frozen core, trim ERI and shift epsilon
     DeviceHostMemory<real_t>& orbital_energies = rhf.get_orbital_energies();
     const real_t* d_orbital_energies = orbital_energies.device_ptr();
 
-    EOMMP2Operator eom_mp2_op(d_eri_mo, d_orbital_energies, num_occ, num_vir, num_basis);
+    real_t* d_eri_for_op = d_eri_mo;
+    bool free_eri_for_op = false;
+    const real_t* d_eps_for_op = d_orbital_energies;
 
-    // Free full MO ERIs — blocks are already extracted
+    if (num_frozen > 0) {
+        const size_t na4 = (size_t)na_active * na_active * na_active * na_active;
+        tracked_cudaMalloc(&d_eri_for_op, na4 * sizeof(real_t));
+        free_eri_for_op = true;
+
+        if (!gpu::gpu_available()) {
+            const size_t N = num_basis;
+            #pragma omp parallel for collapse(2)
+            for (int p = 0; p < na_active; p++)
+                for (int q = 0; q < na_active; q++)
+                    for (int r = 0; r < na_active; r++)
+                        for (int s = 0; s < na_active; s++) {
+                            size_t src = ((size_t)(num_frozen+p)*N + (num_frozen+q))*N*N
+                                       + (size_t)(num_frozen+r)*N + (num_frozen+s);
+                            size_t dst = ((size_t)p*na_active*na_active + (size_t)q*na_active + r)*(size_t)na_active + s;
+                            d_eri_for_op[dst] = d_eri_mo[src];
+                        }
+        } else {
+            int threads = 256;
+            int blocks = (int)((na4 + threads - 1) / threads);
+            trim_eri_frozen_core_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_for_op,
+                                                              num_basis, na_active, num_frozen);
+            cudaDeviceSynchronize();
+        }
+        d_eps_for_op = d_orbital_energies + num_frozen;
+    }
+
+    EOMMP2Operator eom_mp2_op(d_eri_for_op, d_eps_for_op, num_occ, num_vir, na_active);
+
+    // Free MO ERIs — blocks are already extracted
+    if (free_eri_for_op) tracked_cudaFree(d_eri_for_op);
     if (free_eri_mo) tracked_cudaFree(d_eri_mo);
     d_eri_mo = nullptr;
 
@@ -424,7 +462,8 @@ static void compute_eom_mp2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states,
         rhf.get_shell_type_infos(),
         coefficient_matrix.host_ptr(),
         excitation_energies, h_eigenvectors.data(),
-        n_states, num_basis, num_occ, num_vir);
+        n_states, num_basis, num_occ, num_vir,
+        num_frozen, full_occ);
     rhf.set_oscillator_strengths(es_result.oscillator_strengths);
     rhf.set_excited_state_report(es_result.report);
 }
