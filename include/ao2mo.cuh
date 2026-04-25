@@ -69,7 +69,7 @@ __device__ inline size_t vvvv2s(int a, int b, int c, int d, int num_occ, int num
 
 static __global__
 void tensorize_oooo(
-    double* g_int2e, double* g_oooo, const int num_occ, const int num_vir)
+    double* g_int2e, double* g_oooo, const int num_occ, const int num_vir, const int occ_start = 0)
 {
     const long long ijkl = ((long long)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
     const long long num_oooo = (long long)num_occ * num_occ * num_occ * num_occ;
@@ -84,15 +84,15 @@ void tensorize_oooo(
     const int k = kl / num_occ;
     const int l = kl % num_occ;
 
-    const int num_orbitals = num_occ + num_vir;
+    const int num_orbitals = occ_start + num_occ + num_vir;
 
-    g_oooo[oooo2s(i, j, k, l, num_occ)] = g_int2e[q2s(i, k, j, l, num_orbitals)];
+    g_oooo[oooo2s(i, j, k, l, num_occ)] = g_int2e[q2s(occ_start+i, occ_start+k, occ_start+j, occ_start+l, num_orbitals)];
 }
 
 
 static __global__
 void tensorize_vvvv(
-    double* g_int2e, double* g_vvvv, const int num_occ, const int num_vir)
+    double* g_int2e, double* g_vvvv, const int num_occ, const int num_vir, const int occ_start = 0)
 {
     const long long abcd = ((long long)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
     const long long num_vvvv = (long long)num_vir * num_vir * num_vir * num_vir;
@@ -102,21 +102,22 @@ void tensorize_vvvv(
 
     const int ab = abcd / (num_vir * num_vir);
     const int cd = abcd % (num_vir * num_vir);
-    const int a = ab / num_vir + num_occ;
-    const int b = ab % num_vir + num_occ;
-    const int c = cd / num_vir + num_occ;
-    const int d = cd % num_vir + num_occ;
+    const int full_occ = occ_start + num_occ;
+    const int a = ab / num_vir + full_occ;
+    const int b = ab % num_vir + full_occ;
+    const int c = cd / num_vir + full_occ;
+    const int d = cd % num_vir + full_occ;
 
-    const int num_orbitals = num_occ + num_vir;
+    const int num_orbitals = full_occ + num_vir;
 
-    g_vvvv[vvvv2s(a, b, c, d, num_occ, num_vir)] = g_int2e[q2s(a, c, b, d, num_orbitals)];
+    g_vvvv[vvvv2s(a, b, c, d, full_occ, num_vir)] = g_int2e[q2s(a, c, b, d, num_orbitals)];
 }
 
 
 static __global__
 void tensorize_ovov(
-    double* g_int2e, const double* g_eps, double* g_s_ovov, double* g_t_ovov, 
-    const int num_occ, const int num_vir)
+    double* g_int2e, const double* g_eps, double* g_s_ovov, double* g_t_ovov,
+    const int num_occ, const int num_vir, const int occ_start = 0)
 {
     const long long iajb = ((long long)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
     const long long num_unique_elements = (long long)num_occ * num_vir * num_occ * num_vir;
@@ -131,10 +132,10 @@ void tensorize_ovov(
     const int j = jb / num_vir;
     const int b = jb % num_vir + num_occ;
 
-    const int num_orbitals = num_occ + num_vir;
-    const double int2e_iajb = g_int2e[q2s(i, a, j, b, num_orbitals)];
-    const double int2e_ibja = g_int2e[q2s(i, b, j, a, num_orbitals)];
-    const double eps_ijab = g_eps[i] + g_eps[j] - g_eps[a] - g_eps[b];
+    const int num_orbitals = occ_start + num_occ + num_vir;
+    const double int2e_iajb = g_int2e[q2s(occ_start+i, occ_start+a, occ_start+j, occ_start+b, num_orbitals)];
+    const double int2e_ibja = g_int2e[q2s(occ_start+i, occ_start+b, occ_start+j, occ_start+a, num_orbitals)];
+    const double eps_ijab = g_eps[occ_start+i] + g_eps[occ_start+j] - g_eps[occ_start+a] - g_eps[occ_start+b];
 
     g_s_ovov[ovov2s(i, a, j, b, num_occ, num_vir)] = int2e_iajb / eps_ijab;
     g_t_ovov[ovov2s(i, a, j, b, num_occ, num_vir)] = (2 * int2e_iajb - int2e_ibja) / eps_ijab;

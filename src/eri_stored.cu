@@ -3268,8 +3268,9 @@ void kbjc2kcjb(double* d_ovov_in, double* d_ovov_out, const int num_occ, const i
 
 __global__
 void contract_iajb_tensors(   // 4h2p, 2h4p, 3h3p
-    const int num_orbitals, const int num_occ, const int num_vir, double* g_int2e, 
-    double* g_s_ovov, double* g_mm1, double* g_mm2, double* g_mm3, double* g_mm4, double* g_E_3rd)
+    const int num_orbitals, const int num_occ, const int num_vir, double* g_int2e,
+    double* g_s_ovov, double* g_mm1, double* g_mm2, double* g_mm3, double* g_mm4, double* g_E_3rd,
+    const int occ_start = 0)
 {
     __shared__ double s_E_3rd;
     if (threadIdx.x == 0 && threadIdx.y == 0) {
@@ -3291,8 +3292,8 @@ void contract_iajb_tensors(   // 4h2p, 2h4p, 3h3p
     const int b = ab % num_vir + num_occ;
 
     const double s_iajb = g_s_ovov[ovov2s(i, a, j, b, num_occ, num_vir)];
-    const double e_ijab = g_int2e[q2s(i, j, a, b, num_orbitals)];
-    const double e_iajb = g_int2e[q2s(i, a, j, b, num_orbitals)];
+    const double e_ijab = g_int2e[q2s(occ_start+i, occ_start+j, occ_start+a, occ_start+b, num_orbitals)];
+    const double e_iajb = g_int2e[q2s(occ_start+i, occ_start+a, occ_start+j, occ_start+b, num_orbitals)];
 
     double energy = 0.0;
     energy += s_iajb * (g_mm1[oovv2s(i, j, a, b, num_occ, num_vir)] + g_mm2[vvoo2s(a, b, i, j, num_occ, num_vir)]);
@@ -3332,8 +3333,10 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
     cudaMallocHost(&h_groundE_3rd, sizeof(double));
     cudaMemset(d_groundE_3rd, 0, sizeof(double));
 
-    const int num_vir = num_basis - num_occ;
-    printf("#orbitals_occ: %d, #orbitals_vir: %d\n", num_occ, num_vir);
+    const int full_occ = num_occ;                     // total occupied (including frozen)
+    const int active_occ = full_occ - num_frozen;      // active occupied (excluding frozen)
+    const int num_vir = num_basis - full_occ;
+    printf("#orbitals_occ: %d (active: %d, frozen: %d), #orbitals_vir: %d\n", full_occ, active_occ, num_frozen, num_vir);
 
     // Full MO ERI transformation
     double* d_eri_mo;
@@ -3358,11 +3361,11 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
     printf("MP2 energy from full MO ERI: %.12f\n", E_MP2);
     //return E_MP2;
 
-
-    const long long num_oooo = (long long)num_occ * num_occ * num_occ * num_occ;
+    // Tensor dimensions use active_occ (frozen core orbitals excluded)
+    const long long num_oooo = (long long)active_occ * active_occ * active_occ * active_occ;
     const long long num_vvvv = (long long)num_vir * num_vir * num_vir * num_vir;
-    const long long num_ovov = (long long)num_occ * num_vir * num_occ * num_vir;
-    const long long num_oovv = (long long)num_occ * num_occ * num_vir * num_vir;
+    const long long num_ovov = (long long)active_occ * num_vir * active_occ * num_vir;
+    const long long num_oovv = (long long)active_occ * active_occ * num_vir * num_vir;
     //printf("num_oooo: %lld\n", num_oooo);
     //printf("num_vvvv: %lld\n", num_vvvv);
     //printf("num_ovov: %lld\n", num_ovov);
@@ -3420,50 +3423,50 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
     cudaEventRecord(begin);
     if (!gpu::gpu_available()) {
         // CPU fallback: tensorize_oooo, tensorize_vvvv, tensorize_ovov
-        const int num_orbitals = num_occ + num_vir;
+        const int num_orbitals = num_basis;
         auto q2s_cpu = [&](int mu, int nu, int la, int si) -> size_t {
             return ((size_t)num_orbitals*num_orbitals*num_orbitals)*mu + (size_t)num_orbitals*num_orbitals*nu + (size_t)num_orbitals*la + si;
         };
-        // tensorize_oooo: g_oooo[i*o^3+j*o^2+k*o+l] = g_int2e[q2s(i,k,j,l)]
-        const long long num_oooo_tot = (long long)num_occ*num_occ*num_occ*num_occ;
+        // tensorize_oooo: active occ only, offset by num_frozen
+        const long long num_oooo_tot = (long long)active_occ*active_occ*active_occ*active_occ;
         #pragma omp parallel for
         for (long long ijkl = 0; ijkl < num_oooo_tot; ijkl++) {
-            int kl = ijkl % (num_occ*num_occ);
-            int ij = ijkl / (num_occ*num_occ);
-            int i=ij/num_occ, j=ij%num_occ, k=kl/num_occ, l=kl%num_occ;
-            d_oooo[ijkl] = d_eri_mo[q2s_cpu(i,k,j,l)];
+            int kl = ijkl % (active_occ*active_occ);
+            int ij = ijkl / (active_occ*active_occ);
+            int i=ij/active_occ, j=ij%active_occ, k=kl/active_occ, l=kl%active_occ;
+            d_oooo[ijkl] = d_eri_mo[q2s_cpu(num_frozen+i, num_frozen+k, num_frozen+j, num_frozen+l)];
         }
-        // tensorize_vvvv: g_vvvv[(a-o)*v^3+(b-o)*v^2+(c-o)*v+(d-o)] = g_int2e[q2s(a,c,b,d)]
+        // tensorize_vvvv: virtual indices start at full_occ
         const long long num_vvvv_tot = (long long)num_vir*num_vir*num_vir*num_vir;
         #pragma omp parallel for
         for (long long abcd = 0; abcd < num_vvvv_tot; abcd++) {
             int cd = abcd % (num_vir*num_vir);
             int ab = abcd / (num_vir*num_vir);
-            int a=ab/num_vir+num_occ, b=ab%num_vir+num_occ;
-            int c=cd/num_vir+num_occ, d=cd%num_vir+num_occ;
+            int a=ab/num_vir+full_occ, b=ab%num_vir+full_occ;
+            int c=cd/num_vir+full_occ, d=cd%num_vir+full_occ;
             d_vvvv[abcd] = d_eri_mo[q2s_cpu(a,c,b,d)];
         }
-        // tensorize_ovov
+        // tensorize_ovov: active occ with num_frozen offset, virtual at full_occ
         auto ovov2s_cpu = [&](int i, int a, int j, int b) -> size_t {
-            return (size_t)i*num_occ*num_vir*num_vir + (size_t)(a-num_occ)*num_occ*num_vir + (size_t)j*num_vir + (b-num_occ);
+            return (size_t)i*active_occ*num_vir*num_vir + (size_t)(a-active_occ)*active_occ*num_vir + (size_t)j*num_vir + (b-active_occ);
         };
-        const long long num_ovov_tot = (long long)num_occ*num_vir*num_occ*num_vir;
+        const long long num_ovov_tot = (long long)active_occ*num_vir*active_occ*num_vir;
         #pragma omp parallel for
         for (long long idx = 0; idx < num_ovov_tot; idx++) {
-            int jb = idx % (num_occ*num_vir);
-            int ia = idx / (num_occ*num_vir);
-            int i=ia/num_vir, a=ia%num_vir+num_occ;
-            int j=jb/num_vir, b=jb%num_vir+num_occ;
-            double iajb = d_eri_mo[q2s_cpu(i,a,j,b)];
-            double ibja = d_eri_mo[q2s_cpu(i,b,j,a)];
-            double eps_ijab = d_orbital_energies[i]+d_orbital_energies[j]-d_orbital_energies[a]-d_orbital_energies[b];
+            int jb = idx % (active_occ*num_vir);
+            int ia = idx / (active_occ*num_vir);
+            int i=ia/num_vir, a=ia%num_vir+active_occ;
+            int j=jb/num_vir, b=jb%num_vir+active_occ;
+            double iajb = d_eri_mo[q2s_cpu(num_frozen+i, num_frozen+a, num_frozen+j, num_frozen+b)];
+            double ibja = d_eri_mo[q2s_cpu(num_frozen+i, num_frozen+b, num_frozen+j, num_frozen+a)];
+            double eps_ijab = d_orbital_energies[num_frozen+i]+d_orbital_energies[num_frozen+j]-d_orbital_energies[num_frozen+a]-d_orbital_energies[num_frozen+b];
             d_s_ovov[ovov2s_cpu(i,a,j,b)] = iajb / eps_ijab;
             d_t_ovov[ovov2s_cpu(i,a,j,b)] = (2.0*iajb - ibja) / eps_ijab;
         }
     } else {
-        tensorize_oooo<<<blocks_oooo, threads>>>(d_eri_mo, d_oooo, num_occ, num_vir);
-        tensorize_vvvv<<<blocks_vvvv, threads>>>(d_eri_mo, d_vvvv, num_occ, num_vir);
-        tensorize_ovov<<<blocks_ovov, threads>>>(d_eri_mo, d_orbital_energies, d_s_ovov, d_t_ovov, num_occ, num_vir);
+        tensorize_oooo<<<blocks_oooo, threads>>>(d_eri_mo, d_oooo, active_occ, num_vir, num_frozen);
+        tensorize_vvvv<<<blocks_vvvv, threads>>>(d_eri_mo, d_vvvv, active_occ, num_vir, num_frozen);
+        tensorize_ovov<<<blocks_ovov, threads>>>(d_eri_mo, d_orbital_energies, d_s_ovov, d_t_ovov, active_occ, num_vir, num_frozen);
     }
     cudaEventRecord(end);
     cudaEventSynchronize(end);
@@ -3472,9 +3475,9 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
 
     const double alpha = 1.0;
     const double beta = 0.0;
-    const int num_oo = num_occ * num_occ;
+    const int num_oo = active_occ * active_occ;
     const int num_vv = num_vir * num_vir;
-    const int num_ov = num_occ * num_vir;
+    const int num_ov = active_occ * num_vir;
     cublasHandle_t cublasH = NULL;
     if (gpu::gpu_available()) cublasCreate(&cublasH);
 
@@ -3483,22 +3486,22 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
     if (!gpu::gpu_available()) {
         // CPU fallback: kalb2klab permutation
         auto ovov2s_c = [&](int i, int a, int j, int b) -> size_t {
-            return (size_t)i*num_occ*num_vir*num_vir + (size_t)(a-num_occ)*num_occ*num_vir + (size_t)j*num_vir + (b-num_occ);
+            return (size_t)i*active_occ*num_vir*num_vir + (size_t)(a-active_occ)*active_occ*num_vir + (size_t)j*num_vir + (b-active_occ);
         };
         auto oovv2s_c = [&](int i, int j, int a, int b) -> size_t {
-            return (size_t)i*num_vir*num_vir*num_occ + (size_t)j*num_vir*num_vir + (size_t)(a-num_occ)*num_vir + (b-num_occ);
+            return (size_t)i*num_vir*num_vir*active_occ + (size_t)j*num_vir*num_vir + (size_t)(a-active_occ)*num_vir + (b-active_occ);
         };
-        const long long num_ovov_p = (long long)num_occ*num_vir*num_occ*num_vir;
+        const long long num_ovov_p = (long long)active_occ*num_vir*active_occ*num_vir;
         #pragma omp parallel for
         for (long long kalb = 0; kalb < num_ovov_p; kalb++) {
-            int lb = kalb % (num_occ*num_vir);
-            int ka = kalb / (num_occ*num_vir);
-            int k=ka/num_vir, a=ka%num_vir+num_occ;
-            int l=lb/num_vir, b=lb%num_vir+num_occ;
+            int lb = kalb % (active_occ*num_vir);
+            int ka = kalb / (active_occ*num_vir);
+            int k=ka/num_vir, a=ka%num_vir+active_occ;
+            int l=lb/num_vir, b=lb%num_vir+active_occ;
             d_t_tmp[oovv2s_c(k,l,a,b)] = d_t_ovov[ovov2s_c(k,a,l,b)];
         }
     } else {
-        kalb2klab<<<blocks_ovov, threads>>>(d_t_ovov, d_t_tmp, num_occ, num_vir);
+        kalb2klab<<<blocks_ovov, threads>>>(d_t_ovov, d_t_tmp, active_occ, num_vir);
         cudaDeviceSynchronize();
     }
     if (gpu::gpu_available()) {
@@ -3514,22 +3517,22 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
     if (!gpu::gpu_available()) {
         // CPU fallback: icjd2cdij permutation
         auto ovov2s_c = [&](int i, int a, int j, int b) -> size_t {
-            return (size_t)i*num_occ*num_vir*num_vir + (size_t)(a-num_occ)*num_occ*num_vir + (size_t)j*num_vir + (b-num_occ);
+            return (size_t)i*active_occ*num_vir*num_vir + (size_t)(a-active_occ)*active_occ*num_vir + (size_t)j*num_vir + (b-active_occ);
         };
         auto vvoo2s_c = [&](int c, int d, int i, int j) -> size_t {
-            return (size_t)(c-num_occ)*num_occ*num_occ*num_vir + (size_t)(d-num_occ)*num_occ*num_occ + (size_t)i*num_occ + j;
+            return (size_t)(c-active_occ)*active_occ*active_occ*num_vir + (size_t)(d-active_occ)*active_occ*active_occ + (size_t)i*active_occ + j;
         };
-        const long long num_ovov_p = (long long)num_occ*num_vir*num_occ*num_vir;
+        const long long num_ovov_p = (long long)active_occ*num_vir*active_occ*num_vir;
         #pragma omp parallel for
         for (long long icjd = 0; icjd < num_ovov_p; icjd++) {
-            int jd = icjd % (num_occ*num_vir);
-            int ic = icjd / (num_occ*num_vir);
-            int i=ic/num_vir, c=ic%num_vir+num_occ;
-            int j=jd/num_vir, d=jd%num_vir+num_occ;
+            int jd = icjd % (active_occ*num_vir);
+            int ic = icjd / (active_occ*num_vir);
+            int i=ic/num_vir, c=ic%num_vir+active_occ;
+            int j=jd/num_vir, d=jd%num_vir+active_occ;
             d_t_tmp[vvoo2s_c(c,d,i,j)] = d_t_ovov[ovov2s_c(i,c,j,d)];
         }
     } else {
-        icjd2cdij<<<blocks_ovov, threads>>>(d_t_ovov, d_t_tmp, num_occ, num_vir);
+        icjd2cdij<<<blocks_ovov, threads>>>(d_t_ovov, d_t_tmp, active_occ, num_vir);
         cudaDeviceSynchronize();
     }
     if (gpu::gpu_available()) {
@@ -3554,28 +3557,28 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
     if (!gpu::gpu_available()) {
         // CPU fallback: kaic2iakc and kbjc2kcjb permutations
         auto ovov2s_c = [&](int i, int a, int j, int b) -> size_t {
-            return (size_t)i*num_occ*num_vir*num_vir + (size_t)(a-num_occ)*num_occ*num_vir + (size_t)j*num_vir + (b-num_occ);
+            return (size_t)i*active_occ*num_vir*num_vir + (size_t)(a-active_occ)*active_occ*num_vir + (size_t)j*num_vir + (b-active_occ);
         };
-        const long long num_ovov_p = (long long)num_occ*num_vir*num_occ*num_vir;
+        const long long num_ovov_p = (long long)active_occ*num_vir*active_occ*num_vir;
         #pragma omp parallel for
         for (long long kaic = 0; kaic < num_ovov_p; kaic++) {
-            int ic = kaic % (num_occ*num_vir);
-            int ka = kaic / (num_occ*num_vir);
-            int k=ka/num_vir, a=ka%num_vir+num_occ;
-            int i=ic/num_vir, c=ic%num_vir+num_occ;
+            int ic = kaic % (active_occ*num_vir);
+            int ka = kaic / (active_occ*num_vir);
+            int k=ka/num_vir, a=ka%num_vir+active_occ;
+            int i=ic/num_vir, c=ic%num_vir+active_occ;
             d_s_tmp1[ovov2s_c(i,a,k,c)] = d_s_ovov[ovov2s_c(k,a,i,c)];
         }
         #pragma omp parallel for
         for (long long kbjc = 0; kbjc < num_ovov_p; kbjc++) {
-            int jc = kbjc % (num_occ*num_vir);
-            int kb = kbjc / (num_occ*num_vir);
-            int k=kb/num_vir, b=kb%num_vir+num_occ;
-            int j=jc/num_vir, c=jc%num_vir+num_occ;
+            int jc = kbjc % (active_occ*num_vir);
+            int kb = kbjc / (active_occ*num_vir);
+            int k=kb/num_vir, b=kb%num_vir+active_occ;
+            int j=jc/num_vir, c=jc%num_vir+active_occ;
             d_s_tmp2[ovov2s_c(k,c,j,b)] = d_s_ovov[ovov2s_c(k,b,j,c)];
         }
     } else {
-        kaic2iakc<<<blocks_ovov, threads>>>(d_s_ovov, d_s_tmp1, num_occ, num_vir);
-        kbjc2kcjb<<<blocks_ovov, threads>>>(d_s_ovov, d_s_tmp2, num_occ, num_vir);
+        kaic2iakc<<<blocks_ovov, threads>>>(d_s_ovov, d_s_tmp1, active_occ, num_vir);
+        kbjc2kcjb<<<blocks_ovov, threads>>>(d_s_ovov, d_s_tmp2, active_occ, num_vir);
         cudaDeviceSynchronize();
     }
     if (gpu::gpu_available()) {
@@ -3602,25 +3605,25 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
             return ((size_t)num_orbitals*num_orbitals*num_orbitals)*mu + (size_t)num_orbitals*num_orbitals*nu + (size_t)num_orbitals*la + si;
         };
         auto ovov2s_c = [&](int i, int a, int j, int b) -> size_t {
-            return (size_t)i*num_occ*num_vir*num_vir + (size_t)(a-num_occ)*num_occ*num_vir + (size_t)j*num_vir + (b-num_occ);
+            return (size_t)i*active_occ*num_vir*num_vir + (size_t)(a-active_occ)*active_occ*num_vir + (size_t)j*num_vir + (b-active_occ);
         };
         auto oovv2s_c = [&](int i, int j, int a, int b) -> size_t {
-            return (size_t)i*num_vir*num_vir*num_occ + (size_t)j*num_vir*num_vir + (size_t)(a-num_occ)*num_vir + (b-num_occ);
+            return (size_t)i*num_vir*num_vir*active_occ + (size_t)j*num_vir*num_vir + (size_t)(a-active_occ)*num_vir + (b-active_occ);
         };
         auto vvoo2s_c = [&](int c, int d, int i, int j) -> size_t {
-            return (size_t)(c-num_occ)*num_occ*num_occ*num_vir + (size_t)(d-num_occ)*num_occ*num_occ + (size_t)i*num_occ + j;
+            return (size_t)(c-active_occ)*active_occ*active_occ*num_vir + (size_t)(d-active_occ)*active_occ*active_occ + (size_t)i*active_occ + j;
         };
-        const long long num_oovv_tot = (long long)num_occ*num_occ*num_vir*num_vir;
+        const long long num_oovv_tot = (long long)active_occ*active_occ*num_vir*num_vir;
         double cpu_E3 = 0.0;
         #pragma omp parallel for reduction(+:cpu_E3)
         for (long long ijab = 0; ijab < num_oovv_tot; ijab++) {
             int ab = ijab % (num_vir*num_vir);
             int ij = ijab / (num_vir*num_vir);
-            int i=ij/num_occ, j=ij%num_occ;
-            int a=ab/num_vir+num_occ, b=ab%num_vir+num_occ;
+            int i=ij/active_occ, j=ij%active_occ;
+            int a=ab/num_vir+active_occ, b=ab%num_vir+active_occ;
             double s_iajb = d_s_ovov[ovov2s_c(i,a,j,b)];
-            double e_ijab = d_eri_mo[q2s_c(i,j,a,b)];
-            double e_iajb = d_eri_mo[q2s_c(i,a,j,b)];
+            double e_ijab = d_eri_mo[q2s_c(num_frozen+i, num_frozen+j, num_frozen+a, num_frozen+b)];
+            double e_iajb = d_eri_mo[q2s_c(num_frozen+i, num_frozen+a, num_frozen+j, num_frozen+b)];
             double energy = s_iajb * (d_mm1[oovv2s_c(i,j,a,b)] + d_mm2[vvoo2s_c(a,b,i,j)]);
             energy += (2.0*e_iajb - e_ijab) * d_mm3[ovov2s_c(i,a,j,b)];
             energy += (-3.0) * e_ijab * d_mm4[ovov2s_c(i,a,j,b)];
@@ -3628,7 +3631,7 @@ real_t mp3_from_aoeri_via_full_moeri_dgemm(
         }
         *d_groundE_3rd += cpu_E3;
     } else {
-        contract_iajb_tensors<<<blocks_ovov, threads>>>(num_basis, num_occ, num_vir, d_eri_mo, d_s_ovov, d_mm1, d_mm2, d_mm3, d_mm4, d_groundE_3rd);
+        contract_iajb_tensors<<<blocks_ovov, threads>>>(num_basis, active_occ, num_vir, d_eri_mo, d_s_ovov, d_mm1, d_mm2, d_mm3, d_mm4, d_groundE_3rd, num_frozen);
     }
     cudaEventRecord(end);
     cudaEventSynchronize(end);
@@ -3676,9 +3679,6 @@ real_t compute_mp3_energy_impl(RHF& rhf, real_t* d_eri, real_t* d_eri_mo_precomp
     PROFILE_FUNCTION();
 
     const int num_frozen = rhf.get_num_frozen_core();
-    if (num_frozen > 0) {
-        THROW_EXCEPTION("MP3 does not yet support frozen core approximation. Use MP2 or CCSD with frozen_core instead.");
-    }
     const int num_occ = rhf.get_num_electrons() / 2;
     const int num_basis = rhf.get_num_basis();
     DeviceHostMatrix<real_t>& coefficient_matrix = rhf.get_coefficient_matrix();
@@ -3722,8 +3722,8 @@ real_t ERI_Direct_RHF::compute_mp3_energy() {
     PROFILE_FUNCTION();
     const int nao = rhf_.get_num_basis();
 
-    // CPU fallback: reuse stored MP3 path via build_mo_eri
-    if (!gpu::gpu_available()) {
+    // CPU fallback or frozen core: reuse stored MP3 path via build_mo_eri
+    if (!gpu::gpu_available() || rhf_.get_num_frozen_core() > 0) {
         real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), nao);
         real_t result = compute_mp3_energy_impl(rhf_, nullptr, d_mo_eri);
         tracked_cudaFree(d_mo_eri);
@@ -3745,8 +3745,8 @@ real_t ERI_Hash_RHF::compute_mp3_energy() {
     PROFILE_FUNCTION();
     const int nao = rhf_.get_num_basis();
 
-    // CPU fallback: reuse stored MP3 path via build_mo_eri
-    if (!gpu::gpu_available()) {
+    // CPU fallback or frozen core: reuse stored MP3 path via build_mo_eri
+    if (!gpu::gpu_available() || rhf_.get_num_frozen_core() > 0) {
         real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), nao);
         real_t result = compute_mp3_energy_impl(rhf_, nullptr, d_mo_eri);
         tracked_cudaFree(d_mo_eri);
