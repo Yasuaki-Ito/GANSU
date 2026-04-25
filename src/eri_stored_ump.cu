@@ -667,9 +667,9 @@ void transform_ump3_single_mo_eri(
 
 //*
 __global__ void compute_ump2_energy_contrib_ss(
-    double* g_energy_second, 
-    const double* g_eri_mo, const double* g_eps, 
-    const int num_occupied, const int num_virtual)
+    double* g_energy_second,
+    const double* g_eri_mo, const double* g_eps,
+    const int num_occupied, const int num_virtual, const int num_frozen = 0)
 {
     __shared__ double s_tmp;
     if (threadIdx.x == 0 && threadIdx.y == 0) {
@@ -678,17 +678,17 @@ __global__ void compute_ump2_energy_contrib_ss(
     __syncthreads();
 
     double tmp = 0.0;
+    const int active_occ = num_occupied - num_frozen;
     const size_t seq = (((size_t)blockDim.x * blockDim.y) * blockIdx.x) + blockDim.x * threadIdx.y + threadIdx.x;
-    if (seq < (size_t)num_occupied * num_virtual * (size_t)num_occupied * num_virtual) {
-        const int ia = seq / (num_occupied * num_virtual);
-        const int jb = seq % (num_occupied * num_virtual);
-        const int i = ia / num_virtual;
+    if (seq < (size_t)active_occ * num_virtual * (size_t)active_occ * num_virtual) {
+        const int ia = seq / (active_occ * num_virtual);
+        const int jb = seq % (active_occ * num_virtual);
+        const int i = ia / num_virtual + num_frozen;
         const int a = ia % num_virtual;
-        const int j = jb / num_virtual;
+        const int j = jb / num_virtual + num_frozen;
         const int b = jb % num_virtual;
 
         const double iajb = g_eri_mo[ovov2seq(i, a, j, b, num_occupied, num_virtual)];
-        //const double jaib = g_eri_mo[ovov2seq(i, b, j, a, num_occupied, num_virtual)];
         const double jaib = g_eri_mo[ovov2seq(j, a, i, b, num_occupied, num_virtual)];
         tmp = iajb * (iajb - jaib) / (g_eps[i] + g_eps[j] - g_eps[num_occupied + a] - g_eps[num_occupied + b]);
     }
@@ -709,10 +709,11 @@ __global__ void compute_ump2_energy_contrib_ss(
 
 //*
 __global__ void compute_ump2_energy_contrib_os(
-    double* g_energy_second, const double* g_eri_mo, 
-    const double* g_eps_al, const double* g_eps_be, 
-    const int num_occupied_al, const int num_virtual_al, 
-    const int num_occupied_be, const int num_virtual_be)
+    double* g_energy_second, const double* g_eri_mo,
+    const double* g_eps_al, const double* g_eps_be,
+    const int num_occupied_al, const int num_virtual_al,
+    const int num_occupied_be, const int num_virtual_be,
+    const int num_frozen = 0)
 {
     __shared__ double s_tmp;
     if (threadIdx.x == 0 && threadIdx.y == 0) {
@@ -721,13 +722,15 @@ __global__ void compute_ump2_energy_contrib_os(
     __syncthreads();
 
     double tmp = 0.0;
+    const int active_occ_al = num_occupied_al - num_frozen;
+    const int active_occ_be = num_occupied_be - num_frozen;
     const size_t seq = (((size_t)blockDim.x * blockDim.y) * blockIdx.x) + blockDim.x * threadIdx.y + threadIdx.x;
-    if (seq < (size_t)num_occupied_al * num_virtual_al * (size_t)num_occupied_be * num_virtual_be) {
-        const int ia = seq / (num_occupied_be * num_virtual_be);
-        const int jb = seq % (num_occupied_be * num_virtual_be);
-        const int i = ia / num_virtual_al;
+    if (seq < (size_t)active_occ_al * num_virtual_al * (size_t)active_occ_be * num_virtual_be) {
+        const int ia = seq / (active_occ_be * num_virtual_be);
+        const int jb = seq % (active_occ_be * num_virtual_be);
+        const int i = ia / num_virtual_al + num_frozen;
         const int a = ia % num_virtual_al;
-        const int j = jb / num_virtual_be;
+        const int j = jb / num_virtual_be + num_frozen;
         const int b = jb % num_virtual_be;
 
         const double iajb = g_eri_mo[ovov2seq_aabb(i, a, j, b, num_occupied_al, num_virtual_al, num_occupied_be, num_virtual_be)];
@@ -757,9 +760,10 @@ double ump2_from_aoeri_via_required_moeri(
     const double* d_coefficient_matrix_be,
     const double* d_orbital_energies_al,
     const double* d_orbital_energies_be,
-    const int num_basis, 
+    const int num_basis,
     const int num_occ_al,
-    const int num_occ_be)
+    const int num_occ_be,
+    const int num_frozen = 0)
 {
     double* d_eri_tmp1 = nullptr;
     double* d_eri_tmp2 = nullptr;
@@ -812,9 +816,9 @@ double ump2_from_aoeri_via_required_moeri(
         {
             double sum_aa = 0.0;
             #pragma omp parallel for reduction(+:sum_aa) schedule(dynamic)
-            for (int i = 0; i < num_occ_al; i++)
+            for (int i = num_frozen; i < num_occ_al; i++)
                 for (int a = num_occ_al; a < N; a++)
-                    for (int j = 0; j < num_occ_al; j++)
+                    for (int j = num_frozen; j < num_occ_al; j++)
                         for (int b = num_occ_al; b < N; b++) {
                             double iajb = mo_eri(Ca, Ca, i, a, j, b);
                             double jaib = mo_eri(Ca, Ca, j, a, i, b);
@@ -827,9 +831,9 @@ double ump2_from_aoeri_via_required_moeri(
         {
             double sum_bb = 0.0;
             #pragma omp parallel for reduction(+:sum_bb) schedule(dynamic)
-            for (int i = 0; i < num_occ_be; i++)
+            for (int i = num_frozen; i < num_occ_be; i++)
                 for (int a = num_occ_be; a < N; a++)
-                    for (int j = 0; j < num_occ_be; j++)
+                    for (int j = num_frozen; j < num_occ_be; j++)
                         for (int b = num_occ_be; b < N; b++) {
                             double iajb = mo_eri(Cb, Cb, i, a, j, b);
                             double jaib = mo_eri(Cb, Cb, j, a, i, b);
@@ -842,9 +846,9 @@ double ump2_from_aoeri_via_required_moeri(
         {
             double sum_ab = 0.0;
             #pragma omp parallel for reduction(+:sum_ab) schedule(dynamic)
-            for (int i = 0; i < num_occ_al; i++)
+            for (int i = num_frozen; i < num_occ_al; i++)
                 for (int a = num_occ_al; a < N; a++)
-                    for (int j = 0; j < num_occ_be; j++)
+                    for (int j = num_frozen; j < num_occ_be; j++)
                         for (int b = num_occ_be; b < N; b++) {
                             double iajb = mo_eri(Ca, Cb, i, a, j, b);
                             sum_ab += (iajb*iajb) / (ea[i]+eb[j]-ea[a]-eb[b]);
@@ -871,12 +875,13 @@ double ump2_from_aoeri_via_required_moeri(
             cudaDeviceSynchronize();
             double* d_eri_mo_ovov_aa = d_eri_tmp1;
 
-            const size_t total = (size_t)num_occ_al * num_vir_al * num_occ_al * num_vir_al;
+            const int active_occ_al = num_occ_al - num_frozen;
+            const size_t total = (size_t)active_occ_al * num_vir_al * active_occ_al * num_vir_al;
             const size_t num_blocks = (total + num_threads_per_block - 1) / num_threads_per_block;
             const dim3 blocks(num_blocks);
             const dim3 threads(num_threads_per_warp, num_warps_per_block);
 
-            compute_ump2_energy_contrib_ss<<<blocks, threads>>>(d_second_energy, d_eri_mo_ovov_aa, d_orbital_energies_al, num_occ_al, num_vir_al);
+            compute_ump2_energy_contrib_ss<<<blocks, threads>>>(d_second_energy, d_eri_mo_ovov_aa, d_orbital_energies_al, num_occ_al, num_vir_al, num_frozen);
             cudaDeviceSynchronize();
         }
         cudaEventRecord(end);
@@ -897,12 +902,13 @@ double ump2_from_aoeri_via_required_moeri(
             cudaDeviceSynchronize();
             double* d_eri_mo_ovov_bb = d_eri_tmp1;
 
-            const size_t total = (size_t)num_occ_be * num_vir_be * num_occ_be * num_vir_be;
+            const int active_occ_be = num_occ_be - num_frozen;
+            const size_t total = (size_t)active_occ_be * num_vir_be * active_occ_be * num_vir_be;
             const size_t num_blocks = (total + num_threads_per_block - 1) / num_threads_per_block;
             const dim3 blocks(num_blocks);
             const dim3 threads(num_threads_per_warp, num_warps_per_block);
 
-            compute_ump2_energy_contrib_ss<<<blocks, threads>>>(d_second_energy, d_eri_mo_ovov_bb, d_orbital_energies_be, num_occ_be, num_vir_be);
+            compute_ump2_energy_contrib_ss<<<blocks, threads>>>(d_second_energy, d_eri_mo_ovov_bb, d_orbital_energies_be, num_occ_be, num_vir_be, num_frozen);
             cudaDeviceSynchronize();
         }
         cudaEventRecord(end);
@@ -923,12 +929,14 @@ double ump2_from_aoeri_via_required_moeri(
             cudaDeviceSynchronize();
             double* d_eri_mo_ovov_ab = d_eri_tmp1;
 
-            const size_t total = (size_t)num_occ_al * num_vir_al * num_occ_be * num_vir_be;
+            const int active_occ_al2 = num_occ_al - num_frozen;
+            const int active_occ_be2 = num_occ_be - num_frozen;
+            const size_t total = (size_t)active_occ_al2 * num_vir_al * active_occ_be2 * num_vir_be;
             const size_t num_blocks = (total + num_threads_per_block - 1) / num_threads_per_block;
             const dim3 blocks(num_blocks);
             const dim3 threads(num_threads_per_warp, num_warps_per_block);
 
-            compute_ump2_energy_contrib_os<<<blocks, threads>>>(d_second_energy, d_eri_mo_ovov_ab, d_orbital_energies_al, d_orbital_energies_be, num_occ_al, num_vir_al, num_occ_be, num_vir_be);
+            compute_ump2_energy_contrib_os<<<blocks, threads>>>(d_second_energy, d_eri_mo_ovov_ab, d_orbital_energies_al, d_orbital_energies_be, num_occ_al, num_vir_al, num_occ_be, num_vir_be, num_frozen);
             cudaDeviceSynchronize();
         }
         cudaEventRecord(end);
@@ -954,13 +962,14 @@ double ump2_from_aoeri_via_required_moeri(
 
 
 
-real_t ERI_Stored_UHF::compute_mp2_energy() 
+real_t ERI_Stored_UHF::compute_mp2_energy()
 {
     PROFILE_FUNCTION();
 
     const int num_basis = uhf_.get_num_basis();
     const int num_occ_al = uhf_.get_num_alpha_spins();
     const int num_occ_be = uhf_.get_num_beta_spins();
+    const int num_frozen = uhf_.get_num_frozen_core();
 
     DeviceHostMatrix<real_t>& coefficient_matrix_al = uhf_.get_coefficient_matrix_a();
     DeviceHostMatrix<real_t>& coefficient_matrix_be = uhf_.get_coefficient_matrix_b();
@@ -968,14 +977,15 @@ real_t ERI_Stored_UHF::compute_mp2_energy()
     DeviceHostMemory<real_t>& orbital_energies_be = uhf_.get_orbital_energies_b();
 
     const real_t E_UMP2 = ump2_from_aoeri_via_required_moeri(
-        eri_matrix_.device_ptr(), 
-        coefficient_matrix_al.device_ptr(), 
-        coefficient_matrix_be.device_ptr(), 
+        eri_matrix_.device_ptr(),
+        coefficient_matrix_al.device_ptr(),
+        coefficient_matrix_be.device_ptr(),
         orbital_energies_al.device_ptr(),
         orbital_energies_be.device_ptr(),
-        num_basis, 
-        num_occ_al, 
-        num_occ_be
+        num_basis,
+        num_occ_al,
+        num_occ_be,
+        num_frozen
     );
 
     std::cout << "UMP2 energy test" << std::endl;
@@ -2849,6 +2859,11 @@ static void contract_mixed_4h2p_2h4p_from_tensors(
 }
 
 
+// GPU kernel for trimming MO ERI (defined in eri_stored.cu)
+__global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ eri_full,
+                                            real_t* __restrict__ eri_trimmed,
+                                            int N_full, int na_active, int offset);
+
 double ump3_from_aoeri_via_full_moeri_dgemm_eff(
     double* d_eri_ao,
     const double* d_coefficient_matrix_al,
@@ -2857,8 +2872,19 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
     const double* d_orbital_energies_be,
     const int num_basis,
     const int num_occ_al,
-    const int num_occ_be)
+    const int num_occ_be,
+    const int num_frozen = 0)
 {
+    const int active_occ_al = num_occ_al - num_frozen;
+    const int active_occ_be = num_occ_be - num_frozen;
+    const int num_vir_al = num_basis - num_occ_al;
+    const int num_vir_be = num_basis - num_occ_be;
+    const int na_active = num_basis - num_frozen;  // = active_occ + num_vir (same for al/be)
+
+    // Shifted epsilon pointers for frozen core
+    const double* d_eps_al = d_orbital_energies_al + num_frozen;
+    const double* d_eps_be = d_orbital_energies_be + num_frozen;
+
     double* d_g_full = nullptr;
     double* d_eri_tmp = nullptr;
     const size_t num_basis_2 = num_basis * num_basis;
@@ -2867,9 +2893,6 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
     tracked_cudaMalloc(&d_eri_tmp, sizeof(double) * num_basis_4);
     if (!d_g_full) { THROW_EXCEPTION("cudaMalloc failed for d_g_full."); }
     if (!d_eri_tmp) { THROW_EXCEPTION("cudaMalloc failed for d_eri_tmp."); }
-
-    const int num_vir_al = num_basis - num_occ_al;
-    const int num_vir_be = num_basis - num_occ_be;
 
     double* d_energy_4h2p_2h4p = nullptr;
     double* d_energy_3h3p = nullptr;
@@ -2883,17 +2906,17 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
     constexpr int num_threads_per_block = num_threads_per_warp * num_warps_per_block;
     const dim3 threads(num_threads_per_warp, num_warps_per_block);
 
-    const size_t num_aaaa_oooo = (size_t)num_occ_al * num_occ_al * num_occ_al * num_occ_al;
+    const size_t num_aaaa_oooo = (size_t)active_occ_al * active_occ_al * active_occ_al * active_occ_al;
     const size_t num_aaaa_vvvv = (size_t)num_vir_al * num_vir_al * num_vir_al * num_vir_al;
-    const size_t num_aaaa_ovov = (size_t)num_occ_al * num_vir_al * num_occ_al * num_vir_al;
-    const size_t num_aabb_oooo = (size_t)num_occ_al * num_occ_be * num_occ_al * num_occ_be;
+    const size_t num_aaaa_ovov = (size_t)active_occ_al * num_vir_al * active_occ_al * num_vir_al;
+    const size_t num_aabb_oooo = (size_t)active_occ_al * active_occ_be * active_occ_al * active_occ_be;
     const size_t num_aabb_vvvv = (size_t)num_vir_al * num_vir_be * num_vir_al * num_vir_be;
-    const size_t num_aabb_ovov = (size_t)num_occ_al * num_vir_al * num_occ_be * num_vir_be;
-    const size_t num_aabb_oovv = (size_t)num_occ_al * num_occ_al * num_vir_be * num_vir_be;
-    const size_t num_bbaa_oovv = (size_t)num_occ_be * num_occ_be * num_vir_al * num_vir_al;
-    const size_t num_bbbb_oooo = (size_t)num_occ_be * num_occ_be * num_occ_be * num_occ_be;
+    const size_t num_aabb_ovov = (size_t)active_occ_al * num_vir_al * active_occ_be * num_vir_be;
+    const size_t num_aabb_oovv = (size_t)active_occ_al * active_occ_al * num_vir_be * num_vir_be;
+    const size_t num_bbaa_oovv = (size_t)active_occ_be * active_occ_be * num_vir_al * num_vir_al;
+    const size_t num_bbbb_oooo = (size_t)active_occ_be * active_occ_be * active_occ_be * active_occ_be;
     const size_t num_bbbb_vvvv = (size_t)num_vir_be * num_vir_be * num_vir_be * num_vir_be;
-    const size_t num_bbbb_ovov = (size_t)num_occ_be * num_vir_be * num_occ_be * num_vir_be;
+    const size_t num_bbbb_ovov = (size_t)active_occ_be * num_vir_be * active_occ_be * num_vir_be;
     const size_t num_same_ovov_max = std::max(num_aaaa_ovov, num_bbbb_ovov);
 
     const size_t num_blocks_aaaa_oooo = (num_aaaa_oooo + num_threads_per_block - 1) / num_threads_per_block;
@@ -2983,12 +3006,40 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
     cudaMemset(d_g_aabb_ovvo, 0, sizeof(double) * num_aabb_ovov);
     cudaMemset(d_x_bbaa_ovov, 0, sizeof(double) * num_aabb_ovov);
 
+    // Helper: trim full MO ERI to active space when frozen core is present
+    // After transform, d_g_full is num_basis^4. Trim into d_eri_tmp (reused as temp).
+    auto trim_eri = [&](double* d_src, double* d_dst) {
+        if (num_frozen == 0) return d_src;  // no trim needed
+        const size_t na4 = (size_t)na_active * na_active * na_active * na_active;
+        if (!gpu::gpu_available()) {
+            const size_t N = num_basis;
+            #pragma omp parallel for collapse(2)
+            for (int p = 0; p < na_active; p++)
+                for (int q = 0; q < na_active; q++)
+                    for (int r = 0; r < na_active; r++)
+                        for (int s = 0; s < na_active; s++) {
+                            size_t src = ((size_t)(num_frozen+p)*N + (num_frozen+q))*N*N
+                                       + (size_t)(num_frozen+r)*N + (num_frozen+s);
+                            size_t dst_idx = ((size_t)p*na_active*na_active + (size_t)q*na_active + r)*(size_t)na_active + s;
+                            d_dst[dst_idx] = d_src[src];
+                        }
+        } else {
+            int thr = 256;
+            int blk = (int)((na4 + thr - 1) / thr);
+            trim_eri_frozen_core_kernel<<<blk, thr>>>(d_src, d_dst, num_basis, na_active, num_frozen);
+            cudaDeviceSynchronize();
+        }
+        return d_dst;
+    };
+
+    // (αα|αα) block
     {
         transform_ump3_single_mo_eri(
             d_eri_ao, d_g_full, d_eri_tmp,
             d_coefficient_matrix_al, d_coefficient_matrix_al,
             num_basis_4, num_basis, true
         );
+        double* d_g_src = trim_eri(d_g_full, d_eri_tmp);
 
         double* d_g_aaaa_oooo = nullptr;
         double* d_g_aaaa_vvvv = nullptr;
@@ -3007,17 +3058,17 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
         cudaMemset(d_u_aaaa_ovvo, 0, sizeof(double) * num_aaaa_ovov);
 
         if (!gpu::gpu_available()) {
-            cpu_kernels::tensorize_g_aaaa_oooo_cpu(d_g_aaaa_oooo, d_g_full, num_occ_al, num_vir_al);
-            cpu_kernels::tensorize_g_aaaa_vvvv_cpu(d_g_aaaa_vvvv, d_g_full, num_occ_al, num_vir_al);
-            cpu_kernels::tensorize_u_aaaa_ovvo_cpu(d_u_aaaa_ovvo, d_g_full, num_occ_al, num_vir_al);
-            cpu_kernels::tensorize_x_aaaa_ovov_cpu(d_x_aaaa_ovov, d_g_full, d_orbital_energies_al, num_occ_al, num_vir_al);
-            cpu_kernels::tensorize_y_aaaa_ovov_cpu(d_y_aaaa_ovov, d_g_full, d_orbital_energies_al, num_occ_al, num_vir_al);
+            cpu_kernels::tensorize_g_aaaa_oooo_cpu(d_g_aaaa_oooo, d_g_src, active_occ_al, num_vir_al);
+            cpu_kernels::tensorize_g_aaaa_vvvv_cpu(d_g_aaaa_vvvv, d_g_src, active_occ_al, num_vir_al);
+            cpu_kernels::tensorize_u_aaaa_ovvo_cpu(d_u_aaaa_ovvo, d_g_src, active_occ_al, num_vir_al);
+            cpu_kernels::tensorize_x_aaaa_ovov_cpu(d_x_aaaa_ovov, d_g_src, d_eps_al, active_occ_al, num_vir_al);
+            cpu_kernels::tensorize_y_aaaa_ovov_cpu(d_y_aaaa_ovov, d_g_src, d_eps_al, active_occ_al, num_vir_al);
         } else {
-            tensorize_g_aaaa_oooo<<<num_blocks_aaaa_oooo, threads>>>(d_g_aaaa_oooo, d_g_full, num_occ_al, num_vir_al);
-            tensorize_g_aaaa_vvvv<<<num_blocks_aaaa_vvvv, threads>>>(d_g_aaaa_vvvv, d_g_full, num_occ_al, num_vir_al);
-            tensorize_u_aaaa_ovvo<<<num_blocks_aaaa_ovov, threads>>>(d_u_aaaa_ovvo, d_g_full, num_occ_al, num_vir_al);
-            tensorize_x_aaaa_ovov<<<num_blocks_aaaa_ovov, threads>>>(d_x_aaaa_ovov, d_g_full, d_orbital_energies_al, num_occ_al, num_vir_al);
-            tensorize_y_aaaa_ovov<<<num_blocks_aaaa_ovov, threads>>>(d_y_aaaa_ovov, d_g_full, d_orbital_energies_al, num_occ_al, num_vir_al);
+            tensorize_g_aaaa_oooo<<<num_blocks_aaaa_oooo, threads>>>(d_g_aaaa_oooo, d_g_src, active_occ_al, num_vir_al);
+            tensorize_g_aaaa_vvvv<<<num_blocks_aaaa_vvvv, threads>>>(d_g_aaaa_vvvv, d_g_src, active_occ_al, num_vir_al);
+            tensorize_u_aaaa_ovvo<<<num_blocks_aaaa_ovov, threads>>>(d_u_aaaa_ovvo, d_g_src, active_occ_al, num_vir_al);
+            tensorize_x_aaaa_ovov<<<num_blocks_aaaa_ovov, threads>>>(d_x_aaaa_ovov, d_g_src, d_eps_al, active_occ_al, num_vir_al);
+            tensorize_y_aaaa_ovov<<<num_blocks_aaaa_ovov, threads>>>(d_y_aaaa_ovov, d_g_src, d_eps_al, active_occ_al, num_vir_al);
         }
 
         contract_same_spin_contributions_from_tensors(
@@ -3028,7 +3079,7 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
             d_u_aaaa_ovvo,
             d_tmp_same_1, d_tmp_same_2, d_tmp_same_3,
             threads, num_blocks_aaaa_ovov,
-            num_occ_al, num_vir_al
+            active_occ_al, num_vir_al
         );
 
         tracked_cudaFree(d_g_aaaa_oooo);
@@ -3036,12 +3087,14 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
         tracked_cudaFree(d_x_aaaa_ovov);
     }
 
+    // (αα|ββ) block
     {
         transform_ump3_single_mo_eri(
             d_eri_ao, d_g_full, d_eri_tmp,
             d_coefficient_matrix_al, d_coefficient_matrix_be,
             num_basis_4, num_basis, false
         );
+        double* d_g_src = trim_eri(d_g_full, d_eri_tmp);
 
         double* d_g_aabb_oooo = nullptr;
         double* d_g_aabb_vvvv = nullptr;
@@ -3057,17 +3110,17 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
         cudaMemset(d_g_aabb_ovvo, 0, sizeof(double) * num_aabb_ovov);
 
         if (!gpu::gpu_available()) {
-            cpu_kernels::tensorize_g_aabb_oooo_cpu(d_g_aabb_oooo, d_g_full, num_occ_al, num_occ_be, num_basis);
-            cpu_kernels::tensorize_g_aabb_vvvv_cpu(d_g_aabb_vvvv, d_g_full, num_occ_al, num_occ_be, num_vir_al, num_vir_be, num_basis);
-            cpu_kernels::tensorize_x_aabb_ovov_cpu(d_x_aabb_ovov, d_g_full, d_orbital_energies_al, d_orbital_energies_be, num_occ_al, num_vir_al, num_occ_be, num_vir_be, num_basis);
-            cpu_kernels::tensorize_g_bbaa_oovv_cpu(d_g_aabb_oovv, d_g_full, num_occ_al, num_occ_be, num_vir_al, num_vir_be, num_basis);
-            cpu_kernels::tensorize_g_bbaa_ovvo_cpu(d_g_aabb_ovvo, d_g_full, num_occ_al, num_occ_be, num_vir_al, num_vir_be, num_basis);
+            cpu_kernels::tensorize_g_aabb_oooo_cpu(d_g_aabb_oooo, d_g_src, active_occ_al, active_occ_be, na_active);
+            cpu_kernels::tensorize_g_aabb_vvvv_cpu(d_g_aabb_vvvv, d_g_src, active_occ_al, active_occ_be, num_vir_al, num_vir_be, na_active);
+            cpu_kernels::tensorize_x_aabb_ovov_cpu(d_x_aabb_ovov, d_g_src, d_eps_al, d_eps_be, active_occ_al, num_vir_al, active_occ_be, num_vir_be, na_active);
+            cpu_kernels::tensorize_g_bbaa_oovv_cpu(d_g_aabb_oovv, d_g_src, active_occ_al, active_occ_be, num_vir_al, num_vir_be, na_active);
+            cpu_kernels::tensorize_g_bbaa_ovvo_cpu(d_g_aabb_ovvo, d_g_src, active_occ_al, active_occ_be, num_vir_al, num_vir_be, na_active);
         } else {
-            tensorize_g_aabb_oooo<<<num_blocks_aabb_oooo, threads>>>(d_g_aabb_oooo, d_g_full, num_occ_al, num_occ_be, num_basis);
-            tensorize_g_aabb_vvvv<<<num_blocks_aabb_vvvv, threads>>>(d_g_aabb_vvvv, d_g_full, num_occ_al, num_occ_be, num_vir_al, num_vir_be, num_basis);
-            tensorize_x_aabb_ovov<<<num_blocks_aabb_ovov, threads>>>(d_x_aabb_ovov, d_g_full, d_orbital_energies_al, d_orbital_energies_be, num_occ_al, num_vir_al, num_occ_be, num_vir_be, num_basis);
-            tensorize_g_bbaa_oovv<<<num_blocks_aabb_oovv, threads>>>(d_g_aabb_oovv, d_g_full, num_occ_al, num_occ_be, num_vir_al, num_vir_be, num_basis);
-            tensorize_g_bbaa_ovvo<<<num_blocks_aabb_ovov, threads>>>(d_g_aabb_ovvo, d_g_full, num_occ_al, num_occ_be, num_vir_al, num_vir_be, num_basis);
+            tensorize_g_aabb_oooo<<<num_blocks_aabb_oooo, threads>>>(d_g_aabb_oooo, d_g_src, active_occ_al, active_occ_be, na_active);
+            tensorize_g_aabb_vvvv<<<num_blocks_aabb_vvvv, threads>>>(d_g_aabb_vvvv, d_g_src, active_occ_al, active_occ_be, num_vir_al, num_vir_be, na_active);
+            tensorize_x_aabb_ovov<<<num_blocks_aabb_ovov, threads>>>(d_x_aabb_ovov, d_g_src, d_eps_al, d_eps_be, active_occ_al, num_vir_al, active_occ_be, num_vir_be, na_active);
+            tensorize_g_bbaa_oovv<<<num_blocks_aabb_oovv, threads>>>(d_g_aabb_oovv, d_g_src, active_occ_al, active_occ_be, num_vir_al, num_vir_be, na_active);
+            tensorize_g_bbaa_ovvo<<<num_blocks_aabb_ovov, threads>>>(d_g_aabb_ovvo, d_g_src, active_occ_al, active_occ_be, num_vir_al, num_vir_be, na_active);
         }
 
         contract_mixed_4h2p_2h4p_from_tensors(
@@ -3081,19 +3134,21 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
             d_tmp_mixed_3,
             threads,
             num_blocks_aabb_ovov,
-            num_occ_al, num_occ_be, num_vir_al, num_vir_be
+            active_occ_al, active_occ_be, num_vir_al, num_vir_be
         );
 
         tracked_cudaFree(d_g_aabb_oooo);
         tracked_cudaFree(d_g_aabb_vvvv);
     }
 
+    // (ββ|αα) block
     {
         transform_ump3_single_mo_eri(
             d_eri_ao, d_g_full, d_eri_tmp,
             d_coefficient_matrix_be, d_coefficient_matrix_al,
             num_basis_4, num_basis, false
         );
+        double* d_g_src = trim_eri(d_g_full, d_eri_tmp);
 
         double* d_g_bbaa_ovvo = nullptr;
         double* d_g_bbaa_oovv = nullptr;
@@ -3107,13 +3162,13 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
         cudaMemset(d_g_bbaa_oovv, 0, sizeof(double) * num_bbaa_oovv);
 
         if (!gpu::gpu_available()) {
-            cpu_kernels::tensorize_x_aabb_ovov_cpu(d_x_bbaa_ovov, d_g_full, d_orbital_energies_be, d_orbital_energies_al, num_occ_be, num_vir_be, num_occ_al, num_vir_al, num_basis);
-            cpu_kernels::tensorize_g_bbaa_ovvo_cpu(d_g_bbaa_ovvo, d_g_full, num_occ_be, num_occ_al, num_vir_be, num_vir_al, num_basis);
-            cpu_kernels::tensorize_g_bbaa_oovv_cpu(d_g_bbaa_oovv, d_g_full, num_occ_be, num_occ_al, num_vir_be, num_vir_al, num_basis);
+            cpu_kernels::tensorize_x_aabb_ovov_cpu(d_x_bbaa_ovov, d_g_src, d_eps_be, d_eps_al, active_occ_be, num_vir_be, active_occ_al, num_vir_al, na_active);
+            cpu_kernels::tensorize_g_bbaa_ovvo_cpu(d_g_bbaa_ovvo, d_g_src, active_occ_be, active_occ_al, num_vir_be, num_vir_al, na_active);
+            cpu_kernels::tensorize_g_bbaa_oovv_cpu(d_g_bbaa_oovv, d_g_src, active_occ_be, active_occ_al, num_vir_be, num_vir_al, na_active);
         } else {
-            tensorize_x_aabb_ovov<<<num_blocks_aabb_ovov, threads>>>(d_x_bbaa_ovov, d_g_full, d_orbital_energies_be, d_orbital_energies_al, num_occ_be, num_vir_be, num_occ_al, num_vir_al, num_basis);
-            tensorize_g_bbaa_ovvo<<<num_blocks_aabb_ovov, threads>>>(d_g_bbaa_ovvo, d_g_full, num_occ_be, num_occ_al, num_vir_be, num_vir_al, num_basis);
-            tensorize_g_bbaa_oovv<<<num_blocks_bbaa_oovv, threads>>>(d_g_bbaa_oovv, d_g_full, num_occ_be, num_occ_al, num_vir_be, num_vir_al, num_basis);
+            tensorize_x_aabb_ovov<<<num_blocks_aabb_ovov, threads>>>(d_x_bbaa_ovov, d_g_src, d_eps_be, d_eps_al, active_occ_be, num_vir_be, active_occ_al, num_vir_al, na_active);
+            tensorize_g_bbaa_ovvo<<<num_blocks_aabb_ovov, threads>>>(d_g_bbaa_ovvo, d_g_src, active_occ_be, active_occ_al, num_vir_be, num_vir_al, na_active);
+            tensorize_g_bbaa_oovv<<<num_blocks_bbaa_oovv, threads>>>(d_g_bbaa_oovv, d_g_src, active_occ_be, active_occ_al, num_vir_be, num_vir_al, na_active);
         }
 
         contract_mixed_yxg_3h3p_from_tensors(
@@ -3125,8 +3180,8 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
             d_tmp_same_1,
             threads,
             num_blocks_aaaa_ovov,
-            num_occ_al, num_vir_al,
-            num_occ_be, num_vir_be
+            active_occ_al, num_vir_al,
+            active_occ_be, num_vir_be
         );
 
         contract_mixed_xg_oovv_3h3p_from_tensors(
@@ -3138,7 +3193,7 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
             d_tmp_mixed_2,
             threads,
             num_blocks_aabb_ovov,
-            num_occ_al, num_occ_be, num_vir_al, num_vir_be
+            active_occ_al, active_occ_be, num_vir_al, num_vir_be
         );
 
         contract_mixed_xg_oovv_3h3p_from_tensors(
@@ -3150,7 +3205,7 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
             d_tmp_mixed_2,
             threads,
             num_blocks_aabb_ovov,
-            num_occ_be, num_occ_al, num_vir_be, num_vir_al
+            active_occ_be, active_occ_al, num_vir_be, num_vir_al
         );
 
         contract_mixed_xu_3h3p_from_tensors(
@@ -3161,7 +3216,7 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
             d_tmp_mixed_1,
             threads,
             num_blocks_aabb_ovov,
-            num_occ_be, num_occ_al, num_vir_be, num_vir_al
+            active_occ_be, active_occ_al, num_vir_be, num_vir_al
         );
 
         tracked_cudaFree(d_g_bbaa_ovvo);
@@ -3174,12 +3229,14 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
         d_g_aabb_oovv = nullptr;
     }
 
+    // (ββ|ββ) block
     {
         transform_ump3_single_mo_eri(
             d_eri_ao, d_g_full, d_eri_tmp,
             d_coefficient_matrix_be, d_coefficient_matrix_be,
             num_basis_4, num_basis, true
         );
+        double* d_g_src = trim_eri(d_g_full, d_eri_tmp);
 
         double* d_g_bbbb_oooo = nullptr;
         double* d_g_bbbb_vvvv = nullptr;
@@ -3204,17 +3261,17 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
         cudaMemset(d_y_bbbb_ovov, 0, sizeof(double) * num_bbbb_ovov);
 
         if (!gpu::gpu_available()) {
-            cpu_kernels::tensorize_g_aaaa_oooo_cpu(d_g_bbbb_oooo, d_g_full, num_occ_be, num_vir_be);
-            cpu_kernels::tensorize_g_aaaa_vvvv_cpu(d_g_bbbb_vvvv, d_g_full, num_occ_be, num_vir_be);
-            cpu_kernels::tensorize_u_aaaa_ovvo_cpu(d_u_bbbb_ovvo, d_g_full, num_occ_be, num_vir_be);
-            cpu_kernels::tensorize_x_aaaa_ovov_cpu(d_x_bbbb_ovov, d_g_full, d_orbital_energies_be, num_occ_be, num_vir_be);
-            cpu_kernels::tensorize_y_aaaa_ovov_cpu(d_y_bbbb_ovov, d_g_full, d_orbital_energies_be, num_occ_be, num_vir_be);
+            cpu_kernels::tensorize_g_aaaa_oooo_cpu(d_g_bbbb_oooo, d_g_src, active_occ_be, num_vir_be);
+            cpu_kernels::tensorize_g_aaaa_vvvv_cpu(d_g_bbbb_vvvv, d_g_src, active_occ_be, num_vir_be);
+            cpu_kernels::tensorize_u_aaaa_ovvo_cpu(d_u_bbbb_ovvo, d_g_src, active_occ_be, num_vir_be);
+            cpu_kernels::tensorize_x_aaaa_ovov_cpu(d_x_bbbb_ovov, d_g_src, d_eps_be, active_occ_be, num_vir_be);
+            cpu_kernels::tensorize_y_aaaa_ovov_cpu(d_y_bbbb_ovov, d_g_src, d_eps_be, active_occ_be, num_vir_be);
         } else {
-            tensorize_g_aaaa_oooo<<<num_blocks_bbbb_oooo, threads>>>(d_g_bbbb_oooo, d_g_full, num_occ_be, num_vir_be);
-            tensorize_g_aaaa_vvvv<<<num_blocks_bbbb_vvvv, threads>>>(d_g_bbbb_vvvv, d_g_full, num_occ_be, num_vir_be);
-            tensorize_u_aaaa_ovvo<<<num_blocks_bbbb_ovov, threads>>>(d_u_bbbb_ovvo, d_g_full, num_occ_be, num_vir_be);
-            tensorize_x_aaaa_ovov<<<num_blocks_bbbb_ovov, threads>>>(d_x_bbbb_ovov, d_g_full, d_orbital_energies_be, num_occ_be, num_vir_be);
-            tensorize_y_aaaa_ovov<<<num_blocks_bbbb_ovov, threads>>>(d_y_bbbb_ovov, d_g_full, d_orbital_energies_be, num_occ_be, num_vir_be);
+            tensorize_g_aaaa_oooo<<<num_blocks_bbbb_oooo, threads>>>(d_g_bbbb_oooo, d_g_src, active_occ_be, num_vir_be);
+            tensorize_g_aaaa_vvvv<<<num_blocks_bbbb_vvvv, threads>>>(d_g_bbbb_vvvv, d_g_src, active_occ_be, num_vir_be);
+            tensorize_u_aaaa_ovvo<<<num_blocks_bbbb_ovov, threads>>>(d_u_bbbb_ovvo, d_g_src, active_occ_be, num_vir_be);
+            tensorize_x_aaaa_ovov<<<num_blocks_bbbb_ovov, threads>>>(d_x_bbbb_ovov, d_g_src, d_eps_be, active_occ_be, num_vir_be);
+            tensorize_y_aaaa_ovov<<<num_blocks_bbbb_ovov, threads>>>(d_y_bbbb_ovov, d_g_src, d_eps_be, active_occ_be, num_vir_be);
         }
 
         contract_mixed_xu_3h3p_from_tensors(
@@ -3225,7 +3282,7 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
             d_tmp_mixed_1,
             threads,
             num_blocks_aabb_ovov,
-            num_occ_al, num_occ_be, num_vir_al, num_vir_be
+            active_occ_al, active_occ_be, num_vir_al, num_vir_be
         );
 
         contract_mixed_yxg_3h3p_from_tensors(
@@ -3237,8 +3294,8 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
             d_tmp_same_1,
             threads,
             num_blocks_bbbb_ovov,
-            num_occ_be, num_vir_be,
-            num_occ_al, num_vir_al
+            active_occ_be, num_vir_be,
+            active_occ_al, num_vir_al
         );
 
         contract_same_spin_contributions_from_tensors(
@@ -3249,7 +3306,7 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
             d_u_bbbb_ovvo,
             d_tmp_same_1, d_tmp_same_2, d_tmp_same_3,
             threads, num_blocks_bbbb_ovov,
-            num_occ_be, num_vir_be
+            active_occ_be, num_vir_be
         );
 
         tracked_cudaFree(d_g_bbbb_oooo);
@@ -3295,13 +3352,14 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
 
 
 
-real_t ERI_Stored_UHF::compute_mp3_energy() 
+real_t ERI_Stored_UHF::compute_mp3_energy()
 {
     PROFILE_FUNCTION();
 
     const int num_basis = uhf_.get_num_basis();
     const int num_occ_al = uhf_.get_num_alpha_spins();
     const int num_occ_be = uhf_.get_num_beta_spins();
+    const int num_frozen = uhf_.get_num_frozen_core();
 
     DeviceHostMatrix<real_t>& coefficient_matrix_al = uhf_.get_coefficient_matrix_a();
     DeviceHostMatrix<real_t>& coefficient_matrix_be = uhf_.get_coefficient_matrix_b();
@@ -3309,27 +3367,27 @@ real_t ERI_Stored_UHF::compute_mp3_energy()
     DeviceHostMemory<real_t>& orbital_energies_be = uhf_.get_orbital_energies_b();
 
     const real_t E_UMP2 = ump2_from_aoeri_via_required_moeri(
-        eri_matrix_.device_ptr(), 
-        coefficient_matrix_al.device_ptr(), 
-        coefficient_matrix_be.device_ptr(), 
+        eri_matrix_.device_ptr(),
+        coefficient_matrix_al.device_ptr(),
+        coefficient_matrix_be.device_ptr(),
         orbital_energies_al.device_ptr(),
         orbital_energies_be.device_ptr(),
-        num_basis, 
-        num_occ_al, 
-        num_occ_be
+        num_basis,
+        num_occ_al,
+        num_occ_be,
+        num_frozen
     );
 
-    //const real_t E_UMP3 = ump3_from_aoeri_via_full_moeri(
-    //const real_t E_UMP3 = ump3_from_aoeri_via_full_moeri_dgemm(
     const real_t E_UMP3 = ump3_from_aoeri_via_full_moeri_dgemm_eff(
-        eri_matrix_.device_ptr(), 
-        coefficient_matrix_al.device_ptr(), 
-        coefficient_matrix_be.device_ptr(), 
+        eri_matrix_.device_ptr(),
+        coefficient_matrix_al.device_ptr(),
+        coefficient_matrix_be.device_ptr(),
         orbital_energies_al.device_ptr(),
         orbital_energies_be.device_ptr(),
-        num_basis, 
-        num_occ_al, 
-        num_occ_be
+        num_basis,
+        num_occ_al,
+        num_occ_be,
+        num_frozen
     );
 
     std::cout << "UMP3 energy: " << E_UMP3 << " [hartree]" << std::endl;
