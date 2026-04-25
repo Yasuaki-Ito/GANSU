@@ -49,15 +49,25 @@ BasisSet BasisSet::construct_from_gbs(const std::string& filename){
         }
     }
 
+    bool found_ecp = false;
     while(!ifs.eof()){
-        if(!current_element_basis_set.get_element_name().empty()){
+        if(!current_element_basis_set.get_element_name().empty() &&
+           current_element_basis_set.get_num_contracted_gausses() > 0){
             basis_set.add_element_basis_set(current_element_basis_set);
-            current_element_basis_set = ElementBasisSet();
         }
+        current_element_basis_set = ElementBasisSet();
 
-        
+
         { // Read a line for Element name
             std::getline(ifs, line);
+            if(ifs.eof()) break;
+            // Check if this line is an ECP header (contains "-ECP")
+            if(line.find("-ECP") != std::string::npos || line.find("-ecp") != std::string::npos) {
+                // Rewind so the ECP parser can read this line
+                ifs.seekg(ifs.tellg() - static_cast<std::streamoff>(line.size() + 1));
+                found_ecp = true;
+                break;
+            }
             std::istringstream iss(line);
             // Get element name (H, He, Li, ...)
             std::string element_name;
@@ -69,6 +79,13 @@ BasisSet BasisSet::construct_from_gbs(const std::string& filename){
         while(std::getline(ifs, line)){
             // If the line is "****", the end of the basis functions
             if(line == "****"){
+                break;
+            }
+
+            // Check if this line is an ECP header
+            if(line.find("-ECP") != std::string::npos || line.find("-ecp") != std::string::npos) {
+                ifs.seekg(ifs.tellg() - static_cast<std::streamoff>(line.size() + 1));
+                found_ecp = true;
                 break;
             }
 
@@ -113,12 +130,77 @@ BasisSet BasisSet::construct_from_gbs(const std::string& filename){
                 THROW_EXCEPTION("Invalid basis function name: " + type);
             }
         }
+        if(found_ecp) break;
     }
 
-    // The last element basis set is added
-    if(!current_element_basis_set.get_element_name().empty()){
+    // The last element basis set is added (skip if empty, e.g., ECP-only element header)
+    if(!current_element_basis_set.get_element_name().empty() &&
+       current_element_basis_set.get_num_contracted_gausses() > 0){
         basis_set.add_element_basis_set(current_element_basis_set);
     }
+
+    // Continue reading: look for ECP sections in the same file
+    // ECP lines start with "ELEMENT-ECP" or "ELEMENT     0" followed by "ELEMENT-ECP"
+    while(std::getline(ifs, line)){
+        // Skip blank/comment lines
+        if(line.empty() || line[0] == '!' || line[0] == '#') continue;
+
+        // Check for ECP header: "XX-ECP  l_max  n_core"
+        if(line.find("-ECP") != std::string::npos || line.find("-ecp") != std::string::npos){
+            std::istringstream iss(line);
+            std::string ecp_label;
+            int l_max, n_core;
+            iss >> ecp_label >> l_max >> n_core;
+
+            // Extract element name: "BR-ECP" → "Br"
+            std::string element_name = ecp_label.substr(0, ecp_label.find('-'));
+            if(!element_name.empty()){
+                element_name[0] = std::toupper(element_name[0]);
+                for(size_t i = 1; i < element_name.size(); i++)
+                    element_name[i] = std::tolower(element_name[i]);
+            }
+
+            ElementECP ecp;
+            ecp.set_element_name(element_name);
+            ecp.set_l_max(l_max);
+            ecp.set_n_core_electrons(n_core);
+
+            // Read l_max+1 components: first = local, rest = semi-local
+            for(int comp_idx = 0; comp_idx <= l_max; comp_idx++){
+                // Read label line (e.g., "f potential" or "s-f potential")
+                do {
+                    if(!std::getline(ifs, line)) goto ecp_done;
+                } while(line.empty() || line[0] == '!' || line[0] == '#');
+
+                // Read number of primitives
+                if(!std::getline(ifs, line)) goto ecp_done;
+                std::replace(line.begin(), line.end(), 'D', 'E');
+                int n_prim = 0;
+                { std::istringstream iss2(line); iss2 >> n_prim; }
+
+                ECPComponent comp;
+                comp.angular_momentum = (comp_idx == 0) ? -1 : (comp_idx - 1);
+
+                for(int k = 0; k < n_prim; k++){
+                    if(!std::getline(ifs, line)) goto ecp_done;
+                    std::replace(line.begin(), line.end(), 'D', 'E');
+                    std::istringstream iss3(line);
+                    int power;
+                    double exponent, coefficient;
+                    iss3 >> power >> exponent >> coefficient;
+                    comp.primitives.push_back({power, exponent, coefficient});
+                }
+
+                if(comp_idx == 0)
+                    ecp.set_local_component(comp);
+                else
+                    ecp.add_semilocal_component(comp);
+            }
+
+            basis_set.add_element_ecp(ecp);
+        }
+    }
+    ecp_done:
 
     return basis_set;
 }
@@ -183,6 +265,114 @@ BasisSet BasisSet::generate_auxiliary_basis(const BasisSet& primary_basis_set, i
     }
 
     return aux_basis_set;
+}
+
+
+// ============================================================
+//  ECP file parser (Gaussian94 format)
+//
+//  Format:
+//    ELEMENT-ECP  l_max  n_core_electrons
+//    local_label (e.g., "f potential" or "g potential")
+//      N
+//      n1  zeta1  d1
+//      ...
+//    semilocal_label (e.g., "s-f potential")
+//      N
+//      n1  zeta1  d1
+//      ...
+//    ****  (or next element, or EOF)
+// ============================================================
+
+static std::string shell_label_for_l(int l) {
+    const char* labels[] = {"s", "p", "d", "f", "g", "h", "i"};
+    return (l >= 0 && l <= 6) ? labels[l] : "?";
+}
+
+std::unordered_map<std::string, ElementECP> BasisSet::parse_ecp_file(const std::string& filename) {
+    std::ifstream ifs(filename);
+    if (!ifs) {
+        THROW_EXCEPTION("Cannot open ECP file: " + filename);
+    }
+
+    std::unordered_map<std::string, ElementECP> ecps;
+    std::string line;
+
+    while (std::getline(ifs, line)) {
+        // Skip comments and blank lines
+        if (line.empty() || line[0] == '!' || line[0] == '#') continue;
+        if (line.find("****") != std::string::npos) continue;
+
+        // Look for ECP header: "ELEMENT-ECP  l_max  n_core"
+        if (line.find("-ECP") != std::string::npos || line.find("-ecp") != std::string::npos) {
+            std::istringstream iss(line);
+            std::string ecp_label;
+            int l_max, n_core;
+            iss >> ecp_label >> l_max >> n_core;
+
+            // Extract element name from "BR-ECP" → "Br"
+            std::string element_name = ecp_label.substr(0, ecp_label.find('-'));
+            // Capitalize first letter, lowercase rest
+            if (!element_name.empty()) {
+                element_name[0] = std::toupper(element_name[0]);
+                for (size_t i = 1; i < element_name.size(); i++)
+                    element_name[i] = std::tolower(element_name[i]);
+            }
+
+            ElementECP ecp;
+            ecp.set_element_name(element_name);
+            ecp.set_l_max(l_max);
+            ecp.set_n_core_electrons(n_core);
+
+            // Read l_max+1 components: first is local, rest are semi-local
+            // Local is labeled e.g., "f potential" (for l_max=3) or "g potential" (for l_max=4)
+            // Semi-local labeled "s-f potential", "p-f potential", etc.
+            for (int comp_idx = 0; comp_idx <= l_max; comp_idx++) {
+                // Read label line (e.g., "f potential" or "s-f potential")
+                if (!std::getline(ifs, line)) break;
+                // Skip blank/comment lines
+                while (line.empty() || line[0] == '!' || line[0] == '#') {
+                    if (!std::getline(ifs, line)) break;
+                }
+
+                // Read number of primitives
+                if (!std::getline(ifs, line)) break;
+                std::replace(line.begin(), line.end(), 'D', 'E');
+                int n_prim = 0;
+                {
+                    std::istringstream iss2(line);
+                    iss2 >> n_prim;
+                }
+
+                ECPComponent comp;
+                if (comp_idx == 0) {
+                    comp.angular_momentum = -1;  // local component
+                } else {
+                    comp.angular_momentum = comp_idx - 1;  // s=0, p=1, d=2, ...
+                }
+
+                for (int k = 0; k < n_prim; k++) {
+                    if (!std::getline(ifs, line)) break;
+                    std::replace(line.begin(), line.end(), 'D', 'E');
+                    std::istringstream iss3(line);
+                    int power;
+                    double exponent, coefficient;
+                    iss3 >> power >> exponent >> coefficient;
+                    comp.primitives.push_back({power, exponent, coefficient});
+                }
+
+                if (comp_idx == 0) {
+                    ecp.set_local_component(comp);
+                } else {
+                    ecp.add_semilocal_component(comp);
+                }
+            }
+
+            ecps[element_name] = ecp;
+        }
+    }
+
+    return ecps;
 }
 
 }

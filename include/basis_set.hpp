@@ -33,6 +33,7 @@
 #include <algorithm> // std::sort, std::unique
 
 #include "types.hpp"
+#include "ecp.hpp"
 #include "utils.hpp" // Exception
 
 namespace gansu{
@@ -121,8 +122,8 @@ public:
                             * std::pow(4.0 * primitive_a.exponent, L/2.0+0.75) ;
 
                 for(const auto& primitive_b : primitives){
-                    real_t n_b = std::pow(2.0 * M_PI, -3.0/4.0) 
-                                * std::pow(4.0 * primitive_b.exponent, L/2+0.75) ;
+                    real_t n_b = std::pow(2.0 * M_PI, -3.0/4.0)
+                                * std::pow(4.0 * primitive_b.exponent, L/2.0+0.75) ;
 
                     normalize_factor += primitive_a.coefficient * n_a
                                     * primitive_b.coefficient * n_b
@@ -304,6 +305,29 @@ public:
 
     static BasisSet construct_from_gbs(const std::string& filename);
 
+    /// Parse a separate ECP file (Gaussian94 format)
+    static std::unordered_map<std::string, ElementECP> parse_ecp_file(const std::string& filename);
+
+    /// Add an ElementECP to this basis set
+    void add_element_ecp(const ElementECP& ecp) {
+        element_ecp_sets[ecp.get_element_name()] = ecp;
+    }
+
+    /// Get ECP for an element (returns empty ElementECP if not found)
+    const ElementECP& get_element_ecp(const std::string& element_name) const {
+        static ElementECP empty;
+        auto it = element_ecp_sets.find(element_name);
+        return (it != element_ecp_sets.end()) ? it->second : empty;
+    }
+
+    bool has_ecp(const std::string& element_name) const {
+        return element_ecp_sets.count(element_name) > 0;
+    }
+
+    const std::unordered_map<std::string, ElementECP>& get_all_ecps() const {
+        return element_ecp_sets;
+    }
+
     /**
      * @brief Generate an auxiliary basis set from the primary basis set
      * @param primary_basis_set Primary basis set
@@ -356,6 +380,7 @@ public:
     
 private:
     std::unordered_map<std::string, ElementBasisSet> element_basis_sets;
+    std::unordered_map<std::string, ElementECP> element_ecp_sets;
 };
 
 

@@ -56,12 +56,12 @@ void compute_hessian_nuclear_repulsion(
 
     if (A == B) {
         // Diagonal block: d²V_nn/dA dA = Σ_{C≠A} contribution
-        double Z_A = (double)g_atoms[A].atomic_number;
+        double Z_A = (double)g_atoms[A].effective_charge;
         double hess[9] = {0.0};
 
         for (int C = 0; C < num_atoms; C++) {
             if (C == A) continue;
-            double Z_C = (double)g_atoms[C].atomic_number;
+            double Z_C = (double)g_atoms[C].effective_charge;
             double dx = g_atoms[A].coordinate.x - g_atoms[C].coordinate.x;
             double dy = g_atoms[A].coordinate.y - g_atoms[C].coordinate.y;
             double dz = g_atoms[A].coordinate.z - g_atoms[C].coordinate.z;
@@ -91,7 +91,7 @@ void compute_hessian_nuclear_repulsion(
         }
     } else {
         // Off-diagonal block: d²V_nn/dA dB = -Z_A Z_B * f(R_AB)
-        double Z_A = (double)g_atoms[A].atomic_number, Z_B = (double)g_atoms[B].atomic_number;
+        double Z_A = (double)g_atoms[A].effective_charge, Z_B = (double)g_atoms[B].effective_charge;
         double dx = g_atoms[A].coordinate.x - g_atoms[B].coordinate.x;
         double dy = g_atoms[A].coordinate.y - g_atoms[B].coordinate.y;
         double dz = g_atoms[A].coordinate.z - g_atoms[B].coordinate.z;
@@ -151,11 +151,11 @@ void compute_hessian_nuclear_repulsion_cpu(double* g_hessian, const Atom* g_atom
         }
 
         if (A == B) {
-            double Z_A = (double)g_atoms[A].atomic_number;
+            double Z_A = (double)g_atoms[A].effective_charge;
             double hess[9] = {0.0};
             for (int C = 0; C < num_atoms; C++) {
                 if (C == A) continue;
-                double Z_C = (double)g_atoms[C].atomic_number;
+                double Z_C = (double)g_atoms[C].effective_charge;
                 double dx = g_atoms[A].coordinate.x - g_atoms[C].coordinate.x;
                 double dy = g_atoms[A].coordinate.y - g_atoms[C].coordinate.y;
                 double dz = g_atoms[A].coordinate.z - g_atoms[C].coordinate.z;
@@ -180,7 +180,7 @@ void compute_hessian_nuclear_repulsion_cpu(double* g_hessian, const Atom* g_atom
                     }
                 }
         } else {
-            double Z_A = (double)g_atoms[A].atomic_number, Z_B = (double)g_atoms[B].atomic_number;
+            double Z_A = (double)g_atoms[A].effective_charge, Z_B = (double)g_atoms[B].effective_charge;
             double dx = g_atoms[A].coordinate.x - g_atoms[B].coordinate.x;
             double dy = g_atoms[A].coordinate.y - g_atoms[B].coordinate.y;
             double dz = g_atoms[A].coordinate.z - g_atoms[B].coordinate.z;

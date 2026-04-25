@@ -652,7 +652,7 @@ inline double nuclear_contracted(const PrimitiveShell* shells, const real_t* cgt
                     sa.exponent, sb.exponent,
                     sa.coordinate, sb.coordinate,
                     la, ma, na, lb, mb, nb,
-                    atoms[at].coordinate, atoms[at].atomic_number);
+                    atoms[at].coordinate, atoms[at].effective_charge);
             }
             result += sa.coefficient * sb.coefficient * Na * Nb * prim_result;
         }

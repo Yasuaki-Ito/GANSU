@@ -118,7 +118,7 @@ void compute_gradients_nuclear(double* g_gradients, const real_t* g_density_matr
             }
         }
 
-        double Z = g_atom[atom_index].atomic_number;
+        double Z = g_atom[atom_index].effective_charge;
 
         // Pulay A: V_ab = -Z_C * <a|1/rC|b>, sign is -Z_C
         result_Ax -= Z * iter_Ax;
@@ -239,7 +239,7 @@ void compute_gradients_nuclear_cpu(double* g_gradients, const real_t* g_density_
                 }
             }
 
-            double Z = g_atom[atom_index].atomic_number;
+            double Z = g_atom[atom_index].effective_charge;
 
             result_Ax -= Z * iter_Ax;
             result_Ay -= Z * iter_Ay;

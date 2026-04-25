@@ -98,7 +98,7 @@ void compute_hessian_nuclear_attraction(
 
     // Loop over all nuclei C
     for (int iC = 0; iC < num_atoms; iC++) {
-        double Z_C = (double)g_atoms[iC].atomic_number;
+        double Z_C = (double)g_atoms[iC].effective_charge;
         if (Z_C == 0.0) continue;
 
         double Cx = g_atoms[iC].coordinate.x, Cy = g_atoms[iC].coordinate.y, Cz = g_atoms[iC].coordinate.z;
@@ -345,7 +345,7 @@ void compute_hessian_nuclear_attraction_cpu(double* g_hessian, const real_t* g_d
 
     // Loop over all nuclei C
     for (int iC = 0; iC < num_atoms; iC++) {
-        double Z_C = (double)g_atoms[iC].atomic_number;
+        double Z_C = (double)g_atoms[iC].effective_charge;
         if (Z_C == 0.0) continue;
 
         double Cx = g_atoms[iC].coordinate.x, Cy = g_atoms[iC].coordinate.y, Cz = g_atoms[iC].coordinate.z;

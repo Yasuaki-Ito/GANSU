@@ -308,7 +308,7 @@ void compute_nuclear_attraction_integral(real_t* g_nucattr, const PrimitiveShell
                         }
                     }
                 }
-                result_V = (-g_atom[atom_index].atomic_number) * coefandNorm * Norm_A * Norm_B * temp;
+                result_V = (-g_atom[atom_index].effective_charge) * coefandNorm * Norm_A * Norm_B * temp;
 
                 atomicAdd(&g_nucattr[calc_result_index(size_a+lmn_a, size_b+lmn_b, num_basis)], result_V*(1.0+int((size_a==size_b) && (primitive_index_a!=primitive_index_b))));
             }

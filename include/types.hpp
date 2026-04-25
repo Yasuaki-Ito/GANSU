@@ -148,6 +148,7 @@ struct PrimitiveShell {
  */
 struct Atom {
     int atomic_number; ///< atomic number
+    int effective_charge; ///< effective nuclear charge (= atomic_number if no ECP)
     Coordinate coordinate; ///< coordinate=(x, y, z)
     int atom_index; ///< Index of the atom in the molecule
 };

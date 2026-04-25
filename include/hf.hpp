@@ -421,6 +421,10 @@ protected:
     std::vector<real_t> oscillator_strengths_; ///< Oscillator strengths (CIS/EOM)
     std::string excited_state_report_; ///< Formatted excited state report for final summary
 
+    // ECP data (from Molecular)
+    bool has_ecp_ = false;
+    std::unordered_map<std::string, ElementECP> ecp_data_;
+
     // CCSD 1-RDM (correlation density, non-relaxed). Filled by CCSD_DENSITY method.
     std::vector<real_t> ccsd_1rdm_mo_; ///< [nao*nao] row-major, MO basis (incl. HF reference)
     std::vector<real_t> ccsd_1rdm_ao_; ///< [nao*nao] row-major, AO basis

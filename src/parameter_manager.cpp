@@ -74,7 +74,8 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"eom_mp2_solver", "auto"},                  // string (auto, schur_static, schur_omega, full)
         {"eom_cc2_solver", "auto"},                    // string (auto, schur_static, schur_omega, full)
         {"spin_type", "singlet"},                       // string (singlet, triplet)
-        {"frozen_core", "none"}                         // string: "none", "auto", or integer
+        {"frozen_core", "none"},                         // string: "none", "auto", or integer
+        {"ecp_filename", ""}                               // string: ECP file path
     };
 
 
@@ -86,6 +87,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"-x", "xyzfilename"},
         {"-g", "gbsfilename"},
         {"-ag", "auxiliary_gbsfilename"},
+        {"-ecp", "ecp_filename"},
         {"-c", "charge"},
         {"-r", "run_type"},
     };

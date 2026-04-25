@@ -90,25 +90,26 @@ public:
     Molecular(const std::vector<Atom> atoms, const std::string gbs_filename, const int charge=0, const unsigned int beta_to_alpha=0)
         : atoms_(atoms), gbs_filename_(gbs_filename)
     {
-        create_basis_set(gbs_filename);
-
+        // First compute full-electron count (needed by create_basis_set for ECP adjustment)
         num_electrons_ = 0;
         for(const auto& atom : atoms_){
             num_electrons_ += atom.atomic_number;
         }
         num_electrons_ -= charge;
+
+        // Parse basis set (and ECP if present — adjusts num_electrons_)
+        create_basis_set(gbs_filename);
+
         if(num_electrons_ < 1){
             THROW_EXCEPTION("The number of electrons is less than one.");
         }
 
-        num_alpha_spins_ = static_cast<int>((num_electrons_+1)/2) +  beta_to_alpha; // the number of alpha-spin electrons
-        num_beta_spins_  = static_cast<int>(num_electrons_/2) - beta_to_alpha; // the number of beta-spin electrons
-        
+        num_alpha_spins_ = static_cast<int>((num_electrons_+1)/2) +  beta_to_alpha;
+        num_beta_spins_  = static_cast<int>(num_electrons_/2) - beta_to_alpha;
+
         if(num_beta_spins_ < 0){
             THROW_EXCEPTION("The number of beta-spin electrons is less than zero.");
         }
-
-
     }
 
     /**
@@ -146,6 +147,42 @@ public:
     void create_basis_set(const std::string gbs_filename){
         BasisSet basis_set = BasisSet::construct_from_gbs(gbs_filename);
         create_basis_set_from_object(basis_set);
+
+        // If the GBS file contains ECP sections, load them
+        const auto& ecps = basis_set.get_all_ecps();
+        if (!ecps.empty()) {
+            int n_ecp_electrons = 0;
+            effective_charges_.resize(atoms_.size());
+
+            for (size_t i = 0; i < atoms_.size(); i++) {
+                std::string elem = atomic_number_to_element_name(atoms_[i].atomic_number);
+                auto it = ecps.find(elem);
+                if (it != ecps.end()) {
+                    ecp_data_[elem] = it->second;
+                    int n_core = it->second.get_n_core_electrons();
+                    n_ecp_electrons += n_core;
+                    effective_charges_[i] = atoms_[i].atomic_number - n_core;
+                    atoms_[i].effective_charge = effective_charges_[i];
+                } else {
+                    effective_charges_[i] = atoms_[i].atomic_number;
+                }
+            }
+
+            if (n_ecp_electrons > 0) {
+                num_electrons_ -= n_ecp_electrons;
+                num_alpha_spins_ = static_cast<int>((num_electrons_+1)/2);
+                num_beta_spins_  = static_cast<int>(num_electrons_/2);
+                has_ecp_ = true;
+                std::cout << "[ECP] " << n_ecp_electrons << " core electrons replaced, "
+                          << num_electrons_ << " valence electrons" << std::endl;
+                for (size_t i = 0; i < atoms_.size(); i++) {
+                    if (effective_charges_[i] != atoms_[i].atomic_number) {
+                        std::cout << "  " << atomic_number_to_element_name(atoms_[i].atomic_number)
+                                  << ": Z_eff=" << effective_charges_[i] << std::endl;
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -190,6 +227,17 @@ public:
 
                 // store the normalization factor of the contracted Gauss function
                 const std::vector<real_t> normalization_factors = contracted_gauss.get_normalization_factor();
+                // DEBUG: print shell info with primitive details
+                if (atom_index == 1 && shell_type >= 1) {
+                    std::cout << "[CGTO-DBG] atom=" << atom_index << " type=" << shell_type
+                              << " nprim=" << contracted_gauss.get_num_primitives()
+                              << " basis=" << (basis_index - shell_type_to_num_basis(shell_type))
+                              << " norm=" << normalization_factors[0];
+                    for (size_t jp = 0; jp < contracted_gauss.get_num_primitives(); jp++)
+                        std::cout << " [exp=" << contracted_gauss.get_primitive_gauss(jp).exponent
+                                  << " c=" << contracted_gauss.get_primitive_gauss(jp).coefficient << "]";
+                    std::cout << std::endl;
+                }
                 cgto_normalization_factors_.insert(cgto_normalization_factors_.end(), normalization_factors.begin(), normalization_factors.end());
             }
             basis_range.end_index = basis_index;
@@ -282,7 +330,61 @@ public:
     */
     const std::vector<real_t>& get_cgto_normalization_factors() const { return cgto_normalization_factors_; }
 
+    /// Load ECP data from file and adjust electron count
+    void load_ecp(const std::string& ecp_filename) {
+        auto ecps = BasisSet::parse_ecp_file(ecp_filename);
+        int n_ecp_electrons = 0;
+        ecp_data_.clear();
+        effective_charges_.resize(atoms_.size());
 
+        for (size_t i = 0; i < atoms_.size(); i++) {
+            std::string elem = atomic_number_to_element_name(atoms_[i].atomic_number);
+            auto it = ecps.find(elem);
+            if (it != ecps.end()) {
+                ecp_data_[elem] = it->second;
+                int n_core = it->second.get_n_core_electrons();
+                n_ecp_electrons += n_core;
+                effective_charges_[i] = atoms_[i].atomic_number - n_core;
+                std::cout << "  ECP: " << elem << " Z_eff=" << effective_charges_[i]
+                          << " (removed " << n_core << " core electrons)" << std::endl;
+            } else {
+                effective_charges_[i] = atoms_[i].atomic_number;  // no ECP
+            }
+        }
+
+        // Adjust electron count
+        num_electrons_ -= n_ecp_electrons;
+        num_alpha_spins_ = static_cast<int>((num_electrons_+1)/2);
+        num_beta_spins_  = static_cast<int>(num_electrons_/2);
+
+        has_ecp_ = (n_ecp_electrons > 0);
+        if (has_ecp_) {
+            std::cout << "  ECP total: " << n_ecp_electrons << " core electrons removed, "
+                      << num_electrons_ << " valence electrons remain" << std::endl;
+        }
+    }
+
+    bool has_ecp() const { return has_ecp_; }
+
+    /// Get effective nuclear charge for atom i (Z - n_core if ECP, else Z)
+    int get_effective_charge(int atom_index) const {
+        if (effective_charges_.empty()) return atoms_[atom_index].atomic_number;
+        return effective_charges_[atom_index];
+    }
+
+    /// Get ECP data for an element (returns nullptr if not found)
+    const ElementECP* get_ecp(const std::string& element_name) const {
+        auto it = ecp_data_.find(element_name);
+        return (it != ecp_data_.end()) ? &it->second : nullptr;
+    }
+
+    /// Get ECP data for atom by index
+    const ElementECP* get_atom_ecp(int atom_index) const {
+        std::string elem = atomic_number_to_element_name(atoms_[atom_index].atomic_number);
+        return get_ecp(elem);
+    }
+
+    const std::unordered_map<std::string, ElementECP>& get_all_ecps() const { return ecp_data_; }
 
     Molecular(const Molecular&) = delete; ///< copy constructor is deleted
     ~Molecular() = default; ///< destructor
@@ -336,6 +438,10 @@ private:
 
     const std::string gbs_filename_; ///< Basis set file name (Gaussian basis set file)
 
+    // ECP data
+    bool has_ecp_ = false;
+    std::unordered_map<std::string, ElementECP> ecp_data_;
+    std::vector<int> effective_charges_;  // Z_eff for each atom (Z - n_core if ECP)
 };
 
 

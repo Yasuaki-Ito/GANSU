@@ -67,7 +67,7 @@ public:
             std::ostringstream oss;
             oss << value;  // Convert the value to a string
 
-            if(key_ == "xyzfilename" || key_ == "gbsfilename" || key_ == "auxiliary_gbsfilename" || key_ == "parameter_file"){ // Special case for file/path names
+            if(key_ == "xyzfilename" || key_ == "gbsfilename" || key_ == "auxiliary_gbsfilename" || key_ == "ecp_filename" || key_ == "parameter_file"){ // Special case for file/path names
                 map_[key_] = oss.str();
             }else{
                 map_[key_] = toLowerCase(oss.str());

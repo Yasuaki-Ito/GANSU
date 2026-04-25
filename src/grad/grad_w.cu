@@ -82,14 +82,14 @@ __global__ void compute_nuclear_repulsion_gradient_kernel(double* g_grad, const 
         double R_AB2 = dx * dx + dy * dy + dz * dz;
         double R_AB3 = R_AB2 * sqrt(R_AB2);
 
-        grad_x += g_atom[B].atomic_number * dx / R_AB3;
-        grad_y += g_atom[B].atomic_number * dy / R_AB3;
-        grad_z += g_atom[B].atomic_number * dz / R_AB3;
+        grad_x += g_atom[B].effective_charge * dx / R_AB3;
+        grad_y += g_atom[B].effective_charge * dy / R_AB3;
+        grad_z += g_atom[B].effective_charge * dz / R_AB3;
     }
 
-    atomicAdd(&g_grad[3*A+0], g_atom[A].atomic_number * grad_x);
-    atomicAdd(&g_grad[3*A+1], g_atom[A].atomic_number * grad_y);
-    atomicAdd(&g_grad[3*A+2], g_atom[A].atomic_number * grad_z);
+    atomicAdd(&g_grad[3*A+0], g_atom[A].effective_charge * grad_x);
+    atomicAdd(&g_grad[3*A+1], g_atom[A].effective_charge * grad_y);
+    atomicAdd(&g_grad[3*A+2], g_atom[A].effective_charge * grad_z);
 }
 
 // CPU host-callable nuclear repulsion gradient.  Mirrors the GPU kernel.
@@ -110,13 +110,13 @@ void compute_nuclear_repulsion_gradient_cpu(double* g_grad, const Atom* g_atom,
             double dz = g_atom[B].coordinate.z - g_atom[A].coordinate.z;
             double R_AB2 = dx * dx + dy * dy + dz * dz;
             double R_AB3 = R_AB2 * std::sqrt(R_AB2);
-            grad_x += g_atom[B].atomic_number * dx / R_AB3;
-            grad_y += g_atom[B].atomic_number * dy / R_AB3;
-            grad_z += g_atom[B].atomic_number * dz / R_AB3;
+            grad_x += g_atom[B].effective_charge * dx / R_AB3;
+            grad_y += g_atom[B].effective_charge * dy / R_AB3;
+            grad_z += g_atom[B].effective_charge * dz / R_AB3;
         }
-        g_grad[3*A+0] += g_atom[A].atomic_number * grad_x;
-        g_grad[3*A+1] += g_atom[A].atomic_number * grad_y;
-        g_grad[3*A+2] += g_atom[A].atomic_number * grad_z;
+        g_grad[3*A+0] += g_atom[A].effective_charge * grad_x;
+        g_grad[3*A+1] += g_atom[A].effective_charge * grad_y;
+        g_grad[3*A+2] += g_atom[A].effective_charge * grad_z;
     }
 }
 

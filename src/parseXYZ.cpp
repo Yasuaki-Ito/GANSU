@@ -103,8 +103,10 @@ std::vector<Atom> parseXYZ(const std::string& filename) {
             }
         }
 
+        int Z = element_name_to_atomic_number(symbol);
         Atom atom{
-            .atomic_number = element_name_to_atomic_number(symbol),
+            .atomic_number = Z,
+            .effective_charge = Z,  // default: no ECP
             .coordinate = coordinate
         };
 
