@@ -875,6 +875,8 @@ public:
     ~ERI_Stored_RHF() = default; ///< destructor
 
     real_t compute_mp2_energy() override;
+    real_t compute_scs_mp2_energy() override;
+    real_t compute_sos_mp2_energy() override;
     void compute_mp2_effective_densities(real_t* d_P_eff, real_t* d_W_eff, real_t* d_Gamma_eff, real_t* d_P_2el) override;
     real_t compute_mp3_energy() override;
     real_t compute_mp4_energy() override;
@@ -939,7 +941,14 @@ public:
     ~ERI_RI_RHF() = default; ///< destructor
 
     real_t compute_mp2_energy() override;
+    real_t compute_scs_mp2_energy() override;
+    real_t compute_sos_mp2_energy() override;
+    real_t compute_lt_mp2_energy() override;
+    real_t compute_lt_sos_mp2_energy() override;
     real_t compute_mp3_energy() override;
+
+private:
+    real_t* build_B_ia();  // Helper: build B_ia^P on device
     real_t compute_mp4_energy() override;
     real_t compute_cc2_energy() override;
     real_t compute_ccsd_energy() override;
@@ -1389,7 +1398,8 @@ public:
     real_t compute_mp2_energy() override;
 
     bool supports_post_hf_method(PostHFMethod method) const override {
-        return method == PostHFMethod::None || method == PostHFMethod::MP2;
+        return method == PostHFMethod::None || method == PostHFMethod::MP2
+            || method == PostHFMethod::SCS_MP2 || method == PostHFMethod::SOS_MP2;
     }
 
 protected:

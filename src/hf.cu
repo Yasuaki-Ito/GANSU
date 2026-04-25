@@ -126,6 +126,18 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     }else if(post_hf_method_str == "mp2"){
         std::cout << "Message: Post-HF method is MP2." << std::endl;
         post_hf_method_ = PostHFMethod::MP2;
+    }else if(post_hf_method_str == "scs_mp2" || post_hf_method_str == "scs-mp2"){
+        std::cout << "Message: Post-HF method is SCS-MP2." << std::endl;
+        post_hf_method_ = PostHFMethod::SCS_MP2;
+    }else if(post_hf_method_str == "sos_mp2" || post_hf_method_str == "sos-mp2"){
+        std::cout << "Message: Post-HF method is SOS-MP2." << std::endl;
+        post_hf_method_ = PostHFMethod::SOS_MP2;
+    }else if(post_hf_method_str == "lt_mp2" || post_hf_method_str == "lt-mp2" || post_hf_method_str == "laplace_mp2"){
+        std::cout << "Message: Post-HF method is LT-MP2 (Laplace-transformed)." << std::endl;
+        post_hf_method_ = PostHFMethod::LT_MP2;
+    }else if(post_hf_method_str == "lt_sos_mp2" || post_hf_method_str == "lt-sos-mp2" || post_hf_method_str == "laplace_sos_mp2"){
+        std::cout << "Message: Post-HF method is LT-SOS-MP2 (Laplace-transformed, opposite-spin only)." << std::endl;
+        post_hf_method_ = PostHFMethod::LT_SOS_MP2;
     }else if(post_hf_method_str == "mp3"){
         std::cout << "Message: Post-HF method is MP3." << std::endl;
         post_hf_method_ = PostHFMethod::MP3;

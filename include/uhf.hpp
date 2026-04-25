@@ -816,6 +816,8 @@ public:
     ~ERI_Stored_UHF() = default; ///< destructor
 
     real_t compute_mp2_energy() override;
+    real_t compute_scs_mp2_energy() override;
+    real_t compute_sos_mp2_energy() override;
     real_t compute_mp3_energy() override;
 
     void compute_fock_matrix() override {

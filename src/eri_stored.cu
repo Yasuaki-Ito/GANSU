@@ -1225,6 +1225,74 @@ __global__ void mp2_stored_kernel_ovov(
 }
 /**/
 
+// SOS-MP2: opposite-spin only kernel — no exchange integral load needed
+__global__ void mp2_sos_kernel_ovov(
+    double* g_E_os,
+    const double* g_eri_mo, const double* g_eps,
+    const int num_occupied, const int num_virtual)
+{
+    __shared__ double s_os;
+    if (threadIdx.x == 0 && threadIdx.y == 0) s_os = 0;
+    __syncthreads();
+
+    double os = 0.0;
+    const size_t seq = (((size_t)blockDim.x * blockDim.y) * blockIdx.x) + blockDim.x * threadIdx.y + threadIdx.x;
+    if (seq < (size_t)num_occupied * num_virtual * (size_t)num_occupied * num_virtual) {
+        const int ia = seq / (num_occupied * num_virtual);
+        const int jb = seq % (num_occupied * num_virtual);
+        const int i = ia / num_virtual;
+        const int a = ia % num_virtual;
+        const int j = jb / num_virtual;
+        const int b = jb % num_virtual;
+
+        const double iajb = g_eri_mo[ovov2seq(i, a, j, b, num_occupied, num_virtual)];
+        const double denom = g_eps[i] + g_eps[j] - g_eps[num_occupied + a] - g_eps[num_occupied + b];
+        os = iajb * iajb / denom;
+    }
+
+    for (int offset = 16; offset > 0; offset /= 2)
+        os += __shfl_down_sync(FULLMASK, os, offset);
+    if (threadIdx.x == 0) atomicAdd(&s_os, os);
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0) atomicAdd(g_E_os, s_os);
+}
+
+// SCS-MP2: compute E_os and E_ss separately
+__global__ void mp2_scs_kernel_ovov(
+    double* g_E_os, double* g_E_ss,
+    const double* g_eri_mo, const double* g_eps,
+    const int num_occupied, const int num_virtual)
+{
+    __shared__ double s_os, s_ss;
+    if (threadIdx.x == 0 && threadIdx.y == 0) { s_os = 0; s_ss = 0; }
+    __syncthreads();
+
+    double os = 0.0, ss = 0.0;
+    const size_t seq = (((size_t)blockDim.x * blockDim.y) * blockIdx.x) + blockDim.x * threadIdx.y + threadIdx.x;
+    if (seq < (size_t)num_occupied * num_virtual * (size_t)num_occupied * num_virtual) {
+        const int ia = seq / (num_occupied * num_virtual);
+        const int jb = seq % (num_occupied * num_virtual);
+        const int i = ia / num_virtual;
+        const int a = ia % num_virtual;
+        const int j = jb / num_virtual;
+        const int b = jb % num_virtual;
+
+        const double iajb = g_eri_mo[ovov2seq(i, a, j, b, num_occupied, num_virtual)];
+        const double jaib = g_eri_mo[ovov2seq(j, a, i, b, num_occupied, num_virtual)];
+        const double denom = g_eps[i] + g_eps[j] - g_eps[num_occupied + a] - g_eps[num_occupied + b];
+        os = iajb * iajb / denom;
+        ss = iajb * (iajb - jaib) / denom;
+    }
+
+    for (int offset = 16; offset > 0; offset /= 2) {
+        os += __shfl_down_sync(FULLMASK, os, offset);
+        ss += __shfl_down_sync(FULLMASK, ss, offset);
+    }
+    if (threadIdx.x == 0) { atomicAdd(&s_os, os); atomicAdd(&s_ss, ss); }
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0) { atomicAdd(g_E_os, s_os); atomicAdd(g_E_ss, s_ss); }
+}
+
 
 double mp2_from_aoeri_via_required_moeri(
     double* d_eri_ao,
@@ -1464,6 +1532,154 @@ real_t ERI_Stored_RHF::compute_mp2_energy() {
     return E_MP2;
 }
 
+
+// ============================================================
+//  SCS-MP2 / SOS-MP2 energy calculation
+//  SCS-MP2: E = c_os * E_os + c_ss * E_ss  (c_os=6/5, c_ss=1/3)
+//  SOS-MP2: E = c_os * E_os                 (c_os=1.3)
+// ============================================================
+
+// Compute SCS/SOS-MP2 using OVOV path (no full MO-ERI, memory efficient)
+// mode: 0 = SCS-MP2, 1 = SOS-MP2
+static real_t compute_scaled_mp2_energy_impl(RHF& rhf, real_t* d_eri, int mode) {
+    PROFILE_FUNCTION();
+
+    const int num_frozen = rhf.get_num_frozen_core();
+    const int num_occ = rhf.get_num_electrons() / 2;
+    const int num_basis = rhf.get_num_basis();
+    const int num_vir = num_basis - num_occ;
+    DeviceHostMatrix<real_t>& coefficient_matrix = rhf.get_coefficient_matrix();
+    DeviceHostMemory<real_t>& orbital_energies = rhf.get_orbital_energies();
+    const real_t* d_C = coefficient_matrix.device_ptr();
+    const real_t* d_eps = orbital_energies.device_ptr();
+
+    // Frozen core: use full MO-ERI path (same as standard MP2)
+    if (num_frozen > 0) {
+        real_t* d_eri_mo = nullptr;
+        tracked_cudaMalloc(&d_eri_mo, (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
+        transform_ao_eri_to_mo_eri_full(d_eri, d_C, num_basis, d_eri_mo);
+
+        const int active_occ = num_occ - num_frozen;
+        const size_t N = num_basis;
+        const size_t total = (size_t)active_occ * num_vir * active_occ * num_vir;
+        std::vector<double> h_eri(N*N*N*N), h_eps(N);
+        cudaMemcpy(h_eri.data(), d_eri_mo, N*N*N*N * sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_eps.data(), d_eps, N * sizeof(double), cudaMemcpyDeviceToHost);
+        tracked_cudaFree(d_eri_mo);
+
+        double E_os = 0.0, E_ss = 0.0;
+        #pragma omp parallel for reduction(+:E_os,E_ss)
+        for (size_t gid = 0; gid < total; gid++) {
+            size_t t = gid;
+            int b_ = (int)(t % num_vir); t /= num_vir;
+            int a_ = (int)(t % num_vir); t /= num_vir;
+            int j  = (int)(t % active_occ); t /= active_occ;
+            int i  = (int)(t % active_occ);
+            i += num_frozen; j += num_frozen;
+            int a = num_occ + a_, b = num_occ + b_;
+            double denom = h_eps[i] + h_eps[j] - h_eps[a] - h_eps[b];
+            double iajb = h_eri[(((size_t)i*N + a)*N + j)*N + b];
+            E_os += iajb * iajb / denom;
+            double ibja = h_eri[(((size_t)i*N + b)*N + j)*N + a];
+            E_ss += iajb * (iajb - ibja) / denom;
+        }
+
+        std::cout << "  E_os = " << std::setprecision(12) << E_os
+                  << "  E_ss = " << E_ss << std::endl;
+        if (mode == 0) {
+            real_t E_SCS = (6.0/5.0) * E_os + (1.0/3.0) * E_ss;
+            std::cout << "  SCS-MP2 energy (c_os=6/5, c_ss=1/3): " << E_SCS << std::endl;
+            return E_SCS;
+        } else {
+            real_t E_SOS = 1.3 * E_os;
+            std::cout << "  SOS-MP2 energy (c_os=1.3): " << E_SOS << std::endl;
+            return E_SOS;
+        }
+    }
+
+    // Non-frozen: use OVOV path (memory efficient, no full MO-ERI)
+    double* d_eri_tmp;
+    tracked_cudaMalloc(&d_eri_tmp, sizeof(double) * num_occ * (size_t)num_basis * num_basis * num_basis);
+    if (!d_eri_tmp) { THROW_EXCEPTION("cudaMalloc failed for d_eri_tmp."); }
+
+    {
+        std::string str = "Computing AO -> MO (ia|jb) integral transformation... ";
+        PROFILE_ELAPSED_TIME(str);
+        // d_eri will be overwritten with OVOV MO ERIs
+        transform_eri_ao2mo_dgemm_ovov(d_eri, d_eri_tmp, d_C, num_occ, num_vir);
+        cudaDeviceSynchronize();
+    }
+    double* d_eri_mo_ovov = d_eri;
+    tracked_cudaFree(d_eri_tmp);
+
+    const size_t total = (size_t)num_occ * num_vir * num_occ * num_vir;
+
+    double* d_E_os = nullptr;
+    double* d_E_ss = nullptr;
+    tracked_cudaMalloc(&d_E_os, sizeof(double));
+    tracked_cudaMalloc(&d_E_ss, sizeof(double));
+    cudaMemset(d_E_os, 0, sizeof(double));
+    cudaMemset(d_E_ss, 0, sizeof(double));
+
+    const int num_threads_per_warp = 32;
+    const int num_warps_per_block = 32;
+    const int num_threads_per_block = num_threads_per_warp * num_warps_per_block;
+    const size_t num_blocks = (total + num_threads_per_block - 1) / num_threads_per_block;
+    dim3 blocks(num_blocks);
+    dim3 threads(num_threads_per_warp, num_warps_per_block);
+
+    if (!gpu::gpu_available()) {
+        auto ovov2seq_cpu = [&](int i, int a, int j, int b) -> size_t {
+            return (((size_t)i * num_vir + a) * num_occ + j) * num_vir + b;
+        };
+        double cpu_os = 0.0, cpu_ss = 0.0;
+        #pragma omp parallel for reduction(+:cpu_os,cpu_ss)
+        for (size_t seq = 0; seq < total; seq++) {
+            int ia = (int)(seq / (num_occ * num_vir));
+            int jb = (int)(seq % (num_occ * num_vir));
+            int i = ia / num_vir, a = ia % num_vir;
+            int j = jb / num_vir, b = jb % num_vir;
+            double iajb = d_eri_mo_ovov[ovov2seq_cpu(i, a, j, b)];
+            double jaib = d_eri_mo_ovov[ovov2seq_cpu(j, a, i, b)];
+            double denom = d_eps[i] + d_eps[j] - d_eps[num_occ + a] - d_eps[num_occ + b];
+            cpu_os += iajb * iajb / denom;
+            cpu_ss += iajb * (iajb - jaib) / denom;
+        }
+        *d_E_os = cpu_os;
+        *d_E_ss = cpu_ss;
+    } else {
+        mp2_scs_kernel_ovov<<<blocks, threads>>>(d_E_os, d_E_ss, d_eri_mo_ovov, d_eps, num_occ, num_vir);
+        cudaDeviceSynchronize();
+    }
+
+    double h_E_os = 0.0, h_E_ss = 0.0;
+    cudaMemcpy(&h_E_os, d_E_os, sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_E_ss, d_E_ss, sizeof(double), cudaMemcpyDeviceToHost);
+    tracked_cudaFree(d_E_os);
+    tracked_cudaFree(d_E_ss);
+
+    std::cout << "  E_os = " << std::setprecision(12) << h_E_os
+              << "  E_ss = " << h_E_ss
+              << "  E_MP2 = " << (h_E_os + h_E_ss) << std::endl;
+
+    if (mode == 0) {
+        real_t E_SCS = (6.0/5.0) * h_E_os + (1.0/3.0) * h_E_ss;
+        std::cout << "  SCS-MP2 energy (c_os=6/5, c_ss=1/3): " << E_SCS << std::endl;
+        return E_SCS;
+    } else {
+        real_t E_SOS = 1.3 * h_E_os;
+        std::cout << "  SOS-MP2 energy (c_os=1.3): " << E_SOS << std::endl;
+        return E_SOS;
+    }
+}
+
+real_t ERI_Stored_RHF::compute_scs_mp2_energy() {
+    return compute_scaled_mp2_energy_impl(rhf_, eri_matrix_.device_ptr(), 0);
+}
+
+real_t ERI_Stored_RHF::compute_sos_mp2_energy() {
+    return compute_scaled_mp2_energy_impl(rhf_, eri_matrix_.device_ptr(), 1);
+}
 
 // ============================================================
 //  MP2 Effective Densities for Gradient Calculation

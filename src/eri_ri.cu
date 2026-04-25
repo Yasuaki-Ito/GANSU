@@ -25,6 +25,7 @@
 #include "rhf.hpp"
 #include "device_host_memory.hpp"
 #include "int3c2e.hpp"
+#include "laplace_quadrature.hpp"
 
 namespace gansu{
 
@@ -707,6 +708,279 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
 }
 
 
+
+// ============================================================
+//  Laplace-transformed MP2 from B_ia^P
+//  E_os via Laplace: ||C(t)^T C(t)||_F^2 per quadrature point
+//  E_ss via Laplace: sum_{ij} ||C_i(t)^T C_j(t)||_F^2 per point
+// ============================================================
+
+// GPU kernel: scale B_ia^P → C_ia^P(t) = B_ia^P * exp(-t * (eps[nocc+a] - eps[i]) / 2)
+__global__ void laplace_scale_B_kernel(
+    const real_t* __restrict__ d_B,
+    real_t* __restrict__ d_C,
+    const real_t* __restrict__ d_eps,
+    int nocc, int nvir, int naux, double t_half)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t ov = (size_t)nocc * nvir;
+    if (idx >= ov * naux) return;
+
+    size_t P = idx / ov;
+    size_t ia = idx % ov;
+    int i = (int)(ia / nvir);
+    int a = (int)(ia % nvir);
+
+    double scale = exp(-t_half * (d_eps[nocc + a] - d_eps[i]));
+    d_C[idx] = d_B[idx] * scale;
+}
+
+// Compute LT-MP2 spin components: E_os and E_ss
+// d_B: B_ia^P in column-major [nocc*nvir, naux] (after MO transform)
+// Returns {E_os, E_ss}
+static std::pair<real_t, real_t> compute_lt_mp2_spin_components(
+    real_t* d_B, int naux, int nocc, int nvir, const real_t* d_eps,
+    int n_laplace_points)
+{
+    const size_t ov = (size_t)nocc * nvir;
+
+    // Determine denominator range for quadrature
+    std::vector<double> h_eps(nocc + nvir);
+    cudaMemcpy(h_eps.data(), d_eps, (nocc + nvir) * sizeof(double), cudaMemcpyDeviceToHost);
+
+    double eps_min = h_eps[nocc] - h_eps[nocc - 1]; // HOMO-LUMO gap
+    double eps_max = h_eps[nocc + nvir - 1] - h_eps[0]; // max denominator
+    if (eps_min < 1e-6) eps_min = 1e-6; // safety
+
+    auto quad = generate_laplace_quadrature(eps_min, eps_max, n_laplace_points);
+
+    std::cout << "  LT-MP2: " << quad.num_points << " quadrature points, "
+              << "eps_range=[" << std::scientific << std::setprecision(3)
+              << eps_min << ", " << eps_max << "]" << std::defaultfloat << std::endl;
+
+    // Allocate scaled B matrix C(t)
+    real_t* d_C = nullptr;
+    tracked_cudaMalloc(&d_C, ov * naux * sizeof(real_t));
+
+    // Allocate X = C^T C for OS term [naux × naux]
+    real_t* d_X = nullptr;
+    tracked_cudaMalloc(&d_X, (size_t)naux * naux * sizeof(real_t));
+
+    // Allocate N^{ij} and its transpose for exchange [naux × naux]
+    real_t* d_Nij = nullptr;
+    real_t* d_Nij_T = nullptr;
+    tracked_cudaMalloc(&d_Nij, (size_t)naux * naux * sizeof(real_t));
+    tracked_cudaMalloc(&d_Nij_T, (size_t)naux * naux * sizeof(real_t));
+
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    const double alpha = 1.0, beta = 0.0;
+
+    double E_os_total = 0.0, E_ss_total = 0.0;
+    int threads = 256;
+
+    for (int k = 0; k < quad.num_points; k++) {
+        double t = quad.points[k];
+        double w = quad.weights[k];
+        double t_half = t / 2.0;
+
+        // Scale B → C(t): C_ia^P = B_ia^P * exp(-t/2 * (eps_a - eps_i))
+        {
+            size_t total = ov * naux;
+            int blocks = (int)((total + threads - 1) / threads);
+            laplace_scale_B_kernel<<<blocks, threads>>>(d_B, d_C, d_eps, nocc, nvir, naux, t_half);
+        }
+
+        // === Opposite-spin (Coulomb): X = C^T C, E_os = ||X||_F^2 ===
+        // C is col-major [ov, naux], so X = C^T C is [naux, naux]
+        cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    naux, naux, (int)ov,
+                    &alpha, d_C, (int)ov, d_C, (int)ov,
+                    &beta, d_X, naux);
+
+        // ||X||_F^2 = dot(X, X)
+        double X_norm_sq = 0.0;
+        cublasDdot(handle, naux * naux, d_X, 1, d_X, 1, &X_norm_sq);
+        E_os_total -= w * X_norm_sq;
+
+        // === Same-spin (exchange): Σ_{ij} ||C_i^T C_j||_F^2 ===
+        // C_i is a [nvir, naux] submatrix: C[i*nvir:(i+1)*nvir, :]
+        // N^{ij} = C_i^T C_j is [naux, naux]
+        // E_ex = Σ_{ij} ||N^{ij}||_F^2
+        double E_ex_t = 0.0;
+        for (int i = 0; i < nocc; i++) {
+            for (int j = 0; j < nocc; j++) {
+                // C_i starts at offset i*nvir in the ov dimension
+                const real_t* d_Ci = d_C + (size_t)i * nvir;  // col-major stride = ov
+                const real_t* d_Cj = d_C + (size_t)j * nvir;
+
+                // N^{ij} = C_i^T @ C_j where C_i is [nvir, naux] col-major with lda=ov
+                cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                            naux, naux, nvir,
+                            &alpha, d_Ci, (int)ov, d_Cj, (int)ov,
+                            &beta, d_Nij, naux);
+
+                // Tr(N^2) = dot(vec(N), vec(N^T)) — need transpose
+                const double zero = 0.0, one = 1.0;
+                cublasDgeam(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                            naux, naux, &one, d_Nij, naux, &zero, d_Nij, naux, d_Nij_T, naux);
+
+                double trN2 = 0.0;
+                cublasDdot(handle, naux * naux, d_Nij, 1, d_Nij_T, 1, &trN2);
+                E_ex_t += trN2;
+            }
+        }
+        // E_ss = E_os - E_exchange (for closed-shell RHF)
+        // Standard MP2: E = 2*E_os - E_exchange, so E_ss = E_os - E_exchange
+        double E_os_t = -X_norm_sq;
+        double E_ex_t_neg = -E_ex_t;
+        double E_ss_t = E_os_t - E_ex_t_neg; // = -X_norm_sq + E_ex_t
+
+        E_ss_total += w * E_ss_t;
+    }
+
+    cublasDestroy(handle);
+    tracked_cudaFree(d_C);
+    tracked_cudaFree(d_X);
+    tracked_cudaFree(d_Nij);
+    tracked_cudaFree(d_Nij_T);
+
+    std::cout << "  LT-MP2: E_os = " << std::setprecision(12) << E_os_total
+              << "  E_ss = " << E_ss_total
+              << "  E_MP2 = " << (E_os_total + E_ss_total) << std::endl;
+
+    return {E_os_total, E_ss_total};
+}
+
+// LT-SOS-MP2: E_os only via Laplace — no exchange loop, DGEMM only
+static real_t compute_lt_sos_mp2_energy_from_B(
+    real_t* d_B, int naux, int nocc, int nvir, const real_t* d_eps,
+    int n_laplace_points)
+{
+    const size_t ov = (size_t)nocc * nvir;
+
+    std::vector<double> h_eps(nocc + nvir);
+    cudaMemcpy(h_eps.data(), d_eps, (nocc + nvir) * sizeof(double), cudaMemcpyDeviceToHost);
+
+    double eps_min = h_eps[nocc] - h_eps[nocc - 1];
+    double eps_max = h_eps[nocc + nvir - 1] - h_eps[0];
+    if (eps_min < 1e-6) eps_min = 1e-6;
+
+    auto quad = generate_laplace_quadrature(eps_min, eps_max, n_laplace_points);
+
+    std::cout << "  LT-SOS-MP2: " << quad.num_points << " quadrature points" << std::endl;
+
+    real_t* d_C = nullptr;
+    tracked_cudaMalloc(&d_C, ov * naux * sizeof(real_t));
+
+    real_t* d_X = nullptr;
+    tracked_cudaMalloc(&d_X, (size_t)naux * naux * sizeof(real_t));
+
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    const double alpha = 1.0, beta = 0.0;
+
+    double E_os = 0.0;
+    int threads = 256;
+
+    for (int k = 0; k < quad.num_points; k++) {
+        double t_half = quad.points[k] / 2.0;
+        double w = quad.weights[k];
+
+        // Scale B → C(t)
+        size_t total = ov * naux;
+        int blocks = (int)((total + threads - 1) / threads);
+        laplace_scale_B_kernel<<<blocks, threads>>>(d_B, d_C, d_eps, nocc, nvir, naux, t_half);
+
+        // X = C^T C [naux × naux]
+        cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    naux, naux, (int)ov,
+                    &alpha, d_C, (int)ov, d_C, (int)ov,
+                    &beta, d_X, naux);
+
+        // E_os(t) = ||X||_F^2
+        double X_norm_sq = 0.0;
+        cublasDdot(handle, naux * naux, d_X, 1, d_X, 1, &X_norm_sq);
+        E_os -= w * X_norm_sq;
+    }
+
+    cublasDestroy(handle);
+    tracked_cudaFree(d_C);
+    tracked_cudaFree(d_X);
+
+    real_t E_SOS = 1.3 * E_os;
+    std::cout << "  LT-SOS-MP2: E_os = " << std::setprecision(12) << E_os
+              << "  SOS-MP2 (1.3*E_os) = " << E_SOS << std::endl;
+    return E_SOS;
+}
+
+// Helper: copy B, transform AO→MO, return B_ia^P on device (caller must free)
+real_t* ERI_RI_RHF::build_B_ia() {
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = rhf_.get_num_basis() - nocc;
+    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+    const int naux = num_auxiliary_basis_;
+
+    const size_t B_size = (size_t)naux * num_basis_ * num_basis_;
+    real_t* d_B_copy = nullptr;
+    tracked_cudaMalloc(&d_B_copy, B_size * sizeof(real_t));
+    cudaMemcpy(d_B_copy, intermediate_matrix_B_.device_ptr(), B_size * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+    real_t* d_tmp = nullptr;
+    tracked_cudaMalloc(&d_tmp, sizeof(double) * num_basis_ * (size_t)nvir * naux);
+    transform_intermediate_matrix(num_basis_, nocc, nvir, naux, d_C, d_B_copy, d_tmp);
+    tracked_cudaFree(d_tmp);
+
+    return d_B_copy;  // now contains B_ia^P [nocc*nvir, naux] col-major
+}
+
+real_t ERI_RI_RHF::compute_lt_sos_mp2_energy() {
+    PROFILE_FUNCTION();
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = rhf_.get_num_basis() - nocc;
+    real_t* d_B_ia = build_B_ia();
+    real_t E_SOS = compute_lt_sos_mp2_energy_from_B(d_B_ia, num_auxiliary_basis_, nocc, nvir,
+                                                     rhf_.get_orbital_energies().device_ptr(), 30);
+    tracked_cudaFree(d_B_ia);
+    return E_SOS;
+}
+
+real_t ERI_RI_RHF::compute_lt_mp2_energy() {
+    PROFILE_FUNCTION();
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = rhf_.get_num_basis() - nocc;
+    real_t* d_B_ia = build_B_ia();
+    auto [E_os, E_ss] = compute_lt_mp2_spin_components(d_B_ia, num_auxiliary_basis_, nocc, nvir,
+                                                        rhf_.get_orbital_energies().device_ptr(), 30);
+    tracked_cudaFree(d_B_ia);
+    return E_os + E_ss;
+}
+
+real_t ERI_RI_RHF::compute_scs_mp2_energy() {
+    PROFILE_FUNCTION();
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = rhf_.get_num_basis() - nocc;
+    real_t* d_B_ia = build_B_ia();
+    auto [E_os, E_ss] = compute_lt_mp2_spin_components(d_B_ia, num_auxiliary_basis_, nocc, nvir,
+                                                        rhf_.get_orbital_energies().device_ptr(), 30);
+    tracked_cudaFree(d_B_ia);
+    real_t E_SCS = (6.0/5.0) * E_os + (1.0/3.0) * E_ss;
+    std::cout << "  RI-SCS-MP2 (c_os=6/5, c_ss=1/3): " << std::setprecision(12) << E_SCS << std::endl;
+    return E_SCS;
+}
+
+real_t ERI_RI_RHF::compute_sos_mp2_energy() {
+    PROFILE_FUNCTION();
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = rhf_.get_num_basis() - nocc;
+    real_t* d_B_ia = build_B_ia();
+    auto [E_os, E_ss] = compute_lt_mp2_spin_components(d_B_ia, num_auxiliary_basis_, nocc, nvir,
+                                                        rhf_.get_orbital_energies().device_ptr(), 30);
+    tracked_cudaFree(d_B_ia);
+    real_t E_SOS = 1.3 * E_os;
+    std::cout << "  RI-SOS-MP2 (c_os=1.3): " << std::setprecision(12) << E_SOS << std::endl;
+    return E_SOS;
+}
 
 // ============================================================
 //  Common RI-MP2 computation from a given B matrix pointer.

@@ -195,6 +195,14 @@ void RHF::post_process_after_scf() {
         post_hf_energy_ = eri_method_->compute_fci_energy();
     }else if(post_hf_method == PostHFMethod::MP2){
         post_hf_energy_ = eri_method_->compute_mp2_energy();
+    }else if(post_hf_method == PostHFMethod::SCS_MP2){
+        post_hf_energy_ = eri_method_->compute_scs_mp2_energy();
+    }else if(post_hf_method == PostHFMethod::SOS_MP2){
+        post_hf_energy_ = eri_method_->compute_sos_mp2_energy();
+    }else if(post_hf_method == PostHFMethod::LT_MP2){
+        post_hf_energy_ = eri_method_->compute_lt_mp2_energy();
+    }else if(post_hf_method == PostHFMethod::LT_SOS_MP2){
+        post_hf_energy_ = eri_method_->compute_lt_sos_mp2_energy();
     }else if(post_hf_method == PostHFMethod::MP3){
         post_hf_energy_ = eri_method_->compute_mp3_energy();
     }else if(post_hf_method == PostHFMethod::MP4){
@@ -947,6 +955,14 @@ void RHF::report() {
             std::cout << "FCI" << std::endl;
         }else if(get_post_hf_method() == PostHFMethod::MP2){
             std::cout << "MP2" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::SCS_MP2){
+            std::cout << "SCS-MP2" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::SOS_MP2){
+            std::cout << "SOS-MP2" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::LT_MP2){
+            std::cout << "LT-MP2" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::LT_SOS_MP2){
+            std::cout << "LT-SOS-MP2" << std::endl;
         }else if(get_post_hf_method() == PostHFMethod::MP3){
             std::cout << "MP3" << std::endl;
         }else if(get_post_hf_method() == PostHFMethod::CC2){

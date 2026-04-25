@@ -96,6 +96,22 @@ public:
         THROW_EXCEPTION("MP2 energy computation is not supported for the selected ERI method.");
     }
 
+    virtual real_t compute_lt_mp2_energy(){
+        THROW_EXCEPTION("LT-MP2 energy computation is not supported for the selected ERI method.");
+    }
+
+    virtual real_t compute_lt_sos_mp2_energy(){
+        THROW_EXCEPTION("LT-SOS-MP2 energy computation is not supported for the selected ERI method.");
+    }
+
+    virtual real_t compute_scs_mp2_energy(){
+        THROW_EXCEPTION("SCS-MP2 energy computation is not supported for the selected ERI method.");
+    }
+
+    virtual real_t compute_sos_mp2_energy(){
+        THROW_EXCEPTION("SOS-MP2 energy computation is not supported for the selected ERI method.");
+    }
+
     /**
      * @brief Compute MP2 effective density matrices for gradient calculation
      * @param d_P_eff   Output: effective 1-PDM in AO basis (num_basis × num_basis)
@@ -242,6 +258,8 @@ public:
         if( method == PostHFMethod::None // always supported
             || method == PostHFMethod::FCI  // The stored ERI method supports FCI
             || method == PostHFMethod::MP2  // The stored ERI method supports MP2
+            || method == PostHFMethod::SCS_MP2  // SCS-MP2
+            || method == PostHFMethod::SOS_MP2  // SOS-MP2
             || method == PostHFMethod::MP3  // The stored ERI method supports MP3
             || method == PostHFMethod::MP4  // The stored ERI method supports MP4
             || method == PostHFMethod::CC2  // The stored ERI method supports CC2
@@ -303,6 +321,10 @@ public:
     bool supports_post_hf_method(PostHFMethod method) const override {
         if( method == PostHFMethod::None
          || method == PostHFMethod::MP2
+         || method == PostHFMethod::SCS_MP2
+         || method == PostHFMethod::SOS_MP2
+         || method == PostHFMethod::LT_MP2
+         || method == PostHFMethod::LT_SOS_MP2
          || method == PostHFMethod::MP3
          || method == PostHFMethod::CC2
          || method == PostHFMethod::CCSD
@@ -380,6 +402,8 @@ public:
     bool supports_post_hf_method(PostHFMethod method) const override {
         if( method == PostHFMethod::None
          || method == PostHFMethod::MP2
+         || method == PostHFMethod::SCS_MP2
+         || method == PostHFMethod::SOS_MP2
          || method == PostHFMethod::MP3
          || method == PostHFMethod::MP4
          || method == PostHFMethod::CC2
@@ -455,6 +479,8 @@ public:
         // With build_mo_eri, all post-HF methods are supported
         if( method == PostHFMethod::None
          || method == PostHFMethod::MP2
+         || method == PostHFMethod::SCS_MP2
+         || method == PostHFMethod::SOS_MP2
          || method == PostHFMethod::MP3
          || method == PostHFMethod::MP4
          || method == PostHFMethod::CC2
@@ -527,7 +553,8 @@ public:
     const real_t* get_eri_matrix_device() const override;
 
     bool supports_post_hf_method(PostHFMethod method) const override {
-        return method == PostHFMethod::None || method == PostHFMethod::MP2;
+        return method == PostHFMethod::None || method == PostHFMethod::MP2
+            || method == PostHFMethod::SCS_MP2 || method == PostHFMethod::SOS_MP2;
     }
 
 protected:

@@ -763,7 +763,9 @@ double ump2_from_aoeri_via_required_moeri(
     const int num_basis,
     const int num_occ_al,
     const int num_occ_be,
-    const int num_frozen = 0)
+    const int num_frozen = 0,
+    double* out_E_os = nullptr,
+    double* out_E_ss = nullptr)
 {
     double* d_eri_tmp1 = nullptr;
     double* d_eri_tmp2 = nullptr;
@@ -778,8 +780,14 @@ double ump2_from_aoeri_via_required_moeri(
     const int num_vir_be = num_basis - num_occ_be;
 
     double* d_second_energy = nullptr;
+    double* d_energy_ss = nullptr;
+    double* d_energy_os = nullptr;
     tracked_cudaMalloc(&d_second_energy, sizeof(double));
+    tracked_cudaMalloc(&d_energy_ss, sizeof(double));
+    tracked_cudaMalloc(&d_energy_os, sizeof(double));
     cudaMemset(d_second_energy, 0, sizeof(double));
+    cudaMemset(d_energy_ss, 0, sizeof(double));
+    cudaMemset(d_energy_os, 0, sizeof(double));
 
     const int num_threads_per_warp = 32;
     const int num_warps_per_block = 32;
@@ -825,6 +833,7 @@ double ump2_from_aoeri_via_required_moeri(
                             sum_aa += iajb*(iajb-jaib) / (ea[i]+ea[j]-ea[a]-ea[b]);
                         }
             *d_second_energy += sum_aa * 0.5;
+            *d_energy_ss += sum_aa * 0.5;
         }
 
         // beta-beta: 0.5 * sum (ia|jb)[(ia|jb)-(ja|ib)] / denom
@@ -840,6 +849,7 @@ double ump2_from_aoeri_via_required_moeri(
                             sum_bb += iajb*(iajb-jaib) / (eb[i]+eb[j]-eb[a]-eb[b]);
                         }
             *d_second_energy += sum_bb * 0.5;
+            *d_energy_ss += sum_bb * 0.5;
         }
 
         // alpha-beta: sum (ia_alpha|jb_beta)^2 / denom
@@ -854,6 +864,7 @@ double ump2_from_aoeri_via_required_moeri(
                             sum_ab += (iajb*iajb) / (ea[i]+eb[j]-ea[a]-eb[b]);
                         }
             *d_second_energy += sum_ab;
+            *d_energy_os += sum_ab;
         }
     } else {
         // ---------- GPU path ----------
@@ -882,6 +893,7 @@ double ump2_from_aoeri_via_required_moeri(
             const dim3 threads(num_threads_per_warp, num_warps_per_block);
 
             compute_ump2_energy_contrib_ss<<<blocks, threads>>>(d_second_energy, d_eri_mo_ovov_aa, d_orbital_energies_al, num_occ_al, num_vir_al, num_frozen);
+            compute_ump2_energy_contrib_ss<<<blocks, threads>>>(d_energy_ss, d_eri_mo_ovov_aa, d_orbital_energies_al, num_occ_al, num_vir_al, num_frozen);
             cudaDeviceSynchronize();
         }
         cudaEventRecord(end);
@@ -909,6 +921,7 @@ double ump2_from_aoeri_via_required_moeri(
             const dim3 threads(num_threads_per_warp, num_warps_per_block);
 
             compute_ump2_energy_contrib_ss<<<blocks, threads>>>(d_second_energy, d_eri_mo_ovov_bb, d_orbital_energies_be, num_occ_be, num_vir_be, num_frozen);
+            compute_ump2_energy_contrib_ss<<<blocks, threads>>>(d_energy_ss, d_eri_mo_ovov_bb, d_orbital_energies_be, num_occ_be, num_vir_be, num_frozen);
             cudaDeviceSynchronize();
         }
         cudaEventRecord(end);
@@ -937,6 +950,7 @@ double ump2_from_aoeri_via_required_moeri(
             const dim3 threads(num_threads_per_warp, num_warps_per_block);
 
             compute_ump2_energy_contrib_os<<<blocks, threads>>>(d_second_energy, d_eri_mo_ovov_ab, d_orbital_energies_al, d_orbital_energies_be, num_occ_al, num_vir_al, num_occ_be, num_vir_be, num_frozen);
+            compute_ump2_energy_contrib_os<<<blocks, threads>>>(d_energy_os, d_eri_mo_ovov_ab, d_orbital_energies_al, d_orbital_energies_be, num_occ_al, num_vir_al, num_occ_be, num_vir_be, num_frozen);
             cudaDeviceSynchronize();
         }
         cudaEventRecord(end);
@@ -948,13 +962,20 @@ double ump2_from_aoeri_via_required_moeri(
         cudaEventDestroy(end);
     }
 
-    double h_second_energy = 0.0;
+    double h_second_energy = 0.0, h_E_ss = 0.0, h_E_os = 0.0;
     cudaMemcpy(&h_second_energy, d_second_energy, sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_E_ss, d_energy_ss, sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_E_os, d_energy_os, sizeof(double), cudaMemcpyDeviceToHost);
     std::cout << "UMP2 correlation energy: " << std::setprecision(12) << h_second_energy << std::endl;
+
+    if (out_E_os) *out_E_os = h_E_os;
+    if (out_E_ss) *out_E_ss = h_E_ss;
 
     tracked_cudaFree(d_eri_tmp1);
     tracked_cudaFree(d_eri_tmp2);
     tracked_cudaFree(d_second_energy);
+    tracked_cudaFree(d_energy_ss);
+    tracked_cudaFree(d_energy_os);
 
     return h_second_energy;
 }
@@ -993,7 +1014,47 @@ real_t ERI_Stored_UHF::compute_mp2_energy()
     return E_UMP2;
 }
 
+// mode: 0 = SCS, 1 = SOS
+static real_t compute_scaled_ump2_impl(UHF& uhf, real_t* d_eri, int mode) {
+    const int num_basis = uhf.get_num_basis();
+    const int num_occ_al = uhf.get_num_alpha_spins();
+    const int num_occ_be = uhf.get_num_beta_spins();
+    const int num_frozen = uhf.get_num_frozen_core();
 
+    DeviceHostMatrix<real_t>& Ca = uhf.get_coefficient_matrix_a();
+    DeviceHostMatrix<real_t>& Cb = uhf.get_coefficient_matrix_b();
+    DeviceHostMemory<real_t>& ea = uhf.get_orbital_energies_a();
+    DeviceHostMemory<real_t>& eb = uhf.get_orbital_energies_b();
+
+    double E_os = 0.0, E_ss = 0.0;
+    ump2_from_aoeri_via_required_moeri(
+        d_eri, Ca.device_ptr(), Cb.device_ptr(),
+        ea.device_ptr(), eb.device_ptr(),
+        num_basis, num_occ_al, num_occ_be, num_frozen,
+        &E_os, &E_ss);
+
+    std::cout << "  E_os = " << std::setprecision(12) << E_os
+              << "  E_ss = " << E_ss
+              << "  E_UMP2 = " << (E_os + E_ss) << std::endl;
+
+    if (mode == 0) {
+        real_t E_SCS = (6.0/5.0) * E_os + (1.0/3.0) * E_ss;
+        std::cout << "  SCS-UMP2 energy (c_os=6/5, c_ss=1/3): " << E_SCS << std::endl;
+        return E_SCS;
+    } else {
+        real_t E_SOS = 1.3 * E_os;
+        std::cout << "  SOS-UMP2 energy (c_os=1.3): " << E_SOS << std::endl;
+        return E_SOS;
+    }
+}
+
+real_t ERI_Stored_UHF::compute_scs_mp2_energy() {
+    return compute_scaled_ump2_impl(uhf_, eri_matrix_.device_ptr(), 0);
+}
+
+real_t ERI_Stored_UHF::compute_sos_mp2_energy() {
+    return compute_scaled_ump2_impl(uhf_, eri_matrix_.device_ptr(), 1);
+}
 
 
 
