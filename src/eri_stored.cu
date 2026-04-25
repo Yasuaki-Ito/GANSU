@@ -8176,18 +8176,41 @@ real_t ERI_Stored_RHF::compute_ccsd_energy() {
 //  CCSD 1-RDM (Lambda density) for ERI_Stored_RHF — DMET / property analysis
 // ----------------------------------------------------------------------------
 
+// GPU kernel: trim full MO ERI from num_basis^4 to na_active^4
+// eri_trimmed[p,q,r,s] = eri_full[offset+p, offset+q, offset+r, offset+s]
+__global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ eri_full,
+                                            real_t* __restrict__ eri_trimmed,
+                                            int N_full, int na_active, int offset)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t M = na_active;
+    size_t total = M * M * M * M;
+    if (idx >= total) return;
+    int s = idx % M; size_t rem = idx / M;
+    int r = rem % M; rem /= M;
+    int q = rem % M;
+    int p = (int)(rem / M);
+    size_t N = N_full;
+    eri_trimmed[idx] = eri_full[((size_t)(offset+p)*N + (offset+q))*N*N + (size_t)(offset+r)*N + (offset+s)];
+}
+
 void ERI_Stored_RHF::compute_ccsd_density() {
     PROFILE_FUNCTION();
 
     const int num_basis = rhf_.get_num_basis();
-    const int num_occ = rhf_.get_num_electrons() / 2;
+    const int num_occ = rhf_.get_num_electrons() / 2;  // full occupied (including frozen)
+    const int num_frozen = rhf_.get_num_frozen_core();
+    const int active_occ = num_occ - num_frozen;
     const int num_vir = num_basis - num_occ;
+    const int na_active = active_occ + num_vir;  // active + virtual orbital count
     const size_t N4 = (size_t)num_basis * num_basis * num_basis * num_basis;
-    const size_t t1_sz = (size_t)num_occ * num_vir;
-    const size_t t2_sz = (size_t)num_occ * num_occ * num_vir * num_vir;
+    const size_t t1_sz = (size_t)active_occ * num_vir;
+    const size_t t2_sz = (size_t)active_occ * active_occ * num_vir * num_vir;
 
     std::cout << "\n---- CCSD 1-RDM (Lambda density) ----" << std::endl;
-    std::cout << "  nocc=" << num_occ << " nvir=" << num_vir
+    std::cout << "  nocc=" << num_occ;
+    if (num_frozen > 0) std::cout << " (active=" << active_occ << ", frozen=" << num_frozen << ")";
+    std::cout << " nvir=" << num_vir
               << " nao=" << num_basis << std::endl;
 
     const real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
@@ -8202,30 +8225,71 @@ void ERI_Stored_RHF::compute_ccsd_density() {
         d_eri_mo = build_mo_eri(d_C, num_basis);  // CPU AO->MO via Eigen
     }
 
-    // Step 2: Solve CCSD T amplitudes (returned as device pointers)
+    // Step 2: Solve CCSD T amplitudes (returned as device pointers, active space dimensions)
     real_t* d_t1 = nullptr;
     real_t* d_t2 = nullptr;
     real_t E_CCSD = ccsd_spatial_orbital(eri_matrix_.device_ptr(), d_C, d_eps,
                                           num_basis, num_occ, false, nullptr,
-                                          &d_t1, &d_t2, d_eri_mo);
+                                          &d_t1, &d_t2, d_eri_mo, num_frozen);
     rhf_.set_post_hf_energy(E_CCSD);
     std::cout << "  CCSD energy: " << std::fixed << std::setprecision(10)
               << E_CCSD << " Ha" << std::endl;
 
-    // Step 3: Lambda solver (GPU when available, CPU fallback)
+    // Step 3: Prepare ERI and epsilon for Lambda solver
+    // For frozen core: trim ERI to active+virtual space, shift epsilon pointer
+    real_t* d_eri_lambda = d_eri_mo;      // default: use full ERI
+    bool free_eri_lambda = false;
+    const real_t* d_eps_lambda = d_eps;   // default: use full epsilon
+
+    if (num_frozen > 0) {
+        // Trim MO ERI: eri_trimmed[p,q,r,s] = eri_full[F+p, F+q, F+r, F+s]
+        const size_t na4 = (size_t)na_active * na_active * na_active * na_active;
+        tracked_cudaMalloc(&d_eri_lambda, na4 * sizeof(real_t));
+        free_eri_lambda = true;
+
+        if (!gpu::gpu_available()) {
+            // CPU trim
+            const size_t N3 = (size_t)num_basis * num_basis * num_basis;
+            const size_t N2 = (size_t)num_basis * num_basis;
+            #pragma omp parallel for collapse(2)
+            for (int p = 0; p < na_active; p++)
+                for (int q = 0; q < na_active; q++)
+                    for (int r = 0; r < na_active; r++)
+                        for (int s = 0; s < na_active; s++) {
+                            size_t src = (size_t)(num_frozen+p)*N3 + (size_t)(num_frozen+q)*N2
+                                       + (size_t)(num_frozen+r)*num_basis + (num_frozen+s);
+                            size_t dst = ((size_t)p*na_active*na_active + (size_t)q*na_active + r)*(size_t)na_active + s;
+                            d_eri_lambda[dst] = d_eri_mo[src];
+                        }
+        } else {
+            int threads = 256;
+            int blocks = (int)((na4 + threads - 1) / threads);
+            trim_eri_frozen_core_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_lambda,
+                                                              num_basis, na_active, num_frozen);
+            cudaDeviceSynchronize();
+        }
+
+        // Shift epsilon pointer past frozen orbitals
+        d_eps_lambda = d_eps + num_frozen;
+    }
+
+    // Step 4: Lambda solver (GPU when available, CPU fallback)
     auto& D_mo = rhf_.get_ccsd_1rdm_mo();
     auto& D_ao = rhf_.get_ccsd_1rdm_ao();
     D_mo.assign((size_t)num_basis * num_basis, 0.0);
     D_ao.assign((size_t)num_basis * num_basis, 0.0);
 
+    // Lambda solver outputs density in active space: na_active × na_active
+    const size_t dmo_active_sz = (size_t)na_active * na_active;
+
     if (gpu::gpu_available()) {
         // GPU path: keep amplitudes/eri on device, no host roundtrip
-        real_t *d_l1=nullptr, *d_l2=nullptr, *d_D_mo=nullptr;
+        real_t *d_l1=nullptr, *d_l2=nullptr, *d_D_mo_active=nullptr;
         tracked_cudaMalloc(&d_l1, t1_sz * sizeof(real_t));
         tracked_cudaMalloc(&d_l2, t2_sz * sizeof(real_t));
-        tracked_cudaMalloc(&d_D_mo, (size_t)num_basis * num_basis * sizeof(real_t));
+        tracked_cudaMalloc(&d_D_mo_active, dmo_active_sz * sizeof(real_t));
 
-        bool conv = solve_ccsd_lambda_gpu(num_occ, num_vir, d_eps, d_eri_mo,
+        bool conv = solve_ccsd_lambda_gpu(active_occ, num_vir, d_eps_lambda, d_eri_lambda,
                                           d_t1, d_t2, d_l1, d_l2,
                                           100, 1e-8, 1);
         if (!conv) std::cout << "  Warning: Lambda did not fully converge" << std::endl;
@@ -8239,27 +8303,42 @@ void ERI_Stored_RHF::compute_ccsd_density() {
                       << "  ||l2||=" << n2 << std::defaultfloat << std::endl;
         }
 
-        build_ccsd_1rdm_mo_gpu(num_occ, num_vir, d_t1, d_t2, d_l1, d_l2, d_D_mo);
+        build_ccsd_1rdm_mo_gpu(active_occ, num_vir, d_t1, d_t2, d_l1, d_l2, d_D_mo_active);
 
-        // Download D_MO and AO transform on host (cheap)
-        cudaMemcpy(D_mo.data(), d_D_mo, (size_t)num_basis * num_basis * sizeof(real_t),
+        // Download active-space D_MO
+        std::vector<real_t> D_mo_active(dmo_active_sz);
+        cudaMemcpy(D_mo_active.data(), d_D_mo_active, dmo_active_sz * sizeof(real_t),
                    cudaMemcpyDeviceToHost);
+
+        // Embed into full num_basis × num_basis density
+        // Frozen core orbitals: D[i,i] = 2
+        for (int i = 0; i < num_frozen; i++)
+            D_mo[i * num_basis + i] = 2.0;
+        // Active+virtual block from Lambda
+        for (int p = 0; p < na_active; p++)
+            for (int q = 0; q < na_active; q++)
+                D_mo[(num_frozen + p) * num_basis + (num_frozen + q)] = D_mo_active[p * na_active + q];
+
         std::vector<real_t> h_C(num_basis * num_basis);
         cudaMemcpy(h_C.data(), d_C, num_basis * num_basis * sizeof(real_t), cudaMemcpyDeviceToHost);
         transform_density_mo_to_ao_cpu(num_basis, h_C.data(), D_mo.data(), D_ao.data());
 
-        tracked_cudaFree(d_l1); tracked_cudaFree(d_l2); tracked_cudaFree(d_D_mo);
+        tracked_cudaFree(d_l1); tracked_cudaFree(d_l2); tracked_cudaFree(d_D_mo_active);
     } else {
         // CPU fallback
-        std::vector<real_t> h_t1(t1_sz), h_t2(t2_sz), h_eri_mo(N4), h_eps(num_basis), h_C(num_basis*num_basis);
-        cudaMemcpy(h_t1.data(),     d_t1,     t1_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_t2.data(),     d_t2,     t2_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_eri_mo.data(), d_eri_mo, N4    * sizeof(real_t), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_eps.data(),    d_eps,    num_basis * sizeof(real_t), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_C.data(),      d_C,      num_basis*num_basis * sizeof(real_t), cudaMemcpyDeviceToHost);
+        const size_t eri_lambda_sz = (num_frozen > 0)
+            ? (size_t)na_active * na_active * na_active * na_active : N4;
+        std::vector<real_t> h_t1(t1_sz), h_t2(t2_sz), h_eri_lambda(eri_lambda_sz);
+        std::vector<real_t> h_eps(num_basis), h_C(num_basis*num_basis);
+        cudaMemcpy(h_t1.data(),         d_t1,         t1_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_t2.data(),         d_t2,         t2_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_eri_lambda.data(),  d_eri_lambda, eri_lambda_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_eps.data(),         d_eps,        num_basis * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_C.data(),           d_C,          num_basis*num_basis * sizeof(real_t), cudaMemcpyDeviceToHost);
 
         std::vector<real_t> h_l1(t1_sz), h_l2(t2_sz);
-        bool conv = solve_ccsd_lambda_cpu(num_occ, num_vir, h_eps.data(), h_eri_mo.data(),
+        bool conv = solve_ccsd_lambda_cpu(active_occ, num_vir,
+                                          h_eps.data() + num_frozen, h_eri_lambda.data(),
                                           h_t1.data(), h_t2.data(),
                                           h_l1.data(), h_l2.data(), 100, 1e-8, 1);
         if (!conv) std::cout << "  Warning: Lambda did not fully converge" << std::endl;
@@ -8271,12 +8350,23 @@ void ERI_Stored_RHF::compute_ccsd_density() {
                       << std::sqrt(n1) << "  ||l2||=" << std::sqrt(n2)
                       << std::defaultfloat << std::endl;
         }
-        build_ccsd_1rdm_mo_cpu(num_occ, num_vir, h_t1.data(), h_t2.data(),
-                               h_l1.data(), h_l2.data(), D_mo.data());
+
+        // Build active-space density
+        std::vector<real_t> D_mo_active(dmo_active_sz, 0.0);
+        build_ccsd_1rdm_mo_cpu(active_occ, num_vir, h_t1.data(), h_t2.data(),
+                               h_l1.data(), h_l2.data(), D_mo_active.data());
+
+        // Embed into full num_basis × num_basis density
+        for (int i = 0; i < num_frozen; i++)
+            D_mo[i * num_basis + i] = 2.0;
+        for (int p = 0; p < na_active; p++)
+            for (int q = 0; q < na_active; q++)
+                D_mo[(num_frozen + p) * num_basis + (num_frozen + q)] = D_mo_active[p * na_active + q];
+
         transform_density_mo_to_ao_cpu(num_basis, h_C.data(), D_mo.data(), D_ao.data());
     }
 
-    // Step 6: Sanity check — Tr(D_AO @ S) should equal Ne = 2*nocc
+    // Step 5: Sanity check — Tr(D_AO @ S) should equal Ne = 2*nocc (all electrons including frozen)
     const real_t* d_S = rhf_.get_overlap_matrix().device_ptr();
     std::vector<real_t> h_S((size_t)num_basis * num_basis);
     cudaMemcpy(h_S.data(), d_S, num_basis*num_basis*sizeof(real_t), cudaMemcpyDeviceToHost);
@@ -8296,6 +8386,7 @@ void ERI_Stored_RHF::compute_ccsd_density() {
     // Cleanup
     tracked_cudaFree(d_t1);
     tracked_cudaFree(d_t2);
+    if (free_eri_lambda) tracked_cudaFree(d_eri_lambda);
     tracked_cudaFree(d_eri_mo);
 }
 
