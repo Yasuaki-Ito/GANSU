@@ -56,16 +56,20 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             int num_frozen = 0);
 
 
+// GPU kernel for trimming MO ERI (defined in eri_stored.cu)
+__global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ eri_full,
+                                            real_t* __restrict__ eri_trimmed,
+                                            int N_full, int na_active, int offset);
+
 static void compute_eom_ccsd_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
-    if (rhf.get_num_frozen_core() > 0) {
-        THROW_EXCEPTION("EOM-CCSD does not yet support frozen core approximation. Use CIS or ADC(2) with frozen_core instead.");
-    }
-
+    const int num_frozen = rhf.get_num_frozen_core();
     const int num_basis = rhf.get_num_basis();
-    const int num_occ = rhf.get_num_electrons() / 2;
-    const int num_vir = num_basis - num_occ;
+    const int full_occ = rhf.get_num_electrons() / 2;
+    const int num_occ = full_occ - num_frozen;   // active occupied
+    const int num_vir = num_basis - full_occ;
+    const int na_active = num_occ + num_vir;     // active + virtual
     const int singles_dim = num_occ * num_vir;
     const int doubles_dim = num_occ * num_occ * num_vir * num_vir;
     const int total_dim = singles_dim + doubles_dim;
@@ -76,7 +80,9 @@ static void compute_eom_ccsd_impl(RHF& rhf, const real_t* d_eri_ao, int n_states
     const real_t* d_eps = orbital_energies.device_ptr();
 
     std::cout << "\n---- EOM-CCSD excited states ---- "
-              << "nocc=" << num_occ << ", nvir=" << num_vir
+              << "nocc=" << num_occ;
+    if (num_frozen > 0) std::cout << " (frozen=" << num_frozen << ")";
+    std::cout << ", nvir=" << num_vir
               << ", singles=" << singles_dim << ", doubles=" << doubles_dim
               << ", total=" << total_dim
               << ", nstates=" << n_states << std::endl;
@@ -87,12 +93,13 @@ static void compute_eom_ccsd_impl(RHF& rhf, const real_t* d_eri_ao, int n_states
         n_states = singles_dim;
     }
 
-    // Step 1: Solve CCSD ground state and extract T1/T2
+    // Step 1: Solve CCSD ground state and extract T1/T2 (active space dimensions)
     Timer ccsd_timer;
     real_t* d_t1 = nullptr;
     real_t* d_t2 = nullptr;
-    real_t E_CCSD = ccsd_spatial_orbital(d_eri_ao, d_C, d_eps, num_basis, num_occ,
-                                          false, nullptr, &d_t1, &d_t2, d_eri_mo_precomputed);
+    real_t E_CCSD = ccsd_spatial_orbital(d_eri_ao, d_C, d_eps, num_basis, full_occ,
+                                          false, nullptr, &d_t1, &d_t2, d_eri_mo_precomputed,
+                                          num_frozen);
 
     std::cout << "  CCSD correlation energy: " << std::fixed << std::setprecision(10)
               << E_CCSD << " Ha" << std::endl;
@@ -120,13 +127,47 @@ static void compute_eom_ccsd_impl(RHF& rhf, const real_t* d_eri_ao, int n_states
     std::cout << "  MO transform time: " << std::fixed << std::setprecision(3)
               << mo_timer.elapsed_seconds() << " s" << std::endl;
 
-    // Step 3: Build EOM-CCSD operator (takes ownership of T1, T2)
-    Timer build_timer;
-    EOMCCSDOperator eom_ccsd_op(d_eri_mo, d_eps,
-                                 d_t1, d_t2,
-                                 num_occ, num_vir, num_basis);
+    // Step 3: For frozen core, trim ERI to active+virtual space and shift epsilon
+    real_t* d_eri_for_op = d_eri_mo;
+    bool free_eri_for_op = false;
+    const real_t* d_eps_for_op = d_eps;
 
-    // Free full MO ERIs (blocks have been extracted)
+    if (num_frozen > 0) {
+        const size_t na4 = (size_t)na_active * na_active * na_active * na_active;
+        tracked_cudaMalloc(&d_eri_for_op, na4 * sizeof(real_t));
+        free_eri_for_op = true;
+
+        if (!gpu::gpu_available()) {
+            const size_t N = num_basis;
+            #pragma omp parallel for collapse(2)
+            for (int p = 0; p < na_active; p++)
+                for (int q = 0; q < na_active; q++)
+                    for (int r = 0; r < na_active; r++)
+                        for (int s = 0; s < na_active; s++) {
+                            size_t src = ((size_t)(num_frozen+p)*N + (num_frozen+q))*N*N
+                                       + (size_t)(num_frozen+r)*N + (num_frozen+s);
+                            size_t dst = ((size_t)p*na_active*na_active + (size_t)q*na_active + r)*(size_t)na_active + s;
+                            d_eri_for_op[dst] = d_eri_mo[src];
+                        }
+        } else {
+            int threads = 256;
+            int blocks = (int)((na4 + threads - 1) / threads);
+            trim_eri_frozen_core_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_for_op,
+                                                              num_basis, na_active, num_frozen);
+            cudaDeviceSynchronize();
+        }
+
+        d_eps_for_op = d_eps + num_frozen;
+    }
+
+    // Step 4: Build EOM-CCSD operator with (possibly trimmed) ERI
+    Timer build_timer;
+    EOMCCSDOperator eom_ccsd_op(d_eri_for_op, d_eps_for_op,
+                                 d_t1, d_t2,
+                                 num_occ, num_vir, na_active);
+
+    // Free MO ERIs (blocks have been extracted)
+    if (free_eri_for_op) tracked_cudaFree(d_eri_for_op);
     if (free_eri_mo) tracked_cudaFree(d_eri_mo);
     d_eri_mo = nullptr;
 
@@ -188,7 +229,8 @@ static void compute_eom_ccsd_impl(RHF& rhf, const real_t* d_eri_ao, int n_states
         rhf.get_shell_type_infos(),
         coefficient_matrix.host_ptr(),
         excitation_energies, h_eigenvectors.data(),
-        n_states, num_basis, num_occ, num_vir);
+        n_states, num_basis, num_occ, num_vir,
+        num_frozen, full_occ);
     rhf.set_oscillator_strengths(es_result.oscillator_strengths);
     rhf.set_excited_state_report(es_result.report);
 }
