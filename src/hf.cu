@@ -198,7 +198,7 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
         } else {
             num_frozen_core_ = std::stoi(fc_str);
         }
-        if (num_frozen_core_ < 0 || num_frozen_core_ >= num_electrons / 2) {
+        if (num_frozen_core_ < 0 || (num_frozen_core_ > 0 && num_frozen_core_ >= num_electrons / 2)) {
             throw std::runtime_error("Invalid frozen_core: " + fc_str +
                 " (must be < " + std::to_string(num_electrons / 2) + " occupied orbitals)");
         }
