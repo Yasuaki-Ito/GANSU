@@ -35,5 +35,21 @@ void compute_ecp_matrix(
     double* V_ecp,
     int n_radial = 75, int angular_order = 26);
 
+/// GPU kernel launch for off-center Type 2 (defined in ecp_integrals_gpu.cu)
+struct AngPtGPU { double x, y, z, w; };
+
+#ifndef GANSU_CPU_ONLY
+void launch_ecp_type2_offcenter_gpu(
+    const AngPtGPU* d_ang_grid, int n_ang,
+    const double* d_prim_exp_a, const double* d_prim_coef_a, int n_prim_a,
+    int la, int ma_c, int na_c, double dAx, double dAy, double dAz,
+    const double* d_prim_exp_b, const double* d_prim_coef_b, int n_prim_b,
+    int lb, int mb_c, int nb_c, double dBx, double dBy, double dBz,
+    const double* d_ecp_exp, const double* d_ecp_coef, const int* d_ecp_pow, int n_ecp_prim,
+    const double* d_rad_nodes, const double* d_rad_weights, int n_rad,
+    double R_max, int l_proj,
+    double* d_output_prim_val);
+#endif
+
 } // namespace ecp_integral
 } // namespace gansu

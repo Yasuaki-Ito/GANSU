@@ -24,6 +24,12 @@
 #include <algorithm>
 #include <iostream>
 #include <iomanip>
+#include <omp.h>
+
+#ifndef GANSU_CPU_ONLY
+#include <cuda_runtime.h>
+namespace gansu { namespace gpu { bool gpu_available(); } }
+#endif
 
 namespace gansu {
 namespace ecp_integral {
@@ -420,6 +426,39 @@ void compute_ecp_matrix(
             std::vector<double> off_rn, off_rw;
             gauss_legendre_nodes(off_n_rad, off_rn, off_rw);
 
+#ifndef GANSU_CPU_ONLY
+            // GPU resources (allocated once per ECP atom, freed at end of Type 2 block)
+            bool use_gpu = gpu::gpu_available();
+            AngPtGPU* d_ang_grid = nullptr;
+            double* d_rad_nodes = nullptr;
+            double* d_rad_weights = nullptr;
+            double* d_output_prim_val = nullptr;
+            int max_ecp_prims = 0;
+
+            if (use_gpu) {
+                // Upload angular grid
+                std::vector<AngPtGPU> ang_gpu(off_n_ang);
+                for (int i = 0; i < off_n_ang; i++)
+                    ang_gpu[i] = {off_ang[i].x, off_ang[i].y, off_ang[i].z, off_ang[i].w};
+                cudaMalloc(&d_ang_grid, off_n_ang * sizeof(AngPtGPU));
+                cudaMemcpy(d_ang_grid, ang_gpu.data(), off_n_ang * sizeof(AngPtGPU), cudaMemcpyHostToDevice);
+
+                // Upload radial grid
+                cudaMalloc(&d_rad_nodes, off_n_rad * sizeof(double));
+                cudaMalloc(&d_rad_weights, off_n_rad * sizeof(double));
+                cudaMemcpy(d_rad_nodes, off_rn.data(), off_n_rad * sizeof(double), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_rad_weights, off_rw.data(), off_n_rad * sizeof(double), cudaMemcpyHostToDevice);
+
+                // Find max ECP primitives across all components
+                for (size_t il = 0; il < ecp.num_semilocal(); il++)
+                    if ((int)ecp.get_semilocal()[il].primitives.size() > max_ecp_prims)
+                        max_ecp_prims = (int)ecp.get_semilocal()[il].primitives.size();
+                cudaMalloc(&d_output_prim_val, max_ecp_prims * sizeof(double));
+            }
+#else
+            bool use_gpu = false;
+#endif
+
             // Precompute Y_lm for all angular points and all l_proj values
             int off_max_lproj = ecp.get_l_max(); // semi-local l = 0 .. l_max-1
             // Flat Y_lm storage: off_Ylm_flat[ia * stride + offset[l] + m]
@@ -549,13 +588,11 @@ void compute_ecp_matrix(
                                 }
                             }
                         }
-                        // ---- Off-center: numerical quadrature ----
-                        // Compute A_lm ONCE per (shell pair, radial point), reuse for all ECP primitives
+                        // ---- Off-center: numerical quadrature (GPU or OpenMP) ----
                         else if (Da > 1e-10 || Db > 1e-10) {
                             double dAx = cs_a.center.x-C.x, dAy = cs_a.center.y-C.y, dAz = cs_a.center.z-C.z;
                             double dBx = cs_b.center.x-C.x, dBy = cs_b.center.y-C.y, dBz = cs_b.center.z-C.z;
 
-                            // Screening
                             double alpha_min_a = 1e30, alpha_min_b = 1e30;
                             for (size_t ip : cs_a.prim_indices)
                                 if (shells[ip].exponent < alpha_min_a) alpha_min_a = shells[ip].exponent;
@@ -565,42 +602,94 @@ void compute_ecp_matrix(
 
                             int nA = cs_a.num_basis_funcs;
                             int nB = cs_b.num_basis_funcs;
+                            int n_prims = (int)sl_comp.primitives.size();
 
-                            // R_max from the loosest ECP primitive in this component
                             double zeta_min_ecp = 1e30;
                             for (const auto& ep : sl_comp.primitives)
                                 if (ep.exponent < zeta_min_ecp) zeta_min_ecp = ep.exponent;
                             double R_max = std::sqrt(35.0 / (zeta_min_ecp > 0.01 ? zeta_min_ecp : 0.01));
 
-                            for (int ca = 0; ca < nA; ca++) {
-                                int mu = cs_a.basis_start + ca;
-                                int la = comps_a[ca][0], ma_c = comps_a[ca][1], na_c = comps_a[ca][2];
-                                for (int cb = 0; cb < nB; cb++) {
+                            int n_pairs = nA * nB;
+                            std::vector<double> results(n_pairs * n_prims, 0.0);
+
+#ifndef GANSU_CPU_ONLY
+                            if (use_gpu) {
+                                // Prepare ECP primitive data for GPU
+                                std::vector<double> ecp_exp_v(n_prims), ecp_coef_v(n_prims);
+                                std::vector<int> ecp_pow_v(n_prims);
+                                for (int k = 0; k < n_prims; k++) {
+                                    ecp_exp_v[k] = sl_comp.primitives[k].exponent;
+                                    ecp_coef_v[k] = sl_comp.primitives[k].coefficient;
+                                    ecp_pow_v[k] = sl_comp.primitives[k].power;
+                                }
+                                double *d_ecp_exp, *d_ecp_coef; int *d_ecp_pow;
+                                cudaMalloc(&d_ecp_exp, n_prims*sizeof(double));
+                                cudaMalloc(&d_ecp_coef, n_prims*sizeof(double));
+                                cudaMalloc(&d_ecp_pow, n_prims*sizeof(int));
+                                cudaMemcpy(d_ecp_exp, ecp_exp_v.data(), n_prims*sizeof(double), cudaMemcpyHostToDevice);
+                                cudaMemcpy(d_ecp_coef, ecp_coef_v.data(), n_prims*sizeof(double), cudaMemcpyHostToDevice);
+                                cudaMemcpy(d_ecp_pow, ecp_pow_v.data(), n_prims*sizeof(int), cudaMemcpyHostToDevice);
+
+                                // Prepare basis primitive data
+                                std::vector<double> exp_a, coef_a, exp_b, coef_b;
+                                for (size_t ip : cs_a.prim_indices) { exp_a.push_back(shells[ip].exponent); coef_a.push_back(shells[ip].coefficient); }
+                                for (size_t jp : cs_b.prim_indices) { exp_b.push_back(shells[jp].exponent); coef_b.push_back(shells[jp].coefficient); }
+                                double *d_exp_a, *d_coef_a, *d_exp_b, *d_coef_b;
+                                cudaMalloc(&d_exp_a, exp_a.size()*sizeof(double));
+                                cudaMalloc(&d_coef_a, coef_a.size()*sizeof(double));
+                                cudaMalloc(&d_exp_b, exp_b.size()*sizeof(double));
+                                cudaMalloc(&d_coef_b, coef_b.size()*sizeof(double));
+                                cudaMemcpy(d_exp_a, exp_a.data(), exp_a.size()*sizeof(double), cudaMemcpyHostToDevice);
+                                cudaMemcpy(d_coef_a, coef_a.data(), coef_a.size()*sizeof(double), cudaMemcpyHostToDevice);
+                                cudaMemcpy(d_exp_b, exp_b.data(), exp_b.size()*sizeof(double), cudaMemcpyHostToDevice);
+                                cudaMemcpy(d_coef_b, coef_b.data(), coef_b.size()*sizeof(double), cudaMemcpyHostToDevice);
+
+                                for (int pair = 0; pair < n_pairs; pair++) {
+                                    int ca = pair / nB, cb = pair % nB;
+                                    int mu = cs_a.basis_start + ca, nu = cs_b.basis_start + cb;
+                                    if (si == sj && nu < mu) continue;
+
+                                    launch_ecp_type2_offcenter_gpu(
+                                        d_ang_grid, off_n_ang,
+                                        d_exp_a, d_coef_a, (int)exp_a.size(),
+                                        comps_a[ca][0], comps_a[ca][1], comps_a[ca][2], dAx, dAy, dAz,
+                                        d_exp_b, d_coef_b, (int)exp_b.size(),
+                                        comps_b[cb][0], comps_b[cb][1], comps_b[cb][2], dBx, dBy, dBz,
+                                        d_ecp_exp, d_ecp_coef, d_ecp_pow, n_prims,
+                                        d_rad_nodes, d_rad_weights, off_n_rad, R_max, l_proj,
+                                        d_output_prim_val);
+
+                                    cudaMemcpy(&results[pair*n_prims], d_output_prim_val, n_prims*sizeof(double), cudaMemcpyDeviceToHost);
+                                }
+                                cudaFree(d_ecp_exp); cudaFree(d_ecp_coef); cudaFree(d_ecp_pow);
+                                cudaFree(d_exp_a); cudaFree(d_coef_a); cudaFree(d_exp_b); cudaFree(d_coef_b);
+                            } else
+#endif
+                            {
+                                // CPU path (OpenMP)
+                                #pragma omp parallel for schedule(dynamic)
+                                for (int pair = 0; pair < n_pairs; pair++) {
+                                    int ca = pair / nB, cb = pair % nB;
+                                    int mu = cs_a.basis_start + ca;
                                     int nu = cs_b.basis_start + cb;
                                     if (si == sj && nu < mu) continue;
+                                    int la = comps_a[ca][0], ma_c = comps_a[ca][1], na_c = comps_a[ca][2];
                                     int lb = comps_b[cb][0], mb_c = comps_b[cb][1], nb_c = comps_b[cb][2];
-
-                                    // Accumulate per ECP primitive
-                                    std::vector<double> prim_val(sl_comp.primitives.size(), 0.0);
+                                    double* pv = &results[pair * n_prims];
 
                                     for (int ir = 0; ir < off_n_rad; ir++) {
-                                        double t = (off_rn[ir] + 1.0) / 2.0;
-                                        double r = R_max * t;
+                                        double t_ = (off_rn[ir] + 1.0) / 2.0;
+                                        double r = R_max * t_;
                                         double wr = off_rw[ir] * R_max / 2.0;
                                         if (r < 1e-15) continue;
-
-                                        // Compute A_lm ONCE for this radial point
                                         double Alm_mu[7] = {}, Alm_nu[7] = {};
-
                                         for (int ia = 0; ia < off_n_ang; ia++) {
                                             double ox = off_ang[ia].x, oy = off_ang[ia].y, oz = off_ang[ia].z;
                                             double w_ang = off_ang[ia].w;
-
                                             double rx = r*ox-dAx, ry = r*oy-dAy, rz = r*oz-dAz;
                                             double r2A = rx*rx + ry*ry + rz*rz;
                                             double sx = r*ox-dBx, sy = r*oy-dBy, sz = r*oz-dBz;
                                             double r2B = sx*sx + sy*sy + sz*sz;
-
                                             double pow_mu = 1.0;
                                             for (int k=0;k<la;k++) pow_mu*=rx;
                                             for (int k=0;k<ma_c;k++) pow_mu*=ry;
@@ -609,7 +698,6 @@ void compute_ecp_matrix(
                                             for (int k=0;k<lb;k++) pow_nu*=sx;
                                             for (int k=0;k<mb_c;k++) pow_nu*=sy;
                                             for (int k=0;k<nb_c;k++) pow_nu*=sz;
-
                                             double mu_v = 0.0;
                                             for (size_t ip : cs_a.prim_indices)
                                                 mu_v += shells[ip].coefficient * primitive_norm(shells[ip].exponent, la, ma_c, na_c)
@@ -618,39 +706,50 @@ void compute_ecp_matrix(
                                             for (size_t jp : cs_b.prim_indices)
                                                 nu_v += shells[jp].coefficient * primitive_norm(shells[jp].exponent, lb, mb_c, nb_c)
                                                         * pow_nu * std::exp(-shells[jp].exponent * r2B);
-
                                             const double* Ylm_ptr = &off_Ylm_flat[ia * off_stride + off_Ylm_offset[l_proj]];
                                             for (int m = 0; m < n_m; m++) {
                                                 Alm_mu[m] += w_ang * mu_v * Ylm_ptr[m];
                                                 Alm_nu[m] += w_ang * nu_v * Ylm_ptr[m];
                                             }
                                         }
-
                                         double ang_sum = 0.0;
                                         for (int m = 0; m < n_m; m++)
                                             ang_sum += Alm_mu[m] * Alm_nu[m];
-
-                                        // Apply each ECP primitive's radial weight
-                                        for (size_t k = 0; k < sl_comp.primitives.size(); k++) {
+                                        for (int k = 0; k < n_prims; k++) {
                                             double ecp_rad = std::pow(r, sl_comp.primitives[k].power)
                                                            * std::exp(-sl_comp.primitives[k].exponent * r * r);
-                                            prim_val[k] += wr * ecp_rad * ang_sum;
+                                            pv[k] += wr * ecp_rad * ang_sum;
                                         }
                                     }
-
-                                    // Sum all ECP primitives
-                                    double val = 0.0;
-                                    for (size_t k = 0; k < sl_comp.primitives.size(); k++)
-                                        val += sl_comp.primitives[k].coefficient * prim_val[k];
-                                    val *= cgto_norms[mu] * cgto_norms[nu];
-                                    V_ecp[mu * num_basis + nu] += val;
-                                    if (mu != nu) V_ecp[nu * num_basis + mu] += val;
                                 }
+                            }
+
+                            // Collect results (sequential, no race condition)
+                            for (int pair = 0; pair < n_pairs; pair++) {
+                                int ca = pair / nB, cb = pair % nB;
+                                int mu = cs_a.basis_start + ca;
+                                int nu = cs_b.basis_start + cb;
+                                if (si == sj && nu < mu) continue;
+                                double val = 0.0;
+                                for (int k = 0; k < n_prims; k++)
+                                    val += sl_comp.primitives[k].coefficient * results[pair * n_prims + k];
+                                val *= cgto_norms[mu] * cgto_norms[nu];
+                                V_ecp[mu * num_basis + nu] += val;
+                                if (mu != nu) V_ecp[nu * num_basis + mu] += val;
                             }
                         }
                     }
                 }
             }
+
+#ifndef GANSU_CPU_ONLY
+            if (use_gpu) {
+                cudaFree(d_ang_grid);
+                cudaFree(d_rad_nodes);
+                cudaFree(d_rad_weights);
+                cudaFree(d_output_prim_val);
+            }
+#endif
         }
 
         std::cout << "  ECP integrals for " << elem << " computed" << std::endl;

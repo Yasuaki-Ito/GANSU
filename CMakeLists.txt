@@ -202,6 +202,7 @@ set(SOURCES
     src/test_operators.cu
     src/utils.cpp
     src/ecp_integrals.cpp
+    src/ecp_integrals_gpu.cu
 )
 
 if(NOT ENABLE_GPU)
