@@ -202,7 +202,9 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
         } else if (fc_str == "auto") {
             num_frozen_core_ = 0;
             for (size_t i = 0; i < atoms.size(); i++) {
-                int Z = atoms[i].atomic_number;
+                // For ECP atoms, use effective_charge (valence electrons only)
+                // since core electrons are already replaced by the pseudopotential
+                int Z = atoms[i].effective_charge;
                 if      (Z >= 3  && Z <= 10) num_frozen_core_ += 1;  // Li-Ne: 1s
                 else if (Z >= 11 && Z <= 18) num_frozen_core_ += 5;  // Na-Ar: 1s2s2p
                 else if (Z >= 19 && Z <= 36) num_frozen_core_ += 9;  // K-Kr: 1s2s2p3s3p
@@ -289,76 +291,16 @@ void HF::compute_nuclear_repulsion_energy() {
 void HF::compute_core_hamiltonian_matrix() {
     PROFILE_FUNCTION();
 
-    // DEBUG: dump all cgto_norms
-    cgto_normalization_factors.toHost();
-    std::cout << "[NORM-DBG] cgto_norms:" << std::endl;
-    for (size_t i = 0; i < std::min((size_t)15, (size_t)num_basis); i++)
-        std::cout << "  norms[" << i << "] = " << std::setprecision(6) << cgto_normalization_factors.host_ptr()[i] << std::endl;
-
     // compute the core Hamiltonian matrix (T + V_nuc with effective charges)
     gpu::computeCoreHamiltonianMatrix(shell_type_infos, atoms.device_ptr(), primitive_shells.device_ptr(), boys_grid.device_ptr(), cgto_normalization_factors.device_ptr(), overlap_matrix.device_ptr(), core_hamiltonian_matrix.device_ptr(),atoms.size(), num_basis, int1e_method, verbose);
 
     // Add ECP contribution if present
     if (has_ecp_) {
-        std::cout << "[ECP] Computing ECP integrals..." << std::endl;
-
-        // Download primitive shells, norms, atoms to host for CPU ECP computation
+        // Download to host for CPU ECP computation
         primitive_shells.toHost();
         cgto_normalization_factors.toHost();
         atoms.toHost();
         core_hamiltonian_matrix.toHost();
-
-        // Diagnostic: dump normalization info for I atom basis
-        {
-            const auto* sh = primitive_shells.host_ptr();
-            const auto* norms = cgto_normalization_factors.host_ptr();
-            int np = primitive_shells.size();
-
-            // Find I atom primitives (last atom typically)
-            std::cout << "[ECP] ALL primitives:" << std::endl;
-            for (int i = 0; i < np; i++) {
-                std::cout << "  prim[" << i << "]: atom=" << sh[i].atom_index << " basis=" << sh[i].basis_index << " type=" << sh[i].shell_type << " exp=" << sh[i].exponent << " coeff=" << sh[i].coefficient << std::endl;
-            }
-
-            // Test: compute <s_I|exp(-zeta*r^2)|s_I> manually for first I s-shell
-            // Find first I s-shell primitives
-            std::vector<size_t> i_s_prims;
-            size_t i_basis_start = 99999;
-            for (int i = 0; i < np; i++) {
-                if (sh[i].atom_index == (int)atoms.size() - 1 && sh[i].shell_type == 0) {
-                    if (i_basis_start == 99999) i_basis_start = sh[i].basis_index;
-                    if (sh[i].basis_index == i_basis_start)
-                        i_s_prims.push_back(i);
-                }
-            }
-            // Test with single-primitive s-shell: basis=7 (exp=0.28697, coeff=1)
-            {
-                size_t b7 = 99999;
-                std::vector<size_t> b7_prims;
-                for (int i = 0; i < np; i++) {
-                    if (sh[i].atom_index == 1 && sh[i].shell_type == 0 && std::abs(sh[i].exponent - 0.28697) < 0.001) {
-                        if (b7 == 99999) b7 = sh[i].basis_index;
-                        b7_prims.push_back(i);
-                    }
-                }
-                if (!b7_prims.empty()) {
-                    double zeta = 0.8589806, d_ecp = -1.6979585;
-                    double val = 0.0;
-                    for (size_t ip : b7_prims) {
-                        for (size_t jp : b7_prims) {
-                            double gamma = sh[ip].exponent + sh[jp].exponent + zeta;
-                            double Na = ecp_integral::primitive_norm(sh[ip].exponent, 0, 0, 0);
-                            double Nb = ecp_integral::primitive_norm(sh[jp].exponent, 0, 0, 0);
-                            double pv = d_ecp * std::pow(M_PI/gamma, 1.5);
-                            val += sh[ip].coefficient * sh[jp].coefficient * Na * Nb * pv;
-                        }
-                    }
-                    val *= norms[b7] * norms[b7];
-                    std::cout << "[ECP] Manual basis=7 <s|V(n=2)|s> = " << std::setprecision(8) << val
-                              << " (PySCF: -0.43042759, cgto_norm=" << norms[b7] << ")" << std::endl;
-                }
-            }
-        }
 
         std::vector<double> V_ecp((size_t)num_basis * num_basis, 0.0);
 
@@ -370,47 +312,6 @@ void HF::compute_core_hamiltonian_matrix() {
             ecp_data_,
             V_ecp.data());
 
-        // Print hcore diagonal after ECP addition
-        std::cout << "[ECP] hcore diagonal after ECP (I block):" << std::endl;
-        for (int i = 5; i < std::min(15, (int)num_basis); i++)
-            std::cout << "  hcore[" << i << "] = " << std::setprecision(6)
-                      << core_hamiltonian_matrix.host_ptr()[i*num_basis+i] + V_ecp[i*num_basis+i] << std::endl;
-
-        // Print hcore diagonal BEFORE ECP
-        std::cout << "[ECP] hcore diagonal BEFORE ECP (I block):" << std::endl;
-        for (int i = 5; i < std::min(15, (int)num_basis); i++)
-            std::cout << "  T+V[" << i << "] = " << std::setprecision(6)
-                      << core_hamiltonian_matrix.host_ptr()[i*num_basis+i] << std::endl;
-
-        // Print I-I block (indices 5-14, 10x10)
-        std::cout << "[ECP] I-I block V[5:15, 5:15]:" << std::endl;
-        for (int i = 5; i < std::min(15, (int)num_basis); i++) {
-            std::cout << "  [" << i << "]";
-            for (int j = 5; j < std::min(15, (int)num_basis); j++)
-                std::cout << " " << std::setw(8) << std::setprecision(4) << std::fixed << V_ecp[i*num_basis+j];
-            std::cout << std::endl;
-        }
-
-        // Diagnostic: print ECP matrix summary
-        {
-            double max_abs = 0.0, trace = 0.0;
-            for (int i = 0; i < num_basis; i++) {
-                trace += V_ecp[i * num_basis + i];
-                for (int j = 0; j < num_basis; j++)
-                    max_abs = std::max(max_abs, std::abs(V_ecp[i * num_basis + j]));
-            }
-            std::cout << "[ECP] Max |V_ECP|: " << std::setprecision(6) << max_abs
-                      << "  Trace: " << trace << std::endl;
-            // Print first 5x5 block
-            std::cout << "[ECP] V_ECP[0:5,0:5]:" << std::endl;
-            for (int i = 0; i < std::min(5, (int)num_basis); i++) {
-                std::cout << "  ";
-                for (int j = 0; j < std::min(5, (int)num_basis); j++)
-                    std::cout << std::setw(12) << std::setprecision(6) << V_ecp[i*num_basis+j];
-                std::cout << std::endl;
-            }
-        }
-
         // Add V_ECP to core Hamiltonian (on host)
         for (size_t i = 0; i < (size_t)num_basis * num_basis; i++) {
             core_hamiltonian_matrix.host_ptr()[i] += V_ecp[i];
@@ -418,8 +319,6 @@ void HF::compute_core_hamiltonian_matrix() {
 
         // Upload modified core Hamiltonian back to device
         core_hamiltonian_matrix.toDevice();
-
-        std::cout << "[ECP] ECP integrals added to core Hamiltonian" << std::endl;
     }
 
     // print the overlap and core Hamiltonian matrix

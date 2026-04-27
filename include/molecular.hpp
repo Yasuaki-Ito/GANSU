@@ -227,17 +227,6 @@ public:
 
                 // store the normalization factor of the contracted Gauss function
                 const std::vector<real_t> normalization_factors = contracted_gauss.get_normalization_factor();
-                // DEBUG: print shell info with primitive details
-                if (atom_index == 1 && shell_type >= 1) {
-                    std::cout << "[CGTO-DBG] atom=" << atom_index << " type=" << shell_type
-                              << " nprim=" << contracted_gauss.get_num_primitives()
-                              << " basis=" << (basis_index - shell_type_to_num_basis(shell_type))
-                              << " norm=" << normalization_factors[0];
-                    for (size_t jp = 0; jp < contracted_gauss.get_num_primitives(); jp++)
-                        std::cout << " [exp=" << contracted_gauss.get_primitive_gauss(jp).exponent
-                                  << " c=" << contracted_gauss.get_primitive_gauss(jp).coefficient << "]";
-                    std::cout << std::endl;
-                }
                 cgto_normalization_factors_.insert(cgto_normalization_factors_.end(), normalization_factors.begin(), normalization_factors.end());
             }
             basis_range.end_index = basis_index;

@@ -201,6 +201,7 @@ set(SOURCES
     src/fci.cu
     src/test_operators.cu
     src/utils.cpp
+    src/ecp_integrals.cpp
 )
 
 if(NOT ENABLE_GPU)
