@@ -207,31 +207,103 @@ static double E_coeff(int i, int j, int t, double p, double XPA, double XPB) {
 }
 
 // ============================================================
-//  Type 1 ECP integrals (local potential)
+//  Hermite Coulomb integral R^n_{tuv}(p, RPC)
 // ============================================================
-static double type1_n2_primitive(
+static double R_hermite(int t, int u, int v, int n, double p,
+                        double RPC_x, double RPC_y, double RPC_z) {
+    if (t < 0 || u < 0 || v < 0) return 0.0;
+    double T = p * (RPC_x*RPC_x + RPC_y*RPC_y + RPC_z*RPC_z);
+    if (t == 0 && u == 0 && v == 0) {
+        return std::pow(-2.0*p, n) * boys_function(n, T);
+    }
+    if (t > 0) {
+        return (t-1)*R_hermite(t-2,u,v,n+1,p,RPC_x,RPC_y,RPC_z)
+             + RPC_x*R_hermite(t-1,u,v,n+1,p,RPC_x,RPC_y,RPC_z);
+    }
+    if (u > 0) {
+        return (u-1)*R_hermite(t,u-2,v,n+1,p,RPC_x,RPC_y,RPC_z)
+             + RPC_y*R_hermite(t,u-1,v,n+1,p,RPC_x,RPC_y,RPC_z);
+    }
+    return (v-1)*R_hermite(t,u,v-2,n+1,p,RPC_x,RPC_y,RPC_z)
+         + RPC_z*R_hermite(t,u,v-1,n+1,p,RPC_x,RPC_y,RPC_z);
+}
+
+// ============================================================
+//  Type 1 ECP integrals (local potential) for all powers n
+//
+//  n=2: <μ|d exp(-ζr²)|ν>  → 3-center overlap (pure Gaussian)
+//  n=1: <μ|d r⁻¹ exp(-ζr²)|ν>  → modified nuclear attraction
+//  n=0: <μ|d r⁻² exp(-ζr²)|ν>  → Boys function based
+// ============================================================
+static double type1_primitive(
     double alpha, const Coordinate& A, int la, int ma, int na_,
     double beta, const Coordinate& B, int lb, int mb, int nb_,
-    double zeta, const Coordinate& C, double d_coeff)
+    double zeta, const Coordinate& C, double d_coeff, int power)
 {
     double p = alpha + beta;
     double Px = (alpha*A.x + beta*B.x) / p;
     double Py = (alpha*A.y + beta*B.y) / p;
     double Pz = (alpha*A.z + beta*B.z) / p;
     double gamma = p + zeta;
-    double Qx = (p*Px + zeta*C.x) / gamma;
-    double Qy = (p*Py + zeta*C.y) / gamma;
-    double Qz = (p*Pz + zeta*C.z) / gamma;
     double AB2 = (A.x-B.x)*(A.x-B.x) + (A.y-B.y)*(A.y-B.y) + (A.z-B.z)*(A.z-B.z);
-    double PC2 = (Px-C.x)*(Px-C.x) + (Py-C.y)*(Py-C.y) + (Pz-C.z)*(Pz-C.z);
     double K_AB = std::exp(-alpha*beta/p * AB2);
-    double K_PC = std::exp(-p*zeta/gamma * PC2);
-    double QAx = Qx-A.x, QAy = Qy-A.y, QAz = Qz-A.z;
-    double QBx = Qx-B.x, QBy = Qy-B.y, QBz = Qz-B.z;
-    double Ex = E_coeff(la, lb, 0, gamma, QAx, QBx);
-    double Ey = E_coeff(ma, mb, 0, gamma, QAy, QBy);
-    double Ez = E_coeff(na_, nb_, 0, gamma, QAz, QBz);
-    return d_coeff * K_AB * K_PC * std::pow(M_PI / gamma, 1.5) * Ex * Ey * Ez;
+
+    // Helper lambda: 3-center overlap integral with arbitrary zeta (n=2 kernel)
+    auto overlap_3c = [&](double z) -> double {
+        double g = p + z;
+        double qx = (p*Px + z*C.x) / g;
+        double qy = (p*Py + z*C.y) / g;
+        double qz = (p*Pz + z*C.z) / g;
+        double PC2 = (Px-C.x)*(Px-C.x) + (Py-C.y)*(Py-C.y) + (Pz-C.z)*(Pz-C.z);
+        double Kpc = std::exp(-p*z/g * PC2);
+        return K_AB * Kpc * std::pow(M_PI / g, 1.5)
+             * E_coeff(la, lb, 0, g, qx-A.x, qx-B.x)
+             * E_coeff(ma, mb, 0, g, qy-A.y, qy-B.y)
+             * E_coeff(na_, nb_, 0, g, qz-A.z, qz-B.z);
+    };
+
+    if (power == 2) {
+        // Direct analytical computation (fast path, no lambda overhead)
+        double g = p + zeta;
+        double qx = (p*Px + zeta*C.x) / g;
+        double qy = (p*Py + zeta*C.y) / g;
+        double qz = (p*Pz + zeta*C.z) / g;
+        double PC2 = (Px-C.x)*(Px-C.x) + (Py-C.y)*(Py-C.y) + (Pz-C.z)*(Pz-C.z);
+        double Kpc = std::exp(-p*zeta/g * PC2);
+        return d_coeff * K_AB * Kpc * std::pow(M_PI / g, 1.5)
+             * E_coeff(la, lb, 0, g, qx-A.x, qx-B.x)
+             * E_coeff(ma, mb, 0, g, qy-A.y, qy-B.y)
+             * E_coeff(na_, nb_, 0, g, qz-A.z, qz-B.z);
+    }
+
+    // GL nodes for 1D quadrature (cached)
+    static std::vector<double> gl_n, gl_w;
+    static bool gl_init = false;
+    if (!gl_init) { gauss_legendre_nodes(50, gl_n, gl_w); gl_init = true; }
+
+    if (power == 1) {
+        // r^{-1} exp(-ζr²) = (2/√π) ∫_0^∞ exp(-(ζ+u²)r²) du
+        // → <μ|V|ν> = d × (2/√π) ∫_0^∞ overlap_3c(ζ+u²) du
+        double R = std::sqrt(35.0 + p + zeta);
+        double val = 0.0;
+        for (int i = 0; i < 50; i++) {
+            double u = R * (gl_n[i] + 1.0) / 2.0;
+            val += gl_w[i] * R / 2.0 * overlap_3c(zeta + u*u);
+        }
+        return d_coeff * (2.0 / std::sqrt(M_PI)) * val;
+    }
+
+    // power == 0: r^{-2} exp(-ζr²) = ∫_ζ^∞ exp(-t r²) dt
+    // → <μ|V|ν> = d × ∫_ζ^∞ overlap_3c(t) dt
+    {
+        double R = 35.0 + p;
+        double val = 0.0;
+        for (int i = 0; i < 50; i++) {
+            double t_ = zeta + R * (gl_n[i] + 1.0) / 2.0;
+            val += gl_w[i] * R / 2.0 * overlap_3c(t_);
+        }
+        return d_coeff * val;
+    }
 }
 
 // ============================================================
@@ -315,13 +387,11 @@ void compute_ecp_matrix(
                                 double val = 0.0;
                                 for (size_t ip : cs_a.prim_indices) {
                                     for (size_t jp : cs_b.prim_indices) {
-                                        double prim_val = 0.0;
-                                        if (ecp_prim.power == 2) {
-                                            prim_val = type1_n2_primitive(
+                                        double prim_val = type1_primitive(
                                                 shells[ip].exponent, cs_a.center, la, ma, na,
                                                 shells[jp].exponent, cs_b.center, lb, mb, nb,
-                                                ecp_prim.exponent, C, ecp_prim.coefficient);
-                                        }
+                                                ecp_prim.exponent, C, ecp_prim.coefficient,
+                                                ecp_prim.power);
                                         double Na = primitive_norm(shells[ip].exponent, la, ma, na);
                                         double Nb = primitive_norm(shells[jp].exponent, lb, mb, nb);
                                         val += shells[ip].coefficient * shells[jp].coefficient * Na * Nb * prim_val;
@@ -344,7 +414,7 @@ void compute_ecp_matrix(
             int n_ang = ang_grid.size();
 
             // Precompute off-center angular grid and Y_lm (reused across all shell pairs)
-            auto off_ang = product_angular_grid(25, 50);
+            auto off_ang = product_angular_grid(15, 30);
             int off_n_ang = (int)off_ang.size();
             const int off_n_rad = 80;
             std::vector<double> off_rn, off_rw;
@@ -403,50 +473,56 @@ void compute_ecp_matrix(
                 return proj;
             };
 
+            auto radial_integral = [](int M, double g) -> double {
+                if (M % 2 == 0) {
+                    int n = M / 2;
+                    double val = std::sqrt(M_PI);
+                    for (int k = 1; k <= n; k++) val *= (2.0*k - 1.0) / 2.0;
+                    return val / (2.0 * std::pow(g, n + 0.5));
+                } else {
+                    int n = (M - 1) / 2;
+                    double val = 1.0;
+                    for (int k = 1; k <= n; k++) val *= k;
+                    return val / (2.0 * std::pow(g, n + 1.0));
+                }
+            };
+
             for (size_t il = 0; il < ecp.num_semilocal(); il++) {
                 const auto& sl_comp = ecp.get_semilocal()[il];
                 int l_proj = sl_comp.angular_momentum;
+                int n_m = 2 * l_proj + 1;
 
-                for (const auto& ecp_prim : sl_comp.primitives) {
-                    if (ecp_prim.power != 2) continue;
-                    double zeta = ecp_prim.exponent;
-                    double d_ecp = ecp_prim.coefficient;
+                for (size_t si = 0; si < contracted.size(); si++) {
+                    const auto& cs_a = contracted[si];
+                    const auto& comps_a = cart_map[cs_a.shell_type];
+                    int La = cs_a.shell_type;
 
-                    for (size_t si = 0; si < contracted.size(); si++) {
-                        const auto& cs_a = contracted[si];
-                        const auto& comps_a = cart_map[cs_a.shell_type];
-                        int La = cs_a.shell_type;
+                    for (size_t sj = si; sj < contracted.size(); sj++) {
+                        const auto& cs_b = contracted[sj];
+                        const auto& comps_b = cart_map[cs_b.shell_type];
+                        int Lb = cs_b.shell_type;
 
-                        for (size_t sj = si; sj < contracted.size(); sj++) {
-                            const auto& cs_b = contracted[sj];
-                            const auto& comps_b = cart_map[cs_b.shell_type];
-                            int Lb = cs_b.shell_type;
+                        double Da = std::sqrt(
+                            (cs_a.center.x-C.x)*(cs_a.center.x-C.x) +
+                            (cs_a.center.y-C.y)*(cs_a.center.y-C.y) +
+                            (cs_a.center.z-C.z)*(cs_a.center.z-C.z));
+                        double Db = std::sqrt(
+                            (cs_b.center.x-C.x)*(cs_b.center.x-C.x) +
+                            (cs_b.center.y-C.y)*(cs_b.center.y-C.y) +
+                            (cs_b.center.z-C.z)*(cs_b.center.z-C.z));
 
-                            double Da = std::sqrt(
-                                (cs_a.center.x-C.x)*(cs_a.center.x-C.x) +
-                                (cs_a.center.y-C.y)*(cs_a.center.y-C.y) +
-                                (cs_a.center.z-C.z)*(cs_a.center.z-C.z));
-                            double Db = std::sqrt(
-                                (cs_b.center.x-C.x)*(cs_b.center.x-C.x) +
-                                (cs_b.center.y-C.y)*(cs_b.center.y-C.y) +
-                                (cs_b.center.z-C.z)*(cs_b.center.z-C.z));
+                        // ---- Same-center: analytical ----
+                        if (Da < 1e-10 && Db < 1e-10) {
+                            if (l_proj > La || l_proj > Lb) continue;
+                            if ((La - l_proj) % 2 != 0) continue;
+                            if ((Lb - l_proj) % 2 != 0) continue;
 
-                            // ---- Same-center: analytical ----
-                            if (Da < 1e-10 && Db < 1e-10) {
-                                if (l_proj > La || l_proj > Lb) continue;
-                                if ((La - l_proj) % 2 != 0) continue;
-                                if ((Lb - l_proj) % 2 != 0) continue;
+                            auto proj = compute_proj_matrix_cross(La, Lb, l_proj);
+                            int nA = cs_a.num_basis_funcs;
+                            int nB = cs_b.num_basis_funcs;
 
-                                auto proj = compute_proj_matrix_cross(La, Lb, l_proj);
-                                int nA = cs_a.num_basis_funcs;
-                                int nB = cs_b.num_basis_funcs;
-                                int n_rad = 1 + (La + Lb) / 2;
-                                auto gamma_half_int = [](int n_) -> double {
-                                    double val = std::sqrt(M_PI);
-                                    for (int k = 1; k <= n_; k++) val *= (2.0*k - 1.0) / 2.0;
-                                    return val;
-                                };
-
+                            for (const auto& ecp_prim : sl_comp.primitives) {
+                                int rad_exp = La + Lb + ecp_prim.power;
                                 for (int ca = 0; ca < nA; ca++) {
                                     int mu = cs_a.basis_start + ca;
                                     int la = comps_a[ca][0], ma_c = comps_a[ca][1], na_c = comps_a[ca][2];
@@ -459,12 +535,11 @@ void compute_ecp_matrix(
                                         double val = 0.0;
                                         for (size_t ip : cs_a.prim_indices) {
                                             for (size_t jp : cs_b.prim_indices) {
-                                                double gamma = shells[ip].exponent + shells[jp].exponent + zeta;
-                                                double rad = gamma_half_int(n_rad) / (2.0 * std::pow(gamma, n_rad + 0.5));
+                                                double gamma = shells[ip].exponent + shells[jp].exponent + ecp_prim.exponent;
                                                 double Na = primitive_norm(shells[ip].exponent, la, ma_c, na_c);
                                                 double Nb = primitive_norm(shells[jp].exponent, lb, mb_c, nb_c);
                                                 val += shells[ip].coefficient * shells[jp].coefficient * Na * Nb
-                                                     * d_ecp * P_ab * rad;
+                                                     * ecp_prim.coefficient * P_ab * radial_integral(rad_exp, gamma);
                                             }
                                         }
                                         val *= cgto_norms[mu] * cgto_norms[nu];
@@ -473,101 +548,103 @@ void compute_ecp_matrix(
                                     }
                                 }
                             }
-                            // ---- Off-center: numerical quadrature ----
-                            // Angular grid and Y_lm precomputed above; radial GL per pair
-                            else if (Da > 1e-10 || Db > 1e-10) {
-                                double dAx = cs_a.center.x-C.x, dAy = cs_a.center.y-C.y, dAz = cs_a.center.z-C.z;
-                                double dBx = cs_b.center.x-C.x, dBy = cs_b.center.y-C.y, dBz = cs_b.center.z-C.z;
+                        }
+                        // ---- Off-center: numerical quadrature ----
+                        // Compute A_lm ONCE per (shell pair, radial point), reuse for all ECP primitives
+                        else if (Da > 1e-10 || Db > 1e-10) {
+                            double dAx = cs_a.center.x-C.x, dAy = cs_a.center.y-C.y, dAz = cs_a.center.z-C.z;
+                            double dBx = cs_b.center.x-C.x, dBy = cs_b.center.y-C.y, dBz = cs_b.center.z-C.z;
 
-                                // Screening: skip if both shells decay too much at ECP center
-                                double alpha_min_a = 1e30, alpha_min_b = 1e30;
-                                for (size_t ip : cs_a.prim_indices)
-                                    if (shells[ip].exponent < alpha_min_a) alpha_min_a = shells[ip].exponent;
-                                for (size_t jp : cs_b.prim_indices)
-                                    if (shells[jp].exponent < alpha_min_b) alpha_min_b = shells[jp].exponent;
-                                double screen_a = std::exp(-alpha_min_a * Da * Da);
-                                double screen_b = std::exp(-alpha_min_b * Db * Db);
-                                if (screen_a * screen_b < 1e-20) continue;
+                            // Screening
+                            double alpha_min_a = 1e30, alpha_min_b = 1e30;
+                            for (size_t ip : cs_a.prim_indices)
+                                if (shells[ip].exponent < alpha_min_a) alpha_min_a = shells[ip].exponent;
+                            for (size_t jp : cs_b.prim_indices)
+                                if (shells[jp].exponent < alpha_min_b) alpha_min_b = shells[jp].exponent;
+                            if (std::exp(-alpha_min_a*Da*Da) * std::exp(-alpha_min_b*Db*Db) < 1e-20) continue;
 
-                                int nA = cs_a.num_basis_funcs;
-                                int nB = cs_b.num_basis_funcs;
-                                int n_m = 2 * l_proj + 1;
+                            int nA = cs_a.num_basis_funcs;
+                            int nB = cs_b.num_basis_funcs;
 
-                                // R_max based on ECP decay: beyond this range ECP factor ≈ 0
-                                double zm = (zeta > 0.01) ? zeta : 0.01;
-                                double R_max = std::sqrt(35.0 / zm);
+                            // R_max from the loosest ECP primitive in this component
+                            double zeta_min_ecp = 1e30;
+                            for (const auto& ep : sl_comp.primitives)
+                                if (ep.exponent < zeta_min_ecp) zeta_min_ecp = ep.exponent;
+                            double R_max = std::sqrt(35.0 / (zeta_min_ecp > 0.01 ? zeta_min_ecp : 0.01));
 
-                                for (int ca = 0; ca < nA; ca++) {
-                                    int mu = cs_a.basis_start + ca;
-                                    int la = comps_a[ca][0], ma_c = comps_a[ca][1], na_c = comps_a[ca][2];
-                                    for (int cb = 0; cb < nB; cb++) {
-                                        int nu = cs_b.basis_start + cb;
-                                        if (si == sj && nu < mu) continue;
-                                        int lb = comps_b[cb][0], mb_c = comps_b[cb][1], nb_c = comps_b[cb][2];
+                            for (int ca = 0; ca < nA; ca++) {
+                                int mu = cs_a.basis_start + ca;
+                                int la = comps_a[ca][0], ma_c = comps_a[ca][1], na_c = comps_a[ca][2];
+                                for (int cb = 0; cb < nB; cb++) {
+                                    int nu = cs_b.basis_start + cb;
+                                    if (si == sj && nu < mu) continue;
+                                    int lb = comps_b[cb][0], mb_c = comps_b[cb][1], nb_c = comps_b[cb][2];
 
-                                        double val = 0.0;
-                                        for (int ir = 0; ir < off_n_rad; ir++) {
-                                            double t = (off_rn[ir] + 1.0) / 2.0;
-                                            double r = R_max * t;
-                                            double wr = off_rw[ir] * R_max / 2.0;
-                                            if (r < 1e-15) continue;
+                                    // Accumulate per ECP primitive
+                                    std::vector<double> prim_val(sl_comp.primitives.size(), 0.0);
 
-                                            double ecp_rad = std::pow(r, ecp_prim.power) * std::exp(-zeta * r * r);
-                                            if (ecp_rad < 1e-30) continue;
+                                    for (int ir = 0; ir < off_n_rad; ir++) {
+                                        double t = (off_rn[ir] + 1.0) / 2.0;
+                                        double r = R_max * t;
+                                        double wr = off_rw[ir] * R_max / 2.0;
+                                        if (r < 1e-15) continue;
 
-                                            double Alm_mu[7] = {}, Alm_nu[7] = {};  // max 2*3+1=7
+                                        // Compute A_lm ONCE for this radial point
+                                        double Alm_mu[7] = {}, Alm_nu[7] = {};
 
-                                            for (int ia = 0; ia < off_n_ang; ia++) {
-                                                double ox = off_ang[ia].x;
-                                                double oy = off_ang[ia].y;
-                                                double oz = off_ang[ia].z;
-                                                double w_ang = off_ang[ia].w;
+                                        for (int ia = 0; ia < off_n_ang; ia++) {
+                                            double ox = off_ang[ia].x, oy = off_ang[ia].y, oz = off_ang[ia].z;
+                                            double w_ang = off_ang[ia].w;
 
-                                                double rx = r*ox - dAx, ry = r*oy - dAy, rz = r*oz - dAz;
-                                                double r2A = rx*rx + ry*ry + rz*rz;
-                                                double sx = r*ox - dBx, sy = r*oy - dBy, sz = r*oz - dBz;
-                                                double r2B = sx*sx + sy*sy + sz*sz;
+                                            double rx = r*ox-dAx, ry = r*oy-dAy, rz = r*oz-dAz;
+                                            double r2A = rx*rx + ry*ry + rz*rz;
+                                            double sx = r*ox-dBx, sy = r*oy-dBy, sz = r*oz-dBz;
+                                            double r2B = sx*sx + sy*sy + sz*sz;
 
-                                                double pow_mu = 1.0;
-                                                for (int k = 0; k < la;   k++) pow_mu *= rx;
-                                                for (int k = 0; k < ma_c; k++) pow_mu *= ry;
-                                                for (int k = 0; k < na_c; k++) pow_mu *= rz;
+                                            double pow_mu = 1.0;
+                                            for (int k=0;k<la;k++) pow_mu*=rx;
+                                            for (int k=0;k<ma_c;k++) pow_mu*=ry;
+                                            for (int k=0;k<na_c;k++) pow_mu*=rz;
+                                            double pow_nu = 1.0;
+                                            for (int k=0;k<lb;k++) pow_nu*=sx;
+                                            for (int k=0;k<mb_c;k++) pow_nu*=sy;
+                                            for (int k=0;k<nb_c;k++) pow_nu*=sz;
 
-                                                double pow_nu = 1.0;
-                                                for (int k = 0; k < lb;   k++) pow_nu *= sx;
-                                                for (int k = 0; k < mb_c; k++) pow_nu *= sy;
-                                                for (int k = 0; k < nb_c; k++) pow_nu *= sz;
+                                            double mu_v = 0.0;
+                                            for (size_t ip : cs_a.prim_indices)
+                                                mu_v += shells[ip].coefficient * primitive_norm(shells[ip].exponent, la, ma_c, na_c)
+                                                        * pow_mu * std::exp(-shells[ip].exponent * r2A);
+                                            double nu_v = 0.0;
+                                            for (size_t jp : cs_b.prim_indices)
+                                                nu_v += shells[jp].coefficient * primitive_norm(shells[jp].exponent, lb, mb_c, nb_c)
+                                                        * pow_nu * std::exp(-shells[jp].exponent * r2B);
 
-                                                double mu_val = 0.0;
-                                                for (size_t ip : cs_a.prim_indices) {
-                                                    double Na = primitive_norm(shells[ip].exponent, la, ma_c, na_c);
-                                                    mu_val += shells[ip].coefficient * Na * pow_mu
-                                                              * std::exp(-shells[ip].exponent * r2A);
-                                                }
-                                                double nu_val = 0.0;
-                                                for (size_t jp : cs_b.prim_indices) {
-                                                    double Nb = primitive_norm(shells[jp].exponent, lb, mb_c, nb_c);
-                                                    nu_val += shells[jp].coefficient * Nb * pow_nu
-                                                              * std::exp(-shells[jp].exponent * r2B);
-                                                }
-
-                                                const double* Ylm_ptr = &off_Ylm_flat[ia * off_stride + off_Ylm_offset[l_proj]];
-                                                for (int m = 0; m < n_m; m++) {
-                                                    Alm_mu[m] += w_ang * mu_val * Ylm_ptr[m];
-                                                    Alm_nu[m] += w_ang * nu_val * Ylm_ptr[m];
-                                                }
+                                            const double* Ylm_ptr = &off_Ylm_flat[ia * off_stride + off_Ylm_offset[l_proj]];
+                                            for (int m = 0; m < n_m; m++) {
+                                                Alm_mu[m] += w_ang * mu_v * Ylm_ptr[m];
+                                                Alm_nu[m] += w_ang * nu_v * Ylm_ptr[m];
                                             }
-
-                                            double ang_sum = 0.0;
-                                            for (int m = 0; m < n_m; m++)
-                                                ang_sum += Alm_mu[m] * Alm_nu[m];
-                                            val += wr * ecp_rad * ang_sum;
                                         }
 
-                                        val *= d_ecp * cgto_norms[mu] * cgto_norms[nu];
-                                        V_ecp[mu * num_basis + nu] += val;
-                                        if (mu != nu) V_ecp[nu * num_basis + mu] += val;
+                                        double ang_sum = 0.0;
+                                        for (int m = 0; m < n_m; m++)
+                                            ang_sum += Alm_mu[m] * Alm_nu[m];
+
+                                        // Apply each ECP primitive's radial weight
+                                        for (size_t k = 0; k < sl_comp.primitives.size(); k++) {
+                                            double ecp_rad = std::pow(r, sl_comp.primitives[k].power)
+                                                           * std::exp(-sl_comp.primitives[k].exponent * r * r);
+                                            prim_val[k] += wr * ecp_rad * ang_sum;
+                                        }
                                     }
+
+                                    // Sum all ECP primitives
+                                    double val = 0.0;
+                                    for (size_t k = 0; k < sl_comp.primitives.size(); k++)
+                                        val += sl_comp.primitives[k].coefficient * prim_val[k];
+                                    val *= cgto_norms[mu] * cgto_norms[nu];
+                                    V_ecp[mu * num_basis + nu] += val;
+                                    if (mu != nu) V_ecp[nu * num_basis + mu] += val;
                                 }
                             }
                         }
