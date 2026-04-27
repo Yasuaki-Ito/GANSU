@@ -116,21 +116,21 @@
                                             calc_dds_gpu, calc_ddp_gpu, calc_ddd_gpu, calc_ddf_gpu, calc_ddg_gpu};
     
 
-        if (a < N_ORBITAL_TYPE_BASIS && b < N_ORBITAL_TYPE_BASIS && c < N_ORBITAL_TYPE_AUX){
+        // Fallback to Rys quadrature for shell types beyond specialized kernels
+        if (a >= N_ORBITAL_TYPE_BASIS || b >= N_ORBITAL_TYPE_BASIS || c >= N_ORBITAL_TYPE_AUX) {
+            return Rys_int3c2e;
+        }
 #if !defined(COMPUTE_D_BASIS)
-            if (a >= 2 || b >= 2){
-                return Rys_int3c2e;
-            }
+        if (a >= 2 || b >= 2){
+            return Rys_int3c2e;
+        }
 #endif
 #if !defined(COMPUTE_G_AUX)
-            if (c >= 4){
-                return Rys_int3c2e;
-            }
-#endif  
-            return kernels[calcIdx_triangular(a, b, N_ORBITAL_TYPE_BASIS) * N_ORBITAL_TYPE_AUX + c];
-        } else { 
-            throw std::runtime_error("Invalid call for 3center eri.\n");
+        if (c >= 4){
+            return Rys_int3c2e;
         }
+#endif
+        return kernels[calcIdx_triangular(a, b, N_ORBITAL_TYPE_BASIS) * N_ORBITAL_TYPE_AUX + c];
     }
 
     

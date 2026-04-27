@@ -78,16 +78,16 @@ __constant__ int loop_to_ang_RI[7][28][3] = {
                                                                                    calc_ff_gpu, calc_fg_gpu, 
                                                                                                 calc_gg_gpu};
                                                                                         
-        if (a < N_ORBITAL_TYPE_AUX && b < N_ORBITAL_TYPE_AUX){
-#if !defined(COMPUTE_G_AUX)
-            if (a >= 4 || b >= 4){
-                return Rys_int2c2e;
-            }
-#endif
-            return kernels[calcIdx_triangular(a,b,N_ORBITAL_TYPE_AUX)];
-        } else { 
-            throw std::runtime_error("Invalid call for 2center eri.\n");
+        // Fallback to Rys quadrature for shell types beyond specialized kernels
+        if (a >= N_ORBITAL_TYPE_AUX || b >= N_ORBITAL_TYPE_AUX) {
+            return Rys_int2c2e;
         }
+#if !defined(COMPUTE_G_AUX)
+        if (a >= 4 || b >= 4){
+            return Rys_int2c2e;
+        }
+#endif
+        return kernels[calcIdx_triangular(a,b,N_ORBITAL_TYPE_AUX)];
     }
 
 

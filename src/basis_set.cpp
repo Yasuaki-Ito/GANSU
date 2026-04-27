@@ -58,8 +58,11 @@ BasisSet BasisSet::construct_from_gbs(const std::string& filename){
         current_element_basis_set = ElementBasisSet();
 
 
-        { // Read a line for Element name
-            std::getline(ifs, line);
+        { // Read a line for Element name (skip blank/comment lines)
+            do {
+                std::getline(ifs, line);
+                if(ifs.eof()) break;
+            } while(line.empty() || line[0] == '!' || line[0] == '#');
             if(ifs.eof()) break;
             // Check if this line is an ECP header (contains "-ECP")
             if(line.find("-ECP") != std::string::npos || line.find("-ecp") != std::string::npos) {
