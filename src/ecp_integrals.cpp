@@ -343,6 +343,31 @@ void compute_ecp_matrix(
             auto ang_grid = lebedev_26();
             int n_ang = ang_grid.size();
 
+            // Precompute off-center angular grid and Y_lm (reused across all shell pairs)
+            auto off_ang = product_angular_grid(25, 50);
+            int off_n_ang = (int)off_ang.size();
+            const int off_n_rad = 80;
+            std::vector<double> off_rn, off_rw;
+            gauss_legendre_nodes(off_n_rad, off_rn, off_rw);
+
+            // Precompute Y_lm for all angular points and all l_proj values
+            int off_max_lproj = ecp.get_l_max(); // semi-local l = 0 .. l_max-1
+            // Flat Y_lm storage: off_Ylm_flat[ia * stride + offset[l] + m]
+            int off_stride = 0;
+            std::vector<int> off_Ylm_offset(off_max_lproj, 0);
+            for (int l = 0; l < off_max_lproj; l++) {
+                off_Ylm_offset[l] = off_stride;
+                off_stride += 2*l+1;
+            }
+            std::vector<double> off_Ylm_flat(off_n_ang * off_stride, 0.0);
+            for (int ia = 0; ia < off_n_ang; ia++) {
+                for (int l = 0; l < off_max_lproj; l++) {
+                    auto Ylm = solid_harmonics(l, off_ang[ia].x, off_ang[ia].y, off_ang[ia].z);
+                    for (int m = 0; m < 2*l+1; m++)
+                        off_Ylm_flat[ia * off_stride + off_Ylm_offset[l] + m] = Ylm[m];
+                }
+            }
+
             auto compute_proj_matrix_cross = [&](int La_, int Lb_, int l_proj) -> std::vector<double> {
                 int nA = shell_type_to_num_basis(La_);
                 int nB = shell_type_to_num_basis(Lb_);
@@ -449,28 +474,28 @@ void compute_ecp_matrix(
                                 }
                             }
                             // ---- Off-center: numerical quadrature ----
+                            // Angular grid and Y_lm precomputed above; radial GL per pair
                             else if (Da > 1e-10 || Db > 1e-10) {
                                 double dAx = cs_a.center.x-C.x, dAy = cs_a.center.y-C.y, dAz = cs_a.center.z-C.z;
                                 double dBx = cs_b.center.x-C.x, dBy = cs_b.center.y-C.y, dBz = cs_b.center.z-C.z;
 
-                                auto off_ang_grid = product_angular_grid(25, 50);
-                                int n_ang_off = (int)off_ang_grid.size();
-
-                                const int n_rad_pts = 80;
-                                std::vector<double> off_rn, off_rw;
-                                gauss_legendre_nodes(n_rad_pts, off_rn, off_rw);
+                                // Screening: skip if both shells decay too much at ECP center
+                                double alpha_min_a = 1e30, alpha_min_b = 1e30;
+                                for (size_t ip : cs_a.prim_indices)
+                                    if (shells[ip].exponent < alpha_min_a) alpha_min_a = shells[ip].exponent;
+                                for (size_t jp : cs_b.prim_indices)
+                                    if (shells[jp].exponent < alpha_min_b) alpha_min_b = shells[jp].exponent;
+                                double screen_a = std::exp(-alpha_min_a * Da * Da);
+                                double screen_b = std::exp(-alpha_min_b * Db * Db);
+                                if (screen_a * screen_b < 1e-20) continue;
 
                                 int nA = cs_a.num_basis_funcs;
                                 int nB = cs_b.num_basis_funcs;
                                 int n_m = 2 * l_proj + 1;
 
-                                double zeta_min = zeta;
-                                for (size_t ip : cs_a.prim_indices)
-                                    if (shells[ip].exponent < zeta_min) zeta_min = shells[ip].exponent;
-                                for (size_t jp : cs_b.prim_indices)
-                                    if (shells[jp].exponent < zeta_min) zeta_min = shells[jp].exponent;
-                                double zm = (zeta_min > 0.01) ? zeta_min : 0.01;
-                                double R_max = std::sqrt(35.0 / zm) + std::max(Da, Db);
+                                // R_max based on ECP decay: beyond this range ECP factor ≈ 0
+                                double zm = (zeta > 0.01) ? zeta : 0.01;
+                                double R_max = std::sqrt(35.0 / zm);
 
                                 for (int ca = 0; ca < nA; ca++) {
                                     int mu = cs_a.basis_start + ca;
@@ -481,7 +506,7 @@ void compute_ecp_matrix(
                                         int lb = comps_b[cb][0], mb_c = comps_b[cb][1], nb_c = comps_b[cb][2];
 
                                         double val = 0.0;
-                                        for (int ir = 0; ir < n_rad_pts; ir++) {
+                                        for (int ir = 0; ir < off_n_rad; ir++) {
                                             double t = (off_rn[ir] + 1.0) / 2.0;
                                             double r = R_max * t;
                                             double wr = off_rw[ir] * R_max / 2.0;
@@ -490,14 +515,13 @@ void compute_ecp_matrix(
                                             double ecp_rad = std::pow(r, ecp_prim.power) * std::exp(-zeta * r * r);
                                             if (ecp_rad < 1e-30) continue;
 
-                                            std::vector<double> Alm_mu(n_m, 0.0);
-                                            std::vector<double> Alm_nu(n_m, 0.0);
+                                            double Alm_mu[7] = {}, Alm_nu[7] = {};  // max 2*3+1=7
 
-                                            for (int ia = 0; ia < n_ang_off; ia++) {
-                                                double ox = off_ang_grid[ia].x;
-                                                double oy = off_ang_grid[ia].y;
-                                                double oz = off_ang_grid[ia].z;
-                                                double w_ang = off_ang_grid[ia].w;
+                                            for (int ia = 0; ia < off_n_ang; ia++) {
+                                                double ox = off_ang[ia].x;
+                                                double oy = off_ang[ia].y;
+                                                double oz = off_ang[ia].z;
+                                                double w_ang = off_ang[ia].w;
 
                                                 double rx = r*ox - dAx, ry = r*oy - dAy, rz = r*oz - dAz;
                                                 double r2A = rx*rx + ry*ry + rz*rz;
@@ -527,10 +551,10 @@ void compute_ecp_matrix(
                                                               * std::exp(-shells[jp].exponent * r2B);
                                                 }
 
-                                                auto Ylm = solid_harmonics(l_proj, ox, oy, oz);
+                                                const double* Ylm_ptr = &off_Ylm_flat[ia * off_stride + off_Ylm_offset[l_proj]];
                                                 for (int m = 0; m < n_m; m++) {
-                                                    Alm_mu[m] += w_ang * mu_val * Ylm[m];
-                                                    Alm_nu[m] += w_ang * nu_val * Ylm[m];
+                                                    Alm_mu[m] += w_ang * mu_val * Ylm_ptr[m];
+                                                    Alm_nu[m] += w_ang * nu_val * Ylm_ptr[m];
                                                 }
                                             }
 
