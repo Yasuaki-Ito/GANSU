@@ -35,6 +35,17 @@ void compute_ecp_matrix(
     double* V_ecp,
     int n_radial = 75, int angular_order = 26);
 
+/// Compute ECP gradient contributions via finite difference
+/// grad_ecp[3*iatom + xyz] += Tr(D * dV_ECP/dR)
+void compute_ecp_gradient(
+    const PrimitiveShell* shells, int num_primitives,
+    const double* cgto_norms,
+    int num_basis,
+    const Atom* atoms, int num_atoms,
+    const std::unordered_map<std::string, ElementECP>& ecp_data,
+    const double* density_matrix,
+    double* grad_ecp);
+
 /// GPU kernel launch for off-center Type 2 (defined in ecp_integrals_gpu.cu)
 struct AngPtGPU { double x, y, z, w; };
 

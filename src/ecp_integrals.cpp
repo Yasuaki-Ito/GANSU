@@ -756,5 +756,64 @@ void compute_ecp_matrix(
     }
 }
 
+// ============================================================
+//  ECP gradient via finite difference of V_ECP matrix
+//  grad_ecp[3*A + d] = Tr(D * dV_ECP/dR_Ad)
+//  dV_ECP/dR_Ad ≈ (V_ECP(R_A + h*e_d) - V_ECP(R_A - h*e_d)) / (2h)
+// ============================================================
+void compute_ecp_gradient(
+    const PrimitiveShell* shells, int num_primitives,
+    const double* cgto_norms,
+    int num_basis,
+    const Atom* atoms, int num_atoms,
+    const std::unordered_map<std::string, ElementECP>& ecp_data,
+    const double* density_matrix,
+    double* grad_ecp)
+{
+    const double h = 1e-5; // finite difference step (bohr)
+    const size_t mat_size = (size_t)num_basis * num_basis;
+
+    // For each atom and each direction (x,y,z)
+    for (int iatom = 0; iatom < num_atoms; iatom++) {
+        for (int dir = 0; dir < 3; dir++) {
+            // Create displaced atom AND shell arrays
+            std::vector<Atom> atoms_plus(atoms, atoms + num_atoms);
+            std::vector<Atom> atoms_minus(atoms, atoms + num_atoms);
+            std::vector<PrimitiveShell> shells_plus(shells, shells + num_primitives);
+            std::vector<PrimitiveShell> shells_minus(shells, shells + num_primitives);
+
+            // Displace atom coordinates
+            if (dir == 0) { atoms_plus[iatom].coordinate.x += h; atoms_minus[iatom].coordinate.x -= h; }
+            if (dir == 1) { atoms_plus[iatom].coordinate.y += h; atoms_minus[iatom].coordinate.y -= h; }
+            if (dir == 2) { atoms_plus[iatom].coordinate.z += h; atoms_minus[iatom].coordinate.z -= h; }
+
+            // Also displace shell coordinates for shells on this atom
+            for (int ip = 0; ip < num_primitives; ip++) {
+                if (shells[ip].atom_index == iatom) {
+                    if (dir == 0) { shells_plus[ip].coordinate.x += h; shells_minus[ip].coordinate.x -= h; }
+                    if (dir == 1) { shells_plus[ip].coordinate.y += h; shells_minus[ip].coordinate.y -= h; }
+                    if (dir == 2) { shells_plus[ip].coordinate.z += h; shells_minus[ip].coordinate.z -= h; }
+                }
+            }
+
+            // Compute V_ECP at displaced geometries
+            std::vector<double> V_plus(mat_size, 0.0), V_minus(mat_size, 0.0);
+
+            compute_ecp_matrix(shells_plus.data(), num_primitives, cgto_norms, num_basis,
+                               atoms_plus.data(), num_atoms, ecp_data, V_plus.data());
+            compute_ecp_matrix(shells_minus.data(), num_primitives, cgto_norms, num_basis,
+                               atoms_minus.data(), num_atoms, ecp_data, V_minus.data());
+
+            // dV/dR = (V+ - V-) / 2h, then contract with density: Tr(D * dV/dR)
+            double grad_val = 0.0;
+            for (size_t ij = 0; ij < mat_size; ij++) {
+                grad_val += density_matrix[ij] * (V_plus[ij] - V_minus[ij]) / (2.0 * h);
+            }
+
+            grad_ecp[3 * iatom + dir] += grad_val;
+        }
+    }
+}
+
 } // namespace ecp_integral
 } // namespace gansu

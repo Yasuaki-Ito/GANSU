@@ -30,6 +30,7 @@
 #include "minao.hpp"
 
 #include "utils.hpp" // THROW_EXCEPTION
+#include "ecp_integrals.hpp"
 namespace gansu{
 
 
@@ -840,7 +841,7 @@ std::vector<double> RHF::compute_Energy_Gradient() {
     }
 
     // HF gradient (default)
-    return gpu::computeEnergyGradient_RHF(
+    auto gradient = gpu::computeEnergyGradient_RHF(
         shell_type_infos,
         shell_pair_type_infos,
         atoms.device_ptr(),
@@ -855,6 +856,25 @@ std::vector<double> RHF::compute_Energy_Gradient() {
         num_electrons,
         verbose
     );
+
+    // Add ECP gradient contribution if present
+    if (has_ecp_) {
+        density_matrix.toHost();
+        primitive_shells.toHost();
+        cgto_normalization_factors.toHost();
+        atoms.toHost();
+
+        ecp_integral::compute_ecp_gradient(
+            primitive_shells.host_ptr(), primitive_shells.size(),
+            cgto_normalization_factors.host_ptr(),
+            num_basis,
+            atoms.host_ptr(), atoms.size(),
+            ecp_data_,
+            density_matrix.host_ptr(),
+            gradient.data());
+    }
+
+    return gradient;
 }
 
 
