@@ -583,6 +583,13 @@ public:
         for(int i=0; i<hf_.get_atoms().size(); i++){
             const std::string element_name = atomic_number_to_element_name(hf_.get_atoms()[i].atomic_number);
 
+            // Skip ECP atoms — their density block stays zero, core guess handles them
+            if (hf_.get_atoms()[i].effective_charge != hf_.get_atoms()[i].atomic_number) {
+                if(hf_.get_run_type() != "optimize")
+                    std::cout << " [SAD] Skipping ECP atom: " << element_name << " (core guess)" << std::endl;
+                continue;
+            }
+
             if(hf_.get_run_type() != "optimize"){
                 std::cout << " [SAD] Loading density matrix for : " << element_name  << std::endl;
             }
