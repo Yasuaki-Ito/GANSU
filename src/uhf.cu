@@ -20,6 +20,7 @@
 
  #include "uhf.hpp"
  #include "utils.hpp" // THROW_EXCEPTION
+ #include "ecp_integrals.hpp"
 
  #include <limits> // numeric_limits<double>::max();
  #include <iomanip> // std::setprecision
@@ -391,7 +392,7 @@ void UHF::export_density_matrix(real_t* density_matrix_a, real_t* density_matrix
 std::vector<double> UHF::compute_Energy_Gradient() {
     PROFILE_FUNCTION();
 
-    return gpu::computeEnergyGradient_UHF(
+    auto gradient = gpu::computeEnergyGradient_UHF(
         shell_type_infos,
         shell_pair_type_infos,
         atoms.device_ptr(),
@@ -410,6 +411,31 @@ std::vector<double> UHF::compute_Energy_Gradient() {
         num_beta_spins,
         verbose
     );
+
+    // Add ECP gradient contribution if present
+    if (has_ecp_) {
+        // ECP gradient uses total density D = D_alpha + D_beta
+        density_matrix_a.toHost();
+        density_matrix_b.toHost();
+        primitive_shells.toHost();
+        cgto_normalization_factors.toHost();
+        atoms.toHost();
+
+        std::vector<double> D_total((size_t)num_basis * num_basis);
+        for (size_t i = 0; i < D_total.size(); i++)
+            D_total[i] = density_matrix_a.host_ptr()[i] + density_matrix_b.host_ptr()[i];
+
+        ecp_integral::compute_ecp_gradient(
+            primitive_shells.host_ptr(), primitive_shells.size(),
+            cgto_normalization_factors.host_ptr(),
+            num_basis,
+            atoms.host_ptr(), atoms.size(),
+            ecp_data_,
+            D_total.data(),
+            gradient.data());
+    }
+
+    return gradient;
 }
 
 
