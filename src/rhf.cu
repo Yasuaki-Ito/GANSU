@@ -222,6 +222,8 @@ void RHF::post_process_after_scf() {
         eri_method_->compute_cis(get_n_excited_states());
     }else if(post_hf_method == PostHFMethod::ADC2){
         eri_method_->compute_adc2(get_n_excited_states());
+    }else if(post_hf_method == PostHFMethod::SOS_ADC2){
+        eri_method_->compute_sos_adc2(get_n_excited_states());
     }else if(post_hf_method == PostHFMethod::ADC2X){
         eri_method_->compute_adc2x(get_n_excited_states());
     }else if(post_hf_method == PostHFMethod::EOM_MP2){

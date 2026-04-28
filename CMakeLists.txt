@@ -203,6 +203,7 @@ set(SOURCES
     src/utils.cpp
     src/ecp_integrals.cpp
     src/ecp_integrals_gpu.cu
+    src/sos_laplace_adc2_operator.cu
 )
 
 if(NOT ENABLE_GPU)
