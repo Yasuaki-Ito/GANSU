@@ -2611,15 +2611,79 @@ void choleskyDecomposition(double* d_A, const int N) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for workspace: ") + std::string(cudaGetErrorString(err)));
     }
 
-    // Perform Cholesky decomposition (A -> L, overwriting lower triangular part)
+    // Save a copy of A before Cholesky (potrf destroys input on failure)
+    double* d_A_backup;
+    gansu::tracked_cudaMalloc(&d_A_backup, (size_t)N * N * sizeof(double));
+    cudaMemcpy(d_A_backup, d_A, (size_t)N * N * sizeof(double), cudaMemcpyDeviceToDevice);
+
+    // Attempt Cholesky decomposition
     cusolverDnDpotrf(cusolverHandle, CUBLAS_FILL_MODE_UPPER, N, d_A, N, d_work, lwork, d_info);
+
+    int h_info;
+    cudaMemcpy(&h_info, d_info, sizeof(int), cudaMemcpyDeviceToHost);
+
+    if (h_info != 0) {
+        // Cholesky failed — regularize with diagonal shift and retry
+        std::cerr << "[RI] Cholesky failed (info=" << h_info
+                  << "). Applying diagonal regularization." << std::endl;
+
+        // Restore original matrix
+        cudaMemcpy(d_A, d_A_backup, (size_t)N * N * sizeof(double), cudaMemcpyDeviceToDevice);
+
+        // Find max diagonal element for relative shift
+        std::vector<double> diag(N);
+        std::vector<double> A_host((size_t)N * N);
+        cudaMemcpy(A_host.data(), d_A, (size_t)N * N * sizeof(double), cudaMemcpyDeviceToHost);
+        double max_diag = 0.0;
+        for (int i = 0; i < N; i++) {
+            diag[i] = A_host[i * N + i];
+            if (diag[i] > max_diag) max_diag = diag[i];
+        }
+
+        // Add shift: A' = A + ε*I, ε = 1e-8 * max_diag
+        double shift = 1e-8 * max_diag;
+        for (int i = 0; i < N; i++)
+            A_host[i * N + i] += shift;
+        cudaMemcpy(d_A, A_host.data(), (size_t)N * N * sizeof(double), cudaMemcpyHostToDevice);
+
+        std::cerr << "[RI] Diagonal shift = " << shift << " (max_diag = " << max_diag << ")" << std::endl;
+
+        // Retry Cholesky
+        cusolverDnDpotrf_bufferSize(cusolverHandle, CUBLAS_FILL_MODE_UPPER, N, d_A, N, &lwork);
+        gansu::tracked_cudaFree(d_work);
+        gansu::tracked_cudaMalloc(&d_work, lwork * sizeof(double));
+        cusolverDnDpotrf(cusolverHandle, CUBLAS_FILL_MODE_UPPER, N, d_A, N, d_work, lwork, d_info);
+        cudaMemcpy(&h_info, d_info, sizeof(int), cudaMemcpyDeviceToHost);
+
+        if (h_info != 0) {
+            // Still failing — try larger shift
+            std::cerr << "[RI] Retry failed (info=" << h_info << "). Trying larger shift." << std::endl;
+            cudaMemcpy(d_A, d_A_backup, (size_t)N * N * sizeof(double), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(A_host.data(), d_A, (size_t)N * N * sizeof(double), cudaMemcpyDeviceToHost);
+            shift = 1e-6 * max_diag;
+            for (int i = 0; i < N; i++)
+                A_host[i * N + i] += shift;
+            cudaMemcpy(d_A, A_host.data(), (size_t)N * N * sizeof(double), cudaMemcpyHostToDevice);
+            std::cerr << "[RI] Diagonal shift = " << shift << std::endl;
+            cusolverDnDpotrf(cusolverHandle, CUBLAS_FILL_MODE_UPPER, N, d_A, N, d_work, lwork, d_info);
+            cudaMemcpy(&h_info, d_info, sizeof(int), cudaMemcpyDeviceToHost);
+            if (h_info != 0) {
+                std::cerr << "[RI] ERROR: Cholesky still failed after regularization." << std::endl;
+            }
+        }
+
+        if (h_info == 0) {
+            std::cerr << "[RI] Cholesky succeeded after regularization." << std::endl;
+        }
+    }
+
+    gansu::tracked_cudaFree(d_A_backup);
 
     // Set zero to the upper triangular part
     const int num_threads = 256;
     const int num_blocks = (N * N + num_threads - 1) / num_threads;
 
     setZeroUpperTriangle<<<num_blocks, num_threads>>>(d_A, N);
-
 
     // Cleanup
     gansu::tracked_cudaFree(d_work);
