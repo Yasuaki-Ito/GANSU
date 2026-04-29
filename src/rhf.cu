@@ -997,14 +997,16 @@ void RHF::report() {
     std::cout << std::endl;
     std::cout << "[Calculation Summary]" << std::endl;
     std::cout << "Method: Restricted Hartree-Fock (RHF)" << std::endl;
-    std::cout << "Schwarz screening threshold: " << schwarz_screening_threshold << std::endl;
+    std::cout << "Schwarz screening threshold: " << std::scientific << std::setprecision(2) << schwarz_screening_threshold << std::endl;
     std::cout << "Initial guess method: " << initial_guess_method_ << std::endl;
     std::cout << "Convergence algorithm: " << convergence_method_->get_algorithm_name() << std::endl;
     std::cout << "Number of iterations: " << iter_ << std::endl;
-    std::cout << "Convergence criterion: " << convergence_energy_threshold << std::endl;
-    std::cout << "Energy difference: " << energy_difference_ << std::endl;
+    std::cout << "Convergence criterion: " << std::scientific << std::setprecision(2) << convergence_energy_threshold << std::endl;
+    std::cout << "Energy difference: " << std::scientific << std::setprecision(2) << energy_difference_ << std::endl;
+    std::cout << std::fixed;
     std::cout << "Energy (without nuclear repulsion): " << std::setprecision(17) << get_energy() << " [hartree]" << std::endl;
     std::cout << "Total Energy: " << std::setprecision(17) << get_total_energy() << " [hartree]" << std::endl;
+    std::cout << std::defaultfloat;
     std::cout << "Computing time: " << std::setprecision(5) << get_solve_time_in_milliseconds() << " [ms]" << std::endl;
 
     if(get_post_hf_method() != PostHFMethod::None){

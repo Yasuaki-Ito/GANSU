@@ -543,133 +543,113 @@ real_t* ERI_RI::build_mo_eri(const real_t* d_C, int nmo) const {
     return d_eri_mo;
 }
 
-void ERI_RI::precomputation() {
-    // compute the intermediate matrix B of the auxiliary basis functions
+void ERI_RI::precompute_schwarz_and_shell_pairs() {
     const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
     const DeviceHostMemory<PrimitiveShell>& primitive_shells = hf_.get_primitive_shells();
     const DeviceHostMemory<real_t>& cgto_normalization_factors = hf_.get_cgto_normalization_factors();
     const DeviceHostMemory<real_t>& boys_grid = hf_.get_boys_grid();
     const int verbose = hf_.get_verbose();
-
     const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
-    const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
 
     // compute upper bounds of primitive-shell-pair
     gpu::computeSchwarzUpperBounds(
-        shell_type_infos,
-        shell_pair_type_infos,
-        primitive_shells.device_ptr(), 
-        boys_grid.device_ptr(), 
-        cgto_normalization_factors.device_ptr(), 
-        schwarz_upper_bound_factors.device_ptr(),   // schwarz_upper_bound_factorsに√(pq|pq)の値がはいっている
-        verbose
-    );
-
+        shell_type_infos, shell_pair_type_infos,
+        primitive_shells.device_ptr(), boys_grid.device_ptr(),
+        cgto_normalization_factors.device_ptr(),
+        schwarz_upper_bound_factors.device_ptr(), verbose);
 
     const size_t num_primitive_shell_pairs = primitive_shells.size() * (primitive_shells.size() + 1) / 2;
-    size_t2* d_primitive_shell_pair_indices;
-    // Use tracked_cudaMalloc so hybrid --cpu mode falls back to host calloc.
-    tracked_cudaMalloc(&d_primitive_shell_pair_indices, sizeof(size_t2) * num_primitive_shell_pairs);
+    size_t2* d_psi;
+    tracked_cudaMalloc(&d_psi, sizeof(size_t2) * num_primitive_shell_pairs);
 
     int pair_idx = 0;
-    const int threads_per_block = 1024;
-    for(int s0 = 0; s0 < shell_type_infos.size(); s0++){
-        for(int s1 = s0; s1 < shell_type_infos.size(); s1++){
+    const int tpb = 1024;
+    for (int s0 = 0; s0 < (int)shell_type_infos.size(); s0++) {
+        for (int s1 = s0; s1 < (int)shell_type_infos.size(); s1++) {
             const size_t count = shell_pair_type_infos[pair_idx].count;
             const size_t start = shell_pair_type_infos[pair_idx].start_index;
-
 #ifndef GANSU_CPU_ONLY
             if (gpu::gpu_available()) {
-                const int num_blocks = (count + threads_per_block - 1) / threads_per_block;
-                generatePrimitiveShellPairIndices<<<num_blocks, threads_per_block>>>(&d_primitive_shell_pair_indices[start], count, s0 == s1, shell_type_infos[s1].count);
-                thrust::device_ptr<real_t> keys_begin(&schwarz_upper_bound_factors.device_ptr()[start]);
-                thrust::device_ptr<real_t> keys_end(&schwarz_upper_bound_factors.device_ptr()[start] + count);
-                thrust::device_ptr<size_t2> values_begin(&d_primitive_shell_pair_indices[start]);
-                thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+                const int nb = (count + tpb - 1) / tpb;
+                generatePrimitiveShellPairIndices<<<nb, tpb>>>(&d_psi[start], count, s0 == s1, shell_type_infos[s1].count);
+                thrust::sort_by_key(
+                    thrust::device_ptr<real_t>(&schwarz_upper_bound_factors.device_ptr()[start]),
+                    thrust::device_ptr<real_t>(&schwarz_upper_bound_factors.device_ptr()[start] + count),
+                    thrust::device_ptr<size_t2>(&d_psi[start]), thrust::greater<real_t>());
             } else
 #endif
             {
-                // === CPU path: generate indices in original order, skip Schwarz sort ===
-                // In CPU mode schwarz_upper_bound_factors are all 1.0 (no screening),
-                // so a sort would only scramble primitives to no effect.  Leave them
-                // in basis-index order so group_contracted_shells sees them in the
-                // same sequence as the untouched GPU case (important for determinism).
-                size_t2* h_pair = &d_primitive_shell_pair_indices[start];
-                const bool is_symmetric = (s0 == s1);
+                size_t2* h_pair = &d_psi[start];
+                const bool is_sym = (s0 == s1);
                 const size_t ns1 = shell_type_infos[s1].count;
                 for (size_t id = 0; id < count; ++id) {
                     size_t r1, r2;
-                    if (is_symmetric) {
+                    if (is_sym) {
                         r2 = (size_t)((std::sqrt(8.0 * (double)id + 1.0) - 1.0) / 2.0);
                         while ((r2 + 1) * (r2 + 2) / 2 <= id) ++r2;
                         while (r2 > 0 && r2 * (r2 + 1) / 2 > id) --r2;
                         r1 = id - r2 * (r2 + 1) / 2;
-                    } else {
-                        r1 = id / ns1;
-                        r2 = id % ns1;
-                    }
+                    } else { r1 = id / ns1; r2 = id % ns1; }
                     h_pair[id] = {r1, r2};
                 }
             }
-
             pair_idx++;
         }
     }
     cudaDeviceSynchronize();
 
-
-
-
-    // compute upper bounds of  aux-shell
+    // compute upper bounds of aux-shell
     gpu::computeAuxiliarySchwarzUpperBounds(
-        auxiliary_shell_type_infos_,
-        auxiliary_primitive_shells_.device_ptr(),
-        boys_grid.device_ptr(),
-        auxiliary_cgto_normalization_factors_.device_ptr(),
-        auxiliary_schwarz_upper_bound_factors.device_ptr(),   // auxiliary_schwarz_upper_bound_factorsに√(pq|pq)の値がはいっている
-        verbose
-    );
+        auxiliary_shell_type_infos_, auxiliary_primitive_shells_.device_ptr(),
+        boys_grid.device_ptr(), auxiliary_cgto_normalization_factors_.device_ptr(),
+        auxiliary_schwarz_upper_bound_factors.device_ptr(), verbose);
 
-    for(const auto& s : auxiliary_shell_type_infos_){
+    for (const auto& s : auxiliary_shell_type_infos_) {
 #ifndef GANSU_CPU_ONLY
         if (gpu::gpu_available()) {
-            thrust::device_ptr<real_t> keys_begin(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index]);
-            thrust::device_ptr<real_t> keys_end(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index] + s.count);
-            thrust::device_ptr<PrimitiveShell> values_begin(&auxiliary_primitive_shells_.device_ptr()[s.start_index]);
-            thrust::sort_by_key(keys_begin, keys_end, values_begin, thrust::greater<real_t>());
+            thrust::sort_by_key(
+                thrust::device_ptr<real_t>(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index]),
+                thrust::device_ptr<real_t>(&auxiliary_schwarz_upper_bound_factors.device_ptr()[s.start_index] + s.count),
+                thrust::device_ptr<PrimitiveShell>(&auxiliary_primitive_shells_.device_ptr()[s.start_index]),
+                thrust::greater<real_t>());
         }
-        // CPU path: skip sort (all Schwarz bounds = 1.0 in the stub).
 #endif
     }
 
+    d_persistent_shell_pair_indices_ = d_psi;
+    num_persistent_shell_pairs_ = num_primitive_shell_pairs;
+    cudaDeviceSynchronize();
+}
 
-    // Zero-initialize B matrix before computation (defensive: prevent stale GPU memory)
+void ERI_RI::precomputation() {
+    // Step 1: Schwarz + shell pairs + aux Schwarz
+    precompute_schwarz_and_shell_pairs();
+
+    // Step 2: Build full B matrix (uses persisted shell pair indices from step 1)
+    const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
+    const DeviceHostMemory<PrimitiveShell>& primitive_shells = hf_.get_primitive_shells();
+    const DeviceHostMemory<real_t>& cgto_normalization_factors = hf_.get_cgto_normalization_factors();
+    const DeviceHostMemory<real_t>& boys_grid = hf_.get_boys_grid();
+    const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
+    const int verbose = hf_.get_verbose();
+
     cudaMemset(intermediate_matrix_B_.device_ptr(), 0,
                (size_t)num_auxiliary_basis_ * num_basis_ * num_basis_ * sizeof(real_t));
 
     gpu::compute_RI_IntermediateMatrixB(
-        shell_type_infos,
-        shell_pair_type_infos,
-        primitive_shells.device_ptr(),
-        cgto_normalization_factors.device_ptr(),
+        shell_type_infos, shell_pair_type_infos,
+        primitive_shells.device_ptr(), cgto_normalization_factors.device_ptr(),
         auxiliary_shell_type_infos_,
         auxiliary_primitive_shells_.device_ptr(),
         auxiliary_cgto_normalization_factors_.device_ptr(),
         intermediate_matrix_B_.device_ptr(),
-        d_primitive_shell_pair_indices,
+        d_persistent_shell_pair_indices_,
         schwarz_upper_bound_factors.device_ptr(),
         auxiliary_schwarz_upper_bound_factors.device_ptr(),
         schwarz_screening_threshold,
-        num_basis_,
-        num_auxiliary_basis_,
-        boys_grid.device_ptr(),
-        verbose
-        );
-
-
-    // Persist shell pair indices for distributed multi-GPU builds
-    d_persistent_shell_pair_indices_ = d_primitive_shell_pair_indices;
-    num_persistent_shell_pairs_ = num_primitive_shell_pairs;
+        num_basis_, num_auxiliary_basis_,
+        boys_grid.device_ptr(), verbose);
 
     cudaDeviceSynchronize();
 }

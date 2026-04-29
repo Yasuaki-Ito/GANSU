@@ -236,23 +236,28 @@ void ERI_RI_Distributed_RHF::compute_aux_type_ranges() {
 //  Then distributed B build (no full B on any single GPU)
 // ============================================================
 void ERI_RI_Distributed_RHF::precomputation() {
-    // Run parent precomputation which does:
-    // - Schwarz bounds + shell pair indices (now persisted)
-    // - 2c2e + Cholesky + 3c2e + full B on GPU 0
-    // We need the full B for the initial density-matrix-based Fock build
-    // (before coefficient matrix is available). After that, distributed_build_B()
-    // replaces it with per-GPU B_local.
-    ERI_RI::precomputation();
+    const int naux = num_auxiliary_basis_;
+    const int nbas = num_basis_;
 
-    // Compute auxiliary type ranges for chunked distributed build
+    // Step 1: Schwarz + shell pairs + aux Schwarz (skip full B build)
+    precompute_schwarz_and_shell_pairs();
+
+    // Release intermediate_matrix_B_ allocated by base constructor (never used in distributed mode)
+    intermediate_matrix_B_.release();
+    // Release single-GPU Fock workspace (not needed — we use distributed J/K)
+    d_tmp1_.release();
+    d_tmp2_.release();
+
+    std::cout << "[RI-Dist] Skipped full B build (saved "
+              << (size_t)naux * nbas * nbas * sizeof(real_t) / (1024 * 1024) << " MB)" << std::endl;
+
+    // Step 2: Compute auxiliary type ranges for chunked 3c2e
     auxiliary_primitive_shells_.toHost();
     compute_aux_type_ranges();
 
-    // Cache L⁻¹ on GPU 0 for reuse in distributed_build_B().
-    // 2c2e + Cholesky is O(naux²) — negligible vs. O(naux × nbas²) 3c2e.
+    // Step 3: Compute and cache L⁻¹ on GPU 0
     {
         MultiGpuManager::DeviceGuard guard(0);
-        const int naux = num_auxiliary_basis_;
         const real_t schwarz_threshold = hf_.get_schwarz_screening_threshold();
 
         real_t* d_two_center_eri;
@@ -277,6 +282,9 @@ void ERI_RI_Distributed_RHF::precomputation() {
         std::cout << "[RI-Dist] Cached L^-1 on GPU 0 ("
                   << (size_t)naux * naux * sizeof(real_t) / (1024 * 1024) << " MB)" << std::endl;
     }
+
+    // Step 4: Build B_local on all GPUs immediately
+    distributed_build_B();
 }
 
 // ============================================================
@@ -498,26 +506,118 @@ void ERI_RI_Distributed_RHF::distributed_build_B() {
 //  Distributed Fock build
 // ============================================================
 void ERI_RI_Distributed_RHF::compute_fock_matrix() {
-    // Before coefficient matrix is available, fall back to single-GPU density-matrix Fock
-    if (!rhf_.get_hasMatrixC()) {
-        cudaSetDevice(0);
-        const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
-        const DeviceHostMatrix<real_t>& core_hamiltonian_matrix = rhf_.get_core_hamiltonian_matrix();
-        DeviceHostMatrix<real_t>& fock_matrix = rhf_.get_fock_matrix();
-        gpu::computeFockMatrix_RI_RHF_with_density_matrix(
-            density_matrix.device_ptr(), core_hamiltonian_matrix.device_ptr(),
-            intermediate_matrix_B_.device_ptr(), fock_matrix.device_ptr(),
-            num_basis_, num_auxiliary_basis_,
-            d_J_.device_ptr(), d_K_.device_ptr(),
-            d_W_tmp_.device_ptr(), d_tmp1_.device_ptr(), d_tmp2_.device_ptr());
-        return;
-    }
     if (direct_mode_) {
-        // Direct-RI mode: rebuild B_local from full B on GPU 0 each iteration
-        // (B is rebuilt on-the-fly, not stored between iterations)
         distributed_build_B();
     } else {
         if (!scattered_) distributed_build_B();
+    }
+
+    // Density-matrix-based Fock (before coefficient matrix is available, e.g. SAD guess)
+    if (!rhf_.get_hasMatrixC()) {
+        const int nbas = num_basis_;
+        const size_t nbas2 = (size_t)nbas * nbas;
+        const int threads = 256;
+        auto& mgr = MultiGpuManager::instance();
+        const real_t* d_D_gpu0 = rhf_.get_density_matrix().device_ptr();
+        const real_t* d_H_gpu0 = rhf_.get_core_hamiltonian_matrix().device_ptr();
+
+        // Replicate D to all GPUs
+        std::vector<real_t*> d_D(num_gpus_, nullptr);
+        for (int d = 0; d < num_gpus_; d++) {
+            MultiGpuManager::DeviceGuard guard(d);
+            if (d == 0) { d_D[d] = const_cast<real_t*>(d_D_gpu0); }
+            else {
+                cudaMalloc(&d_D[d], nbas2 * sizeof(double));
+                cudaMemcpy(d_D[d], d_D_gpu0, nbas2 * sizeof(double), cudaMemcpyDefault);
+            }
+        }
+
+        // ---- Distributed J build (same as coefficient-based path) ----
+        for (int d = 0; d < num_gpus_; d++) {
+            MultiGpuManager::DeviceGuard guard(d);
+            cublasHandle_t handle = mgr.cublas(d);
+            int nl = naux_local_[d];
+            const double one = 1.0, zero = 0.0;
+            cublasDgemv(handle, CUBLAS_OP_T, (int)nbas2, nl, &one,
+                        d_B_local_[d], (int)nbas2, d_D[d], 1, &zero, d_W_local_[d], 1);
+            int blk = ((int)nbas2 + threads - 1) / threads;
+            distributed_J_accumulate_kernel<<<blk, threads, 0, mgr.compute_stream(d)>>>(
+                d_J_local_[d], d_B_local_[d], d_W_local_[d], nbas, nl);
+        }
+        mgr.sync_all();
+        nccl::group_start();
+        for (int d = 0; d < num_gpus_; d++) {
+            MultiGpuManager::DeviceGuard guard(d);
+            nccl::all_reduce(d_J_local_[d], d_J_local_[d], nbas2, ncclSum, d, mgr.comm_stream(d));
+        }
+        nccl::group_end();
+
+        // ---- Distributed K build (density-matrix based) ----
+        // T_P[μν] = Σ_λ D^T[μλ] × B_P[λν],  K_local = Σ_P T_P^T × B_P, then AllReduce
+        for (int d = 0; d < num_gpus_; d++) {
+            MultiGpuManager::DeviceGuard guard(d);
+            cublasHandle_t handle = mgr.cublas(d);
+            cublasSetStream(handle, mgr.compute_stream(d));
+            int nl = naux_local_[d];
+            const double one = 1.0, zero = 0.0;
+            cudaMemset(d_K_local_[d], 0, nbas2 * sizeof(double));
+
+            // Allocate T and V temporaries
+            real_t *d_T = nullptr, *d_V = nullptr;
+            cudaMalloc(&d_T, (size_t)nl * nbas2 * sizeof(double));
+            cudaMalloc(&d_V, (size_t)nl * nbas2 * sizeof(double));
+
+            // T_P = D^T × B_P  (batched: naux_local batches of [nbas×nbas] × [nbas×nbas])
+            cublasDgemmStridedBatched(handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                nbas, nbas, nbas, &one,
+                d_D[d], nbas, 0LL,
+                d_B_local_[d], nbas, (long long)nbas2,
+                &zero, d_T, nbas, (long long)nbas2, nl);
+
+            // V_P = T_P^T × B_P
+            cublasDgemmStridedBatched(handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                nbas, nbas, nbas, &one,
+                d_T, nbas, (long long)nbas2,
+                d_B_local_[d], nbas, (long long)nbas2,
+                &zero, d_V, nbas, (long long)nbas2, nl);
+
+            // K_local = Σ_P V_P  (= V × ones, using DGEMV on [nbas² × nl] col-major)
+            {
+                real_t* d_ones = nullptr;
+                cudaMalloc(&d_ones, nl * sizeof(double));
+                // Fill with 1.0
+                std::vector<double> ones(nl, 1.0);
+                cudaMemcpy(d_ones, ones.data(), nl * sizeof(double), cudaMemcpyHostToDevice);
+                cublasDgemv(handle, CUBLAS_OP_N, (int)nbas2, nl, &one,
+                            d_V, (int)nbas2, d_ones, 1, &zero, d_K_local_[d], 1);
+                cudaFree(d_ones);
+            }
+            cudaFree(d_T); cudaFree(d_V);
+        }
+        mgr.sync_all();
+        nccl::group_start();
+        for (int d = 0; d < num_gpus_; d++) {
+            MultiGpuManager::DeviceGuard guard(d);
+            nccl::all_reduce(d_K_local_[d], d_K_local_[d], nbas2, ncclSum, d, mgr.comm_stream(d));
+        }
+        nccl::group_end();
+
+        // ---- Fock assembly on GPU 0 ----
+        {
+            MultiGpuManager::DeviceGuard guard(0);
+            cudaStreamSynchronize(mgr.comm_stream(0));
+            int blk = ((int)nbas2 + threads - 1) / threads;
+            distributed_fock_assemble_kernel<<<blk, threads>>>(
+                d_H_gpu0, d_J_local_[0], d_K_local_[0], rhf_.get_fock_matrix().device_ptr(), nbas);
+            cudaDeviceSynchronize();
+        }
+        for (int d = 1; d < num_gpus_; d++) {
+            MultiGpuManager::DeviceGuard guard(d);
+            cudaFree(d_D[d]);
+        }
+        return;
     }
 
     const int nbas = num_basis_;

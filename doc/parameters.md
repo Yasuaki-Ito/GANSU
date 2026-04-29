@@ -19,7 +19,7 @@
 | convergence_energy_threshold | Energy convergence threshold | double | 1.0e-6 |
 | int1e_method | Method to use for one-electron integrals | string | hybrid |
 | eri_method | Method to use for two-electron repulsion integrals | string | stored |
-| post_hf_method | Post-Hartree-Fock method to use (FCI, MP2, CC2, CCSD, CCSD(T), CIS, ADC2, ADC2X, EOM_MP2, EOM_CC2, EOM_CCSD) | string | none |
+| post_hf_method | Post-Hartree-Fock method to use (FCI, MP2, SCS_MP2, SOS_MP2, LT_MP2, LT_SOS_MP2, MP3, MP4, CC2, CCSD, CCSD_T, CCSD_DENSITY, CIS, ADC2, SOS_ADC2, ADC2X, EOM_MP2, EOM_CC2, EOM_CCSD) | string | none |
 | n_excited_states | Number of excited states to compute | int | 5 |
 | spin_type | Spin type for excited states (singlet, triplet) | string | singlet |
 | adc2_solver | Solver for ADC(2) (auto, schur_static, schur_omega, full) | string | auto |
@@ -38,6 +38,8 @@
 | mayer | Perform Mayer bond order analysis | bool | false |
 | wiberg | Perform Wiberg bond order analysis | bool | false |
 | export_molden | Output Molden file | bool | false |
+| ecp_filename | Path to ECP file for effective core potentials | string | |
+| num_gpus | Number of GPUs for multi-GPU RI-HF (-1 = auto-detect all available) | int | -1 |
 
 
 

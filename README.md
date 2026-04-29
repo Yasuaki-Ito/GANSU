@@ -10,7 +10,9 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
 ## Features
 * Hartree-Fock Methods: Includes RHF, UHF, and ROHF implementations.
 * Parallel computing: Accelerates almost all operations on the GPU, achieving true speedup through custom implementations from scratch.
+* Multi-GPU support: Distributed RI-HF across multiple GPUs via NCCL, with per-GPU B-matrix construction and AllReduce-based Fock build.
 * CPU backend: Full CPU-only execution via `--cpu` flag (Eigen + OpenMP), supporting all HF methods, post-HF, gradient, Hessian, and geometry optimization.
+* ECP support: Effective Core Potentials for heavy elements (LANL2DZ, cc-pVnZ-PP basis sets).
 * Python API: Call GANSU from Python via `import gansu` with automatic basis set resolution.
 * C API: Stable ABI for external bindings (`libgansu.so`).
 * Flexible Input Options: Supports standard file formats such as XYZ and Gaussian basis set files.
@@ -31,7 +33,7 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
       * Hash-RI (RHF) — 3-center ERIs in sparse COO, B matrix built on-demand from COO
       * Direct SCF (RHF)
 * Post-Hartree-Fock methods
-    * Møller-Plesset Perturbation Theory (RMP2, RMP3, RMP4, UMP2, UMP3)
+    * Møller-Plesset Perturbation Theory (RMP2, SCS-MP2, SOS-MP2, LT-MP2, LT-SOS-MP2, RMP3, RMP4, UMP2, UMP3)
     * Coupled Cluster (RCC2, RCCSD, RCCSD(T))
     * CCSD Lambda equations and 1-RDM (non-relaxed correlation density for DMET)
     * Full Configuration Interaction (RFCI)
@@ -40,7 +42,7 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
     * RI CIS with B-matrix based sigma vector (no nmo⁴ MO ERI, O(naux×nmo²) memory)
 * Excited state methods
     * Configuration Interaction Singles (CIS)
-    * Algebraic Diagrammatic Construction (ADC(2), ADC(2)-x)
+    * Algebraic Diagrammatic Construction (ADC(2), SOS-ADC(2), ADC(2)-x)
     * Equation-of-Motion MP2 (EOM-MP2)
     * Equation-of-Motion CC2 (EOM-CC2)
     * Equation-of-Motion CCSD (EOM-CCSD)
@@ -99,6 +101,13 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
         * Tested by [MOrbVis](https://yasuaki-ito.github.io/morbvis/), [Avogadro](https://avogadro.cc/), and [Pegamoid](https://github.com/Jellby/Pegamoid)
       ![Orbital renderred by MOrbVis](/doc/images/orbital.png)
       *Resulting molecular orbital of Benzene by MOrbVis*
+* Effective Core Potentials (ECP)
+    * LANL2DZ, cc-pVnZ-PP basis sets for heavy elements
+    * GPU-accelerated ECP integral computation
+* Multi-GPU (`--num_gpus`)
+    * Distributed RI-HF with NCCL AllReduce
+    * Per-GPU independent B-matrix construction (chunked 3-center ERI + L⁻¹ DGEMM)
+    * Supports stored RI and Direct-RI modes
 * CPU-only Backend (`--cpu`)
     * All HF methods (RHF, UHF, ROHF) with all ERI storage methods
     * All post-HF methods (MP2, MP3, MP4, CC2, CCSD, CCSD(T), FCI)
@@ -125,6 +134,9 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
 * Energy Hessian
   * Analytical h1ao/s1ao derivatives (currently uses finite differences)
   * UHF Hessian
+* Multi-GPU
+  * UHF/ROHF distributed Fock build
+  * Multi-GPU post-HF methods
 * Density Functional Theory (DFT)
 * GPU implementation
   * Total spin (UHF)
@@ -148,6 +160,7 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
   * cuSOLVER 11.7 or later
   * [Eigen](https://eigen.tuxfamily.org/) 3.4+ (automatically downloaded via CMake FetchContent)
   * [OpenBLAS](https://www.openblas.net/) (optional but recommended, `sudo apt install libopenblas-dev` on Ubuntu) — automatically detected by CMake; significantly accelerates CPU-mode computation
+  * [NCCL](https://developer.nvidia.com/nccl) (optional, required for multi-GPU support) — `sudo apt install libnccl-dev` on Ubuntu, or included in CUDA Toolkit
 
 #### CPU-only mode (`--cpu`)
 When a GPU is available, pass `--cpu` to force CPU execution. All features are supported with OpenMP parallelization.
@@ -221,6 +234,12 @@ mkdir build
 cd build
 cmake ..
 ```
+
+To enable multi-GPU support (requires NCCL):
+``` bash
+cmake .. -DENABLE_MULTI_GPU=ON
+```
+
 3. Build the software using the generated Makefile:
 ``` bash
 make
@@ -247,6 +266,15 @@ make
 # Geometry optimization
 ./gansu -x ../xyz/optimization/H2_stretched.xyz -g cc-pvdz -r optimize
 
+# RI approximation for large molecules
+./gansu -x ../xyz/large_molecular/fullerene.xyz -g sto-3g --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs
+
+# Multi-GPU RI-HF (auto-detect GPUs)
+./gansu -x ../xyz/large_molecular/fullerene.xyz -g sto-3g --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --num_gpus 4
+
+# CPU-only mode
+./gansu -x ../xyz/H2O.xyz -g sto-3g --cpu
+
 # List available basis sets
 ./gansu --list-basis
 ```
@@ -264,22 +292,6 @@ r = gansu.Molecule("H2O.xyz", basis="cc-pvdz").run(post_hf="ccsd")
 print(f"Energy: {r.total_energy + r.post_hf_energy:.8f} Hartree")
 gansu.finalize()
 ```
-
-#### Web UI (GANSU-UI)
-
-```bash
-# 1. Build C++ (if not already done)
-make
-
-# 2. Build frontend (first time only, requires npm)
-make ui
-
-# 3. Start server
-make serve
-# → Open http://localhost:8000 in browser
-```
-
-The Web UI provides a browser-based interface for running calculations on a remote GPU server. No local GPU required on the client.
 
 #### Documentation
 
@@ -300,6 +312,11 @@ This software is licensed under the BSD 3-Clause License.
 You may obtain a copy of the license in the LICENSE file
 located in the root directory of this source tree or at:
 https://opensource.org/licenses/BSD-3-Clause
+
+## Citation
+The journal article reference describing GANSU is:
+
+* Yasuaki Ito, Satoki Tsuji, Koji Nakano, and Akihiko Kasagi, GANSU: A GPU-Native Quantum Chemistry Framework for Efficient Hartree–Fock and Post-HF Calculations. Eng, vol. 7, 205, 2026. ([DOI](https://doi.org/10.3390/eng7050205))
 
 ## Publications
   1. Nobuya Yokogawa, Yasuaki Ito, Satoki Tsuji, Haruto Fujii, Kanta Suzuki, Koji Nakano, Victor Parque, Akihiko Kasagi, GPU-Accelerated One-Electron Integral Computation for Quantum Chemistry, Concurrency and Computation: Practice and Experience, vol. 38, no. 5, e70628, 2026. ([DOI](https://doi.org/10.1002/cpe.70628))

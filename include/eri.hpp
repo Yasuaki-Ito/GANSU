@@ -304,6 +304,10 @@ public:
 
     void precomputation() override;
 
+    /// Compute only Schwarz bounds, shell pair indices, and auxiliary Schwarz (no full B).
+    /// Subclasses (e.g., distributed) can call this instead of precomputation() to skip full B build.
+    void precompute_schwarz_and_shell_pairs();
+
     DeviceHostMemory<PrimitiveShell>& get_auxiliary_primitive_shells() { return auxiliary_primitive_shells_; } ///< Get the auxiliary primitive shells
     int get_num_auxiliary_basis() { return num_auxiliary_basis_; }
 
