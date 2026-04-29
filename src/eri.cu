@@ -235,6 +235,7 @@ ERI_RI::ERI_RI(const HF& hf, const Molecular& auxiliary_molecular):
 
 ERI_RI::~ERI_RI() {
     if (d_eri_reconstructed_) tracked_cudaFree(d_eri_reconstructed_);
+    if (d_persistent_shell_pair_indices_) tracked_cudaFree(d_persistent_shell_pair_indices_);
 }
 
 void ERI_RI::reconstruct_ao_eri() {
@@ -666,7 +667,10 @@ void ERI_RI::precomputation() {
         );
 
 
-    tracked_cudaFree(d_primitive_shell_pair_indices);
+    // Persist shell pair indices for distributed multi-GPU builds
+    d_persistent_shell_pair_indices_ = d_primitive_shell_pair_indices;
+    num_persistent_shell_pairs_ = num_primitive_shell_pairs;
+
     cudaDeviceSynchronize();
 }
 

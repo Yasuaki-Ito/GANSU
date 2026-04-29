@@ -1068,8 +1068,16 @@ private:
     bool scattered_ = false;
     bool direct_mode_ = false;  ///< If true, B_local is rebuilt and freed each Fock build
 
+    /// Per-auxiliary-shell-type basis function ranges (for chunked 3c2e)
+    std::vector<size_t> aux_type_basis_start_;  ///< [type_idx] → first basis function index
+    std::vector<int> aux_type_nfunc_;           ///< [type_idx] → number of basis functions
+
+    /// Cached L⁻¹ on GPU 0 (computed once in precomputation, reused in distributed_build_B)
+    real_t* d_cached_L_inv_ = nullptr;
+
     void allocate_per_device_workspace();
     void free_per_device_workspace();
+    void compute_aux_type_ranges();  ///< Scan aux shells to determine per-type basis ranges
 };
 #endif
 

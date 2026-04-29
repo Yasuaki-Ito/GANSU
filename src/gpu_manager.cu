@@ -3838,6 +3838,90 @@ void computeThreeCenterERIs(
 }
 
 /**
+ * @brief Compute 3-center ERIs for a single auxiliary shell type into a chunk buffer.
+ *
+ * Uses pointer-offset trick: the kernel writes to g_result[r * nbas² + ...] where r = c->basis_index.
+ * By passing (d_chunk - aux_basis_offset * nbas²) as the output pointer, the actual writes
+ * land at d_chunk[(r - aux_basis_offset) * nbas² + ...], giving a compact [nfunc_chunk × nbas²] output.
+ */
+void computeThreeCenterERIs_for_aux_type(
+    const std::vector<ShellTypeInfo>& shell_type_infos,
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+    const PrimitiveShell* d_primitive_shells,
+    const real_t* d_cgto_normalization_factors,
+    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+    const PrimitiveShell* d_auxiliary_primitive_shells,
+    const real_t* d_auxiliary_cgto_normalization_factors,
+    real_t* d_chunk,
+    const size_t2* d_primitive_shell_pair_indices,
+    const int num_basis,
+    const int num_auxiliary_basis,
+    const real_t* d_boys_grid,
+    const real_t* d_schwarz_upper_bound_factors,
+    const real_t* d_auxiliary_schwarz_upper_bound_factors,
+    const real_t schwarz_screening_threshold,
+    int aux_type_index,
+    size_t aux_basis_offset,
+    int nfunc_chunk)
+{
+#ifndef GANSU_CPU_ONLY
+    if (!gpu_available()) return;
+
+    const int threads_per_block = 128;
+    const int shell_type_count = shell_type_infos.size();
+
+    // Apply pointer offset so kernel writes land in the compact chunk buffer
+    real_t* d_output_shifted = d_chunk - (size_t)aux_basis_offset * (size_t)num_basis * (size_t)num_basis;
+
+    // Iterate over all AO shell-pair types × the single auxiliary type
+    const int s2 = aux_type_index;
+    const ShellTypeInfo shell_s2 = auxiliary_shell_type_infos[s2];
+
+    // Create streams for concurrent kernel launches
+    std::vector<cudaStream_t> streams;
+    for (int a = 0; a < shell_type_count; ++a) {
+        for (int b = a; b < shell_type_count; ++b) {
+            cudaStream_t stream;
+            cudaStreamCreate(&stream);
+            streams.push_back(stream);
+        }
+    }
+
+    int stream_id = 0;
+    for (int s0 = 0; s0 < shell_type_count; ++s0) {
+        for (int s1 = s0; s1 < shell_type_count; ++s1) {
+            const ShellTypeInfo shell_s0 = shell_type_infos[s0];
+            const ShellTypeInfo shell_s1 = shell_type_infos[s1];
+
+            const size_t num_tasks = ((s0 == s1)
+                ? ((size_t)shell_s0.count * (shell_s0.count + 1) / 2)
+                : ((size_t)shell_s0.count * shell_s1.count)) * (size_t)shell_s2.count;
+            const size_t num_blocks = (num_tasks + threads_per_block - 1) / threads_per_block;
+
+            const int pair_idx = calcIdx_triangular_(s0, s1, shell_type_count);
+
+            gpu::get_3center_kernel(s0, s1, s2)<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+                d_output_shifted, d_primitive_shells, d_auxiliary_primitive_shells,
+                d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors,
+                shell_s0, shell_s1, shell_s2,
+                num_tasks, num_basis,
+                &d_primitive_shell_pair_indices[shell_pair_type_infos[pair_idx].start_index],
+                &d_schwarz_upper_bound_factors[shell_pair_type_infos[pair_idx].start_index],
+                d_auxiliary_schwarz_upper_bound_factors,
+                schwarz_screening_threshold,
+                num_auxiliary_basis,
+                d_boys_grid);
+
+            stream_id %= streams.size();
+        }
+    }
+
+    cudaDeviceSynchronize();
+    for (auto& s : streams) cudaStreamDestroy(s);
+#endif // !GANSU_CPU_ONLY
+}
+
+/**
  * @brief Compute the Schwarz upper bounds for the shell pairs.
  * @param shell_type_infos Information about the basis functions
  * @param shell_pair_type_infos Information about the shell pairs

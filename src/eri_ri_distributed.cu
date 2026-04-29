@@ -72,6 +72,26 @@ namespace gpu {
         const real_t* d_auxiliary_schwarz_upper_bound_factors,
         const real_t schwarz_screening_threshold,
         const bool verbose);
+
+    void computeThreeCenterERIs_for_aux_type(
+        const std::vector<ShellTypeInfo>& shell_type_infos,
+        const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+        const PrimitiveShell* d_primitive_shells,
+        const real_t* d_cgto_normalization_factors,
+        const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+        const PrimitiveShell* d_auxiliary_primitive_shells,
+        const real_t* d_auxiliary_cgto_normalization_factors,
+        real_t* d_chunk,
+        const size_t2* d_primitive_shell_pair_indices,
+        const int num_basis,
+        const int num_auxiliary_basis,
+        const real_t* d_boys_grid,
+        const real_t* d_schwarz_upper_bound_factors,
+        const real_t* d_auxiliary_schwarz_upper_bound_factors,
+        const real_t schwarz_screening_threshold,
+        int aux_type_index,
+        size_t aux_basis_offset,
+        int nfunc_chunk);
 }
 
 // ============================================================
@@ -149,6 +169,11 @@ ERI_RI_Distributed_RHF::ERI_RI_Distributed_RHF(RHF& rhf, const Molecular& auxili
 
 ERI_RI_Distributed_RHF::~ERI_RI_Distributed_RHF() {
     free_per_device_workspace();
+    if (d_cached_L_inv_) {
+        MultiGpuManager::DeviceGuard guard(0);
+        tracked_cudaFree(d_cached_L_inv_);
+        d_cached_L_inv_ = nullptr;
+    }
 }
 
 void ERI_RI_Distributed_RHF::allocate_per_device_workspace() {
@@ -178,16 +203,85 @@ void ERI_RI_Distributed_RHF::free_per_device_workspace() {
 }
 
 // ============================================================
-//  Precomputation: Schwarz + 2c2e/Cholesky (no full B on any GPU)
+//  Compute per-auxiliary-shell-type basis function ranges
 // ============================================================
-void ERI_RI_Distributed_RHF::precomputation() {
-    // Parent precomputation: Schwarz + 3c2e + Cholesky + B on GPU 0.
-    // intermediate_matrix_B_ used for initial guess (density-matrix Fock).
-    ERI_RI::precomputation();
+void ERI_RI_Distributed_RHF::compute_aux_type_ranges() {
+    const auto& aux_types = auxiliary_shell_type_infos_;
+    const int n_aux_types = (int)aux_types.size();
+    aux_type_basis_start_.resize(n_aux_types);
+    aux_type_nfunc_.resize(n_aux_types);
+
+    // Scan host-side auxiliary primitive shells to find min/max basis_index per type
+    const PrimitiveShell* h_aux = auxiliary_primitive_shells_.host_ptr();
+    for (int c = 0; c < n_aux_types; c++) {
+        const size_t start = aux_types[c].start_index;
+        const size_t count = aux_types[c].count;
+        const int L = h_aux[start].shell_type;
+        const int n_cart = (L + 1) * (L + 2) / 2;
+
+        size_t min_idx = h_aux[start].basis_index;
+        size_t max_idx = h_aux[start].basis_index;
+        for (size_t i = 1; i < count; i++) {
+            size_t bi = h_aux[start + i].basis_index;
+            if (bi < min_idx) min_idx = bi;
+            if (bi > max_idx) max_idx = bi;
+        }
+        aux_type_basis_start_[c] = min_idx;
+        aux_type_nfunc_[c] = (int)(max_idx - min_idx) + n_cart;
+    }
 }
 
 // ============================================================
-//  Distributed B build: scatter from GPU 0 + release full B
+//  Precomputation: Schwarz + shell pairs + 2c2e/Cholesky
+//  Then distributed B build (no full B on any single GPU)
+// ============================================================
+void ERI_RI_Distributed_RHF::precomputation() {
+    // Run parent precomputation which does:
+    // - Schwarz bounds + shell pair indices (now persisted)
+    // - 2c2e + Cholesky + 3c2e + full B on GPU 0
+    // We need the full B for the initial density-matrix-based Fock build
+    // (before coefficient matrix is available). After that, distributed_build_B()
+    // replaces it with per-GPU B_local.
+    ERI_RI::precomputation();
+
+    // Compute auxiliary type ranges for chunked distributed build
+    auxiliary_primitive_shells_.toHost();
+    compute_aux_type_ranges();
+
+    // Cache L⁻¹ on GPU 0 for reuse in distributed_build_B().
+    // 2c2e + Cholesky is O(naux²) — negligible vs. O(naux × nbas²) 3c2e.
+    {
+        MultiGpuManager::DeviceGuard guard(0);
+        const int naux = num_auxiliary_basis_;
+        const real_t schwarz_threshold = hf_.get_schwarz_screening_threshold();
+
+        real_t* d_two_center_eri;
+        tracked_cudaMalloc(&d_two_center_eri, (size_t)naux * naux * sizeof(real_t));
+        cudaMemset(d_two_center_eri, 0, (size_t)naux * naux * sizeof(real_t));
+
+        gpu::computeTwoCenterERIs(
+            auxiliary_shell_type_infos_,
+            auxiliary_primitive_shells_.device_ptr(),
+            auxiliary_cgto_normalization_factors_.device_ptr(),
+            d_two_center_eri, naux,
+            hf_.get_boys_grid().device_ptr(),
+            auxiliary_schwarz_upper_bound_factors.device_ptr(),
+            schwarz_threshold, false);
+
+        gpu::choleskyDecomposition(d_two_center_eri, naux);
+
+        tracked_cudaMalloc(&d_cached_L_inv_, (size_t)naux * naux * sizeof(real_t));
+        gpu::computeInverseByDtrsm(d_two_center_eri, d_cached_L_inv_, naux);
+
+        tracked_cudaFree(d_two_center_eri);
+        std::cout << "[RI-Dist] Cached L^-1 on GPU 0 ("
+                  << (size_t)naux * naux * sizeof(real_t) / (1024 * 1024) << " MB)" << std::endl;
+    }
+}
+
+// ============================================================
+//  Distributed B build: each GPU independently computes B_local
+//  via chunked 3c2e + L⁻¹ DGEMM (no full B needed after first Fock)
 // ============================================================
 void ERI_RI_Distributed_RHF::distributed_build_B() {
     if (scattered_) return;
@@ -195,36 +289,209 @@ void ERI_RI_Distributed_RHF::distributed_build_B() {
     const int naux = num_auxiliary_basis_;
     const int nbas = num_basis_;
     const size_t nbas2 = (size_t)nbas * nbas;
+    auto& mgr = MultiGpuManager::instance();
 
-    const real_t* d_B_full = intermediate_matrix_B_.device_ptr();
+    const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
+    const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
+    const int n_aux_types = (int)auxiliary_shell_type_infos_.size();
 
-    for (int d = 0; d < num_gpus_; d++) {
-        size_t local_size = (size_t)naux_local_[d] * nbas2;
-        size_t offset = P_start_[d] * nbas2;
-        MultiGpuManager::DeviceGuard guard(d);
-        if (!d_B_local_[d])
-            cudaMalloc(&d_B_local_[d], local_size * sizeof(double));
-        cudaMemcpy(d_B_local_[d], d_B_full + offset,
-                   local_size * sizeof(double), cudaMemcpyDefault);
+    std::cout << "[RI-Dist] Building B_local on " << num_gpus_ << " GPUs (chunked 3c2e + L^-1 DGEMM)..." << std::endl;
+
+    // ---- Step 1: Use cached L⁻¹ (or recompute if not available) ----
+    real_t* d_L_inv_gpu0 = nullptr;
+    bool L_inv_owned = false;  // true if we allocated L⁻¹ here (need to free)
+    if (d_cached_L_inv_) {
+        d_L_inv_gpu0 = d_cached_L_inv_;
+    } else {
+        // Fallback: recompute (e.g., direct_mode_ rebuilds after cache freed)
+        MultiGpuManager::DeviceGuard guard(0);
+        real_t* d_two_center_eri;
+        tracked_cudaMalloc(&d_two_center_eri, (size_t)naux * naux * sizeof(real_t));
+        cudaMemset(d_two_center_eri, 0, (size_t)naux * naux * sizeof(real_t));
+
+        gpu::computeTwoCenterERIs(
+            auxiliary_shell_type_infos_,
+            auxiliary_primitive_shells_.device_ptr(),
+            auxiliary_cgto_normalization_factors_.device_ptr(),
+            d_two_center_eri, naux,
+            hf_.get_boys_grid().device_ptr(),
+            auxiliary_schwarz_upper_bound_factors.device_ptr(),
+            schwarz_screening_threshold, false);
+
+        gpu::choleskyDecomposition(d_two_center_eri, naux);
+
+        tracked_cudaMalloc(&d_L_inv_gpu0, (size_t)naux * naux * sizeof(real_t));
+        gpu::computeInverseByDtrsm(d_two_center_eri, d_L_inv_gpu0, naux);
+
+        tracked_cudaFree(d_two_center_eri);
+        L_inv_owned = true;
     }
 
-    // Release full B on GPU 0 to reclaim naux*nbas^2 memory
+    // ---- Step 2: Replicate L⁻¹ and shell data to all GPUs ----
+    std::vector<real_t*> d_L_inv(num_gpus_, nullptr);
+    std::vector<PrimitiveShell*> d_pshells(num_gpus_, nullptr);
+    std::vector<real_t*> d_cgto_norms(num_gpus_, nullptr);
+    std::vector<PrimitiveShell*> d_aux_pshells(num_gpus_, nullptr);
+    std::vector<real_t*> d_aux_cgto_norms(num_gpus_, nullptr);
+    std::vector<size_t2*> d_shell_pairs(num_gpus_, nullptr);
+    std::vector<real_t*> d_schwarz(num_gpus_, nullptr);
+    std::vector<real_t*> d_aux_schwarz(num_gpus_, nullptr);
+    std::vector<real_t*> d_boys(num_gpus_, nullptr);
+
+    const size_t n_pshells = hf_.get_primitive_shells().size();
+    const size_t n_aux_pshells = auxiliary_primitive_shells_.size();
+    const size_t n_cgto = hf_.get_cgto_normalization_factors().size();
+    const size_t n_aux_cgto = auxiliary_cgto_normalization_factors_.size();
+    const size_t n_boys = hf_.get_boys_grid().size();
+
+    for (int d = 0; d < num_gpus_; d++) {
+        MultiGpuManager::DeviceGuard guard(d);
+        if (d == 0) {
+            d_L_inv[d] = d_L_inv_gpu0;
+            d_pshells[d] = const_cast<PrimitiveShell*>(hf_.get_primitive_shells().device_ptr());
+            d_cgto_norms[d] = const_cast<real_t*>(hf_.get_cgto_normalization_factors().device_ptr());
+            d_aux_pshells[d] = auxiliary_primitive_shells_.device_ptr();
+            d_aux_cgto_norms[d] = auxiliary_cgto_normalization_factors_.device_ptr();
+            d_shell_pairs[d] = d_persistent_shell_pair_indices_;
+            d_schwarz[d] = schwarz_upper_bound_factors.device_ptr();
+            d_aux_schwarz[d] = auxiliary_schwarz_upper_bound_factors.device_ptr();
+            d_boys[d] = const_cast<real_t*>(hf_.get_boys_grid().device_ptr());
+        } else {
+            // L⁻¹
+            cudaMalloc(&d_L_inv[d], (size_t)naux * naux * sizeof(real_t));
+            cudaMemcpy(d_L_inv[d], d_L_inv_gpu0, (size_t)naux * naux * sizeof(real_t), cudaMemcpyDefault);
+            // Primitive shells
+            cudaMalloc(&d_pshells[d], n_pshells * sizeof(PrimitiveShell));
+            cudaMemcpy(d_pshells[d], hf_.get_primitive_shells().device_ptr(), n_pshells * sizeof(PrimitiveShell), cudaMemcpyDefault);
+            // CGTO norms
+            cudaMalloc(&d_cgto_norms[d], n_cgto * sizeof(real_t));
+            cudaMemcpy(d_cgto_norms[d], hf_.get_cgto_normalization_factors().device_ptr(), n_cgto * sizeof(real_t), cudaMemcpyDefault);
+            // Auxiliary primitive shells
+            cudaMalloc(&d_aux_pshells[d], n_aux_pshells * sizeof(PrimitiveShell));
+            cudaMemcpy(d_aux_pshells[d], auxiliary_primitive_shells_.device_ptr(), n_aux_pshells * sizeof(PrimitiveShell), cudaMemcpyDefault);
+            // Auxiliary CGTO norms
+            cudaMalloc(&d_aux_cgto_norms[d], n_aux_cgto * sizeof(real_t));
+            cudaMemcpy(d_aux_cgto_norms[d], auxiliary_cgto_normalization_factors_.device_ptr(), n_aux_cgto * sizeof(real_t), cudaMemcpyDefault);
+            // Shell pair indices
+            cudaMalloc(&d_shell_pairs[d], num_persistent_shell_pairs_ * sizeof(size_t2));
+            cudaMemcpy(d_shell_pairs[d], d_persistent_shell_pair_indices_, num_persistent_shell_pairs_ * sizeof(size_t2), cudaMemcpyDefault);
+            // Schwarz factors
+            cudaMalloc(&d_schwarz[d], schwarz_upper_bound_factors.size() * sizeof(real_t));
+            cudaMemcpy(d_schwarz[d], schwarz_upper_bound_factors.device_ptr(), schwarz_upper_bound_factors.size() * sizeof(real_t), cudaMemcpyDefault);
+            // Auxiliary Schwarz factors
+            cudaMalloc(&d_aux_schwarz[d], auxiliary_schwarz_upper_bound_factors.size() * sizeof(real_t));
+            cudaMemcpy(d_aux_schwarz[d], auxiliary_schwarz_upper_bound_factors.device_ptr(), auxiliary_schwarz_upper_bound_factors.size() * sizeof(real_t), cudaMemcpyDefault);
+            // Boys grid
+            cudaMalloc(&d_boys[d], n_boys * sizeof(real_t));
+            cudaMemcpy(d_boys[d], hf_.get_boys_grid().device_ptr(), n_boys * sizeof(real_t), cudaMemcpyDefault);
+        }
+    }
+
+    // ---- Step 3: Allocate B_local on each GPU and zero-initialize ----
+    for (int d = 0; d < num_gpus_; d++) {
+        MultiGpuManager::DeviceGuard guard(d);
+        size_t local_size = (size_t)naux_local_[d] * nbas2;
+        if (!d_B_local_[d])
+            cudaMalloc(&d_B_local_[d], local_size * sizeof(double));
+        cudaMemset(d_B_local_[d], 0, local_size * sizeof(double));
+    }
+
+    // ---- Step 4: Chunked 3c2e + DGEMM on each GPU ----
+    // For each auxiliary shell type: all GPUs compute the same 3c2e chunk redundantly,
+    // then each GPU accumulates its P_local rows of B via DGEMM with L⁻¹.
+    for (int c = 0; c < n_aux_types; c++) {
+        const size_t Q_c_start = aux_type_basis_start_[c];
+        const int nfunc_c = aux_type_nfunc_[c];
+
+        for (int d = 0; d < num_gpus_; d++) {
+            MultiGpuManager::DeviceGuard guard(d);
+            cublasHandle_t handle = mgr.cublas(d);
+
+            // Allocate and zero chunk buffer
+            real_t* d_chunk = nullptr;
+            cudaMalloc(&d_chunk, (size_t)nfunc_c * nbas2 * sizeof(real_t));
+            cudaMemset(d_chunk, 0, (size_t)nfunc_c * nbas2 * sizeof(real_t));
+
+            // Compute 3c2e for this aux type into chunk (pointer-offset trick)
+            gpu::computeThreeCenterERIs_for_aux_type(
+                shell_type_infos, shell_pair_type_infos,
+                d_pshells[d], d_cgto_norms[d],
+                auxiliary_shell_type_infos_,
+                d_aux_pshells[d], d_aux_cgto_norms[d],
+                d_chunk,
+                d_shell_pairs[d],
+                nbas, naux,
+                d_boys[d],
+                d_schwarz[d], d_aux_schwarz[d],
+                schwarz_screening_threshold,
+                c, Q_c_start, nfunc_c);
+
+            // DGEMM: B_local += L⁻¹_local_rows[:, Q_c] × 3c_chunk
+            // cuBLAS col-major: C = A * B where
+            //   A = 3c_chunk^T [nbas² × nfunc_c], lda=nbas²
+            //   B = L⁻¹ submatrix [nfunc_c × naux_local], ldb=naux
+            //   C = B_local^T [nbas² × naux_local], ldc=nbas²
+            const double one = 1.0;
+            cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                (int)nbas2, naux_local_[d], nfunc_c,
+                &one,
+                d_chunk, (int)nbas2,
+                &d_L_inv[d][P_start_[d] * naux + Q_c_start], naux,
+                &one,
+                d_B_local_[d], (int)nbas2);
+
+            cudaFree(d_chunk);
+        }
+    }
+    mgr.sync_all();
+
+    // ---- Step 5: Cleanup replicated data on non-zero GPUs ----
+    for (int d = 1; d < num_gpus_; d++) {
+        MultiGpuManager::DeviceGuard guard(d);
+        cudaFree(d_L_inv[d]);
+        cudaFree(d_pshells[d]);
+        cudaFree(d_cgto_norms[d]);
+        cudaFree(d_aux_pshells[d]);
+        cudaFree(d_aux_cgto_norms[d]);
+        cudaFree(d_shell_pairs[d]);
+        cudaFree(d_schwarz[d]);
+        cudaFree(d_aux_schwarz[d]);
+        cudaFree(d_boys[d]);
+    }
+    // Free L⁻¹ on GPU 0 only if we allocated it locally (not cached)
+    if (L_inv_owned) {
+        MultiGpuManager::DeviceGuard guard(0);
+        tracked_cudaFree(d_L_inv_gpu0);
+    }
+
+    // Release full B on GPU 0 (no longer needed)
     {
         MultiGpuManager::DeviceGuard guard(0);
-        size_t freed_mb = (size_t)naux * nbas2 * sizeof(real_t) / (1024 * 1024);
-        intermediate_matrix_B_.release();
-        std::cout << "[RI-Dist] Freed full B on GPU 0 (" << freed_mb << " MB)" << std::endl;
+        if (intermediate_matrix_B_.rows() > 0) {
+            size_t freed_mb = (size_t)naux * nbas2 * sizeof(real_t) / (1024 * 1024);
+            intermediate_matrix_B_.release();
+            std::cout << "[RI-Dist] Freed full B on GPU 0 (" << freed_mb << " MB)" << std::endl;
+        }
     }
 
     scattered_ = true;
     allocate_per_device_workspace();
+
+    // In stored mode, free cached L⁻¹ (no longer needed after B_local is built).
+    // In direct mode, keep it for per-iteration rebuilds.
+    if (!direct_mode_ && d_cached_L_inv_) {
+        MultiGpuManager::DeviceGuard guard(0);
+        tracked_cudaFree(d_cached_L_inv_);
+        d_cached_L_inv_ = nullptr;
+    }
 
     for (int d = 0; d < num_gpus_; d++) {
         double mb = (double)naux_local_[d] * nbas2 * sizeof(double) / (1024.0 * 1024.0);
         std::cout << "  [GPU " << d << "] B_local: " << std::fixed << std::setprecision(1)
                   << mb << " MB (" << naux_local_[d] << " aux)" << std::endl;
     }
-    std::cout << "[RI-Dist] B distributed to " << num_gpus_ << " GPUs" << std::endl;
+    std::cout << "[RI-Dist] B distributed to " << num_gpus_ << " GPUs (independent build)" << std::endl;
 }
 
 // ============================================================

@@ -81,6 +81,31 @@ void computeHalfTransformedERI(const std::vector<ShellTypeInfo>& shell_type_info
 void computeTwoCenterERIs(const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos, const PrimitiveShell* d_auxiliary_primitive_shells, const real_t* d_auxiliary_cgto_normalization_factors, real_t* d_two_center_eri, const int num_auxiliary_basis, const real_t* d_boys_grid, const real_t* d_auxiliary_schwarz_upper_bound_factors, const real_t schwarz_screening_threshold, const bool verbose=false);
 void computeThreeCenterERIs(const std::vector<ShellTypeInfo>& shell_type_infos, const std::vector<ShellPairTypeInfo>& shell_pair_type_infos, const PrimitiveShell* d_primitive_shells, const real_t* d_cgto_normalization_factors, const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos, const PrimitiveShell* d_auxiliary_primitive_shells, const real_t* d_auxiliary_cgto_normalization_factors, real_t* d_three_center_eri, const size_t2* d_primitive_shell_pair_indices, const int num_basis, const int num_auxiliary_basis, const real_t* d_boys_grid, const real_t* d_schwarz_upper_bound_factors, const real_t* d_auxiliary_schwarz_upper_bound_factors, const real_t schwarz_screening_threshold, const bool verbose=false);
 
+/// Compute 3-center ERIs for a single auxiliary shell type into a chunk buffer.
+/// Uses pointer-offset trick: output is written to d_chunk[r - aux_basis_offset, μ, ν].
+/// @param aux_type_index Which auxiliary shell type to compute (index into auxiliary_shell_type_infos)
+/// @param aux_basis_offset Subtracted from c->basis_index for local indexing into d_chunk
+/// @param nfunc_chunk Number of auxiliary basis functions in this chunk (size of leading dim)
+void computeThreeCenterERIs_for_aux_type(
+    const std::vector<ShellTypeInfo>& shell_type_infos,
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
+    const PrimitiveShell* d_primitive_shells,
+    const real_t* d_cgto_normalization_factors,
+    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+    const PrimitiveShell* d_auxiliary_primitive_shells,
+    const real_t* d_auxiliary_cgto_normalization_factors,
+    real_t* d_chunk,
+    const size_t2* d_primitive_shell_pair_indices,
+    const int num_basis,
+    const int num_auxiliary_basis,
+    const real_t* d_boys_grid,
+    const real_t* d_schwarz_upper_bound_factors,
+    const real_t* d_auxiliary_schwarz_upper_bound_factors,
+    const real_t schwarz_screening_threshold,
+    int aux_type_index,
+    size_t aux_basis_offset,
+    int nfunc_chunk);
+
 
 void computeDensityMatrix_RHF(const real_t* d_coefficient_matrix, real_t* d_density_matrix, const int num_electron, const int num_basis);
 void computeDensityMatrix_UHF(const real_t* d_coefficient_matrix, real_t* d_density_matrix, const int num_electron, const int num_basis);

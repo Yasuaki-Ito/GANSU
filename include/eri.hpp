@@ -362,6 +362,11 @@ protected:
     // Suzuki.
     DeviceHostMemory<real_t> schwarz_upper_bound_factors;
     DeviceHostMemory<real_t> auxiliary_schwarz_upper_bound_factors;
+
+    /// Persistent shell pair indices (reused by distributed multi-GPU builds)
+    size_t2* d_persistent_shell_pair_indices_ = nullptr;
+    size_t num_persistent_shell_pairs_ = 0;
+
     // DeviceHostMemory<real_t> two_center_eri_;
     // DeviceHostMemory<real_t> three_center_eri_;
 
