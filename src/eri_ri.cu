@@ -26,9 +26,11 @@
 #include "device_host_memory.hpp"
 #include "int3c2e.hpp"
 #include "laplace_quadrature.hpp"
-#include "sos_laplace_adc2_operator.hpp"
+#include "ri_adc2_schur_operator.hpp"
 #include "adc2_operator.hpp"
 #include "davidson_solver.hpp"
+#include "oscillator_strength.hpp"
+#include "profiler.hpp"
 
 namespace gansu{
 
@@ -937,6 +939,182 @@ real_t* ERI_RI_RHF::build_B_ia() {
     return d_B_copy;  // now contains B_ia^P [nocc*nvir, naux] col-major
 }
 
+// Helper: build B_ab^P (VV block) on device. Caller must free.
+// Layout: [nvir*nvir × naux] col-major: element B^P_{a,b} at P*vv + a*nvir + b
+real_t* ERI_RI_RHF::build_B_ab() {
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = rhf_.get_num_basis() - nocc;
+    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+    const int naux = num_auxiliary_basis_;
+    const int nbas = num_basis_;
+    const size_t vv = (size_t)nvir * nvir;
+
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    const double alpha = 1.0, beta = 0.0;
+
+    // Copy AO-basis B
+    const size_t B_ao_size = (size_t)naux * nbas * nbas;
+    real_t* d_B_ao = nullptr;
+    tracked_cudaMalloc(&d_B_ao, B_ao_size * sizeof(real_t));
+    cudaMemcpy(d_B_ao, intermediate_matrix_B_.device_ptr(), B_ao_size * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+    // Step 1: ν→a (same as nu2a_dgemm)
+    // B^P_{μ,a} = Σ_ν C_{ν,nocc+a} × B^P_{μ,ν}
+    // Layout: [nvir × naux*nbas] col-major
+    real_t* d_B_mu_a = nullptr;
+    tracked_cudaMalloc(&d_B_mu_a, (size_t)nbas * nvir * naux * sizeof(real_t));
+    cudaMemset(d_B_mu_a, 0, (size_t)nbas * nvir * naux * sizeof(real_t));
+
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                nvir, naux * nbas, nbas,
+                &alpha, &d_C[nocc], nbas,
+                d_B_ao, nbas,
+                &beta, d_B_mu_a, nvir);
+    tracked_cudaFree(d_B_ao);
+
+    // Step 2: Transpose [nvir × naux*nbas] → [naux*nbas × nvir]
+    real_t* d_B_transposed = nullptr;
+    tracked_cudaMalloc(&d_B_transposed, (size_t)nbas * nvir * naux * sizeof(real_t));
+    {
+        int row = naux * nbas, col = nvir;
+        cublasDgeam(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    row, col,
+                    &alpha, d_B_mu_a, col,
+                    &beta, nullptr, (row >= col) ? row : col,
+                    d_B_transposed, row);
+    }
+
+    // Step 3: μ→b (virtual): B^P_{b,a} = Σ_μ C_{μ,nocc+b} × B^P_{μ,a}
+    // DGEMM: [nvir × nbas] × [nbas × naux*nvir] → [nvir × naux*nvir]
+    cudaMemset(d_B_mu_a, 0, (size_t)nbas * nbas * naux * sizeof(real_t));
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                nvir, naux * nvir, nbas,
+                &alpha, &d_C[nocc], nbas,
+                d_B_transposed, nbas,
+                &beta, d_B_mu_a, nvir);
+
+    // Step 4: Transpose [nvir × naux*nvir] → [naux*nvir × nvir]
+    // Then reinterpret as [vv × naux] col-major: B^P_{b,a} at P*vv + b*nvir + a
+    // Wait — the DGEMM output is [nvir_b × naux*nvir_a] col-major.
+    // Element: d_B_mu_a[b + (P + a*naux)*nvir] = B^P_{b,a}... actually:
+    // batch = P + a*naux? Let me check: ldb=nbas for the input, output has ldc=nvir.
+    // d_B_mu_a[b + batch*nvir] where batch = P*nvir/... hmm.
+    // Actually the DGEMM n=naux*nvir means the result has columns indexed by
+    // (batch) = 0..naux*nvir-1, but the mapping of batch→(P,a) depends on the input layout.
+    //
+    // Input B (d_B_transposed): element B[μ, P+a*naux] = B^P_{μ,a}  (from step 2 transpose)
+    // Wait, need to re-derive. After step 2 transpose:
+    // d_B_transposed[(P*nbas+μ) + a*(naux*nbas)] = B^P_{μ,a}
+    // In DGEMM with ldb=nbas: B[μ, batch] = d_B_transposed[μ + batch*nbas]
+    //   batch*nbas = P*nbas + a*naux*nbas → batch = P + a*naux
+    //   So n = naux*nvir with batch = a*naux + P
+    //
+    // DGEMM output: d_B_mu_a[b + batch*nvir] = Σ_μ C_{μ,b}^vir × B^P_{μ,a}
+    //   = B^P_{b,a} where batch = a*naux + P
+    //   d_B_mu_a[b + (a*naux + P)*nvir] = B^P_{b,a}
+    //
+    // We want: result[P*vv + b*nvir + a]
+    // Current: result[b + a*naux*nvir + P*nvir]
+    // These differ. Need a final transpose/reshape.
+    //
+    // Alternative: transpose to get [naux*nvir × nvir] and reinterpret.
+
+    {
+        int row = naux * nvir, col = nvir;
+        cublasDgeam(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    col, row,
+                    &alpha, d_B_mu_a, row,
+                    &beta, nullptr, (row >= col) ? row : col,
+                    d_B_transposed, col);
+    }
+    // After transpose: d_B_transposed[a + (P*nvir+b)*nvir]... hmm.
+    // cublasDgeam(T, _, col=nvir, row=naux*nvir): output [col × row] = [nvir × naux*nvir]
+    // input A^T: A is [nvir × naux*nvir] (the d_B_mu_a), so A^T is [naux*nvir × nvir].
+    // The call transposes to [col × row] = [nvir × naux*nvir]:
+    // d_B_transposed[a + (P*nvir+b)*nvir]?? No:
+    // geam output C[i,j] = A^T[i,j] = A[j,i]
+    // With m=col=nvir, n=row=naux*nvir:
+    // C[i, j] = A[j, i], C is [nvir × naux*nvir] with ldc=nvir
+    // C[a, P*nvir+b] = A[P*nvir+b, a] = d_B_mu_a[(P*nvir+b) + a*(naux*nvir)]
+    //                = d_B_mu_a[P*nvir + b + a*naux*nvir]
+    // But d_B_mu_a[idx] where idx = b + (a*naux+P)*nvir = b + a*naux*nvir + P*nvir ✓
+    // So C[a, P*nvir+b] = B^P_{b,a}
+    // And d_B_transposed[a + (P*nvir+b)*nvir] = B^P_{b,a}
+    //
+    // We want: d_result[P*vv + b*nvir + a] = B^P_{b,a}
+    // Current: d_B_transposed[a + P*nvir*nvir + b*nvir] = d_B_transposed[P*vv + b*nvir + a] ✓ !!
+
+    tracked_cudaFree(d_B_mu_a);
+    return d_B_transposed;  // B_ab^P [vv × naux] col-major: B^P_{a,b} at P*vv + a*nvir + b
+}
+
+// Helper: build B_ij^P (OO block) on device. Caller must free.
+// Layout: [nocc*nocc × naux] col-major: element B^P_{i,j} at P*oo + i*nocc + j
+real_t* ERI_RI_RHF::build_B_ij() {
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = rhf_.get_num_basis() - nocc;
+    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+    const int naux = num_auxiliary_basis_;
+    const int nbas = num_basis_;
+    const size_t oo = (size_t)nocc * nocc;
+
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    const double alpha = 1.0, beta = 0.0;
+
+    // Copy AO-basis B
+    const size_t B_ao_size = (size_t)naux * nbas * nbas;
+    real_t* d_B_ao = nullptr;
+    tracked_cudaMalloc(&d_B_ao, B_ao_size * sizeof(real_t));
+    cudaMemcpy(d_B_ao, intermediate_matrix_B_.device_ptr(), B_ao_size * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+    // Step 1: ν→j (occupied): B^P_{μ,j} = Σ_ν C_{ν,j} × B^P_{μ,ν}
+    // Like nu2a but with C_occ (m=nocc, no offset)
+    real_t* d_B_mu_j = nullptr;
+    tracked_cudaMalloc(&d_B_mu_j, (size_t)nbas * nocc * naux * sizeof(real_t));
+    cudaMemset(d_B_mu_j, 0, (size_t)nbas * nocc * naux * sizeof(real_t));
+
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                nocc, naux * nbas, nbas,
+                &alpha, d_C, nbas,      // C_occ: no offset
+                d_B_ao, nbas,
+                &beta, d_B_mu_j, nocc);
+    tracked_cudaFree(d_B_ao);
+
+    // Step 2: Transpose [nocc × naux*nbas] → [naux*nbas × nocc]
+    real_t* d_B_transposed = nullptr;
+    tracked_cudaMalloc(&d_B_transposed, (size_t)nbas * nocc * naux * sizeof(real_t));
+    {
+        int row = naux * nbas, col = nocc;
+        cublasDgeam(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    row, col,
+                    &alpha, d_B_mu_j, col,
+                    &beta, nullptr, (row >= col) ? row : col,
+                    d_B_transposed, row);
+    }
+
+    // Step 3: μ→i (occupied): B^P_{i,j} = Σ_μ C_{μ,i} × B^P_{μ,j}
+    cudaMemset(d_B_mu_j, 0, (size_t)nbas * nbas * naux * sizeof(real_t));
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                nocc, naux * nocc, nbas,
+                &alpha, d_C, nbas,
+                d_B_transposed, nbas,
+                &beta, d_B_mu_j, nocc);
+
+    // Step 4: Transpose [nocc × naux*nocc] → [nocc × naux*nocc] reshaped
+    {
+        int row = naux * nocc, col = nocc;
+        cublasDgeam(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    col, row,
+                    &alpha, d_B_mu_j, row,
+                    &beta, nullptr, (row >= col) ? row : col,
+                    d_B_transposed, col);
+    }
+    // d_B_transposed[P*oo + i*nocc + j] = B^P_{i,j}
+
+    tracked_cudaFree(d_B_mu_j);
+    return d_B_transposed;  // B_ij^P [oo × naux] col-major
+}
+
 real_t ERI_RI_RHF::compute_lt_sos_mp2_energy() {
     PROFILE_FUNCTION();
     const int nocc = rhf_.get_num_electrons() / 2;
@@ -1252,359 +1430,142 @@ void ERI_RI_RHF::compute_sos_adc2(int n_states) {
               << ", singles=" << singles_dim
               << ", nstates=" << n_states << std::endl;
 
+    // build_B_ia() uses full occupied space (no frozen core subtraction).
+    // Assert frozen_core == 0 to avoid dimension mismatch.
+    if (rhf_.get_num_frozen_core() != 0) {
+        std::cerr << "[SOS-ADC(2)] Error: frozen core not yet supported in SOS-Laplace path." << std::endl;
+        return;
+    }
+
     // Build B_ia^P on device [ov × naux] col-major
+    Timer setup_timer;
     real_t* d_B_ia = build_B_ia();
+    real_t* d_B_ab = build_B_ab();
+    real_t* d_B_ij = build_B_ij();
+    std::cout << "  B-block build time: " << std::fixed << std::setprecision(3)
+              << setup_timer.elapsed_seconds() << " s" << std::endl;
 
-    // --- Build M11 via existing ADC(2) (correct, uses full MO-ERI) ---
-    // This ensures M11 is identical to the validated ADC(2) implementation
+    // --- Build M11 from RI (no nao⁴ MO-ERI needed) ---
+    Timer m11_timer;
     real_t* d_M11_from_adc2 = nullptr;
+    tracked_cudaMalloc(&d_M11_from_adc2, (size_t)singles_dim * singles_dim * sizeof(real_t));
+    RIADC2SchurOperator::build_M11_from_RI(
+        d_M11_from_adc2, d_B_ia, d_B_ab, d_B_ij,
+        rhf_.get_orbital_energies().device_ptr(), nocc, nvir, num_auxiliary_basis_);
+    std::cout << "  M11 build time: " << std::fixed << std::setprecision(3)
+              << m11_timer.elapsed_seconds() << " s" << std::endl;
+
+    // ============================================================
+    //  RI-ADC(2) exact Schur + Davidson + omega-iteration
+    // ============================================================
+    std::vector<double> sos_eigenvalues;
+    std::vector<real_t> h_sos_eigenvectors((size_t)n_states * singles_dim, 0.0);
     {
-        real_t* d_eri_mo = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
-        ADC2Operator adc2_ref(d_eri_mo, rhf_.get_orbital_energies().device_ptr(),
-                              nocc, nvir, rhf_.get_num_basis());
-        // Copy M11 from ADC2Operator
-        tracked_cudaMalloc(&d_M11_from_adc2, (size_t)singles_dim * singles_dim * sizeof(real_t));
-        cudaMemcpy(d_M11_from_adc2, adc2_ref.get_M11(),
-                   (size_t)singles_dim * singles_dim * sizeof(real_t), cudaMemcpyDeviceToDevice);
-        tracked_cudaFree(d_eri_mo);
-        std::cout << "  M11 borrowed from ADC(2) (validated)" << std::endl;
-    }
+        Timer ri_timer;
+        std::cout << "\n  --- RI-ADC(2) Schur Davidson ---" << std::endl;
 
-#if 0  // Skip RI-based M11 construction for now (debugging)
-    // Build CIS M11 matrix: δε + 2(ia|jb) - (ij|ab) [singlet]
-    // (ia|jb) = Σ_P B_ia^P B_jb^P (Coulomb, from B_ia)
-    // (ij|ab) needs oovv ERI block — build from full MO-ERI via B matrix
-    real_t* d_M11_cis = nullptr;
-    {
-        size_t ov = (size_t)nocc * nvir;
-        tracked_cudaMalloc(&d_M11_cis, ov * ov * sizeof(real_t));
-        cudaMemset(d_M11_cis, 0, ov * ov * sizeof(real_t));
+        RIADC2SchurOperator ri_op(
+            d_B_ia, d_B_ab, d_B_ij, d_M11_from_adc2,
+            rhf_.get_orbital_energies().device_ptr(),
+            nocc, nvir, num_auxiliary_basis_);
 
-        cublasHandle_t handle = gpu::GPUHandle::cublas();
-        const double zero = 0.0, one = 1.0, two = 2.0, neg_one = -1.0;
+        DavidsonConfig dav_config;
+        dav_config.num_eigenvalues = n_states;
+        dav_config.convergence_threshold = 1e-6;
+        dav_config.max_subspace_size = std::min(singles_dim, std::max(30, 4 * n_states));
+        dav_config.max_iterations = 200;
+        dav_config.use_preconditioner = true;
+        dav_config.symmetric = true;
+        dav_config.verbose = 1;
 
-        // Diagonal: ε_a - ε_i
-        std::vector<double> eps(nocc + nvir);
-        cudaMemcpy(eps.data(), rhf_.get_orbital_energies().device_ptr(),
-                   (nocc + nvir) * sizeof(double), cudaMemcpyDeviceToHost);
-        std::vector<double> M11_diag(ov * ov, 0.0);
-        for (int i = 0; i < nocc; i++)
-            for (int a = 0; a < nvir; a++)
-                M11_diag[(size_t)(i*nvir+a) * ov + (i*nvir+a)] = eps[nocc+a] - eps[i];
-        cudaMemcpy(d_M11_cis, M11_diag.data(), ov * ov * sizeof(double), cudaMemcpyHostToDevice);
-
-        // Coulomb: +2(ia|jb) = +2 B_ia · B_jb^T
-        // B_ia is [ov × naux] col-major, lda=ov
-        cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                    (int)ov, (int)ov, num_auxiliary_basis_,
-                    &two, d_B_ia, (int)ov,
-                    d_B_ia, (int)ov,
-                    &one, d_M11_cis, (int)ov);
-
-        // Exchange: -(ij|ab) — computed from B_ia^P by re-indexing
-        // (ij|ab) = Σ_P [B with oo indices] [B with vv indices]
-        // Without B_ij/B_ab, use identity: for Coulomb metric,
-        // (ij|ab) can be computed as:
-        //   For each (i,j,a,b): (ij|ab) = Σ_P B_ia^P · B_jb^P with index swap
-        //   ... no, that gives (ia|jb) again.
-        //
-        // Correct approach: build (ij|ab) from B_μν^P (AO basis) via:
-        //   full_B is [naux × nbas²]. After occ-occ and vir-vir transform:
-        //   B_ij = C_occ^T B C_occ, B_ab = C_vir^T B C_vir
-        //   Then (ij|ab) = Σ_P B_ij^P B_ab^P
-        //
-        // Use a simpler O(N⁴) approach: build oovv block on host from B_ia
-        // via loop over P, using B_ia sub-blocks per i.
-        //
-        // For each P, define L^P[i,a] = B[(i*nvir+a) + P*ov]
-        // Then: (ia|jb) = Σ_P L^P[i,a] L^P[j,b]  [Coulomb]
-        //       (ib|ja) = Σ_P L^P[i,b] L^P[j,a]  [NOT exchange!]
-        //
-        // (ij|ab) requires a DIFFERENT 3-index quantity: the oo-vv mixed.
-        // Without it, use the (ib|ja) as an approximation.
-        // NOTE: For CIS singlet, 2(ia|jb) - (ib|ja) is actually the correct
-        // formula in SOME conventions! Let me verify with GANSU's existing code.
-
-        // GANSU ADC(2) M11 code (line 1507-1511 of adc2_operator.cu):
-        //   val -= eri[i][j][a][b] = (ij|ab)   ← -1× exchange
-        //   val += 2 * eri[i][a][j][b] = 2*(ia|jb) ← +2× Coulomb
-        //
-        // eri[p][q][r][s] uses linear index (p*nao+q)*nao² + r*nao+s
-        // So eri[i][j][a][b] = chemist (ij|ab) = ∫ φ_iφ_j(1) 1/r φ_aφ_b(2)
-        // And eri[i][a][j][b] = chemist (ia|jb) = ∫ φ_iφ_a(1) 1/r φ_jφ_b(2)
-        //
-        // CIS = +2(ia|jb) - (ij|ab) ← CONFIRMED
-        //
-        // Since we can't get (ij|ab) from B_ia alone, build it via
-        // half-transform of original B_μν^P.
-
-        // Access the original AO B_μν^P matrix and coefficient matrix
-        const int nbas = rhf_.get_num_basis();
-        const real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
-        const size_t B_ao_size = (size_t)num_auxiliary_basis_ * nbas * nbas;
-
-        // Download B_μν^P and C to host for exchange computation
-        std::vector<double> B_ao(B_ao_size);
-        cudaMemcpy(B_ao.data(), intermediate_matrix_B_.device_ptr(),
-                   B_ao_size * sizeof(double), cudaMemcpyDeviceToHost);
-        std::vector<double> C_host((size_t)nbas * nbas);
-        cudaMemcpy(C_host.data(), d_C, (size_t)nbas * nbas * sizeof(double), cudaMemcpyDeviceToHost);
-
-        // Build oovv block: (ij|ab) = Σ_P B_ij^P B_ab^P
-        // B_ij^P = Σ_μν C_μi C_νj B_μν^P, B_ab^P = Σ_μν C_μa C_νb B_μν^P
-        // Strategy: for each P, compute B_ij^P[i,j] and B_ab^P[a,b], then accumulate
-        // Exchange K[ia,jb] += B_ij^P × B_ab^P
-        std::vector<double> K_host(ov * ov, 0.0);
-
-        // For each auxiliary function P
-        for (int P = 0; P < num_auxiliary_basis_; P++) {
-            // B_μν for this P: B_ao[P * nbas * nbas + μ * nbas + ν]
-            // But B_μν^P storage: after Cholesky it's L^-1 × 3c-ERI
-            // Layout: B[P, μ, ν] stored as B[P * nbas² + μ * nbas + ν]... need to check
-            // Actually intermediate_matrix_B_ stores B^P_μν differently.
-            // The MO transform uses it as [naux × nbas × nbas] with stride nbas.
-
-            // Compute B_ij^P = Σ_μν C_μi C_νj B_μν^P
-            // For small system, explicit O(nocc² × nbas²) per P
-            std::vector<double> B_ij_P(nocc * nocc, 0.0);
-            for (int i = 0; i < nocc; i++) {
-                for (int j = 0; j < nocc; j++) {
-                    double val = 0.0;
-                    for (int mu = 0; mu < nbas; mu++) {
-                        for (int nu = 0; nu < nbas; nu++) {
-                            val += C_host[mu * nbas + i] * C_host[nu * nbas + j]
-                                 * B_ao[(size_t)P * nbas * nbas + mu * nbas + nu];
-                        }
-                    }
-                    B_ij_P[i * nocc + j] = val;
-                }
-            }
-
-            // Compute B_ab^P = Σ_μν C_μ,nocc+a C_ν,nocc+b B_μν^P
-            std::vector<double> B_ab_P(nvir * nvir, 0.0);
-            for (int a = 0; a < nvir; a++) {
-                for (int b = 0; b < nvir; b++) {
-                    double val = 0.0;
-                    for (int mu = 0; mu < nbas; mu++) {
-                        for (int nu = 0; nu < nbas; nu++) {
-                            val += C_host[mu * nbas + (nocc + a)] * C_host[nu * nbas + (nocc + b)]
-                                 * B_ao[(size_t)P * nbas * nbas + mu * nbas + nu];
-                        }
-                    }
-                    B_ab_P[a * nvir + b] = val;
-                }
-            }
-
-            // Accumulate: K[ia,jb] += B_ij^P × B_ab^P
-            for (int i = 0; i < nocc; i++)
-                for (int j = 0; j < nocc; j++)
-                    for (int a = 0; a < nvir; a++)
-                        for (int b = 0; b < nvir; b++)
-                            K_host[(size_t)(j*nvir+b) * ov + (i*nvir+a)] += B_ij_P[i*nocc+j] * B_ab_P[a*nvir+b];
-        }
-
-        // M11 -= K (exchange)
-        real_t* d_K = nullptr;
-        tracked_cudaMalloc(&d_K, ov * ov * sizeof(real_t));
-        cudaMemcpy(d_K, K_host.data(), ov * ov * sizeof(real_t), cudaMemcpyHostToDevice);
-        cublasDaxpy(handle, (int)(ov * ov), &neg_one, d_K, 1, d_M11_cis, 1);
-        tracked_cudaFree(d_K);
-
-        // --- ISR correction + Σ_oo + Σ_vv (2nd order self-energy) ---
-        // Requires (ia|jb) and t2[i][j][a][b] = (ia|jb)/Δ
+        // Initial Davidson solve (omega=0)
+        ri_op.set_omega(0.0);
         {
-            // Build (ia|jb) on host from B_ia
-            std::vector<double> B_ia_host(ov * num_auxiliary_basis_);
-            cudaMemcpy(B_ia_host.data(), d_B_ia, ov * num_auxiliary_basis_ * sizeof(double), cudaMemcpyDeviceToHost);
-
-            // Build ovov[i][a][j][b] = (ia|jb) = Σ_P B_ia^P B_jb^P
-            size_t ovov_size = ov * ov;
-            std::vector<double> ovov(ovov_size, 0.0);
-            for (size_t ia = 0; ia < ov; ia++)
-                for (size_t jb = 0; jb < ov; jb++)
-                    for (int P = 0; P < num_auxiliary_basis_; P++)
-                        ovov[ia * ov + jb] += B_ia_host[P * ov + ia] * B_ia_host[P * ov + jb];
-
-            // Build t2[i][j][a][b] = (ia|jb) / (ε_i+ε_j-ε_a-ε_b)
-            std::vector<double> t2(ov * ov, 0.0);
-            for (int i = 0; i < nocc; i++)
-                for (int j = 0; j < nocc; j++)
-                    for (int a = 0; a < nvir; a++)
-                        for (int b = 0; b < nvir; b++) {
-                            double denom = eps[i] + eps[j] - eps[nocc+a] - eps[nocc+b];
-                            size_t ia = i*nvir+a, jb = j*nvir+b;
-                            t2[ia * ov + jb] = ovov[ia * ov + jb] / denom;
-                        }
-
-            // ISR + Σ_oo + Σ_vv (singlet, same as ADC(2) M11 correction)
-            // Simplified: Σ_oo[i,j] and Σ_vv[a,b] modify M11 diagonal blocks
-            // ISR_corr[ia,jb] involves t2 × ovov contractions
-
-            // ISR correction (ADC(2) 2nd-order singles-singles)
-            // ISR[ia,jb] = Σ_{kc} { 0.5*t2(ki,ac)*(kb|jc)
-            //   + [singlet: 2*t2(ik,ac)*(jb|kc) - t2(ik,ac)*(kb|jc) - t2(ki,ac)*(jb|kc)]
-            //   + transpose(i↔j, a↔b) }
-            std::vector<double> ISR_corr(ov * ov, 0.0);
-            for (int i = 0; i < nocc; i++)
-                for (int a = 0; a < nvir; a++)
-                    for (int j = 0; j < nocc; j++)
-                        for (int b = 0; b < nvir; b++) {
-                            size_t ia = i*nvir+a, jb = j*nvir+b;
-                            double val = 0.0;
-                            for (int k = 0; k < nocc; k++)
-                                for (int c = 0; c < nvir; c++) {
-                                    size_t kc = k*nvir+c;
-                                    double t2_kiac = t2[(k*nvir+a) * ov + (i*nvir+c)]; // t2[k,i,a,c]=(ka|ic)/Δ
-                                    double t2_ikac = t2[(i*nvir+a) * ov + (k*nvir+c)]; // t2[i,k,a,c]=(ia|kc)/Δ
-                                    double kb_jc = ovov[(k*nvir+b) * ov + (j*nvir+c)];
-                                    double jb_kc = ovov[(j*nvir+b) * ov + kc];
-                                    // Forward
-                                    val += 0.5 * t2_kiac * kb_jc;
-                                    val += 2.0 * t2_ikac * jb_kc;
-                                    val -= t2_ikac * kb_jc;
-                                    val -= t2_kiac * jb_kc;
-                                    // Transpose (i↔j, a↔b)
-                                    double t2_kjbc = t2[(k*nvir+b) * ov + (j*nvir+c)];
-                                    double t2_jkbc = t2[(j*nvir+b) * ov + kc];
-                                    double ka_ic = ovov[(k*nvir+a) * ov + (i*nvir+c)];
-                                    double ia_kc = ovov[(i*nvir+a) * ov + kc];
-                                    val += 0.5 * t2_kjbc * ka_ic;
-                                    val += 2.0 * t2_jkbc * ia_kc;
-                                    val -= t2_jkbc * ka_ic;
-                                    val -= t2_kjbc * ia_kc;
-                                }
-                            ISR_corr[jb * ov + ia] = val; // col-major
-                        }
-
-            // Add ISR to M11
-            real_t* d_isr = nullptr;
-            tracked_cudaMalloc(&d_isr, ov * ov * sizeof(real_t));
-            cudaMemcpy(d_isr, ISR_corr.data(), ov * ov * sizeof(double), cudaMemcpyHostToDevice);
-            cublasDaxpy(handle, (int)(ov * ov), &one, d_isr, 1, d_M11_cis, 1);
-            tracked_cudaFree(d_isr);
-
-            // Σ_oo[i,j] = Σ_{kab} [t2(ik,ab)*((ja|kb)-0.5*(jb|ka)) + t2(jk,ab)*((ia|kb)-0.5*(ib|ka))]
-            // (matches ADC2Operator::build_M11 exactly)
-            std::vector<double> sigma_oo(nocc * nocc, 0.0);
-            for (int i = 0; i < nocc; i++)
-                for (int j = 0; j < nocc; j++) {
-                    double val_ij = 0.0, val_ji = 0.0;
-                    for (int k = 0; k < nocc; k++)
-                        for (int a = 0; a < nvir; a++)
-                            for (int b = 0; b < nvir; b++) {
-                                double t2_ikab = t2[(i*nvir+a) * ov + (k*nvir+b)];
-                                double ja_kb = ovov[(j*nvir+a) * ov + (k*nvir+b)];
-                                double jb_ka = ovov[(j*nvir+b) * ov + (k*nvir+a)];
-                                val_ij += t2_ikab * (ja_kb - 0.5 * jb_ka);
-                                double t2_jkab = t2[(j*nvir+a) * ov + (k*nvir+b)];
-                                double ia_kb = ovov[(i*nvir+a) * ov + (k*nvir+b)];
-                                double ib_ka = ovov[(i*nvir+b) * ov + (k*nvir+a)];
-                                val_ji += t2_jkab * (ia_kb - 0.5 * ib_ka);
-                            }
-                    sigma_oo[i * nocc + j] = val_ij + val_ji;
-                }
-
-            // Σ_vv[a,b] = -Σ_{ijc} [t2(ij,ac)*((ib|jc)-0.5*(jb|ic)) + t2(ij,bc)*((ia|jc)-0.5*(ja|ic))]
-            std::vector<double> sigma_vv(nvir * nvir, 0.0);
-            for (int a = 0; a < nvir; a++)
-                for (int b = 0; b < nvir; b++) {
-                    double val_ab = 0.0, val_ba = 0.0;
-                    for (int i = 0; i < nocc; i++)
-                        for (int j = 0; j < nocc; j++)
-                            for (int c = 0; c < nvir; c++) {
-                                double t2_ijac = t2[(i*nvir+a) * ov + (j*nvir+c)];
-                                double ib_jc = ovov[(i*nvir+b) * ov + (j*nvir+c)];
-                                double jb_ic = ovov[(j*nvir+b) * ov + (i*nvir+c)];
-                                val_ab += t2_ijac * (ib_jc - 0.5 * jb_ic);
-                                double t2_ijbc = t2[(i*nvir+b) * ov + (j*nvir+c)];
-                                double ia_jc = ovov[(i*nvir+a) * ov + (j*nvir+c)];
-                                double ja_ic = ovov[(j*nvir+a) * ov + (i*nvir+c)];
-                                val_ba += t2_ijbc * (ia_jc - 0.5 * ja_ic);
-                            }
-                    sigma_vv[a * nvir + b] = -(val_ab + val_ba);
-                }
-
-            // Add Σ to M11: M11[ia,jb] -= δ_ab Σ_oo[i,j] + δ_ij Σ_vv[a,b]
-            std::vector<double> M11_corr(ov * ov, 0.0);
-            for (int i = 0; i < nocc; i++)
-                for (int j = 0; j < nocc; j++)
-                    for (int a = 0; a < nvir; a++) {
-                        // -δ_ab Σ_oo[i,j]
-                        M11_corr[(size_t)(j*nvir+a) * ov + (i*nvir+a)] -= sigma_oo[i*nocc+j];
-                    }
-            for (int a = 0; a < nvir; a++)
-                for (int b = 0; b < nvir; b++)
-                    for (int i = 0; i < nocc; i++) {
-                        // +δ_ij Σ_vv[a,b]
-                        M11_corr[(size_t)(i*nvir+b) * ov + (i*nvir+a)] += sigma_vv[a*nvir+b];
-                    }
-
-            real_t* d_corr = nullptr;
-            tracked_cudaMalloc(&d_corr, ov * ov * sizeof(real_t));
-            cudaMemcpy(d_corr, M11_corr.data(), ov * ov * sizeof(double), cudaMemcpyHostToDevice);
-            cublasDaxpy(handle, (int)(ov * ov), &one, d_corr, 1, d_M11_cis, 1);
-            tracked_cudaFree(d_corr);
+            DavidsonSolver init_solver(ri_op, dav_config);
+            init_solver.solve();
+            sos_eigenvalues.resize(n_states);
+            const auto& evals = init_solver.get_eigenvalues();
+            for (int k = 0; k < n_states && k < (int)evals.size(); k++)
+                sos_eigenvalues[k] = evals[k];
         }
 
-        std::cout << "  CIS M11 built (D1 + 2J - K + Σ_oo + Σ_vv)" << std::endl;
-    }
-#endif  // Skip RI-based M11
+        std::cout << "  [RI] Initial (omega=0):";
+        for (int k = 0; k < n_states; k++)
+            std::cout << " " << std::fixed << std::setprecision(6) << sos_eigenvalues[k];
+        std::cout << std::endl;
 
-    // Use full ADC(2) operator for correct Schur complement (validated)
-    // SOS + Laplace optimization of sigma vector is future work.
-    // For now: correct ADC(2) eigenvalues via ω-dependent Schur complement.
-    {
-        real_t* d_eri_mo = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
-        ADC2Operator adc2_op(d_eri_mo, rhf_.get_orbital_energies().device_ptr(),
-                             nocc, nvir, rhf_.get_num_basis());
-        tracked_cudaFree(d_eri_mo);
+        // Per-root omega-iteration
+        const double omega_thr = 1e-8;
+        const int max_omega_iter = 15;
 
-        // Build M_eff(ω) and diagonalize with ω-iteration
-        real_t* d_M_eff = nullptr;
-        tracked_cudaMalloc(&d_M_eff, (size_t)singles_dim * singles_dim * sizeof(real_t));
+        for (int root = 0; root < n_states; root++) {
+            double omega = sos_eigenvalues[root];
+            bool converged = false;
 
-        // ω-iteration
-        double omega = 0.0;
-        std::vector<double> eigenvalues;
+            for (int iter = 0; iter < max_omega_iter; iter++) {
+                ri_op.set_omega(omega);
 
-        for (int iter = 0; iter < 15; iter++) {
-            adc2_op.build_M_eff_matrix(omega, d_M_eff);
+                DavidsonSolver solver(ri_op, dav_config);
+                solver.solve();
 
-            // Diagonalize M_eff (symmetric)
-            real_t* d_evals = nullptr;
-            real_t* d_evecs = nullptr;
-            tracked_cudaMalloc(&d_evals, singles_dim * sizeof(real_t));
-            tracked_cudaMalloc(&d_evecs, (size_t)singles_dim * singles_dim * sizeof(real_t));
-            gpu::eigenDecomposition(d_M_eff, d_evals, d_evecs, singles_dim);
-            tracked_cudaFree(d_evecs);
+                const auto& evals = solver.get_eigenvalues();
+                double omega_new = (root < (int)evals.size()) ? evals[root] : omega;
+                double delta = std::abs(omega_new - omega);
 
-            eigenvalues.resize(n_states);
-            cudaMemcpy(eigenvalues.data(), d_evals, n_states * sizeof(double), cudaMemcpyDeviceToHost);
-            tracked_cudaFree(d_evals);
+                std::cout << "  [RI] Root " << root + 1 << " iter " << std::setw(2) << iter + 1
+                          << ": omega=" << std::fixed << std::setprecision(8) << omega_new
+                          << ", d_omega=" << std::scientific << std::setprecision(2) << delta
+                          << std::defaultfloat << std::endl;
 
-            double omega_new = eigenvalues[0];
-            std::cout << "  ω-iter " << iter << ": ω=" << std::setprecision(8) << omega_new
-                      << "  Δω=" << std::abs(omega_new - omega) << std::endl;
-
-            if (std::abs(omega_new - omega) < 1e-8) {
-                std::cout << "  ω converged!" << std::endl;
-                break;
+                if (delta < omega_thr) {
+                    sos_eigenvalues[root] = omega_new;
+                    solver.copy_eigenvectors_to_host(h_sos_eigenvectors.data());
+                    converged = true;
+                    std::cout << "  [RI] Root " << root + 1 << ": converged in "
+                              << iter + 1 << " iterations" << std::endl;
+                    break;
+                }
+                omega = omega_new;
+                if (iter == max_omega_iter - 1)
+                    solver.copy_eigenvectors_to_host(h_sos_eigenvectors.data());
             }
-            omega = omega_new;
+            if (!converged) {
+                sos_eigenvalues[root] = omega;
+                std::cout << "  [RI] Root " << root + 1 << ": NOT converged after "
+                          << max_omega_iter << " iterations" << std::endl;
+            }
         }
 
-        tracked_cudaFree(d_M_eff);
-        tracked_cudaFree(d_M11_from_adc2);
-
-        // Report results
-    std::cout << "\n  SOS-ADC(2) Excitation Energies:" << std::endl;
-    for (int k = 0; k < (int)eigenvalues.size() && k < n_states; k++) {
-        std::cout << "    State " << k + 1 << ": "
-                  << std::setprecision(8) << eigenvalues[k] << " Ha = "
-                  << eigenvalues[k] * 27.2114 << " eV" << std::endl;
-        }
+        std::cout << "  [RI] RI-ADC(2) Schur time: " << std::fixed << std::setprecision(3)
+                  << ri_timer.elapsed_seconds() << " s" << std::endl;
     }
 
+    tracked_cudaFree(d_M11_from_adc2);
+
+    // ============================================================
+    //  Store results and compute oscillator strengths
+    // ============================================================
+    rhf_.set_excitation_energies(sos_eigenvalues);
+
+    rhf_.get_coefficient_matrix().toHost();
+    const auto& prim_shells = rhf_.get_primitive_shells();
+    const auto& cgto_norms = rhf_.get_cgto_normalization_factors();
+    const_cast<DeviceHostMemory<PrimitiveShell>&>(prim_shells).toHost();
+    const_cast<DeviceHostMemory<real_t>&>(cgto_norms).toHost();
+
+    auto es_result = compute_excited_state_properties(
+        "RI-ADC(2)",
+        prim_shells.host_ptr(), prim_shells.size(),
+        cgto_norms.host_ptr(),
+        rhf_.get_shell_type_infos(),
+        rhf_.get_coefficient_matrix().host_ptr(),
+        sos_eigenvalues, h_sos_eigenvectors.data(),
+        n_states, rhf_.get_num_basis(), nocc, nvir);
+    rhf_.set_oscillator_strengths(es_result.oscillator_strengths);
+    rhf_.set_excited_state_report(es_result.report);
+
+    tracked_cudaFree(d_B_ab);
+    tracked_cudaFree(d_B_ij);
     tracked_cudaFree(d_B_ia);
 }
 

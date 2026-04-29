@@ -955,7 +955,9 @@ public:
     real_t compute_mp3_energy() override;
 
 private:
-    real_t* build_B_ia();  // Helper: build B_ia^P on device
+    real_t* build_B_ia();  // Helper: build B_ia^P on device [ov x naux]
+    real_t* build_B_ab();  // Helper: build B_ab^P on device [vv x naux]
+    real_t* build_B_ij();  // Helper: build B_ij^P on device [oo x naux]
     real_t compute_mp4_energy() override;
     real_t compute_cc2_energy() override;
     real_t compute_ccsd_energy() override;
