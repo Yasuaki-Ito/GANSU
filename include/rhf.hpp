@@ -1427,6 +1427,22 @@ protected:
 };
 
 
+#ifdef GANSU_MULTI_GPU
+/// Distributed Semi-Direct RI: per-iteration 3c2e on GPU 0 → L⁻¹ DGEMM → B_local scatter
+/// → distributed J/K AllReduce. B is rebuilt each iteration (no persistent storage).
+class ERI_RI_SemiDirect_Distributed_RHF : public ERI_RI_SemiDirect_RHF {
+public:
+    ERI_RI_SemiDirect_Distributed_RHF(RHF& rhf, const Molecular& auxiliary_molecular);
+    ~ERI_RI_SemiDirect_Distributed_RHF();
+    void compute_fock_matrix() override;
+    std::string get_algorithm_name() override { return "Semi-Direct-RI-Distributed"; }
+private:
+    int num_gpus_;
+    std::vector<int> naux_local_;
+    std::vector<size_t> P_start_;
+};
+#endif
+
 /// Hash RI: stores 3-center ERIs in a Hash table (like Hash ERI for 4-center).
 /// Each SCF iteration: Hash 3c → dense B → J/K via BLAS.
 /// Combines Hash ERI's reuse advantage with RI's O(naux×nao²) scaling.

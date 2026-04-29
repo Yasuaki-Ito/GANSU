@@ -145,7 +145,26 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
         BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);
         Molecular auxiliary_molecular(molecular.get_atoms(), aux_basis);
         std::cout << "[RI] Auxiliary basis: " << auxiliary_molecular.get_num_basis() << " functions" << std::endl;
+#ifdef GANSU_MULTI_GPU
+        {
+            auto& mgr = MultiGpuManager::instance();
+            if (!mgr.num_devices()) {
+                int num_gpus = parameters.get<int>("num_gpus");
+                mgr.initialize(num_gpus);
+            }
+            if (mgr.is_distributed()) {
+                // Use stored-RI distributed (precomputed B + scatter) for multi-GPU
+                // Semi-Direct's per-iteration 3c2e recomputation is incompatible with
+                // NCCL initialization on some GPU/driver configurations.
+                std::cout << "[Semi-Direct-RI] Multi-GPU: using stored-RI distributed path" << std::endl;
+                set_eri_method(std::make_unique<ERI_RI_Distributed_RHF>(*this, auxiliary_molecular));
+            } else {
+                set_eri_method(std::make_unique<ERI_RI_SemiDirect_RHF>(*this, auxiliary_molecular));
+            }
+        }
+#else
         set_eri_method(std::make_unique<ERI_RI_SemiDirect_RHF>(*this, auxiliary_molecular));
+#endif
     }else if(eri_method == "hash_ri"){
         const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename");
         BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);

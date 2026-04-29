@@ -8,6 +8,7 @@
  */
 
 #include "multi_gpu_manager.hpp"
+#include "gpu_manager.hpp"
 #include <iostream>
 #include <algorithm>
 
@@ -33,19 +34,6 @@ void MultiGpuManager::initialize(int requested_devices) {
 
     num_devices_ = (requested_devices > 0) ? std::min(requested_devices, available) : available;
 
-    // Check peer access (NVLink/NVSwitch)
-    for (int i = 0; i < num_devices_; i++) {
-        for (int j = 0; j < num_devices_; j++) {
-            if (i == j) continue;
-            int can_access = 0;
-            cudaDeviceCanAccessPeer(&can_access, i, j);
-            if (can_access) {
-                cudaSetDevice(i);
-                cudaDeviceEnablePeerAccess(j, 0);
-            }
-        }
-    }
-
     // Create per-device handles and streams
     cublas_handles_.resize(num_devices_);
     cusolver_handles_.resize(num_devices_);
@@ -54,13 +42,10 @@ void MultiGpuManager::initialize(int requested_devices) {
 
     for (int d = 0; d < num_devices_; d++) {
         cudaSetDevice(d);
-
         cublasCreate(&cublas_handles_[d]);
         cusolverDnCreate(&cusolver_handles_[d]);
         cudaStreamCreate(&compute_streams_[d]);
         cudaStreamCreate(&comm_streams_[d]);
-
-        // Bind cuBLAS to compute stream
         cublasSetStream(cublas_handles_[d], compute_streams_[d]);
     }
 
@@ -73,7 +58,6 @@ void MultiGpuManager::initialize(int requested_devices) {
     ncclResult_t nccl_result = ncclCommInitAll(nccl_comms_.data(), num_devices_, dev_list.data());
     if (nccl_result != ncclSuccess) {
         std::cerr << "[MultiGPU] NCCL init failed: " << ncclGetErrorString(nccl_result) << std::endl;
-        // Fallback to single GPU
         num_devices_ = 1;
     }
 #endif

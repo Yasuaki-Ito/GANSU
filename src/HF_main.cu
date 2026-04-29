@@ -32,6 +32,9 @@
 #include "parameter_manager.hpp"
 #include "builder.hpp"
 #include "gpu_manager.hpp"
+#ifdef GANSU_MULTI_GPU
+#include "multi_gpu_manager.hpp"
+#endif
 
 namespace fs = std::filesystem;
 using namespace gansu;
@@ -138,6 +141,8 @@ int main(int argc, char* argv[]){
 
     ParameterManager parameters;
     parameters.parse_command_line_args(filtered_argc, filtered_argv.data());
+
+    // Multi-GPU initialization is deferred to ERI factory in rhf.cu
 
     // Resolve basis set short names: -g cc-pvdz → ../basis/cc-pvdz.gbs
     if (parameters.contains("gbsfilename")) {
