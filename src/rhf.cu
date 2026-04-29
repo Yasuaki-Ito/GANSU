@@ -108,7 +108,10 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
 #ifdef GANSU_MULTI_GPU
         {
             auto& mgr = MultiGpuManager::instance();
-            if (!mgr.num_devices()) mgr.initialize();
+            if (!mgr.num_devices()) {
+                int num_gpus = parameters.get<int>("num_gpus");
+                mgr.initialize(num_gpus);
+            }
             if (mgr.is_distributed()) {
                 std::cout << "[RI] Multi-GPU mode: " << mgr.num_devices() << " devices" << std::endl;
                 set_eri_method(std::make_unique<ERI_RI_Distributed_RHF>(*this, auxiliary_molecular));

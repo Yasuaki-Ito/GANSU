@@ -1042,7 +1042,12 @@ public:
     ERI_RI_Distributed_RHF(RHF& rhf, const Molecular& auxiliary_molecular);
     ~ERI_RI_Distributed_RHF();
 
-    void scatter_B();
+    /// Run parent's precomputation for Schwarz + shell pairs, then distributed B build
+    void precomputation() override;
+
+    /// Build B_local on each GPU via chunked 3c2e + L⁻¹ DGEMM (no full B on any GPU)
+    void distributed_build_B();
+
     void compute_fock_matrix() override;
 
     std::string get_algorithm_name() override { return "RI-Distributed"; }

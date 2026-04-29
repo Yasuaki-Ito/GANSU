@@ -93,9 +93,33 @@ void broadcast(T* buf, size_t count, int root, int device_id, cudaStream_t strea
 }
 
 /**
+ * @brief Point-to-point send.
+ */
+template<typename T>
+void send(const T* sendbuf, size_t count, int peer, int device_id, cudaStream_t stream)
+{
+    auto& mgr = MultiGpuManager::instance();
+    detail::check(
+        ncclSend(sendbuf, count, detail::nccl_dtype((T*)nullptr),
+                 peer, mgr.nccl_comm(device_id), stream),
+        "ncclSend");
+}
+
+/**
+ * @brief Point-to-point recv.
+ */
+template<typename T>
+void recv(T* recvbuf, size_t count, int peer, int device_id, cudaStream_t stream)
+{
+    auto& mgr = MultiGpuManager::instance();
+    detail::check(
+        ncclRecv(recvbuf, count, detail::nccl_dtype((T*)nullptr),
+                 peer, mgr.nccl_comm(device_id), stream),
+        "ncclRecv");
+}
+
+/**
  * @brief Group start for batched NCCL operations.
- * Enclose multiple NCCL calls between group_start/group_end
- * to fuse them into a single communication round.
  */
 inline void group_start() { detail::check(ncclGroupStart(), "ncclGroupStart"); }
 inline void group_end()   { detail::check(ncclGroupEnd(),   "ncclGroupEnd"); }

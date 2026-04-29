@@ -75,7 +75,8 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"eom_cc2_solver", "auto"},                    // string (auto, schur_static, schur_omega, full)
         {"spin_type", "singlet"},                       // string (singlet, triplet)
         {"frozen_core", "none"},                         // string: "none", "auto", or integer
-        {"ecp_filename", ""}                               // string: ECP file path
+        {"ecp_filename", ""},                              // string: ECP file path
+        {"num_gpus", "-1"}                                 // int: number of GPUs (-1 = auto-detect all)
     };
 
 
