@@ -15,6 +15,7 @@ cmake_minimum_required(VERSION 3.31)
 
 # GPU support option (must be set before project())
 option(ENABLE_GPU "Build with CUDA GPU support" ON)
+option(ENABLE_MULTI_GPU "Build with multi-GPU support (requires NCCL)" OFF)
 
 if(ENABLE_GPU)
     project(GANSU LANGUAGES CUDA CXX)
@@ -205,6 +206,8 @@ set(SOURCES
     src/ecp_integrals_gpu.cu
     src/sos_laplace_adc2_operator.cu
     src/ri_adc2_schur_operator.cu
+    src/multi_gpu_manager.cu
+    src/eri_ri_distributed.cu
 )
 
 if(NOT ENABLE_GPU)
@@ -249,6 +252,17 @@ if(ENABLE_GPU)
     if(WIN32)
         target_link_options(gansu PUBLIC /DELAYLOAD:cublas64_12.dll /DELAYLOAD:cusolver64_11.dll)
         target_link_libraries(gansu delayimp)
+    endif()
+    # Multi-GPU support (NCCL)
+    if(ENABLE_MULTI_GPU)
+        find_library(NCCL_LIBRARY nccl HINTS ${CUDAToolkit_LIBRARY_DIR} ${CUDA_TOOLKIT_ROOT_DIR}/lib64)
+        if(NCCL_LIBRARY)
+            target_compile_definitions(gansu PUBLIC GANSU_MULTI_GPU)
+            target_link_libraries(gansu ${NCCL_LIBRARY})
+            message(STATUS "Multi-GPU enabled: NCCL found at ${NCCL_LIBRARY}")
+        else()
+            message(WARNING "ENABLE_MULTI_GPU is ON but NCCL not found. Multi-GPU disabled.")
+        endif()
     endif()
 endif()
 

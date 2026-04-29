@@ -1030,6 +1030,39 @@ protected:
     RHF& rhf_; ///< RHF
 };
 
+#ifdef GANSU_MULTI_GPU
+/**
+ * @brief Distributed RI-HF across multiple GPUs (aux-axis partition).
+ *
+ * Builds full B on GPU 0 (existing precomputation), scatters P-local slices
+ * to all GPUs, then computes J/K with local DGEMM + NCCL AllReduce.
+ */
+class ERI_RI_Distributed_RHF : public ERI_RI_RHF {
+public:
+    ERI_RI_Distributed_RHF(RHF& rhf, const Molecular& auxiliary_molecular);
+    ~ERI_RI_Distributed_RHF();
+
+    void scatter_B();
+    void compute_fock_matrix() override;
+
+    std::string get_algorithm_name() override { return "RI-Distributed"; }
+
+private:
+    int num_gpus_;
+    std::vector<int> naux_local_;
+    std::vector<size_t> P_start_;
+    std::vector<real_t*> d_B_local_;
+    std::vector<real_t*> d_W_local_;
+    std::vector<real_t*> d_J_local_;
+    std::vector<real_t*> d_K_local_;
+    std::vector<real_t*> d_X_local_;
+    std::vector<real_t*> d_X_packed_local_;
+    bool scattered_ = false;
+
+    void allocate_per_device_workspace();
+    void free_per_device_workspace();
+};
+#endif
 
 /**
  * @brief ERI_Direct_RHF class for the direct computation of the ERIs of the restricted HF method
