@@ -178,17 +178,16 @@ void ERI_RI_Distributed_RHF::free_per_device_workspace() {
 }
 
 // ============================================================
-//  Precomputation: Schwarz bounds only (B build deferred)
+//  Precomputation: Schwarz + 2c2e/Cholesky (no full B on any GPU)
 // ============================================================
 void ERI_RI_Distributed_RHF::precomputation() {
-    // Run parent's full precomputation (Schwarz + 3c2e + B).
-    // We need intermediate_matrix_B_ for the initial guess (density-matrix Fock).
+    // Parent precomputation: Schwarz + 3c2e + Cholesky + B on GPU 0.
+    // intermediate_matrix_B_ used for initial guess (density-matrix Fock).
     ERI_RI::precomputation();
 }
 
 // ============================================================
-//  Distributed B build: 3c2e → trsm → scatter → free
-//  GPU 0 peak: naux × nbas² (3c/B buffer only, no intermediate_matrix_B_ copy)
+//  Distributed B build: scatter from GPU 0 + release full B
 // ============================================================
 void ERI_RI_Distributed_RHF::distributed_build_B() {
     if (scattered_) return;
@@ -197,22 +196,19 @@ void ERI_RI_Distributed_RHF::distributed_build_B() {
     const int nbas = num_basis_;
     const size_t nbas2 = (size_t)nbas * nbas;
 
-    // Scatter from intermediate_matrix_B_ (computed by parent precomputation on GPU 0)
     const real_t* d_B_full = intermediate_matrix_B_.device_ptr();
 
     for (int d = 0; d < num_gpus_; d++) {
         size_t local_size = (size_t)naux_local_[d] * nbas2;
         size_t offset = P_start_[d] * nbas2;
-
         MultiGpuManager::DeviceGuard guard(d);
         if (!d_B_local_[d])
             cudaMalloc(&d_B_local_[d], local_size * sizeof(double));
-
         cudaMemcpy(d_B_local_[d], d_B_full + offset,
                    local_size * sizeof(double), cudaMemcpyDefault);
     }
 
-    // Free intermediate_matrix_B_ on GPU 0 to reclaim naux×nbas² memory
+    // Release full B on GPU 0 to reclaim naux*nbas^2 memory
     {
         MultiGpuManager::DeviceGuard guard(0);
         size_t freed_mb = (size_t)naux * nbas2 * sizeof(real_t) / (1024 * 1024);
