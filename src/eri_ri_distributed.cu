@@ -247,7 +247,13 @@ void ERI_RI_Distributed_RHF::compute_fock_matrix() {
             d_W_tmp_.device_ptr(), d_tmp1_.device_ptr(), d_tmp2_.device_ptr());
         return;
     }
-    if (!scattered_) distributed_build_B();
+    if (direct_mode_) {
+        // Direct-RI mode: rebuild B_local from full B on GPU 0 each iteration
+        // (B is rebuilt on-the-fly, not stored between iterations)
+        distributed_build_B();
+    } else {
+        if (!scattered_) distributed_build_B();
+    }
 
     const int nbas = num_basis_;
     const int nocc = num_occ_;
@@ -363,6 +369,15 @@ void ERI_RI_Distributed_RHF::compute_fock_matrix() {
         MultiGpuManager::DeviceGuard guard(d);
         cudaFree(d_D[d]);
         cudaFree(d_C[d]);
+    }
+
+    // Direct-RI mode: free B_local after Fock build (not stored between iterations)
+    if (direct_mode_) {
+        for (int d = 0; d < num_gpus_; d++) {
+            MultiGpuManager::DeviceGuard guard(d);
+            if (d_B_local_[d]) { cudaFree(d_B_local_[d]); d_B_local_[d] = nullptr; }
+        }
+        scattered_ = false;  // Force rebuild next iteration
     }
 }
 

@@ -1050,7 +1050,10 @@ public:
 
     void compute_fock_matrix() override;
 
-    std::string get_algorithm_name() override { return "RI-Distributed"; }
+    std::string get_algorithm_name() override { return direct_mode_ ? "RI-Direct-Distributed" : "RI-Distributed"; }
+
+    /// Enable Direct-RI mode: B_local is rebuilt each iteration, not stored
+    void set_direct_mode(bool enable) { direct_mode_ = enable; }
 
 private:
     int num_gpus_;
@@ -1063,6 +1066,7 @@ private:
     std::vector<real_t*> d_X_local_;
     std::vector<real_t*> d_X_packed_local_;
     bool scattered_ = false;
+    bool direct_mode_ = false;  ///< If true, B_local is rebuilt and freed each Fock build
 
     void allocate_per_device_workspace();
     void free_per_device_workspace();
