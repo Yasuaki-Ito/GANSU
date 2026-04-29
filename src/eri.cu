@@ -233,6 +233,27 @@ ERI_RI::ERI_RI(const HF& hf, const Molecular& auxiliary_molecular):
     auxiliary_cgto_normalization_factors_.toDevice();
 }
 
+ERI_RI::ERI_RI(const HF& hf, const Molecular& auxiliary_molecular, LightweightTag):
+        hf_(hf),
+        num_basis_(hf.get_num_basis()),
+        num_auxiliary_basis_(auxiliary_molecular.get_num_basis()),
+        num_occ_(hf.get_num_electrons() / 2),
+        auxiliary_shell_type_infos_(auxiliary_molecular.get_shell_type_infos()),
+        auxiliary_primitive_shells_(auxiliary_molecular.get_primitive_shells()),
+        auxiliary_cgto_normalization_factors_(auxiliary_molecular.get_cgto_normalization_factors()),
+        intermediate_matrix_B_(1, 1),  // dummy — not used in distributed mode
+        d_J_(1, 1),
+        d_K_(1, 1),
+        d_W_tmp_(1),
+        d_tmp1_(1, 1),
+        d_tmp2_(1, 1),
+        schwarz_upper_bound_factors(hf.get_num_primitive_shell_pairs()),
+        auxiliary_schwarz_upper_bound_factors(auxiliary_molecular.get_primitive_shells().size())
+{
+    auxiliary_primitive_shells_.toDevice();
+    auxiliary_cgto_normalization_factors_.toDevice();
+}
+
 ERI_RI::~ERI_RI() {
     if (d_eri_reconstructed_) tracked_cudaFree(d_eri_reconstructed_);
     if (d_persistent_shell_pair_indices_) tracked_cudaFree(d_persistent_shell_pair_indices_);

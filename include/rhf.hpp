@@ -944,6 +944,7 @@ protected:
 class ERI_RI_RHF : public ERI_RI {
 public:
     ERI_RI_RHF(RHF& rhf, const Molecular& auxiliary_molecular): ERI_RI(rhf, auxiliary_molecular), rhf_(rhf) {} ///< Constructor
+    ERI_RI_RHF(RHF& rhf, const Molecular& auxiliary_molecular, LightweightTag t): ERI_RI(rhf, auxiliary_molecular, t), rhf_(rhf) {} ///< Lightweight constructor
     ERI_RI_RHF(const ERI_RI_RHF&) = delete; ///< copy constructor is deleted
     ~ERI_RI_RHF() = default; ///< destructor
 
@@ -1050,10 +1051,26 @@ public:
 
     void compute_fock_matrix() override;
 
-    std::string get_algorithm_name() override { return direct_mode_ ? "RI-Direct-Distributed" : "RI-Distributed"; }
+    /// Storage mode for B matrix
+    enum class StorageMode {
+        GPU_Resident,    ///< ri: B on GPU (single or distributed)
+        OutOfCore,       ///< ri: B on host, streamed to GPU per iteration
+        OnTheFly,        ///< semi_direct_ri/direct_ri: B rebuilt per iteration (no storage)
+    };
 
-    /// Enable Direct-RI mode: B_local is rebuilt each iteration, not stored
-    void set_direct_mode(bool enable) { direct_mode_ = enable; }
+    std::string get_algorithm_name() override {
+        switch (storage_mode_) {
+            case StorageMode::GPU_Resident: return "RI-Distributed";
+            case StorageMode::OutOfCore: return "RI-OutOfCore";
+            case StorageMode::OnTheFly: return "RI-OnTheFly";
+        }
+        return "RI";
+    }
+
+    void set_storage_mode(StorageMode mode) { storage_mode_ = mode; }
+
+    /// Legacy: set_direct_mode maps to OnTheFly
+    void set_direct_mode(bool enable) { if (enable) storage_mode_ = StorageMode::OnTheFly; }
 
 private:
     int num_gpus_;
@@ -1066,18 +1083,74 @@ private:
     std::vector<real_t*> d_X_local_;
     std::vector<real_t*> d_X_packed_local_;
     bool scattered_ = false;
-    bool direct_mode_ = false;  ///< If true, B_local is rebuilt and freed each Fock build
+    StorageMode storage_mode_ = StorageMode::GPU_Resident;
 
-    /// Per-auxiliary-shell-type basis function ranges (for chunked 3c2e)
-    std::vector<size_t> aux_type_basis_start_;  ///< [type_idx] → first basis function index
-    std::vector<int> aux_type_nfunc_;           ///< [type_idx] → number of basis functions
+    /// Aux batches: each aux type split into memory-friendly batches with contiguous basis_index.
+    /// After basis_index sort, each batch has {shell_info (start/count), basis_start, nfunc, angular_momentum}.
+    struct AuxBatch {
+        ShellTypeInfo shell_info;  ///< start_index and count in aux primitive array
+        size_t basis_start;        ///< min basis_index in this batch
+        int nfunc;                 ///< number of basis functions covered
+        int angular_momentum;      ///< shell type (for kernel dispatch)
+    };
+    std::vector<AuxBatch> aux_batches_;  ///< All batches (possibly multiple per aux type)
 
     /// Cached L⁻¹ on GPU 0 (computed once in precomputation, reused in distributed_build_B)
     real_t* d_cached_L_inv_ = nullptr;
 
+    /// Per-GPU replicated data (allocated once, reused across iterations in direct_mode_)
+    struct PerGpuData {
+        real_t* d_L_inv = nullptr;
+        PrimitiveShell* d_pshells = nullptr;
+        real_t* d_cgto_norms = nullptr;
+        PrimitiveShell* d_aux_pshells = nullptr;
+        real_t* d_aux_cgto_norms = nullptr;
+        size_t2* d_shell_pairs = nullptr;
+        real_t* d_schwarz = nullptr;
+        real_t* d_aux_schwarz = nullptr;
+        real_t* d_boys = nullptr;
+        real_t* d_chunk = nullptr;       ///< Pre-allocated chunk buffer (max aux type size)
+    };
+    std::vector<PerGpuData> per_gpu_data_;
+    bool per_gpu_data_ready_ = false;
+    int max_nfunc_chunk_ = 0;  ///< Max nfunc across all aux types (for chunk pre-allocation)
+
+    void replicate_data_to_gpus();   ///< One-time replication of shell data + L⁻¹ to all GPUs
+    void free_per_gpu_data();        ///< Free replicated data
     void allocate_per_device_workspace();
     void free_per_device_workspace();
     void compute_aux_type_ranges();  ///< Scan aux shells to determine per-type basis ranges
+
+    /// Chunked Fock build: compute J/K by streaming through aux chunks without storing full B_local.
+    void chunked_fock_build();
+
+    /// Out-of-core B: partitions stored in pinned host memory, streamed to GPU per iteration
+    struct HostPartition {
+        real_t* h_B = nullptr;  ///< Pinned host memory [nrows × nbas²]
+        int P_start;            ///< Global aux row start
+        int nrows;              ///< Number of rows in this partition
+    };
+    std::vector<HostPartition> host_partitions_;
+    bool out_of_core_ready_ = false;
+
+    void build_out_of_core_B();     ///< Build B partitions to host memory (called once)
+    void out_of_core_fock_build();  ///< Stream partitions to GPU and compute J/K
+    void free_host_partitions();
+
+    /// Cached workspace for chunked Fock (allocated once, reused across iterations)
+    struct ChunkedWorkspace {
+        real_t* d_B_row = nullptr;
+        real_t* d_3c_chunk = nullptr;
+        real_t* d_W = nullptr;
+        real_t* d_X = nullptr;
+        real_t* d_Xp = nullptr;
+        real_t* d_D = nullptr;   ///< Replicated density matrix
+        real_t* d_C = nullptr;   ///< Replicated coefficient matrix
+    };
+    std::vector<ChunkedWorkspace> chunked_ws_;
+    int chunked_N_rows_ = 0;  ///< Cached row partition size
+    void allocate_chunked_workspace();
+    void free_chunked_workspace();
 };
 #endif
 

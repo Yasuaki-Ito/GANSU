@@ -78,7 +78,8 @@ namespace gpu {
         const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
         const PrimitiveShell* d_primitive_shells,
         const real_t* d_cgto_normalization_factors,
-        const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+        const ShellTypeInfo& aux_shell_info,
+        int aux_type_angular_momentum,
         const PrimitiveShell* d_auxiliary_primitive_shells,
         const real_t* d_auxiliary_cgto_normalization_factors,
         real_t* d_chunk,
@@ -89,9 +90,9 @@ namespace gpu {
         const real_t* d_schwarz_upper_bound_factors,
         const real_t* d_auxiliary_schwarz_upper_bound_factors,
         const real_t schwarz_screening_threshold,
-        int aux_type_index,
         size_t aux_basis_offset,
-        int nfunc_chunk);
+        int nfunc_chunk,
+        cudaStream_t stream);
 }
 
 // ============================================================
@@ -141,7 +142,7 @@ __global__ void distributed_pack_X_kernel(
 //  Constructor / Destructor
 // ============================================================
 ERI_RI_Distributed_RHF::ERI_RI_Distributed_RHF(RHF& rhf, const Molecular& auxiliary_molecular)
-    : ERI_RI_RHF(rhf, auxiliary_molecular)
+    : ERI_RI_RHF(rhf, auxiliary_molecular, LightweightTag{})
 {
     auto& mgr = MultiGpuManager::instance();
     num_gpus_ = mgr.num_devices();
@@ -168,12 +169,178 @@ ERI_RI_Distributed_RHF::ERI_RI_Distributed_RHF(RHF& rhf, const Molecular& auxili
 }
 
 ERI_RI_Distributed_RHF::~ERI_RI_Distributed_RHF() {
+    free_host_partitions();
+    free_chunked_workspace();
     free_per_device_workspace();
+    free_per_gpu_data();
     if (d_cached_L_inv_) {
         MultiGpuManager::DeviceGuard guard(0);
         tracked_cudaFree(d_cached_L_inv_);
         d_cached_L_inv_ = nullptr;
     }
+}
+
+void ERI_RI_Distributed_RHF::allocate_chunked_workspace() {
+    if (!chunked_ws_.empty()) return;  // already allocated
+
+    const int nbas = num_basis_;
+    const int nocc = num_occ_;
+    const size_t nbas2 = (size_t)nbas * nbas;
+    const bool has_C = rhf_.get_hasMatrixC();
+
+    // Determine N_rows from free memory.
+    // Budget: B_row (N_rows × nbas²) + 3c_chunk (max_nfunc × nbas²) + X + Xp + W
+    size_t free_mem = 0, total_mem = 0;
+    { cudaSetDevice(0); cudaMemGetInfo(&free_mem, &total_mem); }
+    const size_t reserved = nbas2 * 3 * sizeof(double) + 512ULL * 1024 * 1024;  // J,K,D + margin
+    const size_t available = (free_mem > reserved) ? free_mem - reserved : 512ULL * 1024 * 1024;
+
+    // 3c_chunk is the biggest fixed cost (per aux type)
+    const size_t chunk_3c_bytes = (size_t)max_nfunc_chunk_ * nbas2 * sizeof(double);
+    const size_t remaining = (available > chunk_3c_bytes) ? available - chunk_3c_bytes : available / 2;
+
+    const size_t bytes_per_row = nbas2 * sizeof(double)
+                               + (has_C ? 2 * (size_t)nbas * nocc * sizeof(double) : 2 * nbas2 * sizeof(double))
+                               + sizeof(double);
+    int max_rows = (bytes_per_row > 0) ? (int)(remaining / bytes_per_row) : num_auxiliary_basis_;
+    int max_naux_local = 0;
+    for (int d = 0; d < num_gpus_; d++)
+        if (naux_local_[d] > max_naux_local) max_naux_local = naux_local_[d];
+    chunked_N_rows_ = std::max(1, std::min(max_rows, max_naux_local));
+
+    // If 3c_chunk alone exceeds available memory, fall back to stored RI build + scatter
+    if (chunk_3c_bytes > available * 9 / 10) {
+        std::cout << "[RI-Dist] 3c chunk too large for chunked Fock. "
+                  << "Falling back to B_local build + standard Fock." << std::endl;
+        distributed_build_B();
+        // Use stored RI Fock path (coefficient or density-matrix based)
+        if (has_C) {
+            // Delegate to the stored RI coefficient-based Fock build (below this function)
+            // by breaking out and letting compute_fock_matrix handle it
+        }
+        // NOTE: For this fallback, we set scattered_ and return to compute_fock_matrix
+        // which will proceed with the stored RI J/K build.
+        return;
+    }
+
+    chunked_ws_.resize(num_gpus_);
+    for (int d = 0; d < num_gpus_; d++) {
+        cudaSetDevice(d);
+        auto& w = chunked_ws_[d];
+        // J/K accumulators (used by AllReduce)
+        if (!d_J_local_[d]) cudaMalloc(&d_J_local_[d], nbas2 * sizeof(double));
+        if (!d_K_local_[d]) cudaMalloc(&d_K_local_[d], nbas2 * sizeof(double));
+        cudaMalloc(&w.d_B_row, (size_t)chunked_N_rows_ * nbas2 * sizeof(double));
+        cudaMalloc(&w.d_3c_chunk, (size_t)max_nfunc_chunk_ * nbas2 * sizeof(double));
+        cudaMalloc(&w.d_W, chunked_N_rows_ * sizeof(double));
+        if (has_C) {
+            cudaMalloc(&w.d_X, (size_t)chunked_N_rows_ * nbas * nocc * sizeof(double));
+            cudaMalloc(&w.d_Xp, (size_t)chunked_N_rows_ * nbas * nocc * sizeof(double));
+        } else {
+            cudaMalloc(&w.d_X, (size_t)chunked_N_rows_ * nbas2 * sizeof(double));
+            cudaMalloc(&w.d_Xp, (size_t)chunked_N_rows_ * nbas2 * sizeof(double));
+        }
+        if (d > 0) {
+            cudaMalloc(&w.d_D, nbas2 * sizeof(double));
+            if (has_C) cudaMalloc(&w.d_C, nbas2 * sizeof(double));
+        }
+    }
+
+    int total_sub = 0;
+    for (int d = 0; d < num_gpus_; d++)
+        total_sub += (naux_local_[d] + chunked_N_rows_ - 1) / chunked_N_rows_;
+    std::cout << "[RI-Dist] Chunked Fock: max_rows=" << chunked_N_rows_
+              << ", " << total_sub << " sub-chunk(s) across " << num_gpus_ << " GPU(s)" << std::endl;
+    cudaSetDevice(0);
+}
+
+void ERI_RI_Distributed_RHF::free_chunked_workspace() {
+    for (int d = 0; d < (int)chunked_ws_.size(); d++) {
+        cudaSetDevice(d);
+        auto& w = chunked_ws_[d];
+        if (w.d_B_row) cudaFree(w.d_B_row);
+        if (w.d_3c_chunk) cudaFree(w.d_3c_chunk);
+        if (w.d_W) cudaFree(w.d_W);
+        if (w.d_X) cudaFree(w.d_X);
+        if (w.d_Xp) cudaFree(w.d_Xp);
+        if (w.d_D) cudaFree(w.d_D);
+        if (w.d_C) cudaFree(w.d_C);
+    }
+    chunked_ws_.clear();
+    cudaSetDevice(0);
+}
+
+void ERI_RI_Distributed_RHF::replicate_data_to_gpus() {
+    if (per_gpu_data_ready_) return;
+
+    const int naux = num_auxiliary_basis_;
+    const size_t nbas2 = (size_t)num_basis_ * num_basis_;
+    per_gpu_data_.resize(num_gpus_);
+
+    const size_t n_pshells = hf_.get_primitive_shells().size();
+    const size_t n_aux_pshells = auxiliary_primitive_shells_.size();
+    const size_t n_cgto = hf_.get_cgto_normalization_factors().size();
+    const size_t n_aux_cgto = auxiliary_cgto_normalization_factors_.size();
+    const size_t n_boys = hf_.get_boys_grid().size();
+
+    for (int d = 0; d < num_gpus_; d++) {
+        MultiGpuManager::DeviceGuard guard(d);
+        auto& g = per_gpu_data_[d];
+        if (d == 0) {
+            g.d_L_inv = d_cached_L_inv_;
+            g.d_pshells = const_cast<PrimitiveShell*>(hf_.get_primitive_shells().device_ptr());
+            g.d_cgto_norms = const_cast<real_t*>(hf_.get_cgto_normalization_factors().device_ptr());
+            g.d_aux_pshells = auxiliary_primitive_shells_.device_ptr();
+            g.d_aux_cgto_norms = auxiliary_cgto_normalization_factors_.device_ptr();
+            g.d_shell_pairs = d_persistent_shell_pair_indices_;
+            g.d_schwarz = schwarz_upper_bound_factors.device_ptr();
+            g.d_aux_schwarz = auxiliary_schwarz_upper_bound_factors.device_ptr();
+            g.d_boys = const_cast<real_t*>(hf_.get_boys_grid().device_ptr());
+        } else {
+            cudaMalloc(&g.d_L_inv, (size_t)naux * naux * sizeof(real_t));
+            cudaMemcpy(g.d_L_inv, d_cached_L_inv_, (size_t)naux * naux * sizeof(real_t), cudaMemcpyDefault);
+            cudaMalloc(&g.d_pshells, n_pshells * sizeof(PrimitiveShell));
+            cudaMemcpy(g.d_pshells, hf_.get_primitive_shells().device_ptr(), n_pshells * sizeof(PrimitiveShell), cudaMemcpyDefault);
+            cudaMalloc(&g.d_cgto_norms, n_cgto * sizeof(real_t));
+            cudaMemcpy(g.d_cgto_norms, hf_.get_cgto_normalization_factors().device_ptr(), n_cgto * sizeof(real_t), cudaMemcpyDefault);
+            cudaMalloc(&g.d_aux_pshells, n_aux_pshells * sizeof(PrimitiveShell));
+            cudaMemcpy(g.d_aux_pshells, auxiliary_primitive_shells_.device_ptr(), n_aux_pshells * sizeof(PrimitiveShell), cudaMemcpyDefault);
+            cudaMalloc(&g.d_aux_cgto_norms, n_aux_cgto * sizeof(real_t));
+            cudaMemcpy(g.d_aux_cgto_norms, auxiliary_cgto_normalization_factors_.device_ptr(), n_aux_cgto * sizeof(real_t), cudaMemcpyDefault);
+            cudaMalloc(&g.d_shell_pairs, num_persistent_shell_pairs_ * sizeof(size_t2));
+            cudaMemcpy(g.d_shell_pairs, d_persistent_shell_pair_indices_, num_persistent_shell_pairs_ * sizeof(size_t2), cudaMemcpyDefault);
+            cudaMalloc(&g.d_schwarz, schwarz_upper_bound_factors.size() * sizeof(real_t));
+            cudaMemcpy(g.d_schwarz, schwarz_upper_bound_factors.device_ptr(), schwarz_upper_bound_factors.size() * sizeof(real_t), cudaMemcpyDefault);
+            cudaMalloc(&g.d_aux_schwarz, auxiliary_schwarz_upper_bound_factors.size() * sizeof(real_t));
+            cudaMemcpy(g.d_aux_schwarz, auxiliary_schwarz_upper_bound_factors.device_ptr(), auxiliary_schwarz_upper_bound_factors.size() * sizeof(real_t), cudaMemcpyDefault);
+            cudaMalloc(&g.d_boys, n_boys * sizeof(real_t));
+            cudaMemcpy(g.d_boys, hf_.get_boys_grid().device_ptr(), n_boys * sizeof(real_t), cudaMemcpyDefault);
+        }
+        // Pre-allocate chunk buffer (max aux type size) on every GPU
+        cudaMalloc(&g.d_chunk, (size_t)max_nfunc_chunk_ * nbas2 * sizeof(real_t));
+    }
+    MultiGpuManager::instance().sync_all();
+    per_gpu_data_ready_ = true;
+}
+
+void ERI_RI_Distributed_RHF::free_per_gpu_data() {
+    for (int d = 0; d < (int)per_gpu_data_.size(); d++) {
+        MultiGpuManager::DeviceGuard guard(d);
+        auto& g = per_gpu_data_[d];
+        if (g.d_chunk) { cudaFree(g.d_chunk); g.d_chunk = nullptr; }
+        if (d == 0) continue;  // GPU 0 data is borrowed, not owned
+        if (g.d_L_inv) cudaFree(g.d_L_inv);
+        if (g.d_pshells) cudaFree(g.d_pshells);
+        if (g.d_cgto_norms) cudaFree(g.d_cgto_norms);
+        if (g.d_aux_pshells) cudaFree(g.d_aux_pshells);
+        if (g.d_aux_cgto_norms) cudaFree(g.d_aux_cgto_norms);
+        if (g.d_shell_pairs) cudaFree(g.d_shell_pairs);
+        if (g.d_schwarz) cudaFree(g.d_schwarz);
+        if (g.d_aux_schwarz) cudaFree(g.d_aux_schwarz);
+        if (g.d_boys) cudaFree(g.d_boys);
+    }
+    per_gpu_data_.clear();
+    per_gpu_data_ready_ = false;
 }
 
 void ERI_RI_Distributed_RHF::allocate_per_device_workspace() {
@@ -208,27 +375,79 @@ void ERI_RI_Distributed_RHF::free_per_device_workspace() {
 void ERI_RI_Distributed_RHF::compute_aux_type_ranges() {
     const auto& aux_types = auxiliary_shell_type_infos_;
     const int n_aux_types = (int)aux_types.size();
-    aux_type_basis_start_.resize(n_aux_types);
-    aux_type_nfunc_.resize(n_aux_types);
+    const int nbas = num_basis_;
+    const size_t nbas2 = (size_t)nbas * nbas;
 
-    // Scan host-side auxiliary primitive shells to find min/max basis_index per type
-    const PrimitiveShell* h_aux = auxiliary_primitive_shells_.host_ptr();
+    // Determine max batch size from available GPU memory
+    size_t free_mem = 0, total_mem = 0;
+    { cudaSetDevice(0); cudaMemGetInfo(&free_mem, &total_mem); }
+    // Reserve memory for B_row, X, Xp, L⁻¹, and overhead
+    const size_t reserved = 512ULL * 1024 * 1024;  // 512 MB safety margin
+    const size_t available_for_chunk = (free_mem > reserved) ? (free_mem - reserved) / 3 : 1024ULL * 1024 * 1024;
+    const int max_batch_nfunc = std::max(1, (int)(available_for_chunk / (nbas2 * sizeof(real_t))));
+
+    // Sort auxiliary primitives by basis_index within each type (on host).
+    // This ensures consecutive primitives have contiguous basis_index → efficient batching.
+    // (Replaces Schwarz sort order for the purpose of 3c2e chunking.)
+    PrimitiveShell* h_aux = auxiliary_primitive_shells_.host_ptr();
     for (int c = 0; c < n_aux_types; c++) {
         const size_t start = aux_types[c].start_index;
         const size_t count = aux_types[c].count;
-        const int L = h_aux[start].shell_type;
+        std::sort(h_aux + start, h_aux + start + count,
+            [](const PrimitiveShell& a, const PrimitiveShell& b) {
+                return a.basis_index < b.basis_index;
+            });
+    }
+    // Upload sorted order to device
+    auxiliary_primitive_shells_.toDevice();
+
+    // Build batches: split each aux type into chunks of max_batch_nfunc basis functions
+    aux_batches_.clear();
+    for (int c = 0; c < n_aux_types; c++) {
+        const size_t type_start = aux_types[c].start_index;
+        const size_t type_count = aux_types[c].count;
+        const int L = h_aux[type_start].shell_type;
         const int n_cart = (L + 1) * (L + 2) / 2;
 
-        size_t min_idx = h_aux[start].basis_index;
-        size_t max_idx = h_aux[start].basis_index;
-        for (size_t i = 1; i < count; i++) {
-            size_t bi = h_aux[start + i].basis_index;
-            if (bi < min_idx) min_idx = bi;
-            if (bi > max_idx) max_idx = bi;
+        // Primitives are now sorted by basis_index within this type.
+        // Split into batches where each batch covers at most max_batch_nfunc basis functions.
+        size_t batch_prim_start = 0;
+        while (batch_prim_start < type_count) {
+            const size_t first_basis = h_aux[type_start + batch_prim_start].basis_index;
+            const size_t max_basis = first_basis + max_batch_nfunc - n_cart;
+
+            // Find how many primitives fit in this batch
+            size_t batch_prim_end = batch_prim_start;
+            while (batch_prim_end < type_count &&
+                   h_aux[type_start + batch_prim_end].basis_index <= max_basis) {
+                batch_prim_end++;
+            }
+            if (batch_prim_end == batch_prim_start) batch_prim_end++;  // at least 1
+
+            // Compute actual nfunc for this batch
+            const size_t last_basis = h_aux[type_start + batch_prim_end - 1].basis_index;
+            const int batch_nfunc = (int)(last_basis - first_basis) + n_cart;
+            const int batch_count = (int)(batch_prim_end - batch_prim_start);
+
+            AuxBatch batch;
+            batch.shell_info.start_index = (int)(type_start + batch_prim_start);
+            batch.shell_info.count = batch_count;
+            batch.basis_start = first_basis;
+            batch.nfunc = batch_nfunc;
+            batch.angular_momentum = L;
+            aux_batches_.push_back(batch);
+
+            batch_prim_start = batch_prim_end;
         }
-        aux_type_basis_start_[c] = min_idx;
-        aux_type_nfunc_[c] = (int)(max_idx - min_idx) + n_cart;
     }
+
+    // Compute max_nfunc_chunk_ across all batches
+    max_nfunc_chunk_ = 0;
+    for (const auto& b : aux_batches_)
+        if (b.nfunc > max_nfunc_chunk_) max_nfunc_chunk_ = b.nfunc;
+
+    std::cout << "[RI-Dist] Aux batches: " << aux_batches_.size() << " (max_nfunc=" << max_nfunc_chunk_
+              << ", limit=" << max_batch_nfunc << ")" << std::endl;
 }
 
 // ============================================================
@@ -239,17 +458,13 @@ void ERI_RI_Distributed_RHF::precomputation() {
     const int naux = num_auxiliary_basis_;
     const int nbas = num_basis_;
 
+    // Ensure GPU 0 is active (base class data lives on GPU 0)
+    cudaSetDevice(0);
+
     // Step 1: Schwarz + shell pairs + aux Schwarz (skip full B build)
     precompute_schwarz_and_shell_pairs();
 
-    // Release intermediate_matrix_B_ allocated by base constructor (never used in distributed mode)
-    intermediate_matrix_B_.release();
-    // Release single-GPU Fock workspace (not needed — we use distributed J/K)
-    d_tmp1_.release();
-    d_tmp2_.release();
-
-    std::cout << "[RI-Dist] Skipped full B build (saved "
-              << (size_t)naux * nbas * nbas * sizeof(real_t) / (1024 * 1024) << " MB)" << std::endl;
+    std::cout << "[RI-Dist] Skipped full B build (lightweight constructor)" << std::endl;
 
     // Step 2: Compute auxiliary type ranges for chunked 3c2e
     auxiliary_primitive_shells_.toHost();
@@ -257,7 +472,7 @@ void ERI_RI_Distributed_RHF::precomputation() {
 
     // Step 3: Compute and cache L⁻¹ on GPU 0
     {
-        MultiGpuManager::DeviceGuard guard(0);
+        cudaSetDevice(0);
         const real_t schwarz_threshold = hf_.get_schwarz_screening_threshold();
 
         real_t* d_two_center_eri;
@@ -279,12 +494,39 @@ void ERI_RI_Distributed_RHF::precomputation() {
         gpu::computeInverseByDtrsm(d_two_center_eri, d_cached_L_inv_, naux);
 
         tracked_cudaFree(d_two_center_eri);
+        cudaDeviceSynchronize();
         std::cout << "[RI-Dist] Cached L^-1 on GPU 0 ("
-                  << (size_t)naux * naux * sizeof(real_t) / (1024 * 1024) << " MB)" << std::endl;
+                  << (size_t)naux * naux * sizeof(real_t) / (1024 * 1024) << " MB)" << std::flush << std::endl;
     }
 
-    // Step 4: Build B_local on all GPUs immediately
-    distributed_build_B();
+    // Step 4: Build B based on storage mode
+    if (storage_mode_ == StorageMode::GPU_Resident) {
+        // Check if B_local + 3c chunk fit on each GPU
+        const size_t nbas2_local = (size_t)nbas * nbas;
+        const size_t B_local_bytes = (size_t)naux_local_[0] * nbas2_local * sizeof(real_t);
+        const size_t chunk_3c_bytes = (size_t)max_nfunc_chunk_ * nbas2_local * sizeof(real_t);
+        size_t free_check = 0, total_check = 0;
+        { cudaSetDevice(0); cudaMemGetInfo(&free_check, &total_check); }
+
+        if (B_local_bytes + chunk_3c_bytes > free_check * 8 / 10) {
+            std::cout << "[RI] Auto-switching to out-of-core (B_local=" << B_local_bytes / (1024*1024)
+                      << " MB + chunk=" << chunk_3c_bytes / (1024*1024)
+                      << " MB exceeds GPU free=" << free_check / (1024*1024) << " MB)" << std::endl;
+            storage_mode_ = StorageMode::OutOfCore;
+        }
+    }
+
+    switch (storage_mode_) {
+    case StorageMode::GPU_Resident:
+        distributed_build_B();
+        break;
+    case StorageMode::OutOfCore:
+        build_out_of_core_B();
+        break;
+    case StorageMode::OnTheFly:
+        // B rebuilt per iteration in compute_fock_matrix
+        break;
+    }
 }
 
 // ============================================================
@@ -304,195 +546,164 @@ void ERI_RI_Distributed_RHF::distributed_build_B() {
     const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
     const int n_aux_types = (int)auxiliary_shell_type_infos_.size();
 
-    std::cout << "[RI-Dist] Building B_local on " << num_gpus_ << " GPUs (chunked 3c2e + L^-1 DGEMM)..." << std::endl;
+    // Check if the largest 3c chunk fits in GPU memory.
+    // If not, fall back to full 3c on GPU 0 → DTRSM → scatter.
+    const size_t chunk_3c_bytes = (size_t)max_nfunc_chunk_ * nbas2 * sizeof(real_t);
+    size_t free_mem_check = 0, total_mem_check = 0;
+    { cudaSetDevice(0); cudaMemGetInfo(&free_mem_check, &total_mem_check); }
 
-    // ---- Step 1: Use cached L⁻¹ (or recompute if not available) ----
-    real_t* d_L_inv_gpu0 = nullptr;
-    bool L_inv_owned = false;  // true if we allocated L⁻¹ here (need to free)
-    if (d_cached_L_inv_) {
-        d_L_inv_gpu0 = d_cached_L_inv_;
-    } else {
-        // Fallback: recompute (e.g., direct_mode_ rebuilds after cache freed)
-        MultiGpuManager::DeviceGuard guard(0);
-        real_t* d_two_center_eri;
-        tracked_cudaMalloc(&d_two_center_eri, (size_t)naux * naux * sizeof(real_t));
-        cudaMemset(d_two_center_eri, 0, (size_t)naux * naux * sizeof(real_t));
+    if (chunk_3c_bytes > free_mem_check / 2) {
+        std::cout << "[RI-Dist] 3c chunk too large (" << chunk_3c_bytes / (1024*1024) << " MB)."
+                  << " Falling back to GPU 0 full-3c build + scatter." << std::endl;
 
+        // Free L⁻¹ to maximize memory for full B
+        cudaSetDevice(0);
+        if (d_cached_L_inv_) { tracked_cudaFree(d_cached_L_inv_); d_cached_L_inv_ = nullptr; }
+
+        // Compute 2c2e + Cholesky → L (small: naux² = 119 MB)
+        real_t* d_L = nullptr;
+        tracked_cudaMalloc(&d_L, (size_t)naux * naux * sizeof(real_t));
+        cudaMemset(d_L, 0, (size_t)naux * naux * sizeof(real_t));
         gpu::computeTwoCenterERIs(
             auxiliary_shell_type_infos_,
             auxiliary_primitive_shells_.device_ptr(),
             auxiliary_cgto_normalization_factors_.device_ptr(),
-            d_two_center_eri, naux,
-            hf_.get_boys_grid().device_ptr(),
+            d_L, naux, hf_.get_boys_grid().device_ptr(),
+            auxiliary_schwarz_upper_bound_factors.device_ptr(),
+            schwarz_screening_threshold, false);
+        gpu::choleskyDecomposition(d_L, naux);
+
+        // Allocate full 3c/B buffer (naux × nbas²)
+        real_t* d_B_full = nullptr;
+        tracked_cudaMalloc(&d_B_full, (size_t)naux * nbas2 * sizeof(real_t));
+        cudaMemset(d_B_full, 0, (size_t)naux * nbas2 * sizeof(real_t));
+
+        // Compute 3c2e
+        gpu::computeThreeCenterERIs(
+            shell_type_infos, shell_pair_type_infos,
+            hf_.get_primitive_shells().device_ptr(),
+            hf_.get_cgto_normalization_factors().device_ptr(),
+            auxiliary_shell_type_infos_,
+            auxiliary_primitive_shells_.device_ptr(),
+            auxiliary_cgto_normalization_factors_.device_ptr(),
+            d_B_full, d_persistent_shell_pair_indices_,
+            nbas, naux, hf_.get_boys_grid().device_ptr(),
+            schwarz_upper_bound_factors.device_ptr(),
             auxiliary_schwarz_upper_bound_factors.device_ptr(),
             schwarz_screening_threshold, false);
 
-        gpu::choleskyDecomposition(d_two_center_eri, naux);
-
-        tracked_cudaMalloc(&d_L_inv_gpu0, (size_t)naux * naux * sizeof(real_t));
-        gpu::computeInverseByDtrsm(d_two_center_eri, d_L_inv_gpu0, naux);
-
-        tracked_cudaFree(d_two_center_eri);
-        L_inv_owned = true;
-    }
-
-    // ---- Step 2: Replicate L⁻¹ and shell data to all GPUs ----
-    std::vector<real_t*> d_L_inv(num_gpus_, nullptr);
-    std::vector<PrimitiveShell*> d_pshells(num_gpus_, nullptr);
-    std::vector<real_t*> d_cgto_norms(num_gpus_, nullptr);
-    std::vector<PrimitiveShell*> d_aux_pshells(num_gpus_, nullptr);
-    std::vector<real_t*> d_aux_cgto_norms(num_gpus_, nullptr);
-    std::vector<size_t2*> d_shell_pairs(num_gpus_, nullptr);
-    std::vector<real_t*> d_schwarz(num_gpus_, nullptr);
-    std::vector<real_t*> d_aux_schwarz(num_gpus_, nullptr);
-    std::vector<real_t*> d_boys(num_gpus_, nullptr);
-
-    const size_t n_pshells = hf_.get_primitive_shells().size();
-    const size_t n_aux_pshells = auxiliary_primitive_shells_.size();
-    const size_t n_cgto = hf_.get_cgto_normalization_factors().size();
-    const size_t n_aux_cgto = auxiliary_cgto_normalization_factors_.size();
-    const size_t n_boys = hf_.get_boys_grid().size();
-
-    for (int d = 0; d < num_gpus_; d++) {
-        MultiGpuManager::DeviceGuard guard(d);
-        if (d == 0) {
-            d_L_inv[d] = d_L_inv_gpu0;
-            d_pshells[d] = const_cast<PrimitiveShell*>(hf_.get_primitive_shells().device_ptr());
-            d_cgto_norms[d] = const_cast<real_t*>(hf_.get_cgto_normalization_factors().device_ptr());
-            d_aux_pshells[d] = auxiliary_primitive_shells_.device_ptr();
-            d_aux_cgto_norms[d] = auxiliary_cgto_normalization_factors_.device_ptr();
-            d_shell_pairs[d] = d_persistent_shell_pair_indices_;
-            d_schwarz[d] = schwarz_upper_bound_factors.device_ptr();
-            d_aux_schwarz[d] = auxiliary_schwarz_upper_bound_factors.device_ptr();
-            d_boys[d] = const_cast<real_t*>(hf_.get_boys_grid().device_ptr());
-        } else {
-            // L⁻¹
-            cudaMalloc(&d_L_inv[d], (size_t)naux * naux * sizeof(real_t));
-            cudaMemcpy(d_L_inv[d], d_L_inv_gpu0, (size_t)naux * naux * sizeof(real_t), cudaMemcpyDefault);
-            // Primitive shells
-            cudaMalloc(&d_pshells[d], n_pshells * sizeof(PrimitiveShell));
-            cudaMemcpy(d_pshells[d], hf_.get_primitive_shells().device_ptr(), n_pshells * sizeof(PrimitiveShell), cudaMemcpyDefault);
-            // CGTO norms
-            cudaMalloc(&d_cgto_norms[d], n_cgto * sizeof(real_t));
-            cudaMemcpy(d_cgto_norms[d], hf_.get_cgto_normalization_factors().device_ptr(), n_cgto * sizeof(real_t), cudaMemcpyDefault);
-            // Auxiliary primitive shells
-            cudaMalloc(&d_aux_pshells[d], n_aux_pshells * sizeof(PrimitiveShell));
-            cudaMemcpy(d_aux_pshells[d], auxiliary_primitive_shells_.device_ptr(), n_aux_pshells * sizeof(PrimitiveShell), cudaMemcpyDefault);
-            // Auxiliary CGTO norms
-            cudaMalloc(&d_aux_cgto_norms[d], n_aux_cgto * sizeof(real_t));
-            cudaMemcpy(d_aux_cgto_norms[d], auxiliary_cgto_normalization_factors_.device_ptr(), n_aux_cgto * sizeof(real_t), cudaMemcpyDefault);
-            // Shell pair indices
-            cudaMalloc(&d_shell_pairs[d], num_persistent_shell_pairs_ * sizeof(size_t2));
-            cudaMemcpy(d_shell_pairs[d], d_persistent_shell_pair_indices_, num_persistent_shell_pairs_ * sizeof(size_t2), cudaMemcpyDefault);
-            // Schwarz factors
-            cudaMalloc(&d_schwarz[d], schwarz_upper_bound_factors.size() * sizeof(real_t));
-            cudaMemcpy(d_schwarz[d], schwarz_upper_bound_factors.device_ptr(), schwarz_upper_bound_factors.size() * sizeof(real_t), cudaMemcpyDefault);
-            // Auxiliary Schwarz factors
-            cudaMalloc(&d_aux_schwarz[d], auxiliary_schwarz_upper_bound_factors.size() * sizeof(real_t));
-            cudaMemcpy(d_aux_schwarz[d], auxiliary_schwarz_upper_bound_factors.device_ptr(), auxiliary_schwarz_upper_bound_factors.size() * sizeof(real_t), cudaMemcpyDefault);
-            // Boys grid
-            cudaMalloc(&d_boys[d], n_boys * sizeof(real_t));
-            cudaMemcpy(d_boys[d], hf_.get_boys_grid().device_ptr(), n_boys * sizeof(real_t), cudaMemcpyDefault);
+        // B = L⁻¹ × 3c via DTRSM (in-place, no extra allocation)
+        // d_B_full is [naux × nbas²] row-major = [nbas² × naux] col-major
+        // L after choleskyDecomposition is row-major lower = col-major upper
+        {
+            cublasHandle_t h0 = gpu::GPUHandle::cublas();
+            const double one = 1.0;
+            cublasDtrsm(h0, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
+                        (int)nbas2, naux, &one, d_L, naux, d_B_full, (int)nbas2);
         }
+        tracked_cudaFree(d_L);
+
+        // Scatter B_local to all GPUs
+        for (int d = 0; d < num_gpus_; d++) {
+            MultiGpuManager::DeviceGuard guard(d);
+            size_t local_size = (size_t)naux_local_[d] * nbas2;
+            if (!d_B_local_[d]) cudaMalloc(&d_B_local_[d], local_size * sizeof(double));
+            cudaMemcpy(d_B_local_[d], d_B_full + P_start_[d] * nbas2,
+                       local_size * sizeof(double), cudaMemcpyDefault);
+        }
+        { cudaSetDevice(0); tracked_cudaFree(d_B_full); }
+
+        scattered_ = true;
+        allocate_per_device_workspace();
+
+        for (int d = 0; d < num_gpus_; d++) {
+            double mb = (double)naux_local_[d] * nbas2 * sizeof(double) / (1024.0 * 1024.0);
+            std::cout << "  [GPU " << d << "] B_local: " << std::fixed << std::setprecision(1)
+                      << mb << " MB (" << naux_local_[d] << " aux)" << std::endl;
+        }
+        std::cout << "[RI-Dist] B distributed to " << num_gpus_ << " GPUs (GPU 0 build + scatter)" << std::endl;
+
+        if (storage_mode_ != StorageMode::OnTheFly) {
+            free_per_gpu_data();
+            if (d_cached_L_inv_) { cudaSetDevice(0); tracked_cudaFree(d_cached_L_inv_); d_cached_L_inv_ = nullptr; }
+        }
+        return;
     }
 
-    // ---- Step 3: Allocate B_local on each GPU and zero-initialize ----
+    std::cout << "[RI-Dist] Building B_local on " << num_gpus_ << " GPUs (chunked 3c2e + L^-1 DGEMM)..." << std::endl;
+
+    // ---- Step 1: Replicate data to all GPUs ----
+    replicate_data_to_gpus();
+
+    // ---- Step 2: Allocate B_local on each GPU and zero-initialize ----
     for (int d = 0; d < num_gpus_; d++) {
         MultiGpuManager::DeviceGuard guard(d);
         size_t local_size = (size_t)naux_local_[d] * nbas2;
         if (!d_B_local_[d])
             cudaMalloc(&d_B_local_[d], local_size * sizeof(double));
-        cudaMemset(d_B_local_[d], 0, local_size * sizeof(double));
+        cudaMemsetAsync(d_B_local_[d], 0, local_size * sizeof(double), mgr.compute_stream(d));
     }
 
-    // ---- Step 4: Chunked 3c2e + DGEMM on each GPU ----
-    // For each auxiliary shell type: all GPUs compute the same 3c2e chunk redundantly,
-    // then each GPU accumulates its P_local rows of B via DGEMM with L⁻¹.
-    for (int c = 0; c < n_aux_types; c++) {
-        const size_t Q_c_start = aux_type_basis_start_[c];
-        const int nfunc_c = aux_type_nfunc_[c];
+    // ---- Step 3: Chunked 3c2e + DGEMM — all GPUs launch concurrently ----
+    for (const auto& batch : aux_batches_) {
+        const size_t Q_c_start = batch.basis_start;
+        const int nfunc_c = batch.nfunc;
 
+        // Launch on all GPUs (non-blocking)
         for (int d = 0; d < num_gpus_; d++) {
             MultiGpuManager::DeviceGuard guard(d);
+            cudaStream_t cs = mgr.compute_stream(d);
             cublasHandle_t handle = mgr.cublas(d);
+            cublasSetStream(handle, cs);
+            auto& g = per_gpu_data_[d];
 
-            // Allocate and zero chunk buffer
-            real_t* d_chunk = nullptr;
-            cudaMalloc(&d_chunk, (size_t)nfunc_c * nbas2 * sizeof(real_t));
-            cudaMemset(d_chunk, 0, (size_t)nfunc_c * nbas2 * sizeof(real_t));
+            // Zero pre-allocated chunk buffer
+            cudaMemsetAsync(g.d_chunk, 0, (size_t)nfunc_c * nbas2 * sizeof(real_t), cs);
 
-            // Compute 3c2e for this aux type into chunk (pointer-offset trick)
+            // Compute 3c2e for this batch (async)
             gpu::computeThreeCenterERIs_for_aux_type(
                 shell_type_infos, shell_pair_type_infos,
-                d_pshells[d], d_cgto_norms[d],
-                auxiliary_shell_type_infos_,
-                d_aux_pshells[d], d_aux_cgto_norms[d],
-                d_chunk,
-                d_shell_pairs[d],
-                nbas, naux,
-                d_boys[d],
-                d_schwarz[d], d_aux_schwarz[d],
+                g.d_pshells, g.d_cgto_norms,
+                batch.shell_info, batch.angular_momentum,
+                g.d_aux_pshells, g.d_aux_cgto_norms,
+                g.d_chunk, g.d_shell_pairs,
+                nbas, naux, g.d_boys,
+                g.d_schwarz, g.d_aux_schwarz,
                 schwarz_screening_threshold,
-                c, Q_c_start, nfunc_c);
+                Q_c_start, nfunc_c, cs);
 
-            // DGEMM: B_local += L⁻¹_local_rows[:, Q_c] × 3c_chunk
-            // cuBLAS col-major: C = A * B where
-            //   A = 3c_chunk^T [nbas² × nfunc_c], lda=nbas²
-            //   B = L⁻¹ submatrix [nfunc_c × naux_local], ldb=naux
-            //   C = B_local^T [nbas² × naux_local], ldc=nbas²
+            // DGEMM on the same stream: B_local += L⁻¹_rows × chunk
             const double one = 1.0;
             cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                 (int)nbas2, naux_local_[d], nfunc_c,
                 &one,
-                d_chunk, (int)nbas2,
-                &d_L_inv[d][P_start_[d] * naux + Q_c_start], naux,
+                g.d_chunk, (int)nbas2,
+                &g.d_L_inv[P_start_[d] * naux + Q_c_start], naux,
                 &one,
                 d_B_local_[d], (int)nbas2);
+        }
 
-            cudaFree(d_chunk);
+        // Sync all GPUs before next aux type (chunk reused)
+        mgr.sync_all();
+    }
+
+    // ---- Step 4: Cleanup ----
+    // In stored mode, free replicated data + cached L⁻¹ (no longer needed).
+    // In direct mode, keep them for per-iteration rebuilds.
+    if (storage_mode_ != StorageMode::OnTheFly) {
+        free_per_gpu_data();
+        if (d_cached_L_inv_) {
+            MultiGpuManager::DeviceGuard guard(0);
+            tracked_cudaFree(d_cached_L_inv_);
+            d_cached_L_inv_ = nullptr;
         }
     }
-    mgr.sync_all();
 
-    // ---- Step 5: Cleanup replicated data on non-zero GPUs ----
-    for (int d = 1; d < num_gpus_; d++) {
-        MultiGpuManager::DeviceGuard guard(d);
-        cudaFree(d_L_inv[d]);
-        cudaFree(d_pshells[d]);
-        cudaFree(d_cgto_norms[d]);
-        cudaFree(d_aux_pshells[d]);
-        cudaFree(d_aux_cgto_norms[d]);
-        cudaFree(d_shell_pairs[d]);
-        cudaFree(d_schwarz[d]);
-        cudaFree(d_aux_schwarz[d]);
-        cudaFree(d_boys[d]);
-    }
-    // Free L⁻¹ on GPU 0 only if we allocated it locally (not cached)
-    if (L_inv_owned) {
-        MultiGpuManager::DeviceGuard guard(0);
-        tracked_cudaFree(d_L_inv_gpu0);
-    }
-
-    // Release full B on GPU 0 (no longer needed)
-    {
-        MultiGpuManager::DeviceGuard guard(0);
-        if (intermediate_matrix_B_.rows() > 0) {
-            size_t freed_mb = (size_t)naux * nbas2 * sizeof(real_t) / (1024 * 1024);
-            intermediate_matrix_B_.release();
-            std::cout << "[RI-Dist] Freed full B on GPU 0 (" << freed_mb << " MB)" << std::endl;
-        }
-    }
+    // Release intermediate_matrix_B_ dummy from lightweight constructor
+    { MultiGpuManager::DeviceGuard guard(0); intermediate_matrix_B_.release(); }
 
     scattered_ = true;
     allocate_per_device_workspace();
-
-    // In stored mode, free cached L⁻¹ (no longer needed after B_local is built).
-    // In direct mode, keep it for per-iteration rebuilds.
-    if (!direct_mode_ && d_cached_L_inv_) {
-        MultiGpuManager::DeviceGuard guard(0);
-        tracked_cudaFree(d_cached_L_inv_);
-        d_cached_L_inv_ = nullptr;
-    }
 
     for (int d = 0; d < num_gpus_; d++) {
         double mb = (double)naux_local_[d] * nbas2 * sizeof(double) / (1024.0 * 1024.0);
@@ -506,11 +717,18 @@ void ERI_RI_Distributed_RHF::distributed_build_B() {
 //  Distributed Fock build
 // ============================================================
 void ERI_RI_Distributed_RHF::compute_fock_matrix() {
-    if (direct_mode_) {
-        distributed_build_B();
-    } else {
-        if (!scattered_) distributed_build_B();
+    // OnTheFly: rebuild B per iteration (semi_direct_ri / direct_ri)
+    if (storage_mode_ == StorageMode::OnTheFly) {
+        chunked_fock_build();
+        return;
     }
+    // OutOfCore: B stored on host, streamed to GPU per iteration
+    if (storage_mode_ == StorageMode::OutOfCore) {
+        out_of_core_fock_build();
+        return;
+    }
+    // GPU_Resident: B on GPU(s)
+    if (!scattered_) distributed_build_B();
 
     // Density-matrix-based Fock (before coefficient matrix is available, e.g. SAD guess)
     if (!rhf_.get_hasMatrixC()) {
@@ -735,14 +953,487 @@ void ERI_RI_Distributed_RHF::compute_fock_matrix() {
         cudaFree(d_D[d]);
         cudaFree(d_C[d]);
     }
+}
 
-    // Direct-RI mode: free B_local after Fock build (not stored between iterations)
-    if (direct_mode_) {
-        for (int d = 0; d < num_gpus_; d++) {
-            MultiGpuManager::DeviceGuard guard(d);
-            if (d_B_local_[d]) { cudaFree(d_B_local_[d]); d_B_local_[d] = nullptr; }
+// ============================================================
+//  Out-of-core B: build partitions to pinned host memory (once).
+//  If full B fits on GPU, keep it there instead (no transfer overhead).
+// ============================================================
+void ERI_RI_Distributed_RHF::free_host_partitions() {
+    for (auto& p : host_partitions_) {
+        if (p.h_B) { cudaFreeHost(p.h_B); p.h_B = nullptr; }
+    }
+    host_partitions_.clear();
+    out_of_core_ready_ = false;
+}
+
+void ERI_RI_Distributed_RHF::build_out_of_core_B() {
+    if (out_of_core_ready_) return;
+
+    const int naux = num_auxiliary_basis_;
+    const int nbas = num_basis_;
+    const size_t nbas2 = (size_t)nbas * nbas;
+    auto& mgr = MultiGpuManager::instance();
+
+    const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
+    const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
+
+    replicate_data_to_gpus();
+
+    // Determine partition size: fit B_partition + 3c_chunk + workspace on GPU
+    size_t free_mem = 0, total_mem = 0;
+    { cudaSetDevice(0); cudaMemGetInfo(&free_mem, &total_mem); }
+    const size_t reserved = 512ULL * 1024 * 1024;
+    const size_t chunk_3c_bytes = (size_t)max_nfunc_chunk_ * nbas2 * sizeof(real_t);
+    const size_t available = (free_mem > reserved + chunk_3c_bytes) ? free_mem - reserved - chunk_3c_bytes : free_mem / 3;
+    int max_rows = std::max(1, (int)(available / (nbas2 * sizeof(real_t))));
+    max_rows = std::min(max_rows, naux);
+
+    // Check if full B fits on GPU (no out-of-core needed)
+    const bool fits_on_gpu = ((size_t)naux * nbas2 * sizeof(real_t) + chunk_3c_bytes + reserved < free_mem);
+
+    if (fits_on_gpu) {
+        // Full B fits on GPU — use optimized compute_RI_IntermediateMatrixB (parallel streams)
+        std::cout << "[RI-Dist] Full B fits on GPU (" << naux * nbas2 * sizeof(real_t) / (1024*1024)
+                  << " MB). Building with optimized path." << std::endl;
+
+        real_t* d_B_full = nullptr;
+        tracked_cudaMalloc(&d_B_full, (size_t)naux * nbas2 * sizeof(real_t));
+        cudaMemset(d_B_full, 0, (size_t)naux * nbas2 * sizeof(real_t));
+
+        gpu::compute_RI_IntermediateMatrixB(
+            shell_type_infos, shell_pair_type_infos,
+            hf_.get_primitive_shells().device_ptr(),
+            hf_.get_cgto_normalization_factors().device_ptr(),
+            auxiliary_shell_type_infos_,
+            auxiliary_primitive_shells_.device_ptr(),
+            auxiliary_cgto_normalization_factors_.device_ptr(),
+            d_B_full, d_persistent_shell_pair_indices_,
+            schwarz_upper_bound_factors.device_ptr(),
+            auxiliary_schwarz_upper_bound_factors.device_ptr(),
+            schwarz_screening_threshold,
+            nbas, naux,
+            hf_.get_boys_grid().device_ptr(), false);
+
+        d_B_local_[0] = d_B_full;
+        naux_local_[0] = naux;
+        P_start_[0] = 0;
+        host_partitions_.resize(1);
+        host_partitions_[0] = {nullptr, 0, naux};
+        out_of_core_ready_ = true;
+        std::cout << "[RI-Dist] Out-of-core B ready (GPU-resident)" << std::endl;
+        return;
+    }
+
+    const int n_partitions = (naux + max_rows - 1) / max_rows;
+    std::cout << "[RI-Dist] Out-of-core B: " << n_partitions << " partition(s), "
+              << max_rows << " rows each" << std::endl;
+
+    // Allocate host partitions
+    host_partitions_.resize(n_partitions);
+    for (int k = 0; k < n_partitions; k++) {
+        const int P_start = k * max_rows;
+        const int P_count = std::min(max_rows, naux - P_start);
+        host_partitions_[k].P_start = P_start;
+        host_partitions_[k].nrows = P_count;
+        if (fits_on_gpu) {
+            host_partitions_[k].h_B = nullptr;  // will use GPU-resident B
+        } else {
+            cudaMallocHost(&host_partitions_[k].h_B, (size_t)P_count * nbas2 * sizeof(real_t));
         }
-        scattered_ = false;  // Force rebuild next iteration
+    }
+
+    // Build each partition: 3c2e + L⁻¹ DGEMM on GPU 0, then copy to host
+    cudaSetDevice(0);
+    auto& g = per_gpu_data_[0];
+
+    // GPU buffers (reused per partition)
+    real_t* d_B_row = nullptr;
+    real_t* d_3c_chunk = nullptr;
+    if (fits_on_gpu) {
+        // Allocate full B on GPU
+        cudaMalloc(&d_B_row, (size_t)naux * nbas2 * sizeof(real_t));
+        cudaMemset(d_B_row, 0, (size_t)naux * nbas2 * sizeof(real_t));
+    } else {
+        cudaMalloc(&d_B_row, (size_t)max_rows * nbas2 * sizeof(real_t));
+    }
+    cudaMalloc(&d_3c_chunk, (size_t)max_nfunc_chunk_ * nbas2 * sizeof(real_t));
+
+    // Use default stream — operations are ordered, no explicit sync between batches needed
+    cublasHandle_t h0 = gpu::GPUHandle::cublas();
+
+    for (int k = 0; k < n_partitions; k++) {
+        const int P_start = host_partitions_[k].P_start;
+        const int P_count = host_partitions_[k].nrows;
+        real_t* d_B_dest = fits_on_gpu ? (d_B_row + (size_t)P_start * nbas2) : d_B_row;
+
+        if (!fits_on_gpu)
+            cudaMemset(d_B_dest, 0, (size_t)P_count * nbas2 * sizeof(real_t));
+
+        for (const auto& batch : aux_batches_) {
+            cudaMemset(d_3c_chunk, 0, (size_t)batch.nfunc * nbas2 * sizeof(real_t));
+
+            gpu::computeThreeCenterERIs_for_aux_type(
+                shell_type_infos, shell_pair_type_infos,
+                g.d_pshells, g.d_cgto_norms,
+                batch.shell_info, batch.angular_momentum,
+                g.d_aux_pshells, g.d_aux_cgto_norms,
+                d_3c_chunk, g.d_shell_pairs,
+                nbas, naux, g.d_boys,
+                g.d_schwarz, g.d_aux_schwarz,
+                schwarz_screening_threshold,
+                batch.basis_start, batch.nfunc, 0);
+
+            const double one_val = 1.0;
+            cublasDgemm(h0, CUBLAS_OP_N, CUBLAS_OP_N,
+                (int)nbas2, P_count, batch.nfunc,
+                &one_val,
+                d_3c_chunk, (int)nbas2,
+                &g.d_L_inv[P_start * naux + batch.basis_start], naux,
+                &one_val,
+                d_B_dest, (int)nbas2);
+        }
+
+        // Copy partition to host (unless GPU-resident)
+        if (!fits_on_gpu) {
+            cudaDeviceSynchronize();
+            cudaMemcpy(host_partitions_[k].h_B, d_B_dest,
+                       (size_t)P_count * nbas2 * sizeof(real_t), cudaMemcpyDeviceToHost);
+        }
+    }
+
+    cudaFree(d_3c_chunk);
+
+    if (fits_on_gpu) {
+        // Keep d_B_row as the single GPU-resident partition
+        // Store pointer in first partition's h_B (repurposed as device pointer flag)
+        // Actually, store in d_B_local_[0] for the stored RI J/K path
+        d_B_local_[0] = d_B_row;
+        naux_local_[0] = naux;
+        P_start_[0] = 0;
+    } else {
+        cudaFree(d_B_row);
+    }
+
+    out_of_core_ready_ = true;
+    std::cout << "[RI-Dist] Out-of-core B ready ("
+              << (fits_on_gpu ? "GPU-resident" : "host-streamed") << ")" << std::endl;
+}
+
+void ERI_RI_Distributed_RHF::out_of_core_fock_build() {
+    const int naux = num_auxiliary_basis_;
+    const int nbas = num_basis_;
+    const int nocc = num_occ_;
+    const size_t nbas2 = (size_t)nbas * nbas;
+    const int threads = 256;
+    const bool has_C = rhf_.get_hasMatrixC();
+
+    cudaSetDevice(0);
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+
+    const real_t* d_D = rhf_.get_density_matrix().device_ptr();
+    const real_t* d_C = has_C ? rhf_.get_coefficient_matrix().device_ptr() : nullptr;
+    const real_t* d_H = rhf_.get_core_hamiltonian_matrix().device_ptr();
+
+    const bool fits_on_gpu = (host_partitions_[0].h_B == nullptr);
+
+    // Allocate J/K accumulators + workspace (cached via allocate_chunked_workspace)
+    if (chunked_ws_.empty()) {
+        int max_part_rows = 0;
+        for (const auto& p : host_partitions_)
+            if (p.nrows > max_part_rows) max_part_rows = p.nrows;
+        chunked_N_rows_ = max_part_rows;
+        max_nfunc_chunk_ = 0;  // not used for out-of-core Fock
+
+        chunked_ws_.resize(1);
+        auto& w = chunked_ws_[0];
+        if (!d_J_local_[0]) cudaMalloc(&d_J_local_[0], nbas2 * sizeof(double));
+        if (!d_K_local_[0]) cudaMalloc(&d_K_local_[0], nbas2 * sizeof(double));
+        if (!fits_on_gpu)
+            cudaMalloc(&w.d_B_row, (size_t)max_part_rows * nbas2 * sizeof(double));
+        cudaMalloc(&w.d_W, max_part_rows * sizeof(double));
+        if (has_C) {
+            cudaMalloc(&w.d_X, (size_t)max_part_rows * nbas * nocc * sizeof(double));
+            cudaMalloc(&w.d_Xp, (size_t)max_part_rows * nbas * nocc * sizeof(double));
+        }
+    }
+    auto& ws = chunked_ws_[0];
+    cudaMemset(d_J_local_[0], 0, nbas2 * sizeof(double));
+    cudaMemset(d_K_local_[0], 0, nbas2 * sizeof(double));
+
+    for (const auto& part : host_partitions_) {
+        const int P_count = part.nrows;
+
+        // Get B data for this partition
+        real_t* d_B;
+        if (fits_on_gpu) {
+            d_B = d_B_local_[0] + (size_t)part.P_start * nbas2;
+        } else {
+            d_B = ws.d_B_row;
+            cudaMemcpy(d_B, part.h_B, (size_t)P_count * nbas2 * sizeof(double), cudaMemcpyHostToDevice);
+        }
+
+        // ---- J contribution ----
+        const double one = 1.0, zero = 0.0, two = 2.0;
+        cublasDgemv(handle, CUBLAS_OP_T, (int)nbas2, P_count, &one,
+                    d_B, (int)nbas2, d_D, 1, &zero, ws.d_W, 1);
+        cublasDgemv(handle, CUBLAS_OP_N, (int)nbas2, P_count, &one,
+                    d_B, (int)nbas2, ws.d_W, 1, &one, d_J_local_[0], 1);
+
+        // ---- K contribution ----
+        if (has_C) {
+            cublasDgemmStridedBatched(handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                nocc, nbas, nbas, &one,
+                d_C, nbas, 0LL,
+                d_B, nbas, (long long)nbas2,
+                &zero, ws.d_X, nocc, (long long)(nbas * nocc),
+                P_count);
+
+            int total = P_count * nbas * nocc;
+            int blk = (total + threads - 1) / threads;
+            distributed_pack_X_kernel<<<blk, threads>>>(ws.d_X, ws.d_Xp, nbas, P_count, nocc);
+
+            size_t pc_nocc = (size_t)P_count * nocc;
+            cublasDgemm(handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                nbas, nbas, (int)pc_nocc,
+                &two, ws.d_Xp, (int)pc_nocc, ws.d_Xp, (int)pc_nocc,
+                &one, d_K_local_[0], nbas);
+        } else {
+            // Density-matrix K (reuse X/Xp buffers as T/V)
+            cublasDgemmStridedBatched(handle,
+                CUBLAS_OP_T, CUBLAS_OP_N, nbas, nbas, nbas, &one,
+                d_D, nbas, 0LL, d_B, nbas, (long long)nbas2,
+                &zero, ws.d_X, nbas, (long long)nbas2, P_count);
+            cublasDgemmStridedBatched(handle,
+                CUBLAS_OP_T, CUBLAS_OP_N, nbas, nbas, nbas, &one,
+                ws.d_X, nbas, (long long)nbas2, d_B, nbas, (long long)nbas2,
+                &zero, ws.d_Xp, nbas, (long long)nbas2, P_count);
+
+            std::vector<double> ones(P_count, 1.0);
+            cudaMemcpy(ws.d_W, ones.data(), P_count * sizeof(double), cudaMemcpyHostToDevice);
+            cublasDgemv(handle, CUBLAS_OP_N, (int)nbas2, P_count, &one,
+                        ws.d_Xp, (int)nbas2, ws.d_W, 1, &one, d_K_local_[0], 1);
+        }
+    }
+
+    // ---- Fock assembly ----
+    {
+        int blk = ((int)nbas2 + threads - 1) / threads;
+        distributed_fock_assemble_kernel<<<blk, threads>>>(
+            d_H, d_J_local_[0], d_K_local_[0], rhf_.get_fock_matrix().device_ptr(), nbas);
+        cudaDeviceSynchronize();
+    }
+    // Workspace is cached — no per-iteration cleanup.
+}
+
+// ============================================================
+//  Chunked Fock build: partition B by rows (P-index), build each
+//  row-partition from 3c2e + L⁻¹ DGEMM, compute J/K contribution,
+//  then discard.  J and K decompose perfectly by row partition.
+//
+//  Memory: B_row_chunk (N_rows × nbas²) + X workspace per chunk.
+//  N_rows auto-determined from free GPU memory.
+// ============================================================
+void ERI_RI_Distributed_RHF::chunked_fock_build() {
+    const int naux = num_auxiliary_basis_;
+    const int nbas = num_basis_;
+    const int nocc = num_occ_;
+    const size_t nbas2 = (size_t)nbas * nbas;
+    const int threads = 256;
+    auto& mgr = MultiGpuManager::instance();
+
+    const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
+    const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
+    const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
+    const bool has_C = rhf_.get_hasMatrixC();
+
+    // ---- One-time setup (cached across iterations) ----
+    replicate_data_to_gpus();
+    allocate_chunked_workspace();
+
+    const int N_rows = chunked_N_rows_;
+
+    // ---- Replicate D/C to all GPUs (copy into cached buffers) ----
+    const real_t* d_D_gpu0 = rhf_.get_density_matrix().device_ptr();
+    const real_t* d_C_gpu0 = has_C ? rhf_.get_coefficient_matrix().device_ptr() : nullptr;
+    const real_t* d_H_gpu0 = rhf_.get_core_hamiltonian_matrix().device_ptr();
+
+    for (int d = 0; d < num_gpus_; d++) {
+        cudaSetDevice(d);
+        auto& w = chunked_ws_[d];
+        if (d > 0) {
+            cudaMemcpy(w.d_D, d_D_gpu0, nbas2 * sizeof(double), cudaMemcpyDefault);
+            if (has_C && w.d_C)
+                cudaMemcpy(w.d_C, d_C_gpu0, nbas2 * sizeof(double), cudaMemcpyDefault);
+        }
+    }
+
+    // D/C pointer per GPU (GPU 0 uses originals)
+    std::vector<real_t*> d_D(num_gpus_), d_C(num_gpus_);
+    d_D[0] = const_cast<real_t*>(d_D_gpu0);
+    d_C[0] = has_C ? const_cast<real_t*>(d_C_gpu0) : nullptr;
+    for (int d = 1; d < num_gpus_; d++) {
+        d_D[d] = chunked_ws_[d].d_D;
+        d_C[d] = chunked_ws_[d].d_C;
+    }
+
+    // ---- Zero J/K ----
+    for (int d = 0; d < num_gpus_; d++) {
+        cudaSetDevice(d);
+        cudaMemsetAsync(d_J_local_[d], 0, nbas2 * sizeof(double), mgr.compute_stream(d));
+        cudaMemsetAsync(d_K_local_[d], 0, nbas2 * sizeof(double), mgr.compute_stream(d));
+    }
+
+    // ---- Main loop: each GPU handles its fixed naux_local rows ----
+    // Within each GPU, sub-chunk if naux_local > N_rows.
+    // All GPUs run concurrently (async launch, sync at end).
+    for (int d = 0; d < num_gpus_; d++) {
+        cudaSetDevice(d);
+        cudaStream_t cs = mgr.compute_stream(d);
+        cublasHandle_t handle = mgr.cublas(d);
+        cublasSetStream(handle, cs);
+        auto& g = per_gpu_data_[d];
+        auto& w = chunked_ws_[d];
+
+        const int gpu_P_start = (int)P_start_[d];  // global start row for this GPU
+        const int gpu_P_total = naux_local_[d];     // total rows for this GPU
+        const int n_sub = (gpu_P_total + N_rows - 1) / N_rows;
+
+        for (int sub = 0; sub < n_sub; sub++) {
+            const int local_offset = sub * N_rows;
+            const int P_start_global = gpu_P_start + local_offset;
+            const int P_count = std::min(N_rows, gpu_P_total - local_offset);
+
+            // Zero B_row
+            cudaMemsetAsync(w.d_B_row, 0, (size_t)P_count * nbas2 * sizeof(double), cs);
+
+            // Build B_row by accumulating over aux batches:
+            for (const auto& batch : aux_batches_) {
+                const size_t Q_c_start = batch.basis_start;
+                const int nfunc_c = batch.nfunc;
+
+                cudaMemsetAsync(w.d_3c_chunk, 0, (size_t)nfunc_c * nbas2 * sizeof(double), cs);
+
+                gpu::computeThreeCenterERIs_for_aux_type(
+                    shell_type_infos, shell_pair_type_infos,
+                    g.d_pshells, g.d_cgto_norms,
+                    batch.shell_info, batch.angular_momentum,
+                    g.d_aux_pshells, g.d_aux_cgto_norms,
+                    w.d_3c_chunk, g.d_shell_pairs,
+                    nbas, naux, g.d_boys,
+                    g.d_schwarz, g.d_aux_schwarz,
+                    schwarz_screening_threshold,
+                    Q_c_start, nfunc_c, cs);
+
+                const double one = 1.0;
+                cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                    (int)nbas2, P_count, nfunc_c,
+                    &one,
+                    w.d_3c_chunk, (int)nbas2,
+                    &g.d_L_inv[P_start_global * naux + Q_c_start], naux,
+                    &one,
+                    w.d_B_row, (int)nbas2);
+            }
+
+            // ---- J contribution ----
+            const double one = 1.0, zero = 0.0, two = 2.0;
+            cublasDgemv(handle, CUBLAS_OP_T,
+                        (int)nbas2, P_count, &one,
+                        w.d_B_row, (int)nbas2,
+                        d_D[d], 1, &zero, w.d_W, 1);
+            cublasDgemv(handle, CUBLAS_OP_N,
+                        (int)nbas2, P_count, &one,
+                        w.d_B_row, (int)nbas2,
+                        w.d_W, 1, &one, d_J_local_[d], 1);
+
+            // ---- K contribution ----
+            if (has_C) {
+                cublasDgemmStridedBatched(handle,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    nocc, nbas, nbas, &one,
+                    d_C[d], nbas, 0LL,
+                    w.d_B_row, nbas, (long long)nbas2,
+                    &zero, w.d_X, nocc, (long long)(nbas * nocc),
+                    P_count);
+
+                int total = P_count * nbas * nocc;
+                int blk = (total + threads - 1) / threads;
+                distributed_pack_X_kernel<<<blk, threads, 0, cs>>>(
+                    w.d_X, w.d_Xp, nbas, P_count, nocc);
+
+                size_t pc_nocc = (size_t)P_count * nocc;
+                cublasDgemm(handle,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    nbas, nbas, (int)pc_nocc,
+                    &two,
+                    w.d_Xp, (int)pc_nocc,
+                    w.d_Xp, (int)pc_nocc,
+                    &one,
+                    d_K_local_[d], nbas);
+            } else {
+                cublasDgemmStridedBatched(handle,
+                    CUBLAS_OP_T, CUBLAS_OP_N, nbas, nbas, nbas, &one,
+                    d_D[d], nbas, 0LL,
+                    w.d_B_row, nbas, (long long)nbas2,
+                    &zero, w.d_X, nbas, (long long)nbas2, P_count);
+                cublasDgemmStridedBatched(handle,
+                    CUBLAS_OP_T, CUBLAS_OP_N, nbas, nbas, nbas, &one,
+                    w.d_X, nbas, (long long)nbas2,
+                    w.d_B_row, nbas, (long long)nbas2,
+                    &zero, w.d_Xp, nbas, (long long)nbas2, P_count);
+
+                // K_local += Σ V_p via DGEMV with ones
+                real_t* d_ones = w.d_W;  // reuse W buffer (P_count <= N_rows)
+                std::vector<double> ones_vec(P_count, 1.0);
+                cudaMemcpyAsync(d_ones, ones_vec.data(), P_count * sizeof(double), cudaMemcpyHostToDevice, cs);
+                cublasDgemv(handle, CUBLAS_OP_N, (int)nbas2, P_count, &one,
+                            w.d_Xp, (int)nbas2, d_ones, 1, &one, d_K_local_[d], 1);
+            }
+        }  // sub-chunk loop
+    }  // GPU loop
+    mgr.sync_all();
+
+    // ---- AllReduce J/K across GPUs ----
+    if (num_gpus_ > 1) {
+        // NCCL group calls: set device before each ncclAllReduce (required by NCCL)
+        nccl::group_start();
+        for (int d = 0; d < num_gpus_; d++) {
+            cudaSetDevice(d);
+            nccl::all_reduce(d_J_local_[d], d_J_local_[d], nbas2, ncclSum, d, mgr.comm_stream(d));
+        }
+        nccl::group_end();
+        nccl::group_start();
+        for (int d = 0; d < num_gpus_; d++) {
+            cudaSetDevice(d);
+            nccl::all_reduce(d_K_local_[d], d_K_local_[d], nbas2, ncclSum, d, mgr.comm_stream(d));
+        }
+        nccl::group_end();
+        // Sync comm streams
+        for (int d = 0; d < num_gpus_; d++) {
+            cudaSetDevice(d);
+            cudaStreamSynchronize(mgr.comm_stream(d));
+        }
+    }
+
+    // ---- Fock assembly on GPU 0 ----
+    {
+        cudaSetDevice(0);
+        int blk = ((int)nbas2 + threads - 1) / threads;
+        distributed_fock_assemble_kernel<<<blk, threads>>>(
+            d_H_gpu0, d_J_local_[0], d_K_local_[0], rhf_.get_fock_matrix().device_ptr(), nbas);
+        cudaDeviceSynchronize();
+    }
+
+    // Check for async CUDA errors
+    cudaSetDevice(0);
+    {
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            std::cerr << "[RI-Dist] CUDA error after chunked Fock: " << cudaGetErrorString(err) << std::endl;
+        }
     }
 }
 

@@ -3849,7 +3849,8 @@ void computeThreeCenterERIs_for_aux_type(
     const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
     const PrimitiveShell* d_primitive_shells,
     const real_t* d_cgto_normalization_factors,
-    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+    const ShellTypeInfo& aux_shell_info,
+    int aux_type_angular_momentum,
     const PrimitiveShell* d_auxiliary_primitive_shells,
     const real_t* d_auxiliary_cgto_normalization_factors,
     real_t* d_chunk,
@@ -3860,9 +3861,9 @@ void computeThreeCenterERIs_for_aux_type(
     const real_t* d_schwarz_upper_bound_factors,
     const real_t* d_auxiliary_schwarz_upper_bound_factors,
     const real_t schwarz_screening_threshold,
-    int aux_type_index,
     size_t aux_basis_offset,
-    int nfunc_chunk)
+    int nfunc_chunk,
+    cudaStream_t stream)
 {
 #ifndef GANSU_CPU_ONLY
     if (!gpu_available()) return;
@@ -3873,21 +3874,10 @@ void computeThreeCenterERIs_for_aux_type(
     // Apply pointer offset so kernel writes land in the compact chunk buffer
     real_t* d_output_shifted = d_chunk - (size_t)aux_basis_offset * (size_t)num_basis * (size_t)num_basis;
 
-    // Iterate over all AO shell-pair types × the single auxiliary type
-    const int s2 = aux_type_index;
-    const ShellTypeInfo shell_s2 = auxiliary_shell_type_infos[s2];
+    const int s2 = aux_type_angular_momentum;
+    const ShellTypeInfo shell_s2 = aux_shell_info;
 
-    // Create streams for concurrent kernel launches
-    std::vector<cudaStream_t> streams;
-    for (int a = 0; a < shell_type_count; ++a) {
-        for (int b = a; b < shell_type_count; ++b) {
-            cudaStream_t stream;
-            cudaStreamCreate(&stream);
-            streams.push_back(stream);
-        }
-    }
-
-    int stream_id = 0;
+    // Launch all kernels on the provided stream (caller manages synchronization)
     for (int s0 = 0; s0 < shell_type_count; ++s0) {
         for (int s1 = s0; s1 < shell_type_count; ++s1) {
             const ShellTypeInfo shell_s0 = shell_type_infos[s0];
@@ -3900,7 +3890,7 @@ void computeThreeCenterERIs_for_aux_type(
 
             const int pair_idx = calcIdx_triangular_(s0, s1, shell_type_count);
 
-            gpu::get_3center_kernel(s0, s1, s2)<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
+            gpu::get_3center_kernel(s0, s1, s2)<<<num_blocks, threads_per_block, 0, stream>>>(
                 d_output_shifted, d_primitive_shells, d_auxiliary_primitive_shells,
                 d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors,
                 shell_s0, shell_s1, shell_s2,
@@ -3911,13 +3901,9 @@ void computeThreeCenterERIs_for_aux_type(
                 schwarz_screening_threshold,
                 num_auxiliary_basis,
                 d_boys_grid);
-
-            stream_id %= streams.size();
         }
     }
-
-    cudaDeviceSynchronize();
-    for (auto& s : streams) cudaStreamDestroy(s);
+    // No synchronization here — caller is responsible
 #endif // !GANSU_CPU_ONLY
 }
 

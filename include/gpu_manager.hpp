@@ -86,12 +86,16 @@ void computeThreeCenterERIs(const std::vector<ShellTypeInfo>& shell_type_infos, 
 /// @param aux_type_index Which auxiliary shell type to compute (index into auxiliary_shell_type_infos)
 /// @param aux_basis_offset Subtracted from c->basis_index for local indexing into d_chunk
 /// @param nfunc_chunk Number of auxiliary basis functions in this chunk (size of leading dim)
+/// Compute 3-center ERIs for a single auxiliary shell type (or sub-range of it).
+/// @param aux_shell_info ShellTypeInfo for the aux type (can be a sub-range with modified start_index/count)
+/// @param aux_type_angular_momentum Angular momentum of this aux type (for kernel dispatch)
 void computeThreeCenterERIs_for_aux_type(
     const std::vector<ShellTypeInfo>& shell_type_infos,
     const std::vector<ShellPairTypeInfo>& shell_pair_type_infos,
     const PrimitiveShell* d_primitive_shells,
     const real_t* d_cgto_normalization_factors,
-    const std::vector<ShellTypeInfo>& auxiliary_shell_type_infos,
+    const ShellTypeInfo& aux_shell_info,
+    int aux_type_angular_momentum,
     const PrimitiveShell* d_auxiliary_primitive_shells,
     const real_t* d_auxiliary_cgto_normalization_factors,
     real_t* d_chunk,
@@ -102,9 +106,9 @@ void computeThreeCenterERIs_for_aux_type(
     const real_t* d_schwarz_upper_bound_factors,
     const real_t* d_auxiliary_schwarz_upper_bound_factors,
     const real_t schwarz_screening_threshold,
-    int aux_type_index,
     size_t aux_basis_offset,
-    int nfunc_chunk);
+    int nfunc_chunk,
+    cudaStream_t stream = 0);
 
 
 void computeDensityMatrix_RHF(const real_t* d_coefficient_matrix, real_t* d_density_matrix, const int num_electron, const int num_basis);

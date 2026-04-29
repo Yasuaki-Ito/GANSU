@@ -298,7 +298,12 @@ class ERI_RI: public ERI {
 public:
 
     ERI_RI(const HF& hf, const Molecular& auxiliary_molecular); ///< Constructor
-    
+
+    /// Lightweight constructor: skips allocation of intermediate_matrix_B_, d_tmp1_, d_tmp2_.
+    /// Used by distributed subclasses that don't need single-GPU workspace.
+    struct LightweightTag {};
+    ERI_RI(const HF& hf, const Molecular& auxiliary_molecular, LightweightTag); ///< Lightweight constructor
+
     ERI_RI(const ERI_RI&) = delete; ///< copy constructor is deleted
     virtual ~ERI_RI(); ///< destructor
 
