@@ -204,8 +204,26 @@ public:
     }
 
     /**
+     * @brief Release all allocated memory early (before destructor).
+     * Safe to call multiple times; subsequent calls are no-ops.
+     */
+    void release() {
+        if (gpu::gpu_available()) {
+            if (device_ptr_) { cudaFree(device_ptr_); track_deallocation(device_bytes_); }
+            if (host_ptr_) cudaFreeHost(host_ptr_);
+        } else {
+            if (host_ptr_) std::free(host_ptr_);
+        }
+        device_ptr_ = nullptr;
+        host_ptr_ = nullptr;
+        size_ = 0;
+        device_bytes_ = 0;
+        host_bytes_ = 0;
+    }
+
+    /**
      * @brief Allocates memory on the device.
-     * 
+     *
      * This method must be implemented by derived classes.
      */
     virtual void allocate() = 0;
@@ -569,6 +587,9 @@ public:
      * @return Const pointer to the device memory.
      */
     const T* device_ptr() const { return memory_manager_.device_ptr(); }
+
+    /// Release all memory early (before destructor).
+    void release() { memory_manager_.release(); rows_ = 0; cols_ = 0; }
 
     /**
      * @brief Gets the host pointer to the matrix data.

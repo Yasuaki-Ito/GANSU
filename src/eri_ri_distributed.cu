@@ -178,19 +178,17 @@ void ERI_RI_Distributed_RHF::free_per_device_workspace() {
 }
 
 // ============================================================
-//  Precomputation: Schwarz bounds + distributed B build
+//  Precomputation: Schwarz bounds only (B build deferred)
 // ============================================================
 void ERI_RI_Distributed_RHF::precomputation() {
-    // Run parent's precomputation for Schwarz bounds, shell pair indices, etc.
-    // This builds the full B on GPU 0, which we'll replace with distributed B.
+    // Run parent's full precomputation (Schwarz + 3c2e + B).
+    // We need intermediate_matrix_B_ for the initial guess (density-matrix Fock).
     ERI_RI::precomputation();
-
-    // Now replace with distributed B
-    distributed_build_B();
 }
 
 // ============================================================
-//  Distributed B build (chunked 3c2e + L⁻¹ DGEMM)
+//  Distributed B build: 3c2e → trsm → scatter → free
+//  GPU 0 peak: naux × nbas² (3c/B buffer only, no intermediate_matrix_B_ copy)
 // ============================================================
 void ERI_RI_Distributed_RHF::distributed_build_B() {
     if (scattered_) return;
@@ -199,8 +197,7 @@ void ERI_RI_Distributed_RHF::distributed_build_B() {
     const int nbas = num_basis_;
     const size_t nbas2 = (size_t)nbas * nbas;
 
-    // precomputation() already built full B in intermediate_matrix_B_ on GPU 0.
-    // Scatter P-local slices to all GPUs, then free full B on GPU 0.
+    // Scatter from intermediate_matrix_B_ (computed by parent precomputation on GPU 0)
     const real_t* d_B_full = intermediate_matrix_B_.device_ptr();
 
     for (int d = 0; d < num_gpus_; d++) {
@@ -208,15 +205,20 @@ void ERI_RI_Distributed_RHF::distributed_build_B() {
         size_t offset = P_start_[d] * nbas2;
 
         MultiGpuManager::DeviceGuard guard(d);
-        cudaMalloc(&d_B_local_[d], local_size * sizeof(double));
+        if (!d_B_local_[d])
+            cudaMalloc(&d_B_local_[d], local_size * sizeof(double));
 
-        // Copy slice from GPU 0 (peer access enabled)
         cudaMemcpy(d_B_local_[d], d_B_full + offset,
                    local_size * sizeof(double), cudaMemcpyDefault);
     }
 
-    // Note: intermediate_matrix_B_ on GPU 0 is still allocated (freed by destructor).
-    // For larger systems, we would want to free it here to reclaim GPU memory.
+    // Free intermediate_matrix_B_ on GPU 0 to reclaim naux×nbas² memory
+    {
+        MultiGpuManager::DeviceGuard guard(0);
+        size_t freed_mb = (size_t)naux * nbas2 * sizeof(real_t) / (1024 * 1024);
+        intermediate_matrix_B_.release();
+        std::cout << "[RI-Dist] Freed full B on GPU 0 (" << freed_mb << " MB)" << std::endl;
+    }
 
     scattered_ = true;
     allocate_per_device_workspace();
