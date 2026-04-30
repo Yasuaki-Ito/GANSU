@@ -22,11 +22,11 @@
  * Limit (4×H200): ~2700 basis functions
  */
 
-#ifdef GANSU_MULTI_GPU
-
 #include "rhf.hpp"
 #include "multi_gpu_manager.hpp"
+#ifdef GANSU_MULTI_GPU
 #include "nccl_comm.hpp"
+#endif
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
 #include <iostream>
@@ -378,12 +378,13 @@ void ERI_RI_Distributed_RHF::compute_aux_type_ranges() {
     const int nbas = num_basis_;
     const size_t nbas2 = (size_t)nbas * nbas;
 
-    // Determine max batch size from available GPU memory
+    // Determine max batch size: free memory minus B_local and workspace
     size_t free_mem = 0, total_mem = 0;
     { cudaSetDevice(0); cudaMemGetInfo(&free_mem, &total_mem); }
-    // Reserve memory for B_row, X, Xp, L⁻¹, and overhead
-    const size_t reserved = 512ULL * 1024 * 1024;  // 512 MB safety margin
-    const size_t available_for_chunk = (free_mem > reserved) ? (free_mem - reserved) / 3 : 1024ULL * 1024 * 1024;
+    const size_t B_local_bytes = (size_t)naux_local_[0] * nbas2 * sizeof(real_t);
+    const size_t overhead_bytes = 2ULL * 1024 * 1024 * 1024;  // L⁻¹, J, K, W, X, safety margin
+    const size_t used = B_local_bytes + overhead_bytes;
+    const size_t available_for_chunk = (free_mem > used) ? free_mem - used : free_mem / 4;
     const int max_batch_nfunc = std::max(1, (int)(available_for_chunk / (nbas2 * sizeof(real_t))));
 
     // Sort auxiliary primitives by basis_index within each type (on host).
@@ -501,17 +502,16 @@ void ERI_RI_Distributed_RHF::precomputation() {
 
     // Step 4: Build B based on storage mode
     if (storage_mode_ == StorageMode::GPU_Resident) {
-        // Check if B_local + 3c chunk fit on each GPU
+        // Check if B_local itself fits on GPU (chunk sizing is handled by compute_aux_type_ranges)
         const size_t nbas2_local = (size_t)nbas * nbas;
         const size_t B_local_bytes = (size_t)naux_local_[0] * nbas2_local * sizeof(real_t);
-        const size_t chunk_3c_bytes = (size_t)max_nfunc_chunk_ * nbas2_local * sizeof(real_t);
         size_t free_check = 0, total_check = 0;
         { cudaSetDevice(0); cudaMemGetInfo(&free_check, &total_check); }
 
-        if (B_local_bytes + chunk_3c_bytes > free_check * 8 / 10) {
+        const size_t overhead = 4ULL * 1024 * 1024 * 1024;  // L⁻¹ + workspace + chunk headroom
+        if (B_local_bytes + overhead > free_check) {
             std::cout << "[RI] Auto-switching to out-of-core (B_local=" << B_local_bytes / (1024*1024)
-                      << " MB + chunk=" << chunk_3c_bytes / (1024*1024)
-                      << " MB exceeds GPU free=" << free_check / (1024*1024) << " MB)" << std::endl;
+                      << " MB, GPU free=" << free_check / (1024*1024) << " MB)" << std::endl;
             storage_mode_ = StorageMode::OutOfCore;
         }
     }
@@ -546,90 +546,7 @@ void ERI_RI_Distributed_RHF::distributed_build_B() {
     const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
     const int n_aux_types = (int)auxiliary_shell_type_infos_.size();
 
-    // Check if the largest 3c chunk fits in GPU memory.
-    // If not, fall back to full 3c on GPU 0 → DTRSM → scatter.
-    const size_t chunk_3c_bytes = (size_t)max_nfunc_chunk_ * nbas2 * sizeof(real_t);
-    size_t free_mem_check = 0, total_mem_check = 0;
-    { cudaSetDevice(0); cudaMemGetInfo(&free_mem_check, &total_mem_check); }
-
-    if (chunk_3c_bytes > free_mem_check / 2) {
-        std::cout << "[RI-Dist] 3c chunk too large (" << chunk_3c_bytes / (1024*1024) << " MB)."
-                  << " Falling back to GPU 0 full-3c build + scatter." << std::endl;
-
-        // Free L⁻¹ to maximize memory for full B
-        cudaSetDevice(0);
-        if (d_cached_L_inv_) { tracked_cudaFree(d_cached_L_inv_); d_cached_L_inv_ = nullptr; }
-
-        // Compute 2c2e + Cholesky → L (small: naux² = 119 MB)
-        real_t* d_L = nullptr;
-        tracked_cudaMalloc(&d_L, (size_t)naux * naux * sizeof(real_t));
-        cudaMemset(d_L, 0, (size_t)naux * naux * sizeof(real_t));
-        gpu::computeTwoCenterERIs(
-            auxiliary_shell_type_infos_,
-            auxiliary_primitive_shells_.device_ptr(),
-            auxiliary_cgto_normalization_factors_.device_ptr(),
-            d_L, naux, hf_.get_boys_grid().device_ptr(),
-            auxiliary_schwarz_upper_bound_factors.device_ptr(),
-            schwarz_screening_threshold, false);
-        gpu::choleskyDecomposition(d_L, naux);
-
-        // Allocate full 3c/B buffer (naux × nbas²)
-        real_t* d_B_full = nullptr;
-        tracked_cudaMalloc(&d_B_full, (size_t)naux * nbas2 * sizeof(real_t));
-        cudaMemset(d_B_full, 0, (size_t)naux * nbas2 * sizeof(real_t));
-
-        // Compute 3c2e
-        gpu::computeThreeCenterERIs(
-            shell_type_infos, shell_pair_type_infos,
-            hf_.get_primitive_shells().device_ptr(),
-            hf_.get_cgto_normalization_factors().device_ptr(),
-            auxiliary_shell_type_infos_,
-            auxiliary_primitive_shells_.device_ptr(),
-            auxiliary_cgto_normalization_factors_.device_ptr(),
-            d_B_full, d_persistent_shell_pair_indices_,
-            nbas, naux, hf_.get_boys_grid().device_ptr(),
-            schwarz_upper_bound_factors.device_ptr(),
-            auxiliary_schwarz_upper_bound_factors.device_ptr(),
-            schwarz_screening_threshold, false);
-
-        // B = L⁻¹ × 3c via DTRSM (in-place, no extra allocation)
-        // d_B_full is [naux × nbas²] row-major = [nbas² × naux] col-major
-        // L after choleskyDecomposition is row-major lower = col-major upper
-        {
-            cublasHandle_t h0 = gpu::GPUHandle::cublas();
-            const double one = 1.0;
-            cublasDtrsm(h0, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
-                        (int)nbas2, naux, &one, d_L, naux, d_B_full, (int)nbas2);
-        }
-        tracked_cudaFree(d_L);
-
-        // Scatter B_local to all GPUs
-        for (int d = 0; d < num_gpus_; d++) {
-            MultiGpuManager::DeviceGuard guard(d);
-            size_t local_size = (size_t)naux_local_[d] * nbas2;
-            if (!d_B_local_[d]) cudaMalloc(&d_B_local_[d], local_size * sizeof(double));
-            cudaMemcpy(d_B_local_[d], d_B_full + P_start_[d] * nbas2,
-                       local_size * sizeof(double), cudaMemcpyDefault);
-        }
-        { cudaSetDevice(0); tracked_cudaFree(d_B_full); }
-
-        scattered_ = true;
-        allocate_per_device_workspace();
-
-        for (int d = 0; d < num_gpus_; d++) {
-            double mb = (double)naux_local_[d] * nbas2 * sizeof(double) / (1024.0 * 1024.0);
-            std::cout << "  [GPU " << d << "] B_local: " << std::fixed << std::setprecision(1)
-                      << mb << " MB (" << naux_local_[d] << " aux)" << std::endl;
-        }
-        std::cout << "[RI-Dist] B distributed to " << num_gpus_ << " GPUs (GPU 0 build + scatter)" << std::endl;
-
-        if (storage_mode_ != StorageMode::OnTheFly) {
-            free_per_gpu_data();
-            if (d_cached_L_inv_) { cudaSetDevice(0); tracked_cudaFree(d_cached_L_inv_); d_cached_L_inv_ = nullptr; }
-        }
-        return;
-    }
-
+    // Batch sizing in compute_aux_type_ranges() ensures chunks fit alongside B_local.
     std::cout << "[RI-Dist] Building B_local on " << num_gpus_ << " GPUs (chunked 3c2e + L^-1 DGEMM)..." << std::endl;
 
     // ---- Step 1: Replicate data to all GPUs ----
@@ -763,12 +680,14 @@ void ERI_RI_Distributed_RHF::compute_fock_matrix() {
                 d_J_local_[d], d_B_local_[d], d_W_local_[d], nbas, nl);
         }
         mgr.sync_all();
+#ifdef GANSU_MULTI_GPU
         nccl::group_start();
         for (int d = 0; d < num_gpus_; d++) {
             MultiGpuManager::DeviceGuard guard(d);
             nccl::all_reduce(d_J_local_[d], d_J_local_[d], nbas2, ncclSum, d, mgr.comm_stream(d));
         }
         nccl::group_end();
+#endif
 
         // ---- Distributed K build (density-matrix based) ----
         // T_P[μν] = Σ_λ D^T[μλ] × B_P[λν],  K_local = Σ_P T_P^T × B_P, then AllReduce
@@ -815,12 +734,14 @@ void ERI_RI_Distributed_RHF::compute_fock_matrix() {
             cudaFree(d_T); cudaFree(d_V);
         }
         mgr.sync_all();
+#ifdef GANSU_MULTI_GPU
         nccl::group_start();
         for (int d = 0; d < num_gpus_; d++) {
             MultiGpuManager::DeviceGuard guard(d);
             nccl::all_reduce(d_K_local_[d], d_K_local_[d], nbas2, ncclSum, d, mgr.comm_stream(d));
         }
         nccl::group_end();
+#endif
 
         // ---- Fock assembly on GPU 0 ----
         {
@@ -1131,20 +1052,21 @@ void ERI_RI_Distributed_RHF::out_of_core_fock_build() {
 
     cudaSetDevice(0);
     cublasHandle_t handle = gpu::GPUHandle::cublas();
+    cublasSetStream(handle, 0);  // ensure cuBLAS uses default stream for synchronization with transfer
 
     const real_t* d_D = rhf_.get_density_matrix().device_ptr();
     const real_t* d_C = has_C ? rhf_.get_coefficient_matrix().device_ptr() : nullptr;
     const real_t* d_H = rhf_.get_core_hamiltonian_matrix().device_ptr();
 
     const bool fits_on_gpu = (host_partitions_[0].h_B == nullptr);
+    const int n_part = (int)host_partitions_.size();
 
-    // Allocate J/K accumulators + workspace (cached via allocate_chunked_workspace)
+    // Allocate J/K accumulators + workspace (cached across iterations)
     if (chunked_ws_.empty()) {
         int max_part_rows = 0;
         for (const auto& p : host_partitions_)
             if (p.nrows > max_part_rows) max_part_rows = p.nrows;
         chunked_N_rows_ = max_part_rows;
-        max_nfunc_chunk_ = 0;  // not used for out-of-core Fock
 
         chunked_ws_.resize(1);
         auto& w = chunked_ws_[0];
@@ -1165,7 +1087,6 @@ void ERI_RI_Distributed_RHF::out_of_core_fock_build() {
     for (const auto& part : host_partitions_) {
         const int P_count = part.nrows;
 
-        // Get B data for this partition
         real_t* d_B;
         if (fits_on_gpu) {
             d_B = d_B_local_[0] + (size_t)part.P_start * nbas2;
@@ -1174,44 +1095,28 @@ void ERI_RI_Distributed_RHF::out_of_core_fock_build() {
             cudaMemcpy(d_B, part.h_B, (size_t)P_count * nbas2 * sizeof(double), cudaMemcpyHostToDevice);
         }
 
-        // ---- J contribution ----
         const double one = 1.0, zero = 0.0, two = 2.0;
         cublasDgemv(handle, CUBLAS_OP_T, (int)nbas2, P_count, &one,
                     d_B, (int)nbas2, d_D, 1, &zero, ws.d_W, 1);
         cublasDgemv(handle, CUBLAS_OP_N, (int)nbas2, P_count, &one,
                     d_B, (int)nbas2, ws.d_W, 1, &one, d_J_local_[0], 1);
 
-        // ---- K contribution ----
         if (has_C) {
-            cublasDgemmStridedBatched(handle,
-                CUBLAS_OP_N, CUBLAS_OP_N,
-                nocc, nbas, nbas, &one,
-                d_C, nbas, 0LL,
-                d_B, nbas, (long long)nbas2,
-                &zero, ws.d_X, nocc, (long long)(nbas * nocc),
-                P_count);
-
+            cublasDgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                nocc, nbas, nbas, &one, d_C, nbas, 0LL,
+                d_B, nbas, (long long)nbas2, &zero, ws.d_X, nocc, (long long)(nbas*nocc), P_count);
             int total = P_count * nbas * nocc;
-            int blk = (total + threads - 1) / threads;
-            distributed_pack_X_kernel<<<blk, threads>>>(ws.d_X, ws.d_Xp, nbas, P_count, nocc);
-
-            size_t pc_nocc = (size_t)P_count * nocc;
-            cublasDgemm(handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                nbas, nbas, (int)pc_nocc,
-                &two, ws.d_Xp, (int)pc_nocc, ws.d_Xp, (int)pc_nocc,
-                &one, d_K_local_[0], nbas);
+            distributed_pack_X_kernel<<<(total+threads-1)/threads, threads>>>(ws.d_X, ws.d_Xp, nbas, P_count, nocc);
+            size_t pc = (size_t)P_count * nocc;
+            cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, nbas, nbas, (int)pc,
+                &two, ws.d_Xp, (int)pc, ws.d_Xp, (int)pc, &one, d_K_local_[0], nbas);
         } else {
-            // Density-matrix K (reuse X/Xp buffers as T/V)
-            cublasDgemmStridedBatched(handle,
-                CUBLAS_OP_T, CUBLAS_OP_N, nbas, nbas, nbas, &one,
-                d_D, nbas, 0LL, d_B, nbas, (long long)nbas2,
+            cublasDgemmStridedBatched(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                nbas, nbas, nbas, &one, d_D, nbas, 0LL, d_B, nbas, (long long)nbas2,
                 &zero, ws.d_X, nbas, (long long)nbas2, P_count);
-            cublasDgemmStridedBatched(handle,
-                CUBLAS_OP_T, CUBLAS_OP_N, nbas, nbas, nbas, &one,
-                ws.d_X, nbas, (long long)nbas2, d_B, nbas, (long long)nbas2,
+            cublasDgemmStridedBatched(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                nbas, nbas, nbas, &one, ws.d_X, nbas, (long long)nbas2, d_B, nbas, (long long)nbas2,
                 &zero, ws.d_Xp, nbas, (long long)nbas2, P_count);
-
             std::vector<double> ones(P_count, 1.0);
             cudaMemcpy(ws.d_W, ones.data(), P_count * sizeof(double), cudaMemcpyHostToDevice);
             cublasDgemv(handle, CUBLAS_OP_N, (int)nbas2, P_count, &one,
@@ -1226,7 +1131,6 @@ void ERI_RI_Distributed_RHF::out_of_core_fock_build() {
             d_H, d_J_local_[0], d_K_local_[0], rhf_.get_fock_matrix().device_ptr(), nbas);
         cudaDeviceSynchronize();
     }
-    // Workspace is cached — no per-iteration cleanup.
 }
 
 // ============================================================
@@ -1399,18 +1303,22 @@ void ERI_RI_Distributed_RHF::chunked_fock_build() {
     // ---- AllReduce J/K across GPUs ----
     if (num_gpus_ > 1) {
         // NCCL group calls: set device before each ncclAllReduce (required by NCCL)
+#ifdef GANSU_MULTI_GPU
         nccl::group_start();
         for (int d = 0; d < num_gpus_; d++) {
             cudaSetDevice(d);
             nccl::all_reduce(d_J_local_[d], d_J_local_[d], nbas2, ncclSum, d, mgr.comm_stream(d));
         }
         nccl::group_end();
+#endif
+#ifdef GANSU_MULTI_GPU
         nccl::group_start();
         for (int d = 0; d < num_gpus_; d++) {
             cudaSetDevice(d);
             nccl::all_reduce(d_K_local_[d], d_K_local_[d], nbas2, ncclSum, d, mgr.comm_stream(d));
         }
         nccl::group_end();
+#endif
         // Sync comm streams
         for (int d = 0; d < num_gpus_; d++) {
             cudaSetDevice(d);
@@ -1640,5 +1548,3 @@ void ERI_RI_SemiDirect_Distributed_RHF::compute_fock_matrix() {
 }
 
 } // namespace gansu
-
-#endif // GANSU_MULTI_GPU

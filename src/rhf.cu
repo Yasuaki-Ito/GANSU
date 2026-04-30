@@ -105,22 +105,17 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
         BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);
         Molecular auxiliary_molecular(molecular.get_atoms(), aux_basis);
         std::cout << "[RI] Auxiliary basis: " << auxiliary_molecular.get_num_basis() << " functions" << std::endl;
-#ifdef GANSU_MULTI_GPU
         {
             auto& mgr = MultiGpuManager::instance();
             if (!mgr.num_devices()) {
                 int num_gpus = parameters.get<int>("num_gpus");
                 mgr.initialize(num_gpus);
             }
-            // GPU_Resident mode: auto falls back to OutOfCore if B doesn't fit
             std::cout << "[RI] " << mgr.num_devices() << " device(s)" << std::endl;
             auto eri = std::make_unique<ERI_RI_Distributed_RHF>(*this, auxiliary_molecular);
             eri->set_storage_mode(ERI_RI_Distributed_RHF::StorageMode::GPU_Resident);
             set_eri_method(std::move(eri));
         }
-#else
-        set_eri_method(std::make_unique<ERI_RI_RHF>(*this, auxiliary_molecular));
-#endif
     }else if(eri_method == "direct"){
         set_eri_method(std::make_unique<ERI_Direct_RHF>(*this));
     }else if(eri_method == "hash"){
@@ -138,43 +133,33 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
         BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);
         Molecular auxiliary_molecular(molecular.get_atoms(), aux_basis);
         std::cout << "[RI] Auxiliary basis: " << auxiliary_molecular.get_num_basis() << " functions" << std::endl;
-#ifdef GANSU_MULTI_GPU
         {
             auto& mgr = MultiGpuManager::instance();
             if (!mgr.num_devices()) {
                 int num_gpus = parameters.get<int>("num_gpus");
                 mgr.initialize(num_gpus);
             }
-            // OnTheFly: no B storage, rebuild per iteration
             std::cout << "[Direct-RI] On-the-fly mode (" << mgr.num_devices() << " device(s))" << std::endl;
             auto eri = std::make_unique<ERI_RI_Distributed_RHF>(*this, auxiliary_molecular);
             eri->set_storage_mode(ERI_RI_Distributed_RHF::StorageMode::OnTheFly);
             set_eri_method(std::move(eri));
         }
-#else
-        set_eri_method(std::make_unique<ERI_RI_Direct_RHF>(*this, auxiliary_molecular));
-#endif
     }else if(eri_method == "semi_direct_ri"){
         const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename");
         BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);
         Molecular auxiliary_molecular(molecular.get_atoms(), aux_basis);
         std::cout << "[RI] Auxiliary basis: " << auxiliary_molecular.get_num_basis() << " functions" << std::endl;
-#ifdef GANSU_MULTI_GPU
         {
             auto& mgr = MultiGpuManager::instance();
             if (!mgr.num_devices()) {
                 int num_gpus = parameters.get<int>("num_gpus");
                 mgr.initialize(num_gpus);
             }
-            // OnTheFly: no B storage, rebuild per iteration
             std::cout << "[Semi-Direct-RI] On-the-fly mode (" << mgr.num_devices() << " device(s))" << std::endl;
             auto eri = std::make_unique<ERI_RI_Distributed_RHF>(*this, auxiliary_molecular);
             eri->set_storage_mode(ERI_RI_Distributed_RHF::StorageMode::OnTheFly);
             set_eri_method(std::move(eri));
         }
-#else
-        set_eri_method(std::make_unique<ERI_RI_SemiDirect_RHF>(*this, auxiliary_molecular));
-#endif
     }else if(eri_method == "hash_ri"){
         const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename");
         BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);
