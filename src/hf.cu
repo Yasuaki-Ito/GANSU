@@ -164,8 +164,11 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
         std::cout << "Message: Post-HF method is ADC(2)." << std::endl;
         post_hf_method_ = PostHFMethod::ADC2;
     }else if(post_hf_method_str == "sos_adc2" || post_hf_method_str == "sos-adc2" || post_hf_method_str == "sos_adc(2)"){
-        std::cout << "Message: Post-HF method is SOS-ADC(2) (Laplace)." << std::endl;
+        std::cout << "Message: Post-HF method is SOS-ADC(2) (Schur)." << std::endl;
         post_hf_method_ = PostHFMethod::SOS_ADC2;
+    }else if(post_hf_method_str == "lt_sos_adc2" || post_hf_method_str == "lt-sos-adc2" || post_hf_method_str == "lt_sos_adc(2)"){
+        std::cout << "Message: Post-HF method is SOS-Laplace-ADC(2)." << std::endl;
+        post_hf_method_ = PostHFMethod::LT_SOS_ADC2;
     }else if(post_hf_method_str == "adc2x" || post_hf_method_str == "adc2-x" || post_hf_method_str == "adc(2)-x"){
         std::cout << "Message: Post-HF method is ADC(2)-x." << std::endl;
         post_hf_method_ = PostHFMethod::ADC2X;

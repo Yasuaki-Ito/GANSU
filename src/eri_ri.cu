@@ -27,6 +27,7 @@
 #include "int3c2e.hpp"
 #include "laplace_quadrature.hpp"
 #include "ri_adc2_schur_operator.hpp"
+#include "sos_laplace_adc2_operator.hpp"
 #include "adc2_operator.hpp"
 #include "davidson_solver.hpp"
 #include "oscillator_strength.hpp"
@@ -1566,6 +1567,136 @@ void ERI_RI_RHF::compute_sos_adc2(int n_states) {
 
     tracked_cudaFree(d_B_ab);
     tracked_cudaFree(d_B_ij);
+    tracked_cudaFree(d_B_ia);
+}
+
+void ERI_RI_RHF::compute_sos_laplace_adc2(int n_states) {
+    const int nocc = rhf_.get_num_electrons() / 2 - rhf_.get_num_frozen_core();
+    const int nvir = rhf_.get_num_basis() - rhf_.get_num_electrons() / 2;
+    const int singles_dim = nocc * nvir;
+
+    std::cout << "\n---- SOS-Laplace-ADC(2) ----"
+              << " nocc=" << nocc << ", nvir=" << nvir
+              << ", naux=" << num_auxiliary_basis_
+              << ", singles=" << singles_dim
+              << ", nstates=" << n_states << std::endl;
+
+    if (rhf_.get_num_frozen_core() != 0) {
+        std::cerr << "[SOS-Laplace-ADC(2)] Error: frozen core not yet supported." << std::endl;
+        return;
+    }
+
+    // Build B blocks and M11
+    Timer setup_timer;
+    real_t* d_B_ia = build_B_ia();
+    real_t* d_B_ab = build_B_ab();
+    real_t* d_B_ij = build_B_ij();
+    std::cout << "  B-block build time: " << std::fixed << std::setprecision(3)
+              << setup_timer.elapsed_seconds() << " s" << std::endl;
+
+    Timer m11_timer;
+    real_t* d_M11 = nullptr;
+    tracked_cudaMalloc(&d_M11, (size_t)singles_dim * singles_dim * sizeof(real_t));
+    RIADC2SchurOperator::build_M11_from_RI(
+        d_M11, d_B_ia, d_B_ab, d_B_ij,
+        rhf_.get_orbital_energies().device_ptr(), nocc, nvir, num_auxiliary_basis_);
+    std::cout << "  M11 build time: " << std::fixed << std::setprecision(3)
+              << m11_timer.elapsed_seconds() << " s" << std::endl;
+
+    tracked_cudaFree(d_B_ab);
+    tracked_cudaFree(d_B_ij);
+
+    // Davidson + omega iteration with SOS-Laplace operator
+    std::vector<double> eigenvalues;
+    std::vector<real_t> h_eigenvectors((size_t)n_states * singles_dim, 0.0);
+    {
+        Timer dav_timer;
+        std::cout << "\n  --- SOS-Laplace-ADC(2) Davidson ---" << std::endl;
+
+        SOSLaplaceADC2Operator op(
+            d_B_ia, d_M11,
+            rhf_.get_orbital_energies().device_ptr(),
+            nocc, nvir, num_auxiliary_basis_);
+
+        DavidsonConfig dav_config;
+        dav_config.num_eigenvalues = n_states;
+        dav_config.convergence_threshold = 1e-6;
+        dav_config.max_subspace_size = std::min(singles_dim, std::max(30, 4 * n_states));
+        dav_config.max_iterations = 200;
+        dav_config.use_preconditioner = true;
+        dav_config.symmetric = true;
+        dav_config.verbose = 1;
+
+        op.set_omega(0.0);
+        op.update_laplace_quadrature();
+        {
+            DavidsonSolver solver(op, dav_config);
+            solver.solve();
+            eigenvalues.resize(n_states);
+            const auto& evals = solver.get_eigenvalues();
+            for (int k = 0; k < n_states && k < (int)evals.size(); k++)
+                eigenvalues[k] = evals[k];
+        }
+
+        std::cout << "  [SOS-LT] Initial (omega=0):";
+        for (int k = 0; k < n_states; k++)
+            std::cout << " " << std::fixed << std::setprecision(6) << eigenvalues[k];
+        std::cout << std::endl;
+
+        const double omega_thr = 1e-8;
+        const int max_omega_iter = 15;
+        for (int root = 0; root < n_states; root++) {
+            double omega = eigenvalues[root];
+            bool converged = false;
+            for (int iter = 0; iter < max_omega_iter; iter++) {
+                op.set_omega(omega);
+                op.update_laplace_quadrature();
+                DavidsonSolver solver(op, dav_config);
+                solver.solve();
+                const auto& evals = solver.get_eigenvalues();
+                double omega_new = (root < (int)evals.size()) ? evals[root] : omega;
+                double delta = std::abs(omega_new - omega);
+                std::cout << "  [SOS-LT] Root " << root + 1 << " iter " << std::setw(2) << iter + 1
+                          << ": omega=" << std::fixed << std::setprecision(8) << omega_new
+                          << ", d_omega=" << std::scientific << std::setprecision(2) << delta
+                          << std::defaultfloat << std::endl;
+                if (delta < omega_thr) {
+                    eigenvalues[root] = omega_new;
+                    solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+                    converged = true;
+                    break;
+                }
+                omega = omega_new;
+                if (iter == max_omega_iter - 1)
+                    solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+            }
+            if (!converged)
+                eigenvalues[root] = omega;
+        }
+        std::cout << "  [SOS-LT] Davidson time: " << std::fixed << std::setprecision(3)
+                  << dav_timer.elapsed_seconds() << " s" << std::endl;
+    }
+
+    tracked_cudaFree(d_M11);
+
+    rhf_.set_excitation_energies(eigenvalues);
+    rhf_.get_coefficient_matrix().toHost();
+    const auto& prim_shells = rhf_.get_primitive_shells();
+    const auto& cgto_norms = rhf_.get_cgto_normalization_factors();
+    const_cast<DeviceHostMemory<PrimitiveShell>&>(prim_shells).toHost();
+    const_cast<DeviceHostMemory<real_t>&>(cgto_norms).toHost();
+
+    auto es_result = compute_excited_state_properties(
+        "SOS-Laplace-ADC(2)",
+        prim_shells.host_ptr(), prim_shells.size(),
+        cgto_norms.host_ptr(),
+        rhf_.get_shell_type_infos(),
+        rhf_.get_coefficient_matrix().host_ptr(),
+        eigenvalues, h_eigenvectors.data(),
+        n_states, rhf_.get_num_basis(), nocc, nvir);
+    rhf_.set_oscillator_strengths(es_result.oscillator_strengths);
+    rhf_.set_excited_state_report(es_result.report);
+
     tracked_cudaFree(d_B_ia);
 }
 

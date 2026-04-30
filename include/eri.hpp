@@ -204,6 +204,10 @@ public:
         THROW_EXCEPTION("SOS-ADC(2) computation is not supported for the selected ERI method.");
     }
 
+    virtual void compute_sos_laplace_adc2(int n_states){
+        THROW_EXCEPTION("SOS-Laplace-ADC(2) computation is not supported for the selected ERI method.");
+    }
+
     virtual void compute_adc2x(int n_states){
         THROW_EXCEPTION("ADC(2)-x computation is not supported for the selected ERI method.");
     }
@@ -345,6 +349,7 @@ public:
          || method == PostHFMethod::CIS
          || method == PostHFMethod::ADC2
          || method == PostHFMethod::SOS_ADC2
+         || method == PostHFMethod::LT_SOS_ADC2
          || method == PostHFMethod::ADC2X
          || method == PostHFMethod::EOM_MP2
          || method == PostHFMethod::EOM_CC2
@@ -431,6 +436,7 @@ public:
          || method == PostHFMethod::CIS
          || method == PostHFMethod::ADC2
          || method == PostHFMethod::SOS_ADC2
+         || method == PostHFMethod::LT_SOS_ADC2
          || method == PostHFMethod::ADC2X
          || method == PostHFMethod::EOM_MP2
          || method == PostHFMethod::EOM_CC2
@@ -509,6 +515,7 @@ public:
          || method == PostHFMethod::CIS
          || method == PostHFMethod::ADC2
          || method == PostHFMethod::SOS_ADC2
+         || method == PostHFMethod::LT_SOS_ADC2
          || method == PostHFMethod::ADC2X
          || method == PostHFMethod::EOM_MP2
          || method == PostHFMethod::EOM_CC2

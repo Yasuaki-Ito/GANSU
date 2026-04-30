@@ -29,6 +29,10 @@
 #include "nccl_comm.hpp"
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
+#include "ri_adc2_schur_distributed_operator.hpp"
+#include "sos_laplace_adc2_distributed_operator.hpp"
+#include "davidson_solver.hpp"
+#include "oscillator_strength.hpp"
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
@@ -1537,6 +1541,526 @@ void ERI_RI_SemiDirect_Distributed_RHF::compute_fock_matrix() {
         cudaFree(d_B_local[d]); cudaFree(d_W_local[d]); cudaFree(d_J_local[d]); cudaFree(d_K_local[d]);
         if (d > 0) { cudaFree(d_D[d]); cudaFree(d_C[d]); }
     }
+}
+
+// ============================================================
+//  Distributed RI-ADC(2) Schur complement
+// ============================================================
+
+void ERI_RI_Distributed_RHF::compute_sos_adc2(int n_states) {
+    const int nocc = rhf_.get_num_electrons() / 2 - rhf_.get_num_frozen_core();
+    const int nvir = rhf_.get_num_basis() - rhf_.get_num_electrons() / 2;
+    const int singles_dim = nocc * nvir;
+
+    std::cout << "\n---- Distributed RI-ADC(2) Schur ----"
+              << " nocc=" << nocc << ", nvir=" << nvir
+              << ", num_gpus=" << num_gpus_
+              << ", singles=" << singles_dim
+              << ", nstates=" << n_states << std::endl;
+
+    if (rhf_.get_num_frozen_core() != 0) {
+        std::cerr << "[Distributed ADC(2)] Error: frozen core not yet supported." << std::endl;
+        return;
+    }
+
+    auto& mgr = MultiGpuManager::instance();
+    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();  // on GPU 0
+    const int nbas = num_basis_;
+
+    // --- Step 1: Build MO-transformed B blocks on each GPU ---
+    Timer setup_timer;
+    std::vector<real_t*> d_B_ia_local(num_gpus_, nullptr);
+    std::vector<real_t*> d_B_ab_local(num_gpus_, nullptr);
+    std::vector<real_t*> d_B_ij_local(num_gpus_, nullptr);
+
+    for (int d = 0; d < num_gpus_; d++) {
+        MultiGpuManager::DeviceGuard guard(d);
+
+        // Need C on this GPU
+        real_t* d_C_dev = d_C;
+        if (d > 0) {
+            cudaMalloc(&d_C_dev, (size_t)nbas * nbas * sizeof(real_t));
+            cudaMemcpyPeer(d_C_dev, d, d_C, 0, (size_t)nbas * nbas * sizeof(real_t));
+        }
+
+        d_B_ia_local[d] = build_B_ia_local(d_B_local_[d], naux_local_[d],
+                                           d_C_dev, nbas, nocc, nvir);
+        d_B_ab_local[d] = build_B_ab_local(d_B_local_[d], naux_local_[d],
+                                           d_C_dev, nbas, nocc, nvir);
+        d_B_ij_local[d] = build_B_ij_local(d_B_local_[d], naux_local_[d],
+                                           d_C_dev, nbas, nocc, nvir);
+
+        if (d > 0) cudaFree(d_C_dev);
+    }
+    std::cout << "  B-block build time: " << std::fixed << std::setprecision(3)
+              << setup_timer.elapsed_seconds() << " s" << std::endl;
+
+    // --- Step 2: Build M11 (distributed) ---
+    Timer m11_timer;
+    real_t* d_M11 = nullptr;
+    {
+        MultiGpuManager::DeviceGuard guard(0);
+        tracked_cudaMalloc(&d_M11, (size_t)singles_dim * singles_dim * sizeof(real_t));
+    }
+    RIADC2SchurDistributedOperator::build_M11_distributed(
+        d_M11, num_gpus_,
+        d_B_ia_local, d_B_ab_local, d_B_ij_local,
+        naux_local_,
+        rhf_.get_orbital_energies().device_ptr(),
+        nocc, nvir);
+    std::cout << "  M11 build time: " << std::fixed << std::setprecision(3)
+              << m11_timer.elapsed_seconds() << " s" << std::endl;
+
+    // --- Step 3: Davidson + omega iteration ---
+    std::vector<double> eigenvalues;
+    std::vector<real_t> h_eigenvectors((size_t)n_states * singles_dim, 0.0);
+    {
+        Timer dav_timer;
+        std::cout << "\n  --- Distributed RI-ADC(2) Schur Davidson ---" << std::endl;
+
+        RIADC2SchurDistributedOperator op(
+            num_gpus_,
+            d_B_ia_local, d_B_ab_local, d_B_ij_local,
+            naux_local_, d_M11,
+            rhf_.get_orbital_energies().device_ptr(),
+            nocc, nvir);
+
+        DavidsonConfig dav_config;
+        dav_config.num_eigenvalues = n_states;
+        dav_config.convergence_threshold = 1e-6;
+        dav_config.max_subspace_size = std::min(singles_dim, std::max(30, 4 * n_states));
+        dav_config.max_iterations = 200;
+        dav_config.use_preconditioner = true;
+        dav_config.symmetric = true;
+        dav_config.verbose = 1;
+
+        // Initial solve (omega=0)
+        op.set_omega(0.0);
+        {
+            DavidsonSolver solver(op, dav_config);
+            solver.solve();
+            eigenvalues.resize(n_states);
+            const auto& evals = solver.get_eigenvalues();
+            for (int k = 0; k < n_states && k < (int)evals.size(); k++)
+                eigenvalues[k] = evals[k];
+        }
+
+        std::cout << "  [Dist] Initial (omega=0):";
+        for (int k = 0; k < n_states; k++)
+            std::cout << " " << std::fixed << std::setprecision(6) << eigenvalues[k];
+        std::cout << std::endl;
+
+        // Per-root omega iteration
+        const double omega_thr = 1e-8;
+        const int max_omega_iter = 15;
+
+        for (int root = 0; root < n_states; root++) {
+            double omega = eigenvalues[root];
+            bool converged = false;
+
+            for (int iter = 0; iter < max_omega_iter; iter++) {
+                op.set_omega(omega);
+                DavidsonSolver solver(op, dav_config);
+                solver.solve();
+
+                const auto& evals = solver.get_eigenvalues();
+                double omega_new = (root < (int)evals.size()) ? evals[root] : omega;
+                double delta = std::abs(omega_new - omega);
+
+                std::cout << "  [Dist] Root " << root + 1 << " iter " << std::setw(2) << iter + 1
+                          << ": omega=" << std::fixed << std::setprecision(8) << omega_new
+                          << ", d_omega=" << std::scientific << std::setprecision(2) << delta
+                          << std::defaultfloat << std::endl;
+
+                if (delta < omega_thr) {
+                    eigenvalues[root] = omega_new;
+                    solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+                    converged = true;
+                    std::cout << "  [Dist] Root " << root + 1 << ": converged in "
+                              << iter + 1 << " iterations" << std::endl;
+                    break;
+                }
+                omega = omega_new;
+                if (iter == max_omega_iter - 1)
+                    solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+            }
+            if (!converged) {
+                eigenvalues[root] = omega;
+                std::cout << "  [Dist] Root " << root + 1 << ": NOT converged after "
+                          << max_omega_iter << " iterations" << std::endl;
+            }
+        }
+
+        std::cout << "  [Dist] Davidson time: " << std::fixed << std::setprecision(3)
+                  << dav_timer.elapsed_seconds() << " s" << std::endl;
+    }
+
+    // --- Step 4: Excited state properties ---
+    {
+        MultiGpuManager::DeviceGuard guard(0);
+        tracked_cudaFree(d_M11);
+    }
+
+    rhf_.set_excitation_energies(eigenvalues);
+
+    rhf_.get_coefficient_matrix().toHost();
+    const auto& prim_shells = rhf_.get_primitive_shells();
+    const auto& cgto_norms = rhf_.get_cgto_normalization_factors();
+    const_cast<DeviceHostMemory<PrimitiveShell>&>(prim_shells).toHost();
+    const_cast<DeviceHostMemory<real_t>&>(cgto_norms).toHost();
+
+    auto es_result = compute_excited_state_properties(
+        "Distributed-RI-ADC(2)",
+        prim_shells.host_ptr(), prim_shells.size(),
+        cgto_norms.host_ptr(),
+        rhf_.get_shell_type_infos(),
+        rhf_.get_coefficient_matrix().host_ptr(),
+        eigenvalues, h_eigenvectors.data(),
+        n_states, rhf_.get_num_basis(), nocc, nvir);
+    rhf_.set_oscillator_strengths(es_result.oscillator_strengths);
+    rhf_.set_excited_state_report(es_result.report);
+
+    // Cleanup MO-transformed B blocks
+    for (int d = 0; d < num_gpus_; d++) {
+        MultiGpuManager::DeviceGuard guard(d);
+        cudaFree(d_B_ia_local[d]);
+        cudaFree(d_B_ab_local[d]);
+        cudaFree(d_B_ij_local[d]);
+    }
+}
+
+// ============================================================
+//  Distributed SOS-Laplace-ADC(2) — O(N⁴) with Laplace-point parallelism
+// ============================================================
+
+void ERI_RI_Distributed_RHF::compute_sos_laplace_adc2(int n_states) {
+    const int nocc = rhf_.get_num_electrons() / 2 - rhf_.get_num_frozen_core();
+    const int nvir = rhf_.get_num_basis() - rhf_.get_num_electrons() / 2;
+    const int singles_dim = nocc * nvir;
+    const int naux_total = num_auxiliary_basis_;
+
+    std::cout << "\n---- Distributed SOS-Laplace-ADC(2) ----"
+              << " nocc=" << nocc << ", nvir=" << nvir
+              << ", naux=" << naux_total
+              << ", num_gpus=" << num_gpus_
+              << ", singles=" << singles_dim
+              << ", nstates=" << n_states << std::endl;
+
+    if (rhf_.get_num_frozen_core() != 0) {
+        std::cerr << "[SOS-Laplace-ADC(2)] Error: frozen core not yet supported." << std::endl;
+        return;
+    }
+
+    auto& mgr = MultiGpuManager::instance();
+    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+    const int nbas = num_basis_;
+
+    // --- Step 1: Build B_ia on each GPU ---
+    Timer setup_timer;
+    std::vector<real_t*> d_B_ia_local(num_gpus_, nullptr);
+    // Also build B_ab, B_ij for M11 (then free them)
+    std::vector<real_t*> d_B_ab_local(num_gpus_, nullptr);
+    std::vector<real_t*> d_B_ij_local(num_gpus_, nullptr);
+
+    for (int d = 0; d < num_gpus_; d++) {
+        MultiGpuManager::DeviceGuard guard(d);
+        real_t* d_C_dev = d_C;
+        if (d > 0) {
+            cudaMalloc(&d_C_dev, (size_t)nbas * nbas * sizeof(real_t));
+            cudaMemcpyPeer(d_C_dev, d, d_C, 0, (size_t)nbas * nbas * sizeof(real_t));
+        }
+        d_B_ia_local[d] = build_B_ia_local(d_B_local_[d], naux_local_[d],
+                                           d_C_dev, nbas, nocc, nvir);
+        d_B_ab_local[d] = build_B_ab_local(d_B_local_[d], naux_local_[d],
+                                           d_C_dev, nbas, nocc, nvir);
+        d_B_ij_local[d] = build_B_ij_local(d_B_local_[d], naux_local_[d],
+                                           d_C_dev, nbas, nocc, nvir);
+        if (d > 0) cudaFree(d_C_dev);
+    }
+    std::cout << "  B-block build time: " << std::fixed << std::setprecision(3)
+              << setup_timer.elapsed_seconds() << " s" << std::endl;
+
+    // --- Step 2: Build M11 distributed ---
+    Timer m11_timer;
+    real_t* d_M11 = nullptr;
+    {
+        MultiGpuManager::DeviceGuard guard(0);
+        tracked_cudaMalloc(&d_M11, (size_t)singles_dim * singles_dim * sizeof(real_t));
+    }
+    RIADC2SchurDistributedOperator::build_M11_distributed(
+        d_M11, num_gpus_,
+        d_B_ia_local, d_B_ab_local, d_B_ij_local,
+        naux_local_,
+        rhf_.get_orbital_energies().device_ptr(),
+        nocc, nvir);
+    std::cout << "  M11 build time: " << std::fixed << std::setprecision(3)
+              << m11_timer.elapsed_seconds() << " s" << std::endl;
+
+    // Free B_ab, B_ij (not needed for SOS-Laplace sigma)
+    for (int d = 0; d < num_gpus_; d++) {
+        MultiGpuManager::DeviceGuard guard(d);
+        cudaFree(d_B_ab_local[d]);
+        cudaFree(d_B_ij_local[d]);
+    }
+
+    // --- Step 3: Davidson + omega iteration ---
+    std::vector<double> eigenvalues;
+    std::vector<real_t> h_eigenvectors((size_t)n_states * singles_dim, 0.0);
+    {
+        Timer dav_timer;
+        std::cout << "\n  --- Distributed SOS-Laplace-ADC(2) Davidson ---" << std::endl;
+
+        SOSLaplaceADC2DistributedOperator op(
+            num_gpus_, d_B_ia_local, naux_local_,
+            d_M11, rhf_.get_orbital_energies().device_ptr(),
+            nocc, nvir, naux_total);
+
+        DavidsonConfig dav_config;
+        dav_config.num_eigenvalues = n_states;
+        dav_config.convergence_threshold = 1e-6;
+        dav_config.max_subspace_size = std::min(singles_dim, std::max(30, 4 * n_states));
+        dav_config.max_iterations = 200;
+        dav_config.use_preconditioner = true;
+        dav_config.symmetric = true;
+        dav_config.verbose = 1;
+
+        op.set_omega(0.0);
+        op.update_laplace_quadrature();
+        {
+            DavidsonSolver solver(op, dav_config);
+            solver.solve();
+            eigenvalues.resize(n_states);
+            const auto& evals = solver.get_eigenvalues();
+            for (int k = 0; k < n_states && k < (int)evals.size(); k++)
+                eigenvalues[k] = evals[k];
+        }
+
+        std::cout << "  [SOS-LT] Initial (omega=0):";
+        for (int k = 0; k < n_states; k++)
+            std::cout << " " << std::fixed << std::setprecision(6) << eigenvalues[k];
+        std::cout << std::endl;
+
+        const double omega_thr = 1e-8;
+        const int max_omega_iter = 15;
+
+        for (int root = 0; root < n_states; root++) {
+            double omega = eigenvalues[root];
+            bool converged = false;
+            for (int iter = 0; iter < max_omega_iter; iter++) {
+                op.set_omega(omega);
+                op.update_laplace_quadrature();
+                DavidsonSolver solver(op, dav_config);
+                solver.solve();
+                const auto& evals = solver.get_eigenvalues();
+                double omega_new = (root < (int)evals.size()) ? evals[root] : omega;
+                double delta = std::abs(omega_new - omega);
+                std::cout << "  [SOS-LT] Root " << root + 1 << " iter " << std::setw(2) << iter + 1
+                          << ": omega=" << std::fixed << std::setprecision(8) << omega_new
+                          << ", d_omega=" << std::scientific << std::setprecision(2) << delta
+                          << std::defaultfloat << std::endl;
+                if (delta < omega_thr) {
+                    eigenvalues[root] = omega_new;
+                    solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+                    converged = true;
+                    std::cout << "  [SOS-LT] Root " << root + 1 << ": converged in "
+                              << iter + 1 << " iterations" << std::endl;
+                    break;
+                }
+                omega = omega_new;
+                if (iter == max_omega_iter - 1)
+                    solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+            }
+            if (!converged) {
+                eigenvalues[root] = omega;
+                std::cout << "  [SOS-LT] Root " << root + 1 << ": NOT converged after "
+                          << max_omega_iter << " iterations" << std::endl;
+            }
+        }
+        std::cout << "  [SOS-LT] Davidson time: " << std::fixed << std::setprecision(3)
+                  << dav_timer.elapsed_seconds() << " s" << std::endl;
+    }
+
+    // --- Step 4: Excited state properties ---
+    {
+        MultiGpuManager::DeviceGuard guard(0);
+        tracked_cudaFree(d_M11);
+    }
+
+    rhf_.set_excitation_energies(eigenvalues);
+    rhf_.get_coefficient_matrix().toHost();
+    const auto& prim_shells = rhf_.get_primitive_shells();
+    const auto& cgto_norms = rhf_.get_cgto_normalization_factors();
+    const_cast<DeviceHostMemory<PrimitiveShell>&>(prim_shells).toHost();
+    const_cast<DeviceHostMemory<real_t>&>(cgto_norms).toHost();
+
+    auto es_result = compute_excited_state_properties(
+        "Distributed-SOS-Laplace-ADC(2)",
+        prim_shells.host_ptr(), prim_shells.size(),
+        cgto_norms.host_ptr(),
+        rhf_.get_shell_type_infos(),
+        rhf_.get_coefficient_matrix().host_ptr(),
+        eigenvalues, h_eigenvectors.data(),
+        n_states, rhf_.get_num_basis(), nocc, nvir);
+    rhf_.set_oscillator_strengths(es_result.oscillator_strengths);
+    rhf_.set_excited_state_report(es_result.report);
+
+    // Cleanup
+    for (int d = 0; d < num_gpus_; d++) {
+        MultiGpuManager::DeviceGuard guard(d);
+        cudaFree(d_B_ia_local[d]);
+    }
+}
+
+// ============================================================
+//  build_B_*_local: MO-transform B_local for distributed ADC(2)
+// ============================================================
+
+// Forward declaration from eri_ri.cu (no-handle overload)
+void transform_intermediate_matrix(int norbs, int nocc, int nvir, int naux,
+                                   double* d_C, double* d_B, double* d_tmp);
+
+real_t* ERI_RI_Distributed_RHF::build_B_ia_local(
+    const real_t* d_B_ao, int naux_local,
+    real_t* d_C, int nbas, int nocc, int nvir)
+{
+    const size_t B_ao_size = (size_t)naux_local * nbas * nbas;
+
+    // Copy AO-basis B (transform is destructive)
+    real_t* d_B_copy = nullptr;
+    tracked_cudaMalloc(&d_B_copy, B_ao_size * sizeof(real_t));
+    cudaMemcpy(d_B_copy, d_B_ao, B_ao_size * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+    // Workspace for intermediate result
+    real_t* d_tmp = nullptr;
+    tracked_cudaMalloc(&d_tmp, (size_t)nbas * nvir * naux_local * sizeof(real_t));
+
+    // nu→a, then mu→i: B^P_{mu,nu} → B^P_{i,a}
+    transform_intermediate_matrix(nbas, nocc, nvir, naux_local, d_C, d_B_copy, d_tmp);
+
+    tracked_cudaFree(d_tmp);
+    return d_B_copy;  // [ov × naux_local] col-major
+}
+
+real_t* ERI_RI_Distributed_RHF::build_B_ab_local(
+    const real_t* d_B_ao, int naux_local,
+    real_t* d_C, int nbas, int nocc, int nvir)
+{
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    const double alpha = 1.0, beta = 0.0;
+    const size_t vv = (size_t)nvir * nvir;
+
+    // Copy AO-basis B
+    const size_t B_ao_size = (size_t)naux_local * nbas * nbas;
+    real_t* d_B_ao_copy = nullptr;
+    tracked_cudaMalloc(&d_B_ao_copy, B_ao_size * sizeof(real_t));
+    cudaMemcpy(d_B_ao_copy, d_B_ao, B_ao_size * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+    // Step 1: nu→a (virtual): B^P_{mu,a} = sum_nu C_{nu,nocc+a} * B^P_{mu,nu}
+    real_t* d_B_mu_a = nullptr;
+    tracked_cudaMalloc(&d_B_mu_a, (size_t)nbas * nvir * naux_local * sizeof(real_t));
+    cudaMemset(d_B_mu_a, 0, (size_t)nbas * nvir * naux_local * sizeof(real_t));
+
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                nvir, naux_local * nbas, nbas,
+                &alpha, &d_C[nocc], nbas,
+                d_B_ao_copy, nbas,
+                &beta, d_B_mu_a, nvir);
+    tracked_cudaFree(d_B_ao_copy);
+
+    // Step 2: Transpose [nvir × naux_local*nbas] → [naux_local*nbas × nvir]
+    real_t* d_B_transposed = nullptr;
+    tracked_cudaMalloc(&d_B_transposed, (size_t)nbas * nvir * naux_local * sizeof(real_t));
+    {
+        int row = naux_local * nbas, col = nvir;
+        cublasDgeam(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    row, col,
+                    &alpha, d_B_mu_a, col,
+                    &beta, nullptr, (row >= col) ? row : col,
+                    d_B_transposed, row);
+    }
+
+    // Step 3: mu→b (virtual): B^P_{b,a} = sum_mu C_{mu,nocc+b} * B^P_{mu,a}
+    cudaMemset(d_B_mu_a, 0, (size_t)nbas * nbas * naux_local * sizeof(real_t));
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                nvir, naux_local * nvir, nbas,
+                &alpha, &d_C[nocc], nbas,
+                d_B_transposed, nbas,
+                &beta, d_B_mu_a, nvir);
+
+    // Step 4: Transpose to get [vv × naux_local] col-major layout
+    {
+        int row = naux_local * nvir, col = nvir;
+        cublasDgeam(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    col, row,
+                    &alpha, d_B_mu_a, row,
+                    &beta, nullptr, (row >= col) ? row : col,
+                    d_B_transposed, col);
+    }
+    // d_B_transposed[P*vv + b*nvir + a] = B^P_{b,a}
+
+    tracked_cudaFree(d_B_mu_a);
+    return d_B_transposed;  // [vv × naux_local] col-major
+}
+
+real_t* ERI_RI_Distributed_RHF::build_B_ij_local(
+    const real_t* d_B_ao, int naux_local,
+    real_t* d_C, int nbas, int nocc, int nvir)
+{
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    const double alpha = 1.0, beta = 0.0;
+    const size_t oo = (size_t)nocc * nocc;
+
+    // Copy AO-basis B
+    const size_t B_ao_size = (size_t)naux_local * nbas * nbas;
+    real_t* d_B_ao_copy = nullptr;
+    tracked_cudaMalloc(&d_B_ao_copy, B_ao_size * sizeof(real_t));
+    cudaMemcpy(d_B_ao_copy, d_B_ao, B_ao_size * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+    // Step 1: nu→j (occupied): B^P_{mu,j} = sum_nu C_{nu,j} * B^P_{mu,nu}
+    real_t* d_B_mu_j = nullptr;
+    tracked_cudaMalloc(&d_B_mu_j, (size_t)nbas * nocc * naux_local * sizeof(real_t));
+    cudaMemset(d_B_mu_j, 0, (size_t)nbas * nocc * naux_local * sizeof(real_t));
+
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                nocc, naux_local * nbas, nbas,
+                &alpha, d_C, nbas,      // C_occ: no offset
+                d_B_ao_copy, nbas,
+                &beta, d_B_mu_j, nocc);
+    tracked_cudaFree(d_B_ao_copy);
+
+    // Step 2: Transpose [nocc × naux_local*nbas] → [naux_local*nbas × nocc]
+    real_t* d_B_transposed = nullptr;
+    tracked_cudaMalloc(&d_B_transposed, (size_t)nbas * nocc * naux_local * sizeof(real_t));
+    {
+        int row = naux_local * nbas, col = nocc;
+        cublasDgeam(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    row, col,
+                    &alpha, d_B_mu_j, col,
+                    &beta, nullptr, (row >= col) ? row : col,
+                    d_B_transposed, row);
+    }
+
+    // Step 3: mu→i (occupied): B^P_{i,j} = sum_mu C_{mu,i} * B^P_{mu,j}
+    cudaMemset(d_B_mu_j, 0, (size_t)nbas * nbas * naux_local * sizeof(real_t));
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                nocc, naux_local * nocc, nbas,
+                &alpha, d_C, nbas,
+                d_B_transposed, nbas,
+                &beta, d_B_mu_j, nocc);
+
+    // Step 4: Transpose to get [oo × naux_local] col-major layout
+    {
+        int row = naux_local * nocc, col = nocc;
+        cublasDgeam(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    col, row,
+                    &alpha, d_B_mu_j, row,
+                    &beta, nullptr, (row >= col) ? row : col,
+                    d_B_transposed, col);
+    }
+    // d_B_transposed[P*oo + i*nocc + j] = B^P_{i,j}
+
+    tracked_cudaFree(d_B_mu_j);
+    return d_B_transposed;  // [oo × naux_local] col-major
 }
 
 } // namespace gansu

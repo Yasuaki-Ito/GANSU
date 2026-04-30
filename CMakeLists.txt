@@ -206,6 +206,8 @@ set(SOURCES
     src/ecp_integrals_gpu.cu
     src/sos_laplace_adc2_operator.cu
     src/ri_adc2_schur_operator.cu
+    src/ri_adc2_schur_distributed_operator.cu
+    src/sos_laplace_adc2_distributed_operator.cu
     src/multi_gpu_manager.cu
     src/eri_ri_distributed.cu
 )

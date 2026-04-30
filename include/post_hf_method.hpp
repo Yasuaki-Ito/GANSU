@@ -33,6 +33,7 @@ enum class PostHFMethod {
     CIS,
     ADC2,
     SOS_ADC2,
+    LT_SOS_ADC2,  // SOS-Laplace-ADC(2) — O(N⁴) with Laplace quadrature
     ADC2X,
     EOM_MP2,
     EOM_CC2,

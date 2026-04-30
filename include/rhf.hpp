@@ -967,6 +967,7 @@ private:
     void compute_cis(int n_states) override;
     void compute_adc2(int n_states) override;
     void compute_sos_adc2(int n_states) override;
+    void compute_sos_laplace_adc2(int n_states) override;
     void compute_adc2x(int n_states) override;
     void compute_eom_mp2(int n_states) override;
     void compute_eom_cc2(int n_states) override;
@@ -1071,6 +1072,31 @@ public:
 
     /// Legacy: set_direct_mode maps to OnTheFly
     void set_direct_mode(bool enable) { if (enable) storage_mode_ = StorageMode::OnTheFly; }
+
+    /// Distributed RI-ADC(2) Schur complement (multi-GPU sigma build)
+    void compute_sos_adc2(int n_states) override;
+
+    /// Distributed SOS-Laplace-ADC(2) (O(N⁴), Laplace-point-parallel)
+    void compute_sos_laplace_adc2(int n_states);
+
+    // --- Distributed MO-transformed B blocks for post-HF ---
+
+    /// Build B_ia^P [ov × naux_local] from AO-basis B_local. Caller must free result.
+    static real_t* build_B_ia_local(const real_t* d_B_ao, int naux_local,
+                                    real_t* d_C, int nbas, int nocc, int nvir);
+
+    /// Build B_ab^P [vv × naux_local] from AO-basis B_local. Caller must free result.
+    static real_t* build_B_ab_local(const real_t* d_B_ao, int naux_local,
+                                    real_t* d_C, int nbas, int nocc, int nvir);
+
+    /// Build B_ij^P [oo × naux_local] from AO-basis B_local. Caller must free result.
+    static real_t* build_B_ij_local(const real_t* d_B_ao, int naux_local,
+                                    real_t* d_C, int nbas, int nocc, int nvir);
+
+    /// Access distributed B data
+    int num_gpus() const { return num_gpus_; }
+    const std::vector<int>& get_naux_local() const { return naux_local_; }
+    const std::vector<real_t*>& get_d_B_local() const { return d_B_local_; }
 
 private:
     int num_gpus_;
