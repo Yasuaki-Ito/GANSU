@@ -22,11 +22,11 @@
  * Limit (4×H200): ~2700 basis functions
  */
 
+#ifdef GANSU_MULTI_GPU
+
 #include "rhf.hpp"
 #include "multi_gpu_manager.hpp"
-#ifdef GANSU_MULTI_GPU
 #include "nccl_comm.hpp"
-#endif
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
 #include <iostream>
@@ -680,14 +680,12 @@ void ERI_RI_Distributed_RHF::compute_fock_matrix() {
                 d_J_local_[d], d_B_local_[d], d_W_local_[d], nbas, nl);
         }
         mgr.sync_all();
-#ifdef GANSU_MULTI_GPU
         nccl::group_start();
         for (int d = 0; d < num_gpus_; d++) {
             MultiGpuManager::DeviceGuard guard(d);
             nccl::all_reduce(d_J_local_[d], d_J_local_[d], nbas2, ncclSum, d, mgr.comm_stream(d));
         }
         nccl::group_end();
-#endif
 
         // ---- Distributed K build (density-matrix based) ----
         // T_P[μν] = Σ_λ D^T[μλ] × B_P[λν],  K_local = Σ_P T_P^T × B_P, then AllReduce
@@ -734,14 +732,12 @@ void ERI_RI_Distributed_RHF::compute_fock_matrix() {
             cudaFree(d_T); cudaFree(d_V);
         }
         mgr.sync_all();
-#ifdef GANSU_MULTI_GPU
         nccl::group_start();
         for (int d = 0; d < num_gpus_; d++) {
             MultiGpuManager::DeviceGuard guard(d);
             nccl::all_reduce(d_K_local_[d], d_K_local_[d], nbas2, ncclSum, d, mgr.comm_stream(d));
         }
         nccl::group_end();
-#endif
 
         // ---- Fock assembly on GPU 0 ----
         {
@@ -1303,22 +1299,18 @@ void ERI_RI_Distributed_RHF::chunked_fock_build() {
     // ---- AllReduce J/K across GPUs ----
     if (num_gpus_ > 1) {
         // NCCL group calls: set device before each ncclAllReduce (required by NCCL)
-#ifdef GANSU_MULTI_GPU
         nccl::group_start();
         for (int d = 0; d < num_gpus_; d++) {
             cudaSetDevice(d);
             nccl::all_reduce(d_J_local_[d], d_J_local_[d], nbas2, ncclSum, d, mgr.comm_stream(d));
         }
         nccl::group_end();
-#endif
-#ifdef GANSU_MULTI_GPU
         nccl::group_start();
         for (int d = 0; d < num_gpus_; d++) {
             cudaSetDevice(d);
             nccl::all_reduce(d_K_local_[d], d_K_local_[d], nbas2, ncclSum, d, mgr.comm_stream(d));
         }
         nccl::group_end();
-#endif
         // Sync comm streams
         for (int d = 0; d < num_gpus_; d++) {
             cudaSetDevice(d);
@@ -1548,3 +1540,5 @@ void ERI_RI_SemiDirect_Distributed_RHF::compute_fock_matrix() {
 }
 
 } // namespace gansu
+
+#endif // GANSU_MULTI_GPU

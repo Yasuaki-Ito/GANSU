@@ -1031,6 +1031,7 @@ protected:
     RHF& rhf_; ///< RHF
 };
 
+#ifdef GANSU_MULTI_GPU
 /**
  * @brief Distributed RI-HF across multiple GPUs (aux-axis partition).
  *
@@ -1151,6 +1152,7 @@ private:
     void allocate_chunked_workspace();
     void free_chunked_workspace();
 };
+#endif
 
 /**
  * @brief ERI_Direct_RHF class for the direct computation of the ERIs of the restricted HF method
