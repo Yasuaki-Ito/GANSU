@@ -175,6 +175,14 @@ public:
     }
 
     /**
+     * @brief Compute DMET-CCSD energy
+     * @return DMET-CCSD correlation energy
+     */
+    virtual real_t compute_dmet_ccsd(){
+        THROW_EXCEPTION("DMET-CCSD is not supported for the selected ERI method.");
+    }
+
+    /**
      * @brief Compute FCI energy
         * @return FCI energy
         * @details This function computes the FCI energy.
@@ -262,6 +270,9 @@ public:
     std::string get_algorithm_name() override { return "Stored"; } ///< Get the algorithm name
     const real_t* get_eri_matrix_device() const { return eri_matrix_.device_ptr(); }
 
+    /// Build MO ERI with rectangular C [nao × nmo] support
+    real_t* build_mo_eri(const real_t* d_C, int nmo) const override;
+
     bool supports_post_hf_method(PostHFMethod method) const override {
         if( method == PostHFMethod::None // always supported
             || method == PostHFMethod::FCI  // The stored ERI method supports FCI
@@ -280,6 +291,7 @@ public:
             || method == PostHFMethod::EOM_MP2 // The stored ERI method supports EOM-MP2
             || method == PostHFMethod::EOM_CC2 // The stored ERI method supports EOM-CC2
             || method == PostHFMethod::EOM_CCSD // The stored ERI method supports EOM-CCSD
+            || method == PostHFMethod::DMET_CCSD // DMET-CCSD
           ){
             return true;
         }
@@ -355,6 +367,7 @@ public:
          || method == PostHFMethod::EOM_CC2
          || method == PostHFMethod::EOM_CCSD
          || method == PostHFMethod::FCI
+         || method == PostHFMethod::DMET_CCSD
           ){
             return true;
         }

@@ -108,6 +108,8 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
 {
     adc_c_t_ = parameters.get<double>("adc_c_t");
     adc_c_c_ = parameters.get<double>("adc_c_c");
+    dmet_fragments_str_ = parameters.get<std::string>("dmet_fragments");
+    dmet_threshold_ = parameters.get<double>("dmet_threshold");
 
     // Validate run_type
     if(run_type_ != "energy" && run_type_ != "gradient" && run_type_ != "optimize" && run_type_ != "hessian"){
@@ -184,6 +186,9 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     }else if(post_hf_method_str == "eom_ccsd"){
         std::cout << "Message: Post-HF method is EOM-CCSD." << std::endl;
         post_hf_method_ = PostHFMethod::EOM_CCSD;
+    }else if(post_hf_method_str == "dmet_ccsd" || post_hf_method_str == "dmet-ccsd" || post_hf_method_str == "dmet"){
+        std::cout << "Message: Post-HF method is DMET-CCSD." << std::endl;
+        post_hf_method_ = PostHFMethod::DMET_CCSD;
     }else{
         throw std::runtime_error("Error: Unknown post-HF method: " + post_hf_method_str);
     }

@@ -210,6 +210,7 @@ set(SOURCES
     src/sos_laplace_adc2_distributed_operator.cu
     src/multi_gpu_manager.cu
     src/eri_ri_distributed.cu
+    src/dmet.cu
 )
 
 if(NOT ENABLE_GPU)

@@ -103,4 +103,49 @@ void build_ccsd_1rdm_mo_gpu(
     const real_t* d_lambda1, const real_t* d_lambda2,
     real_t* d_D_mo_out);        // [nao × nao] device
 
+/**
+ * @brief Build CCSD 2-RDM in MO basis (CPU, for DMET democratic partitioning).
+ *
+ * Γ[p,q,r,s] = ⟨a†_p a†_r a_s a_q⟩ in chemist notation (pq|rs).
+ * Includes HF reference. For embedding spaces (n_emb ~ 10-30), CPU is fast enough.
+ *
+ * @param D2_mo_out [nao^4] output, row-major Γ[p*nao³+q*nao²+r*nao+s]
+ */
+void build_ccsd_2rdm_mo_cpu(
+    int nocc, int nvir,
+    const real_t* h_t1, const real_t* h_t2,
+    const real_t* h_l1, const real_t* h_l2,
+    real_t* D2_mo_out);
+
+/**
+ * @brief Compute DMET fragment correlation energy via democratic partitioning
+ *        using T amplitudes directly (no Lambda/RDM needed).
+ *
+ * P_can[i,j] = Σ_{p∈frag} U[p,i] * U[p,j]  (U = h_emb eigenvectors)
+ * E_corr_frag = Σ_{i,i'∈occ} P_can[i,i'] * Σ_{j∈occ,a,b∈vir}
+ *               (ia|jb) * (2*τ[i',j,a,b] - τ[i',j,b,a])
+ * where τ = t2 + t1⊗t1.
+ * For P=I, this exactly recovers the full CCSD correlation energy.
+ */
+/**
+ * @brief Build CCSD 2-RDM in PySCF convention (CPU).
+ * dm2[p,q,r,s] = γ[p,q]*γ[r,s] - 0.5*γ[p,s]*γ[r,q] + cumulant
+ * Energy: E = einsum('pq,qp',h_core,dm1) + 0.5*einsum('pqrs,pqrs',eri,dm2) + E_nuc
+ */
+void build_ccsd_2rdm_pyscf_cpu(
+    int nocc, int nvir,
+    const real_t* h_t1, const real_t* h_t2,
+    const real_t* h_l1, const real_t* h_l2,
+    const real_t* dm1,  // [na × na] 1-RDM
+    real_t* D2);        // [na^4] output
+
+real_t compute_dmet_fragment_energy(
+    int nocc, int nvir,
+    const real_t* eri_emb,   // [na^4] canonical MO ERI, chemist: eri[p,q,r,s]=(pq|rs)
+    const real_t* t1,        // [nocc_active × nvir] T1 amplitudes
+    const real_t* t2,        // [nocc_active^2 × nvir^2] T2 amplitudes
+    int n_frag,              // number of fragment AOs in embedding space
+    const real_t* eigvecs,   // [na × na] h_emb eigenvectors: U[p,i] = eigvecs[p*na+i]
+    int n_frozen = 0);       // frozen core orbitals (σ≈1, first n_frozen MOs)
+
 } // namespace gansu

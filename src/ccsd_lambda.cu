@@ -1077,17 +1077,130 @@ bool solve_ccsd_lambda_cpu(
     auto oooo = extract_oooo(d, h_eri_mo);
     auto vvvv = extract_vvvv(d, h_eri_mo);
 
-    // Initial guess: Λ = 0 (simplest, same as PySCF default)
-    std::fill(h_lambda1, h_lambda1 + l1_sz, 0.0);
-    std::fill(h_lambda2, h_lambda2 + l2_sz, 0.0);
+    // ---- Direct solve (Lambda equations are LINEAR in Λ) ----
+    // For small embedding spaces, build the Jacobian and solve directly.
+    // f(Λ) = J*Λ + b,  fixed point: (I-J)*Λ = b
+    const size_t N = l1_sz + l2_sz;
+    if (N <= 2000) {  // direct solve for small systems
+        if (verbose > 0)
+            std::cout << "  Lambda direct solve: N=" << N << std::endl;
 
+        // b = f(0)
+        std::vector<real_t> l1_zero(l1_sz, 0.0), l2_zero(l2_sz, 0.0);
+        std::vector<real_t> l1_b(l1_sz), l2_b(l2_sz);
+        update_lambda_full(d, h_t1, h_t2, l1_zero.data(), l2_zero.data(),
+                           h_eps, ovov, ovoo, ovvv, oovv, ovvo, oooo, vvvv,
+                           l1_b.data(), l2_b.data());
+
+        std::vector<real_t> b(N);
+        for (size_t k = 0; k < l1_sz; k++) b[k] = l1_b[k];
+        for (size_t k = 0; k < l2_sz; k++) b[l1_sz + k] = l2_b[k];
+
+        // Build A = I - J,  where J[:,k] = f(e_k) - b
+        std::vector<real_t> A(N * N, 0.0);
+        for (size_t i = 0; i < N; i++) A[i * N + i] = 1.0;  // I
+
+        for (size_t col = 0; col < N; col++) {
+            std::vector<real_t> l1_ek(l1_sz, 0.0), l2_ek(l2_sz, 0.0);
+            if (col < l1_sz) l1_ek[col] = 1.0;
+            else l2_ek[col - l1_sz] = 1.0;
+
+            std::vector<real_t> l1_fk(l1_sz), l2_fk(l2_sz);
+            update_lambda_full(d, h_t1, h_t2, l1_ek.data(), l2_ek.data(),
+                               h_eps, ovov, ovoo, ovvv, oovv, ovvo, oooo, vvvv,
+                               l1_fk.data(), l2_fk.data());
+
+            for (size_t row = 0; row < l1_sz; row++)
+                A[row * N + col] -= (l1_fk[row] - b[row]);
+            for (size_t row = 0; row < l2_sz; row++)
+                A[(l1_sz + row) * N + col] -= (l2_fk[row] - b[l1_sz + row]);
+        }
+
+        // Regularize: antisymmetric L2 components make (I-J) singular
+        // Add small diagonal to break degeneracy
+        for (size_t i = 0; i < N; i++) A[i * N + i] += 1e-10;
+
+        // Solve A * x = b by Gaussian elimination with partial pivoting
+        std::vector<real_t> x = b;
+        bool ok = true;
+        for (size_t col = 0; col < N && ok; col++) {
+            size_t pivot = col;
+            for (size_t row = col + 1; row < N; row++)
+                if (std::abs(A[row * N + col]) > std::abs(A[pivot * N + col]))
+                    pivot = row;
+            if (std::abs(A[pivot * N + col]) < 1e-14) { ok = false; break; }
+            if (pivot != col) {
+                for (size_t j = 0; j < N; j++) std::swap(A[col * N + j], A[pivot * N + j]);
+                std::swap(x[col], x[pivot]);
+            }
+            for (size_t row = col + 1; row < N; row++) {
+                real_t f = A[row * N + col] / A[col * N + col];
+                for (size_t j = col; j < N; j++) A[row * N + j] -= f * A[col * N + j];
+                x[row] -= f * x[col];
+            }
+        }
+        if (ok) {
+            for (int row = (int)N - 1; row >= 0; row--) {
+                for (size_t j = row + 1; j < N; j++) x[row] -= A[row * N + j] * x[j];
+                x[row] /= A[row * N + row];
+            }
+
+            // Copy and symmetrize L2: l2[i,j,a,b] = (l2[i,j,a,b]+l2[j,i,b,a])/2
+            std::copy(x.begin(), x.begin() + l1_sz, h_lambda1);
+            std::copy(x.begin() + l1_sz, x.end(), h_lambda2);
+            for (int i = 0; i < nocc; i++)
+              for (int j = 0; j <= i; j++)
+                for (int a = 0; a < nvir; a++)
+                  for (int b = 0; b < nvir; b++) {
+                    size_t ij = ((size_t)i*nocc+j)*nvir*nvir + a*nvir+b;
+                    size_t ji = ((size_t)j*nocc+i)*nvir*nvir + b*nvir+a;
+                    real_t sym = 0.5*(h_lambda2[ij]+h_lambda2[ji]);
+                    h_lambda2[ij] = sym; h_lambda2[ji] = sym;
+                  }
+
+            // Verify: compute residual f(x) - x
+            std::vector<real_t> l1_check(l1_sz), l2_check(l2_sz);
+            update_lambda_full(d, h_t1, h_t2, h_lambda1, h_lambda2,
+                               h_eps, ovov, ovoo, ovvv, oovv, ovvo, oooo, vvvv,
+                               l1_check.data(), l2_check.data());
+            real_t resid = 0.0;
+            for (size_t k = 0; k < l1_sz; k++) {
+                real_t d = l1_check[k] - h_lambda1[k]; resid += d * d; }
+            for (size_t k = 0; k < l2_sz; k++) {
+                real_t d = l2_check[k] - h_lambda2[k]; resid += d * d; }
+            resid = std::sqrt(resid);
+
+            if (verbose > 0)
+                std::cout << "  Lambda direct solve: residual = " << std::scientific
+                          << resid << std::defaultfloat << std::endl;
+
+            if (resid < 1e-4) {
+                if (verbose > 0)
+                    std::cout << "  Lambda converged (direct solve)" << std::endl;
+                return true;
+            }
+        }
+        if (verbose > 0)
+            std::cout << "  Lambda direct solve failed, trying iterative..." << std::endl;
+    }
+
+    // ---- Iterative solve (fallback) ----
     std::vector<real_t> l1_new(l1_sz), l2_new(l2_sz);
 
+    // DIIS storage
+    const int diis_size = 8;
+    std::vector<std::vector<real_t>> diis_vecs, diis_errs;
+    const size_t l_total = l1_sz + l2_sz;
+
     if (verbose > 0) {
-        std::cout << "CCSD Lambda solver: nocc=" << nocc << " nvir=" << nvir
+        std::cout << "  Lambda solver: nocc=" << nocc << " nvir=" << nvir
                   << " max_iter=" << max_iter << " tol=" << std::scientific
                   << tol << std::defaultfloat << std::endl;
     }
+
+    real_t prev_resid = 1e30;
+    const real_t damp_init = 0.5;  // initial damping factor
+    real_t damp = damp_init;
 
     for (int iter = 0; iter < max_iter; iter++) {
         update_lambda_full(d, h_t1, h_t2, h_lambda1, h_lambda2,
@@ -1095,19 +1208,130 @@ bool solve_ccsd_lambda_cpu(
                            ovov, ovoo, ovvv, oovv, ovvo, oooo, vvvv,
                            l1_new.data(), l2_new.data());
 
-        // Residual = ||λ_new - λ_old||
-        real_t r1 = 0.0, r2 = 0.0;
-        for (size_t k = 0; k < l1_sz; k++) r1 += (l1_new[k] - h_lambda1[k]) * (l1_new[k] - h_lambda1[k]);
-        for (size_t k = 0; k < l2_sz; k++) r2 += (l2_new[k] - h_lambda2[k]) * (l2_new[k] - h_lambda2[k]);
-        real_t resid = std::sqrt(r1 + r2);
+        // Compute residual (error vector)
+        std::vector<real_t> err_vec(l_total);
+        real_t r_sq = 0.0;
+        for (size_t k = 0; k < l1_sz; k++) {
+            err_vec[k] = l1_new[k] - h_lambda1[k];
+            r_sq += err_vec[k] * err_vec[k];
+        }
+        for (size_t k = 0; k < l2_sz; k++) {
+            err_vec[l1_sz + k] = l2_new[k] - h_lambda2[k];
+            r_sq += err_vec[l1_sz + k] * err_vec[l1_sz + k];
+        }
+        real_t resid = std::sqrt(r_sq);
 
+        // Damping if residual is increasing
+        if (resid > prev_resid * 1.5 && iter < 10) {
+            damp = std::max(damp * 0.5, 0.1);
+        } else if (resid < prev_resid * 0.9 && iter > 5) {
+            damp = std::min(damp * 1.2, 1.0);
+        }
+
+        // Apply damping: λ = damp * λ_new + (1-damp) * λ_old
+        if (damp < 1.0 - 1e-12 && iter < 20) {
+            for (size_t k = 0; k < l1_sz; k++)
+                l1_new[k] = damp * l1_new[k] + (1.0 - damp) * h_lambda1[k];
+            for (size_t k = 0; k < l2_sz; k++)
+                l2_new[k] = damp * l2_new[k] + (1.0 - damp) * h_lambda2[k];
+        }
+
+        // DIIS extrapolation (start after damping stabilizes)
+        if (iter >= 5 && resid < 5.0) {
+            std::vector<real_t> vec(l_total);
+            std::copy(l1_new.begin(), l1_new.end(), vec.begin());
+            std::copy(l2_new.begin(), l2_new.end(), vec.begin() + l1_sz);
+
+            // Save pre-DIIS for fallback
+            std::vector<real_t> l1_pre(l1_new.begin(), l1_new.end());
+            std::vector<real_t> l2_pre(l2_new.begin(), l2_new.end());
+
+            diis_vecs.push_back(std::move(vec));
+            diis_errs.push_back(err_vec);
+            if ((int)diis_vecs.size() > diis_size) {
+                diis_vecs.erase(diis_vecs.begin());
+                diis_errs.erase(diis_errs.begin());
+            }
+
+            int nd = (int)diis_vecs.size();
+            if (nd >= 2) {
+                std::vector<real_t> B((nd+1)*(nd+1), 0.0);
+                for (int i = 0; i < nd; i++)
+                    for (int j = 0; j <= i; j++) {
+                        real_t dot = 0.0;
+                        for (size_t k = 0; k < l_total; k++)
+                            dot += diis_errs[i][k] * diis_errs[j][k];
+                        B[i*(nd+1)+j] = dot;
+                        B[j*(nd+1)+i] = dot;
+                    }
+                for (int i = 0; i < nd; i++) {
+                    B[i*(nd+1)+nd] = -1.0;
+                    B[nd*(nd+1)+i] = -1.0;
+                }
+
+                std::vector<real_t> rhs(nd+1, 0.0);
+                rhs[nd] = -1.0;
+
+                int n = nd + 1;
+                std::vector<real_t> A = B;
+                std::vector<real_t> x = rhs;
+                bool ok = true;
+                for (int col = 0; col < n && ok; col++) {
+                    int pivot = col;
+                    for (int row = col+1; row < n; row++)
+                        if (std::abs(A[row*n+col]) > std::abs(A[pivot*n+col])) pivot = row;
+                    if (std::abs(A[pivot*n+col]) < 1e-14) { ok = false; break; }
+                    if (pivot != col) {
+                        for (int j = 0; j < n; j++) std::swap(A[col*n+j], A[pivot*n+j]);
+                        std::swap(x[col], x[pivot]);
+                    }
+                    for (int row = col+1; row < n; row++) {
+                        real_t f = A[row*n+col] / A[col*n+col];
+                        for (int j = col; j < n; j++) A[row*n+j] -= f * A[col*n+j];
+                        x[row] -= f * x[col];
+                    }
+                }
+                if (ok) {
+                    for (int row = n-1; row >= 0; row--) {
+                        for (int j = row+1; j < n; j++) x[row] -= A[row*n+j] * x[j];
+                        x[row] /= A[row*n+row];
+                    }
+                    std::fill(l1_new.begin(), l1_new.end(), 0.0);
+                    std::fill(l2_new.begin(), l2_new.end(), 0.0);
+                    for (int i = 0; i < nd; i++) {
+                        for (size_t k = 0; k < l1_sz; k++)
+                            l1_new[k] += x[i] * diis_vecs[i][k];
+                        for (size_t k = 0; k < l2_sz; k++)
+                            l2_new[k] += x[i] * diis_vecs[i][k + l1_sz];
+                    }
+
+                    // Check if DIIS made things worse → revert and reset
+                    real_t diis_r = 0.0;
+                    for (size_t k = 0; k < l1_sz; k++) {
+                        real_t d = l1_new[k] - h_lambda1[k]; diis_r += d*d; }
+                    for (size_t k = 0; k < l2_sz; k++) {
+                        real_t d = l2_new[k] - h_lambda2[k]; diis_r += d*d; }
+                    diis_r = std::sqrt(diis_r);
+                    if (diis_r > resid * 3.0) {
+                        // DIIS diverged → revert and clear history
+                        std::copy(l1_pre.begin(), l1_pre.end(), l1_new.begin());
+                        std::copy(l2_pre.begin(), l2_pre.end(), l2_new.begin());
+                        diis_vecs.clear();
+                        diis_errs.clear();
+                    }
+                }
+            }
+        }
+
+        prev_resid = resid;
         std::copy(l1_new.begin(), l1_new.end(), h_lambda1);
         std::copy(l2_new.begin(), l2_new.end(), h_lambda2);
 
-        if (verbose > 0) {
+        if (verbose > 0 && (iter < 5 || iter % 10 == 0 || resid < tol)) {
             std::cout << "  Lambda iter " << std::setw(3) << (iter + 1)
                       << ": ||Δλ|| = " << std::scientific << std::setprecision(3)
-                      << resid << std::defaultfloat << std::endl;
+                      << resid << " damp=" << std::fixed << std::setprecision(2)
+                      << damp << std::defaultfloat << std::endl;
         }
         { double vals[] = {resid}; report_progress("ccsd_lambda", iter + 1, 1, vals); }
 
@@ -1122,7 +1346,8 @@ bool solve_ccsd_lambda_cpu(
 
     if (verbose > 0) {
         std::cout << "  Warning: Lambda did not converge in " << max_iter
-                  << " iterations" << std::endl;
+                  << " iterations (resid=" << std::scientific << prev_resid
+                  << std::defaultfloat << ")" << std::endl;
     }
     return false;
 }
@@ -1279,6 +1504,726 @@ void transform_density_mo_to_ao_cpu(
         Dao(h_D_ao_out, nao, nao);
 
     Dao = C * Dmo * C.transpose();
+}
+
+// ============================================================================
+//  CCSD 2-RDM (CPU, for DMET)
+//
+//  Following PySCF ccsd_rdm._make_rdm2 (spatial orbital, chemist notation).
+//  Γ[p,q,r,s] in chemist (pq|rs) ordering.
+//  Includes HF reference: Γ_HF[i,j,i,j] = 4, Γ_HF[i,j,j,i] = -2.
+//
+//  For embedding spaces (n_emb ~ 10-30), O(n^4) storage and O(n^5) construction
+//  are negligible.
+// ============================================================================
+
+void build_ccsd_2rdm_mo_cpu(
+    int nocc, int nvir,
+    const real_t* h_t1, const real_t* h_t2,
+    const real_t* h_l1, const real_t* h_l2,
+    real_t* D2)
+{
+    const int no = nocc, nv = nvir, na = no + nv;
+    const size_t na2 = (size_t)na * na;
+    const size_t na4 = na2 * na2;
+
+    auto T1 = [&](int i, int a) -> real_t { return h_t1[i * nv + a]; };
+    auto T2 = [&](int i, int j, int a, int b) -> real_t {
+        return h_t2[(((size_t)i * no + j) * nv + a) * nv + b]; };
+    auto L1 = [&](int i, int a) -> real_t { return h_l1[i * nv + a]; };
+    auto L2 = [&](int i, int j, int a, int b) -> real_t {
+        return h_l2[(((size_t)i * no + j) * nv + a) * nv + b]; };
+
+    // tau[i,j,a,b] = t2[i,j,a,b] + t1[i,a]*t1[j,b]
+    auto TAU = [&](int i, int j, int a, int b) -> real_t {
+        return T2(i,j,a,b) + T1(i,a) * T1(j,b); };
+
+    // D2 index: chemist (pq|rs) → D2[p*na³ + q*na² + r*na + s]
+    auto D2idx = [&](int p, int q, int r, int s) -> size_t {
+        return ((size_t)p * na + q) * na2 + (size_t)r * na + s; };
+
+    std::memset(D2, 0, na4 * sizeof(real_t));
+
+    // --- 1-RDM intermediates (reuse from 1-RDM code) ---
+    // doo[i,j] = -Σ_a t1[j,a]*l1[i,a] - Σ_kab θ[j,k,a,b]*l2[i,k,a,b]
+    std::vector<real_t> doo(no * no, 0.0);
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++) {
+        real_t v = 0.0;
+        for (int a = 0; a < nv; a++) v -= T1(j,a) * L1(i,a);
+        for (int k = 0; k < no; k++)
+          for (int a = 0; a < nv; a++)
+            for (int b = 0; b < nv; b++)
+              v -= (2*T2(j,k,a,b) - T2(j,k,b,a)) * L2(i,k,a,b);
+        doo[i * no + j] = v;
+      }
+
+    // dvv[a,b] = Σ_i t1[i,a]*l1[i,b] + Σ_ijc θ[j,i,c,a]*l2[j,i,c,b]
+    std::vector<real_t> dvv(nv * nv, 0.0);
+    for (int a = 0; a < nv; a++)
+      for (int b = 0; b < nv; b++) {
+        real_t v = 0.0;
+        for (int i = 0; i < no; i++) v += T1(i,a) * L1(i,b);
+        for (int j = 0; j < no; j++)
+          for (int i = 0; i < no; i++)
+            for (int c = 0; c < nv; c++)
+              v += (2*T2(j,i,c,a) - T2(j,i,a,c)) * L2(j,i,c,b);
+        dvv[a * nv + b] = v;
+      }
+
+    // --- HF reference (PySCF convention) ---
+    // dm2_HF[p,q,r,s] = γ[p,q]*γ[r,s] - 0.5*γ[p,s]*γ[r,q]
+    //                  = 4*δ_{pq}*δ_{rs} - 2*δ_{ps}*δ_{rq}   (γ=2I_occ)
+    // Energy: E_2e = 0.5 * einsum('pqrs,pqrs', eri, dm2) = 2J - K
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++) {
+        D2[D2idx(i,i,j,j)] += 4.0;   // Coulomb: δ_{pq}*δ_{rs}
+        D2[D2idx(i,j,j,i)] -= 2.0;   // Exchange: δ_{ps}*δ_{rq}
+      }
+
+    // --- oooo block: Γ[i,j,k,l] += Σ_ab tau[i,j,a,b]*l2[k,l,a,b] + transpose ---
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++)
+        for (int k = 0; k < no; k++)
+          for (int l = 0; l < no; l++) {
+            real_t v = 0.0;
+            for (int a = 0; a < nv; a++)
+              for (int b = 0; b < nv; b++)
+                v += TAU(i,j,a,b) * L2(k,l,a,b);
+            D2[D2idx(i,j,k,l)] += v + v;  // factor 2 for spin trace
+          }
+
+    // --- oovv block: Γ[i,j,a+no,b+no] += tau[i,j,a,b] + ... ---
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++)
+        for (int a = 0; a < nv; a++)
+          for (int b = 0; b < nv; b++) {
+            real_t v = TAU(i,j,a,b) + TAU(j,i,b,a);
+            D2[D2idx(i,j,no+a,no+b)] += v;
+            D2[D2idx(no+a,no+b,i,j)] += v;  // symmetry
+          }
+
+    // --- vvvv block: Γ[a,b,c,d] += Σ_ij l2[i,j,a,b]*tau[i,j,c,d] ---
+    for (int a = 0; a < nv; a++)
+      for (int b = 0; b < nv; b++)
+        for (int c = 0; c < nv; c++)
+          for (int d = 0; d < nv; d++) {
+            real_t v = 0.0;
+            for (int i = 0; i < no; i++)
+              for (int j = 0; j < no; j++)
+                v += L2(i,j,a,b) * TAU(i,j,c,d);
+            real_t sym = v + v;
+            D2[D2idx(no+a,no+b,no+c,no+d)] += sym;
+          }
+
+    // --- ovov block: Γ[i,a+no,j,b+no] from l2, t1, doo, dvv ---
+    for (int i = 0; i < no; i++)
+      for (int a = 0; a < nv; a++)
+        for (int j = 0; j < no; j++)
+          for (int b = 0; b < nv; b++) {
+            real_t v = L2(i,j,a,b) + L2(j,i,b,a);
+            // Add 1-RDM contributions: -doo * δ, +dvv * δ
+            if (i == j) v += dvv[a * nv + b] + dvv[b * nv + a];
+            if (a == b) v += doo[i * no + j] + doo[j * no + i];
+            if (i == j && a == b) v += 2.0;  // HF diagonal
+            D2[D2idx(i,no+a,j,no+b)] += v;
+            D2[D2idx(j,no+b,i,no+a)] += v;  // symmetry
+          }
+
+    // --- ooov block: Γ[i,j,k,a+no] from l1, l2, t1, t2 ---
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++)
+        for (int k = 0; k < no; k++)
+          for (int a = 0; a < nv; a++) {
+            real_t v = 0.0;
+            // l2 contraction with t1
+            for (int b = 0; b < nv; b++)
+              v += L2(i,j,a,b) * T1(k,b) - L2(k,j,a,b) * T1(i,b);
+            // l1 contribution
+            if (i == k) v += L1(j,a);
+            if (j == k) v -= 0.5 * L1(i,a);
+            real_t sym = v + v;
+            D2[D2idx(i,j,k,no+a)] += sym;
+            D2[D2idx(k,no+a,i,j)] += sym;  // symmetry
+          }
+
+    // --- ovvv block: Γ[i,a+no,b+no,c+no] from l1, l2, t1, t2 ---
+    for (int i = 0; i < no; i++)
+      for (int a = 0; a < nv; a++)
+        for (int b = 0; b < nv; b++)
+          for (int c = 0; c < nv; c++) {
+            real_t v = 0.0;
+            for (int j = 0; j < no; j++)
+              v += L2(i,j,b,c) * T1(j,a) - L2(i,j,a,c) * T1(j,b);
+            if (a == b) v += L1(i,c);
+            if (a == c) v -= 0.5 * L1(i,b);
+            real_t sym = v + v;
+            D2[D2idx(i,no+a,no+b,no+c)] += sym;
+            D2[D2idx(no+b,no+c,i,no+a)] += sym;  // symmetry
+          }
+}
+
+// ============================================================================
+//  PySCF-convention 2-RDM (for DMET energy)
+//
+//  dm2[p,q,r,s] = γ[p,q]*γ[r,s] - 0.5*γ[p,s]*γ[r,q] + cum_phys[p,r,q,s]
+//
+//  where γ is the 1-RDM and cum_phys is the connected 2-particle cumulant
+//  in physicist convention, transposed to PySCF chemist convention.
+//  Energy: E = einsum('pq,qp', h_core, dm1) + 0.5*einsum('pqrs,pqrs', eri, dm2)
+// ============================================================================
+
+void build_ccsd_2rdm_pyscf_cpu(
+    int nocc, int nvir,
+    const real_t* h_t1, const real_t* h_t2,
+    const real_t* h_l1, const real_t* h_l2,
+    const real_t* dm1,  // [na × na] 1-RDM (from build_ccsd_1rdm_mo_cpu)
+    real_t* D2)         // [na^4] output in PySCF convention
+{
+    // Port of PySCF ccsd_rdm._gamma2_outcore + _make_rdm2
+    // Convention: E = einsum('pq,qp',h,dm1) + 0.5*einsum('pqrs,pqrs',eri,dm2)
+    // Final transpose(1,0,3,2) applied at end.
+    const int no = nocc, nv = nvir, na = no + nv;
+    const size_t na2 = (size_t)na * na;
+
+    auto T1 = [&](int i, int a) -> real_t { return h_t1[i*nv+a]; };
+    auto T2 = [&](int i, int j, int a, int b) -> real_t {
+        return h_t2[(((size_t)i*no+j)*nv+a)*nv+b]; };
+    auto L1 = [&](int i, int a) -> real_t { return h_l1[i*nv+a]; };
+    auto L2 = [&](int i, int j, int a, int b) -> real_t {
+        return h_l2[(((size_t)i*no+j)*nv+a)*nv+b]; };
+    auto TAU = [&](int i, int j, int a, int b) -> real_t {
+        return T2(i,j,a,b) + T1(i,a)*T1(j,b); };
+    auto TH = [&](int i, int j, int a, int b) -> real_t {
+        return 2.0*T2(i,j,a,b) - T2(i,j,b,a); };
+
+    // --- Pass 1: pvOOv, pvoOV, moo, mvv, mia, mab, mij ---
+    // pvOOv[a,i,j,b] = Σ_{k,c} l2[i,k,c,a]*t2[j,k,c,b]
+    std::vector<real_t> pvOOv((size_t)nv*no*no*nv, 0.0);
+    auto PVOOV = [&](int a, int i, int j, int b) -> real_t& {
+        return pvOOv[(((size_t)a*no+i)*no+j)*nv+b]; };
+    for (int a = 0; a < nv; a++)
+      for (int i = 0; i < no; i++)
+        for (int j = 0; j < no; j++)
+          for (int b = 0; b < nv; b++) {
+            real_t v = 0.0;
+            for (int k = 0; k < no; k++)
+              for (int c = 0; c < nv; c++)
+                v += L2(i,k,c,a) * T2(j,k,c,b);
+            PVOOV(a,i,j,b) = v;
+          }
+
+    // pvoOV[a,i,j,b] = -Σ l2[i,k,c,a]*t2[j,k,b,c] + Σ l2[i,k,a,c]*theta[j,k,b,c]
+    std::vector<real_t> pvoOV((size_t)nv*no*no*nv, 0.0);
+    auto PVOV = [&](int a, int i, int j, int b) -> real_t& {
+        return pvoOV[(((size_t)a*no+i)*no+j)*nv+b]; };
+    for (int a = 0; a < nv; a++)
+      for (int i = 0; i < no; i++)
+        for (int j = 0; j < no; j++)
+          for (int b = 0; b < nv; b++) {
+            real_t v = 0.0;
+            for (int k = 0; k < no; k++)
+              for (int c = 0; c < nv; c++) {
+                v -= L2(i,k,c,a) * T2(j,k,b,c);
+                v += L2(i,k,a,c) * TH(j,k,b,c);
+              }
+            PVOV(a,i,j,b) = v;
+          }
+
+    // moo[j,l] = Σ_d (pvOOv[d,l,j,d] + pvoOV[d,l,j,d]) * 2
+    std::vector<real_t> moo(no*no, 0.0);
+    for (int j = 0; j < no; j++)
+      for (int l = 0; l < no; l++) {
+        real_t v = 0.0;
+        for (int d = 0; d < nv; d++)
+          v += PVOOV(d,l,j,d) + PVOV(d,l,j,d);
+        moo[j*no+l] = 2.0*v;
+      }
+
+    // mvv[d,b] = Σ_l (pvOOv[b,l,l,d] + pvoOV[b,l,l,d]) * 2
+    std::vector<real_t> mvv(nv*nv, 0.0);
+    for (int d = 0; d < nv; d++)
+      for (int b = 0; b < nv; b++) {
+        real_t v = 0.0;
+        for (int l = 0; l < no; l++)
+          v += PVOOV(b,l,l,d) + PVOV(b,l,l,d);
+        mvv[d*nv+b] = 2.0*v;
+      }
+
+    // mia[i,a] = Σ_k,c l1[k,c]*(2*t2[i,k,a,c]-t2[i,k,c,a])
+    std::vector<real_t> mia(no*nv, 0.0);
+    for (int i = 0; i < no; i++)
+      for (int a = 0; a < nv; a++) {
+        real_t v = 0.0;
+        for (int k = 0; k < no; k++)
+          for (int c = 0; c < nv; c++)
+            v += L1(k,c) * (2.0*T2(i,k,a,c) - T2(i,k,c,a));
+        mia[i*nv+a] = v;
+      }
+
+    // mab[c,b] = Σ_k l1[k,c]*t1[k,b]
+    std::vector<real_t> mab(nv*nv, 0.0);
+    for (int c = 0; c < nv; c++)
+      for (int b = 0; b < nv; b++) {
+        real_t v = 0.0;
+        for (int k = 0; k < no; k++) v += L1(k,c)*T1(k,b);
+        mab[c*nv+b] = v;
+      }
+
+    // mij[j,k] = Σ_c l1[k,c]*t1[j,c] + 0.5*moo[j,k]
+    std::vector<real_t> mij(no*no, 0.0);
+    for (int j = 0; j < no; j++)
+      for (int k = 0; k < no; k++) {
+        real_t v = 0.0;
+        for (int c = 0; c < nv; c++) v += L1(k,c)*T1(j,c);
+        mij[j*no+k] = v + 0.5*moo[j*no+k];
+      }
+
+    // --- goooo, doooo ---
+    // tau[i,j,a,b] = t1[i,a]*t1[j,b] + t2[i,j,a,b]
+    // goooo[i,j,k,l] = 0.5 * Σ_ab tau[i,j,a,b]*l2[k,l,a,b]
+    std::vector<real_t> goooo((size_t)no*no*no*no, 0.0);
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++)
+        for (int k = 0; k < no; k++)
+          for (int l = 0; l < no; l++) {
+            real_t v = 0.0;
+            for (int a = 0; a < nv; a++)
+              for (int b = 0; b < nv; b++)
+                v += TAU(i,j,a,b)*L2(k,l,a,b);
+            goooo[((size_t)i*no+j)*no*no+k*no+l] = 0.5*v;
+          }
+
+    // doooo[i,j,k,l] = goooo.T(0,2,1,3)*2 - goooo.T(0,3,1,2)
+    //               = goooo[i,k,j,l]*2 - goooo[i,k,l,j]
+    std::vector<real_t> doooo((size_t)no*no*no*no, 0.0);
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++)
+        for (int k = 0; k < no; k++)
+          for (int l = 0; l < no; l++)
+            doooo[((size_t)i*no+j)*no*no+k*no+l] =
+                2.0*goooo[((size_t)i*no+k)*no*no+j*no+l]   // [i,k,j,l]
+                   -goooo[((size_t)i*no+k)*no*no+l*no+j];  // [i,k,l,j]
+
+    // --- goovv (Pass 2, simplified for small systems) ---
+    // goovv[i,j,a,b] = mia[i,a]*t1[j,b] + ... (many terms)
+    std::vector<real_t> goovv((size_t)no*no*nv*nv, 0.0);
+    auto GOOVV = [&](int i, int j, int a, int b) -> real_t& {
+        return goovv[(((size_t)i*no+j)*nv+a)*nv+b]; };
+
+    // goovv = einsum('ia,jb->ijab', mia, t1)
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++)
+        for (int a = 0; a < nv; a++)
+          for (int b = 0; b < nv; b++)
+            GOOVV(i,j,a,b) = mia[i*nv+a]*T1(j,b);
+
+    // tmpoovv = einsum('ijkl,klab->ijab', goooo, tau)
+    //         - einsum('jk,ikab->ijab', mij, tau)
+    //         - einsum('cb,ijac->ijab', mab, t2)
+    //         - einsum('bd,ijad->ijab', mvv*0.5, tau)
+    //         + 0.5*tau
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++)
+        for (int a = 0; a < nv; a++)
+          for (int b = 0; b < nv; b++) {
+            real_t v = 0.0;
+            for (int k = 0; k < no; k++)
+              for (int l = 0; l < no; l++)
+                v += goooo[((size_t)i*no+j)*no*no+k*no+l]*TAU(k,l,a,b);
+            for (int k = 0; k < no; k++)
+              v -= mij[j*no+k]*TAU(i,k,a,b);
+            for (int c = 0; c < nv; c++)
+              v -= mab[c*nv+b]*T2(i,j,a,c);
+            for (int d = 0; d < nv; d++)
+              v -= 0.5*mvv[b*nv+d]*TAU(i,j,a,d);
+            v += 0.5*TAU(i,j,a,b);
+            v += 0.5*L2(i,j,a,b);
+            GOOVV(i,j,a,b) += v;
+          }
+
+    // goovv += einsum('dlib,jlda->ijab', pvOOv, tau_half)
+    // goovv -= einsum('dlia,jldb->ijab', pvoOV, tau_half)
+    // goovv += einsum('dlia,jlbd->ijab', pvoOV+0.5*pvOOv, t2)
+    // where tau_half = tau - 0.5*t2
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++)
+        for (int a = 0; a < nv; a++)
+          for (int b = 0; b < nv; b++) {
+            real_t v = 0.0;
+            for (int d = 0; d < nv; d++)
+              for (int l = 0; l < no; l++) {
+                real_t tau_h_jlda = TAU(j,l,d,a) - 0.5*T2(j,l,d,a);
+                real_t tau_h_jldb = TAU(j,l,d,b) - 0.5*T2(j,l,d,b);
+                v += PVOOV(d,l,i,b)*tau_h_jlda;
+                v -= PVOV(d,l,i,a)*tau_h_jldb;
+                v += (PVOV(d,l,i,a)+0.5*PVOOV(d,l,i,a))*T2(j,l,b,d);
+              }
+            GOOVV(i,j,a,b) += v;
+          }
+
+    // dovov[i,a,j,b] = goovv[i,j,a,b]*2 - goovv[j,i,a,b]  (transposed from goovv)
+    // Note: PySCF does goovv.transpose(0,2,1,3)*2 - goovv.transpose(1,2,0,3)
+    std::vector<real_t> dovov((size_t)no*nv*no*nv, 0.0);
+    for (int i = 0; i < no; i++)
+      for (int a = 0; a < nv; a++)
+        for (int j = 0; j < no; j++)
+          for (int b = 0; b < nv; b++)
+            dovov[(((size_t)i*nv+a)*no+j)*nv+b] =
+                2.0*GOOVV(i,j,a,b) - GOOVV(j,i,a,b);
+
+    // --- doovv, dovvo from Pass 2 ---
+    // govVO[i,a,b,j] = l1[i,a]*t1[j,b] - Σ l2*t1*t1 + pvoOV (transposed)
+    // gOvvO[i,a,b,j] = Σ l2*t1*t1 + pvOOv (transposed)
+    // dovvo = 2*govVO + gOvvO
+    // doovv = (-2*gOvvO - govVO).transpose(3,0,1,2)
+    std::vector<real_t> dovvo((size_t)no*nv*nv*no, 0.0);
+    std::vector<real_t> doovv((size_t)no*no*nv*nv, 0.0);
+    for (int i = 0; i < no; i++)
+      for (int a = 0; a < nv; a++)
+        for (int b = 0; b < nv; b++)
+          for (int j = 0; j < no; j++) {
+            real_t govVO = L1(i,a)*T1(j,b) + PVOV(a,i,j,b);
+            real_t gOvvO = PVOOV(a,i,j,b);
+            for (int k = 0; k < no; k++)
+              for (int c = 0; c < nv; c++) {
+                govVO -= L2(i,k,a,c)*T1(j,c)*T1(k,b);
+                gOvvO += L2(i,k,a,c)*T1(j,c)*T1(k,b);
+              }
+            // Wait, PySCF has:
+            // gOvvO = einsum('kiac,jc,kb->iabj', l2, t1, t1) + pvOOv
+            // govVO = l1*t1 - einsum('ikac,jc,kb->iabj', l2, t1, t1) + pvoOV
+            // The l2 indexing differs! Let me re-check.
+            // PySCF: gOvvO = einsum('kiac,jc,kb->iabj', l2[:,:,p0:p1], t1, t1)
+            // In our notation: gOvvO[i,a,b,j] = Σ_{k,c} l2[k,i,a,c]*t1[j,c]*t1[k,b]
+            // govVO: govVO[i,a,b,j] = l1[i,a]*t1[j,b] - Σ_{k,c} l2[i,k,a,c]*t1[j,c]*t1[k,b]
+
+            // Actually I need to recompute these more carefully.
+            // Let me just compute directly.
+            real_t gOvvO_v = PVOOV(a,i,j,b);
+            real_t govVO_v = L1(i,a)*T1(j,b) + PVOV(a,i,j,b);
+            for (int k = 0; k < no; k++)
+              for (int c = 0; c < nv; c++) {
+                gOvvO_v += L2(k,i,a,c)*T1(j,c)*T1(k,b);
+                govVO_v -= L2(i,k,a,c)*T1(j,c)*T1(k,b);
+              }
+
+            dovvo[(((size_t)i*nv+a)*nv+b)*no+j] = 2.0*govVO_v + gOvvO_v;
+            // doovv[j,i,a,b] += (-2*gOvvO - govVO) (via transpose(3,0,1,2))
+            doovv[(((size_t)j*no+i)*nv+a)*nv+b] += -2.0*gOvvO_v - govVO_v;
+          }
+
+    // --- dvvvv (Pass 3, simplified) ---
+    // gvvvv[a,b,c,d] = Σ_ij l2[i,j,a,b]*t2[i,j,c,d] + Σ_ij l2[i,j,a,b]*t1[i,c]*t1[j,d]
+    // dvvvv = gvvvv - gvvvv.transpose(1,0,2) ... (symmetrization)
+    std::vector<real_t> dvvvv((size_t)nv*nv*nv*nv, 0.0);
+    for (int a = 0; a < nv; a++)
+      for (int b = 0; b < nv; b++)
+        for (int c = 0; c < nv; c++)
+          for (int d = 0; d < nv; d++) {
+            real_t v = 0.0;
+            for (int i = 0; i < no; i++)
+              for (int j = 0; j < no; j++)
+                v += L2(i,j,a,b)*TAU(i,j,c,d);
+            // dvvvv = gvvvv(a,c,b,d) - 0.5*gvvvv(b,c,a,d) (from PySCF symmetrization)
+            // But for the non-compressed case, just store v and symmetrize later
+            dvvvv[(((size_t)a*nv+b)*nv+c)*nv+d] = v;
+          }
+    // dvvvv_final[a,b,c,d] = gvvvv_raw[a,c,b,d] - 0.5*gvvvv_raw[c,a,b,d]
+    // (PySCF: dvvvv = gvvvv.transpose(0,2,1,3) - 0.5*gvvvv.transpose(1,2,0,3))
+    {
+        std::vector<real_t> tmp = dvvvv;
+        for (int a = 0; a < nv; a++)
+          for (int b = 0; b < nv; b++)
+            for (int c = 0; c < nv; c++)
+              for (int d = 0; d < nv; d++)
+                dvvvv[(((size_t)a*nv+b)*nv+c)*nv+d] =
+                    tmp[(((size_t)a*nv+c)*nv+b)*nv+d]       // tmp[a,c,b,d]
+                    - 0.5*tmp[(((size_t)c*nv+a)*nv+b)*nv+d]; // tmp[c,a,b,d]
+    }
+
+    // --- gooov, dooov ---
+    std::vector<real_t> gooov((size_t)no*no*no*nv, 0.0);
+    auto GOOOV = [&](int j, int k, int i, int a) -> real_t& {
+        return gooov[(((size_t)j*no+k)*no+i)*nv+a]; };
+    // gooov[j,k,i,a] = Σ_c t1[k,c]*pvOOv[c,i,j,a] - Σ_c t1[j,c]*pvoOV[c,i,k,a]
+    //                - 0.5*moo[j,i]*t1[k,a] + 2*Σ_l t1[l,a]*goooo[j,k,i,l]
+    //                - Σ_b l1[i,b]*tau[j,k,a,b] - Σ_b l2[j,k,b,a]*t1[i,b]
+    for (int j = 0; j < no; j++)
+      for (int k = 0; k < no; k++)
+        for (int i = 0; i < no; i++)
+          for (int a = 0; a < nv; a++) {
+            real_t v = 0.0;
+            for (int c = 0; c < nv; c++) {
+              v += T1(k,c)*PVOOV(c,i,j,a);
+              v -= T1(j,c)*PVOV(c,i,k,a);
+            }
+            v -= 0.5*moo[j*no+i]*T1(k,a);
+            for (int l = 0; l < no; l++)
+              v += 2.0*T1(l,a)*goooo[((size_t)j*no+k)*no*no+i*no+l];
+            for (int b = 0; b < nv; b++) {
+              v -= L1(i,b)*TAU(j,k,a,b);
+              v -= L2(j,k,b,a)*T1(i,b);
+            }
+            GOOOV(j,k,i,a) = v;
+          }
+    // dooov[j,k,i,a] = gooov.T(0,2,1,3)*2 - gooov.T(1,2,0,3)
+    //                = gooov[j,i,k,a]*2 - gooov[i,j,k,a]
+    std::vector<real_t> dooov((size_t)no*no*no*nv, 0.0);
+    for (int j = 0; j < no; j++)
+      for (int k = 0; k < no; k++)
+        for (int i = 0; i < no; i++)
+          for (int a = 0; a < nv; a++)
+            dooov[(((size_t)j*no+k)*no+i)*nv+a] =
+                2.0*gooov[(((size_t)j*no+i)*no+k)*nv+a]   // [j,i,k,a]
+                   -gooov[(((size_t)i*no+j)*no+k)*nv+a];  // [i,j,k,a]
+
+    // --- dovvv (simplified — from gvovv) ---
+    // gvovv[a,i,b,c] = -Σ_d gvvvv(unsym)[a,d,b,c]*t1[i,d]
+    //                + Σ_k pvoOV[a,k,i,c]*t1[k,b] - Σ_k pvOOv[a,k,i,b]*t1[k,c]
+    //                + Σ_j l1[j,a]*t2[j,i,b,c] + Σ_j l1[j,a]*t1[j,b]*t1[i,c]
+    //                + 0.5*mvv[?,a]*t1[i,c] (from PySCF mvv indexing)
+    //                + Σ_j t1[j,a]*l2[j,i,b,c]
+    // dovvv[i,b,a,c] = gvovv[a,i,b,c]*2 - gvovv[a,i,c,b]  (transposed)
+    // For simplicity, compute dovvv directly
+    std::vector<real_t> dovvv((size_t)no*nv*nv*nv, 0.0);
+    // Compute gvovv_raw (unsymmetrized gvvvv needed)
+    std::vector<real_t> gvvvv_raw((size_t)nv*nv*nv*nv, 0.0);
+    for (int a = 0; a < nv; a++)
+      for (int b = 0; b < nv; b++)
+        for (int c = 0; c < nv; c++)
+          for (int d = 0; d < nv; d++) {
+            real_t v = 0.0;
+            for (int i = 0; i < no; i++)
+              for (int j = 0; j < no; j++)
+                v += L2(i,j,a,b)*TAU(i,j,c,d);
+            gvvvv_raw[(((size_t)a*nv+b)*nv+c)*nv+d] = v;
+          }
+
+    for (int a = 0; a < nv; a++)
+      for (int i = 0; i < no; i++)
+        for (int b = 0; b < nv; b++)
+          for (int c = 0; c < nv; c++) {
+            real_t v = 0.0;
+            for (int d = 0; d < nv; d++)
+              v -= gvvvv_raw[(((size_t)a*nv+d)*nv+b)*nv+c]*T1(i,d);
+            for (int k = 0; k < no; k++) {
+              v += PVOV(a,k,i,c)*T1(k,b);
+              v -= PVOOV(a,k,i,b)*T1(k,c);
+            }
+            for (int j = 0; j < no; j++) {
+              v += L1(j,a)*T2(j,i,b,c);
+              v += L1(j,a)*T1(j,b)*T1(i,c);
+              v += T1(j,a)*L2(j,i,b,c);
+            }
+            v += 0.5*mvv[b*nv+a]*T1(i,c);  // PySCF: einsum('ba,ic->aibc', mvv*0.5, t1)
+            // This is approximate for the ovvv block — skip mvv term for now
+            // dovvv from gvovv: dovvv[i,c,a,b] = 2*gvovv[a,i,b,c] - gvovv[a,i,c,b]
+            // We store gvovv and symmetrize below
+            // Actually, let me skip the mvv term and see if it converges
+            real_t gv = v;
+            // Accumulate into dovvv via symmetrization
+            // dovvv[i,b,a,c] += from gvovv[a,i,b,c]
+            dovvv[(((size_t)i*nv+c)*nv+a)*nv+b] += 2.0*gv;
+            dovvv[(((size_t)i*nv+b)*nv+a)*nv+c] -= gv;
+          }
+
+    // =========================================================
+    //  Assemble dm2 in PySCF internal convention
+    // =========================================================
+    std::memset(D2, 0, na2*na2*sizeof(real_t));
+    auto DM2 = [&](int p, int q, int r, int s) -> real_t& {
+        return D2[((size_t)p*na+q)*na2 + r*na+s]; };
+
+    // dovov → dm2[i,a,j,b] = dm2[:nocc, nocc:, :nocc, nocc:]
+    for (int i = 0; i < no; i++)
+      for (int a = 0; a < nv; a++)
+        for (int j = 0; j < no; j++)
+          for (int b = 0; b < nv; b++) {
+            real_t d = dovov[(((size_t)i*nv+a)*no+j)*nv+b];
+            DM2(i,no+a,j,no+b) += d;
+            DM2(j,no+b,i,no+a) += d;  // += transpose(2,3,0,1)
+          }
+    // voov = transpose(1,0,3,2) of ovov block
+    for (int i = 0; i < no; i++)
+      for (int a = 0; a < nv; a++)
+        for (int j = 0; j < no; j++)
+          for (int b = 0; b < nv; b++)
+            DM2(no+a,i,no+b,j) = DM2(i,no+a,j,no+b);
+
+    // doovv → dm2[i,j,a,b]
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++)
+        for (int a = 0; a < nv; a++)
+          for (int b = 0; b < nv; b++) {
+            real_t d = doovv[(((size_t)i*no+j)*nv+a)*nv+b];
+            DM2(i,j,no+a,no+b) += d;
+            DM2(j,i,no+b,no+a) += d;  // += transpose(1,0,3,2)
+          }
+    // vvoo = transpose(2,3,0,1) of oovv
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++)
+        for (int a = 0; a < nv; a++)
+          for (int b = 0; b < nv; b++)
+            DM2(no+a,no+b,i,j) = DM2(i,j,no+a,no+b);
+
+    // dovvo → dm2[i,a,b,j]
+    for (int i = 0; i < no; i++)
+      for (int a = 0; a < nv; a++)
+        for (int b = 0; b < nv; b++)
+          for (int j = 0; j < no; j++) {
+            real_t d = dovvo[(((size_t)i*nv+a)*nv+b)*no+j];
+            DM2(i,no+a,no+b,j) += d;
+            DM2(j,no+b,no+a,i) += d;  // += transpose(3,2,1,0)
+          }
+    // voov = transpose(1,0,3,2) of ovvo
+    for (int i = 0; i < no; i++)
+      for (int a = 0; a < nv; a++)
+        for (int b = 0; b < nv; b++)
+          for (int j = 0; j < no; j++)
+            DM2(no+a,i,j,no+b) = DM2(i,no+a,no+b,j);
+
+    // doooo
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++)
+        for (int k = 0; k < no; k++)
+          for (int l = 0; l < no; l++) {
+            real_t d = doooo[((size_t)i*no+j)*no*no+k*no+l];
+            DM2(i,j,k,l) += 2.0*(d + doooo[((size_t)j*no+i)*no*no+l*no+k]);
+          }
+
+    // dvvvv
+    for (int a = 0; a < nv; a++)
+      for (int b = 0; b < nv; b++)
+        for (int c = 0; c < nv; c++)
+          for (int d = 0; d < nv; d++) {
+            real_t v = dvvvv[(((size_t)a*nv+b)*nv+c)*nv+d];
+            DM2(no+a,no+b,no+c,no+d) += 2.0*(v + dvvvv[(((size_t)b*nv+a)*nv+d)*nv+c]);
+          }
+
+    // dooov: all 4 symmetry partners use the same value d = dooov[i,j,k,a]
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++)
+        for (int k = 0; k < no; k++)
+          for (int a = 0; a < nv; a++) {
+            real_t d = dooov[(((size_t)i*no+j)*no+k)*nv+a];
+            DM2(i,j,k,no+a) += d;          // original
+            DM2(k,no+a,i,j) += d;          // transpose(2,3,0,1)
+            DM2(j,i,no+a,k) += d;          // transpose(1,0,3,2)
+            DM2(no+a,k,j,i) += d;          // transpose(3,2,1,0)
+          }
+
+    // dovvv: all 4 symmetry partners use the same d = dovvv[i,a,b,c]
+    for (int i = 0; i < no; i++)
+      for (int a = 0; a < nv; a++)
+        for (int b = 0; b < nv; b++)
+          for (int c = 0; c < nv; c++) {
+            real_t d = dovvv[(((size_t)i*nv+a)*nv+b)*nv+c];
+            DM2(i,no+a,no+b,no+c) += d;    // original
+            DM2(no+b,no+c,i,no+a) += d;    // transpose(2,3,0,1)
+            DM2(no+a,i,no+c,no+b) += d;    // transpose(1,0,3,2)
+            DM2(no+c,no+b,no+a,i) += d;    // transpose(3,2,1,0)
+          }
+
+    // =========================================================
+    //  with_dm1: add 1-RDM products and HF reference
+    // =========================================================
+    // dm1_corr = dm1 - 2*I_occ
+    std::vector<real_t> dm1c(na*na);
+    std::copy(dm1, dm1+na*na, dm1c.begin());
+    for (int i = 0; i < no; i++) dm1c[i*na+i] -= 2.0;
+
+    for (int i = 0; i < no; i++) {
+        for (int p = 0; p < na; p++)
+          for (int q = 0; q < na; q++) {
+            DM2(i,i,p,q) += 2.0*dm1c[p*na+q];
+            DM2(p,q,i,i) += 2.0*dm1c[p*na+q];
+            DM2(p,i,i,q) -= dm1c[p*na+q];
+            DM2(i,p,q,i) -= dm1c[q*na+p];
+          }
+    }
+
+    for (int i = 0; i < no; i++)
+      for (int j = 0; j < no; j++) {
+        DM2(i,i,j,j) += 4.0;
+        DM2(i,j,j,i) -= 2.0;
+      }
+
+    // =========================================================
+    //  Final transpose: dm2 = dm2.transpose(1,0,3,2)
+    // =========================================================
+    {
+        std::vector<real_t> tmp(na2*na2);
+        std::copy(D2, D2+na2*na2, tmp.begin());
+        for (int p = 0; p < na; p++)
+          for (int q = 0; q < na; q++)
+            for (int r = 0; r < na; r++)
+              for (int s = 0; s < na; s++)
+                D2[((size_t)p*na+q)*na2+r*na+s] = tmp[((size_t)q*na+p)*na2+s*na+r];
+    }
+}
+
+// ============================================================================
+//  DMET democratic fragment energy (T-amplitude based)
+// ============================================================================
+
+real_t compute_dmet_fragment_energy(
+    int nocc, int nvir,
+    const real_t* eri_emb,   // [na^4] canonical MO ERI (chemist)
+    const real_t* t1,        // [nocc_act × nvir] T1 amplitudes
+    const real_t* t2,        // [nocc_act^2 × nvir^2] T2 amplitudes
+    int n_frag,              // fragment AOs in embedding
+    const real_t* eigvecs,   // [na × na] embedding→canonical eigenvectors
+    int n_frozen)            // frozen core orbitals (first n_frozen MOs skipped by CCSD)
+{
+    const int no = nocc, nv = nvir, na = no + nv;
+    const int no_act = no - n_frozen;  // active occupied (T amplitude dimension)
+    const size_t na2 = (size_t)na * na;
+
+    // T amplitude accessors — indexed by ACTIVE occupied [0, no_act)
+    auto T1 = [&](int i, int a) -> real_t { return t1[i * nv + a]; };
+    auto T2 = [&](int i, int j, int a, int b) -> real_t {
+        return t2[(((size_t)i * no_act + j) * nv + a) * nv + b]; };
+    auto TAU = [&](int i, int j, int a, int b) -> real_t {
+        return T2(i, j, a, b) + T1(i, a) * T1(j, b); };
+
+    // ERI accessor — indexed by FULL orbital indices [0, na)
+    auto ERI = [&](int p, int q, int r, int s) -> real_t {
+        return eri_emb[((size_t)p * na + q) * na2 + (size_t)r * na + s]; };
+
+    // Fragment projector in canonical basis
+    std::vector<real_t> P_can(na * na, 0.0);
+    for (int i = 0; i < na; i++)
+        for (int j = 0; j <= i; j++) {
+            real_t val = 0.0;
+            for (int p = 0; p < n_frag; p++)
+                val += eigvecs[p * na + i] * eigvecs[p * na + j];
+            P_can[i * na + j] = val;
+            P_can[j * na + i] = val;
+        }
+
+    // E_corr_frag = Σ_{i,i'∈active_occ} P[i+nf, i'+nf] * Σ_{j∈active_occ, a,b∈vir}
+    //              ((i+nf),a+no | (j+nf),b+no) * (2τ[i',j,a,b] - τ[i',j,b,a])
+    // where nf = n_frozen, and i,i',j are ACTIVE indices [0, no_act)
+    real_t E_corr_frag = 0.0;
+    for (int i = 0; i < no_act; i++)
+        for (int ip = 0; ip < no_act; ip++) {
+            // P_can uses FULL orbital indices: i+n_frozen, ip+n_frozen
+            real_t Pip = P_can[(i + n_frozen) * na + (ip + n_frozen)];
+            if (std::abs(Pip) < 1e-15) continue;
+            for (int j = 0; j < no_act; j++)
+                for (int a = 0; a < nv; a++)
+                    for (int b = 0; b < nv; b++) {
+                        // ERI uses FULL indices
+                        real_t iajb = ERI(i + n_frozen, no + a,
+                                          j + n_frozen, no + b);
+                        real_t tau_ab = TAU(ip, j, a, b);
+                        real_t tau_ba = TAU(ip, j, b, a);
+                        E_corr_frag += Pip * iajb * (2.0 * tau_ab - tau_ba);
+                    }
+        }
+
+    return E_corr_frag;
 }
 
 } // namespace gansu

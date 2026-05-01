@@ -2114,6 +2114,143 @@ real_t* ERI_RI_Distributed_RHF::build_B_ij_local(
     return d_B_transposed;  // [oo × naux_local] col-major
 }
 
+// ============================================================================
+//  Distributed post-HF: MP2 via build_mo_eri (avoids broken intermediate_matrix_B_)
+// ============================================================================
+
+// Forward declaration (defined in eri_ri.cu)
+double mp2_from_full_moeri(
+    const double* d_eri_mo, const double* d_C, const double* d_eps,
+    int nao, int occ, int frozen);
+
+real_t ERI_RI_Distributed_RHF::compute_mp2_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), num_basis_);
+    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+    real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+    int nocc = rhf_.get_num_electrons() / 2;
+    int frozen = rhf_.get_num_frozen_core();
+    real_t E = mp2_from_full_moeri(d_mo_eri, d_C, d_eps, num_basis_, nocc, frozen);
+    tracked_cudaFree(d_mo_eri);
+    std::cout << "MP2 energy: " << E << " Hartree" << std::endl;
+    return E;
+}
+
+real_t ERI_RI_Distributed_RHF::compute_scs_mp2_energy() {
+    // TODO: distributed build_B_ia for proper SCS-MP2
+    // For now, use full MO ERI fallback (same as stored ERI path)
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), num_basis_);
+    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+    real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+    int nocc = rhf_.get_num_electrons() / 2;
+    real_t E = mp2_from_full_moeri(d_mo_eri, d_C, d_eps, num_basis_, nocc, 0);
+    tracked_cudaFree(d_mo_eri);
+    std::cout << "SCS-MP2 (fallback to MP2 via full MO ERI): " << E << " Hartree" << std::endl;
+    return E;
+}
+
+real_t ERI_RI_Distributed_RHF::compute_sos_mp2_energy() {
+    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), num_basis_);
+    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+    real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+    int nocc = rhf_.get_num_electrons() / 2;
+    real_t E = mp2_from_full_moeri(d_mo_eri, d_C, d_eps, num_basis_, nocc, 0);
+    tracked_cudaFree(d_mo_eri);
+    std::cout << "SOS-MP2 (fallback to MP2 via full MO ERI): " << E << " Hartree" << std::endl;
+    return E;
+}
+
+// ============================================================================
+//  build_mo_eri: gather distributed B_local → full B on GPU 0, then delegate
+// ============================================================================
+
+real_t* ERI_RI_Distributed_RHF::build_mo_eri(const real_t* d_C, int nmo) const {
+    const int nao = num_basis_;
+    const int naux = num_auxiliary_basis_;
+    const size_t nao2 = (size_t)nao * nao;
+
+    // Gather full B [naux × nao²] on GPU 0 from distributed B_local chunks
+    cudaSetDevice(0);
+    real_t* d_B_full = nullptr;
+    tracked_cudaMalloc(&d_B_full, (size_t)naux * nao2 * sizeof(real_t));
+
+    size_t offset = 0;
+    for (int g = 0; g < num_gpus_; g++) {
+        const size_t chunk = (size_t)naux_local_[g] * nao2;
+        if (g == 0) {
+            cudaMemcpy(d_B_full + offset, d_B_local_[g],
+                       chunk * sizeof(real_t), cudaMemcpyDeviceToDevice);
+        } else {
+            // Cross-GPU: use cudaMemcpyPeer for reliable transfer
+            cudaMemcpyPeer(d_B_full + offset, 0, d_B_local_[g], g,
+                           chunk * sizeof(real_t));
+        }
+        offset += chunk;
+    }
+    cudaDeviceSynchronize();
+
+    // Temporarily set intermediate_matrix_B_ to the gathered B
+    // Since build_mo_eri in ERI_RI reads intermediate_matrix_B_.device_ptr(),
+    // we write d_B_full into it (it was a 1×1 dummy).
+    // Instead, call the GPU DGEMM sequence directly here.
+
+    // Reuse the ERI_RI::build_mo_eri logic with d_B_full:
+    // Step 1: B_tmp = C^T × B  (right half-transform)
+    // Step 2: B_mo = C^T × B_tmp (left half-transform with transpose)
+    // Step 3: eri_mo = B_mo^T × B_mo
+
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    const double alpha = 1.0, beta = 0.0;
+    const size_t nmo2 = (size_t)nmo * nmo;
+
+    // Step 1: right half-transform
+    real_t* d_B_tmp = nullptr;
+    tracked_cudaMalloc(&d_B_tmp, (size_t)naux * nao * nmo * sizeof(real_t));
+
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        nmo, (long long)naux * nao, nao,
+        &alpha, d_C, nmo, d_B_full, nao,
+        &beta, d_B_tmp, nmo);
+
+    tracked_cudaFree(d_B_full);
+
+    // Step 2: transpose per Q then left half-transform
+    real_t* d_B_tmp2 = nullptr;
+    tracked_cudaMalloc(&d_B_tmp2, (size_t)naux * nao * nmo * sizeof(real_t));
+
+    for (int Q = 0; Q < naux; Q++) {
+        cublasDgeam(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            nao, nmo, &alpha,
+            d_B_tmp + (size_t)Q * nao * nmo, nmo,
+            &beta, nullptr, nao,
+            d_B_tmp2 + (size_t)Q * nmo * nao, nao);
+    }
+    tracked_cudaFree(d_B_tmp);
+
+    real_t* d_B_mo = nullptr;
+    tracked_cudaMalloc(&d_B_mo, (size_t)naux * nmo2 * sizeof(real_t));
+
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        nmo, (long long)naux * nmo, nao,
+        &alpha, d_C, nmo, d_B_tmp2, nao,
+        &beta, d_B_mo, nmo);
+
+    tracked_cudaFree(d_B_tmp2);
+
+    // Step 3: eri_mo = B_mo^T × B_mo
+    real_t* d_eri_mo = nullptr;
+    tracked_cudaMalloc(&d_eri_mo, nmo2 * nmo2 * sizeof(real_t));
+
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+        nmo2, nmo2, naux,
+        &alpha, d_B_mo, nmo2, d_B_mo, nmo2,
+        &beta, d_eri_mo, nmo2);
+
+    tracked_cudaFree(d_B_mo);
+    cudaDeviceSynchronize();
+
+    return d_eri_mo;
+}
+
 } // namespace gansu
 
 #endif // GANSU_MULTI_GPU

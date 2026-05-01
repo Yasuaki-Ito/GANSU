@@ -78,7 +78,9 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"ecp_filename", ""},                              // string: ECP file path
         {"num_gpus", "-1"},                                // int: number of GPUs (-1 = auto-detect all)
         {"adc_c_t", "1.3"},                                // real_t: SOS-ADC(2) t2 amplitude scaling
-        {"adc_c_c", "0.85"}                                // real_t: SOS-ADC(2) coupling block scaling
+        {"adc_c_c", "0.85"},                               // real_t: SOS-ADC(2) coupling block scaling
+        {"dmet_fragments", ""},                            // string: fragment specification e.g. "{0,1,2} {3,4,5}"
+        {"dmet_threshold", "1e-6"}                         // real_t: SVD threshold for bath orbital selection
     };
 
 

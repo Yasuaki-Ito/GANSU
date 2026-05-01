@@ -232,6 +232,11 @@ public:
     /// SOS-ADC(2) scaling: coupling block scaling (default 1.17)
     double get_adc_c_c() const { return adc_c_c_; }
 
+    /// DMET fragment specification string
+    const std::string& get_dmet_fragments_str() const { return dmet_fragments_str_; }
+    /// DMET SVD threshold for bath orbital selection
+    double get_dmet_threshold() const { return dmet_threshold_; }
+
     /**
      * @brief Get Shell-pair type info
      */
@@ -391,6 +396,8 @@ protected:
     const real_t schwarz_screening_threshold; ///< Schwartz screening threshold
     double adc_c_t_ = 1.3;   ///< SOS-ADC(2) t2 amplitude scaling
     double adc_c_c_ = 0.85;  ///< SOS-ADC(2) coupling block scaling
+    std::string dmet_fragments_str_;    ///< DMET fragment specification string
+    double dmet_threshold_ = 1e-6;     ///< SVD threshold for DMET bath orbital selection
     const int max_iter; ///< Maximum number of iterations
     int iter_; ///< Number of iterations
     real_t energy_difference_; ///< Energy difference between the current and the previous iteration

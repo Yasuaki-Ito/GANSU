@@ -37,7 +37,8 @@ enum class PostHFMethod {
     ADC2X,
     EOM_MP2,
     EOM_CC2,
-    EOM_CCSD
+    EOM_CCSD,
+    DMET_CCSD
 };
 
 } // namespace gansu

@@ -117,10 +117,6 @@ void mu2i_(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_B_p_m
 
 
 void mu2i_dgemm(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_B_p_mu_a, double* d_B_p_i_a, cublasHandle_t &handle){
-    // cublasManager cublas;
-    // cublasHandle_t handle;
-    // cublasCreate(&handle);
-
     const double alpha = 1.0;
     const double beta = 0.0;
 
@@ -139,16 +135,17 @@ void mu2i_dgemm(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_
         d_B_p_i_a, row
     );
 
-    cudaMemset(d_B_p_mu_a, 0, norbs * (size_t)norbs * naux * sizeof(double));
+    // beta=0 in DGEMM fully overwrites output; no memset needed
+    // (previous memset had buffer overflow: norbs*norbs*naux > allocated norbs*nvir*naux)
 
     cublasDgemm(
-        handle, 
-        CUBLAS_OP_N, CUBLAS_OP_N, 
-        nocc, naux * nvir, norbs, 
-        &alpha, 
-        d_C, norbs, 
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        nocc, naux * nvir, norbs,
+        &alpha,
+        d_C, norbs,
         d_B_p_i_a, norbs,
-        &beta, 
+        &beta,
         d_B_p_mu_a, nocc
     );
 
@@ -210,7 +207,6 @@ void transform_intermediate_matrix(int norbs, int nocc, int nvir, int naux, doub
 
 
 void mu2i_dgemm(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_B_p_mu_a, double* d_B_p_i_a){
-    // cublasManager cublas;
     cublasHandle_t handle;
     cublasCreate(&handle);
 
@@ -232,16 +228,17 @@ void mu2i_dgemm(int norbs, int nocc, int nvir, int naux, double* d_C, double* d_
         d_B_p_i_a, row
     );
 
-    cudaMemset(d_B_p_mu_a, 0, norbs * (size_t)norbs * naux * sizeof(double));
+    // beta=0 in DGEMM fully overwrites output; no memset needed
+    // (previous memset had buffer overflow: norbs*norbs*naux > allocated norbs*nvir*naux)
 
     cublasDgemm(
-        handle, 
-        CUBLAS_OP_N, CUBLAS_OP_N, 
-        nocc, naux * nvir, norbs, 
-        &alpha, 
-        d_C, norbs, 
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        nocc, naux * nvir, norbs,
+        &alpha,
+        d_C, norbs,
         d_B_p_i_a, norbs,
-        &beta, 
+        &beta,
         d_B_p_mu_a, nocc
     );
 
@@ -607,9 +604,6 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
 
     transform_intermediate_matrix(num_basis_, nocc, nvir, num_auxiliary_basis, d_C, d_intermediate_matrix_B, d_tmp);
     tracked_cudaFree(d_tmp);
-
-
-
 
 
     size_t num_blocks_3 = ((size_t)(nocc_block * (size_t)nvir * (nvir - 1.0) / 2) + num_threads - 1) / num_threads, 

@@ -306,83 +306,153 @@ real_t* ERI::build_mo_eri(const real_t* d_C, int nmo) const {
     if (!d_eri_ao) {
         THROW_EXCEPTION("build_mo_eri: no AO ERI available for this ERI method.");
     }
-    const size_t N = nmo;
-    const size_t n4 = N * N * N * N;
-    real_t* d_eri_mo = nullptr;
-    tracked_cudaMalloc(&d_eri_mo, n4 * sizeof(real_t));
+    const size_t nmo4 = (size_t)nmo * nmo * nmo * nmo;
 
-    if (!gpu::gpu_available()) {
-        // CPU: 4-index AO→MO transform using O(N^5) algorithm
-        // (pq|rs) = sum_{mu,nu,la,si} C(mu,p)*C(nu,q)*(mu nu|la si)*C(la,r)*C(si,s)
-        // Step-by-step quarter transforms to keep O(N^5):
-        real_t* tmp1 = nullptr;
-        real_t* tmp2 = nullptr;
-        tracked_cudaMalloc(&tmp1, n4 * sizeof(real_t));
-        tracked_cudaMalloc(&tmp2, n4 * sizeof(real_t));
+    // Base class: square transform only (nmo == nao assumed).
+    // Subclasses (ERI_Stored, ERI_RI) override for rectangular C.
+    {
+        real_t* d_eri_mo = nullptr;
+        tracked_cudaMalloc(&d_eri_mo, nmo4 * sizeof(real_t));
+        if (!gpu::gpu_available()) {
+            // CPU square transform (original code)
+            const size_t N = nmo;
+            real_t* tmp1 = nullptr; real_t* tmp2 = nullptr;
+            tracked_cudaMalloc(&tmp1, nmo4 * sizeof(real_t));
+            tracked_cudaMalloc(&tmp2, nmo4 * sizeof(real_t));
 
-        // Step 1: contract 4th index: tmp1(mu,nu,la,s) = sum_si eri(mu,nu,la,si) * C(si,s)
-        std::memset(tmp1, 0, n4 * sizeof(real_t));
-        #pragma omp parallel for schedule(dynamic)
-        for (size_t mu = 0; mu < N; mu++)
-            for (size_t nu = 0; nu < N; nu++)
-                for (size_t la = 0; la < N; la++)
-                    for (size_t s = 0; s < N; s++) {
-                        double val = 0.0;
-                        for (size_t si = 0; si < N; si++)
-                            val += d_eri_ao[mu*N*N*N + nu*N*N + la*N + si] * d_C[si*N + s];
-                        tmp1[mu*N*N*N + nu*N*N + la*N + s] = val;
-                    }
-
-        // Step 2: contract 3rd index: tmp2(mu,nu,r,s) = sum_la tmp1(mu,nu,la,s) * C(la,r)
-        std::memset(tmp2, 0, n4 * sizeof(real_t));
-        #pragma omp parallel for schedule(dynamic)
-        for (size_t mu = 0; mu < N; mu++)
-            for (size_t nu = 0; nu < N; nu++)
-                for (size_t r = 0; r < N; r++)
-                    for (size_t s = 0; s < N; s++) {
-                        double val = 0.0;
-                        for (size_t la = 0; la < N; la++)
-                            val += tmp1[mu*N*N*N + nu*N*N + la*N + s] * d_C[la*N + r];
-                        tmp2[mu*N*N*N + nu*N*N + r*N + s] = val;
-                    }
-
-        // Step 3: contract 2nd index: tmp1(mu,q,r,s) = sum_nu tmp2(mu,nu,r,s) * C(nu,q)
-        std::memset(tmp1, 0, n4 * sizeof(real_t));
-        #pragma omp parallel for schedule(dynamic)
-        for (size_t mu = 0; mu < N; mu++)
-            for (size_t q = 0; q < N; q++)
-                for (size_t r = 0; r < N; r++)
-                    for (size_t s = 0; s < N; s++) {
-                        double val = 0.0;
-                        for (size_t nu = 0; nu < N; nu++)
-                            val += tmp2[mu*N*N*N + nu*N*N + r*N + s] * d_C[nu*N + q];
-                        tmp1[mu*N*N*N + q*N*N + r*N + s] = val;
-                    }
-
-        // Step 4: contract 1st index: eri_mo(p,q,r,s) = sum_mu tmp1(mu,q,r,s) * C(mu,p)
-        std::memset(d_eri_mo, 0, n4 * sizeof(real_t));
-        #pragma omp parallel for schedule(dynamic)
-        for (size_t p = 0; p < N; p++)
-            for (size_t q = 0; q < N; q++)
-                for (size_t r = 0; r < N; r++)
-                    for (size_t s = 0; s < N; s++) {
-                        double val = 0.0;
-                        for (size_t mu = 0; mu < N; mu++)
-                            val += d_C[mu*N + p] * tmp1[mu*N*N*N + q*N*N + r*N + s];
-                        d_eri_mo[p*N*N*N + q*N*N + r*N + s] = val;
-                    }
-
-        tracked_cudaFree(tmp1);
-        tracked_cudaFree(tmp2);
+            std::memset(tmp1, 0, nmo4 * sizeof(real_t));
+            #pragma omp parallel for schedule(dynamic)
+            for (size_t mu = 0; mu < N; mu++)
+                for (size_t nu = 0; nu < N; nu++)
+                    for (size_t la = 0; la < N; la++)
+                        for (size_t s = 0; s < N; s++) {
+                            double val = 0.0;
+                            for (size_t si = 0; si < N; si++)
+                                val += d_eri_ao[mu*N*N*N + nu*N*N + la*N + si] * d_C[si*N + s];
+                            tmp1[mu*N*N*N + nu*N*N + la*N + s] = val;
+                        }
+            std::memset(tmp2, 0, nmo4 * sizeof(real_t));
+            #pragma omp parallel for schedule(dynamic)
+            for (size_t mu = 0; mu < N; mu++)
+                for (size_t nu = 0; nu < N; nu++)
+                    for (size_t r = 0; r < N; r++)
+                        for (size_t s = 0; s < N; s++) {
+                            double val = 0.0;
+                            for (size_t la = 0; la < N; la++)
+                                val += tmp1[mu*N*N*N + nu*N*N + la*N + s] * d_C[la*N + r];
+                            tmp2[mu*N*N*N + nu*N*N + r*N + s] = val;
+                        }
+            std::memset(tmp1, 0, nmo4 * sizeof(real_t));
+            #pragma omp parallel for schedule(dynamic)
+            for (size_t mu = 0; mu < N; mu++)
+                for (size_t q = 0; q < N; q++)
+                    for (size_t r = 0; r < N; r++)
+                        for (size_t s = 0; s < N; s++) {
+                            double val = 0.0;
+                            for (size_t nu = 0; nu < N; nu++)
+                                val += tmp2[mu*N*N*N + nu*N*N + r*N + s] * d_C[nu*N + q];
+                            tmp1[mu*N*N*N + q*N*N + r*N + s] = val;
+                        }
+            std::memset(d_eri_mo, 0, nmo4 * sizeof(real_t));
+            #pragma omp parallel for schedule(dynamic)
+            for (size_t p = 0; p < N; p++)
+                for (size_t q = 0; q < N; q++)
+                    for (size_t r = 0; r < N; r++)
+                        for (size_t s = 0; s < N; s++) {
+                            double val = 0.0;
+                            for (size_t mu = 0; mu < N; mu++)
+                                val += d_C[mu*N + p] * tmp1[mu*N*N*N + q*N*N + r*N + s];
+                            d_eri_mo[p*N*N*N + q*N*N + r*N + s] = val;
+                        }
+            tracked_cudaFree(tmp1); tracked_cudaFree(tmp2);
+        } else {
+            real_t* d_eri_work = nullptr;
+            tracked_cudaMalloc(&d_eri_work, nmo4 * sizeof(real_t));
+            cudaMemcpy(d_eri_work, d_eri_ao, nmo4 * sizeof(real_t), cudaMemcpyDeviceToDevice);
+            transform_eri_ao2mo_dgemm_full(d_eri_work, d_eri_mo, d_C, nmo);
+            tracked_cudaFree(d_eri_work);
+        }
         return d_eri_mo;
     }
 
-    // GPU path
-    real_t* d_eri_work = nullptr;
-    tracked_cudaMalloc(&d_eri_work, n4 * sizeof(real_t));
-    cudaMemcpy(d_eri_work, d_eri_ao, n4 * sizeof(real_t), cudaMemcpyDeviceToDevice);
-    transform_eri_ao2mo_dgemm_full(d_eri_work, d_eri_mo, d_C, nmo);
-    tracked_cudaFree(d_eri_work);
+    // Base class does not support rectangular C [nao × nmo] with nmo < nao.
+    // Subclasses (ERI_Stored, ERI_RI) override build_mo_eri for rectangular support.
+    THROW_EXCEPTION("build_mo_eri: rectangular C not supported in base ERI class. "
+                    "Use ERI_Stored or ERI_RI which override this method.");
+}
+
+real_t* ERI_Stored::build_mo_eri(const real_t* d_C, int nmo) const {
+    const int nao = num_basis_;
+    const size_t nmo4 = (size_t)nmo * nmo * nmo * nmo;
+
+    // Square transform: delegate to base class
+    if (nmo == nao) {
+        return ERI::build_mo_eri(d_C, nmo);
+    }
+
+    // Rectangular C [nao × nmo]: 4-step quarter transform on CPU
+    const size_t nao4 = (size_t)nao * nao * nao * nao;
+    std::vector<real_t> h_eri(nao4), h_C(nao * nmo);
+    cudaMemcpy(h_eri.data(), eri_matrix_.device_ptr(), nao4 * sizeof(real_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_C.data(), d_C, nao * nmo * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+    // Step 1: (μνλ|s) = Σ_σ (μνλσ) C[σ,s]
+    std::vector<real_t> h1((size_t)nao * nao * nao * nmo, 0.0);
+    #pragma omp parallel for
+    for (int mu = 0; mu < nao; mu++)
+        for (int nu = 0; nu < nao; nu++)
+            for (int la = 0; la < nao; la++)
+                for (int s = 0; s < nmo; s++) {
+                    real_t v = 0;
+                    for (int si = 0; si < nao; si++)
+                        v += h_eri[((size_t)mu*nao+nu)*(size_t)nao*nao+(size_t)la*nao+si] * h_C[si*nmo+s];
+                    h1[((size_t)mu*nao+nu)*(size_t)nao*nmo+(size_t)la*nmo+s] = v;
+                }
+
+    // Step 2: (μν|rs) = Σ_λ h1(μνλ|s) C[λ,r]
+    std::vector<real_t> h2((size_t)nao * nao * nmo * nmo, 0.0);
+    #pragma omp parallel for
+    for (int mu = 0; mu < nao; mu++)
+        for (int nu = 0; nu < nao; nu++)
+            for (int r = 0; r < nmo; r++)
+                for (int s = 0; s < nmo; s++) {
+                    real_t v = 0;
+                    for (int la = 0; la < nao; la++)
+                        v += h1[((size_t)mu*nao+nu)*(size_t)nao*nmo+(size_t)la*nmo+s] * h_C[la*nmo+r];
+                    h2[((size_t)mu*nao+nu)*(size_t)nmo*nmo+(size_t)r*nmo+s] = v;
+                }
+    h1.clear(); h1.shrink_to_fit();
+
+    // Step 3: (μ|qrs) = Σ_ν h2(μν|rs) C[ν,q]
+    std::vector<real_t> h3((size_t)nao * nmo * nmo * nmo, 0.0);
+    #pragma omp parallel for
+    for (int mu = 0; mu < nao; mu++)
+        for (int q = 0; q < nmo; q++)
+            for (int r = 0; r < nmo; r++)
+                for (int s = 0; s < nmo; s++) {
+                    real_t v = 0;
+                    for (int nu = 0; nu < nao; nu++)
+                        v += h2[((size_t)mu*nao+nu)*(size_t)nmo*nmo+(size_t)r*nmo+s] * h_C[nu*nmo+q];
+                    h3[((size_t)mu*nmo+q)*(size_t)nmo*nmo+(size_t)r*nmo+s] = v;
+                }
+    h2.clear(); h2.shrink_to_fit();
+
+    // Step 4: (pqrs) = Σ_μ C[μ,p] h3(μ|qrs)
+    std::vector<real_t> h_mo(nmo4, 0.0);
+    #pragma omp parallel for
+    for (int p = 0; p < nmo; p++)
+        for (int q = 0; q < nmo; q++)
+            for (int r = 0; r < nmo; r++)
+                for (int s = 0; s < nmo; s++) {
+                    real_t v = 0;
+                    for (int mu = 0; mu < nao; mu++)
+                        v += h_C[mu*nmo+p] * h3[((size_t)mu*nmo+q)*(size_t)nmo*nmo+(size_t)r*nmo+s];
+                    h_mo[((size_t)p*nmo+q)*(size_t)nmo*nmo+(size_t)r*nmo+s] = v;
+                }
+
+    real_t* d_eri_mo = nullptr;
+    tracked_cudaMalloc(&d_eri_mo, nmo4 * sizeof(real_t));
+    cudaMemcpy(d_eri_mo, h_mo.data(), nmo4 * sizeof(real_t), cudaMemcpyHostToDevice);
     return d_eri_mo;
 }
 

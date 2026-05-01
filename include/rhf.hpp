@@ -898,6 +898,7 @@ public:
     void compute_eom_mp2(int n_states) override;
     void compute_eom_cc2(int n_states) override;
     void compute_eom_ccsd(int n_states) override;
+    real_t compute_dmet_ccsd() override;
 
     /// Set CCSD algorithm: 0=spatial-optimized (default), 1=spatial-naive, 2=spin-orbital
     void set_ccsd_algorithm(int algo) { ccsd_algorithm_ = algo; }
@@ -972,6 +973,7 @@ private:
     void compute_eom_mp2(int n_states) override;
     void compute_eom_cc2(int n_states) override;
     void compute_eom_ccsd(int n_states) override;
+    real_t compute_dmet_ccsd() override;
 
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
@@ -1052,6 +1054,11 @@ public:
 
     void compute_fock_matrix() override;
 
+    /// Post-HF via build_mo_eri (distributed B_local → gather → MO ERI)
+    real_t compute_mp2_energy() override;
+    real_t compute_scs_mp2_energy() override;
+    real_t compute_sos_mp2_energy() override;
+
     /// Storage mode for B matrix
     enum class StorageMode {
         GPU_Resident,    ///< ri: B on GPU (single or distributed)
@@ -1092,6 +1099,9 @@ public:
     /// Build B_ij^P [oo × naux_local] from AO-basis B_local. Caller must free result.
     static real_t* build_B_ij_local(const real_t* d_B_ao, int naux_local,
                                     real_t* d_C, int nbas, int nocc, int nvir);
+
+    /// Build MO ERI from distributed B_local: gather full B on GPU 0, then delegate
+    real_t* build_mo_eri(const real_t* d_C, int nmo) const override;
 
     /// Access distributed B data
     int num_gpus() const { return num_gpus_; }
