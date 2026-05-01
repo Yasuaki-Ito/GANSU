@@ -1796,10 +1796,57 @@ void ERI_RI_Distributed_RHF::compute_sos_laplace_adc2(int n_states) {
     std::cout << "  M11 build time: " << std::fixed << std::setprecision(3)
               << m11_timer.elapsed_seconds() << " s" << std::endl;
 
-    // Free B_ab, B_ij (not needed for SOS-Laplace sigma)
+    // AllGather B_ab_local → B_ab_full on GPU 0 for A3-Coulomb
+    real_t* d_B_ab_full = nullptr;
+    {
+        const int vv = nvir * nvir;
+        std::vector<size_t> P_start(num_gpus_ + 1, 0);
+        for (int d = 0; d < num_gpus_; d++)
+            P_start[d + 1] = P_start[d] + naux_local_[d];
+
+        MultiGpuManager::DeviceGuard guard(0);
+        cudaMalloc(&d_B_ab_full, (size_t)vv * naux_total * sizeof(real_t));
+        for (int d_src = 0; d_src < num_gpus_; d_src++) {
+            size_t offset = P_start[d_src] * vv;
+            size_t bytes = (size_t)naux_local_[d_src] * vv * sizeof(real_t);
+            if (d_src == 0)
+                cudaMemcpy(d_B_ab_full + offset, d_B_ab_local[d_src],
+                           bytes, cudaMemcpyDeviceToDevice);
+            else
+                cudaMemcpyPeer(d_B_ab_full + offset, 0,
+                               d_B_ab_local[d_src], d_src, bytes);
+        }
+    }
+    // Free B_ab_local
     for (int d = 0; d < num_gpus_; d++) {
         MultiGpuManager::DeviceGuard guard(d);
         cudaFree(d_B_ab_local[d]);
+    }
+
+    // AllGather B_ij_local → B_ij_full on GPU 0 for B3-exchange
+    real_t* d_B_ij_full = nullptr;
+    {
+        const int oo = nocc * nocc;
+        std::vector<size_t> P_start(num_gpus_ + 1, 0);
+        for (int d = 0; d < num_gpus_; d++)
+            P_start[d + 1] = P_start[d] + naux_local_[d];
+
+        MultiGpuManager::DeviceGuard guard(0);
+        cudaMalloc(&d_B_ij_full, (size_t)oo * naux_total * sizeof(real_t));
+        for (int d_src = 0; d_src < num_gpus_; d_src++) {
+            size_t offset = P_start[d_src] * oo;
+            size_t bytes = (size_t)naux_local_[d_src] * oo * sizeof(real_t);
+            if (d_src == 0)
+                cudaMemcpy(d_B_ij_full + offset, d_B_ij_local[d_src],
+                           bytes, cudaMemcpyDeviceToDevice);
+            else
+                cudaMemcpyPeer(d_B_ij_full + offset, 0,
+                               d_B_ij_local[d_src], d_src, bytes);
+        }
+    }
+    // Free B_ij_local
+    for (int d = 0; d < num_gpus_; d++) {
+        MultiGpuManager::DeviceGuard guard(d);
         cudaFree(d_B_ij_local[d]);
     }
 
@@ -1810,10 +1857,12 @@ void ERI_RI_Distributed_RHF::compute_sos_laplace_adc2(int n_states) {
         Timer dav_timer;
         std::cout << "\n  --- Distributed SOS-Laplace-ADC(2) Davidson ---" << std::endl;
 
+        const double c_c = rhf_.get_adc_c_c();
         SOSLaplaceADC2DistributedOperator op(
             num_gpus_, d_B_ia_local, naux_local_,
-            d_M11, rhf_.get_orbital_energies().device_ptr(),
-            nocc, nvir, naux_total);
+            d_B_ij_full, d_B_ab_full, d_M11,
+            rhf_.get_orbital_energies().device_ptr(),
+            nocc, nvir, naux_total, c_c);
 
         DavidsonConfig dav_config;
         dav_config.num_eigenvalues = n_states;
@@ -1884,6 +1933,8 @@ void ERI_RI_Distributed_RHF::compute_sos_laplace_adc2(int n_states) {
     {
         MultiGpuManager::DeviceGuard guard(0);
         tracked_cudaFree(d_M11);
+        cudaFree(d_B_ij_full);
+        cudaFree(d_B_ab_full);
     }
 
     rhf_.set_excitation_energies(eigenvalues);

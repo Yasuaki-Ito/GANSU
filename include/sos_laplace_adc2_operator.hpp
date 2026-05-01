@@ -48,11 +48,15 @@ public:
      */
     /**
      * @param d_B_ia     B^P_{ia} [ov × naux] col-major (occ-virt block)
+     * @param d_B_ij     B^P_{ij} [oo × naux] col-major, nullable → B3-exchange
+     * @param d_B_ab     B^P_{ab} [vv × naux] col-major, nullable → A3-Coulomb
      * @param d_M11_ext  Pre-built M11 matrix [ov × ov] col-major.
      *                   If nullptr, M11 is built internally (CIS Coulomb only).
      */
     SOSLaplaceADC2Operator(
         const real_t* d_B_ia,
+        const real_t* d_B_ij,
+        const real_t* d_B_ab,
         const real_t* d_M11_ext,
         const real_t* d_orbital_energies,
         int nocc, int nvir, int naux,
@@ -93,8 +97,10 @@ private:
     std::vector<double> laplace_t_;   // nodes t_τ
     std::vector<double> laplace_w_;   // weights w_τ
 
-    // RI B matrix (device, persistent)
-    const real_t* d_B_ia_;    // [ov × naux], NOT owned
+    // RI B matrices (device, persistent, NOT owned)
+    const real_t* d_B_ia_;    // [ov × naux]
+    const real_t* d_B_ij_;    // [oo × naux], nullable (B3-exchange)
+    const real_t* d_B_ab_;    // [vv × naux], nullable (A3-Coulomb)
 
     // Orbital energies (host copy for Laplace scaling)
     std::vector<double> eps_occ_;  // ε_i [nocc]
@@ -114,10 +120,24 @@ private:
     real_t* d_eps_vir_dev_ = nullptr;  // [nvir]
 
     // Workspace (mutable for const apply)
-    mutable real_t* d_B_scaled_ = nullptr;    // B̃(τ) [naux × nov]
-    mutable real_t* d_F_ = nullptr;           // B̃ × x [naux × nov]
+    mutable real_t* d_B_scaled_ = nullptr;    // B̃_ia(τ) [ov × naux]
+    mutable real_t* d_F_ = nullptr;           // B̃_ia × x [ov × naux]
     mutable real_t* d_X_PQ_ = nullptr;        // X^{PQ}(τ) [naux × naux]
-    mutable real_t* d_temp_ov_aux_ = nullptr; // temp [naux × nov]
+    mutable real_t* d_temp_ov_aux_ = nullptr; // temp [ov × naux]
+
+    // B3-exchange workspace (allocated only if d_B_ij_ != nullptr)
+    mutable real_t* d_B_ij_scaled_ = nullptr; // B̃_ij(τ) [oo × naux]
+    mutable real_t* d_g_ = nullptr;           // g = B̃_ij × x [ov × naux]
+    mutable real_t* d_Z_ = nullptr;           // Z = B̃_ia^T·B̃_ia [naux × naux]
+    mutable real_t* d_h_ = nullptr;           // h = Z × g [naux × ov]
+    mutable real_t* d_sigma_b3_ = nullptr;    // B3-exchange sigma [ov]
+
+    // A3-Coulomb workspace (allocated only if d_B_ab_ != nullptr)
+    mutable real_t* d_B_ab_scaled_ = nullptr; // B̃_ab(τ) [vv × naux]
+    mutable real_t* d_x_scaled_ = nullptr;    // x̃ = x × exp(-εC·t/2) [ov]
+    mutable real_t* d_f_buf_ = nullptr;       // f_P = B̃_ab_P × x̃^T [nvir×nocc × naux]
+    mutable real_t* d_w_T_ = nullptr;         // B̃_ij × Z [oo × naux]
+    mutable real_t* d_sigma_a3_ = nullptr;    // A3 sigma [ov]
 
     // --- Internal methods ---
     void build_M11();

@@ -76,7 +76,9 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"spin_type", "singlet"},                       // string (singlet, triplet)
         {"frozen_core", "none"},                         // string: "none", "auto", or integer
         {"ecp_filename", ""},                              // string: ECP file path
-        {"num_gpus", "-1"}                                 // int: number of GPUs (-1 = auto-detect all)
+        {"num_gpus", "-1"},                                // int: number of GPUs (-1 = auto-detect all)
+        {"adc_c_t", "1.3"},                                // real_t: SOS-ADC(2) t2 amplitude scaling
+        {"adc_c_c", "0.85"}                                // real_t: SOS-ADC(2) coupling block scaling
     };
 
 

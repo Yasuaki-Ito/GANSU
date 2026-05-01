@@ -106,10 +106,118 @@ __global__ void sos_adc2_rowdot_kernel(
 }
 
 // ============================================================
+//  B3-exchange kernels
+// ============================================================
+
+// Scale B_ij: B̃_ij[I*nocc+L, P] = B_ij[I*nocc+L, P] × exp(εI × t/2)
+// Only the first (I) index is scaled; L is unscaled.
+__global__ void sos_adc2_scale_B_ij_kernel(
+    const real_t* __restrict__ d_B_ij,
+    real_t* __restrict__ d_B_ij_scaled,
+    const real_t* __restrict__ d_eps_occ,
+    int nocc, int naux, double t_half)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t oo = (size_t)nocc * nocc;
+    if (idx >= oo * naux) return;
+    size_t il = idx % oo;
+    int I = (int)(il / nocc);
+    double scale = exp(t_half * d_eps_occ[I]);
+    d_B_ij_scaled[idx] = d_B_ij[idx] * scale;
+}
+
+// Compute g[I*nvir+E, Q] = Σ_L B̃_ij[I*nocc+L, Q] × x[L*nvir+E]
+__global__ void sos_adc2_compute_g_kernel(
+    const real_t* __restrict__ d_B_ij_scaled,
+    const real_t* __restrict__ d_x,
+    real_t* __restrict__ d_g,
+    int nocc, int nvir, int naux)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t ov = (size_t)nocc * nvir;
+    size_t oo = (size_t)nocc * nocc;
+    if (idx >= ov * naux) return;
+    size_t ie = idx % ov;
+    int Q = (int)(idx / ov);
+    int I = (int)(ie / nvir);
+    int E = (int)(ie % nvir);
+    double sum = 0.0;
+    for (int L = 0; L < nocc; L++)
+        sum += d_B_ij_scaled[I * nocc + L + Q * oo] * d_x[L * nvir + E];
+    d_g[idx] = sum;
+}
+
+// Accumulate B3-exchange: σ[K*nvir+E] += factor × exp(-εE×t) × raw[K*nvir+E]
+__global__ void sos_adc2_b3x_postscale_kernel(
+    const real_t* __restrict__ d_raw,
+    real_t* __restrict__ d_sigma,
+    const real_t* __restrict__ d_eps_vir,
+    double factor, int nocc, int nvir, double t)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ov = nocc * nvir;
+    if (idx >= ov) return;
+    int E = idx % nvir;
+    d_sigma[idx] += factor * exp(-d_eps_vir[E] * t) * d_raw[idx];
+}
+
+// ============================================================
+//  A3-Coulomb kernels
+// ============================================================
+
+// Scale B_ab: B̃_ab[E*nvir+C, P] = B_ab × exp(-εC × t/2)
+// C = idx % nvir within each P-slice
+__global__ void sos_adc2_scale_B_ab_kernel(
+    const real_t* __restrict__ d_B_ab,
+    real_t* __restrict__ d_B_ab_scaled,
+    const real_t* __restrict__ d_eps_vir,
+    int nvir, int naux, double t_half)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir;
+    if (idx >= vv * naux) return;
+    size_t ec = idx % vv;
+    int C = (int)(ec % nvir);
+    double scale = exp(-t_half * d_eps_vir[C]);
+    d_B_ab_scaled[idx] = d_B_ab[idx] * scale;
+}
+
+// Scale x: x̃[ia] = x[ia] × exp(-εa × t/2)
+__global__ void sos_adc2_scale_x_kernel(
+    const real_t* __restrict__ d_x,
+    real_t* __restrict__ d_x_scaled,
+    const real_t* __restrict__ d_eps_vir,
+    int nvir, int ov, double t_half)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= ov) return;
+    int a = idx % nvir;
+    d_x_scaled[idx] = d_x[idx] * exp(-t_half * d_eps_vir[a]);
+}
+
+// Extract diagonal sum: σ[K*nvir+E] += factor × exp(εK×t/2) × Σ_C r[E*nvir+C + C*vv]
+// r_K is [vv × nvir], we want Σ_C r[E*nvir+C, C]
+// But here we accumulate from f_P × w_P^T result (already summed over P)
+__global__ void sos_adc2_a3_postscale_kernel(
+    const real_t* __restrict__ d_raw,
+    real_t* __restrict__ d_sigma,
+    const real_t* __restrict__ d_eps_occ,
+    double factor, int nocc, int nvir, double t_half)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ov = nocc * nvir;
+    if (idx >= ov) return;
+    int K = idx / nvir;
+    d_sigma[idx] += factor * exp(t_half * d_eps_occ[K]) * d_raw[idx];
+}
+
+// ============================================================
 //  Constructor
 // ============================================================
 SOSLaplaceADC2Operator::SOSLaplaceADC2Operator(
     const real_t* d_B_ia,
+    const real_t* d_B_ij,
+    const real_t* d_B_ab,
     const real_t* d_M11_ext,
     const real_t* d_orbital_energies,
     int nocc, int nvir, int naux,
@@ -117,7 +225,7 @@ SOSLaplaceADC2Operator::SOSLaplaceADC2Operator(
     : nocc_(nocc), nvir_(nvir), naux_(naux),
       singles_dim_(nocc * nvir),
       c_os_(c_os), n_laplace_(n_laplace),
-      d_B_ia_(d_B_ia)
+      d_B_ia_(d_B_ia), d_B_ij_(d_B_ij), d_B_ab_(d_B_ab)
 {
     // Copy orbital energies to host
     std::vector<double> eps(nocc + nvir);
@@ -143,6 +251,26 @@ SOSLaplaceADC2Operator::SOSLaplaceADC2Operator(
     tracked_cudaMalloc(&d_X_PQ_, (size_t)naux * naux * sizeof(real_t));
     tracked_cudaMalloc(&d_temp_ov_aux_, ov * naux * sizeof(real_t));
 
+    // B3-exchange workspace (only if B_ij provided)
+    if (d_B_ij_) {
+        size_t oo = (size_t)nocc * nocc;
+        tracked_cudaMalloc(&d_B_ij_scaled_, oo * naux * sizeof(real_t));
+        tracked_cudaMalloc(&d_g_, ov * naux * sizeof(real_t));
+        tracked_cudaMalloc(&d_Z_, (size_t)naux * naux * sizeof(real_t));
+        tracked_cudaMalloc(&d_h_, (size_t)naux * ov * sizeof(real_t));
+        tracked_cudaMalloc(&d_sigma_b3_, ov * sizeof(real_t));
+    }
+
+    // A3-Coulomb workspace (only if B_ab provided)
+    if (d_B_ab_) {
+        size_t vv = (size_t)nvir * nvir;
+        tracked_cudaMalloc(&d_B_ab_scaled_, vv * naux * sizeof(real_t));
+        tracked_cudaMalloc(&d_x_scaled_, ov * sizeof(real_t));
+        tracked_cudaMalloc(&d_f_buf_, (size_t)nvir * nocc * naux * sizeof(real_t));
+        tracked_cudaMalloc(&d_w_T_, (size_t)nocc * nocc * naux * sizeof(real_t));
+        tracked_cudaMalloc(&d_sigma_a3_, ov * sizeof(real_t));
+    }
+
     // Allocate D1 and diagonal
     tracked_cudaMalloc(&d_D1_, singles_dim_ * sizeof(real_t));
     tracked_cudaMalloc(&d_diagonal_, singles_dim_ * sizeof(real_t));
@@ -163,7 +291,8 @@ SOSLaplaceADC2Operator::SOSLaplaceADC2Operator(
     compute_diagonal();
 
     std::cout << "[SOS-LT-ADC(2)] Initialized: nocc=" << nocc << " nvir=" << nvir
-              << " naux=" << naux << " c_os=" << c_os << " n_laplace=" << n_laplace << std::endl;
+              << " naux=" << naux << " c_os=" << c_os << " n_laplace=" << n_laplace
+              << (d_B_ij_ ? " +B3x" : "") << (d_B_ab_ ? " +A3" : "") << std::endl;
 }
 
 SOSLaplaceADC2Operator::~SOSLaplaceADC2Operator() {
@@ -176,6 +305,18 @@ SOSLaplaceADC2Operator::~SOSLaplaceADC2Operator() {
     tracked_cudaFree(d_M11_);
     tracked_cudaFree(d_eps_occ_dev_);
     tracked_cudaFree(d_eps_vir_dev_);
+    // B3-exchange
+    tracked_cudaFree(d_B_ij_scaled_);
+    tracked_cudaFree(d_g_);
+    tracked_cudaFree(d_Z_);
+    tracked_cudaFree(d_h_);
+    tracked_cudaFree(d_sigma_b3_);
+    // A3-Coulomb
+    tracked_cudaFree(d_B_ab_scaled_);
+    tracked_cudaFree(d_x_scaled_);
+    tracked_cudaFree(d_f_buf_);
+    tracked_cudaFree(d_w_T_);
+    tracked_cudaFree(d_sigma_a3_);
 }
 
 // ============================================================
@@ -465,6 +606,141 @@ void SOSLaplaceADC2Operator::apply(const real_t* d_input, real_t* d_output) cons
             sos_adc2_rowdot_kernel<<<blocks, threads>>>(
                 d_B_scaled_, d_temp_ov_aux_, d_output,
                 prefactor, (int)ov, naux_);
+        }
+
+        // ---- B3-exchange: +2(IK|JD)(IL|JD) / (D2-ω) ----
+        if (d_B_ij_) {
+            const int oo = nocc_ * nocc_;
+            const double b3_factor = -2.0 * c_os_ * w * std::exp(omega_ * t);
+
+            // 3a. Scale B_ij: B̃_ij[I*nocc+L, P] = B_ij × exp(εI×t/2)
+            {
+                size_t total_ij = (size_t)oo * naux_;
+                int blocks = (int)((total_ij + threads - 1) / threads);
+                sos_adc2_scale_B_ij_kernel<<<blocks, threads>>>(
+                    d_B_ij_, d_B_ij_scaled_, d_eps_occ_dev_,
+                    nocc_, naux_, t_half);
+            }
+
+            // 3b. g[I*nvir+E, Q] = Σ_L B̃_ij[I*nocc+L, Q] × x[L*nvir+E]
+            {
+                size_t total_g = ov * naux_;
+                int blocks = (int)((total_g + threads - 1) / threads);
+                sos_adc2_compute_g_kernel<<<blocks, threads>>>(
+                    d_B_ij_scaled_, d_input, d_g_,
+                    nocc_, nvir_, naux_);
+            }
+
+            // 3c. Z = B̃_ia^T · B̃_ia [naux × naux] (reuse d_B_scaled_)
+            cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                        naux_, naux_, (int)ov,
+                        &one, d_B_scaled_, (int)ov,
+                        d_B_scaled_, (int)ov,
+                        &zero, d_Z_, naux_);
+
+            // 3d. h[P, ie] = Σ_Q Z[P,Q] × g[ie,Q]
+            // g is [ov × naux] col-major (ie rows, Q cols).
+            // h = Z × g^T  →  [naux × naux] × [naux × ov] = [naux × ov]
+            cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                        naux_, (int)ov, naux_,
+                        &one, d_Z_, naux_,
+                        d_g_, (int)ov,
+                        &zero, d_h_, naux_);
+
+            // 3e. σ_b3[K*nvir+E] = Σ_I Σ_P B̃_ij_I[K,P] × h_I[P,E]
+            // For each I: DGEMM h_I^T × B̃_ij_I^T → [nvir × nocc]
+            // h_I = &d_h_[I*nvir*naux], [naux × nvir], lda=naux
+            // B̃_ij_I = &d_B_ij_scaled_[I*nocc], [nocc × naux], lda=oo
+            cudaMemset(d_sigma_b3_, 0, ov * sizeof(real_t));
+            for (int I = 0; I < nocc_; I++) {
+                cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T,
+                            nvir_, nocc_, naux_,
+                            &one,
+                            &d_h_[I * nvir_ * naux_], naux_,
+                            &d_B_ij_scaled_[I * nocc_], oo,
+                            &one, d_sigma_b3_, nvir_);
+            }
+
+            // 3f. σ += b3_factor × exp(-εE×t) × σ_b3
+            {
+                int blocks = ((int)ov + threads - 1) / threads;
+                sos_adc2_b3x_postscale_kernel<<<blocks, threads>>>(
+                    d_sigma_b3_, d_output, d_eps_vir_dev_,
+                    b3_factor, nocc_, nvir_, t);
+            }
+        }
+
+        // ---- A3-Coulomb: -2c_os(EC|JD)(KL|JD) / (D2-ω) ----
+        if (d_B_ab_) {
+            const int oo = nocc_ * nocc_;
+            const int vv = nvir_ * nvir_;
+            const double a3_factor = +2.0 * c_os_ * w * std::exp(omega_ * t);
+
+            // 4a. Scale B_ab: B̃_ab[EC, P] = B_ab × exp(-εC×t/2)
+            {
+                size_t total_ab = (size_t)vv * naux_;
+                int blocks = (int)((total_ab + threads - 1) / threads);
+                sos_adc2_scale_B_ab_kernel<<<blocks, threads>>>(
+                    d_B_ab_, d_B_ab_scaled_, d_eps_vir_dev_,
+                    nvir_, naux_, t_half);
+            }
+
+            // 4b. Scale x: x̃[ia] = x[ia] × exp(-εa×t/2)
+            {
+                int blocks = ((int)ov + threads - 1) / threads;
+                sos_adc2_scale_x_kernel<<<blocks, threads>>>(
+                    d_input, d_x_scaled_, d_eps_vir_dev_,
+                    nvir_, (int)ov, t_half);
+            }
+
+            // 4c. f_P[E,L] = Σ_C B̃_ab_P[E,C] × x̃^T[C,L]
+            // B̃_ab_P: [nvir × nvir] at offset P*vv, stride vv
+            // x̃ viewed as [nocc × nvir]: x̃^T is [nvir × nocc]
+            // f_P: [nvir × nocc] at offset P*nvir*nocc
+            // B̃_ab_P stored as [E*nvir+C] = cuBLAS [C_row, E_col] → use OP_T
+            cublasDgemmStridedBatched(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                nvir_, nocc_, nvir_,
+                &one,
+                d_B_ab_scaled_, nvir_, (long long)vv,    // A_P^T → [E×C]
+                d_x_scaled_, nvir_, 0LL,                 // B = x̃ [nvir×nocc] col-major
+                &zero,
+                d_f_buf_, nvir_, (long long)(nvir_ * nocc_), // C_P [nvir×nocc]
+                naux_);
+
+            // 4d. w_T = B̃_ij × Z [oo × naux]
+            // B̃_ij_scaled [oo × naux] already computed in B3-exchange step
+            // Z [naux × naux] already computed in B3-exchange step
+            // If B3 was not computed, we need Z and B̃_ij_scaled here too
+            if (d_B_ij_) {
+                // Reuse d_Z_ and d_B_ij_scaled_ from B3
+                cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                            oo, naux_, naux_,
+                            &one, d_B_ij_scaled_, oo,
+                            d_Z_, naux_,
+                            &zero, d_w_T_, oo);
+            }
+
+            // 4e. σ_a3 = Σ_P f_P × w_P^T [nvir × nocc]
+            // f_P at &d_f_buf_[P * nvir_ * nocc_], [nvir × nocc]
+            // w_P at &d_w_T_[P * oo], [nocc × nocc] viewed as w_P[L, K] = w_T[K*nocc+L, P]
+            cudaMemset(d_sigma_a3_, 0, ov * sizeof(real_t));
+            for (int P = 0; P < naux_; P++) {
+                // w_P_cublas[L_row, K_col] → no transpose needed
+                cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                            nvir_, nocc_, nocc_,
+                            &one,
+                            &d_f_buf_[P * nvir_ * nocc_], nvir_,
+                            &d_w_T_[P * oo], nocc_,
+                            &one, d_sigma_a3_, nvir_);
+            }
+
+            // 4f. σ += a3_factor × exp(εK×t/2) × σ_a3
+            {
+                int blocks = ((int)ov + threads - 1) / threads;
+                sos_adc2_a3_postscale_kernel<<<blocks, threads>>>(
+                    d_sigma_a3_, d_output, d_eps_occ_dev_,
+                    a3_factor, nocc_, nvir_, t_half);
+            }
         }
     }
 }

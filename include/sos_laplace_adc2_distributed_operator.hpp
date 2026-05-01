@@ -44,10 +44,16 @@ public:
      * @param c_os            Opposite-spin scaling factor (default: 1.17)
      * @param n_laplace       Number of Laplace quadrature points (default: 10)
      */
+    /**
+     * @param d_B_ij_full  B_ij [oo × naux] on GPU 0, nullable → B3-exchange
+     * @param d_B_ab_full  B_ab [vv × naux] on GPU 0, nullable → A3-Coulomb
+     */
     SOSLaplaceADC2DistributedOperator(
         int num_gpus,
         const std::vector<real_t*>& d_B_ia_local,
         const std::vector<int>& naux_local,
+        const real_t* d_B_ij_full,
+        const real_t* d_B_ab_full,
         const real_t* d_M11,
         const real_t* d_orbital_energies,
         int nocc, int nvir, int naux_total,
@@ -90,14 +96,28 @@ private:
     // Per-GPU workspace (owned)
     struct PerGpuWorkspace {
         real_t* d_B_ia_full  = nullptr;  // AllGathered [ov × naux]
+        real_t* d_B_ij_full  = nullptr;  // Replicated [oo × naux] (B3-exchange)
         real_t* d_x          = nullptr;  // replicated input [ov]
-        real_t* d_B_scaled   = nullptr;  // B̃(τ) [ov × naux]
+        real_t* d_B_scaled   = nullptr;  // B̃_ia(τ) [ov × naux]
         real_t* d_F          = nullptr;  // F = B̃ × x [ov × naux]
         real_t* d_X_PQ       = nullptr;  // X^{PQ}(τ) [naux × naux]
         real_t* d_temp       = nullptr;  // temp [ov × naux]
         real_t* d_sigma_local = nullptr; // partial sigma [ov]
         real_t* d_eps_occ    = nullptr;  // [nocc]
         real_t* d_eps_vir    = nullptr;  // [nvir]
+        // B3-exchange workspace
+        real_t* d_B_ij_scaled = nullptr; // B̃_ij(τ) [oo × naux]
+        real_t* d_g           = nullptr; // [ov × naux]
+        real_t* d_Z           = nullptr; // [naux × naux]
+        real_t* d_h           = nullptr; // [naux × ov]
+        real_t* d_sigma_b3    = nullptr; // [ov]
+        // A3-Coulomb workspace
+        real_t* d_B_ab_full   = nullptr; // [vv × naux]
+        real_t* d_B_ab_scaled = nullptr; // B̃_ab(τ) [vv × naux]
+        real_t* d_x_scaled    = nullptr; // [ov]
+        real_t* d_f_buf       = nullptr; // [nvir × nocc × naux]
+        real_t* d_w_T         = nullptr; // [oo × naux]
+        real_t* d_sigma_a3    = nullptr; // [ov]
     };
     std::vector<PerGpuWorkspace> ws_;
 
@@ -105,6 +125,9 @@ private:
     real_t* d_M11_      = nullptr;
     real_t* d_D1_       = nullptr;
     real_t* d_diagonal_ = nullptr;
+
+    bool has_b3_exchange_ = false;
+    bool has_a3_coulomb_ = false;
 
     void compute_D1();
     void compute_diagonal();

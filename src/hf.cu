@@ -106,6 +106,9 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     is_wiberg_bond_order_analysis_(parameters.get<bool>("wiberg")),
     is_export_molden_(parameters.get<bool>("export_molden"))
 {
+    adc_c_t_ = parameters.get<double>("adc_c_t");
+    adc_c_c_ = parameters.get<double>("adc_c_c");
+
     // Validate run_type
     if(run_type_ != "energy" && run_type_ != "gradient" && run_type_ != "optimize" && run_type_ != "hessian"){
         throw std::runtime_error("Invalid run_type: '" + run_type_ + "'. Must be 'energy', 'gradient', 'optimize', or 'hessian'.");

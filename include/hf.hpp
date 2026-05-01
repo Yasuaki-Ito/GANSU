@@ -227,6 +227,11 @@ public:
      */
     real_t get_schwarz_screening_threshold() const { return schwarz_screening_threshold; }
 
+    /// SOS-ADC(2) scaling: t2 amplitude scaling (default 1.3)
+    double get_adc_c_t() const { return adc_c_t_; }
+    /// SOS-ADC(2) scaling: coupling block scaling (default 1.17)
+    double get_adc_c_c() const { return adc_c_c_; }
+
     /**
      * @brief Get Shell-pair type info
      */
@@ -384,6 +389,8 @@ protected:
     const int verbose; ///< Verbose mode
     const real_t convergence_energy_threshold; ///< Convergence criterion
     const real_t schwarz_screening_threshold; ///< Schwartz screening threshold
+    double adc_c_t_ = 1.3;   ///< SOS-ADC(2) t2 amplitude scaling
+    double adc_c_c_ = 0.85;  ///< SOS-ADC(2) coupling block scaling
     const int max_iter; ///< Maximum number of iterations
     int iter_; ///< Number of iterations
     real_t energy_difference_; ///< Energy difference between the current and the previous iteration

@@ -1603,8 +1603,7 @@ void ERI_RI_RHF::compute_sos_laplace_adc2(int n_states) {
     std::cout << "  M11 build time: " << std::fixed << std::setprecision(3)
               << m11_timer.elapsed_seconds() << " s" << std::endl;
 
-    tracked_cudaFree(d_B_ab);
-    tracked_cudaFree(d_B_ij);
+    // Keep d_B_ab and d_B_ij alive for A3/B3 in SOS-Laplace operator
 
     // Davidson + omega iteration with SOS-Laplace operator
     std::vector<double> eigenvalues;
@@ -1613,10 +1612,11 @@ void ERI_RI_RHF::compute_sos_laplace_adc2(int n_states) {
         Timer dav_timer;
         std::cout << "\n  --- SOS-Laplace-ADC(2) Davidson ---" << std::endl;
 
+        const double c_c = rhf_.get_adc_c_c();
         SOSLaplaceADC2Operator op(
-            d_B_ia, d_M11,
+            d_B_ia, d_B_ij, d_B_ab, d_M11,
             rhf_.get_orbital_energies().device_ptr(),
-            nocc, nvir, num_auxiliary_basis_);
+            nocc, nvir, num_auxiliary_basis_, c_c);
 
         DavidsonConfig dav_config;
         dav_config.num_eigenvalues = n_states;
@@ -1697,6 +1697,8 @@ void ERI_RI_RHF::compute_sos_laplace_adc2(int n_states) {
     rhf_.set_oscillator_strengths(es_result.oscillator_strengths);
     rhf_.set_excited_state_report(es_result.report);
 
+    tracked_cudaFree(d_B_ab);
+    tracked_cudaFree(d_B_ij);
     tracked_cudaFree(d_B_ia);
 }
 
