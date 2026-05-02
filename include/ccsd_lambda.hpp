@@ -128,16 +128,24 @@ void build_ccsd_2rdm_mo_cpu(
  * For P=I, this exactly recovers the full CCSD correlation energy.
  */
 /**
- * @brief Build CCSD 2-RDM in PySCF convention (CPU).
- * dm2[p,q,r,s] = γ[p,q]*γ[r,s] - 0.5*γ[p,s]*γ[r,q] + cumulant
- * Energy: E = einsum('pq,qp',h_core,dm1) + 0.5*einsum('pqrs,pqrs',eri,dm2) + E_nuc
+ * @brief Build CCSD 2-RDM in PySCF chemist convention (CPU).
+ *
+ * Computes dm2[p,q,r,s] = <a†_p a†_r a_s a_q> with the final transpose(1,0,3,2)
+ * applied so that:
+ *     E_total = einsum('pq,qp', h_core, dm1) + 0.5 * einsum('pqrs,pqrs', eri, dm2)
+ *             + E_nuc
+ * Includes HF reference. Verified element-wise against pyscf.cc.ccsd_rdm.make_rdm2.
+ *
+ * @param dm1 [na × na] CCSD 1-RDM (with HF reference) — must come from
+ *            build_ccsd_1rdm_mo_cpu before calling this.
+ * @param D2  [na^4] output, row-major D2[((p*na+q)*na+r)*na+s]
  */
-void build_ccsd_2rdm_pyscf_cpu(
+void build_ccsd_2rdm_chemist_cpu(
     int nocc, int nvir,
     const real_t* h_t1, const real_t* h_t2,
     const real_t* h_l1, const real_t* h_l2,
-    const real_t* dm1,  // [na × na] 1-RDM
-    real_t* D2);        // [na^4] output
+    const real_t* dm1,
+    real_t* D2);
 
 real_t compute_dmet_fragment_energy(
     int nocc, int nvir,

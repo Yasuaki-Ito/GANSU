@@ -98,6 +98,10 @@ else()
 endif()
 
 find_package(OpenMP REQUIRED)
+# Note: link both OpenMP::OpenMP_CXX (for .cpp) and OpenMP::OpenMP_CUDA
+# (for .cu files). Without OpenMP_CUDA, NVCC won't pass -fopenmp through to
+# the host compiler and #pragma omp parallel is silently ignored, yielding
+# team_size=1 at runtime.
 
 
 # ============================================================================
@@ -140,14 +144,16 @@ endif()
 foreach(src ${INTEGRAL_SOURCES})
     get_filename_component(lib_name ${src} NAME_WE)
     add_library(${lib_name} STATIC ${src})
-    target_link_libraries(${lib_name} Eigen3::Eigen OpenMP::OpenMP_CXX)
+    target_link_libraries(${lib_name} Eigen3::Eigen OpenMP::OpenMP_CXX
+        $<$<TARGET_EXISTS:OpenMP::OpenMP_CUDA>:OpenMP::OpenMP_CUDA>)
 endforeach()
 
 # Static libraries (gradients)
 foreach(src ${GRADIENT_SOURCES})
     get_filename_component(lib_name ${src} NAME_WE)
     add_library(${lib_name} STATIC ${src})
-    target_link_libraries(${lib_name} Eigen3::Eigen OpenMP::OpenMP_CXX)
+    target_link_libraries(${lib_name} Eigen3::Eigen OpenMP::OpenMP_CXX
+        $<$<TARGET_EXISTS:OpenMP::OpenMP_CUDA>:OpenMP::OpenMP_CUDA>)
 endforeach()
 
 
@@ -224,6 +230,7 @@ target_compile_definitions(gansu PRIVATE CONSOLE_COLOR_ENABLED)
 target_link_libraries(gansu
         Eigen3::Eigen
         OpenMP::OpenMP_CXX
+        $<$<TARGET_EXISTS:OpenMP::OpenMP_CUDA>:OpenMP::OpenMP_CUDA>
         $<$<BOOL:${BLAS_FOUND}>:${BLAS_LIBRARIES}>
         int1e
         int2e

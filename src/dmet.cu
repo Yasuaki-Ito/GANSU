@@ -14,9 +14,20 @@
 
 #include <iostream>
 #include <iomanip>
+#include <sstream>
 #include <cmath>
 #include <algorithm>
 #include <tuple>
+#include <omp.h>
+#include <Eigen/Dense>
+
+// Compile-time guard: NVCC must propagate -fopenmp to the host compiler when
+// compiling .cu files (via OpenMP::OpenMP_CUDA target in CMakeLists.txt).
+// Without it, #pragma omp parallel is silently ignored and the fragment loop
+// collapses to a single thread.
+#ifndef _OPENMP
+#  error "_OPENMP not defined — link OpenMP::OpenMP_CUDA in CMakeLists.txt"
+#endif
 
 #include "dmet.hpp"
 #include "rhf.hpp"
@@ -37,6 +48,113 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             real_t** d_t1_out, real_t** d_t2_out,
                             real_t* d_eri_mo_precomputed,
                             int num_frozen);
+
+// RAII guard: redirect std::cout to a discarded sink for the lifetime of the
+// object. Used to silence ccsd_spatial_orbital's per-iteration output during
+// the bisection inner loop, where its many lines would drown out the bisection
+// progress messages.
+class CoutSilencer {
+    std::streambuf* old_buf_ = nullptr;
+    std::stringstream sink_;
+public:
+    explicit CoutSilencer(bool silence) {
+        if (silence) old_buf_ = std::cout.rdbuf(sink_.rdbuf());
+    }
+    ~CoutSilencer() {
+        if (old_buf_) std::cout.rdbuf(old_buf_);
+    }
+};
+
+// ============================================================================
+//  Embedding HF SCF (CPU, Roothaan iteration)
+//
+//  Solves canonical orbitals of the embedding Hamiltonian H = h_emb + V_emb,
+//  i.e. eigenstates of the *self-consistent* Fock matrix
+//      F[p,q] = h_emb[p,q] + Σ_rs D[r,s] (eri[p,q,r,s] - 0.5 eri[p,r,s,q])
+//  with D[r,s] = 2 Σ_{i<n_occ} C[r,i] C[s,i].
+//
+//  Without this step, h_emb eigenstates leave F off-diagonal in the embedding
+//  basis (e.g. ~10⁻¹ for benzene/STO-3G), violating the canonical-orbital
+//  assumption made by ccsd_spatial_orbital and solve_ccsd_lambda_cpu.
+//
+//  Output: U[p, i] = embedding-basis coefficient of i-th canonical orbital,
+//          eps[i]  = orbital energy (eigenvalue of converged F).
+//
+//  Tolerance is on the energy change between iterations; for ne ≲ 30 this
+//  runs in microseconds even without DIIS.
+// ============================================================================
+static std::pair<std::vector<real_t>, std::vector<real_t>>
+run_embedding_hf_cpu(
+    const std::vector<real_t>& h_emb,    // [ne × ne] row-major
+    const std::vector<real_t>& eri_emb,  // [ne^4] chemist (pq|rs)
+    int ne, int n_occ,
+    int max_iter, real_t tol, int verbose)
+{
+    using RowMatXd = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    Eigen::Map<const RowMatXd> H(h_emb.data(), ne, ne);
+
+    // Initial guess: diagonalize h_emb
+    Eigen::SelfAdjointEigenSolver<RowMatXd> sol0(H);
+    RowMatXd C = sol0.eigenvectors();
+    Eigen::VectorXd eps = sol0.eigenvalues();
+
+    real_t E_prev = 0.0;
+    bool converged = false;
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        // Density: D[r,s] = 2 Σ_{i<n_occ} C[r,i] C[s,i]
+        RowMatXd Cocc = C.leftCols(n_occ);
+        RowMatXd D = 2.0 * Cocc * Cocc.transpose();
+
+        // Fock: F[p,q] = h[p,q] + Σ_rs D[r,s] (eri[p,q,r,s] - 0.5 eri[p,r,s,q])
+        RowMatXd F = H;
+        for (int p = 0; p < ne; p++) {
+            for (int q = 0; q < ne; q++) {
+                real_t v = 0.0;
+                for (int r = 0; r < ne; r++) {
+                    for (int s = 0; s < ne; s++) {
+                        const real_t Drs = D(r, s);
+                        v += Drs * eri_emb[(((size_t)p*ne+q)*ne+r)*ne+s];
+                        v -= 0.5 * Drs * eri_emb[(((size_t)p*ne+r)*ne+s)*ne+q];
+                    }
+                }
+                F(p, q) += v;
+            }
+        }
+
+        // Energy: E = 0.5 Σ_pq D[p,q] (h[p,q] + F[p,q])
+        real_t E = 0.5 * (D.cwiseProduct(H + F)).sum();
+
+        // Diagonalize F
+        Eigen::SelfAdjointEigenSolver<RowMatXd> sol(F);
+        eps = sol.eigenvalues();
+        RowMatXd C_new = sol.eigenvectors();
+
+        real_t dE = std::abs(E - E_prev);
+        if (verbose >= 2)
+            std::cout << "      Emb HF iter " << iter << ": E=" << std::setprecision(10) << E
+                      << " dE=" << std::setprecision(3) << dE << std::endl;
+
+        C = C_new;
+        if (iter > 0 && dE < tol) { converged = true; break; }
+        E_prev = E;
+    }
+
+    if (!converged && verbose >= 1)
+        std::cerr << "      [warn] embedding HF not converged (max_iter=" << max_iter
+                  << ", final dE=" << std::setprecision(3) << std::abs(E_prev) << ")" << std::endl;
+
+    // Pack into row-major std::vector. Convention matches gpu::eigenDecomposition:
+    //   U[p*ne + i] = p-th component of i-th eigenvector (column i of C)
+    std::vector<real_t> U(ne * ne);
+    std::vector<real_t> eps_v(ne);
+    for (int p = 0; p < ne; p++) {
+        eps_v[p] = eps(p);
+        for (int i = 0; i < ne; i++)
+            U[p * ne + i] = C(p, i);
+    }
+    return {U, eps_v};
+}
 
 // ============================================================================
 //  Fragment parsing (unchanged)
@@ -475,6 +593,80 @@ real_t DMET::compute_energy() {
     cudaDeviceSynchronize();
 
     // ================================================================
+    //  Phase A.5: Multi-GPU setup + fragment equivalence clustering
+    //  (μ-independent, computed once)
+    // ================================================================
+
+    // Multi-GPU strategy:
+    //   Replicated (preferred): replicate full B to every GPU → fragment-parallel
+    //                           across OpenMP threads with no peer copies.
+    //   Distributed (fallback when B too large to replicate): keep B sliced by
+    //                           aux index, each fragment's build_mo_eri uses
+    //                           all GPUs collectively (NCCL AllReduce).
+    //                           Fragment loop is serial but each ERI build is
+    //                           multi-GPU parallel.
+    int num_gpus = 1;
+    auto* eri_distributed =
+        dynamic_cast<ERI_RI_Distributed_RHF*>(const_cast<ERI*>(&eri_));
+    if (eri_distributed && eri_distributed->num_gpus() > 1) {
+        bool ok = eri_distributed->replicate_B_to_all_gpus();
+        if (ok) {
+            num_gpus = eri_distributed->num_gpus();
+            std::cout << "  Multi-GPU strategy: Replicated (B on every GPU, "
+                         "fragment-parallel " << num_gpus << " GPUs)" << std::endl;
+        } else {
+            std::cout << "  Multi-GPU strategy: Distributed (B sliced, collective "
+                         "build_mo_eri across " << eri_distributed->num_gpus()
+                      << " GPUs; fragment loop serial)" << std::endl;
+        }
+    } else {
+        std::cout << "  Multi-GPU strategy: single GPU (serial)" << std::endl;
+    }
+
+    // Pre-cluster fragments by μ-independent equivalence (h_emb_base norm,
+    // n_emb, n_emb_occ, etc). Each fragment maps to a canonical representative;
+    // only canonical fragments are solved, others copy the result.
+    std::vector<int> canonical_of(fragments_.size(), -1);
+    std::vector<int> unique_fragments;  // canonical fragment indices to solve
+    std::vector<real_t> h_norms(fragments_.size(), 0.0);
+    for (size_t f = 0; f < fragments_.size(); f++) {
+        for (auto v : baths[f].h_emb_base) h_norms[f] += v * v;
+    }
+    for (size_t f = 0; f < fragments_.size(); f++) {
+        auto& bd = baths[f];
+        if (bd.is_full_system) {
+            canonical_of[f] = (int)f;  // never deduplicated (rare singleton case)
+            unique_fragments.push_back((int)f);
+            continue;
+        }
+        if (bd.n_emb_occ <= 0 || bd.n_emb_occ >= bd.n_emb) {
+            canonical_of[f] = (int)f;  // trivial — handled in evaluate_at_mu
+            continue;  // not added to unique_fragments
+        }
+        int canon = -1;
+        for (int u : unique_fragments) {
+            auto& bg = baths[u];
+            if (bg.is_full_system) continue;
+            if (bg.n_emb != bd.n_emb || bg.n_emb_occ != bd.n_emb_occ
+                || bg.n_frozen != bd.n_frozen
+                || fragments_[u].n_frag != fragments_[f].n_frag) continue;
+            if (std::abs(h_norms[f] - h_norms[u])
+                < 1e-10 * std::max(h_norms[f], h_norms[u])) {
+                canon = u;
+                break;
+            }
+        }
+        if (canon < 0) {
+            canonical_of[f] = (int)f;
+            unique_fragments.push_back((int)f);
+        } else {
+            canonical_of[f] = canon;
+        }
+    }
+    std::cout << "  Equivalence clustering: " << unique_fragments.size()
+              << " unique fragment(s) of " << fragments_.size() << std::endl;
+
+    // ================================================================
     //  Phase B: evaluate_at_mu — solve all fragments at given μ
     //  Returns {Σ N_frag, Σ E_corr_frag}
     // ================================================================
@@ -485,251 +677,248 @@ real_t DMET::compute_energy() {
     };
 
     auto evaluate_at_mu = [&](real_t mu, bool verbose) -> std::pair<real_t, real_t> {
-        real_t N_total_frag = 0.0, E_corr_total = 0.0;
-        std::vector<FragResult> results(fragments_.size());
-        std::vector<bool> solved(fragments_.size(), false);
+        std::vector<FragResult> results(fragments_.size(), {0.0, 0.0});
+        // char (not bool) — std::vector<bool> bit-packs and is not thread-safe
+        // for concurrent writes to different elements.
+        std::vector<char> solved(fragments_.size(), 0);
+        std::vector<char> lambda_ok_v(fragments_.size(), 0);
+        // GPU id where each fragment's CCSD/Lambda actually ran (-1 = not solved /
+        // equivalent; 0 = full-system / Distributed mode).
+        std::vector<int> gpu_used(fragments_.size(), -1);
 
+        // ---- Serial: full-system fragments (rare singleton case) ----
         for (size_t f = 0; f < fragments_.size(); f++) {
             auto& bd = baths[f];
+            if (!bd.is_full_system) continue;
 
-            if (bd.is_full_system) {
-                // 1-fragment = full system → regular CCSD, no μ
-                real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
-                real_t* d_mo_eri = eri_.build_mo_eri(d_C, nao);
-                real_t E_corr = ccsd_spatial_orbital(
+            cudaSetDevice(0);
+            real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+            real_t* d_mo_eri;
+            real_t E_corr;
+            {
+                CoutSilencer silence(!verbose);
+                d_mo_eri = eri_.build_mo_eri(d_C, nao);
+                E_corr = ccsd_spatial_orbital(
                     nullptr, d_C, rhf_.get_orbital_energies().device_ptr(),
                     nao, nocc, false, nullptr, nullptr, nullptr, d_mo_eri, 0);
-                tracked_cudaFree(d_mo_eri);
-                results[f] = {E_corr, (real_t)N_elec};
-                solved[f] = true;
-                E_corr_total += E_corr;
-                N_total_frag += N_elec;
-                if (verbose)
-                    std::cout << "  Fragment " << f << ": full system CCSD = "
-                              << std::setprecision(10) << E_corr << " Ha" << std::endl;
-                continue;
             }
+            tracked_cudaFree(d_mo_eri);
+            results[f] = {E_corr, (real_t)N_elec};
+            solved[f] = true;
+            gpu_used[f] = 0;  // full-system always runs on GPU 0
+        }
 
+        // ---- Mark trivial fragments (n_emb_occ degenerate) ----
+        for (size_t f = 0; f < fragments_.size(); f++) {
+            auto& bd = baths[f];
+            if (bd.is_full_system) continue;
             if (bd.n_emb_occ <= 0 || bd.n_emb_occ >= bd.n_emb) {
                 results[f] = {0.0, 0.0};
                 solved[f] = true;
-                continue;
             }
-
-            // Check equivalence with an already-solved fragment
-            bool reused = false;
-            for (size_t g = 0; g < f; g++) {
-                if (!solved[g] || baths[g].is_full_system) continue;
-                auto& bg = baths[g];
-                if (bg.n_emb == bd.n_emb && bg.n_emb_occ == bd.n_emb_occ
-                    && bg.n_frozen == bd.n_frozen
-                    && fragments_[g].n_frag == fragments_[f].n_frag) {
-                    // Compare h_emb_base norms as a quick equivalence test
-                    real_t norm_f = 0.0, norm_g = 0.0;
-                    for (auto v : bd.h_emb_base) norm_f += v * v;
-                    for (auto v : bg.h_emb_base) norm_g += v * v;
-                    if (std::abs(norm_f - norm_g) < 1e-10 * std::max(norm_f, norm_g)) {
-                        results[f] = results[g];
-                        solved[f] = true;
-                        reused = true;
-                        E_corr_total += results[f].E_corr_frag;
-                        N_total_frag += results[f].N_frag;
-                        if (verbose)
-                            std::cout << "  Fragment " << f << ": equivalent to " << g
-                                      << " (E=" << std::setprecision(10) << results[f].E_corr_frag
-                                      << ", N=" << std::setprecision(4) << results[f].N_frag << ")" << std::endl;
-                        break;
-                    }
-                }
-            }
-            if (reused) continue;
-
-            const int ne = bd.n_emb, no = bd.n_emb_occ, nv = ne - no;
-            const int no_act = no - bd.n_frozen;  // active occupied (CCSD T amplitude dim)
-            const int n_frag_emb = fragments_[f].n_frag;
-            const size_t t1sz = (size_t)no_act * nv;  // n_frozen=0 → no_act=no
-            const size_t t2sz = (size_t)no_act * no_act * nv * nv;
-
-            // 1. h_emb(μ) = h_emb_base - μ P_frag
-            std::vector<real_t> h_emb(bd.h_emb_base);
-            for (int p = 0; p < n_frag_emb; p++)
-                h_emb[p * ne + p] -= mu;
-
-            // 2. Diagonalize h_emb(μ) → ε, U
-            real_t *d_h_emb = nullptr, *d_eigvals = nullptr, *d_eigvecs = nullptr;
-            tracked_cudaMalloc(&d_h_emb, ne * ne * sizeof(real_t));
-            tracked_cudaMalloc(&d_eigvals, ne * sizeof(real_t));
-            tracked_cudaMalloc(&d_eigvecs, ne * ne * sizeof(real_t));
-            cudaMemcpy(d_h_emb, h_emb.data(), ne * ne * sizeof(real_t), cudaMemcpyHostToDevice);
-            gpu::eigenDecomposition(d_h_emb, d_eigvals, d_eigvecs, ne);
-            tracked_cudaFree(d_h_emb);
-
-            // Level shift
-            std::vector<real_t> h_eps(ne);
-            cudaMemcpy(h_eps.data(), d_eigvals, ne * sizeof(real_t), cudaMemcpyDeviceToHost);
-            if (no > 0 && no < ne) {
-                real_t gap = h_eps[no] - h_eps[no - 1];
-                const real_t target_gap = 0.1;
-                if (gap < target_gap) {
-                    real_t shift = target_gap - gap;
-                    for (int i = no; i < ne; i++) h_eps[i] += shift;
-                    cudaMemcpy(d_eigvals, h_eps.data(), ne * sizeof(real_t), cudaMemcpyHostToDevice);
-                }
-            }
-
-            std::vector<real_t> h_eigvecs(ne * ne);
-            cudaMemcpy(h_eigvecs.data(), d_eigvecs, ne * ne * sizeof(real_t), cudaMemcpyDeviceToHost);
-            tracked_cudaFree(d_eigvecs);
-
-            // 3. C_can = C_emb × U
-            std::vector<real_t> h_C_can(nao * ne, 0.0);
-            for (int mu_idx = 0; mu_idx < nao; mu_idx++)
-                for (int i = 0; i < ne; i++) {
-                    real_t val = 0.0;
-                    for (int p = 0; p < ne; p++)
-                        val += bd.C_emb[mu_idx * ne + p] * h_eigvecs[p * ne + i];
-                    h_C_can[mu_idx * ne + i] = val;
-                }
-
-            // 4. Build MO ERI
-            cudaSetDevice(0);
-            real_t* d_C_can = nullptr;
-            tracked_cudaMalloc(&d_C_can, nao * ne * sizeof(real_t));
-            cudaMemcpy(d_C_can, h_C_can.data(), nao * ne * sizeof(real_t), cudaMemcpyHostToDevice);
-            real_t* d_eri_mo = eri_.build_mo_eri(d_C_can, ne);
-
-            // 5. CCSD
-            real_t *d_t1 = nullptr, *d_t2 = nullptr;
-            real_t E_CCSD = ccsd_spatial_orbital(
-                nullptr, d_C_can, d_eigvals,
-                ne, no, false, nullptr, &d_t1, &d_t2,
-                d_eri_mo, bd.n_frozen);
-
-            // 6. Download T amplitudes and ERI
-            std::vector<real_t> h_t1(t1sz), h_t2(t2sz);
-            std::vector<real_t> h_eri((size_t)ne*ne*ne*ne);
-            cudaMemcpy(h_t1.data(), d_t1, t1sz*sizeof(real_t), cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_t2.data(), d_t2, t2sz*sizeof(real_t), cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_eri.data(), d_eri_mo, h_eri.size()*sizeof(real_t), cudaMemcpyDeviceToHost);
-
-            // 7. Lambda solver (CPU, L=T initial guess, DIIS+damping)
-            std::vector<real_t> h_l1(h_t1), h_l2(h_t2);  // L=T initial guess
-            bool lambda_ok = solve_ccsd_lambda_cpu(
-                no, nv, h_eps.data(), h_eri.data(),
-                h_t1.data(), h_t2.data(), h_l1.data(), h_l2.data(),
-                300, 1e-5, verbose ? 1 : 0);
-
-            if (!lambda_ok && verbose)
-                std::cout << "  Lambda: falling back to L=T" << std::endl;
-
-            // 8. Democratic E_corr_frag from T amplitudes
-            real_t E_frag = compute_dmet_fragment_energy(
-                no, nv, h_eri.data(), h_t1.data(), h_t2.data(),
-                n_frag_emb, h_eigvecs.data(), bd.n_frozen);
-
-            // 8. Fragment electron count from relaxed 1-RDM (if Lambda ok) or HF
-            real_t N_frag = 2.0 * bd.n_core;
-            if (lambda_ok) {
-                // Relaxed 1-RDM → accurate N_frag
-                const int na_act = no_act + nv;
-                std::vector<real_t> dm1(na_act * na_act, 0.0);
-                build_ccsd_1rdm_mo_cpu(no_act, nv, h_t1.data(), h_t2.data(),
-                                       h_l1.data(), h_l2.data(), dm1.data());
-                const int nf = bd.n_frozen;
-                for (int i = 0; i < na_act; i++)
-                    for (int j = 0; j < na_act; j++) {
-                        real_t P_ij = 0.0;
-                        for (int p = 0; p < n_frag_emb; p++)
-                            P_ij += h_eigvecs[p * ne + (i+nf)] * h_eigvecs[p * ne + (j+nf)];
-                        N_frag += P_ij * dm1[i * na_act + j];
-                    }
-            } else {
-                // HF fallback: N_frag = 2*Σ_{i<no} P_can[i,i]
-                for (int i = 0; i < no; i++) {
-                    real_t P_ii = 0.0;
-                    for (int p = 0; p < n_frag_emb; p++)
-                        P_ii += h_eigvecs[p * ne + i] * h_eigvecs[p * ne + i];
-                    N_frag += 2.0 * P_ii;
-                }
-            }
-
-            results[f] = {E_frag, N_frag};
-            solved[f] = true;
-            E_corr_total += E_frag;
-            N_total_frag += N_frag;
-
-            // 10. RDM-based E_corr verification (PySCF convention, P=I)
-            if (verbose && lambda_ok) {
-                const int na_act = no_act + nv;
-                const int nf = bd.n_frozen;
-
-                // Build PySCF dm2 from relaxed 1-RDM + T/L
-                std::vector<real_t> dm1_v(na_act * na_act, 0.0);
-                std::vector<real_t> dm2_v((size_t)na_act*na_act*na_act*na_act, 0.0);
-                build_ccsd_1rdm_mo_cpu(no_act, nv, h_t1.data(), h_t2.data(),
-                                       h_l1.data(), h_l2.data(), dm1_v.data());
-                build_ccsd_2rdm_pyscf_cpu(no_act, nv, h_t1.data(), h_t2.data(),
-                                          h_l1.data(), h_l2.data(),
-                                          dm1_v.data(), dm2_v.data());
-
-                // h_core in canonical(μ) basis
-                std::vector<real_t> hc(na_act * na_act, 0.0);
-                for (int p = 0; p < na_act; p++)
-                  for (int q = 0; q < na_act; q++) {
-                    real_t val = 0.0;
-                    for (int a = 0; a < ne; a++)
-                      for (int b = 0; b < ne; b++)
-                        val += h_eigvecs[a*ne+(p+nf)] * bd.h_core_emb[a*ne+b] * h_eigvecs[b*ne+(q+nf)];
-                    hc[p * na_act + q] = val;
-                  }
-
-                // E_1e = Tr(h_core * dm1) - E_1e_HF
-                real_t e1 = 0.0, e1hf = 0.0;
-                for (int p = 0; p < na_act; p++)
-                  for (int q = 0; q < na_act; q++) {
-                    e1 += hc[p*na_act+q] * dm1_v[q*na_act+p];
-                    real_t hf = (q == p && p < no_act) ? 2.0 : 0.0;
-                    e1hf += hc[p*na_act+q] * hf;  // only diagonal survives
-                  }
-
-                // E_2e = 0.5*einsum('pqrs,pqrs', eri, dm2) - E_2e_HF
-                const size_t na2a = (size_t)na_act * na_act;
-                real_t e2 = 0.0, e2hf = 0.0;
-                for (int p = 0; p < na_act; p++)
-                  for (int q = 0; q < na_act; q++)
-                    for (int r = 0; r < na_act; r++)
-                      for (int s = 0; s < na_act; s++) {
-                        real_t eri_v = h_eri[((size_t)(p+nf)*ne+(q+nf))*((size_t)ne*ne)
-                                            +(size_t)(r+nf)*ne+(s+nf)];
-                        e2 += eri_v * dm2_v[((size_t)p*na_act+q)*na2a + r*na_act+s];
-                        // HF dm2: 4δ_{pq}δ_{rs} - 2δ_{ps}δ_{rq}
-                        real_t hfv = 0.0;
-                        if (p < no_act && q < no_act && r < no_act && s < no_act) {
-                            if (p==q && r==s) hfv += 4.0;
-                            if (p==s && r==q) hfv -= 2.0;
-                        }
-                        e2hf += eri_v * hfv;
-                      }
-                e2 *= 0.5; e2hf *= 0.5;
-
-                real_t e_corr_rdm = (e1 - e1hf) + (e2 - e2hf);
-                std::cout << "  Fragment " << f << ": E_T=" << std::setprecision(10) << E_frag
-                          << " E_RDM=" << e_corr_rdm
-                          << " N=" << std::setprecision(4) << N_frag
-                          << " raw=" << std::setprecision(10) << E_CCSD << std::endl;
-            } else if (verbose) {
-                std::cout << "  Fragment " << f << ": E_corr=" << std::setprecision(10) << E_frag
-                          << " N_frag=" << std::setprecision(4) << N_frag
-                          << " (L=T)" << std::endl;
-            }
-
-            // Cleanup
-            tracked_cudaFree(d_t1); tracked_cudaFree(d_t2);
-            tracked_cudaFree(d_C_can); tracked_cudaFree(d_eri_mo);
-            tracked_cudaFree(d_eigvals);
         }
 
-        return {N_total_frag, E_corr_total};
+        // ---- Parallel: solve canonical non-trivial fragments ----
+        // Inner output (CCSD/Lambda iter prints) is suppressed throughout; the
+        // bisection summary line per fragment is printed in-order afterwards.
+        int n_threads = std::min((int)unique_fragments.size(), num_gpus);
+        if (n_threads < 1) n_threads = 1;
+
+        // Force OMP team size and disable dynamic adjustment. Eigen serial is
+        // set BEFORE the parallel region to avoid its internal OMP setting
+        // shrinking our team.
+        omp_set_dynamic(0);
+        omp_set_num_threads(n_threads);
+        Eigen::setNbThreads(1);
+
+        {
+            CoutSilencer silence(true);
+            #pragma omp parallel num_threads(n_threads)
+            {
+                #pragma omp for schedule(static, 1)
+                for (int idx = 0; idx < (int)unique_fragments.size(); idx++) {
+                    int my_tid = omp_get_thread_num();
+                    cudaSetDevice(my_tid);
+
+                    int f = unique_fragments[idx];
+                    if (solved[f]) continue;  // full-system was handled serially
+                    auto& bd = baths[f];
+
+                    const int ne = bd.n_emb, no = bd.n_emb_occ, nv = ne - no;
+                    const int no_act = no - bd.n_frozen;
+                    const int n_frag_emb = fragments_[f].n_frag;
+                    const size_t t1sz = (size_t)no_act * nv;
+                    const size_t t2sz = (size_t)no_act * no_act * nv * nv;
+
+                    // 1. h_emb(μ) = h_emb_base - μ P_frag
+                    std::vector<real_t> h_emb(bd.h_emb_base);
+                    for (int p = 0; p < n_frag_emb; p++)
+                        h_emb[p * ne + p] -= mu;
+
+                    // 2. Build eri in embedding basis (current device's replicated B)
+                    real_t* d_C_emb_dev = nullptr;
+                    tracked_cudaMalloc(&d_C_emb_dev, nao * ne * sizeof(real_t));
+                    cudaMemcpy(d_C_emb_dev, bd.C_emb.data(), nao * ne * sizeof(real_t),
+                               cudaMemcpyHostToDevice);
+                    real_t* d_eri_emb_dev = eri_.build_mo_eri(d_C_emb_dev, ne);
+                    tracked_cudaFree(d_C_emb_dev);
+
+                    std::vector<real_t> h_eri_emb((size_t)ne*ne*ne*ne);
+                    cudaMemcpy(h_eri_emb.data(), d_eri_emb_dev,
+                               h_eri_emb.size()*sizeof(real_t), cudaMemcpyDeviceToHost);
+                    tracked_cudaFree(d_eri_emb_dev);
+
+                    // 3. Embedding HF
+                    auto [h_eigvecs, h_eps] = run_embedding_hf_cpu(
+                        h_emb, h_eri_emb, ne, no,
+                        /*max_iter=*/100, /*tol=*/1e-10, /*verbose=*/0);
+
+                    // Level shift
+                    if (no > 0 && no < ne) {
+                        real_t gap = h_eps[no] - h_eps[no - 1];
+                        const real_t target_gap = 0.1;
+                        if (gap < target_gap) {
+                            real_t shift = target_gap - gap;
+                            for (int i = no; i < ne; i++) h_eps[i] += shift;
+                        }
+                    }
+
+                    real_t* d_eigvals = nullptr;
+                    tracked_cudaMalloc(&d_eigvals, ne * sizeof(real_t));
+                    cudaMemcpy(d_eigvals, h_eps.data(), ne * sizeof(real_t),
+                               cudaMemcpyHostToDevice);
+
+                    // 4. C_can = C_emb × U_HF
+                    std::vector<real_t> h_C_can(nao * ne, 0.0);
+                    for (int mu_idx = 0; mu_idx < nao; mu_idx++)
+                        for (int i = 0; i < ne; i++) {
+                            real_t val = 0.0;
+                            for (int p = 0; p < ne; p++)
+                                val += bd.C_emb[mu_idx * ne + p] * h_eigvecs[p * ne + i];
+                            h_C_can[mu_idx * ne + i] = val;
+                        }
+
+                    // 5. MO ERI in canonical basis
+                    real_t* d_C_can = nullptr;
+                    tracked_cudaMalloc(&d_C_can, nao * ne * sizeof(real_t));
+                    cudaMemcpy(d_C_can, h_C_can.data(), nao * ne * sizeof(real_t),
+                               cudaMemcpyHostToDevice);
+                    real_t* d_eri_mo = eri_.build_mo_eri(d_C_can, ne);
+
+                    // 6. CCSD
+                    real_t *d_t1 = nullptr, *d_t2 = nullptr;
+                    real_t E_CCSD = ccsd_spatial_orbital(
+                        nullptr, d_C_can, d_eigvals,
+                        ne, no, false, nullptr, &d_t1, &d_t2,
+                        d_eri_mo, bd.n_frozen);
+                    (void)E_CCSD;
+
+                    // 7. Download T/ERI
+                    std::vector<real_t> h_t1(t1sz), h_t2(t2sz);
+                    std::vector<real_t> h_eri((size_t)ne*ne*ne*ne);
+                    cudaMemcpy(h_t1.data(), d_t1, t1sz*sizeof(real_t),
+                               cudaMemcpyDeviceToHost);
+                    cudaMemcpy(h_t2.data(), d_t2, t2sz*sizeof(real_t),
+                               cudaMemcpyDeviceToHost);
+                    cudaMemcpy(h_eri.data(), d_eri_mo,
+                               h_eri.size()*sizeof(real_t), cudaMemcpyDeviceToHost);
+
+                    // 8. Lambda solver
+                    std::vector<real_t> h_l1(h_t1), h_l2(h_t2);
+                    bool lambda_ok = solve_ccsd_lambda_cpu(
+                        no, nv, h_eps.data(), h_eri.data(),
+                        h_t1.data(), h_t2.data(), h_l1.data(), h_l2.data(),
+                        300, 1e-5, /*verbose=*/0);
+
+                    // 9. Democratic E_corr_frag
+                    real_t E_frag = compute_dmet_fragment_energy(
+                        no, nv, h_eri.data(), h_t1.data(), h_t2.data(),
+                        n_frag_emb, h_eigvecs.data(), bd.n_frozen);
+
+                    // 10. N_frag from relaxed 1-RDM (or HF fallback)
+                    real_t N_frag = 2.0 * bd.n_core;
+                    if (lambda_ok) {
+                        const int na_act = no_act + nv;
+                        std::vector<real_t> dm1(na_act * na_act, 0.0);
+                        build_ccsd_1rdm_mo_cpu(no_act, nv, h_t1.data(), h_t2.data(),
+                                               h_l1.data(), h_l2.data(), dm1.data());
+                        const int nf = bd.n_frozen;
+                        for (int i = 0; i < na_act; i++)
+                            for (int j = 0; j < na_act; j++) {
+                                real_t P_ij = 0.0;
+                                for (int p = 0; p < n_frag_emb; p++)
+                                    P_ij += h_eigvecs[p * ne + (i+nf)]
+                                          * h_eigvecs[p * ne + (j+nf)];
+                                N_frag += P_ij * dm1[i * na_act + j];
+                            }
+                    } else {
+                        for (int i = 0; i < no; i++) {
+                            real_t P_ii = 0.0;
+                            for (int p = 0; p < n_frag_emb; p++)
+                                P_ii += h_eigvecs[p * ne + i] * h_eigvecs[p * ne + i];
+                            N_frag += 2.0 * P_ii;
+                        }
+                    }
+
+                    results[f] = {E_frag, N_frag};
+                    lambda_ok_v[f] = lambda_ok;
+                    gpu_used[f] = my_tid;
+                    solved[f] = true;
+
+                    tracked_cudaFree(d_t1); tracked_cudaFree(d_t2);
+                    tracked_cudaFree(d_C_can); tracked_cudaFree(d_eri_mo);
+                    tracked_cudaFree(d_eigvals);
+                }
+            } // end omp parallel
+        } // end CoutSilencer
+
+        // ---- Copy canonical results to equivalent fragments ----
+        for (size_t f = 0; f < fragments_.size(); f++) {
+            if (solved[f]) continue;
+            int canon = canonical_of[f];
+            if (canon >= 0 && solved[canon]) {
+                results[f] = results[canon];
+                lambda_ok_v[f] = lambda_ok_v[canon];
+                solved[f] = true;
+            }
+        }
+
+        // ---- Verbose summary (in fragment order) ----
+        if (verbose) {
+            for (size_t f = 0; f < fragments_.size(); f++) {
+                auto& bd = baths[f];
+                int canon = canonical_of[f];
+                if (bd.is_full_system) {
+                    std::cout << "  Fragment " << f << ": full system CCSD = "
+                              << std::setprecision(10) << results[f].E_corr_frag
+                              << " Ha [GPU 0]" << std::endl;
+                } else if (canon == (int)f) {
+                    if (gpu_used[f] < 0) {
+                        std::cout << "  Fragment " << f << ": (trivial, skipped)"
+                                  << std::endl;
+                    } else {
+                        std::cout << "  Fragment " << f << ": E_corr="
+                                  << std::setprecision(10) << results[f].E_corr_frag
+                                  << " N_frag=" << std::setprecision(4) << results[f].N_frag
+                                  << (lambda_ok_v[f] ? " (Lambda OK)" : " (L=T)")
+                                  << " [GPU " << gpu_used[f] << "]" << std::endl;
+                    }
+                } else if (canon >= 0) {
+                    std::cout << "  Fragment " << f << ": equivalent to " << canon
+                              << " (E=" << std::setprecision(10) << results[f].E_corr_frag
+                              << ", N=" << std::setprecision(4) << results[f].N_frag
+                              << ") [from GPU " << gpu_used[canon] << "]" << std::endl;
+                }
+            }
+        }
+
+        // ---- Aggregate ----
+        real_t N_total = 0.0, E_total = 0.0;
+        for (size_t f = 0; f < fragments_.size(); f++) {
+            N_total += results[f].N_frag;
+            E_total += results[f].E_corr_frag;
+        }
+        return {N_total, E_total};
     };
 
     // ================================================================
@@ -755,33 +944,48 @@ real_t DMET::compute_energy() {
         real_t mu_lo = -1.0, mu_hi = 1.0;
 
         // Ensure the bracket contains the root
+        std::cout << "  Bracket init: solving at μ=" << mu_lo << " and μ=" << mu_hi << std::endl;
         auto [N_lo, E_lo] = evaluate_at_mu(mu_lo, false);
+        std::cout << "    μ=" << std::setprecision(4) << mu_lo
+                  << "  Σ N_frag=" << N_lo << "  err=" << (N_lo - N_elec) << std::endl;
         auto [N_hi, E_hi] = evaluate_at_mu(mu_hi, false);
+        std::cout << "    μ=" << mu_hi
+                  << "  Σ N_frag=" << N_hi << "  err=" << (N_hi - N_elec) << std::endl;
 
         // Expand bracket if needed
         for (int expand = 0; expand < 5; expand++) {
             if ((N_lo - N_elec) * (N_hi - N_elec) <= 0) break;
             mu_lo *= 2.0; mu_hi *= 2.0;
+            std::cout << "  Expanding bracket to μ=[" << mu_lo << ", " << mu_hi << "]" << std::endl;
             std::tie(N_lo, E_lo) = evaluate_at_mu(mu_lo, false);
+            std::cout << "    μ=" << mu_lo
+                      << "  Σ N_frag=" << N_lo << "  err=" << (N_lo - N_elec) << std::endl;
             std::tie(N_hi, E_hi) = evaluate_at_mu(mu_hi, false);
+            std::cout << "    μ=" << mu_hi
+                      << "  Σ N_frag=" << N_hi << "  err=" << (N_hi - N_elec) << std::endl;
         }
 
         if ((N_lo - N_elec) * (N_hi - N_elec) > 0) {
             std::cout << "  WARNING: bisection bracket failed, using μ=0" << std::endl;
         } else {
             const int max_iter = 30;
+            std::cout << "  Bisecting (target |err| < " << std::scientific << N_tol
+                      << std::defaultfloat << ")..." << std::endl;
             for (int iter = 0; iter < max_iter; iter++) {
                 real_t mu_mid = 0.5 * (mu_lo + mu_hi);
                 auto [N_mid, E_mid] = evaluate_at_mu(mu_mid, false);
                 real_t err_mid = N_mid - N_elec;
 
+                std::cout << "    iter " << std::setw(2) << iter + 1
+                          << ": μ=" << std::setprecision(6) << mu_mid
+                          << "  Σ N_frag=" << std::setprecision(6) << N_mid
+                          << "  err=" << std::scientific << err_mid
+                          << std::defaultfloat << std::endl;
+
                 if (std::abs(err_mid) < N_tol || (mu_hi - mu_lo) < 1e-10) {
                     mu_opt = mu_mid;
                     E_corr_opt = E_mid;
-                    std::cout << "  μ converged: μ=" << std::setprecision(6) << mu_opt
-                              << " Σ N_frag=" << std::setprecision(6) << N_mid
-                              << " err=" << std::scientific << err_mid
-                              << std::defaultfloat << " (iter=" << iter + 1 << ")" << std::endl;
+                    std::cout << "  μ converged at iter " << iter + 1 << std::endl;
                     break;
                 }
 
@@ -820,6 +1024,11 @@ real_t DMET::compute_energy() {
     std::cout << "  DMET-CCSD total energy: "
               << std::setprecision(10) << rhf_.get_total_energy() + E_corr_opt << " Ha" << std::endl;
     std::cout << std::defaultfloat;
+
+    // Release replicated full-B copies (frees ~num_gpus × naux × nao² × 8 bytes)
+    if (eri_distributed && eri_distributed->b_is_replicated()) {
+        eri_distributed->free_replicated_B();
+    }
 
     return E_corr_opt;
 }

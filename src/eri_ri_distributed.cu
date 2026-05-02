@@ -25,6 +25,7 @@
 #ifdef GANSU_MULTI_GPU
 
 #include "rhf.hpp"
+#include "dmet.hpp"
 #include "multi_gpu_manager.hpp"
 #include "nccl_comm.hpp"
 #include "device_host_memory.hpp"
@@ -36,6 +37,7 @@
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
+#include <cstdlib>
 
 #ifndef GANSU_CPU_ONLY
 #include <cuda_runtime.h>
@@ -2160,63 +2162,30 @@ real_t ERI_RI_Distributed_RHF::compute_sos_mp2_energy() {
 }
 
 // ============================================================================
-//  build_mo_eri: gather distributed B_local → full B on GPU 0, then delegate
+//  build_mo_eri: three paths
+//    Replicated:   full B replicated on every GPU → run pipeline locally on caller
+//    Distributed:  B sliced by aux index → each GPU runs partial pipeline, NCCL AllReduce
+//    Single-GPU:   num_gpus_ == 1 → run pipeline on GPU 0
 // ============================================================================
 
-real_t* ERI_RI_Distributed_RHF::build_mo_eri(const real_t* d_C, int nmo) const {
-    const int nao = num_basis_;
-    const int naux = num_auxiliary_basis_;
-    const size_t nao2 = (size_t)nao * nao;
-
-    // Gather full B [naux × nao²] on GPU 0 from distributed B_local chunks
-    cudaSetDevice(0);
-    real_t* d_B_full = nullptr;
-    tracked_cudaMalloc(&d_B_full, (size_t)naux * nao2 * sizeof(real_t));
-
-    size_t offset = 0;
-    for (int g = 0; g < num_gpus_; g++) {
-        const size_t chunk = (size_t)naux_local_[g] * nao2;
-        if (g == 0) {
-            cudaMemcpy(d_B_full + offset, d_B_local_[g],
-                       chunk * sizeof(real_t), cudaMemcpyDeviceToDevice);
-        } else {
-            // Cross-GPU: use cudaMemcpyPeer for reliable transfer
-            cudaMemcpyPeer(d_B_full + offset, 0, d_B_local_[g], g,
-                           chunk * sizeof(real_t));
-        }
-        offset += chunk;
-    }
-    cudaDeviceSynchronize();
-
-    // Temporarily set intermediate_matrix_B_ to the gathered B
-    // Since build_mo_eri in ERI_RI reads intermediate_matrix_B_.device_ptr(),
-    // we write d_B_full into it (it was a 1×1 dummy).
-    // Instead, call the GPU DGEMM sequence directly here.
-
-    // Reuse the ERI_RI::build_mo_eri logic with d_B_full:
-    // Step 1: B_tmp = C^T × B  (right half-transform)
-    // Step 2: B_mo = C^T × B_tmp (left half-transform with transpose)
-    // Step 3: eri_mo = B_mo^T × B_mo
-
-    cublasHandle_t handle = gpu::GPUHandle::cublas();
+// Helper: standard (right half-transform → transpose → left half-transform → ERI)
+// pipeline using a full-B pointer on the calling device. Returns eri_mo on the
+// caller's device.
+static real_t* build_eri_from_B_pipeline(
+    const real_t* d_C, int nmo, int nao, int naux,
+    const real_t* d_B, cublasHandle_t handle)
+{
     const double alpha = 1.0, beta = 0.0;
     const size_t nmo2 = (size_t)nmo * nmo;
 
-    // Step 1: right half-transform
     real_t* d_B_tmp = nullptr;
     tracked_cudaMalloc(&d_B_tmp, (size_t)naux * nao * nmo * sizeof(real_t));
-
     cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
         nmo, (long long)naux * nao, nao,
-        &alpha, d_C, nmo, d_B_full, nao,
-        &beta, d_B_tmp, nmo);
+        &alpha, d_C, nmo, d_B, nao, &beta, d_B_tmp, nmo);
 
-    tracked_cudaFree(d_B_full);
-
-    // Step 2: transpose per Q then left half-transform
     real_t* d_B_tmp2 = nullptr;
     tracked_cudaMalloc(&d_B_tmp2, (size_t)naux * nao * nmo * sizeof(real_t));
-
     for (int Q = 0; Q < naux; Q++) {
         cublasDgeam(handle, CUBLAS_OP_T, CUBLAS_OP_N,
             nao, nmo, &alpha,
@@ -2228,27 +2197,211 @@ real_t* ERI_RI_Distributed_RHF::build_mo_eri(const real_t* d_C, int nmo) const {
 
     real_t* d_B_mo = nullptr;
     tracked_cudaMalloc(&d_B_mo, (size_t)naux * nmo2 * sizeof(real_t));
-
     cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
         nmo, (long long)naux * nmo, nao,
-        &alpha, d_C, nmo, d_B_tmp2, nao,
-        &beta, d_B_mo, nmo);
-
+        &alpha, d_C, nmo, d_B_tmp2, nao, &beta, d_B_mo, nmo);
     tracked_cudaFree(d_B_tmp2);
 
-    // Step 3: eri_mo = B_mo^T × B_mo
     real_t* d_eri_mo = nullptr;
     tracked_cudaMalloc(&d_eri_mo, nmo2 * nmo2 * sizeof(real_t));
-
     cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
         nmo2, nmo2, naux,
-        &alpha, d_B_mo, nmo2, d_B_mo, nmo2,
-        &beta, d_eri_mo, nmo2);
-
+        &alpha, d_B_mo, nmo2, d_B_mo, nmo2, &beta, d_eri_mo, nmo2);
     tracked_cudaFree(d_B_mo);
-    cudaDeviceSynchronize();
 
     return d_eri_mo;
+}
+
+real_t* ERI_RI_Distributed_RHF::build_mo_eri(const real_t* d_C, int nmo) const {
+    const int nao = num_basis_;
+    const int naux = num_auxiliary_basis_;
+    const size_t nmo2 = (size_t)nmo * nmo;
+
+    // ---- Replicated path: full B on caller's current device ----
+    if (b_replicated_) {
+        int curr_dev;
+        cudaGetDevice(&curr_dev);
+        if (curr_dev < 0 || curr_dev >= num_gpus_ || !d_B_full_per_gpu_[curr_dev]) {
+            throw std::runtime_error("build_mo_eri: replicated B requested but device "
+                                     + std::to_string(curr_dev) + " has no copy");
+        }
+        cublasHandle_t handle = gpu::GPUHandle::cublas();
+        real_t* d_eri_mo = build_eri_from_B_pipeline(
+            d_C, nmo, nao, naux, d_B_full_per_gpu_[curr_dev], handle);
+        cudaDeviceSynchronize();
+        return d_eri_mo;
+    }
+
+    // ---- Distributed path: collective build via NCCL AllReduce ----
+    // Each GPU does a partial DGEMM on its B_local slice → eri_local.
+    // AllReduce(SUM) combines across GPUs since
+    //     eri[i,j,k,l] = Σ_P B_mo[P,i,j] B_mo[P,k,l]
+    //                  = Σ_g Σ_{P∈slice g} B_mo[P,i,j] B_mo[P,k,l]
+    // After AllReduce only GPU 0 keeps eri (others freed). Trades
+    // num_gpus × naux × nao² (replication memory) for one nmo⁴ AllReduce.
+    if (num_gpus_ > 1) {
+        auto& mgr = MultiGpuManager::instance();
+        std::vector<real_t*> d_C_per_gpu(num_gpus_, nullptr);
+        std::vector<real_t*> d_eri_per_gpu(num_gpus_, nullptr);
+
+        const size_t C_bytes = (size_t)nao * nmo * sizeof(real_t);
+        for (int g = 0; g < num_gpus_; g++) {
+            cudaSetDevice(g);
+            if (g == 0) {
+                d_C_per_gpu[g] = const_cast<real_t*>(d_C);
+            } else {
+                tracked_cudaMalloc(&d_C_per_gpu[g], C_bytes);
+                cudaMemcpyPeer(d_C_per_gpu[g], g, d_C, 0, C_bytes);
+            }
+        }
+
+        for (int g = 0; g < num_gpus_; g++) {
+            cudaSetDevice(g);
+            d_eri_per_gpu[g] = build_eri_from_B_pipeline(
+                d_C_per_gpu[g], nmo, nao, naux_local_[g],
+                d_B_local_[g], mgr.cublas(g));
+        }
+
+        for (int g = 0; g < num_gpus_; g++) {
+            cudaSetDevice(g);
+            cudaDeviceSynchronize();
+        }
+
+        nccl::group_start();
+        for (int g = 0; g < num_gpus_; g++) {
+            cudaSetDevice(g);
+            nccl::all_reduce<real_t>(d_eri_per_gpu[g], d_eri_per_gpu[g],
+                                     nmo2 * nmo2, ncclSum, g,
+                                     mgr.comm_stream(g));
+        }
+        nccl::group_end();
+
+        for (int g = 0; g < num_gpus_; g++) {
+            cudaSetDevice(g);
+            cudaStreamSynchronize(mgr.comm_stream(g));
+        }
+
+        for (int g = 0; g < num_gpus_; g++) {
+            cudaSetDevice(g);
+            if (g != 0 && d_C_per_gpu[g]) tracked_cudaFree(d_C_per_gpu[g]);
+            if (g != 0) tracked_cudaFree(d_eri_per_gpu[g]);
+        }
+
+        cudaSetDevice(0);
+        return d_eri_per_gpu[0];
+    }
+
+    // ---- Single-GPU fallback (num_gpus_ == 1) ----
+    cudaSetDevice(0);
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    real_t* d_eri_mo = build_eri_from_B_pipeline(
+        d_C, nmo, nao, naux_local_[0], d_B_local_[0], handle);
+    cudaDeviceSynchronize();
+    return d_eri_mo;
+}
+
+// ============================================================================
+//  Replicated-B mode: replicate full B to every GPU for fragment-parallel DMET.
+//
+//  After calling, each GPU holds the complete B[naux × nao²] tensor and
+//  build_mo_eri can run independently per device (no peer copies). This
+//  trades memory (factor of num_gpus) for fully parallel fragment solves.
+// ============================================================================
+
+bool ERI_RI_Distributed_RHF::replicate_B_to_all_gpus() {
+    if (b_replicated_) return true;
+
+    // Debug override: force the Distributed path even when B would fit.
+    // Useful for exercising the collective build_mo_eri on small test systems
+    // where memory is plentiful (otherwise Replicated is always selected).
+    if (std::getenv("GANSU_DMET_FORCE_DISTRIBUTED")) {
+        std::cout << "[Multi-GPU DMET] Distributed mode forced via "
+                     "GANSU_DMET_FORCE_DISTRIBUTED" << std::endl;
+        return false;
+    }
+
+    const int nao = num_basis_;
+    const int naux = num_auxiliary_basis_;
+    const size_t nao2 = (size_t)nao * nao;
+    const size_t full_bytes = (size_t)naux * nao2 * sizeof(real_t);
+
+    // Memory check: confirm each GPU can hold a full B copy with margin.
+    size_t min_free = SIZE_MAX;
+    for (int g = 0; g < num_gpus_; g++) {
+        cudaSetDevice(g);
+        size_t free_bytes = 0, total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        min_free = std::min(min_free, free_bytes);
+    }
+    cudaSetDevice(0);
+
+    // Need to leave headroom for fragment-local working memory (CCSD intermediates,
+    // MO ERI, B_tmp, etc). Require full_bytes < 60% of free on the tightest GPU.
+    if (full_bytes > min_free * 6 / 10) {
+        std::cout << "[Multi-GPU DMET] B replication skipped: full B = "
+                  << (full_bytes >> 20) << " MB exceeds 60% of free GPU memory ("
+                  << (min_free >> 20) << " MB). Falling back to gather-to-GPU0 path."
+                  << std::endl;
+        return false;
+    }
+
+    d_B_full_per_gpu_.assign(num_gpus_, nullptr);
+
+    // Allocate full-B buffer on every GPU.
+    for (int g = 0; g < num_gpus_; g++) {
+        cudaSetDevice(g);
+        tracked_cudaMalloc(&d_B_full_per_gpu_[g], full_bytes);
+    }
+
+    // Each source GPU's slice is broadcast to every destination GPU.
+    // Layout: d_B_full[offset_g .. offset_g + naux_local[g]*nao²] = d_B_local_[g].
+    std::vector<size_t> offsets(num_gpus_, 0);
+    for (int g = 1; g < num_gpus_; g++)
+        offsets[g] = offsets[g - 1] + (size_t)naux_local_[g - 1] * nao2;
+
+    for (int src = 0; src < num_gpus_; src++) {
+        const size_t bytes_src = (size_t)naux_local_[src] * nao2 * sizeof(real_t);
+        for (int dst = 0; dst < num_gpus_; dst++) {
+            cudaSetDevice(dst);
+            if (dst == src) {
+                cudaMemcpy(d_B_full_per_gpu_[dst] + offsets[src], d_B_local_[src],
+                           bytes_src, cudaMemcpyDeviceToDevice);
+            } else {
+                cudaMemcpyPeer(d_B_full_per_gpu_[dst] + offsets[src], dst,
+                               d_B_local_[src], src, bytes_src);
+            }
+        }
+    }
+    for (int g = 0; g < num_gpus_; g++) {
+        cudaSetDevice(g);
+        cudaDeviceSynchronize();
+    }
+    cudaSetDevice(0);
+
+    b_replicated_ = true;
+    std::cout << "[Multi-GPU DMET] B replicated across " << num_gpus_
+              << " GPUs (" << (full_bytes >> 20) << " MB each)" << std::endl;
+    return true;
+}
+
+void ERI_RI_Distributed_RHF::free_replicated_B() {
+    if (!b_replicated_) return;
+    for (int g = 0; g < (int)d_B_full_per_gpu_.size(); g++) {
+        if (d_B_full_per_gpu_[g]) {
+            cudaSetDevice(g);
+            tracked_cudaFree(d_B_full_per_gpu_[g]);
+        }
+    }
+    d_B_full_per_gpu_.clear();
+    b_replicated_ = false;
+    cudaSetDevice(0);
+}
+
+// DMET-CCSD entry point. Forwards to DMET; the multi-GPU optimization is
+// applied inside DMET::compute_energy() when it detects this ERI subclass.
+real_t ERI_RI_Distributed_RHF::compute_dmet_ccsd() {
+    DMET dmet(rhf_, *this);
+    return dmet.compute_energy();
 }
 
 } // namespace gansu

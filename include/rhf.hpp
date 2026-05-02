@@ -1103,6 +1103,28 @@ public:
     /// Build MO ERI from distributed B_local: gather full B on GPU 0, then delegate
     real_t* build_mo_eri(const real_t* d_C, int nmo) const override;
 
+    /**
+     * @brief Replicate the full B intermediate to every GPU.
+     *
+     * After calling, d_B_full_per_gpu_[g] holds a complete B[naux × nao²] copy
+     * on device g. Subsequent build_mo_eri calls then run entirely on the
+     * caller's current device (chosen via cudaSetDevice), enabling
+     * fragment-parallel multi-GPU DMET.
+     *
+     * Performs a memory check; returns false (without allocating) if the
+     * replication would exceed roughly 60% of the smallest GPU's free memory.
+     */
+    bool replicate_B_to_all_gpus();
+
+    /// Free the replicated full-B copies, returning to the distributed-only state.
+    void free_replicated_B();
+
+    /// Whether replicate_B_to_all_gpus() has been called and not freed.
+    bool b_is_replicated() const { return b_replicated_; }
+
+    /// DMET-CCSD entry point that takes advantage of B replication for fragment-parallel multi-GPU.
+    real_t compute_dmet_ccsd() override;
+
     /// Access distributed B data
     int num_gpus() const { return num_gpus_; }
     const std::vector<int>& get_naux_local() const { return naux_local_; }
@@ -1133,6 +1155,11 @@ private:
 
     /// Cached L⁻¹ on GPU 0 (computed once in precomputation, reused in distributed_build_B)
     real_t* d_cached_L_inv_ = nullptr;
+
+    /// Replicated full B [naux × nao²] on each GPU (Replicated-B fragment-parallel DMET).
+    /// d_B_full_per_gpu_[g] points to memory allocated on device g, or nullptr.
+    mutable std::vector<real_t*> d_B_full_per_gpu_;
+    mutable bool b_replicated_ = false;
 
     /// Per-GPU replicated data (allocated once, reused across iterations in direct_mode_)
     struct PerGpuData {
