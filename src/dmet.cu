@@ -1308,19 +1308,17 @@ real_t DMET::compute_energy() {
                                     }
                     }
 
-                    // Diagnostic: maximum |f_ov| for this fragment (μ-shifted). Use stderr
-                    // since stdout is silenced. Helps gauge whether semi-canonical CCSD
-                    // can converge — empirically PySCF/Vayesta handle |f_ov| ≲ 0.5 Ha.
-                    std::fprintf(stderr,
-                        "[DMET frag %d μ=%.4f] max|f_ov|=%.4e  ε_HOMO=%.4e ε_LUMO=%.4e\n",
-                        f, mu, fov_max,
-                        (no > 0 ? h_eps[no - 1] : 0.0),
-                        (no < ne ? h_eps[no] : 0.0));
-
-                    // Detailed diagnostic: full ε spectrum + D_cluster eigenvalues.
-                    // Helps identify whether canonicalize_cluster_subspaces is putting
-                    // the wrong directions in occ/vir (e.g., core leaking into vir).
+                    // Per-fragment per-μ diagnostic (max|f_ov|, ε spectrum, D_cluster).
+                    // Hidden by default — set GANSU_DMET_VERBOSE=1 to enable. Helps
+                    // diagnose CCSD convergence issues (|f_ov| ≲ 0.5 Ha is typically OK)
+                    // and whether canonicalize_cluster_subspaces puts the right
+                    // directions in occ/vir (e.g., core leaking into vir).
                     if (std::getenv("GANSU_DMET_VERBOSE") != nullptr) {
+                        std::fprintf(stderr,
+                            "[DMET frag %d μ=%.4f] max|f_ov|=%.4e  ε_HOMO=%.4e ε_LUMO=%.4e\n",
+                            f, mu, fov_max,
+                            (no > 0 ? h_eps[no - 1] : 0.0),
+                            (no < ne ? h_eps[no] : 0.0));
                         std::fprintf(stderr, "[DMET frag %d] ε_occ:", f);
                         for (int i = 0; i < no; i++)
                             std::fprintf(stderr, " %.4e", h_eps[i]);
@@ -1568,7 +1566,7 @@ real_t DMET::compute_energy() {
     // The need_ccsd_density flag is now redundant — kept in the API for backward
     // compat with the old 2-stage pipeline. Stage-2 refinement (the dmet_mu_refine_ccsd
     // parameter) is now a no-op since Stage-1 already runs CCSD-density.
-    const real_t N_tol = 1e-5;
+    const real_t N_tol = rhf_.get_dmet_n_tol();
     if (std::abs(N_err) > N_tol) {
         // Bracket: μ > 0 pulls electrons into the fragment, μ < 0 pushes them out.
         real_t mu_lo = -1.0, mu_hi = 1.0;

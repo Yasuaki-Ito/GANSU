@@ -81,7 +81,8 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"adc_c_c", "0.85"},                               // real_t: SOS-ADC(2) coupling block scaling
         {"dmet_fragments", ""},                            // string: fragment specification e.g. "{0,1,2} {3,4,5}"
         {"dmet_threshold", "1e-6"},                        // real_t: SVD threshold for bath orbital selection
-        {"dmet_mu_refine_ccsd", "0"}                       // bool (0/1): refine μ with CCSD-relaxed density after HF stage
+        {"dmet_mu_refine_ccsd", "0"},                      // bool (0/1): refine μ with CCSD-relaxed density after HF stage
+        {"dmet_n_tol", "1e-5"}                             // real_t: bisection tol on |Σ N_frag − N_elec| (Vayesta-compat: 4.2e-3 for benzene)
     };
 
 

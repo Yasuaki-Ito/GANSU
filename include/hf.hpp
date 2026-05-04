@@ -238,6 +238,9 @@ public:
     double get_dmet_threshold() const { return dmet_threshold_; }
     /// DMET: refine μ with CCSD-relaxed density after HF stage (2-stage μ optimization)
     bool get_dmet_mu_refine_ccsd() const { return dmet_mu_refine_ccsd_; }
+    /// DMET: bisection tolerance on |Σ N_frag − N_elec|. Default 1e-5 (tight, GANSU native).
+    /// Vayesta-compat: 4.2e-3 for benzene/STO-3G (= 1e-4 × 42, matches Vayesta's max_elec_err).
+    double get_dmet_n_tol() const { return dmet_n_tol_; }
 
     /**
      * @brief Get Shell-pair type info
@@ -401,6 +404,7 @@ protected:
     std::string dmet_fragments_str_;    ///< DMET fragment specification string
     double dmet_threshold_ = 1e-6;     ///< SVD threshold for DMET bath orbital selection
     bool dmet_mu_refine_ccsd_ = false;  ///< DMET: refine μ with CCSD-relaxed density
+    double dmet_n_tol_ = 1e-5;  ///< DMET: bisection tolerance on |Σ N_frag − N_elec|
     const int max_iter; ///< Maximum number of iterations
     int iter_; ///< Number of iterations
     real_t energy_difference_; ///< Energy difference between the current and the previous iteration
