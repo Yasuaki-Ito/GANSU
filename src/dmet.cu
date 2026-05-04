@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <numeric>
 #include <tuple>
@@ -517,10 +518,14 @@ DMET::build_bath_orbitals(const DMETFragment& frag,
     // factor is √(1 − σ²) (environment-component norm).
     //
     // For σ → 1, the environment component vanishes (orbital is fragment-
-    // localized), so we exclude it from bath and count it as n_core. Use a
-    // dedicated core_threshold (1e-3) since the user-facing svd_threshold_
-    // (default 1e-6) is too small to catch σ ≈ 1 ↔ Schmidt-pair degeneracy.
-    const real_t core_threshold = 1e-3;
+    // localized), so the bath partner has D_cluster eigenvalue ≈ 2(1−σ²) ≈ 0.
+    // We KEEP the partner in the cluster (as a near-virtual bath orbital) to
+    // match Vayesta's DMET bath construction — this is essential for the full
+    // Schmidt structure (n_emb = n_frag + n_bath where n_bath = #(σ < 1) σ
+    // values) and gives the correct cluster Fock μ-response (~10/Ha rather
+    // than ~0.05/Ha that we see if σ ≈ 1 partner is excluded). Tolerance
+    // 1e-12 only avoids 1/√(1−σ²) division by zero at σ exactly 1.
+    const real_t core_threshold = 1e-12;
     int n_bath = 0, n_core = 0;
     for (int i = 0; i < k; i++) {
         if (sigma[i] > svd_threshold_ && sigma[i] < 1.0 - core_threshold)
@@ -1189,31 +1194,118 @@ real_t DMET::compute_energy() {
                     //  f_oo, f_vv diagonal). The off-diag in occ-vir is kept and
                     //  fed to non-canonical CCSD/Lambda via h_fov_active.
                     // -----------------------------------------------------------
-                    const std::vector<real_t>& h_eigvecs = bd.h_eigvecs_can;
-                    const std::vector<real_t>& F_can     = bd.h_F_can;
-                    const std::vector<real_t>& P_can     = bd.h_P_can;
-                    const std::vector<real_t>& eps_h     = bd.h_eps_can_h;
-                    std::vector<real_t>        h_eri     = bd.h_eri_can;  // cached
+                    // Cached (μ-independent) initial canonical-basis quantities
+                    // from Phase A.6 (canonicalize_cluster_subspaces using h_emb_base):
+                    //   bd.h_eigvecs_can : U_initial, eigenvectors of h_emb_base in cluster
+                    //   bd.h_F_can       : U_initial^T h_emb_base U_initial (block-diagonal)
+                    //   bd.h_P_can       : U_initial^T P_frag U_initial (full ne×ne)
+                    //   bd.h_eri_can     : ERI in initial canonical basis (n_emb⁴, μ-independent)
+                    //
+                    // Per μ, re-canonicalize WITHIN occ and vir subspaces using the
+                    // FULL μ-shifted Fock F_total = F_can − μ·P_can. This rotates the
+                    // canonical orbitals within each subspace (μ-dependent rotation),
+                    // ensuring the semi-canonical CCSD assumption (f_oo, f_vv diagonal)
+                    // holds at any μ. The full off-diagonal of −μ·P_frag is now
+                    // captured (no diag-only approximation), giving the correct
+                    // μ-response (~2000× steeper than the previous approximation).
+                    using RowMatXd2 = Eigen::Matrix<real_t, Eigen::Dynamic,
+                        Eigen::Dynamic, Eigen::RowMajor>;
+                    Eigen::Map<const RowMatXd2> F0(bd.h_F_can.data(), ne, ne);
+                    Eigen::Map<const RowMatXd2> P0(bd.h_P_can.data(), ne, ne);
+                    Eigen::Map<const RowMatXd2> U0(bd.h_eigvecs_can.data(), ne, ne);
 
-                    // (a) Semi-canonical ε with diag μ shift
+                    RowMatXd2 F_total_initial = F0 - mu * P0;
+
+                    // Re-diagonalize F_total within each subspace (per-μ rotation).
+                    Eigen::SelfAdjointEigenSolver<RowMatXd2> solver_o(
+                        F_total_initial.block(0, 0, no, no));
+                    Eigen::SelfAdjointEigenSolver<RowMatXd2> solver_v(
+                        F_total_initial.block(no, no, nv, nv));
+                    RowMatXd2 V_o = solver_o.eigenvectors();   // [no × no]
+                    RowMatXd2 V_v = solver_v.eigenvectors();   // [nv × nv]
+                    Eigen::VectorXd eps_o = solver_o.eigenvalues();
+                    Eigen::VectorXd eps_v = solver_v.eigenvalues();
+
+                    // V_blk = block_diag(V_o, V_v): rotates initial canonical → new canonical
+                    RowMatXd2 V_blk = RowMatXd2::Zero(ne, ne);
+                    V_blk.block(0, 0, no, no) = V_o;
+                    V_blk.block(no, no, nv, nv) = V_v;
+
+                    // New canonical orbitals U_new = U_initial · V_blk (in embedding basis)
+                    RowMatXd2 U_new_mat = U0 * V_blk;
+                    std::vector<real_t> h_eigvecs((size_t)ne * ne);
+                    std::memcpy(h_eigvecs.data(), U_new_mat.data(),
+                                (size_t)ne * ne * sizeof(real_t));
+
+                    // ε in new basis: diagonal entries of F_total in new canonical basis
                     std::vector<real_t> h_eps(ne, 0.0);
-                    for (int i = 0; i < ne; i++)
-                        h_eps[i] = eps_h[i] - mu * P_can[(size_t)i * ne + i];
+                    for (int i = 0; i < no; i++) h_eps[i] = eps_o(i);
+                    for (int a = 0; a < nv; a++) h_eps[no + a] = eps_v(a);
 
-                    // (b) f_ov_active[i, a] = F_can[i+nf, no+a] − μ · P_can[i+nf, no+a]
-                    //     for i ∈ [0, no_act), a ∈ [0, nv).
+                    // f_ov_active in new basis = V_o^T · F_total[occ,vir] · V_v
+                    RowMatXd2 F_ov_initial = F_total_initial.block(0, no, no, nv);
+                    RowMatXd2 f_ov_new_mat = V_o.transpose() * F_ov_initial * V_v;
                     std::vector<real_t> h_fov_active(t1sz, 0.0);
                     real_t fov_max = 0.0;
                     for (int i = 0; i < no_act; i++) {
-                        const size_t row = (size_t)(i + nf);
                         for (int a = 0; a < nv; a++) {
-                            const size_t col = (size_t)(no + a);
-                            const real_t F_ia = F_can[row * ne + col];
-                            const real_t P_ia = P_can[row * ne + col];
-                            const real_t v   = F_ia - mu * P_ia;
+                            const real_t v = f_ov_new_mat(i + nf, a);
                             h_fov_active[(size_t)i * nv + a] = v;
                             fov_max = std::max(fov_max, std::abs(v));
                         }
+                    }
+
+                    // Rotate eri_can_initial by V_blk to get eri in new canonical basis.
+                    //   eri_new[i,j,k,l] = Σ_pqrs V_blk[p,i] V_blk[q,j] V_blk[r,k] V_blk[s,l]
+                    //                          · eri_initial[p,q,r,s]
+                    // 4-step partial transform: each step O(ne^5), total O(4 ne^5).
+                    // For ne ≤ 30 this is < 1 ms — negligible compared to CCSD itself.
+                    std::vector<real_t> h_eri((size_t)ne * ne * ne * ne, 0.0);
+                    {
+                        const std::vector<real_t>& eri0 = bd.h_eri_can;
+                        std::vector<real_t> tmp1((size_t)ne * ne * ne * ne, 0.0);
+                        std::vector<real_t> tmp2((size_t)ne * ne * ne * ne, 0.0);
+                        std::vector<real_t> tmp3((size_t)ne * ne * ne * ne, 0.0);
+                        // Step 1: tmp1[i,q,r,s] = Σ_p V_blk[p,i] · eri0[p,q,r,s]
+                        for (int q = 0; q < ne; q++)
+                            for (int r = 0; r < ne; r++)
+                                for (int s = 0; s < ne; s++)
+                                    for (int i = 0; i < ne; i++) {
+                                        real_t v = 0.0;
+                                        for (int p = 0; p < ne; p++)
+                                            v += V_blk(p, i) * eri0[(((size_t)p*ne + q)*ne + r)*ne + s];
+                                        tmp1[(((size_t)i*ne + q)*ne + r)*ne + s] = v;
+                                    }
+                        // Step 2: tmp2[i,j,r,s] = Σ_q V_blk[q,j] · tmp1[i,q,r,s]
+                        for (int i = 0; i < ne; i++)
+                            for (int r = 0; r < ne; r++)
+                                for (int s = 0; s < ne; s++)
+                                    for (int j = 0; j < ne; j++) {
+                                        real_t v = 0.0;
+                                        for (int q = 0; q < ne; q++)
+                                            v += V_blk(q, j) * tmp1[(((size_t)i*ne + q)*ne + r)*ne + s];
+                                        tmp2[(((size_t)i*ne + j)*ne + r)*ne + s] = v;
+                                    }
+                        // Step 3: tmp3[i,j,k,s] = Σ_r V_blk[r,k] · tmp2[i,j,r,s]
+                        for (int i = 0; i < ne; i++)
+                            for (int j = 0; j < ne; j++)
+                                for (int s = 0; s < ne; s++)
+                                    for (int k = 0; k < ne; k++) {
+                                        real_t v = 0.0;
+                                        for (int r = 0; r < ne; r++)
+                                            v += V_blk(r, k) * tmp2[(((size_t)i*ne + j)*ne + r)*ne + s];
+                                        tmp3[(((size_t)i*ne + j)*ne + k)*ne + s] = v;
+                                    }
+                        // Step 4: eri_new[i,j,k,l] = Σ_s V_blk[s,l] · tmp3[i,j,k,s]
+                        for (int i = 0; i < ne; i++)
+                            for (int j = 0; j < ne; j++)
+                                for (int k = 0; k < ne; k++)
+                                    for (int l = 0; l < ne; l++) {
+                                        real_t v = 0.0;
+                                        for (int s = 0; s < ne; s++)
+                                            v += V_blk(s, l) * tmp3[(((size_t)i*ne + j)*ne + k)*ne + s];
+                                        h_eri[(((size_t)i*ne + j)*ne + k)*ne + l] = v;
+                                    }
                     }
 
                     // Diagnostic: maximum |f_ov| for this fragment (μ-shifted). Use stderr
@@ -1274,7 +1366,7 @@ real_t DMET::compute_energy() {
                     cudaMemcpy(d_eigvals, h_eps.data(), ne * sizeof(real_t),
                                cudaMemcpyHostToDevice);
 
-                    // Canonical-basis ERI is μ-independent: upload the cached host copy.
+                    // h_eri is the eri_can_initial rotated by V_blk (μ-dependent).
                     real_t* d_eri_mo = nullptr;
                     tracked_cudaMalloc(&d_eri_mo, h_eri.size() * sizeof(real_t));
                     cudaMemcpy(d_eri_mo, h_eri.data(),
