@@ -6908,7 +6908,16 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             const bool computing_ccsd_t, real_t* ccsd_t_energy,
                             real_t** d_t1_out, real_t** d_t2_out,
                             real_t* d_eri_mo_precomputed = nullptr,
-                            int num_frozen = 0)
+                            int num_frozen = 0,
+                            const real_t* h_fov_active = nullptr)
+//
+// h_fov_active (optional): off-diagonal Fock f_ov[i, a] in canonical basis,
+//   shape [nocc_active × nvir]. When non-null, the Brillouin condition is
+//   relaxed and f_ov is added to the T1 amplitude residual:
+//     t_i^a (ε_i − ε_a) = ... + f_ov[i, a]
+//   For DMET clusters with semi-canonical orbitals (f_oo, f_vv block-diagonal
+//   but f_ov ≠ 0 due to subspace canonicalization) — typically used by
+//   compute_dmet_ccsd to match Vayesta's cluster Hamiltonian convention.
 {
     const int N = num_basis;
     const int nocc = num_occ - num_frozen;  // active occupied orbitals
@@ -7243,6 +7252,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // Energy: E = sum_{ijab} w_oovv[ij,ab] * (t2(i,j,a,b) + t1(i,a)*t1(j,b))
     auto energy = [&]() -> real_t {
         real_t E = 0.0;
+        // 2-electron part (canonical CCSD)
         for (int i = 0; i < nocc; i++)
             for (int j = 0; j < nocc; j++)
                 for (int a = 0; a < nvir; a++)
@@ -7250,6 +7260,12 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                         E += w_oovv[((size_t)i*nocc+j)*vv + (size_t)a*nvir+b]
                            * (t2v[T2(i,j,a,b)] + t1[i*nvir+a]*t1[j*nvir+b]);
                     }
+        // Semi-canonical: + 2 Σ_ia f_ov[i,a] t1[i,a]   (Brillouin term in CCSD energy)
+        if (h_fov_active) {
+            for (int i = 0; i < nocc; i++)
+                for (int a = 0; a < nvir; a++)
+                    E += 2.0 * h_fov_active[(size_t)i*nvir + a] * t1[i*nvir + a];
+        }
         return E;
     };
 
@@ -7300,6 +7316,14 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             cudaMemcpy(Fkc.data(), d_Fkc, ov * sizeof(double), cudaMemcpyDeviceToHost);
         }
 
+        // Semi-canonical f_ov contribution: Fkc += f_ov  (PySCF: fov bare contribution
+        // to enriched intermediate that drives t1·t2 cross terms in T1 update).
+        if (h_fov_active) {
+            for (int k = 0; k < nocc; k++)
+                for (int c = 0; c < nvir; c++)
+                    Fkc[k*nvir + c] += h_fov_active[(size_t)k * nvir + c];
+        }
+
         // F^k_i = sum_{lcd} w_oovv[k,(l*vv+cd)] * tau[i,(l*vv+cd)]
         // DGEMM: Fki(nocc×nocc) = w_oovv(nocc×nocc*vv) × tau^T(nocc*vv×nocc)
         std::vector<real_t> Fki(nocc * nocc);
@@ -7344,6 +7368,12 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                                          - v_ooov[((size_t)l*nocc+k)*ov + (size_t)i*nvir+c];
                         val += wval * t1[l*nvir+c];
                     }
+                // Semi-canonical: foo intermediate = 0.5 f_ov·t1, then ft_ij = foo + 0.5 t1·fov
+                // For semi-canon at iter ≥ 1 with bare f_ov: ft_ij[k,i] += Σ_c f_ov[k,c] * t1[i,c]
+                if (h_fov_active) {
+                    for (int c = 0; c < nvir; c++)
+                        val += h_fov_active[(size_t)k*nvir + c] * t1[i*nvir + c];
+                }
                 Lki[k*nocc+i] = val;
             }
 
@@ -7355,6 +7385,12 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 for (int k = 0; k < nocc; k++)
                     for (int d = 0; d < nvir; d++)
                         val += w_ovvv[(size_t)k*vvv + (size_t)a*vv + (size_t)d*nvir+c] * t1[k*nvir+d];
+                // Semi-canonical: fvv intermediate = -0.5 t1·f_ov, then ft_ab = fvv - 0.5 t1·fov
+                // For semi-canon at iter ≥ 1 with bare f_ov: ft_ab[a,c] -= Σ_k t1[k,a] * f_ov[k,c]
+                if (h_fov_active) {
+                    for (int k = 0; k < nocc; k++)
+                        val -= t1[k*nvir + a] * h_fov_active[(size_t)k*nvir + c];
+                }
                 Lac[a*nvir+c] = val;
             }
 
@@ -7551,6 +7587,12 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                     for (int l = 0; l < nocc; l++)
                         for (int c = 0; c < nvir; c++)
                             val -= w_ooov[((size_t)k*nocc+l)*ov + (size_t)i*nvir+c] * (t2v[T2(k,l,a,c)] + t1[k*nvir+a]*t1[l*nvir+c]);
+                // Off-diagonal Fock f_ov term (Brillouin condition relaxation).
+                // Active when h_fov_active is supplied (e.g. semi-canonical
+                // DMET cluster orbitals). For canonical Fock (f_ov = 0), no-op.
+                if (h_fov_active) {
+                    val += h_fov_active[(size_t)i * nvir + a];
+                }
                 newT1[i*nvir+a] = val / Dia[i*nvir+a];
             }
 

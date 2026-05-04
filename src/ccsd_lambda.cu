@@ -187,7 +187,8 @@ void update_lambda_full(const LambdaDims& d,
                         const std::vector<real_t>& ovvo,
                         const std::vector<real_t>& oooo,
                         const std::vector<real_t>& vvvv,
-                        real_t* l1_new, real_t* l2_new)
+                        real_t* l1_new, real_t* l2_new,
+                        const real_t* fov_active = nullptr)
 {
     const int no = d.no, nv = d.nv;
     const size_t l1_sz = (size_t)no * nv;
@@ -242,6 +243,7 @@ void update_lambda_full(const LambdaDims& d,
 
     // v1[b,a] = fvv[b,a] - Σ_{j,k,c} ovov1[j,a,k,c]*tau[j,k,b,c]
     //   For canonical: fvv[b,a] = δ_ba * ε_{nocc+a}
+    //   Semi-canonical (PySCF): v1 -= Σ_j fov[j,a]*t1[j,b]
     for (int b = 0; b < nv; b++)
       for (int a = 0; a < nv; a++) {
         real_t v = (a == b ? eps[no + a] : 0.0);
@@ -249,10 +251,15 @@ void update_lambda_full(const LambdaDims& d,
           for (int k = 0; k < no; k++)
             for (int c = 0; c < nv; c++)
               v -= OVOV1(j,a,k,c) * TAU(j,k,b,c);
+        if (fov_active) {
+            for (int j = 0; j < no; j++)
+                v -= fov_active[(size_t)j*nv + a] * T1(j, b);
+        }
         v1[(size_t)b*nv + a] = v;
       }
 
     // v2[i,j] = foo[i,j] + Σ_{b,k,c} ovov1[i,b,k,c]*tau[j,k,b,c] + Σ_{k,b} ovoo1[k,b,i,j]*t1[k,b]
+    //   Semi-canonical (PySCF): v2 += Σ_b fov[i,b]*t1[j,b]
     for (int i = 0; i < no; i++)
       for (int j = 0; j < no; j++) {
         real_t v = (i == j ? eps[i] : 0.0);
@@ -263,13 +270,17 @@ void update_lambda_full(const LambdaDims& d,
         for (int k = 0; k < no; k++)
           for (int b = 0; b < nv; b++)
             v += OVOO1(k,b,i,j) * T1(k,b);
+        if (fov_active) {
+            for (int b = 0; b < nv; b++)
+                v += fov_active[(size_t)i*nv + b] * T1(j, b);
+        }
         v2[(size_t)i*no + j] = v;
       }
 
     // v4[j,b] = fov + Σ_{k,c} ovov1[j,b,k,c]*t1[k,c]   (fov=0 for canonical)
     for (int j = 0; j < no; j++)
       for (int b = 0; b < nv; b++) {
-        real_t v = 0.0;
+        real_t v = (fov_active ? fov_active[(size_t)j*nv + b] : 0.0);
         for (int k = 0; k < no; k++)
           for (int c = 0; c < nv; c++)
             v += OVOV1(j,b,k,c) * T1(k,c);
@@ -277,12 +288,20 @@ void update_lambda_full(const LambdaDims& d,
       }
     auto V4 = [&](int j, int b) { return v4[(size_t)j*nv + b]; };
 
-    // v5[b,j] = +fvo (=0)
+    // v5[b,j] = +fvo (= fov^T for real, = 0 for canonical)
+    //   + 2 Σ_{k,c} fov[k,c]*t2[j,k,b,c] - Σ_{k,c} fov[k,c]*t2[j,k,c,b]   (semi-canon)
     //   + Σ_{k,c} v4[k,c]*t1[k,b]*t1[j,c]
     //   - Σ_{l,c,k} ovoo1[l,c,k,j]*t2[k,l,b,c]
     for (int b = 0; b < nv; b++)
       for (int j = 0; j < no; j++) {
-        real_t v = 0.0;
+        real_t v = (fov_active ? fov_active[(size_t)j*nv + b] : 0.0);  // fvo = fov^T
+        if (fov_active) {
+            for (int k = 0; k < no; k++)
+                for (int c = 0; c < nv; c++) {
+                    v += 2.0 * fov_active[(size_t)k*nv + c] * T2(j, k, b, c);
+                    v -=        fov_active[(size_t)k*nv + c] * T2(j, k, c, b);
+                }
+        }
         for (int k = 0; k < no; k++)
           for (int c = 0; c < nv; c++)
             v += V4(k,c) * T1(k,b) * T1(j,c);
@@ -957,7 +976,12 @@ void update_lambda_full(const LambdaDims& d,
                 L2N(i,j,a,b) += 0.5 * TMP(i,j,a,b) + TMP(j,i,a,b);
     }
 
-    // l1new += fov (=0)
+    // l1new += fov (=0 for canonical, ≠ 0 for semi-canonical/DMET cluster)
+    if (fov_active) {
+        for (int i = 0; i < no; i++)
+            for (int a = 0; a < nv; a++)
+                L1N(i, a) += fov_active[(size_t)i*nv + a];
+    }
     // l1new += einsum('ib,ba->ia', l1, v1)   v1[b,a]
     for (int i = 0; i < no; i++)
       for (int a = 0; a < nv; a++) {
@@ -1062,7 +1086,8 @@ bool solve_ccsd_lambda_cpu(
     real_t* h_lambda2,
     int max_iter,
     real_t tol,
-    int verbose)
+    int verbose,
+    const real_t* h_fov_active)
 {
     LambdaDims d{nocc, nvir, nocc + nvir};
     size_t l1_sz = (size_t)nocc * nvir;
@@ -1098,7 +1123,7 @@ bool solve_ccsd_lambda_cpu(
         std::vector<real_t> l1_b(l1_sz), l2_b(l2_sz);
         update_lambda_full(d, h_t1, h_t2, l1_zero.data(), l2_zero.data(),
                            h_eps, ovov, ovoo, ovvv, oovv, ovvo, oooo, vvvv,
-                           l1_b.data(), l2_b.data());
+                           l1_b.data(), l2_b.data(), h_fov_active);
 
         std::vector<real_t> b(N);
         for (size_t k = 0; k < l1_sz; k++) b[k] = l1_b[k];
@@ -1116,7 +1141,7 @@ bool solve_ccsd_lambda_cpu(
             std::vector<real_t> l1_fk(l1_sz), l2_fk(l2_sz);
             update_lambda_full(d, h_t1, h_t2, l1_ek.data(), l2_ek.data(),
                                h_eps, ovov, ovoo, ovvv, oovv, ovvo, oooo, vvvv,
-                               l1_fk.data(), l2_fk.data());
+                               l1_fk.data(), l2_fk.data(), h_fov_active);
 
             for (size_t row = 0; row < l1_sz; row++)
                 A[row * N + col] -= (l1_fk[row] - b[row]);
@@ -1170,7 +1195,7 @@ bool solve_ccsd_lambda_cpu(
             std::vector<real_t> l1_check(l1_sz), l2_check(l2_sz);
             update_lambda_full(d, h_t1, h_t2, h_lambda1, h_lambda2,
                                h_eps, ovov, ovoo, ovvv, oovv, ovvo, oooo, vvvv,
-                               l1_check.data(), l2_check.data());
+                               l1_check.data(), l2_check.data(), h_fov_active);
             real_t resid = 0.0;
             for (size_t k = 0; k < l1_sz; k++) {
                 real_t d = l1_check[k] - h_lambda1[k]; resid += d * d; }
@@ -1214,7 +1239,7 @@ bool solve_ccsd_lambda_cpu(
         update_lambda_full(d, h_t1, h_t2, h_lambda1, h_lambda2,
                            h_eps,
                            ovov, ovoo, ovvv, oovv, ovvo, oooo, vvvv,
-                           l1_new.data(), l2_new.data());
+                           l1_new.data(), l2_new.data(), h_fov_active);
 
         // Compute residual (error vector)
         std::vector<real_t> err_vec(l_total);
@@ -2159,7 +2184,8 @@ real_t compute_dmet_fragment_energy(
     const real_t* t2,        // [nocc_act^2 × nvir^2] T2 amplitudes
     int n_frag,              // fragment AOs in embedding
     const real_t* eigvecs,   // [na × na] embedding→canonical eigenvectors
-    int n_frozen)            // frozen core orbitals (first n_frozen MOs skipped by CCSD)
+    int n_frozen,            // frozen core orbitals (first n_frozen MOs skipped by CCSD)
+    const real_t* fov_active)// [nocc_act × nvir] semi-canonical f_ov (optional)
 {
     const int no = nocc, nv = nvir, na = no + nv;
     const int no_act = no - n_frozen;  // active occupied (T amplitude dimension)
@@ -2207,6 +2233,25 @@ real_t compute_dmet_fragment_energy(
                         E_corr_frag += Pip * iajb * (2.0 * tau_ab - tau_ba);
                     }
         }
+
+    // Semi-canonical Brillouin term: when f_ov ≠ 0 (e.g. Vayesta-canonical
+    // DMET clusters with μ-shift), the CCSD correlation energy gains
+    //   E_corr += 2 Σ_{i,a} f_ov[i,a] · t1[i,a]
+    // which the democratic partition projects with P:
+    //   E_corr_frag += 2 Σ_{i,i',a} P[i+nf, i'+nf] · f_ov[i,a] · t1[i',a]
+    // Σ_F P_F = I → summing over all fragments recovers the total Brillouin
+    // contribution exactly.
+    if (fov_active) {
+        for (int i = 0; i < no_act; i++)
+            for (int ip = 0; ip < no_act; ip++) {
+                real_t Pip = P_can[(i + n_frozen) * na + (ip + n_frozen)];
+                if (std::abs(Pip) < 1e-15) continue;
+                for (int a = 0; a < nv; a++)
+                    E_corr_frag += 2.0 * Pip
+                                 * fov_active[(size_t)i * nv + a]
+                                 * T1(ip, a);
+            }
+    }
 
     return E_corr_frag;
 }

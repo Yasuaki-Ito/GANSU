@@ -53,7 +53,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             const bool computing_ccsd_t, real_t* ccsd_t_energy,
                             real_t** d_t1_out, real_t** d_t2_out,
                             real_t* d_eri_mo_precomputed = nullptr,
-                            int num_frozen = 0);
+                            int num_frozen = 0,
+                            const real_t* h_fov_active = nullptr);
 
 
 // GPU kernel for trimming MO ERI (defined in eri_stored.cu)

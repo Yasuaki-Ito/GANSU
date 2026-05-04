@@ -49,7 +49,14 @@ bool solve_ccsd_lambda_cpu(
     real_t* h_lambda2,          // [nocc^2 * nvir^2] — output
     int max_iter = 100,
     real_t tol = 1e-8,
-    int verbose = 1);
+    int verbose = 1,
+    const real_t* h_fov_active = nullptr);  // [nocc*nvir] off-diag Fock f_ov.
+                                            // For semi-canonical (DMET cluster):
+                                            //   v1 -= Σ_j fov[j,a]*t1[j,b]
+                                            //   v2 += Σ_b fov[i,b]*t1[j,b]
+                                            //   v4 += fov
+                                            //   l1new += fov  (Brillouin)
+                                            // Default nullptr → canonical Lambda.
 
 /**
  * @brief Build non-relaxed CCSD 1-RDM in MO basis (CPU).
@@ -154,7 +161,13 @@ real_t compute_dmet_fragment_energy(
     const real_t* t2,        // [nocc_active^2 × nvir^2] T2 amplitudes
     int n_frag,              // number of fragment AOs in embedding space
     const real_t* eigvecs,   // [na × na] h_emb eigenvectors: U[p,i] = eigvecs[p*na+i]
-    int n_frozen = 0);       // frozen core orbitals (σ≈1, first n_frozen MOs)
+    int n_frozen = 0,        // frozen core orbitals (σ≈1, first n_frozen MOs)
+    const real_t* fov_active = nullptr);  // [nocc_active × nvir] semi-canonical f_ov.
+                                          // When non-null, adds the Brillouin term
+                                          //   2 Σ_{i,i',a} P[i+nf,i'+nf] · f_ov[i,a] · t1[i',a]
+                                          // to the democratic CCSD correlation energy
+                                          // (required for non-zero f_ov, e.g. DMET clusters
+                                          // with Vayesta-style canonicalization).
 
 /**
  * @brief AO-projected DMET fragment correlation energy via full 1-RDM and 2-RDM.
