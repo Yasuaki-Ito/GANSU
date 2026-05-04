@@ -19,7 +19,7 @@
 | convergence_energy_threshold | Energy convergence threshold | double | 1.0e-6 |
 | int1e_method | Method to use for one-electron integrals | string | hybrid |
 | eri_method | Method to use for two-electron repulsion integrals | string | stored |
-| post_hf_method | Post-Hartree-Fock method to use (FCI, MP2, SCS_MP2, SOS_MP2, LT_MP2, LT_SOS_MP2, MP3, MP4, CC2, CCSD, CCSD_T, CCSD_DENSITY, CIS, ADC2, SOS_ADC2, ADC2X, EOM_MP2, EOM_CC2, EOM_CCSD) | string | none |
+| post_hf_method | Post-Hartree-Fock method to use (FCI, MP2, SCS_MP2, SOS_MP2, LT_MP2, LT_SOS_MP2, MP3, MP4, CC2, CCSD, CCSD_T, CCSD_DENSITY, DMET_CCSD, CIS, ADC2, SOS_ADC2, ADC2X, EOM_MP2, EOM_CC2, EOM_CCSD) | string | none |
 | n_excited_states | Number of excited states to compute | int | 5 |
 | spin_type | Spin type for excited states (singlet, triplet) | string | singlet |
 | adc2_solver | Solver for ADC(2) (auto, schur_static, schur_omega, full) | string | auto |
@@ -40,6 +40,10 @@
 | export_molden | Output Molden file | bool | false |
 | ecp_filename | Path to ECP file for effective core potentials | string | |
 | num_gpus | Number of GPUs for multi-GPU RI-HF (-1 = auto-detect all available) | int | -1 |
+| dmet_fragments | DMET fragment specification (e.g. `"{0,6} {1,7}"`); empty = auto-detect by X-H bonds | string | "" |
+| dmet_threshold | SVD threshold for DMET bath orbital selection (σ < threshold excluded) | double | 1.0e-6 |
+| dmet_n_tol | DMET bisection tolerance on \|Σ N_frag − N_elec\| (Vayesta-compat: 4.2e-3 for benzene) | double | 1.0e-5 |
+| dmet_mu_refine_ccsd | DMET 2-stage μ optimization (Stage 1: HF density, Stage 2: CCSD-relaxed density) | bool | false |
 
 
 
@@ -506,4 +510,51 @@ At each optimization step, the translational and rotational components are proje
 
 # UHF geometry optimization with SAD initial guess
 ./gansu -x ../xyz/O2.xyz -g sto-3g -m UHF --initial_guess sad -r optimize
+```
+
+
+## DMET-CCSD parameters
+
+| Parameter | Description | Type | Default |
+| --- | --- | --- | --- |
+| dmet_fragments | Fragment specification (e.g. `"{0,6} {1,7}"`); empty = auto-detect by X-H bonds | string | "" |
+| dmet_threshold | SVD threshold for bath orbital selection (σ < threshold excluded) | double | 1.0e-6 |
+| dmet_n_tol | Bisection tolerance on \|Σ N_frag − N_elec\| | double | 1.0e-5 |
+| dmet_mu_refine_ccsd | 2-stage μ optimization (HF density → CCSD-relaxed density) | bool | false |
+
+DMET-CCSD partitions the molecule into atom-localized fragments, builds a Schmidt-decomposed embedding cluster (fragment AOs + bath orbitals) for each, and solves CCSD on each cluster independently. A global chemical potential μ is bisected to satisfy the embedded-fragment density-consistency condition Σ N_frag = N_elec. Equivalent fragments are detected via embedding-Hamiltonian eigenvalue matching and reused.
+
+#### dmet_fragments - Fragment specification
+Empty string (default) triggers automatic detection: each heavy atom becomes a fragment, and each hydrogen joins its nearest heavy-atom fragment within 2.6 Bohr (≈ 1.38 Å). For example, benzene (C6H6) auto-detects 6 CH fragments.
+
+Manual specification uses brace notation, atoms 0-indexed:
+```bash
+# 6 CH pairs in benzene (atoms C0/H6, C1/H7, ...)
+./gansu -x ../xyz/Benzene.xyz -g sto-3g --post_hf_method dmet \
+    --dmet_fragments "{0,6} {1,7} {2,8} {3,9} {4,10} {5,11}"
+```
+
+#### dmet_threshold - SVD threshold
+Bath orbitals are constructed from the SVD of `C_lo_occ[frag_AOs, :]`. Singular values σ < `dmet_threshold` are excluded as numerical noise; σ ≥ 1 − 1e-12 are core orbitals (excluded from the active cluster, counted in n_core).
+
+#### dmet_n_tol - Bisection tolerance
+Bisection of μ stops when |Σ_F N_frag(μ) − N_elec| < `dmet_n_tol`. Default 1e-5 enforces strict density consistency. For Vayesta-compatible loose convergence (4.2e-3 for benzene, matching Vayesta's `max_elec_err = 1e-4 × N_elec`), pass `--dmet_n_tol 4.2e-3` (yields earlier termination, slightly different μ_DMET).
+
+#### dmet_mu_refine_ccsd - 2-stage μ optimization
+* **false** (default): single-stage CCSD-density bisection. Runs CCSD/Lambda/dm1 at every μ evaluation; the relaxed dm1 trace defines `N_frag(μ)`.
+* **true**: two-stage refinement. Stage 1 performs HF-density bisection (fast, μ-continuous). Stage 2 refines around `μ_HF*` using CCSD-relaxed dm1 in a tight bracket. Falls back to Stage 1 result if Stage 2 hits a discontinuity (e.g. heteroatom OH fragments). Recommended only for paper-quality match with external DMET implementations; default is sufficient for most uses.
+
+```bash
+# Auto fragment detection, default tight tol
+./gansu -x ../xyz/Benzene.xyz -g sto-3g --eri_method ri \
+    -ag ../auxiliary_basis/cc-pvdz-rifit.gbs \
+    --post_hf_method dmet --num_gpus 4
+
+# Vayesta-compatible loose tolerance for benchmarking
+./gansu -x ../xyz/Benzene.xyz -g sto-3g --eri_method ri \
+    -ag ../auxiliary_basis/cc-pvdz-rifit.gbs \
+    --post_hf_method dmet --dmet_n_tol 4.2e-3
+
+# Verbose per-fragment diagnostics (for debugging)
+GANSU_DMET_VERBOSE=1 ./gansu ... --post_hf_method dmet
 ```

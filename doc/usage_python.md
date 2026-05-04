@@ -269,6 +269,40 @@ print(f"Natural occupations: {np.sort(np.linalg.eigvalsh(D))[::-1]}")
 gansu.finalize()
 ```
 
+### 6b. DMET-CCSD (Fragment-Based Correlation)
+
+```python
+import gansu
+
+gansu.init()
+
+# Benzene with auto-detected fragments (each heavy atom + nearest H)
+# 6 CH fragments, 2 unique by para-symmetry
+r = gansu.Molecule("../xyz/Benzene.xyz", basis="sto-3g").run(
+    post_hf="dmet",
+    eri_method="ri",
+    auxiliary_gbsfilename="../auxiliary_basis/cc-pvdz-rifit.gbs",
+    num_gpus=4,
+)
+print(f"HF:           {r.total_energy:.6f} Ha")
+print(f"DMET-CCSD:    {r.total_energy + r.post_hf_energy:.6f} Ha")
+print(f"E_corr:       {r.post_hf_energy:.6f} Ha")
+
+# Manual fragment specification
+r2 = gansu.Molecule("../xyz/Benzene.xyz", basis="sto-3g").run(
+    post_hf="dmet",
+    dmet_fragments="{0,6} {1,7} {2,8} {3,9} {4,10} {5,11}",
+)
+
+# Vayesta-compatible loose tolerance
+r3 = gansu.Molecule("../xyz/Benzene.xyz", basis="sto-3g").run(
+    post_hf="dmet",
+    dmet_n_tol=4.2e-3,
+)
+
+gansu.finalize()
+```
+
 ### 7. Potential Energy Scan (Bond Stretching)
 
 ```python

@@ -127,6 +127,7 @@ Basis sets are specified by name. GANSU automatically resolves the path.
 | `ccsd` | CCSD |
 | `ccsd_t` | CCSD(T) |
 | `ccsd_density` | CCSD + Lambda + 1-RDM |
+| `dmet` | DMET-CCSD (fragment-based correlation, multi-GPU, auto X-H bond fragmentation) |
 | `fci` | Full CI |
 | `cis` | CIS excited states |
 | `adc2` | ADC(2) excited states |
@@ -195,6 +196,40 @@ EOF
 
 # Triplet states
 ./gansu -x h2o.xyz -g cc-pvdz --post_hf_method adc2 --spin_type triplet
+```
+
+### 4b. DMET-CCSD (Fragment-Based Correlation)
+
+DMET-CCSD partitions the molecule into atom-localized fragments, builds an embedding cluster (fragment AOs + Schmidt-decomposed bath orbitals) for each, and runs CCSD per cluster. Total correlation is reconstructed by democratic projection. Multi-GPU fragment parallelism gives near-linear speedup with the number of unique fragments.
+
+```bash
+# Auto fragment detection (recommended): each heavy atom + nearest H atoms
+# Benzene → 6 CH fragments, 2 unique by symmetry
+./gansu -x ../xyz/Benzene.xyz -g sto-3g --eri_method ri \
+    -ag ../auxiliary_basis/cc-pvdz-rifit.gbs \
+    --post_hf_method dmet --num_gpus 4
+
+# Manual fragment specification (atom indices, 0-indexed)
+./gansu -x ../xyz/Benzene.xyz -g sto-3g --post_hf_method dmet \
+    --dmet_fragments "{0,6} {1,7} {2,8} {3,9} {4,10} {5,11}"
+
+# Vayesta-compatible loose tolerance (faster bisection, ~1% N deviation)
+./gansu -x ../xyz/Benzene.xyz -g sto-3g --post_hf_method dmet \
+    --dmet_n_tol 4.2e-3
+
+# Per-fragment debug output (max|f_ov|, ε spectrum, D_cluster eigenvalues)
+GANSU_DMET_VERBOSE=1 ./gansu ../xyz/Benzene.xyz -g sto-3g --post_hf_method dmet
+```
+
+The output reports both T-amplitude democratic energy and the standard QC-DMET (Vayesta-convention) energy:
+
+```
+---- DMET-CCSD Summary ----
+  Chemical potential μ_DMET (CCSD-relaxed): -1.144e-03 Ha
+  Total DMET-CCSD correlation energy (T-amp democratic): -0.3043 Ha
+  Total DMET-CCSD correlation energy (DMET, Vayesta):    -0.4938 Ha
+  HF energy:                              -227.8926 Ha
+  DMET-CCSD total energy (DMET):          -228.3864 Ha
 ```
 
 ### 5. Energy Gradient
