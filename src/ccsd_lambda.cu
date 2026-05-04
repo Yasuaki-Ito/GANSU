@@ -2211,4 +2211,328 @@ real_t compute_dmet_fragment_energy(
     return E_corr_frag;
 }
 
+// ============================================================================
+//  AO-projected DMET fragment correlation energy via Lambda-relaxed 1-RDM+2-RDM.
+//
+//  Cleanly derived form: stays in canonical basis, but applies the fragment
+//  projector P[i,i'] = Σ_{p<n_frag} U[p,i] U[p,i'] to one index pair. The
+//  orthonormality of U collapses the other three index sums to identities.
+//
+//      E_corr_frag = E_frag(D1, D2) − E_frag(D1_HF, D2_HF)
+//      E_frag      = Σ_{i,i'} P[i,i'] (h_can D1)[i,i']
+//                  + (1/2) Σ_{i,i'} P[i,i'] Σ_{jkl} eri_can[i,j,k,l] D2[i',j,k,l]
+//      h_can       = U^T h_emb_1e U
+//
+//  Pass the same 1e operator the CCSD's reference HF uses (h_emb_base = C^T F C
+//  in this code) so the result is a true CCSD-correlation energy (≤ 0). Using
+//  C^T h_core C instead measures a physical-Hamiltonian energy against the
+//  F_emb-HF reference, which is NOT a correlation and can be positive.
+//
+//  Cost is O(ne⁵) per fragment; for ne ≲ 30 this runs in under 1 ms.
+// ============================================================================
+real_t compute_dmet_fragment_energy_aoproj(
+    int nocc_act, int nvir,
+    const real_t* h_emb_1e,
+    const real_t* eri_can,
+    const real_t* dm1_active,
+    const real_t* dm2_active,
+    int n_frag,
+    const real_t* eigvecs,
+    int n_frozen,
+    real_t* E1_out,
+    real_t* E2_out)
+{
+    const int na_act = nocc_act + nvir;
+    const int ne = n_frozen + na_act;
+    const int no_full = n_frozen + nocc_act;
+    const size_t ne2 = (size_t)ne * ne;
+    const size_t ne4 = ne2 * ne2;
+
+    // 1. dm1_full: HF ref on frozen-frozen, active CCSD on active-active.
+    std::vector<real_t> dm1_full(ne2, 0.0);
+    for (int i = 0; i < n_frozen; i++) dm1_full[i*ne + i] = 2.0;
+    for (int i = 0; i < na_act; i++)
+        for (int j = 0; j < na_act; j++)
+            dm1_full[(i+n_frozen)*ne + (j+n_frozen)] = dm1_active[i*na_act + j];
+
+    // 2. dm2_full: start from D2_HF over all occupied (frozen + active occ),
+    //    then overwrite the all-active block with dm2_active. The all-active
+    //    slice of D2_HF_full equals D2_HF_active (since D1_HF on those indices
+    //    is the same), so the overwrite correctly replaces "active HF" with
+    //    "active HF + correlation" while leaving frozen-* blocks at HF.
+    auto D1HF_full = [no_full](int p, int q) -> real_t {
+        return (p == q && p < no_full) ? 2.0 : 0.0;
+    };
+    std::vector<real_t> dm2_full(ne4, 0.0);
+    for (int p = 0; p < ne; p++)
+        for (int q = 0; q < ne; q++) {
+            real_t d_pq = D1HF_full(p,q);
+            for (int r = 0; r < ne; r++) {
+                real_t d_rq = D1HF_full(r,q);
+                for (int s = 0; s < ne; s++) {
+                    real_t d_rs = D1HF_full(r,s);
+                    real_t d_ps = D1HF_full(p,s);
+                    dm2_full[(((size_t)p*ne+q)*ne+r)*ne+s] =
+                        d_pq*d_rs - 0.5*d_ps*d_rq;
+                }
+            }
+        }
+    for (int i = 0; i < na_act; i++)
+        for (int j = 0; j < na_act; j++)
+            for (int k = 0; k < na_act; k++)
+                for (int l = 0; l < na_act; l++)
+                    dm2_full[(((size_t)(i+n_frozen)*ne+(j+n_frozen))*ne+(k+n_frozen))*ne+(l+n_frozen)] =
+                        dm2_active[(((size_t)i*na_act+j)*na_act+k)*na_act+l];
+
+    // 3. h_can = U^T h_emb_1e U
+    std::vector<real_t> h_can(ne2, 0.0);
+    {
+        std::vector<real_t> tmp(ne2, 0.0);
+        for (int i = 0; i < ne; i++)
+            for (int q = 0; q < ne; q++) {
+                real_t v = 0.0;
+                for (int p = 0; p < ne; p++)
+                    v += eigvecs[p*ne + i] * h_emb_1e[p*ne + q];
+                tmp[i*ne + q] = v;
+            }
+        for (int i = 0; i < ne; i++)
+            for (int j = 0; j < ne; j++) {
+                real_t v = 0.0;
+                for (int q = 0; q < ne; q++)
+                    v += tmp[i*ne + q] * eigvecs[q*ne + j];
+                h_can[i*ne + j] = v;
+            }
+    }
+
+    // 4. P[i,i'] = Σ_{p<n_frag} U[p,i] U[p,i']
+    std::vector<real_t> P(ne2, 0.0);
+    for (int i = 0; i < ne; i++)
+        for (int j = 0; j <= i; j++) {
+            real_t v = 0.0;
+            for (int p = 0; p < n_frag; p++)
+                v += eigvecs[p*ne + i] * eigvecs[p*ne + j];
+            P[i*ne + j] = v;
+            P[j*ne + i] = v;
+        }
+
+    // 5. HF reference on full ne basis (to subtract).
+    std::vector<real_t> D1_HF(ne2, 0.0);
+    for (int i = 0; i < no_full; i++) D1_HF[i*ne + i] = 2.0;
+    std::vector<real_t> D2_HF(ne4, 0.0);
+    for (int p = 0; p < ne; p++)
+        for (int q = 0; q < ne; q++) {
+            real_t d_pq = D1_HF[p*ne + q];
+            for (int r = 0; r < ne; r++) {
+                real_t d_rq = D1_HF[r*ne + q];
+                for (int s = 0; s < ne; s++) {
+                    real_t d_rs = D1_HF[r*ne + s];
+                    real_t d_ps = D1_HF[p*ne + s];
+                    D2_HF[(((size_t)p*ne+q)*ne+r)*ne+s] =
+                        d_pq*d_rs - 0.5*d_ps*d_rq;
+                }
+            }
+        }
+
+    // 6. E_frag(D1, D2) — apply P to first index of (h, eri); contract rest.
+    //    Returns (E1, E2) separately for diagnostics.
+    auto eval_E_frag = [&](const std::vector<real_t>& D1,
+                           const std::vector<real_t>& D2)
+        -> std::pair<real_t, real_t> {
+        real_t E1 = 0.0, E2 = 0.0;
+        for (int i = 0; i < ne; i++)
+            for (int ip = 0; ip < ne; ip++) {
+                real_t Pi = P[i*ne + ip];
+                if (std::abs(Pi) < 1e-15) continue;
+                real_t hD = 0.0;
+                for (int j = 0; j < ne; j++)
+                    hD += h_can[i*ne + j] * D1[j*ne + ip];
+                E1 += Pi * hD;
+                real_t two_e = 0.0;
+                for (int j = 0; j < ne; j++)
+                    for (int k = 0; k < ne; k++)
+                        for (int l = 0; l < ne; l++)
+                            two_e += eri_can[(((size_t)i*ne+j)*ne+k)*ne+l]
+                                   * D2[(((size_t)ip*ne+j)*ne+k)*ne+l];
+                E2 += 0.5 * Pi * two_e;
+            }
+        return {E1, E2};
+    };
+
+    auto [E1_full, E2_full] = eval_E_frag(dm1_full, dm2_full);
+    auto [E1_HF,  E2_HF ]  = eval_E_frag(D1_HF, D2_HF);
+    real_t E1_corr = E1_full - E1_HF;
+    real_t E2_corr = E2_full - E2_HF;
+    if (E1_out) *E1_out = E1_corr;
+    if (E2_out) *E2_out = E2_corr;
+    return E1_corr + E2_corr;
+}
+
+
+// ============================================================================
+//  Vayesta-convention DMET fragment correlation energy (standard QC-DMET).
+//
+//  e1 = Tr[P · h_avg · D1]   with  h_avg = ½(h_bare + h_eff)
+//  e2 = ½ · Σ P[p,t] · eri[t,q,r,s] · D2[p,q,r,s]
+//  E_corr = (e1 + e2) − (e1_HF + e2_HF)
+//
+//  h_bare = canonical-basis bare core (= U^T · C_emb^T · h_core · C_emb · U)
+//  h_eff  = canonical-basis (F − cluster-internal V_HF), so on average the
+//           1-body operator reduces to h_core (cluster Hartree-exchange
+//           cancels). Validated against Vayesta on benzene/STO-3G.
+// ============================================================================
+real_t compute_dmet_fragment_energy_vayesta(
+    int nocc_act, int nvir,
+    const real_t* h_core_emb,
+    const real_t* h_emb_1e,
+    const real_t* eri_can,
+    const real_t* dm1_active,
+    const real_t* dm2_active,
+    int n_frag,
+    const real_t* eigvecs,
+    int n_frozen,
+    real_t* E1_out,
+    real_t* E2_out)
+{
+    const int na_act = nocc_act + nvir;
+    const int ne = n_frozen + na_act;
+    const int no_full = n_frozen + nocc_act;
+    const size_t ne2 = (size_t)ne * ne;
+    const size_t ne4 = ne2 * ne2;
+
+    // 1. Build full-ne dm1, dm2 (HF on frozen, CCSD active block)
+    std::vector<real_t> dm1_full(ne2, 0.0);
+    for (int i = 0; i < n_frozen; i++) dm1_full[i*ne + i] = 2.0;
+    for (int i = 0; i < na_act; i++)
+        for (int j = 0; j < na_act; j++)
+            dm1_full[(i+n_frozen)*ne + (j+n_frozen)] = dm1_active[i*na_act + j];
+
+    auto D1HF_full = [no_full](int p, int q) -> real_t {
+        return (p == q && p < no_full) ? 2.0 : 0.0;
+    };
+    std::vector<real_t> dm2_full(ne4, 0.0);
+    for (int p = 0; p < ne; p++)
+        for (int q = 0; q < ne; q++) {
+            real_t d_pq = D1HF_full(p,q);
+            for (int r = 0; r < ne; r++) {
+                real_t d_rq = D1HF_full(r,q);
+                for (int s = 0; s < ne; s++) {
+                    real_t d_rs = D1HF_full(r,s);
+                    real_t d_ps = D1HF_full(p,s);
+                    dm2_full[(((size_t)p*ne+q)*ne+r)*ne+s] =
+                        d_pq*d_rs - 0.5*d_ps*d_rq;
+                }
+            }
+        }
+    for (int i = 0; i < na_act; i++)
+        for (int j = 0; j < na_act; j++)
+            for (int k = 0; k < na_act; k++)
+                for (int l = 0; l < na_act; l++)
+                    dm2_full[(((size_t)(i+n_frozen)*ne+(j+n_frozen))*ne+(k+n_frozen))*ne+(l+n_frozen)] =
+                        dm2_active[(((size_t)i*na_act+j)*na_act+k)*na_act+l];
+
+    // 2. Transform 1-body operators to canonical basis: h_can = U^T · h_emb · U
+    auto transform_to_can = [&](const real_t* h_emb, std::vector<real_t>& h_can) {
+        h_can.assign(ne2, 0.0);
+        std::vector<real_t> tmp(ne2, 0.0);
+        for (int i = 0; i < ne; i++)
+            for (int q = 0; q < ne; q++) {
+                real_t v = 0.0;
+                for (int p = 0; p < ne; p++)
+                    v += eigvecs[p*ne + i] * h_emb[p*ne + q];
+                tmp[i*ne + q] = v;
+            }
+        for (int i = 0; i < ne; i++)
+            for (int j = 0; j < ne; j++) {
+                real_t v = 0.0;
+                for (int q = 0; q < ne; q++)
+                    v += tmp[i*ne + q] * eigvecs[q*ne + j];
+                h_can[i*ne + j] = v;
+            }
+    };
+
+    std::vector<real_t> h_bare_can, h_F_can;
+    transform_to_can(h_core_emb, h_bare_can);
+    transform_to_can(h_emb_1e,  h_F_can);
+
+    // 3. v_act in canonical basis: 2·Σ_{k∈occ} eri[k,k,i,j] − Σ_{k∈occ} eri[k,j,i,k]
+    //    (closed-shell 2J − K from cluster-occupied density)
+    std::vector<real_t> v_act(ne2, 0.0);
+    for (int i = 0; i < ne; i++)
+        for (int j = 0; j < ne; j++) {
+            real_t s = 0.0;
+            for (int k = 0; k < no_full; k++) {
+                s += 2.0 * eri_can[(((size_t)k*ne + k)*ne + i)*ne + j];
+                s -=        eri_can[(((size_t)k*ne + j)*ne + i)*ne + k];
+            }
+            v_act[i*ne + j] = s;
+        }
+
+    // 4. h_avg = ½ · (h_bare + h_F − v_act)  =  ½ · (h_bare + h_eff)
+    std::vector<real_t> h_avg(ne2, 0.0);
+    for (size_t idx = 0; idx < ne2; idx++) {
+        h_avg[idx] = 0.5 * (h_bare_can[idx] + h_F_can[idx] - v_act[idx]);
+    }
+
+    // 5. P[i,i'] = Σ_{p<n_frag} U[p,i] · U[p,i']  (fragment AO projector)
+    std::vector<real_t> P(ne2, 0.0);
+    for (int i = 0; i < ne; i++)
+        for (int j = 0; j <= i; j++) {
+            real_t v = 0.0;
+            for (int p = 0; p < n_frag; p++)
+                v += eigvecs[p*ne + i] * eigvecs[p*ne + j];
+            P[i*ne + j] = v;
+            P[j*ne + i] = v;
+        }
+
+    // 6. HF reference RDMs
+    std::vector<real_t> D1_HF(ne2, 0.0);
+    for (int i = 0; i < no_full; i++) D1_HF[i*ne + i] = 2.0;
+    std::vector<real_t> D2_HF(ne4, 0.0);
+    for (int p = 0; p < ne; p++)
+        for (int q = 0; q < ne; q++) {
+            real_t d_pq = D1_HF[p*ne + q];
+            for (int r = 0; r < ne; r++) {
+                real_t d_rq = D1_HF[r*ne + q];
+                for (int s = 0; s < ne; s++) {
+                    real_t d_rs = D1_HF[r*ne + s];
+                    real_t d_ps = D1_HF[p*ne + s];
+                    D2_HF[(((size_t)p*ne+q)*ne+r)*ne+s] =
+                        d_pq*d_rs - 0.5*d_ps*d_rq;
+                }
+            }
+        }
+
+    // 7. e1 = Tr[P · h_avg · D1];  e2 = ½ · Σ_pqrs P[p,t] · eri[t,q,r,s] · D2[p,q,r,s]
+    auto eval_E_frag = [&](const std::vector<real_t>& D1,
+                           const std::vector<real_t>& D2)
+        -> std::pair<real_t, real_t> {
+        real_t E1 = 0.0, E2 = 0.0;
+        for (int i = 0; i < ne; i++)
+            for (int ip = 0; ip < ne; ip++) {
+                real_t Pi = P[i*ne + ip];
+                if (std::abs(Pi) < 1e-15) continue;
+                real_t hD = 0.0;
+                for (int j = 0; j < ne; j++)
+                    hD += h_avg[i*ne + j] * D1[j*ne + ip];
+                E1 += Pi * hD;
+                real_t two_e = 0.0;
+                for (int j = 0; j < ne; j++)
+                    for (int k = 0; k < ne; k++)
+                        for (int l = 0; l < ne; l++)
+                            two_e += eri_can[(((size_t)i*ne+j)*ne+k)*ne+l]
+                                   * D2[(((size_t)ip*ne+j)*ne+k)*ne+l];
+                E2 += 0.5 * Pi * two_e;
+            }
+        return {E1, E2};
+    };
+
+    auto [E1_full, E2_full] = eval_E_frag(dm1_full, dm2_full);
+    auto [E1_HF,  E2_HF ]  = eval_E_frag(D1_HF, D2_HF);
+    real_t E1_corr = E1_full - E1_HF;
+    real_t E2_corr = E2_full - E2_HF;
+    if (E1_out) *E1_out = E1_corr;
+    if (E2_out) *E2_out = E2_corr;
+    return E1_corr + E2_corr;
+}
+
 } // namespace gansu

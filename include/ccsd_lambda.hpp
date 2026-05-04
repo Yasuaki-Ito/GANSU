@@ -156,4 +156,91 @@ real_t compute_dmet_fragment_energy(
     const real_t* eigvecs,   // [na × na] h_emb eigenvectors: U[p,i] = eigvecs[p*na+i]
     int n_frozen = 0);       // frozen core orbitals (σ≈1, first n_frozen MOs)
 
+/**
+ * @brief AO-projected DMET fragment correlation energy via full 1-RDM and 2-RDM.
+ *
+ * Compared to compute_dmet_fragment_energy (T-amplitude form), this:
+ *   - Uses Lambda-relaxed dm1 and dm2 (full CCSD density matrices)
+ *   - Includes the 1-electron (h × dm1) contribution
+ *
+ * Formula (chemist convention, derived via U-orthonormality so that no explicit
+ *          back-transform from canonical to embedding basis is needed):
+ *   E_corr_frag = E_frag(D1, D2) − E_frag(D1_HF, D2_HF)
+ *   E_frag(D1, D2) = Σ_{i,i'} P[i,i'] (h_can D1)[i,i']
+ *                  + (1/2) Σ_{i,i'} P[i,i'] Σ_{jkl} eri_can[i,j,k,l] D2[i',j,k,l]
+ *   P[i,i'] = Σ_{p<n_frag} U[p,i] U[p,i']
+ *   h_can = U^T h_emb_1e U
+ *
+ * Must be passed the same 1e operator that the CCSD/embedding-HF used as
+ * reference (h_emb_base = C^T F C in the current code) so that
+ *  − the orbital eigenstates U are exact eigenstates of h_can + 2J(D)−K(D),
+ *  − E_corr_frag has the standard CCSD-correlation sign (≤ 0).
+ * Passing h_core_emb instead measures the physical Hamiltonian's energy with
+ * the F_emb-HF reference, which is NOT a correlation energy and can be
+ * positive — verified empirically on benzene/STO-3G.
+ *
+ * Σ over fragments recovers the full embedding-basis CCSD energy.
+ *
+ * @param nocc_act     Active occupied dimension (nocc - n_frozen)
+ * @param nvir         Virtual dimension
+ * @param h_emb_1e     [ne × ne] embedding 1e operator (h_emb_base = C^T F C)
+ * @param eri_can      [ne⁴]    canonical-basis ERI (chemist), as fed to CCSD
+ * @param dm1_active   [na_act²] canonical 1-RDM with active HF reference
+ * @param dm2_active   [na_act⁴] canonical 2-RDM with active HF reference
+ * @param n_frag       First n_frag indices = fragment AOs in embedding
+ * @param eigvecs      [ne × ne] U[p,i] (canonical i in embedding p)
+ * @param n_frozen     Frozen core orbitals (placed at canonical indices [0, n_frozen))
+ * @param E1_out       (optional) decomposed 1-electron contribution for diagnostics
+ * @param E2_out       (optional) decomposed 2-electron contribution for diagnostics
+ */
+real_t compute_dmet_fragment_energy_aoproj(
+    int nocc_act, int nvir,
+    const real_t* h_emb_1e,
+    const real_t* eri_can,
+    const real_t* dm1_active,
+    const real_t* dm2_active,
+    int n_frag,
+    const real_t* eigvecs,
+    int n_frozen = 0,
+    real_t* E1_out = nullptr,
+    real_t* E2_out = nullptr);
+
+
+/**
+ * @brief Vayesta-convention DMET fragment correlation energy.
+ *
+ * Standard quantum-chemistry DMET energy partition (Knizia/Wouters/Vayesta):
+ *
+ *   e1 = Tr[P · h_avg · D1]                with h_avg = ½(h_bare + h_eff)
+ *   e2 = ½ · Σ P[p,t] · eri_can[t,q,r,s] · D2[p,q,r,s]
+ *   E_corr = (e1 + e2) − (e1_HF + e2_HF)
+ *
+ *   h_bare = U^T · (C_emb^T · h_core · C_emb) · U      (canonical bare core)
+ *   h_eff  = U^T · h_emb_1e · U − v_act                 (cluster-local HF removed)
+ *   v_act[i,j] = 2·Σ_{k∈occ} eri_can[k,k,i,j] − Σ_{k∈occ} eri_can[k,j,i,k]
+ *
+ * Differs from `compute_dmet_fragment_energy_aoproj` in two ways:
+ *   (a) takes h_core_emb in addition to h_emb_1e (= F projected to embedding)
+ *   (b) builds v_act from the canonical ERI to remove the cluster-internal HF
+ *       interaction, recovering the bare 1-body operator on average
+ *
+ * Validated against Vayesta (benzene/STO-3G, 6 CH SAO fragments, oneshot CCSD)
+ * which gives e_corr = −0.4310 Ha (102 % of full CCSD).  GANSU's existing
+ * AO-proj formula gives only −0.067 Ha (16 %) because it uses h_F = U^T F U
+ * directly, mixing in the global Hartree-exchange that should be cancelled
+ * by v_act.
+ */
+real_t compute_dmet_fragment_energy_vayesta(
+    int nocc_act, int nvir,
+    const real_t* h_core_emb,    // C_emb^T · h_core · C_emb (μ-independent)
+    const real_t* h_emb_1e,      // C_emb^T · F_full · C_emb (or with μ-shift)
+    const real_t* eri_can,
+    const real_t* dm1_active,
+    const real_t* dm2_active,
+    int n_frag,
+    const real_t* eigvecs,
+    int n_frozen = 0,
+    real_t* E1_out = nullptr,
+    real_t* E2_out = nullptr);
+
 } // namespace gansu

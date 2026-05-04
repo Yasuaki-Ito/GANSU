@@ -236,6 +236,8 @@ public:
     const std::string& get_dmet_fragments_str() const { return dmet_fragments_str_; }
     /// DMET SVD threshold for bath orbital selection
     double get_dmet_threshold() const { return dmet_threshold_; }
+    /// DMET: refine μ with CCSD-relaxed density after HF stage (2-stage μ optimization)
+    bool get_dmet_mu_refine_ccsd() const { return dmet_mu_refine_ccsd_; }
 
     /**
      * @brief Get Shell-pair type info
@@ -398,6 +400,7 @@ protected:
     double adc_c_c_ = 0.85;  ///< SOS-ADC(2) coupling block scaling
     std::string dmet_fragments_str_;    ///< DMET fragment specification string
     double dmet_threshold_ = 1e-6;     ///< SVD threshold for DMET bath orbital selection
+    bool dmet_mu_refine_ccsd_ = false;  ///< DMET: refine μ with CCSD-relaxed density
     const int max_iter; ///< Maximum number of iterations
     int iter_; ///< Number of iterations
     real_t energy_difference_; ///< Energy difference between the current and the previous iteration

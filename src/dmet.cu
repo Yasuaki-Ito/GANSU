@@ -17,7 +17,10 @@
 #include <sstream>
 #include <cmath>
 #include <algorithm>
+#include <numeric>
 #include <tuple>
+#include <map>
+#include <utility>
 #include <omp.h>
 #include <Eigen/Dense>
 
@@ -53,35 +56,56 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
 // object. Used to silence ccsd_spatial_orbital's per-iteration output during
 // the bisection inner loop, where its many lines would drown out the bisection
 // progress messages.
+//
+// IMPORTANT: the sink must be thread-safe — std::cout is global, and the
+// fragment-parallel OpenMP region inside `evaluate_at_mu` has multiple threads
+// concurrently writing to it (CCSD/Lambda iter prints). The previous
+// implementation used a std::stringstream sink, whose stringbuf appends to a
+// shared std::string non-atomically; concurrent writes corrupted the string's
+// internal size/capacity, causing glibc heap errors (`corrupted size vs.
+// prev_size`) on later allocations. The NullBuf below has no state, so
+// overflow / xsputn are trivially safe under concurrent calls.
 class CoutSilencer {
+    struct NullBuf : std::streambuf {
+        int_type overflow(int_type c) override {
+            return traits_type::not_eof(c);
+        }
+        std::streamsize xsputn(const char_type*, std::streamsize n) override {
+            return n;
+        }
+    };
     std::streambuf* old_buf_ = nullptr;
-    std::stringstream sink_;
+    NullBuf null_buf_;
 public:
     explicit CoutSilencer(bool silence) {
-        if (silence) old_buf_ = std::cout.rdbuf(sink_.rdbuf());
+        if (silence) old_buf_ = std::cout.rdbuf(&null_buf_);
     }
     ~CoutSilencer() {
         if (old_buf_) std::cout.rdbuf(old_buf_);
     }
+    CoutSilencer(const CoutSilencer&) = delete;
+    CoutSilencer& operator=(const CoutSilencer&) = delete;
 };
 
 // ============================================================================
 //  Embedding HF SCF (CPU, Roothaan iteration)
 //
-//  Solves canonical orbitals of the embedding Hamiltonian H = h_emb + V_emb,
-//  i.e. eigenstates of the *self-consistent* Fock matrix
+//  When max_iter > 0: solves canonical orbitals of the embedding Hamiltonian
+//  H = h_emb + V_emb, i.e. eigenstates of the *self-consistent* Fock matrix
 //      F[p,q] = h_emb[p,q] + Σ_rs D[r,s] (eri[p,q,r,s] - 0.5 eri[p,r,s,q])
 //  with D[r,s] = 2 Σ_{i<n_occ} C[r,i] C[s,i].
 //
-//  Without this step, h_emb eigenstates leave F off-diagonal in the embedding
-//  basis (e.g. ~10⁻¹ for benzene/STO-3G), violating the canonical-orbital
-//  assumption made by ccsd_spatial_orbital and solve_ccsd_lambda_cpu.
+//  When max_iter == 0: just diagonalizes h_emb directly (no SCF). This is
+//  the "Vayesta convention" path — h_emb is treated as the canonical Fock
+//  itself, so ε = eig(h_emb) and the cluster CCSD effectively solves
+//  H_cluster = h_eff + cluster_ERI where h_eff = h_emb − v_act (the cluster
+//  internal V_HF cancels out implicitly because the CCSD reconstructs Fock
+//  as h_eff + V_HF[D_HF_canonical] = h_emb = diag(ε)). Using SCF instead
+//  double-counts V_HF[cluster] (once in h_emb_base = C^T F C, once in the
+//  Fock update), giving 1.5× over Vayesta on benzene.
 //
 //  Output: U[p, i] = embedding-basis coefficient of i-th canonical orbital,
-//          eps[i]  = orbital energy (eigenvalue of converged F).
-//
-//  Tolerance is on the energy change between iterations; for ne ≲ 30 this
-//  runs in microseconds even without DIIS.
+//          eps[i]  = orbital energy.
 // ============================================================================
 static std::pair<std::vector<real_t>, std::vector<real_t>>
 run_embedding_hf_cpu(
@@ -99,7 +123,7 @@ run_embedding_hf_cpu(
     Eigen::VectorXd eps = sol0.eigenvalues();
 
     real_t E_prev = 0.0;
-    bool converged = false;
+    bool converged = (max_iter == 0);  // direct-diag path: trivially "converged"
 
     for (int iter = 0; iter < max_iter; iter++) {
         // Density: D[r,s] = 2 Σ_{i<n_occ} C[r,i] C[s,i]
@@ -157,12 +181,95 @@ run_embedding_hf_cpu(
 }
 
 // ============================================================================
+//  Vayesta-convention cluster orbital construction
+//
+//  Given a cluster basis with M_co = C_emb^T S C_occ_full (μ-independent),
+//  produce canonical cluster orbitals U[ne × ne] and energies eps[ne]:
+//
+//    1. D_cluster = 2 M_co · M_co^T  (cluster representation of full HF DM).
+//       Eigenvalues are between 0 and 2; sort descending.
+//    2. Top n_emb_occ eigenvectors → occupied subspace U_occ [ne × n_emb_occ].
+//       Remaining (ne − n_emb_occ) → virtual subspace U_vir.
+//    3. Within each subspace, diagonalize h_emb (= h_emb_base − μ·P_frag) to
+//       get canonical orbitals: F_sub = U_sub^T h_emb U_sub → eps, V_sub.
+//       Final canonical = U_sub @ V_sub.
+//    4. Combine: U[:, :n_occ] = occupied canonical, [:, n_occ:] = virtual.
+//
+//  This is Vayesta's `canonicalize_mo` (fragment.py:506) applied to occ/vir
+//  separately (via `_get_bath_option("canonicalize", "occupied"/"virtual")`).
+//  CCSD then implicitly uses h_eff = h_emb − v_act as the cluster 1-body
+//  operator, recovering Vayesta's cluster Hamiltonian without V_HF[cluster]
+//  double-counting.
+//
+//  f_ov is generally non-zero between blocks (h_emb couples occ and vir),
+//  but f_oo and f_vv are diagonal — sufficient for canonical CCSD with the
+//  Brillouin condition assumed for the HF reference.
+// ============================================================================
+static std::pair<std::vector<real_t>, std::vector<real_t>>
+canonicalize_cluster_subspaces(
+    const std::vector<real_t>& h_emb,    // [ne × ne] (= h_emb_base − μ·P_frag)
+    const std::vector<real_t>& M_co,     // [ne × nocc_full]  C_emb^T S C_occ
+    int ne, int nocc_full, int n_emb_occ)
+{
+    using RowMatXd = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+
+    Eigen::Map<const RowMatXd> H(h_emb.data(), ne, ne);
+    Eigen::Map<const RowMatXd> M(M_co.data(), ne, nocc_full);
+
+    // 1. Cluster DM: D_cluster = 2 M Mᵀ
+    RowMatXd D_cluster = 2.0 * M * M.transpose();
+
+    // 2. Diagonalize, sort descending
+    Eigen::SelfAdjointEigenSolver<RowMatXd> dm_solver(D_cluster);
+    Eigen::VectorXd dm_eigs = dm_solver.eigenvalues();   // ascending
+    RowMatXd dm_vecs = dm_solver.eigenvectors();         // columns are eigenvectors
+
+    // SelfAdjointEigenSolver returns ascending; reverse to get descending.
+    // Top n_emb_occ → occupied subspace.
+    RowMatXd U_occ(ne, n_emb_occ);
+    RowMatXd U_vir(ne, ne - n_emb_occ);
+    for (int i = 0; i < n_emb_occ; i++)
+        U_occ.col(i) = dm_vecs.col(ne - 1 - i);
+    for (int i = 0; i < ne - n_emb_occ; i++)
+        U_vir.col(i) = dm_vecs.col(ne - n_emb_occ - 1 - i);
+
+    // 3. Canonicalize each subspace via h_emb
+    auto canonicalize = [&H](const RowMatXd& U_sub)
+        -> std::pair<RowMatXd, Eigen::VectorXd> {
+        if (U_sub.cols() == 0) return {RowMatXd(U_sub.rows(), 0), Eigen::VectorXd(0)};
+        RowMatXd F_sub = U_sub.transpose() * H * U_sub;
+        Eigen::SelfAdjointEigenSolver<RowMatXd> solver(F_sub);
+        return {U_sub * solver.eigenvectors(), solver.eigenvalues()};
+    };
+    auto [U_occ_can, eps_occ] = canonicalize(U_occ);
+    auto [U_vir_can, eps_vir] = canonicalize(U_vir);
+
+    // 4. Combine: U[:, :n_occ] = occupied, U[:, n_occ:] = virtual.
+    //    Convention matches GANSU eigenvecs storage: U[p*ne + i] = component p of orbital i.
+    std::vector<real_t> U_out((size_t)ne * ne, 0.0);
+    std::vector<real_t> eps_out(ne, 0.0);
+    for (int i = 0; i < n_emb_occ; i++) {
+        eps_out[i] = eps_occ(i);
+        for (int p = 0; p < ne; p++) U_out[p * ne + i] = U_occ_can(p, i);
+    }
+    for (int i = 0; i < ne - n_emb_occ; i++) {
+        const int idx = n_emb_occ + i;
+        eps_out[idx] = eps_vir(i);
+        for (int p = 0; p < ne; p++) U_out[p * ne + idx] = U_vir_can(p, i);
+    }
+    return {U_out, eps_out};
+}
+
+// ============================================================================
 //  Fragment parsing (unchanged)
 // ============================================================================
 
 std::vector<DMETFragment> DMET::parse_fragments(const std::string& spec, int num_atoms) {
     std::vector<DMETFragment> fragments;
     if (spec.empty()) {
+        // Empty spec without auto-detection — fall back to one fragment per atom.
+        // The recommended path for empty spec is auto_fragments_by_bonds(),
+        // dispatched from the DMET constructor.
         for (int i = 0; i < num_atoms; i++) {
             DMETFragment frag;
             frag.atom_indices.push_back(i);
@@ -209,6 +316,97 @@ std::vector<DMETFragment> DMET::parse_fragments(const std::string& spec, int num
 }
 
 // ============================================================================
+//  Automatic atom-based fragmentation by bond distance
+//
+//  Algorithm:
+//   1. Each heavy atom (atomic_number > 1) becomes its own fragment.
+//   2. Each H is bonded to its single closest heavy atom (Euclidean distance
+//      < bond_threshold_bohr); the H is appended to that fragment's atom list.
+//   3. H atoms with no heavy neighbor within threshold (e.g. isolated H, H₂)
+//      become singleton fragments.
+//
+//  Default threshold 2.6 Bohr ≈ 1.38 Å covers all common X-H bonds:
+//      O-H 0.96 Å, N-H 1.01 Å, C-H 1.09 Å, S-H 1.34 Å (all < 1.38 Å)
+//  while excluding heavy-heavy bonds (C-C 1.54 Å = 2.91 Bohr is well above).
+// ============================================================================
+std::vector<DMETFragment> DMET::auto_fragments_by_bonds(
+    const RHF& rhf, real_t bond_threshold_bohr)
+{
+    const auto& atoms = rhf.get_atoms();
+    const int N = (int)atoms.size();
+    const real_t r2_max = bond_threshold_bohr * bond_threshold_bohr;
+
+    // Phase 1: heavy atoms each become a fragment, mapped via heavy_to_frag.
+    std::vector<int> heavy_to_frag(N, -1);
+    std::vector<DMETFragment> fragments;
+    for (int i = 0; i < N; i++) {
+        if (atoms[i].atomic_number > 1) {
+            DMETFragment frag;
+            frag.atom_indices.push_back(i);
+            heavy_to_frag[i] = (int)fragments.size();
+            fragments.push_back(std::move(frag));
+        }
+    }
+
+    // Phase 2: assign each H to its closest heavy neighbor (within threshold).
+    int orphan_h = 0;
+    for (int h = 0; h < N; h++) {
+        if (atoms[h].atomic_number != 1) continue;
+        const auto& Hc = atoms[h].coordinate;
+        int closest = -1;
+        real_t min_r2 = r2_max;  // strict-less-than below preserves bond cutoff
+        for (int j = 0; j < N; j++) {
+            if (atoms[j].atomic_number <= 1) continue;
+            const auto& Xc = atoms[j].coordinate;
+            const real_t dx = Hc.x - Xc.x;
+            const real_t dy = Hc.y - Xc.y;
+            const real_t dz = Hc.z - Xc.z;
+            const real_t r2 = dx*dx + dy*dy + dz*dz;
+            if (r2 < min_r2) { min_r2 = r2; closest = j; }
+        }
+        if (closest >= 0) {
+            fragments[heavy_to_frag[closest]].atom_indices.push_back(h);
+        } else {
+            // Orphan H: no heavy atom within bond_threshold.
+            DMETFragment frag;
+            frag.atom_indices.push_back(h);
+            fragments.push_back(std::move(frag));
+            orphan_h++;
+        }
+    }
+
+    // Print a concise summary so the user can verify the partitioning.
+    std::cout << "  Auto-detected " << fragments.size()
+              << " fragment(s) by X-H bond proximity (threshold "
+              << bond_threshold_bohr << " Bohr ≈ "
+              << std::fixed << std::setprecision(2)
+              << bond_threshold_bohr / 1.8897259886 << " Å)";
+    if (orphan_h > 0)
+        std::cout << ", " << orphan_h << " orphan H atom(s)";
+    std::cout << std::defaultfloat << std::endl;
+    // Element-symbol summary so heteroatoms are visible at a glance.
+    std::map<std::string, int> by_signature;
+    for (const auto& frag : fragments) {
+        std::string sig;
+        std::map<std::string, int> ec;
+        for (int a : frag.atom_indices)
+            ec[atomic_number_to_element_name(atoms[a].atomic_number)]++;
+        for (const auto& [el, n] : ec) {
+            if (!sig.empty()) sig += "+";
+            sig += el;
+            if (n > 1) sig += std::to_string(n);
+        }
+        by_signature[sig]++;
+    }
+    std::cout << "  Fragment signatures:";
+    for (const auto& [sig, n] : by_signature)
+        std::cout << " " << sig << "×" << n;
+    std::cout << std::endl;
+
+    return fragments;
+}
+
+// ============================================================================
 //  Constructor
 // ============================================================================
 
@@ -219,7 +417,14 @@ DMET::DMET(RHF& rhf, const ERI& eri)
       num_atoms_((int)rhf.get_atom_to_basis_range().size()),
       svd_threshold_(rhf.get_dmet_threshold())
 {
-    fragments_ = parse_fragments(rhf.get_dmet_fragments_str(), num_atoms_);
+    const std::string& spec = rhf.get_dmet_fragments_str();
+    if (spec.empty()) {
+        // Default: automatic atomic fragmentation by X-H bond proximity.
+        fragments_ = auto_fragments_by_bonds(rhf);
+    } else {
+        // User-specified fragments override the auto-detection.
+        fragments_ = parse_fragments(spec, num_atoms_);
+    }
     const auto& a2b = rhf.get_atom_to_basis_range();
     for (auto& frag : fragments_) {
         frag.ao_indices.clear();
@@ -297,12 +502,23 @@ DMET::build_bath_orbitals(const DMETFragment& frag,
     for (int i = 0; i < k; i++) std::cout << " " << std::fixed << std::setprecision(6) << sigma[i];
     std::cout << std::defaultfloat << std::endl;
 
-    // --- Count bath (threshold < σ < 1-threshold) and core (σ ≥ 1-threshold) ---
+    // --- Count bath / core / discarded ---
+    // The naive (C_lo_occ V) bath orbital includes weight on fragment AOs
+    // (= U_A · σ from the SVD), so it is not orthogonal to the fragment basis.
+    // We project out the fragment component → bath_proj has weight only on
+    // environment AOs → ⟨frag | bath⟩ = 0 in Löwdin basis. Normalization
+    // factor is √(1 − σ²) (environment-component norm).
+    //
+    // For σ → 1, the environment component vanishes (orbital is fragment-
+    // localized), so we exclude it from bath and count it as n_core. Use a
+    // dedicated core_threshold (1e-3) since the user-facing svd_threshold_
+    // (default 1e-6) is too small to catch σ ≈ 1 ↔ Schmidt-pair degeneracy.
+    const real_t core_threshold = 1e-3;
     int n_bath = 0, n_core = 0;
     for (int i = 0; i < k; i++) {
-        if (sigma[i] > svd_threshold_ && sigma[i] < 1.0 - svd_threshold_)
+        if (sigma[i] > svd_threshold_ && sigma[i] < 1.0 - core_threshold)
             n_bath++;
-        else if (sigma[i] >= 1.0 - svd_threshold_)
+        else if (sigma[i] >= 1.0 - core_threshold)
             n_core++;
     }
 
@@ -312,24 +528,34 @@ DMET::build_bath_orbitals(const DMETFragment& frag,
 
     // --- Build C_emb in Löwdin basis, then convert to AO ---
     // Fragment: identity on Löwdin AO indices
-    // Bath: C_lo_occ × V (in Löwdin basis)
+    // Bath: project (C_lo_occ × V) to env subspace and normalize by √(1−σ²)
+    //       → bath orbitals orthogonal to frag AOs in Löwdin basis
     // Convert: C_emb_ao = S^{-1/2} × C_emb_lo
-    // Result: C_emb_ao^T S C_emb_ao = C_emb_lo^T (S^{-1/2} S S^{-1/2}) C_emb_lo = C_emb_lo^T C_emb_lo = I
+    // Result: C_emb_ao^T S C_emb_ao = C_emb_lo^T C_emb_lo = I  (orthonormal)
 
     std::vector<real_t> C_emb_lo(nao * n_emb, 0.0);
+    std::vector<char> is_frag_ao(nao, 0);
     for (int i = 0; i < n_frag; i++) {
         int mu = frag.ao_indices[i];
         C_emb_lo[mu * n_emb + i] = 1.0;
+        is_frag_ao[mu] = 1;
     }
     int bath_col = n_frag;
     for (int i = 0; i < k; i++) {
-        if (sigma[i] > svd_threshold_ && sigma[i] < 1.0 - svd_threshold_) {
+        if (sigma[i] > svd_threshold_ && sigma[i] < 1.0 - core_threshold) {
+            // (C_lo_occ V)[μ, i] for env AOs only; zero on frag AOs
             for (int mu = 0; mu < nao; mu++) {
+                if (is_frag_ao[mu]) continue;
                 real_t val = 0.0;
                 for (int j = 0; j < nocc; j++)
                     val += C_lo_occ[mu * nocc + j] * Vt[i * nocc + j];
                 C_emb_lo[mu * n_emb + bath_col] = val;
             }
+            // Normalize by √(1 − σ²): (env norm)² = ||C_lo_occ V||² − ||A V||²
+            //                                    = 1 − σ² (since ||V||=1, ||AV||=σ)
+            const real_t inv_norm = 1.0 / std::sqrt(1.0 - sigma[i] * sigma[i]);
+            for (int mu = 0; mu < nao; mu++)
+                C_emb_lo[mu * n_emb + bath_col] *= inv_norm;
             bath_col++;
         }
     }
@@ -534,6 +760,10 @@ real_t DMET::compute_energy() {
         std::vector<real_t> C_emb;       // [nao × n_emb]
         std::vector<real_t> h_emb_base;  // C_emb^T F C_emb (before μ shift)
         std::vector<real_t> h_core_emb;  // C_emb^T h_core C_emb (for RDM energy, μ-independent)
+        std::vector<real_t> M_co;        // [n_emb × nocc_full]: C_emb^T S C_occ_full,
+                                         //  used to build cluster-DM = 2 M M^T for the
+                                         //  Vayesta-style separate-subspace canonicalization.
+        std::vector<real_t> h_eri_emb;   // [n_emb⁴] embedding-basis ERI, μ-independent (cached)
         int n_emb, n_emb_occ, n_frozen;
         int n_core;  // σ≈1 orbitals: for N_frag counting only
         bool is_full_system = false;
@@ -588,6 +818,26 @@ real_t DMET::compute_energy() {
                 bd.h_emb_base[p * bd.n_emb + q] = vf;
                 bd.h_core_emb[p * bd.n_emb + q] = vh;
             }
+
+        // Precompute M_co = C_emb^T · S · C_occ_full  [n_emb × nocc].
+        // Used by canonicalize_cluster_subspaces to build cluster-DM = 2 M Mᵀ
+        // and identify occupied/virtual subspaces (Vayesta convention).
+        bd.M_co.assign((size_t)bd.n_emb * nocc, 0.0);
+        std::vector<real_t> SC(nao * nocc, 0.0);
+        for (int mu = 0; mu < nao; mu++)
+            for (int i = 0; i < nocc; i++) {
+                real_t v = 0.0;
+                for (int nu = 0; nu < nao; nu++)
+                    v += h_S[mu * nao + nu] * h_C[nu * nao + i];  // C_occ = first nocc cols of h_C
+                SC[mu * nocc + i] = v;
+            }
+        for (int p = 0; p < bd.n_emb; p++)
+            for (int i = 0; i < nocc; i++) {
+                real_t v = 0.0;
+                for (int mu = 0; mu < nao; mu++)
+                    v += bd.C_emb[mu * bd.n_emb + p] * SC[mu * nocc + i];
+                bd.M_co[p * nocc + i] = v;
+            }
     }
 
     cudaDeviceSynchronize();
@@ -623,15 +873,42 @@ real_t DMET::compute_energy() {
         std::cout << "  Multi-GPU strategy: single GPU (serial)" << std::endl;
     }
 
-    // Pre-cluster fragments by μ-independent equivalence (h_emb_base norm,
-    // n_emb, n_emb_occ, etc). Each fragment maps to a canonical representative;
-    // only canonical fragments are solved, others copy the result.
+    // Pre-cluster fragments by μ-independent equivalence. Each fragment maps to
+    // a canonical representative; only canonical fragments are solved, others
+    // copy the result.
+    //
+    // Equivalence signature: sorted eigenvalues of h_emb_base. These are
+    // unitary invariants — robust against the bath SVD's non-unique basis
+    // choice when several singular values are nearly degenerate (which makes
+    // h_emb_base elements differ between symmetry-equivalent fragments even
+    // though the matrices are unitarily equivalent). The earlier norm-only
+    // check missed these for pentacene and beyond.
     std::vector<int> canonical_of(fragments_.size(), -1);
     std::vector<int> unique_fragments;  // canonical fragment indices to solve
-    std::vector<real_t> h_norms(fragments_.size(), 0.0);
+
+    using RowMatXd = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    std::vector<std::vector<real_t>> h_eigs(fragments_.size());
     for (size_t f = 0; f < fragments_.size(); f++) {
-        for (auto v : baths[f].h_emb_base) h_norms[f] += v * v;
+        auto& bd = baths[f];
+        if (bd.is_full_system || bd.n_emb == 0) continue;
+        const int ne = bd.n_emb;
+        Eigen::Map<const RowMatXd> H(bd.h_emb_base.data(), ne, ne);
+        Eigen::SelfAdjointEigenSolver<RowMatXd> es(H);
+        // SelfAdjointEigenSolver returns eigenvalues sorted ascending.
+        h_eigs[f].assign(es.eigenvalues().data(), es.eigenvalues().data() + ne);
     }
+
+    // Element-wise comparison of sorted eigenvalues.
+    auto eigs_match = [](const std::vector<real_t>& a,
+                         const std::vector<real_t>& b, real_t rel_tol) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); i++) {
+            const real_t scale = std::max({std::abs(a[i]), std::abs(b[i]), 1.0});
+            if (std::abs(a[i] - b[i]) > rel_tol * scale) return false;
+        }
+        return true;
+    };
+
     for (size_t f = 0; f < fragments_.size(); f++) {
         auto& bd = baths[f];
         if (bd.is_full_system) {
@@ -650,8 +927,11 @@ real_t DMET::compute_energy() {
             if (bg.n_emb != bd.n_emb || bg.n_emb_occ != bd.n_emb_occ
                 || bg.n_frozen != bd.n_frozen
                 || fragments_[u].n_frag != fragments_[f].n_frag) continue;
-            if (std::abs(h_norms[f] - h_norms[u])
-                < 1e-10 * std::max(h_norms[f], h_norms[u])) {
+            // Tolerance 1e-4: SCF/bath-SVD noise on eigenvalues is ~1e-5
+            // relative for medium systems; physically distinct fragment types
+            // (e.g. α-CH vs β-CH in polyacenes) differ by >1e-3 in their
+            // eigenvalue spectrum — a comfortable separation.
+            if (eigs_match(h_eigs[f], h_eigs[u], 1e-4)) {
                 canon = u;
                 break;
             }
@@ -667,17 +947,68 @@ real_t DMET::compute_energy() {
               << " unique fragment(s) of " << fragments_.size() << std::endl;
 
     // ================================================================
+    //  Phase A.6: Precompute embedding-basis ERI per fragment
+    //
+    //  eri_emb = (C_emb)^T eri_AO C_emb is μ-independent (C_emb is determined
+    //  by bath SVD which depends only on the full-system HF density). The
+    //  embedding HF inside evaluate_at_mu re-uses this same eri_emb each μ.
+    //
+    //  Building it once here saves N_unique × N_bisection_iter rebuilds.
+    //  For pentacene: 6×30 = 180 saved; for cholesterol: 28×30 = 840 saved.
+    //
+    //  Only unique-canonical fragments are precomputed — equivalent fragments
+    //  copy their canonical's results in evaluate_at_mu, so they never need
+    //  their own h_eri_emb. (Pentacene: 6 of 22 fragments precomputed.)
+    //
+    //  Done sequentially on GPU 0 (build_mo_eri uses replicated B if available,
+    //  or distributed collective via NCCL). Memory footprint per fragment is
+    //  ne⁴ × 8 bytes — negligible for cholesterol-scale (max ~525 KB / frag).
+    // ================================================================
+    cudaSetDevice(0);
+    for (int u : unique_fragments) {
+        auto& bd = baths[u];
+        if (bd.is_full_system) continue;
+        const int ne = bd.n_emb;
+        if (ne == 0) continue;
+        real_t* d_C_emb_dev = nullptr;
+        tracked_cudaMalloc(&d_C_emb_dev, nao * ne * sizeof(real_t));
+        cudaMemcpy(d_C_emb_dev, bd.C_emb.data(), nao * ne * sizeof(real_t),
+                   cudaMemcpyHostToDevice);
+        real_t* d_eri_emb_dev = eri_.build_mo_eri(d_C_emb_dev, ne);
+        tracked_cudaFree(d_C_emb_dev);
+        bd.h_eri_emb.resize((size_t)ne * ne * ne * ne);
+        cudaMemcpy(bd.h_eri_emb.data(), d_eri_emb_dev,
+                   bd.h_eri_emb.size() * sizeof(real_t),
+                   cudaMemcpyDeviceToHost);
+        tracked_cudaFree(d_eri_emb_dev);
+    }
+
+    // ================================================================
     //  Phase B: evaluate_at_mu — solve all fragments at given μ
     //  Returns {Σ N_frag, Σ E_corr_frag}
     // ================================================================
 
     struct FragResult {
-        real_t E_corr_frag;
+        real_t E_corr_frag;        // T-amplitude democratic (existing)
+        real_t E_corr_frag_aoproj; // AO-projected dm2-based (E1+E2 combined)
+        real_t E1_aoproj;          // 1e contribution (diagnostic)
+        real_t E2_aoproj;          // 2e contribution (diagnostic)
         real_t N_frag;
     };
 
-    auto evaluate_at_mu = [&](real_t mu, bool verbose) -> std::pair<real_t, real_t> {
-        std::vector<FragResult> results(fragments_.size(), {0.0, 0.0});
+    // Evaluation modes for evaluate_at_mu:
+    //   verbose=true:  full pipeline (CCSD + Lambda + dm1 + dm2 + AO-proj + print).
+    //                  Used for the energy-providing call at μ_final.
+    //   verbose=false, need_ccsd_density=false: HF-only fast path for μ bisection.
+    //                  Skips CCSD entirely; N_frag from embedding-HF 1-RDM.
+    //   verbose=false, need_ccsd_density=true:  CCSD-density mode for the optional
+    //                  2-stage μ refinement. Runs CCSD + Lambda + dm1 to obtain the
+    //                  Λ-relaxed N_frag, but skips dm2/AO-proj for speed.
+    auto evaluate_at_mu = [&](real_t mu, bool verbose, bool need_ccsd_density = false)
+        -> std::tuple<real_t, real_t, real_t> {
+        const bool full_pipeline = verbose;
+        const bool ccsd_pipeline = verbose || need_ccsd_density;
+        std::vector<FragResult> results(fragments_.size(), {0.0, 0.0, 0.0, 0.0, 0.0});
         // char (not bool) — std::vector<bool> bit-packs and is not thread-safe
         // for concurrent writes to different elements.
         std::vector<char> solved(fragments_.size(), 0);
@@ -691,19 +1022,32 @@ real_t DMET::compute_energy() {
             auto& bd = baths[f];
             if (!bd.is_full_system) continue;
 
+            // Fast path for μ-bisection: full-system fragment trivially has
+            // N_frag = N_elec independent of μ (no projection effect), so we
+            // can skip CCSD entirely in both HF-only and CCSD-density modes.
+            // Energies are computed only at the full_pipeline (verbose) call.
+            if (!full_pipeline) {
+                results[f] = {0.0, 0.0, 0.0, 0.0, (real_t)N_elec};
+                solved[f] = true;
+                gpu_used[f] = 0;
+                continue;
+            }
+
             cudaSetDevice(0);
             real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
             real_t* d_mo_eri;
             real_t E_corr;
             {
-                CoutSilencer silence(!verbose);
+                CoutSilencer silence(false);  // verbose=true here, never silence
                 d_mo_eri = eri_.build_mo_eri(d_C, nao);
                 E_corr = ccsd_spatial_orbital(
                     nullptr, d_C, rhf_.get_orbital_energies().device_ptr(),
                     nao, nocc, false, nullptr, nullptr, nullptr, d_mo_eri, 0);
             }
             tracked_cudaFree(d_mo_eri);
-            results[f] = {E_corr, (real_t)N_elec};
+            // Full-system fragment: AO projection is trivial (covers all AOs),
+            // so both democratic forms collapse to the same full CCSD energy.
+            results[f] = {E_corr, E_corr, 0.0, E_corr, (real_t)N_elec};
             solved[f] = true;
             gpu_used[f] = 0;  // full-system always runs on GPU 0
         }
@@ -713,7 +1057,7 @@ real_t DMET::compute_energy() {
             auto& bd = baths[f];
             if (bd.is_full_system) continue;
             if (bd.n_emb_occ <= 0 || bd.n_emb_occ >= bd.n_emb) {
-                results[f] = {0.0, 0.0};
+                results[f] = {0.0, 0.0, 0.0, 0.0, 0.0};
                 solved[f] = true;
             }
         }
@@ -755,23 +1099,84 @@ real_t DMET::compute_energy() {
                     for (int p = 0; p < n_frag_emb; p++)
                         h_emb[p * ne + p] -= mu;
 
-                    // 2. Build eri in embedding basis (current device's replicated B)
-                    real_t* d_C_emb_dev = nullptr;
-                    tracked_cudaMalloc(&d_C_emb_dev, nao * ne * sizeof(real_t));
-                    cudaMemcpy(d_C_emb_dev, bd.C_emb.data(), nao * ne * sizeof(real_t),
-                               cudaMemcpyHostToDevice);
-                    real_t* d_eri_emb_dev = eri_.build_mo_eri(d_C_emb_dev, ne);
-                    tracked_cudaFree(d_C_emb_dev);
+                    // 2. Embedding-basis ERI is μ-independent — use the cached
+                    //    bd.h_eri_emb precomputed in Phase A.6. This skips a
+                    //    GPU build_mo_eri call on every μ evaluation.
+                    const std::vector<real_t>& h_eri_emb = bd.h_eri_emb;
 
-                    std::vector<real_t> h_eri_emb((size_t)ne*ne*ne*ne);
-                    cudaMemcpy(h_eri_emb.data(), d_eri_emb_dev,
-                               h_eri_emb.size()*sizeof(real_t), cudaMemcpyDeviceToHost);
-                    tracked_cudaFree(d_eri_emb_dev);
-
-                    // 3. Embedding HF
+                    // 3a. Embedding HF SCF — gives μ-dependent occ/vir split
+                    //     (needed for HF-fast μ bisection).
                     auto [h_eigvecs, h_eps] = run_embedding_hf_cpu(
                         h_emb, h_eri_emb, ne, no,
                         /*max_iter=*/100, /*tol=*/1e-10, /*verbose=*/0);
+
+                    // 3b. Re-canonicalize within each subspace using h_emb_base
+                    //     (NO μ shift, matches Vayesta's canonicalize_mo).
+                    //     Then apply diag μ shift to ε. This makes CCSD's
+                    //     implicit Fock approximate h_eff (V_HF[cluster] removed).
+                    //     The full (off-diagonal) μ·P_frag perturbation is
+                    //     approximated as diag(P_diag) — proper handling needs
+                    //     CCSD with f_ov ≠ 0 support (see DMET.md §7.13).
+                    {
+                        using RowMatXd = Eigen::Matrix<real_t,
+                            Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+                        Eigen::Map<const RowMatXd> H_base(bd.h_emb_base.data(), ne, ne);
+                        Eigen::Map<const RowMatXd> U_SCF(h_eigvecs.data(), ne, ne);
+                        const int nv = ne - no;
+
+                        auto recan = [&H_base](const RowMatXd& U_sub)
+                            -> std::pair<RowMatXd, Eigen::VectorXd> {
+                            if (U_sub.cols() == 0)
+                                return {RowMatXd(U_sub.rows(), 0), Eigen::VectorXd(0)};
+                            RowMatXd F_sub = U_sub.transpose() * H_base * U_sub;
+                            Eigen::SelfAdjointEigenSolver<RowMatXd> s(F_sub);
+                            return {U_sub * s.eigenvectors(), s.eigenvalues()};
+                        };
+
+                        auto [U_occ_can, eps_occ] = recan(U_SCF.leftCols(no));
+                        auto [U_vir_can, eps_vir] = recan(U_SCF.rightCols(nv));
+
+                        for (int i = 0; i < no; i++) {
+                            h_eps[i] = eps_occ(i);
+                            for (int p = 0; p < ne; p++)
+                                h_eigvecs[p * ne + i] = U_occ_can(p, i);
+                        }
+                        for (int i = 0; i < nv; i++) {
+                            h_eps[no + i] = eps_vir(i);
+                            for (int p = 0; p < ne; p++)
+                                h_eigvecs[p * ne + (no + i)] = U_vir_can(p, i);
+                        }
+
+                        // Apply diag μ shift on ε
+                        for (int i = 0; i < ne; i++) {
+                            real_t P_diag = 0.0;
+                            for (int p = 0; p < n_frag_emb; p++)
+                                P_diag += h_eigvecs[p * ne + i] * h_eigvecs[p * ne + i];
+                            h_eps[i] -= mu * P_diag;
+                        }
+                    }
+
+                    // ---------------------------------------------------------
+                    //  HF-only fast path for μ-bisection: skip CCSD entirely.
+                    //  N_frag from embedding-HF 1-RDM (2 P_ii summed over
+                    //  occupied canonical orbitals projected onto fragment AOs).
+                    //  This is the standard DMET density-only μ optimization
+                    //  (Wouters/Knizia practice).
+                    // ---------------------------------------------------------
+                    if (!ccsd_pipeline) {
+                        real_t N_frag = 2.0 * bd.n_core;
+                        for (int i = 0; i < no; i++) {
+                            real_t P_ii = 0.0;
+                            for (int p = 0; p < n_frag_emb; p++)
+                                P_ii += h_eigvecs[p * ne + i]
+                                      * h_eigvecs[p * ne + i];
+                            N_frag += 2.0 * P_ii;
+                        }
+                        results[f] = {0.0, 0.0, 0.0, 0.0, N_frag};
+                        gpu_used[f] = my_tid;
+                        solved[f] = true;
+                        continue;
+                    }
 
                     // Level shift
                     if (no > 0 && no < ne) {
@@ -830,15 +1235,26 @@ real_t DMET::compute_energy() {
                         h_t1.data(), h_t2.data(), h_l1.data(), h_l2.data(),
                         300, 1e-5, /*verbose=*/0);
 
-                    // 9. Democratic E_corr_frag
-                    real_t E_frag = compute_dmet_fragment_energy(
-                        no, nv, h_eri.data(), h_t1.data(), h_t2.data(),
-                        n_frag_emb, h_eigvecs.data(), bd.n_frozen);
+                    // 9. Democratic E_corr_frag (T-amplitude form). Only needed
+                    //    in full_pipeline mode; ccsd_density mode skips it since
+                    //    bisection only uses N_frag.
+                    real_t E_frag = 0.0;
+                    if (full_pipeline) {
+                        E_frag = compute_dmet_fragment_energy(
+                            no, nv, h_eri.data(), h_t1.data(), h_t2.data(),
+                            n_frag_emb, h_eigvecs.data(), bd.n_frozen);
+                    }
 
-                    // 10. N_frag from relaxed 1-RDM (or HF fallback)
+                    // 10. N_frag from relaxed 1-RDM (always computed in
+                    //     ccsd_pipeline modes). AO-projected E_frag from dm2 is
+                    //     full_pipeline-only.
                     real_t N_frag = 2.0 * bd.n_core;
+                    real_t E_frag_aoproj = 0.0;
+                    real_t E1_ao = 0.0, E2_ao = 0.0;
                     if (lambda_ok) {
                         const int na_act = no_act + nv;
+                        const size_t na_act4 =
+                            (size_t)na_act * na_act * na_act * na_act;
                         std::vector<real_t> dm1(na_act * na_act, 0.0);
                         build_ccsd_1rdm_mo_cpu(no_act, nv, h_t1.data(), h_t2.data(),
                                                h_l1.data(), h_l2.data(), dm1.data());
@@ -851,6 +1267,26 @@ real_t DMET::compute_energy() {
                                           * h_eigvecs[p * ne + (j+nf)];
                                 N_frag += P_ij * dm1[i * na_act + j];
                             }
+
+                        if (full_pipeline) {
+                            // 10b. Standard QC-DMET fragment energy (Vayesta convention).
+                            // Uses h_avg = ½(h_bare + h_eff) where h_eff = F − v_act,
+                            // so cluster-internal Hartree-exchange cancels and we
+                            // recover the bare core operator on average. Validated
+                            // against Vayesta on benzene/STO-3G (−0.431 Ha vs the
+                            // old AO-proj formula's −0.067 Ha).
+                            std::vector<real_t> dm2(na_act4, 0.0);
+                            build_ccsd_2rdm_chemist_cpu(
+                                no_act, nv, h_t1.data(), h_t2.data(),
+                                h_l1.data(), h_l2.data(), dm1.data(), dm2.data());
+                            E_frag_aoproj = compute_dmet_fragment_energy_vayesta(
+                                no_act, nv,
+                                bd.h_core_emb.data(), bd.h_emb_base.data(),
+                                h_eri.data(),
+                                dm1.data(), dm2.data(),
+                                n_frag_emb, h_eigvecs.data(), bd.n_frozen,
+                                &E1_ao, &E2_ao);
+                        }
                     } else {
                         for (int i = 0; i < no; i++) {
                             real_t P_ii = 0.0;
@@ -858,9 +1294,12 @@ real_t DMET::compute_energy() {
                                 P_ii += h_eigvecs[p * ne + i] * h_eigvecs[p * ne + i];
                             N_frag += 2.0 * P_ii;
                         }
+                        // Without Lambda we can't form relaxed 2-RDM; fall back
+                        // to the T-amplitude value so totals stay finite.
+                        E_frag_aoproj = E_frag;
                     }
 
-                    results[f] = {E_frag, N_frag};
+                    results[f] = {E_frag, E_frag_aoproj, E1_ao, E2_ao, N_frag};
                     lambda_ok_v[f] = lambda_ok;
                     gpu_used[f] = my_tid;
                     solved[f] = true;
@@ -897,15 +1336,23 @@ real_t DMET::compute_energy() {
                         std::cout << "  Fragment " << f << ": (trivial, skipped)"
                                   << std::endl;
                     } else {
-                        std::cout << "  Fragment " << f << ": E_corr="
-                                  << std::setprecision(10) << results[f].E_corr_frag
+                        std::cout << "  Fragment " << f
+                                  << ": E_corr(T-amp)=" << std::setprecision(10)
+                                  << results[f].E_corr_frag
+                                  << " E_corr(DMET)=" << std::setprecision(10)
+                                  << results[f].E_corr_frag_aoproj
+                                  << " (E1=" << std::setprecision(6) << results[f].E1_aoproj
+                                  << " E2=" << std::setprecision(6) << results[f].E2_aoproj
+                                  << ")"
                                   << " N_frag=" << std::setprecision(4) << results[f].N_frag
                                   << (lambda_ok_v[f] ? " (Lambda OK)" : " (L=T)")
                                   << " [GPU " << gpu_used[f] << "]" << std::endl;
                     }
                 } else if (canon >= 0) {
                     std::cout << "  Fragment " << f << ": equivalent to " << canon
-                              << " (E=" << std::setprecision(10) << results[f].E_corr_frag
+                              << " (E_T=" << std::setprecision(10) << results[f].E_corr_frag
+                              << ", E_DMET=" << std::setprecision(10)
+                              << results[f].E_corr_frag_aoproj
                               << ", N=" << std::setprecision(4) << results[f].N_frag
                               << ") [from GPU " << gpu_used[canon] << "]" << std::endl;
                 }
@@ -913,12 +1360,13 @@ real_t DMET::compute_energy() {
         }
 
         // ---- Aggregate ----
-        real_t N_total = 0.0, E_total = 0.0;
+        real_t N_total = 0.0, E_total = 0.0, E_total_aoproj = 0.0;
         for (size_t f = 0; f < fragments_.size(); f++) {
             N_total += results[f].N_frag;
             E_total += results[f].E_corr_frag;
+            E_total_aoproj += results[f].E_corr_frag_aoproj;
         }
-        return {N_total, E_total};
+        return {N_total, E_total, E_total_aoproj};
     };
 
     // ================================================================
@@ -928,7 +1376,7 @@ real_t DMET::compute_energy() {
     std::cout << "\n---- μ optimization ----" << std::endl;
 
     // First evaluation at μ=0
-    auto [N0, E0] = evaluate_at_mu(0.0, true);
+    auto [N0, E0, E0_aoproj] = evaluate_at_mu(0.0, true);
     real_t N_err = N0 - N_elec;
 
     std::cout << "  μ=0: Σ N_frag=" << std::setprecision(4) << N0
@@ -936,6 +1384,11 @@ real_t DMET::compute_energy() {
 
     real_t mu_opt = 0.0;
     real_t E_corr_opt = E0;
+    real_t E_corr_opt_aoproj = E0_aoproj;
+    // True only if Stage-2 refinement succeeded AND the Final evaluation at
+    // μ_DMET ran. False on refinement-off or refinement-fallback paths;
+    // controls whether the Summary labels AO-proj as "at μ_DMET" or "at μ=0".
+    bool refinement_applied = false;
 
     const real_t N_tol = 1e-5;
     if (std::abs(N_err) > N_tol) {
@@ -945,10 +1398,10 @@ real_t DMET::compute_energy() {
 
         // Ensure the bracket contains the root
         std::cout << "  Bracket init: solving at μ=" << mu_lo << " and μ=" << mu_hi << std::endl;
-        auto [N_lo, E_lo] = evaluate_at_mu(mu_lo, false);
+        auto [N_lo, E_lo, E_lo_ao] = evaluate_at_mu(mu_lo, false);
         std::cout << "    μ=" << std::setprecision(4) << mu_lo
                   << "  Σ N_frag=" << N_lo << "  err=" << (N_lo - N_elec) << std::endl;
-        auto [N_hi, E_hi] = evaluate_at_mu(mu_hi, false);
+        auto [N_hi, E_hi, E_hi_ao] = evaluate_at_mu(mu_hi, false);
         std::cout << "    μ=" << mu_hi
                   << "  Σ N_frag=" << N_hi << "  err=" << (N_hi - N_elec) << std::endl;
 
@@ -957,10 +1410,10 @@ real_t DMET::compute_energy() {
             if ((N_lo - N_elec) * (N_hi - N_elec) <= 0) break;
             mu_lo *= 2.0; mu_hi *= 2.0;
             std::cout << "  Expanding bracket to μ=[" << mu_lo << ", " << mu_hi << "]" << std::endl;
-            std::tie(N_lo, E_lo) = evaluate_at_mu(mu_lo, false);
+            std::tie(N_lo, E_lo, E_lo_ao) = evaluate_at_mu(mu_lo, false);
             std::cout << "    μ=" << mu_lo
                       << "  Σ N_frag=" << N_lo << "  err=" << (N_lo - N_elec) << std::endl;
-            std::tie(N_hi, E_hi) = evaluate_at_mu(mu_hi, false);
+            std::tie(N_hi, E_hi, E_hi_ao) = evaluate_at_mu(mu_hi, false);
             std::cout << "    μ=" << mu_hi
                       << "  Σ N_frag=" << N_hi << "  err=" << (N_hi - N_elec) << std::endl;
         }
@@ -973,7 +1426,7 @@ real_t DMET::compute_energy() {
                       << std::defaultfloat << ")..." << std::endl;
             for (int iter = 0; iter < max_iter; iter++) {
                 real_t mu_mid = 0.5 * (mu_lo + mu_hi);
-                auto [N_mid, E_mid] = evaluate_at_mu(mu_mid, false);
+                auto [N_mid, E_mid, E_mid_ao] = evaluate_at_mu(mu_mid, false);
                 real_t err_mid = N_mid - N_elec;
 
                 std::cout << "    iter " << std::setw(2) << iter + 1
@@ -985,28 +1438,195 @@ real_t DMET::compute_energy() {
                 if (std::abs(err_mid) < N_tol || (mu_hi - mu_lo) < 1e-10) {
                     mu_opt = mu_mid;
                     E_corr_opt = E_mid;
+                    E_corr_opt_aoproj = E_mid_ao;
                     std::cout << "  μ converged at iter " << iter + 1 << std::endl;
                     break;
                 }
 
                 if ((N_lo - N_elec) * err_mid < 0) {
-                    mu_hi = mu_mid; N_hi = N_mid; E_hi = E_mid;
+                    mu_hi = mu_mid; N_hi = N_mid; E_hi = E_mid; E_hi_ao = E_mid_ao;
                 } else {
-                    mu_lo = mu_mid; N_lo = N_mid; E_lo = E_mid;
+                    mu_lo = mu_mid; N_lo = N_mid; E_lo = E_mid; E_lo_ao = E_mid_ao;
                 }
 
                 if (iter == max_iter - 1) {
                     mu_opt = mu_mid;
                     E_corr_opt = E_mid;
+                    E_corr_opt_aoproj = E_mid_ao;
                     std::cout << "  μ: max iterations reached, μ=" << std::setprecision(6) << mu_opt
                               << " err=" << err_mid << std::endl;
                 }
             }
         }
 
-        // Energy: use μ=0 (T-amplitude energy is only valid for H(μ=0))
-        // μ* gives density consistency but doesn't improve energy without proper 2-RDM
-        E_corr_opt = E0;
+        // Stage-2 (optional): refine μ with CCSD-relaxed density.
+        //
+        // Stage 1 above bisected with HF dm1 N_frag for speed (~50× cheaper).
+        // Stage 2 starts from μ_HF*, evaluates the CCSD-relaxed N_frag, and
+        // does a small bracketed bisection if the CCSD density disagrees with
+        // the HF prediction. The final FULL_VERBOSE call at μ_DMET* provides
+        // the energies (overriding the μ=0 fallback).
+        const real_t mu_HF = mu_opt;
+        if (rhf_.get_dmet_mu_refine_ccsd()) {
+            std::cout << "\n---- μ refinement with CCSD-relaxed density ----" << std::endl;
+            std::cout << "  Starting from HF μ* = " << std::setprecision(6) << mu_HF << std::endl;
+
+            // CCSD-density mode discards E and E_ao (only N_frag matters here).
+            // Pre-declared dummies receive those tuple elements every call.
+            real_t N_at_mu_HF = 0.0, E_dummy = 0.0, E_ao_dummy = 0.0;
+            std::tie(N_at_mu_HF, E_dummy, E_ao_dummy) =
+                evaluate_at_mu(mu_HF, false, /*need_ccsd_density=*/true);
+            real_t err_HF = N_at_mu_HF - N_elec;
+            std::cout << "  CCSD N_frag(μ_HF*) = " << std::setprecision(6) << N_at_mu_HF
+                      << "  err = " << std::scientific << err_HF
+                      << std::defaultfloat << std::endl;
+
+            real_t mu_DMET = mu_HF;
+            // Stage-2 convergence flag. The CCSD-relaxed N_frag(μ) is not
+            // guaranteed continuous: small fragments (e.g. OH in cholesterol)
+            // can switch electronic state across μ, producing step-like
+            // discontinuities that bisection cannot resolve. If Stage 2 fails,
+            // we fall back to E0/E0_aoproj rather than evaluating at a
+            // non-converged μ where CCSD diverges on broken reference states.
+            bool stage2_converged = false;
+            if (std::abs(err_HF) < N_tol) {
+                std::cout << "  CCSD density already consistent at HF μ* (within tol)" << std::endl;
+                stage2_converged = true;
+            } else {
+                // Bracket around HF μ*. Width chosen heuristically; HF/CCSD μ*
+                // typically differ by < 0.05 Ha, but expand if needed.
+                real_t mu2_lo = mu_HF - 0.1;
+                real_t mu2_hi = mu_HF + 0.1;
+                real_t N2_lo = 0.0, N2_hi = 0.0;
+                std::tie(N2_lo, E_dummy, E_ao_dummy) =
+                    evaluate_at_mu(mu2_lo, false, /*need_ccsd_density=*/true);
+                std::tie(N2_hi, E_dummy, E_ao_dummy) =
+                    evaluate_at_mu(mu2_hi, false, /*need_ccsd_density=*/true);
+                std::cout << "    μ=" << std::setprecision(6) << mu2_lo
+                          << "  Σ N_frag=" << N2_lo
+                          << "  err=" << std::scientific << (N2_lo - N_elec)
+                          << std::defaultfloat << std::endl;
+                std::cout << "    μ=" << std::setprecision(6) << mu2_hi
+                          << "  Σ N_frag=" << N2_hi
+                          << "  err=" << std::scientific << (N2_hi - N_elec)
+                          << std::defaultfloat << std::endl;
+
+                for (int expand = 0; expand < 3; expand++) {
+                    if ((N2_lo - N_elec) * (N2_hi - N_elec) <= 0) break;
+                    real_t span = mu2_hi - mu2_lo;
+                    mu2_lo -= span; mu2_hi += span;
+                    std::cout << "  Expanding bracket to μ=[" << mu2_lo << ", "
+                              << mu2_hi << "]" << std::endl;
+                    std::tie(N2_lo, E_dummy, E_ao_dummy) =
+                        evaluate_at_mu(mu2_lo, false, /*need_ccsd_density=*/true);
+                    std::tie(N2_hi, E_dummy, E_ao_dummy) =
+                        evaluate_at_mu(mu2_hi, false, /*need_ccsd_density=*/true);
+                }
+
+                if ((N2_lo - N_elec) * (N2_hi - N_elec) > 0) {
+                    std::cout << "  WARNING: CCSD bracket failed; falling back to HF μ*" << std::endl;
+                    mu_DMET = mu_HF;
+                } else {
+                    const int max_iter2 = 15;
+                    real_t N_mid = 0.0;
+                    for (int iter = 0; iter < max_iter2; iter++) {
+                        real_t mu_mid = 0.5 * (mu2_lo + mu2_hi);
+                        std::tie(N_mid, E_dummy, E_ao_dummy) =
+                            evaluate_at_mu(mu_mid, false, /*need_ccsd_density=*/true);
+                        real_t err_mid = N_mid - N_elec;
+                        std::cout << "    iter " << std::setw(2) << iter + 1
+                                  << ": μ=" << std::setprecision(6) << mu_mid
+                                  << "  Σ N_frag=" << std::setprecision(6) << N_mid
+                                  << "  err=" << std::scientific << err_mid
+                                  << std::defaultfloat << std::endl;
+                        if (std::abs(err_mid) < N_tol || (mu2_hi - mu2_lo) < 1e-10) {
+                            mu_DMET = mu_mid;
+                            stage2_converged = true;
+                            std::cout << "  CCSD μ converged at iter " << iter + 1 << std::endl;
+                            break;
+                        }
+                        if ((N2_lo - N_elec) * err_mid < 0) {
+                            mu2_hi = mu_mid; N2_hi = N_mid;
+                        } else {
+                            mu2_lo = mu_mid; N2_lo = N_mid;
+                        }
+                        if (iter == max_iter2 - 1) {
+                            mu_DMET = mu_mid;
+                            std::cout << "  CCSD μ: max iterations reached, μ="
+                                      << std::setprecision(6) << mu_DMET
+                                      << "  err=" << err_mid << std::endl;
+                        }
+                    }
+                }
+            }
+
+            if (!stage2_converged) {
+                // Stage 2 failed: skip the Final evaluation entirely. Running
+                // it at a non-converged μ puts CCSD on broken reference states
+                // (cholesterol: OH/quaternary-C fragments switch occupation,
+                // AO-proj diverges to +3.5 Ha). Fall back to μ=0 results,
+                // identical to refinement off.
+                std::cout << "  WARNING: Stage 2 did not converge — N_frag(μ) "
+                             "likely discontinuous." << std::endl;
+                std::cout << "  Falling back to μ_HF* and μ=0 energies "
+                             "(equivalent to refinement off)." << std::endl;
+                mu_opt = mu_HF;
+                E_corr_opt = E0;
+                E_corr_opt_aoproj = E0_aoproj;
+            } else {
+                // Final full evaluation at μ_DMET for energy.
+                std::cout << "  Final energy evaluation at μ_DMET = "
+                          << std::setprecision(6) << mu_DMET << std::endl;
+                real_t N_final = 0.0, E_final = 0.0, E_final_ao = 0.0;
+                std::tie(N_final, E_final, E_final_ao) = evaluate_at_mu(mu_DMET, true);
+                (void)N_final;
+                (void)E_final;  // T-amp at μ ≠ 0 is unphysical (see below).
+                mu_opt = mu_DMET;
+                // Reporting strategy when refinement is on:
+                //   T-amp form  E_corr = Σ P[i,i'] (ia|jb) (2τ-τ')  is derived
+                //     assuming H_emb has no μ-shift. Reusing it at μ_DMET ≠ 0
+                //     gives an inconsistent number (verified empirically: it
+                //     diverges by O(0.1 Ha) for moderate μ). We therefore report
+                //     the T-amp value at μ=0 (E0).
+                //   AO-proj form uses the relaxed dm1 + dm2 directly, which
+                //     absorb the μ-shift consistently, so we report it at the
+                //     refined μ_DMET (E_final_ao).
+                E_corr_opt = E0;
+                E_corr_opt_aoproj = E_final_ao;
+                refinement_applied = true;
+                std::cout << "  Reporting: T-amp from μ=0, AO-proj from μ_DMET"
+                          << " (T-amp formula valid only at μ=0)" << std::endl;
+            }
+        } else {
+            // Default mode (refinement off):
+            //   T-amp formula is only formally valid at μ=0 (its derivation
+            //     assumes H_emb has no μ shift), so we report it from E0.
+            //   The DMET (Vayesta) formula is the standard QC-DMET energy
+            //     partition, and *requires* the cluster electron count to
+            //     match the physical fragment electron count. At μ=0 the
+            //     constraint is unsatisfied (e.g. benzene STO-3G gives
+            //     Σ N_frag = 30 vs 42 expected), so the formula returns a
+            //     physically nonsensical value (positive). We therefore
+            //     evaluate DMET at μ_HF* where the constraint holds.
+            if (std::abs(mu_opt) > 1e-12) {
+                std::cout << "  Final DMET evaluation at μ_HF* = "
+                          << std::setprecision(6) << mu_opt
+                          << " (T-amp keeps μ=0 value)" << std::endl;
+                real_t N_at_HF = 0.0, E_at_HF = 0.0, E_at_HF_ao = 0.0;
+                std::tie(N_at_HF, E_at_HF, E_at_HF_ao) =
+                    evaluate_at_mu(mu_opt, true);
+                (void)N_at_HF;
+                (void)E_at_HF;  // T-amp at μ ≠ 0 unphysical
+                E_corr_opt = E0;                  // T-amp from μ=0
+                E_corr_opt_aoproj = E_at_HF_ao;   // DMET from μ_HF*
+                refinement_applied = true;        // use mixed-μ Summary labels
+            } else {
+                // μ_opt = 0 (symmetric system with exact electron count).
+                // E0_aoproj is already at the consistent μ.
+                E_corr_opt = E0;
+                E_corr_opt_aoproj = E0_aoproj;
+            }
+        }
     } else {
         std::cout << "  μ=0 satisfies electron count (err=" << std::scientific << N_err
                   << std::defaultfloat << "), no optimization needed" << std::endl;
@@ -1016,13 +1636,30 @@ real_t DMET::compute_energy() {
     //  Summary
     // ================================================================
 
+    const bool refine_ccsd = rhf_.get_dmet_mu_refine_ccsd();
     std::cout << "\n---- DMET-CCSD Summary ----" << std::endl;
-    std::cout << "  Chemical potential μ: " << std::setprecision(6) << mu_opt << " Ha" << std::endl;
-    std::cout << "  Total DMET-CCSD correlation energy: "
-              << std::fixed << std::setprecision(10) << E_corr_opt << " Ha" << std::endl;
+    if (refinement_applied) {
+        const char* mu_label = refine_ccsd
+            ? "Chemical potential μ_DMET (CCSD-relaxed)"
+            : "Chemical potential μ_HF* (HF-density bisection)";
+        std::cout << "  " << mu_label << ": "
+                  << std::setprecision(6) << mu_opt << " Ha" << std::endl;
+        std::cout << "  Total DMET-CCSD correlation energy (T-amp, at μ=0):  "
+                  << std::fixed << std::setprecision(10) << E_corr_opt << " Ha" << std::endl;
+        std::cout << "  Total DMET-CCSD correlation energy (DMET,  at μ*):   "
+                  << std::setprecision(10) << E_corr_opt_aoproj << " Ha" << std::endl;
+    } else {
+        std::cout << "  Chemical potential μ: " << std::setprecision(6) << mu_opt << " Ha" << std::endl;
+        std::cout << "  Total DMET-CCSD correlation energy (T-amp democratic): "
+                  << std::fixed << std::setprecision(10) << E_corr_opt << " Ha" << std::endl;
+        std::cout << "  Total DMET-CCSD correlation energy (DMET, Vayesta):     "
+                  << std::setprecision(10) << E_corr_opt_aoproj << " Ha" << std::endl;
+    }
     std::cout << "  HF energy: " << std::setprecision(10) << rhf_.get_total_energy() << " Ha" << std::endl;
-    std::cout << "  DMET-CCSD total energy: "
+    std::cout << "  DMET-CCSD total energy (T-amp): "
               << std::setprecision(10) << rhf_.get_total_energy() + E_corr_opt << " Ha" << std::endl;
+    std::cout << "  DMET-CCSD total energy (DMET):  "
+              << std::setprecision(10) << rhf_.get_total_energy() + E_corr_opt_aoproj << " Ha" << std::endl;
     std::cout << std::defaultfloat;
 
     // Release replicated full-B copies (frees ~num_gpus × naux × nao² × 8 bytes)

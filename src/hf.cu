@@ -110,6 +110,7 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     adc_c_c_ = parameters.get<double>("adc_c_c");
     dmet_fragments_str_ = parameters.get<std::string>("dmet_fragments");
     dmet_threshold_ = parameters.get<double>("dmet_threshold");
+    dmet_mu_refine_ccsd_ = parameters.get<bool>("dmet_mu_refine_ccsd");
 
     // Validate run_type
     if(run_type_ != "energy" && run_type_ != "gradient" && run_type_ != "optimize" && run_type_ != "hessian"){

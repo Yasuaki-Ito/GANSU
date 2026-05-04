@@ -56,6 +56,15 @@ private:
 
     static std::vector<DMETFragment> parse_fragments(const std::string& spec, int num_atoms);
 
+    /// Automatic atom-based fragmentation: each heavy atom becomes a fragment,
+    /// and each H is grouped with its closest heavy atom (within bond threshold).
+    /// Yields the standard "atomic fragment" partitioning used in most DMET papers.
+    /// H atoms not within bond_threshold of any heavy atom become singleton fragments.
+    /// @param bond_threshold_bohr Maximum X-H bond length (default 2.6 Bohr ≈ 1.38 Å,
+    ///        covers C-H/N-H/O-H/S-H but not heavy-heavy bonds at ≥ 2.7 Bohr)
+    static std::vector<DMETFragment> auto_fragments_by_bonds(
+        const RHF& rhf, real_t bond_threshold_bohr = 2.6);
+
     std::tuple<std::vector<real_t>, int, int, int>
     build_bath_orbitals(const DMETFragment& frag,
                         const real_t* h_C,
