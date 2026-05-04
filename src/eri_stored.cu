@@ -1822,7 +1822,7 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
     gansu::tracked_cudaMalloc(&d_P_vv, (size_t)nvir * nvir * sizeof(real_t));
     cudaMemcpy(d_P_vv, h_P_vv.data(), nvir * nvir * sizeof(real_t), cudaMemcpyHostToDevice);
 
-    // Diagnostic: print P_oo and P_vv elements for PySCF comparison
+    // Diagnostic: print P_oo and P_vv elements for reference comparison
     {
         std::vector<real_t> h_Poo(nocc * nocc);
         cudaMemcpy(h_Poo.data(), d_P_oo, nocc * nocc * sizeof(real_t), cudaMemcpyDeviceToHost);
@@ -1945,16 +1945,16 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
     const int nvo = nvir * nocc;
     std::vector<real_t> h_z(nvo, 0.0);
 
-    // Build RHS: Xvo = 0.5 * vhf_MO(vo) [J - 0.5K convention, matching PySCF]
-    // vhf_MO is (2J-K); PySCF uses (J-0.5K) = 0.5*(2J-K)
+    // Build RHS: Xvo = 0.5 * vhf_MO(vo) [J - 0.5K convention, ]
+    // vhf_MO is (2J-K); reference uses (J-0.5K) = 0.5*(2J-K)
     std::vector<real_t> h_Xvo(nvo, 0.0);
     for (int a = 0; a < nvir; a++)
         for (int i = 0; i < nocc; i++)
             h_Xvo[a * nocc + i] = 0.5 * h_vhf_MO[(a + nocc) * nmo + i];
 
-    // Build M = diag(ε_a - ε_i) + A (CPHF matrix, PySCF convention)
+    // Build M = diag(ε_a - ε_i) + A (CPHF matrix, chemist convention)
     // A_{ai,bj} = 2*(a+n,i|b+n,j) - 0.5*(a+n,b+n|i,j) - 0.5*(a+n,j|b+n,i)
-    // This matches PySCF's (J - 0.5K) convention for the orbital Hessian.
+    // This matches the (J - 0.5K) convention for the orbital Hessian.
     std::vector<real_t> h_M(nvo * nvo, 0.0);
     for (int a = 0; a < nvir; a++) {
         for (int i = 0; i < nocc; i++) {
@@ -1987,13 +1987,13 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
     {
         double z_norm = 0;
         for (auto v : h_z) z_norm += v * v;
-        std::cout << "    |z| (CPHF) = " << std::sqrt(z_norm) << " (PySCF: 0.000784)" << std::endl;
+        std::cout << "    |z| (CPHF) = " << std::sqrt(z_norm) << " (reference: 0.000784)" << std::endl;
     }
 
     // -------------------------------------------------------
     // Step 5: Build relaxed density in MO basis → transform to AO
     //   dm1mo: MP2 correction to 1-RDM (no factor 2, no HF part)
-    //   P_MO = D_HF_MO + 2*dm1mo  (factor 2 for spin-sum, matching PySCF dm1p)
+    //   P_MO = D_HF_MO + 2*dm1mo  (factor 2 for spin-sum, matching reference dm1p)
     // -------------------------------------------------------
     // First build dm1mo (used for W matrix, factor-1)
     std::vector<real_t> h_dm1mo(nmo * nmo, 0.0);
@@ -2009,15 +2009,15 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
             h_dm1mo[i * nmo + (a + nocc)] = h_z[a * nocc + i];
         }
 
-    // Diagnostic: dm1mo norm (PySCF: 0.04174 with z-vector)
+    // Diagnostic: dm1mo norm (reference: 0.04174 with z-vector)
     {
         double dm1_norm = 0;
         for (auto v : h_dm1mo) dm1_norm += v * v;
-        std::cout << "    |dm1mo| = " << std::sqrt(dm1_norm) << " (PySCF: 0.02903)" << std::endl;
+        std::cout << "    |dm1mo| = " << std::sqrt(dm1_norm) << " (reference: 0.02903)" << std::endl;
     }
 
     // Build P_MO = D_HF_MO + dm1mo (factor 1, for 1-el gradient)
-    // PySCF: dm1 = D_HF + dm1_ao (1-el uses this)
+    // reference: dm1 = D_HF + dm1_ao (1-el uses this)
     std::vector<real_t> h_P_MO(nmo * nmo, 0.0);
     for (int i = 0; i < nocc; i++) h_P_MO[i * nmo + i] = 2.0;
     for (int p = 0; p < nmo; p++)
@@ -2042,7 +2042,7 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
     gpu::matrixMatrixProduct(d_tmp, d_C, d_P_eff, nao, false, true);  // P_eff = tmp × C^T
 
     // Build unrelaxed density for 2-electron term (NO z-vector)
-    // PySCF's make_rdm2() uses unrelaxed dm1 for the separable 2-PDM.
+    // the spin-traced make_rdm2() uses unrelaxed dm1 for the separable 2-PDM.
     // The z-vector response enters only through 1-el and overlap terms.
     {
         std::vector<real_t> h_P_MO_2el(nmo * nmo, 0.0);
@@ -2081,7 +2081,7 @@ void ERI_Stored_RHF::compute_mp2_effective_densities(
     // They enter the gradient through the 2-RDM (cross term in sep(P_unrelaxed))
     // rather than through the overlap derivative. Adding them to W would
     // double-count their contribution.
-    // TODO: Verify this against PySCF's exact dme0 construction.
+    // TODO: Verify this against the reference dme0 construction.
 
     // Symmetrize: W = (W + W^T) / 2
     for (int p = 0; p < nmo; p++)
@@ -7316,7 +7316,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             cudaMemcpy(Fkc.data(), d_Fkc, ov * sizeof(double), cudaMemcpyDeviceToHost);
         }
 
-        // Semi-canonical f_ov contribution: Fkc += f_ov  (PySCF: fov bare contribution
+        // Semi-canonical f_ov contribution: Fkc += f_ov  (reference: fov bare contribution
         // to enriched intermediate that drives t1·t2 cross terms in T1 update).
         if (h_fov_active) {
             for (int k = 0; k < nocc; k++)
@@ -7333,9 +7333,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         cudaMemcpy(Fki.data(), d_Fki, oo * sizeof(double), cudaMemcpyDeviceToHost);
 
         // Semi-canonical: Fki gets NO f_ov·t1 contribution.
-        //   PySCF rccsd cc_Foo (rintermediates.py line 30) is independent of fov.
+        //   The cc_Foo intermediate is independent of fov.
         //   The fov·t1 term lives in Lki (T2 path) only — added below at Lki
-        //   construction with factor 1.0, matching PySCF Loo (rintermediates.py L63).
+        //   construction with factor 1.0, matching the Loo intermediate.
         //   T1 path gets fov via direct cubic (−2·fov·t1·t1, added in T1 update
         //   loop) plus Fkc·(2t2 − t2.T + t1·t1) plus direct +fov Brillouin.
 
@@ -7363,15 +7363,15 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         }
 
         // Semi-canonical: Fac gets NO t1·f_ov contribution.
-        //   PySCF rccsd cc_Fvv (rintermediates.py line 41) is independent of fov.
+        //   The cc_Fvv intermediate is independent of fov.
         //   The −t1·fov term lives in Lac (T2 path) only — added below at Lac
-        //   construction with factor 1.0, matching PySCF Lvv (rintermediates.py L72).
+        //   construction with factor 1.0, matching the Lvv intermediate.
 
         // ---- L intermediates ----
         // L^k_i = F^k_i + sum_{lc} w(l,k,C,i) * t1(l,c)
         // w(l,k,C,i) = 2*v(l,k,C,i) - v(l,k,i,C) = 2*v_oovo[(l*nocc+k)*nvir*nocc + c*nocc+i] - v_ooov[(l*nocc+k)*ov + i*nvir+c]
         // Semi-canonical: Lki gets += f_ov[k,c] * t1[i,c] with factor 1.0
-        //   (PySCF Loo, rintermediates.py L66). Used in T2 update via −Lki·t2.
+        //   (matching the Loo intermediate). Used in T2 update via −Lki·t2.
         std::vector<real_t> Lki(nocc * nocc, 0.0);
         for (int k = 0; k < nocc; k++)
             for (int i = 0; i < nocc; i++) {
@@ -7393,7 +7393,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
 
         // L^a_c = F^a_c + sum_{kd} w_ovvv[k,a,d,c] * t1(k,d)
         // Semi-canonical: Lac gets −= t1[k,a] * f_ov[k,c] with factor 1.0
-        //   (PySCF Lvv, rintermediates.py L75). Used in T2 update via +Lac·t2.
+        //   (matching the Lvv intermediate). Used in T2 update via +Lac·t2.
         std::vector<real_t> Lac(nvir * nvir, 0.0);
         for (int a = 0; a < nvir; a++)
             for (int c = 0; c < nvir; c++) {
@@ -7607,10 +7607,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 // Active when h_fov_active is supplied (e.g. semi-canonical
                 // DMET cluster orbitals). For canonical Fock (f_ov = 0), no-op.
                 if (h_fov_active) {
-                    // Direct fov term (PySCF rccsd L70: t1new += fov.conj()).
+                    // Direct fov term: t1new += fov (Brillouin condition).
                     val += h_fov_active[(size_t)i * nvir + a];
-                    // Direct cubic (PySCF rccsd L64:
-                    //   t1new −= 2 · einsum('kc,ka,ic->ia', fov, t1, t1)).
+                    // Direct cubic:
+                    //   t1new −= 2 · einsum('kc,ka,ic->ia', fov, t1, t1).
                     real_t cubic = 0.0;
                     for (int k = 0; k < nocc; k++)
                         for (int c = 0; c < nvir; c++)
@@ -8660,7 +8660,7 @@ void ERI_Stored_RHF::compute_ccsd_density() {
     std::cout << "  Tr(D_AO·S) = " << std::fixed << std::setprecision(8) << trace
               << " (expected " << (2*num_occ) << ")" << std::endl;
 
-    // Diagnostic: D_MO diagonal (for PySCF comparison)
+    // Diagnostic: D_MO diagonal (for reference comparison)
     std::cout << "  D_MO diagonal:";
     for (int p = 0; p < num_basis; p++)
         std::cout << " " << std::fixed << std::setprecision(6) << D_mo[p*num_basis + p];

@@ -646,7 +646,7 @@ std::vector<double> RHF::compute_Energy_Hessian() {
     }
 
     // --- Step 2b: Add occ-occ density response correction to CPHF RHS ---
-    // PySCF's CPHF includes the 2e response from the occ-occ density change
+    // The CPHF includes the 2e response from the occ-occ density change
     // D_oo = -2 C_occ s1oo C_occ^T. We compute G(D_oo) and add its vir-occ
     // MO projection to the RHS: rhs[ai] -= (C^T G(D_oo) C)[a,i]
     {

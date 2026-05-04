@@ -23,7 +23,7 @@
  * M11, M12, M21 are IDENTICAL to ADC(2)-s (reused via ADC2Operator).
  * V includes: oooo, vvvv, voov contractions derived from spin integration.
  *
- * After singlet RHF spin integration (verified against PySCF radc_ee.py):
+ * After singlet RHF spin integration (verified numerically (EE-ADC(2))):
  *   oooo: Σ_{kl} (ik|jl) r^{ab}_{kl}
  *   vvvv: Σ_{cd} (ac|bd) r^{cd}_{ij}
  *   voov (8 terms): see adc2x_operator.cu for details

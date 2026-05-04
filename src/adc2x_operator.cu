@@ -77,7 +77,7 @@ __global__ void adc2_apply_M12_x2_kernel(
  * V (first-order off-diagonal, from RHF spin integration):
  *   oooo: Σ_{kl} (ik|jl) × r2[k,l,a,b]
  *   vvvv: Σ_{cd} (ac|bd) × r2[i,j,c,d]
- *   voov (8 terms, verified against PySCF radc_ee.py):
+ *   voov (8 terms, verified numerically (EE-ADC(2))):
  *     +2(jb|kc) r^{ac}_{ik} - (kj|bc) r^{ac}_{ik}
  *     -(jb|kc) r^{ca}_{ik}  - (kj|ac) r^{cb}_{ik}
  *     +2(ia|kc) r^{bc}_{jk} - (ki|ac) r^{bc}_{jk}

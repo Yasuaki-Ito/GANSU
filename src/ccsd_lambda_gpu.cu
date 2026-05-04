@@ -456,7 +456,7 @@ __global__ void compute_woovo_k(const real_t* v4o, const real_t* v4v,
     // step5: WOOVO(i,k,b,j) += sum_{l,c'} ovoo1[l,c',i,k]*theta[j,l,b,c']
     //   At (i,j,c,k), reindex (k↔k, b→c, j→j_in_orig). Original step is on WOOVO(i,k,b,j); to map:
     //   WOOVO(i, k_dst, b_dst, j_dst) where here (k_dst, b_dst, j_dst) = (j_curr, c_curr, k_curr) — wait.
-    //   Let me re-derive. The PySCF einsum is:
+    //   Let me re-derive. The the reference einsum is:
     //     woovo[i,k,b,j] += sum_{l,c'} ovoo1[l,c',i,k]*theta[j,l,b,c']
     //   At current dest (i,j,c,k), what does this contribute? We need (i,k_dst,b_dst,j_dst) = (i,j,c,k).
     //   So k_dst=j, b_dst=c, j_dst=k. Then the contribution is sum_{l,c'} ovoo1[l,c',i,k_dst=j]*theta[j_dst=k,l,b_dst=c,c']
@@ -480,7 +480,7 @@ __global__ void compute_woovo_k(const real_t* v4o, const real_t* v4v,
         v -= ovoo1 * t2[IDX4(l,j,c,cc)];
       }
     // step8: += einsum('idcb,jkdb->ijck', ovvv1, tau):
-    //   ovvv1[i,d,c,b] = 2*ovvv[i,d,c,b] - ovvv[i,b,c,d]  (PySCF uses reassigned ovvv1 here)
+    //   ovvv1[i,d,c,b] = 2*ovvv[i,d,c,b] - ovvv[i,b,c,d]  (the reference uses reassigned ovvv1 here)
     for (int d = 0; d < NV; d++)
       for (int b = 0; b < NV; b++) {
         real_t ovvv1 = 2.0 * ovvv[IDX_OVVV(i,d,c,b)] - ovvv[IDX_OVVV(i,b,c,d)];
@@ -536,7 +536,7 @@ __global__ void compute_wvvvo_k(const real_t* v4o, const real_t* v4v,
       }
     // step5: wvvvo[b,a,c,k] += 1.5 * sum_{k',d} ovvv[k',a,c,d]*t2[k',k,b,d]
     //   (Note: k inside einsum is the dummy index; the dest k matches output k)
-    //   PySCF: einsum('kacd,kjbd->bacj', ovvv, t2)*1.5 → sum_{k',d} ovvv[k',a,c,d]*t2[k',j,b,d] at (b,a,c,j)
+    //   einsum('kacd,kjbd->bacj', ovvv, t2)*1.5 → sum_{k',d} ovvv[k',a,c,d]*t2[k',j,b,d] at (b,a,c,j)
     //   At (b,a,c,k) here = (b,a,c,j_out): += 1.5 * sum_{k',d} ovvv[k',a,c,d]*t2[k',k,b,d]
     {
         real_t sum = 0.0;
@@ -603,7 +603,7 @@ __global__ void compute_mvv_moo_k(const real_t* l2, const real_t* theta,
         int a = idx / NV;
         int b = idx % NV;
         real_t v = 0.0;
-        // mvv[a,b] = Σ l2[k,l,c,b]*theta[k,l,c,a]  (PySCF 'klca,klcb->ba')
+        // mvv[a,b] = Σ l2[k,l,c,b]*theta[k,l,c,a]  (einsum 'klca,klcb->ba')
         for (int k = 0; k < NO; k++)
           for (int l = 0; l < NO; l++)
             for (int c = 0; c < NV; c++)
@@ -791,10 +791,10 @@ __global__ void compute_l2new_k(const real_t* ovov, const real_t* ovvv, const re
     for (int c = 0; c < NV; c++) v -= mvv1[c*NV + a] * ovov[IDX_OVOV(i,c,j,b)];
     for (int k = 0; k < NO; k++) v -= moo1[i*NO + k] * ovov[IDX_OVOV(k,a,j,b)];
     v += l1[IDX2(i,a)] * v4[IDX2(j,b)];
-    // PySCF: l2new += einsum('ic,jbca->jiba', l1, ovvv)  → at dest (j,i,b,a)... we are at (i,j,a,b).
+    // reference: l2new += einsum('ic,jbca->jiba', l1, ovvv)  → at dest (j,i,b,a)... we are at (i,j,a,b).
     // Reindex (i↔j, a↔b): contribution += sum_c l1[j,c]*ovvv[i,a,c,b]
     for (int c = 0; c < NV; c++) v += l1[IDX2(j,c)] * ovvv[IDX_OVVV(i,a,c,b)];
-    // PySCF: l2new -= einsum('ka,jbik->ijab', l1, ovoo) — at (i,j,a,b)
+    // reference: l2new -= einsum('ka,jbik->ijab', l1, ovoo) — at (i,j,a,b)
     for (int k = 0; k < NO; k++) v -= l1[IDX2(k,a)] * ovoo[IDX_OVOO(j,b,i,k)];
     // wovvo and woVVo terms
     real_t v_w = 0.0, v_wV = 0.0;
@@ -1219,7 +1219,7 @@ bool solve_ccsd_lambda_gpu(
         make_theta_k<<<p.first, p.second>>>(d_t2, d_theta, NO, NV);
     }
 
-    // Initial guess Λ = 0 (PySCF default)
+    // Initial guess Λ = 0 (default)
     cudaMemset(d_lambda1, 0, l1_sz * sizeof(real_t));
     cudaMemset(d_lambda2, 0, l2_sz * sizeof(real_t));
 

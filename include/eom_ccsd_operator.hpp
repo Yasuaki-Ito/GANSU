@@ -19,7 +19,7 @@
  * Implements σ = H_EOM-CCSD × R for RHF reference.
  * R = [R1(ov) | R2(oovv)], σ = [σ1(ov) | σ2(oovv)]
  *
- * σ2 follows PySCF's eeccsd_matvec_singlet algorithm:
+ * σ2 follows the EE-CCSD singlet matvec algorithm:
  *   1. Precompute dressed intermediates (Foo, Fvv, Woooo, WoVVo, WoVvO,
  *      woOoV, woVoO, wvOvV) from T1, T2, and ERI blocks
  *   2. Compute "half" σ2 using these intermediates

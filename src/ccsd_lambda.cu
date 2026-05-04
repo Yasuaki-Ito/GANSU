@@ -11,7 +11,7 @@
  * @file ccsd_lambda.cu
  * @brief CCSD Lambda equations solver and 1-RDM (non-relaxed correlation density).
  *
- * CPU reference implementation. Follows PySCF's rccsd_lambda.py and ccsd_rdm.py
+ * CPU reference implementation
  * (_gamma1_intermediates) for spin-traced closed-shell RHF.
  *
  * MO integral convention: chemist's notation (pq|rs), row-major [p,q,r,s].
@@ -106,7 +106,7 @@ std::vector<real_t> extract_oooo(const LambdaDims& d, const real_t* eri) {
     return out;
 }
 
-// ovoo[i,a,j,k] = (i, nocc+a | j, k)  — PySCF convention
+// ovoo[i,a,j,k] = (i, nocc+a | j, k)  — chemist convention
 std::vector<real_t> extract_ovoo(const LambdaDims& d, const real_t* eri) {
     std::vector<real_t> out((size_t)d.no * d.nv * d.no * d.no);
     for (int i = 0; i < d.no; i++)
@@ -170,7 +170,7 @@ void make_theta(const LambdaDims& d, const real_t* t2,
 }
 
 // ---------------------------------------------------------------------------
-//  Lambda equations — direct translation of PySCF rccsd_lambda.py
+//  Lambda equations — direct translation of the reference Lambda equations
 //  (make_intermediates + update_lambda) for canonical RHF:
 //    foo[i,j] = δ_ij ε_i,  fvv[a,b] = δ_ab ε_{nocc+a},  fov = fvo = 0.
 //  All MO ERI in chemist's notation.
@@ -194,7 +194,7 @@ void update_lambda_full(const LambdaDims& d,
     const size_t l1_sz = (size_t)no * nv;
     const size_t l2_sz = (size_t)no * no * nv * nv;
 
-    // ----- Index lambdas (PySCF chemist notation, row-major) -----
+    // ----- Index lambdas (chemist notation, row-major) -----
     auto T1 = [&](int i, int a) { return t1[i*nv + a]; };
     auto T2 = [&](int i, int j, int a, int b) { return t2[idx_t2(d,i,j,a,b)]; };
     auto L1 = [&](int i, int a) { return l1[i*nv + a]; };
@@ -224,7 +224,7 @@ void update_lambda_full(const LambdaDims& d,
     // ovov1[j,a,k,c] = 2*ovov[j,a,k,c] - ovov[j,c,k,a]
     auto OVOV1 = [&](int j, int a, int k, int c) {
         return 2.0 * OVOV(j,a,k,c) - OVOV(j,c,k,a); };
-    // ovoo1[k,b,i,j] = 2*ovoo[k,b,i,j] - ovoo[i,b,k,j]   (PySCF: ovoo*2 - ovoo.T(2,1,0,3))
+    // ovoo1[k,b,i,j] = 2*ovoo[k,b,i,j] - ovoo[i,b,k,j]   (reference: ovoo*2 - ovoo.T(2,1,0,3))
     auto OVOO1 = [&](int k, int b, int i, int j) {
         return 2.0 * OVOO(k,b,i,j) - OVOO(i,b,k,j); };
     // ovvv1[i,a,b,c] = 2*ovvv[i,a,b,c] - ovvv[i,c,b,a]
@@ -234,7 +234,7 @@ void update_lambda_full(const LambdaDims& d,
     // =================================================================
     //  make_intermediates
     // =================================================================
-    std::vector<real_t> v1((size_t)nv*nv, 0.0);   // [a,b] indexed v1[b,a] (PySCF) → store as v1[b*nv+a]? PySCF: einsum('jakc,jkbc->ba')
+    std::vector<real_t> v1((size_t)nv*nv, 0.0);   // [a,b] indexed v1[b,a] → store as v1[b*nv+a]? reference: einsum('jakc,jkbc->ba')
                                                   //  We'll store v1[b,a] = v1[(size_t)b*nv+a].
     std::vector<real_t> v2((size_t)no*no, 0.0);   // [i,j]
     std::vector<real_t> v4((size_t)no*nv, 0.0);   // [j,b]
@@ -243,7 +243,7 @@ void update_lambda_full(const LambdaDims& d,
 
     // v1[b,a] = fvv[b,a] - Σ_{j,k,c} ovov1[j,a,k,c]*tau[j,k,b,c]
     //   For canonical: fvv[b,a] = δ_ba * ε_{nocc+a}
-    //   Semi-canonical (PySCF): v1 -= Σ_j fov[j,a]*t1[j,b]
+    //   Semi-canonical: v1 -= Σ_j fov[j,a]*t1[j,b]
     for (int b = 0; b < nv; b++)
       for (int a = 0; a < nv; a++) {
         real_t v = (a == b ? eps[no + a] : 0.0);
@@ -259,7 +259,7 @@ void update_lambda_full(const LambdaDims& d,
       }
 
     // v2[i,j] = foo[i,j] + Σ_{b,k,c} ovov1[i,b,k,c]*tau[j,k,b,c] + Σ_{k,b} ovoo1[k,b,i,j]*t1[k,b]
-    //   Semi-canonical (PySCF): v2 += Σ_b fov[i,b]*t1[j,b]
+    //   Semi-canonical: v2 += Σ_b fov[i,b]*t1[j,b]
     for (int i = 0; i < no; i++)
       for (int j = 0; j < no; j++) {
         real_t v = (i == j ? eps[i] : 0.0);
@@ -312,7 +312,7 @@ void update_lambda_full(const LambdaDims& d,
         v5[(size_t)b*no + j] = v;
       }
 
-    // woooo[i,k,j,l]:  PySCF einsum order:
+    // woooo[i,k,j,l]:  einsum order:
     //   woooo  = einsum('icjl,kc->ikjl', ovoo, t1)   → woooo[i,k,j,l] += Σ_c ovoo[i,c,j,l]*t1[k,c]
     //   woooo += einsum('jcil,kc->iljk', ovoo, t1)   → woooo[i,l,j,k] += Σ_c ovoo[j,c,i,l]*t1[k,c]
     //   woooo += oooo                                → woooo[i,k,j,l] += oooo[i,k,j,l]
@@ -357,8 +357,8 @@ void update_lambda_full(const LambdaDims& d,
               }
             V4OVvo(j,b,c,k) = v;
           }
-    // v4oVVo[j,b,c,k] = Σ_{l,d} ovov[j,d,l,b]*t2[k,l,d,c] - oovv[j,c,b,k] (PySCF: oovv.T(0,3,2,1))
-    //   PySCF: v4oVVo -= eris.oovv.transpose(0,3,2,1) → v4oVVo[j,b,c,k] -= oovv[j,k,c,b]
+    // v4oVVo[j,b,c,k] = Σ_{l,d} ovov[j,d,l,b]*t2[k,l,d,c] - oovv[j,c,b,k] (reference: oovv.T(0,3,2,1))
+    //   reference: v4oVVo -= eris.oovv.transpose(0,3,2,1) → v4oVVo[j,b,c,k] -= oovv[j,k,c,b]
     //   (Since transpose order (0,3,2,1) maps oovv[a,b,c,d]→[a,d,c,b])
     for (int j = 0; j < no; j++)
       for (int b = 0; b < nv; b++)
@@ -433,7 +433,7 @@ void update_lambda_full(const LambdaDims& d,
     std::vector<real_t> woovo((size_t)no*no*nv*no, 0.0);
     auto WOOVO = [&](int i, int j, int c, int k) -> real_t& {
         return woovo[(((size_t)i * no + j) * nv + c) * no + k]; };
-    // From PySCF:
+    // From the reference:
     //   woovo  = einsum('ibck,jb->ijck', v4ovvo, t1)               # v4ovvo = 2*v4OVvo + v4oVVo
     //   woovo  = woovo - woovo.T(0,3,2,1)                          # woovo[i,j,c,k] -= woovo[i,k,c,j]
     //   woovo += einsum('ibck,jb->ikcj', v4OVvo - v4oVVo, t1)      # adds woovo[i,k,c,j] += sum_b (v4O-v4o)[i,b,c,k]*t1[j,b]
@@ -517,7 +517,7 @@ void update_lambda_full(const LambdaDims& d,
                 WOOVO(i,j,b,k) -= v;
               }
         // step 8: += einsum('idcb,jkdb->ijck', ovvv1, tau)
-        //   ovvv1[i,d,c,b] = 2*ovvv[i,d,c,b] - ovvv[i,b,c,d]   (PySCF reassigns ovvv→ovvv1 before this step)
+        //   ovvv1[i,d,c,b] = 2*ovvv[i,d,c,b] - ovvv[i,b,c,d]   (reference reassigns ovvv→ovvv1 before this step)
         for (int i = 0; i < no; i++)
           for (int j = 0; j < no; j++)
             for (int c = 0; c < nv; c++)
@@ -537,7 +537,7 @@ void update_lambda_full(const LambdaDims& d,
     auto WVVVO = [&](int b, int a, int c, int k) -> real_t& {
         return wvvvo[(((size_t)b * nv + a) * nv + c) * no + k]; };
     {
-        // PySCF:
+        // reference:
         //   wvvvo  = einsum('jack,jb->back', v4ovvo, t1)   → wvvvo[b,a,c,k] = sum_j v4[j,a,c,k]*t1[j,b]
         //   wvvvo  = wvvvo - wvvvo.T(2,1,0,3)              → wvvvo[b,a,c,k] -= wvvvo[c,a,b,k]
         //   wvvvo += einsum('jack,jb->cabk', v4OVvo - v4oVVo, t1)  → wvvvo[c,a,b,k] += sum_j (v4O-v4o)[j,a,c,k]*t1[j,b]
@@ -633,7 +633,7 @@ void update_lambda_full(const LambdaDims& d,
     }
 
     // Add ovvv1 contribution to v1: v1[b,a] += sum_j ovvv1[j,c,b,a]*t1[j,c]
-    // (PySCF: v1 += einsum('jcba,jc->ba', ovvv1, t1))
+    // (reference: v1 += einsum('jcba,jc->ba', ovvv1, t1))
     for (int b = 0; b < nv; b++)
       for (int a = 0; a < nv; a++) {
         real_t v = 0.0;
@@ -666,7 +666,7 @@ void update_lambda_full(const LambdaDims& d,
     // =================================================================
     //  update_lambda
     // =================================================================
-    // mvv[a,b] = Σ_{k,l,c} l2[k,l,c,b]*theta[k,l,c,a]   (PySCF einsum 'klca,klcb->ba')
+    // mvv[a,b] = Σ_{k,l,c} l2[k,l,c,b]*theta[k,l,c,a]   (einsum 'klca,klcb->ba')
     std::vector<real_t> mvv((size_t)nv*nv, 0.0);
     for (int a = 0; a < nv; a++)
       for (int b = 0; b < nv; b++) {
@@ -709,7 +709,7 @@ void update_lambda_full(const LambdaDims& d,
     //               + 0.5 * Σ_{k,l} ovov[k,a,l,b] * (Σ_{c,d} l2[i,j,c,d]*tau[k,l,c,d])
     std::vector<real_t> m3(l2_sz, 0.0);
     auto M3 = [&](int i, int j, int a, int b) -> real_t& { return m3[idx_t2(d,i,j,a,b)]; };
-    // first term: l2.vvvv  (note PySCF uses .conj() but real → no-op)
+    // first term: l2.vvvv  (note reference uses .conj() but real → no-op)
     for (int i = 0; i < no; i++)
       for (int j = 0; j < no; j++)
         for (int a = 0; a < nv; a++)
@@ -768,8 +768,8 @@ void update_lambda_full(const LambdaDims& d,
           for (int b = 0; b < nv; b++)
             L2N(i,j,a,b) = 0.5 * OVOV(i,a,j,b);
 
-    // l2new += einsum('ijac,cb->ijab', l2, v1)   v1 stored [b,a]; PySCF v1[c,b]; here v1[b,a] indexed v1[b*nv+a]
-    //   So 'cb' here means PySCF's v1[c,b] = our v1[(c,b)] = v1[c*nv + b].
+    // l2new += einsum('ijac,cb->ijab', l2, v1)   v1 stored [b,a]; reference v1[c,b]; here v1[b,a] indexed v1[b*nv+a]
+    //   So 'cb' here means v1[c,b] = our v1[(c,b)] = v1[c*nv + b].
     for (int i = 0; i < no; i++)
       for (int j = 0; j < no; j++)
         for (int a = 0; a < nv; a++)
@@ -1388,7 +1388,7 @@ bool solve_ccsd_lambda_cpu(
 // ---------------------------------------------------------------------------
 //  Public: build_ccsd_1rdm_mo_cpu
 //
-//  Following PySCF ccsd_rdm._gamma1_intermediates (spin-traced RHF 1-RDM).
+//  Following the spin-traced ccsd_rdm._gamma1_intermediates (spin-traced RHF 1-RDM).
 //
 //  doo[i,j] = -Σ_a t1[j,a]*l1[i,a] - Σ_kab θ[j,k,a,b]*l2[i,k,a,b]
 //  dvv[a,b] =  Σ_i t1[i,a]*l1[i,b] + Σ_ijc θ[j,i,c,a]*l2[j,i,c,b]
@@ -1542,7 +1542,7 @@ void transform_density_mo_to_ao_cpu(
 // ============================================================================
 //  CCSD 2-RDM (CPU, for DMET)
 //
-//  Following PySCF ccsd_rdm._make_rdm2 (spatial orbital, chemist notation).
+//  Following the spin-traced ccsd_rdm._make_rdm2 (spatial orbital, chemist notation).
 //  Γ[p,q,r,s] in chemist (pq|rs) ordering.
 //  Includes HF reference: Γ_HF[i,j,i,j] = 4, Γ_HF[i,j,j,i] = -2.
 //
@@ -1694,10 +1694,10 @@ void build_ccsd_2rdm_mo_cpu(
 }
 
 // ============================================================================
-//  CCSD 2-RDM in PySCF chemist convention (CPU).
+//  CCSD 2-RDM in chemist convention (CPU).
 //
-//  Direct port of pyscf.cc.ccsd_rdm._gamma2_outcore + _make_rdm2.
-//  Verified element-wise against PySCF on H2O/STO-3G (no=5,nv=2): max|diff| < 1e-16.
+//  Direct port of the reference 2-RDM._gamma2_outcore + _make_rdm2.
+//  Verified element-wise on H2O/STO-3G (no=5,nv=2): max|diff| < 1e-16.
 //
 //  Convention: E = einsum('pq,qp', h_core, dm1) + 0.5*einsum('pqrs,pqrs', eri, dm2) + E_nuc
 //  (final transpose(1,0,3,2) is applied; HF reference is included via with_dm1.)
@@ -1758,7 +1758,7 @@ void build_ccsd_2rdm_chemist_cpu(
           }
 
     // moo[j,l] = 2 * Σ_d pvOOv[d,l,j,d] + Σ_d pvoOV[d,l,j,d]
-    //   (PySCF: factor 2 only on the pvOOv contribution, ccsd_rdm.py L71+L80)
+    //   (factor 2 only on the pvOOv contribution; chemist convention)
     std::vector<real_t> moo(no*no, 0.0);
     for (int j = 0; j < no; j++)
       for (int l = 0; l < no; l++) {
@@ -1891,7 +1891,7 @@ void build_ccsd_2rdm_chemist_cpu(
           }
 
     // dovov[i,a,j,b] = goovv[i,j,a,b]*2 - goovv[j,i,a,b]  (transposed from goovv)
-    // Note: PySCF does goovv.transpose(0,2,1,3)*2 - goovv.transpose(1,2,0,3)
+    // Note: reference does goovv.transpose(0,2,1,3)*2 - goovv.transpose(1,2,0,3)
     std::vector<real_t> dovov((size_t)no*nv*no*nv, 0.0);
     for (int i = 0; i < no; i++)
       for (int a = 0; a < nv; a++)
@@ -1934,12 +1934,12 @@ void build_ccsd_2rdm_chemist_cpu(
             for (int i = 0; i < no; i++)
               for (int j = 0; j < no; j++)
                 v += L2(i,j,a,b)*TAU(i,j,c,d);
-            // dvvvv = gvvvv(a,c,b,d) - 0.5*gvvvv(b,c,a,d) (from PySCF symmetrization)
+            // dvvvv = gvvvv(a,c,b,d) - 0.5*gvvvv(b,c,a,d) (from reference symmetrization)
             // But for the non-compressed case, just store v and symmetrize later
             dvvvv[(((size_t)a*nv+b)*nv+c)*nv+d] = v;
           }
     // dvvvv[a,b,c,d] = gvvvv[a,c,b,d] - 0.5 * gvvvv[a,c,d,b]
-    //   PySCF: vvv = gvvvv[a].transpose(1,0,2);  dvvvv[a] = vvv - vvv.transpose(2,1,0)*0.5
+    //   reference: vvv = gvvvv[a].transpose(1,0,2);  dvvvv[a] = vvv - vvv.transpose(2,1,0)*0.5
     //   Derivation: vvv[c,b,d] = gvvvv[a,b,c,d];  vvv.T(2,1,0)[c,b,d] = gvvvv[a,b,d,c]
     //   so dvvvv[a, X=c, Y=b, Z=d] = gvvvv[a, Y=b, X=c, Z=d] - 0.5*gvvvv[a, Y=b, Z=d, X=c]
     //   relabel (X,Y,Z) → (b',c',d'):  dvvvv[a,b',c',d'] = gvvvv[a,c',b',d'] - 0.5*gvvvv[a,c',d',b']
@@ -1961,7 +1961,7 @@ void build_ccsd_2rdm_chemist_cpu(
     // gooov[j,k,i,a] = Σ_c t1[k,c]*pvOOv[c,i,j,a] - Σ_c t1[j,c]*pvoOV[c,i,k,a]
     //                - 0.5*moo[j,i]*t1[k,a] + 2*Σ_l t1[l,a]*goooo[j,k,i,l]
     //                - Σ_b l1[i,b]*tau[j,k,b,a] - Σ_b l2[j,k,b,a]*t1[i,b]
-    //   (PySCF einsum 'ib,jkba->jkia' contracts on b with tau[j,k,b,a])
+    //   (einsum 'ib,jkba->jkia' contracts on b with tau[j,k,b,a])
     for (int j = 0; j < no; j++)
       for (int k = 0; k < no; k++)
         for (int i = 0; i < no; i++)
@@ -1995,7 +1995,7 @@ void build_ccsd_2rdm_chemist_cpu(
     // gvovv[a,i,b,c] = -Σ_d gvvvv(unsym)[a,d,b,c]*t1[i,d]
     //                + Σ_k pvoOV[a,k,i,c]*t1[k,b] - Σ_k pvOOv[a,k,i,b]*t1[k,c]
     //                + Σ_j l1[j,a]*t2[j,i,b,c] + Σ_j l1[j,a]*t1[j,b]*t1[i,c]
-    //                + 0.5*mvv[?,a]*t1[i,c] (from PySCF mvv indexing)
+    //                + 0.5*mvv[?,a]*t1[i,c] (from reference mvv indexing)
     //                + Σ_j t1[j,a]*l2[j,i,b,c]
     // dovvv[i,b,a,c] = gvovv[a,i,b,c]*2 - gvovv[a,i,c,b]  (transposed)
     // For simplicity, compute dovvv directly
@@ -2029,9 +2029,9 @@ void build_ccsd_2rdm_chemist_cpu(
               v += L1(j,a)*T1(j,b)*T1(i,c);
               v += T1(j,a)*L2(j,i,b,c);
             }
-            v += 0.5*mvv[b*nv+a]*T1(i,c);  // PySCF: einsum('ba,ic->aibc', mvv*0.5, t1)
+            v += 0.5*mvv[b*nv+a]*T1(i,c);  // reference: einsum('ba,ic->aibc', mvv*0.5, t1)
             // dovvv[i,J,K,L] = 2*gvovv[K,i,L,J] - gvovv[K,i,J,L]
-            //   from PySCF: dovvv = gvovv.T(1,3,0,2)*2 - gvovv.T(1,2,0,3)
+            //   from the reference: dovvv = gvovv.T(1,3,0,2)*2 - gvovv.T(1,2,0,3)
             //   loop iter (i,a,b,c) writes gv to dovvv[i,c,a,b]*2 and dovvv[i,b,a,c]*(-1)
             real_t gv = v;
             dovvv[(((size_t)i*nv+c)*nv+a)*nv+b] += 2.0*gv;
@@ -2039,7 +2039,7 @@ void build_ccsd_2rdm_chemist_cpu(
           }
 
     // =========================================================
-    //  Assemble dm2 in PySCF internal convention
+    //  Assemble dm2 in reference internal convention
     // =========================================================
     std::memset(D2, 0, na2*na2*sizeof(real_t));
     auto DM2 = [&](int p, int q, int r, int s) -> real_t& {

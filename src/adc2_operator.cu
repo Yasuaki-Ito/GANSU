@@ -16,7 +16,7 @@
  * @file adc2_operator.cu
  * @brief GPU implementation of ADC(2) operator via ω-dependent Schur complement
  *
- * All formulas verified numerically against PySCF EE-ADC(2).
+ * All formulas verified numerically against the reference EE-ADC(2).
  *
  * M_eff(ω) = M11 + M12 · diag(1/(ω - D2)) · M21
  *

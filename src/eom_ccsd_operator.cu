@@ -18,7 +18,7 @@
  *
  * All coefficients use ÷2 convention (spin degeneracy factor divided out).
  *
- * σ1 (8 terms using dressed intermediates, matches PySCF eeccsd_matvec_singlet):
+ * σ1 (8 terms using dressed intermediates, matches the EE-CCSD singlet matvec kernel):
  *   T1-T2:  dressed Fock (Fvv, Foo) × r1
  *   T3-T4:  Fov × r2
  *   T5:     ovvv × θ_r2
@@ -398,11 +398,11 @@ __global__ void eom_ccsd_tau_half_kernel(
 }
 
 // ========================================================================
-//  Half σ2 kernel — PySCF eeccsd_matvec_singlet algorithm
+//  Half σ2 kernel — EE-CCSD singlet matvec kernel
 // ========================================================================
 
 /**
- * Computes "half" σ2 following PySCF's algorithm.
+ * Computes "half" σ2 following the EE-CCSD algorithm.
  * Final σ2 is obtained by symmetrizing: σ2[ijab] = half[ijab] + half[jiba].
  *
  * Uses 8 precomputed dressed intermediates (Foo, Fvv, Woooo, WoVVo, WoVvO,
@@ -1048,7 +1048,7 @@ void EOMCCSDOperator::build_dressed_intermediates() {
             for (int i = 0; i < NO; i++)
                 for (int e = 0; e < NV; e++) {
                     real_t val = H_OOOV(m,n,i,e); // bare: H_OOOV(m,n,i,e) = (mn|ie)
-                    // Hmm wait: PySCF's woOoV is ovoo.T(2,0,3,1). Let me re-derive.
+                    // Hmm wait: woOoV is ovoo.T(2,0,3,1). Let me re-derive.
                     // ovoo[i,a,j,k] shape (NO,NV,NO,NO).
                     // T(2,0,3,1): new[α,β,γ,δ] = old[γ,β,α,δ]... no.
                     // T(2,0,3,1) means: new axis order is (old_axis2, old_axis0, old_axis3, old_axis1)
@@ -1136,7 +1136,7 @@ void EOMCCSDOperator::build_dressed_intermediates() {
                 }
 
     // ================================================================
-    //  7. wvOvV [nvir × nocc × nvir × nvir]  (PySCF Wvovv)
+    //  7. wvOvV [nvir × nocc × nvir × nvir]  (Wvovv)
     // ================================================================
     // wvOvV[a,l,c,d] = -Σ_k t1[k,a]*ovov[k,c,l,d] + ovvv[l,d,a,c]
     size_t wvOvV_sz = (size_t)NV * NO * NV * NV;
@@ -1152,9 +1152,9 @@ void EOMCCSDOperator::build_dressed_intermediates() {
                 }
 
     // ================================================================
-    //  8. woVoO [nocc × nvir × nocc × nocc]  (PySCF Wovoo from rintermediates)
+    //  8. woVoO [nocc × nvir × nocc × nocc]  (Wovoo)
     // ================================================================
-    // This is the most complex intermediate. Following PySCF's rintermediates.py:
+    // This is the most complex intermediate. Following the spin-traced rintermediates:
     // Wkbij = W1ovov*t1 - Woooo_ri*t1 + W1ovvo*t1
     //       + ovoo/ovvv/Fov contractions with t2 + bare ERI
 
@@ -1291,7 +1291,7 @@ void EOMCCSDOperator::build_dressed_intermediates() {
 
     // ================================================================
     //  Keep full Foo, Fvv (do NOT subtract bare Fock diagonal).
-    //  PySCF subtracts it because eeccsd_matvec_singlet adds bare Fock
+    //  the reference subtracts it because the singlet matvec adds bare Fock
     //  via (ea+eb-ei-ej)*r2 explicitly. Our half+symmetrize kernel
     //  already includes Foo/Fvv contractions that supply the Fock
     //  contribution, so we keep the diagonal intact.
@@ -1363,7 +1363,7 @@ void EOMCCSDOperator::build_dressed_intermediates() {
 //  EOM-CCSD σ1 kernel — 8 terms using dressed intermediates
 // ========================================================================
 /**
- * Verified formula (matches PySCF eeccsd_matvec_singlet exactly):
+ * Verified formula (matches the EE-CCSD singlet matvec kernel exactly):
  *
  * σ1[ia]  = Σ_e Fvv[a,e] r1[i,e]                                   (T1)
  *         - Σ_m Foo[m,i] r1[m,a]                                   (T2)

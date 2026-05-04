@@ -85,7 +85,7 @@ void transform_density_mo_to_ao_cpu(
  * @brief Solve CCSD Lambda equations on GPU (cuBLAS + CUDA kernels).
  *
  * Same interface as the CPU version but takes device pointers. Implementation
- * mirrors solve_ccsd_lambda_cpu term-for-term but each PySCF einsum is a
+ * mirrors solve_ccsd_lambda_cpu term-for-term but each einsum is a
  * CUDA kernel parallelized over output indices, with cuBLAS DGEMM for the
  * vvvv contractions in m3.
  */
@@ -135,13 +135,13 @@ void build_ccsd_2rdm_mo_cpu(
  * For P=I, this exactly recovers the full CCSD correlation energy.
  */
 /**
- * @brief Build CCSD 2-RDM in PySCF chemist convention (CPU).
+ * @brief Build CCSD 2-RDM in chemist convention (CPU).
  *
  * Computes dm2[p,q,r,s] = <a†_p a†_r a_s a_q> with the final transpose(1,0,3,2)
  * applied so that:
  *     E_total = einsum('pq,qp', h_core, dm1) + 0.5 * einsum('pqrs,pqrs', eri, dm2)
  *             + E_nuc
- * Includes HF reference. Verified element-wise against pyscf.cc.ccsd_rdm.make_rdm2.
+ * Includes HF reference. Verified element-wise.
  *
  * @param dm1 [na × na] CCSD 1-RDM (with HF reference) — must come from
  *            build_ccsd_1rdm_mo_cpu before calling this.

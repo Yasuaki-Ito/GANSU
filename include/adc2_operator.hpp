@@ -25,7 +25,7 @@
  *   M21 = doubles-singles coupling
  *   D2  = orbital energy denominators (eps_a + eps_b - eps_i - eps_j), diagonal
  *
- * Key properties (verified against PySCF):
+ * Key properties (verified numerically):
  *   - M_eff(ω) IS symmetric for any ω — standard symmetric eigensolvers apply
  *   - The full ADC(2) matrix is non-symmetric (M12 ≠ M21^T)
  *   - Static Schur complement (ω=0) is approximate (~0.005-0.02 Ha error)
@@ -35,7 +35,7 @@
  *   1. Direct: build_M_eff_matrix(ω) + eigvalsh (for stored ERI / small molecules)
  *   2. Davidson: apply() uses ω-dependent operator (for future large-molecule support)
  *
- * Formulas verified numerically against PySCF EE-ADC(2).
+ * Formulas verified numerically against the reference EE-ADC(2).
  */
 
 #pragma once
