@@ -7332,23 +7332,12 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                                 false, true, false, 1.0);
         cudaMemcpy(Fki.data(), d_Fki, oo * sizeof(double), cudaMemcpyDeviceToHost);
 
-        // Semi-canonical f_ov contribution: Fki += 0.5 · Σ_c f_ov[k, c] · t1[i, c]
-        //   (= PySCF rccsd update_amps L126: Foo += 0.5 · einsum('me,ie->mi', fov, t1)).
-        //   Factor 0.5 is critical — combined with Fac's −0.5 t1·fov below, the T1
-        //   update gets total contribution −t1·fov·t1 (factor 1.0), matching PySCF.
-        //   With factor 1.0 here we'd double-count.
-        //   Fki is used in BOTH T1 update (via −Fki·t1) and indirectly via Lki in
-        //   T2 update; adding here ensures both paths see the semi-canonical
-        //   correction, equivalent to PySCF's shared Foo intermediate.
-        if (h_fov_active) {
-            for (int k = 0; k < nocc; k++)
-                for (int i = 0; i < nocc; i++) {
-                    real_t v = 0.0;
-                    for (int c = 0; c < nvir; c++)
-                        v += h_fov_active[(size_t)k*nvir + c] * t1[i*nvir + c];
-                    Fki[k*nocc + i] += 0.5 * v;
-                }
-        }
+        // Semi-canonical: Fki gets NO f_ov·t1 contribution.
+        //   PySCF rccsd cc_Foo (rintermediates.py line 30) is independent of fov.
+        //   The fov·t1 term lives in Lki (T2 path) only — added below at Lki
+        //   construction with factor 1.0, matching PySCF Loo (rintermediates.py L63).
+        //   T1 path gets fov via direct cubic (−2·fov·t1·t1, added in T1 update
+        //   loop) plus Fkc·(2t2 − t2.T + t1·t1) plus direct +fov Brillouin.
 
         // F^a_c = -sum_{kld} w_oovv[(kl),(cd)] * tau[T2(k,l,a,d)] — GPU kernel
         std::vector<real_t> Fac(nvir * nvir);
@@ -7373,48 +7362,51 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             cudaMemcpy(Fac.data(), d_Fac, vv * sizeof(double), cudaMemcpyDeviceToHost);
         }
 
-        // Semi-canonical f_ov contribution: Fac −= 0.5 · Σ_k t1[k, a] · f_ov[k, c]
-        //   (= PySCF rccsd update_amps L129: Fvv -= 0.5 · einsum('me,ma->ae', fov, t1)).
-        //   Factor 0.5 — see Fki note above.
-        if (h_fov_active) {
-            for (int a = 0; a < nvir; a++)
-                for (int c = 0; c < nvir; c++) {
-                    real_t v = 0.0;
-                    for (int k = 0; k < nocc; k++)
-                        v += t1[k*nvir + a] * h_fov_active[(size_t)k*nvir + c];
-                    Fac[a*nvir + c] -= 0.5 * v;
-                }
-        }
+        // Semi-canonical: Fac gets NO t1·f_ov contribution.
+        //   PySCF rccsd cc_Fvv (rintermediates.py line 41) is independent of fov.
+        //   The −t1·fov term lives in Lac (T2 path) only — added below at Lac
+        //   construction with factor 1.0, matching PySCF Lvv (rintermediates.py L72).
 
         // ---- L intermediates ----
         // L^k_i = F^k_i + sum_{lc} w(l,k,C,i) * t1(l,c)
         // w(l,k,C,i) = 2*v(l,k,C,i) - v(l,k,i,C) = 2*v_oovo[(l*nocc+k)*nvir*nocc + c*nocc+i] - v_ooov[(l*nocc+k)*ov + i*nvir+c]
-        // Note on semi-canonical: the f_ov·t1 contribution to F_oo intermediate is
-        // already added to Fki upstream (so it propagates to BOTH T1 and T2 via the
-        // shared Fki). The Lki computation below starts from Fki which already
-        // has the semi-canonical term — no extra addition needed here.
+        // Semi-canonical: Lki gets += f_ov[k,c] * t1[i,c] with factor 1.0
+        //   (PySCF Loo, rintermediates.py L66). Used in T2 update via −Lki·t2.
         std::vector<real_t> Lki(nocc * nocc, 0.0);
         for (int k = 0; k < nocc; k++)
             for (int i = 0; i < nocc; i++) {
-                real_t val = Fki[k*nocc+i];   // includes f_ov·t1 from upstream addition
+                real_t val = Fki[k*nocc+i];   // pure cc_Foo (no fov)
                 for (int l = 0; l < nocc; l++)
                     for (int c = 0; c < nvir; c++) {
                         real_t wval = 2.0 * v_oovo[((size_t)l*nocc+k)*(size_t)nvir*nocc + (size_t)c*nocc+i]
                                          - v_ooov[((size_t)l*nocc+k)*ov + (size_t)i*nvir+c];
                         val += wval * t1[l*nvir+c];
                     }
+                if (h_fov_active) {
+                    real_t fv = 0.0;
+                    for (int c = 0; c < nvir; c++)
+                        fv += h_fov_active[(size_t)k*nvir + c] * t1[i*nvir + c];
+                    val += fv;
+                }
                 Lki[k*nocc+i] = val;
             }
 
         // L^a_c = F^a_c + sum_{kd} w_ovvv[k,a,d,c] * t1(k,d)
-        // (semi-canonical t1·f_ov contribution to F_vv intermediate already in Fac)
+        // Semi-canonical: Lac gets −= t1[k,a] * f_ov[k,c] with factor 1.0
+        //   (PySCF Lvv, rintermediates.py L75). Used in T2 update via +Lac·t2.
         std::vector<real_t> Lac(nvir * nvir, 0.0);
         for (int a = 0; a < nvir; a++)
             for (int c = 0; c < nvir; c++) {
-                real_t val = Fac[a*nvir+c];   // includes -t1·f_ov from upstream addition
+                real_t val = Fac[a*nvir+c];   // pure cc_Fvv (no fov)
                 for (int k = 0; k < nocc; k++)
                     for (int d = 0; d < nvir; d++)
                         val += w_ovvv[(size_t)k*vvv + (size_t)a*vv + (size_t)d*nvir+c] * t1[k*nvir+d];
+                if (h_fov_active) {
+                    real_t fv = 0.0;
+                    for (int k = 0; k < nocc; k++)
+                        fv += t1[k*nvir + a] * h_fov_active[(size_t)k*nvir + c];
+                    val -= fv;
+                }
                 Lac[a*nvir+c] = val;
             }
 
@@ -7615,7 +7607,16 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 // Active when h_fov_active is supplied (e.g. semi-canonical
                 // DMET cluster orbitals). For canonical Fock (f_ov = 0), no-op.
                 if (h_fov_active) {
+                    // Direct fov term (PySCF rccsd L70: t1new += fov.conj()).
                     val += h_fov_active[(size_t)i * nvir + a];
+                    // Direct cubic (PySCF rccsd L64:
+                    //   t1new −= 2 · einsum('kc,ka,ic->ia', fov, t1, t1)).
+                    real_t cubic = 0.0;
+                    for (int k = 0; k < nocc; k++)
+                        for (int c = 0; c < nvir; c++)
+                            cubic += h_fov_active[(size_t)k*nvir + c]
+                                   * t1[k*nvir + a] * t1[i*nvir + c];
+                    val -= 2.0 * cubic;
                 }
                 newT1[i*nvir+a] = val / Dia[i*nvir+a];
             }
