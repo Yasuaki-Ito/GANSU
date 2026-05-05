@@ -112,6 +112,12 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     dmet_threshold_ = parameters.get<double>("dmet_threshold");
     dmet_mu_refine_ccsd_ = parameters.get<bool>("dmet_mu_refine_ccsd");
     dmet_n_tol_ = parameters.get<double>("dmet_n_tol");
+    opt_max_iter_ = parameters.get<int>("opt_max_iter");
+    opt_grad_threshold_ = parameters.get<double>("opt_grad_threshold");
+    opt_rms_grad_threshold_ = parameters.get<double>("opt_rms_grad_threshold");
+    opt_energy_threshold_ = parameters.get<double>("opt_energy_threshold");
+    opt_disp_threshold_ = parameters.get<double>("opt_disp_threshold");
+    opt_step_max_ = parameters.get<double>("opt_step_max");
 
     // Validate run_type
     if(run_type_ != "energy" && run_type_ != "gradient" && run_type_ != "optimize" && run_type_ != "hessian"){
@@ -191,6 +197,11 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     }else if(post_hf_method_str == "dmet_ccsd" || post_hf_method_str == "dmet-ccsd" || post_hf_method_str == "dmet"){
         std::cout << "Message: Post-HF method is DMET-CCSD." << std::endl;
         post_hf_method_ = PostHFMethod::DMET_CCSD;
+    }else if(post_hf_method_str == "dmet_ccsd_t" || post_hf_method_str == "dmet-ccsd_t"
+             || post_hf_method_str == "dmet_ccsd(t)" || post_hf_method_str == "dmet-ccsd(t)"
+             || post_hf_method_str == "dmet_ccsdt"){
+        std::cout << "Message: Post-HF method is DMET-CCSD(T)." << std::endl;
+        post_hf_method_ = PostHFMethod::DMET_CCSD_T;
     }else{
         throw std::runtime_error("Error: Unknown post-HF method: " + post_hf_method_str);
     }
@@ -561,12 +572,12 @@ real_t HF::solve(const real_t* density_matrix_alpha, const real_t* density_matri
 
         GlobalProfiler::setSilent(true); // Suppress profiler output during optimization
 
-        const int max_iter = 200;
-        const double grad_threshold = 3.0e-4;    // max gradient component (Hartree/Bohr)
-        const double rms_grad_threshold = 2.0e-4; // RMS gradient (Hartree/Bohr)
-        const double energy_threshold = 1.0e-6;   // energy change (Hartree)
-        const double disp_threshold = 3.0e-4;     // max displacement (Bohr)
-        const double step_max = 0.3;               // trust radius (Bohr)
+        const int max_iter = opt_max_iter_;
+        const double grad_threshold = opt_grad_threshold_;     // max gradient component (Hartree/Bohr)
+        const double rms_grad_threshold = opt_rms_grad_threshold_; // RMS gradient (Hartree/Bohr)
+        const double energy_threshold = opt_energy_threshold_; // energy change (Hartree)
+        const double disp_threshold = opt_disp_threshold_;     // max displacement (Bohr)
+        const double step_max = opt_step_max_;                  // trust radius (Bohr)
 
         // Initial SCF
         real_t energy = single_point_energy(density_matrix_alpha, density_matrix_beta, force_density);

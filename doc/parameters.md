@@ -19,7 +19,7 @@
 | convergence_energy_threshold | Energy convergence threshold | double | 1.0e-6 |
 | int1e_method | Method to use for one-electron integrals | string | hybrid |
 | eri_method | Method to use for two-electron repulsion integrals | string | stored |
-| post_hf_method | Post-Hartree-Fock method to use (FCI, MP2, SCS_MP2, SOS_MP2, LT_MP2, LT_SOS_MP2, MP3, MP4, CC2, CCSD, CCSD_T, CCSD_DENSITY, DMET_CCSD, CIS, ADC2, SOS_ADC2, ADC2X, EOM_MP2, EOM_CC2, EOM_CCSD) | string | none |
+| post_hf_method | Post-Hartree-Fock method to use (FCI, MP2, SCS_MP2, SOS_MP2, LT_MP2, LT_SOS_MP2, MP3, MP4, CC2, CCSD, CCSD_T, CCSD_DENSITY, DMET_CCSD, DMET_CCSD_T, CIS, ADC2, SOS_ADC2, ADC2X, EOM_MP2, EOM_CC2, EOM_CCSD) | string | none |
 | n_excited_states | Number of excited states to compute | int | 5 |
 | spin_type | Spin type for excited states (singlet, triplet) | string | singlet |
 | adc2_solver | Solver for ADC(2) (auto, schur_static, schur_omega, full) | string | auto |
@@ -44,6 +44,12 @@
 | dmet_threshold | SVD threshold for DMET bath orbital selection (σ < threshold excluded) | double | 1.0e-6 |
 | dmet_n_tol | DMET bisection tolerance on \|Σ N_frag − N_elec\| (Vayesta-compat: 4.2e-3 for benzene) | double | 1.0e-5 |
 | dmet_mu_refine_ccsd | DMET 2-stage μ optimization (Stage 1: HF density, Stage 2: CCSD-relaxed density) | bool | false |
+| opt_max_iter | Geometry optimization max iterations | int | 200 |
+| opt_grad_threshold | Convergence: max gradient component (Hartree/Bohr) | double | 3.0e-4 |
+| opt_rms_grad_threshold | Convergence: RMS gradient (Hartree/Bohr) | double | 2.0e-4 |
+| opt_energy_threshold | Convergence: energy change (Hartree) | double | 1.0e-6 |
+| opt_disp_threshold | Convergence: max displacement (Bohr) | double | 3.0e-4 |
+| opt_step_max | Trust-region radius (Bohr) | double | 0.3 |
 
 
 
@@ -524,6 +530,8 @@ At each optimization step, the translational and rotational components are proje
 
 DMET-CCSD partitions the molecule into atom-localized fragments, builds a Schmidt-decomposed embedding cluster (fragment AOs + bath orbitals) for each, and solves CCSD on each cluster independently. A global chemical potential μ is bisected to satisfy the embedded-fragment density-consistency condition Σ N_frag = N_elec. Equivalent fragments are detected via embedding-Hamiltonian eigenvalue matching and reused.
 
+For DMET-CCSD(T), pass `--post_hf_method dmet_ccsd_t` (or `dmet-ccsd_t`, `dmet_ccsdt`, `dmet_ccsd(t)`). The (T) perturbative-triples correction is computed per fragment at the converged μ_DMET using canonical denominators (small \|f_ov\| at the converged μ makes the canonical-(T) approximation acceptable), then summed across fragments with equivalent-fragment reuse.
+
 #### dmet_fragments - Fragment specification
 Empty string (default) triggers automatic detection: each heavy atom becomes a fragment, and each hydrogen joins its nearest heavy-atom fragment within 2.6 Bohr (≈ 1.38 Å). For example, benzene (C6H6) auto-detects 6 CH fragments.
 
@@ -549,6 +557,11 @@ Bisection of μ stops when |Σ_F N_frag(μ) − N_elec| < `dmet_n_tol`. Default 
 ./gansu -x ../xyz/Benzene.xyz -g sto-3g --eri_method ri \
     -ag ../auxiliary_basis/cc-pvdz-rifit.gbs \
     --post_hf_method dmet --num_gpus 4
+
+# DMET-CCSD(T) — adds perturbative triples per fragment at μ_DMET
+./gansu -x ../xyz/Benzene.xyz -g sto-3g --eri_method ri \
+    -ag ../auxiliary_basis/cc-pvdz-rifit.gbs \
+    --post_hf_method dmet_ccsd_t --num_gpus 4
 
 # Vayesta-compatible loose tolerance for benchmarking
 ./gansu -x ../xyz/Benzene.xyz -g sto-3g --eri_method ri \

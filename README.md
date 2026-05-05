@@ -36,7 +36,7 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
     * Møller-Plesset Perturbation Theory (RMP2, SCS-MP2, SOS-MP2, LT-MP2, LT-SOS-MP2, RMP3, RMP4, UMP2, UMP3)
     * Coupled Cluster (RCC2, RCCSD, RCCSD(T))
     * CCSD Lambda equations and 1-RDM (relaxed correlation density)
-    * Density Matrix Embedding Theory with CCSD solver (DMET-CCSD) — fragment-based correlation, semi-canonical CCSD with f_ov support, μ-bisection density consistency, multi-GPU fragment parallelism, automatic X-H bond fragment detection
+    * Density Matrix Embedding Theory with CCSD solver (DMET-CCSD, DMET-CCSD(T)) — fragment-based correlation, semi-canonical CCSD with f_ov support, μ-bisection density consistency, multi-GPU fragment parallelism, automatic X-H bond fragment detection, optional perturbative triples per fragment
     * Full Configuration Interaction (RFCI)
     * RI support for all post-HF methods (AO ERI reconstructed from B matrix, nao⁴ intermediate skipped via direct MO ERI construction)
     * Semi-Direct RI and Direct-RI MP2 (B matrix built on-the-fly, no persistent naux×nao² storage)
@@ -275,6 +275,9 @@ make
 
 # DMET-CCSD (auto fragment detection by X-H bonds; benzene → 6 CH fragments)
 ./gansu -x ../xyz/Benzene.xyz -g sto-3g --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method dmet --num_gpus 4
+
+# DMET-CCSD(T) (perturbative triples per fragment)
+./gansu -x ../xyz/Benzene.xyz -g sto-3g --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method dmet_ccsd_t --num_gpus 4
 
 # CPU-only mode
 ./gansu -x ../xyz/H2O.xyz -g sto-3g --cpu

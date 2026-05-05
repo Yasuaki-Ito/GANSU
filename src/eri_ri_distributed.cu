@@ -2401,7 +2401,12 @@ void ERI_RI_Distributed_RHF::free_replicated_B() {
 // applied inside DMET::compute_energy() when it detects this ERI subclass.
 real_t ERI_RI_Distributed_RHF::compute_dmet_ccsd() {
     DMET dmet(rhf_, *this);
-    return dmet.compute_energy();
+    return dmet.compute_energy(/*with_triples=*/false);
+}
+
+real_t ERI_RI_Distributed_RHF::compute_dmet_ccsd_t() {
+    DMET dmet(rhf_, *this);
+    return dmet.compute_energy(/*with_triples=*/true);
 }
 
 } // namespace gansu

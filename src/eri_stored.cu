@@ -8083,6 +8083,26 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             // Shared memory: r3buf (o3) + reduction buffer (blockSize)
             const int blockSize = 128;
             size_t smem_size = (o3 + blockSize) * sizeof(double);
+            // Default shared-memory cap is 48 KB on Ampere/Hopper. For larger
+            // o3 = nocc^3 we opt-in to dynamic shared memory up to the device max
+            // (228 KB on H200, 100 KB on A100). cudaFuncSetAttribute is required.
+            // If smem still exceeds the device's max, the launch will fail and
+            // we report rather than silently producing E_(T) = 0.
+            cudaDeviceProp prop;
+            cudaGetDeviceProperties(&prop, 0);
+            const size_t max_smem = prop.sharedMemPerBlockOptin > 0
+                ? prop.sharedMemPerBlockOptin
+                : prop.sharedMemPerBlock;
+            if (smem_size > 48u * 1024u) {
+                cudaFuncSetAttribute(ccsd_t_energy_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    (int)std::min(smem_size, max_smem));
+            }
+            if (smem_size > max_smem) {
+                std::cout << "  WARNING: (T) requires " << smem_size
+                          << " B shared memory but device max is " << max_smem
+                          << " B (nocc=" << nocc << "). E_(T) may be 0." << std::endl;
+            }
             ccsd_t_energy_kernel<<<num_triples, blockSize, smem_size>>>(
                 d_F_sum, (int)F_cols,
                 d_M_sum, (int)M_cols,
@@ -8091,6 +8111,11 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 d_abc, num_triples,
                 d_block_ET,
                 d_g_wt, d_g_zt);
+            cudaError_t kerr = cudaGetLastError();
+            if (kerr != cudaSuccess) {
+                std::cout << "  (T) kernel launch error: "
+                          << cudaGetErrorString(kerr) << std::endl;
+            }
             cudaDeviceSynchronize();
 
             // Download partial sums and accumulate

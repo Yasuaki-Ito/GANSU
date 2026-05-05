@@ -42,8 +42,10 @@ class DMET {
 public:
     DMET(RHF& rhf, const ERI& eri);
 
-    /// Run DMET-CCSD and return total correlation energy
-    real_t compute_energy();
+    /// Run DMET-CCSD and return total correlation energy.
+    /// @param with_triples When true, evaluate (T) perturbative correction per fragment
+    ///                     at the final μ_DMET and add it to the returned correlation energy.
+    real_t compute_energy(bool with_triples = false);
 
 private:
     RHF& rhf_;

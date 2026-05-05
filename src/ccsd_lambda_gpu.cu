@@ -215,9 +215,11 @@ __global__ void make_theta_k(const real_t* __restrict__ t2,
 //          + sum_{j,c} ovvv1[j,c,b,a]*t1[j,c]
 // where ovov1[j,a,k,c] = 2*ovov[j,a,k,c] - ovov[j,c,k,a]
 //       ovvv1[j,c,b,a] = 2*ovvv[j,c,b,a] - ovvv[j,a,b,c]
+// Semi-canonical: when fov ≠ nullptr, add - sum_j fov[j,a] * t1[j,b]
 __global__ void compute_v1_k(const real_t* __restrict__ ovov, const real_t* __restrict__ ovvv,
                              const real_t* __restrict__ t1,   const real_t* __restrict__ tau,
                              const real_t* __restrict__ eps,
+                             const real_t* __restrict__ fov,
                              real_t* __restrict__ v1, int NO, int NV)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -234,15 +236,21 @@ __global__ void compute_v1_k(const real_t* __restrict__ ovov, const real_t* __re
       for (int c = 0; c < NV; c++)
         v += (2.0*ovvv[IDX_OVVV(j,c,b,a)] - ovvv[IDX_OVVV(j,a,b,c)])
               * t1[IDX2(j,c)];
+    if (fov) {
+        for (int j = 0; j < NO; j++)
+            v -= fov[IDX2(j,a)] * t1[IDX2(j,b)];
+    }
     v1[idx] = v;
 }
 
 // v2[i,j] = (i==j ? eps[i] : 0) + sum_{b,k,c} ovov1[i,b,k,c]*tau[j,k,b,c]
 //                                + sum_{k,b} ovoo1[k,b,i,j]*t1[k,b]
 // ovoo1[k,b,i,j] = 2*ovoo[k,b,i,j] - ovoo[i,b,k,j]
+// Semi-canonical: when fov ≠ nullptr, add + sum_b fov[i,b] * t1[j,b]
 __global__ void compute_v2_k(const real_t* __restrict__ ovov, const real_t* __restrict__ ovoo,
                              const real_t* __restrict__ t1,   const real_t* __restrict__ tau,
                              const real_t* __restrict__ eps,
+                             const real_t* __restrict__ fov,
                              real_t* __restrict__ v2, int NO, int NV)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -259,18 +267,24 @@ __global__ void compute_v2_k(const real_t* __restrict__ ovov, const real_t* __re
       for (int b = 0; b < NV; b++)
         v += (2.0*ovoo[IDX_OVOO(k,b,i,j)] - ovoo[IDX_OVOO(i,b,k,j)])
               * t1[IDX2(k,b)];
+    if (fov) {
+        for (int b = 0; b < NV; b++)
+            v += fov[IDX2(i,b)] * t1[IDX2(j,b)];
+    }
     v2[idx] = v;
 }
 
 // v4[j,b] = sum_{k,c} ovov1[j,b,k,c]*t1[k,c]
+// Semi-canonical: when fov ≠ nullptr, add direct + fov[j,b]
 __global__ void compute_v4_k(const real_t* __restrict__ ovov, const real_t* __restrict__ t1,
+                             const real_t* __restrict__ fov,
                              real_t* __restrict__ v4, int NO, int NV)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= NO*NV) return;
     int j = idx / NV;
     int b = idx % NV;
-    real_t v = 0.0;
+    real_t v = (fov ? fov[IDX2(j,b)] : 0.0);
     for (int k = 0; k < NO; k++)
       for (int c = 0; c < NV; c++)
         v += (2.0*ovov[IDX_OVOV(j,b,k,c)] - ovov[IDX_OVOV(j,c,k,b)]) * t1[IDX2(k,c)];
@@ -280,16 +294,20 @@ __global__ void compute_v4_k(const real_t* __restrict__ ovov, const real_t* __re
 // v5[b,j] = sum_{k,c} v4[k,c]*t1[k,b]*t1[j,c]
 //        - sum_{l,c,k} ovoo1[l,c,k,j]*t2[k,l,b,c]
 //        + sum_{k,c,d} ovvv1[k,d,b,c]*t2[j,k,c,d]
+// Semi-canonical: when fov ≠ nullptr, add fvo[b,j] = fov[j,b]
+//                                       + 2*sum_{k,c} fov[k,c]*t2[j,k,b,c]
+//                                       - sum_{k,c} fov[k,c]*t2[j,k,c,b]
 __global__ void compute_v5_k(const real_t* __restrict__ ovoo, const real_t* __restrict__ ovvv,
                              const real_t* __restrict__ t1, const real_t* __restrict__ t2,
                              const real_t* __restrict__ v4,
+                             const real_t* __restrict__ fov,
                              real_t* __restrict__ v5, int NO, int NV)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= NV*NO) return;
     int b = idx / NO;
     int j = idx % NO;
-    real_t v = 0.0;
+    real_t v = (fov ? fov[IDX2(j,b)] : 0.0);  // fvo[b,j] = fov[j,b]^T
     for (int k = 0; k < NO; k++)
       for (int c = 0; c < NV; c++)
         v += v4[IDX2(k,c)] * t1[IDX2(k,b)] * t1[IDX2(j,c)];
@@ -301,6 +319,13 @@ __global__ void compute_v5_k(const real_t* __restrict__ ovoo, const real_t* __re
       for (int c = 0; c < NV; c++)
         for (int d = 0; d < NV; d++)
           v += (2.0*ovvv[IDX_OVVV(k,d,b,c)] - ovvv[IDX_OVVV(k,c,b,d)]) * t2[IDX4(j,k,c,d)];
+    if (fov) {
+        for (int k = 0; k < NO; k++)
+            for (int c = 0; c < NV; c++) {
+                v += 2.0 * fov[IDX2(k,c)] * t2[IDX4(j,k,b,c)];
+                v -=       fov[IDX2(k,c)] * t2[IDX4(j,k,c,b)];
+            }
+    }
     v5[idx] = v;
 }
 
@@ -862,6 +887,7 @@ __global__ void compute_l1new_k(
     const real_t* wovvo_unused, const real_t* woovo, const real_t* wvvvo, const real_t* w3,
     const real_t* m3, const real_t* t1,
     const real_t* tmp_jb,
+    const real_t* fov,                // Semi-canonical Brillouin term: l1new += fov
     real_t* l1new, int NO, int NV)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -923,6 +949,8 @@ __global__ void compute_l1new_k(
         v += 2.0 * l2[IDX4(i,j,a,b)] * w3[b*NO + j];
         v -=       l2[IDX4(i,j,b,a)] * w3[b*NO + j];
       }
+    // Semi-canonical Brillouin: l1new += fov (when fov ≠ nullptr)
+    if (fov) v += fov[idx];
     l1new[idx] = v;
 }
 
@@ -1137,7 +1165,8 @@ bool solve_ccsd_lambda_gpu(
     real_t* d_lambda2,
     int max_iter,
     real_t tol,
-    int verbose)
+    int verbose,
+    const real_t* d_fov_active)  // [NO × NV] semi-canonical f_ov, nullptr for canonical
 {
     const int NO = nocc, NV = nvir, NA = nocc + nvir;
     const size_t l1_sz = (size_t)NO * NV;
@@ -1225,11 +1254,11 @@ bool solve_ccsd_lambda_gpu(
 
     // Compute T-only intermediates (don't change between iterations)
     {
-        auto p = launch(NV*NV); compute_v1_k<<<p.first, p.second>>>(d_ovov, d_ovvv, d_t1, d_tau, d_eps, d_v1, NO, NV);
-        p = launch(NO*NO);      compute_v2_k<<<p.first, p.second>>>(d_ovov, d_ovoo, d_t1, d_tau, d_eps, d_v2, NO, NV);
-        p = launch(NO*NV);      compute_v4_k<<<p.first, p.second>>>(d_ovov, d_t1, d_v4, NO, NV);
+        auto p = launch(NV*NV); compute_v1_k<<<p.first, p.second>>>(d_ovov, d_ovvv, d_t1, d_tau, d_eps, d_fov_active, d_v1, NO, NV);
+        p = launch(NO*NO);      compute_v2_k<<<p.first, p.second>>>(d_ovov, d_ovoo, d_t1, d_tau, d_eps, d_fov_active, d_v2, NO, NV);
+        p = launch(NO*NV);      compute_v4_k<<<p.first, p.second>>>(d_ovov, d_t1, d_fov_active, d_v4, NO, NV);
         cudaDeviceSynchronize();
-        p = launch(NV*NO);      compute_v5_k<<<p.first, p.second>>>(d_ovoo, d_ovvv, d_t1, d_t2, d_v4, d_v5, NO, NV);
+        p = launch(NV*NO);      compute_v5_k<<<p.first, p.second>>>(d_ovoo, d_ovvv, d_t1, d_t2, d_v4, d_fov_active, d_v5, NO, NV);
         p = launch(oooo_sz);    compute_woooo_k<<<p.first, p.second>>>(d_oooo, d_ovoo, d_ovov, d_t1, d_tau, d_woooo, NO, NV);
         p = launch(ovvo_sz);    compute_v4OVvo_k<<<p.first, p.second>>>(d_ovov, d_t2, d_ovvo, d_v4o, NO, NV);
         p = launch(ovvo_sz);    compute_v4oVVo_k<<<p.first, p.second>>>(d_ovov, d_t2, d_oovv, d_v4v, NO, NV);
@@ -1263,6 +1292,9 @@ bool solve_ccsd_lambda_gpu(
     tracked_cudaMalloc(&d_resid_buf, sizeof(real_t));
 
     bool converged = false;
+    real_t prev_resid = 1e30;
+    // Semi-canonical (f_ov ≠ 0) Lambda is more sensitive — start with smaller damping.
+    real_t damp = (d_fov_active ? 0.2 : 0.5);
     for (int iter = 0; iter < max_iter; iter++) {
         // λ-dependent intermediates
         {
@@ -1319,6 +1351,7 @@ bool solve_ccsd_lambda_gpu(
                                                    d_mvv, d_mvv1, d_moo, d_moo1,
                                                    d_wovvo, d_woovo, d_wvvvo, d_w3,
                                                    d_m3, d_t1, d_tmp_jb,
+                                                   d_fov_active,
                                                    d_l1new, NO, NV);
         }
         // Apply denominators
@@ -1340,9 +1373,22 @@ bool solve_ccsd_lambda_gpu(
         cudaMemcpy(&resid, d_resid_buf, sizeof(real_t), cudaMemcpyDeviceToHost);
         resid = std::sqrt(resid);
 
-        // Update lambda
-        cudaMemcpy(d_lambda1, d_l1new, l1_sz * sizeof(real_t), cudaMemcpyDeviceToDevice);
-        cudaMemcpy(d_lambda2, d_m3,    l2_sz * sizeof(real_t), cudaMemcpyDeviceToDevice);
+        // Adaptive damping: shrink when residual increases, grow when decreasing.
+        // Critical for semi-canonical (f_ov ≠ 0) Lambda where naive iteration oscillates.
+        if (resid > prev_resid * 1.5 && iter < 30) {
+            damp = std::max(damp * 0.5, 0.05);
+        } else if (resid < prev_resid * 0.9 && iter > 5) {
+            damp = std::min(damp * 1.2, 1.0);
+        }
+        prev_resid = resid;
+
+        // Update lambda with damping: λ_new = damp·λ_iter + (1-damp)·λ_old
+        // Implemented via cuBLAS: (a) λ_old *= (1-damp); (b) λ_old += damp · λ_iter
+        const real_t scale_old = 1.0 - damp;
+        cublasDscal(gpu::GPUHandle::cublas(), (int)l1_sz, &scale_old, d_lambda1, 1);
+        cublasDscal(gpu::GPUHandle::cublas(), (int)l2_sz, &scale_old, d_lambda2, 1);
+        cublasDaxpy(gpu::GPUHandle::cublas(), (int)l1_sz, &damp, d_l1new, 1, d_lambda1, 1);
+        cublasDaxpy(gpu::GPUHandle::cublas(), (int)l2_sz, &damp, d_m3,    1, d_lambda2, 1);
 
         if (verbose > 0) {
             std::cout << "  Lambda iter " << std::setw(3) << (iter + 1)

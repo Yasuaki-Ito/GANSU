@@ -82,7 +82,13 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"dmet_fragments", ""},                            // string: fragment specification e.g. "{0,1,2} {3,4,5}"
         {"dmet_threshold", "1e-6"},                        // real_t: SVD threshold for bath orbital selection
         {"dmet_mu_refine_ccsd", "0"},                      // bool (0/1): refine μ with CCSD-relaxed density after HF stage
-        {"dmet_n_tol", "1e-5"}                             // real_t: bisection tol on |Σ N_frag − N_elec| (Vayesta-compat: 4.2e-3 for benzene)
+        {"dmet_n_tol", "1e-5"},                            // real_t: bisection tol on |Σ N_frag − N_elec| (Vayesta-compat: 4.2e-3 for benzene)
+        {"opt_max_iter", "200"},                           // int: maximum geometry optimization iterations
+        {"opt_grad_threshold", "3.0e-4"},                  // real_t: max gradient component (Hartree/Bohr)
+        {"opt_rms_grad_threshold", "2.0e-4"},              // real_t: RMS gradient (Hartree/Bohr)
+        {"opt_energy_threshold", "1.0e-6"},                // real_t: energy change threshold (Hartree)
+        {"opt_disp_threshold", "3.0e-4"},                  // real_t: max displacement (Bohr)
+        {"opt_step_max", "0.3"}                            // real_t: trust-region radius (Bohr)
     };
 
 

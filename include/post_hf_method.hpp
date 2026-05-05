@@ -38,7 +38,8 @@ enum class PostHFMethod {
     EOM_MP2,
     EOM_CC2,
     EOM_CCSD,
-    DMET_CCSD
+    DMET_CCSD,
+    DMET_CCSD_T
 };
 
 } // namespace gansu

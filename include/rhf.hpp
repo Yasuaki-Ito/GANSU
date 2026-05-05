@@ -899,6 +899,7 @@ public:
     void compute_eom_cc2(int n_states) override;
     void compute_eom_ccsd(int n_states) override;
     real_t compute_dmet_ccsd() override;
+    real_t compute_dmet_ccsd_t() override;
 
     /// Set CCSD algorithm: 0=spatial-optimized (default), 1=spatial-naive, 2=spin-orbital
     void set_ccsd_algorithm(int algo) { ccsd_algorithm_ = algo; }
@@ -974,6 +975,7 @@ private:
     void compute_eom_cc2(int n_states) override;
     void compute_eom_ccsd(int n_states) override;
     real_t compute_dmet_ccsd() override;
+    real_t compute_dmet_ccsd_t() override;
 
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
@@ -1124,6 +1126,7 @@ public:
 
     /// DMET-CCSD entry point that takes advantage of B replication for fragment-parallel multi-GPU.
     real_t compute_dmet_ccsd() override;
+    real_t compute_dmet_ccsd_t() override;
 
     /// Access distributed B data
     int num_gpus() const { return num_gpus_; }

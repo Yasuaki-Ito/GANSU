@@ -99,7 +99,8 @@ bool solve_ccsd_lambda_gpu(
     real_t* d_lambda2,          // [nocc^2 * nvir^2] — output
     int max_iter = 100,
     real_t tol = 1e-8,
-    int verbose = 1);
+    int verbose = 1,
+    const real_t* d_fov_active = nullptr);  // [nocc*nvir] semi-canonical f_ov, nullptr for canonical
 
 /**
  * @brief Build CCSD 1-RDM in MO basis on GPU.

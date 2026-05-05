@@ -16,6 +16,7 @@
 #include <iomanip>
 #include <sstream>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -713,12 +714,12 @@ FragmentResult DMET::solve_fragment_ccsd(
 //  DMET energy driver
 // ============================================================================
 
-real_t DMET::compute_energy() {
+real_t DMET::compute_energy(bool with_triples) {
     const int nao = num_basis_;
     const int nocc = num_occ_;
     const int N_elec = rhf_.get_num_electrons();
 
-    std::cout << "\n==== DMET-CCSD ====" << std::endl;
+    std::cout << "\n==== DMET-CCSD" << (with_triples ? "(T)" : "") << " ====" << std::endl;
     std::cout << "  nao=" << nao << " nocc=" << nocc << " N_elec=" << N_elec
               << " num_atoms=" << num_atoms_ << std::endl;
     std::cout << "  Number of fragments: " << fragments_.size() << std::endl;
@@ -1075,6 +1076,7 @@ real_t DMET::compute_energy() {
         real_t E1_aoproj;          // 1e contribution (diagnostic)
         real_t E2_aoproj;          // 2e contribution (diagnostic)
         real_t N_frag;
+        real_t E_T;                // (T) perturbative correction (0 if not computed)
     };
 
     // Evaluation modes for evaluate_at_mu:
@@ -1089,9 +1091,9 @@ real_t DMET::compute_energy() {
     // would never move N_frag. We always need CCSD-relaxed dm1.
     auto evaluate_at_mu = [&](real_t mu, bool verbose,
                               [[maybe_unused]] bool need_ccsd_density = false)
-        -> std::tuple<real_t, real_t, real_t> {
+        -> std::tuple<real_t, real_t, real_t, real_t> {
         const bool full_pipeline = verbose;
-        std::vector<FragResult> results(fragments_.size(), {0.0, 0.0, 0.0, 0.0, 0.0});
+        std::vector<FragResult> results(fragments_.size(), {0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
         // char (not bool) — std::vector<bool> bit-packs and is not thread-safe
         // for concurrent writes to different elements.
         std::vector<char> solved(fragments_.size(), 0);
@@ -1110,7 +1112,7 @@ real_t DMET::compute_energy() {
             // can skip CCSD entirely in both HF-only and CCSD-density modes.
             // Energies are computed only at the full_pipeline (verbose) call.
             if (!full_pipeline) {
-                results[f] = {0.0, 0.0, 0.0, 0.0, (real_t)N_elec};
+                results[f] = {0.0, 0.0, 0.0, 0.0, (real_t)N_elec, 0.0};
                 solved[f] = true;
                 gpu_used[f] = 0;
                 continue;
@@ -1120,17 +1122,20 @@ real_t DMET::compute_energy() {
             real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
             real_t* d_mo_eri;
             real_t E_corr;
+            real_t E_T_full = 0.0;
+            const bool compute_T_full = with_triples && full_pipeline;
             {
                 CoutSilencer silence(false);  // verbose=true here, never silence
                 d_mo_eri = eri_.build_mo_eri(d_C, nao);
                 E_corr = ccsd_spatial_orbital(
                     nullptr, d_C, rhf_.get_orbital_energies().device_ptr(),
-                    nao, nocc, false, nullptr, nullptr, nullptr, d_mo_eri, 0);
+                    nao, nocc, compute_T_full, &E_T_full,
+                    nullptr, nullptr, d_mo_eri, 0);
             }
             tracked_cudaFree(d_mo_eri);
             // Full-system fragment: AO projection is trivial (covers all AOs),
             // so both democratic forms collapse to the same full CCSD energy.
-            results[f] = {E_corr, E_corr, 0.0, E_corr, (real_t)N_elec};
+            results[f] = {E_corr, E_corr, 0.0, E_corr, (real_t)N_elec, E_T_full};
             solved[f] = true;
             gpu_used[f] = 0;  // full-system always runs on GPU 0
         }
@@ -1140,7 +1145,7 @@ real_t DMET::compute_energy() {
             auto& bd = baths[f];
             if (bd.is_full_system) continue;
             if (bd.n_emb_occ <= 0 || bd.n_emb_occ >= bd.n_emb) {
-                results[f] = {0.0, 0.0, 0.0, 0.0, 0.0};
+                results[f] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
                 solved[f] = true;
             }
         }
@@ -1158,6 +1163,11 @@ real_t DMET::compute_energy() {
         omp_set_num_threads(n_threads);
         Eigen::setNbThreads(1);
 
+        // Per-fragment progress: when full_pipeline (verbose μ) we print
+        // stderr heartbeat lines per fragment summarising CCSD/Lambda/(T) timing.
+        // Output goes through stderr so the inner CoutSilencer doesn't suppress
+        // it; the bisection-iteration print path stays clean on stdout.
+        const int total_unique = (int)unique_fragments.size();
         {
             CoutSilencer silence(true);
             #pragma omp parallel num_threads(n_threads)
@@ -1177,6 +1187,18 @@ real_t DMET::compute_energy() {
                     const int n_frag_emb = fragments_[f].n_frag;
                     const size_t t1sz = (size_t)no_act * nv;
                     const size_t t2sz = (size_t)no_act * no_act * nv * nv;
+
+                    // Per-fragment progress: emit a "starting" line so the user can
+                    // see the work assignment / GPU placement live (only at verbose
+                    // final eval; bisection iterations stay quiet to avoid spam).
+                    auto t_frag_start = std::chrono::steady_clock::now();
+                    if (full_pipeline) {
+                        std::fprintf(stderr,
+                            "[DMET frag %d/%d] starting (ne=%d, nocc=%d, nvir=%d) "
+                            "[GPU %d]\n",
+                            idx + 1, total_unique, ne, no_act, nv, my_tid);
+                        std::fflush(stderr);
+                    }
 
                     // -----------------------------------------------------------
                     //  Vayesta-convention cluster Hamiltonian.
@@ -1372,14 +1394,30 @@ real_t DMET::compute_energy() {
 
                     // CCSD with non-canonical (semi-canonical) f_ov.
                     // d_C_emb is unused when d_eri_mo_precomputed is supplied and
-                    // CCSD(T) is off; pass nullptr.
+                    // (T) is computed only at the verbose final eval (after μ converges)
+                    // and only when DMET-CCSD(T) is requested. Standard (T) uses canonical
+                    // denominators; at semi-canonical μ ≠ 0 with |f_ov| ≲ 10⁻³ this is
+                    // a good approximation (CCSD amplitudes already absorb the f_ov coupling).
+                    const bool compute_T_here = with_triples && full_pipeline;
                     real_t *d_t1 = nullptr, *d_t2 = nullptr;
+                    real_t E_T_frag = 0.0;
+                    auto t_ccsd_start = std::chrono::steady_clock::now();
                     real_t E_CCSD = ccsd_spatial_orbital(
                         nullptr, nullptr, d_eigvals,
-                        ne, no, false, nullptr, &d_t1, &d_t2,
+                        ne, no, compute_T_here, &E_T_frag, &d_t1, &d_t2,
                         d_eri_mo, bd.n_frozen,
                         fov_ptr);
                     (void)E_CCSD;
+                    const double t_ccsd_sec = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t_ccsd_start).count();
+                    if (full_pipeline) {
+                        std::fprintf(stderr,
+                            "[DMET frag %d/%d]   CCSD%s done (%.1fs) [GPU %d]\n",
+                            idx + 1, total_unique,
+                            compute_T_here ? "+(T)" : "",
+                            t_ccsd_sec, my_tid);
+                        std::fflush(stderr);
+                    }
 
                     // Download T-amplitudes (h_eri already on host).
                     std::vector<real_t> h_t1(t1sz), h_t2(t2sz);
@@ -1388,13 +1426,62 @@ real_t DMET::compute_energy() {
                     cudaMemcpy(h_t2.data(), d_t2, t2sz*sizeof(real_t),
                                cudaMemcpyDeviceToHost);
 
-                    // Lambda solver with the same f_ov for self-consistency.
-                    std::vector<real_t> h_l1(h_t1), h_l2(h_t2);
-                    bool lambda_ok = solve_ccsd_lambda_cpu(
-                        no, nv, h_eps.data(), h_eri.data(),
-                        h_t1.data(), h_t2.data(), h_l1.data(), h_l2.data(),
+                    // Lambda solver on GPU. f_ov is uploaded once if non-null.
+                    // GPU Lambda starts from Λ = 0 internally (cudaMemset). For
+                    // semi-canonical clusters with non-trivial f_ov this can
+                    // diverge despite damping; we fall back to the CPU DIIS solver
+                    // when GPU returns false (slower but robust).
+                    real_t *d_l1 = nullptr, *d_l2 = nullptr;
+                    real_t *d_fov_dev = nullptr;
+                    tracked_cudaMalloc(&d_l1, t1sz * sizeof(real_t));
+                    tracked_cudaMalloc(&d_l2, t2sz * sizeof(real_t));
+                    if (fov_ptr) {
+                        tracked_cudaMalloc(&d_fov_dev, t1sz * sizeof(real_t));
+                        cudaMemcpy(d_fov_dev, fov_ptr, t1sz * sizeof(real_t),
+                                   cudaMemcpyHostToDevice);
+                    }
+                    auto t_lambda_start = std::chrono::steady_clock::now();
+                    bool lambda_ok = solve_ccsd_lambda_gpu(
+                        no, nv, d_eigvals, d_eri_mo,
+                        d_t1, d_t2, d_l1, d_l2,
                         300, 1e-5, /*verbose=*/0,
-                        fov_ptr);
+                        d_fov_dev);
+
+                    // Download relaxed Λ for downstream CPU 2-RDM / energy.
+                    std::vector<real_t> h_l1(t1sz), h_l2(t2sz);
+                    bool lambda_used_cpu_fallback = false;
+                    if (lambda_ok) {
+                        cudaMemcpy(h_l1.data(), d_l1, t1sz*sizeof(real_t),
+                                   cudaMemcpyDeviceToHost);
+                        cudaMemcpy(h_l2.data(), d_l2, t2sz*sizeof(real_t),
+                                   cudaMemcpyDeviceToHost);
+                    } else {
+                        // GPU failed — try CPU DIIS solver as a robust fallback.
+                        // Initial guess Λ = T (close to converged for non-canonical CCSD).
+                        lambda_used_cpu_fallback = true;
+                        std::copy(h_t1.begin(), h_t1.end(), h_l1.begin());
+                        std::copy(h_t2.begin(), h_t2.end(), h_l2.begin());
+                        lambda_ok = solve_ccsd_lambda_cpu(
+                            no, nv, h_eps.data(), h_eri.data(),
+                            h_t1.data(), h_t2.data(), h_l1.data(), h_l2.data(),
+                            300, 1e-5, /*verbose=*/0,
+                            fov_ptr);
+                    }
+                    const double t_lambda_sec = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t_lambda_start).count();
+                    if (full_pipeline) {
+                        std::fprintf(stderr,
+                            "[DMET frag %d/%d]   Lambda %s done (%.1fs)%s [GPU %d]\n",
+                            idx + 1, total_unique,
+                            lambda_ok ? "OK" : "FAIL",
+                            t_lambda_sec,
+                            lambda_used_cpu_fallback ? " [CPU fallback]" : "",
+                            my_tid);
+                        std::fflush(stderr);
+                    }
+                    tracked_cudaFree(d_l1);
+                    tracked_cudaFree(d_l2);
+                    if (d_fov_dev) tracked_cudaFree(d_fov_dev);
 
                     // Democratic E_corr_frag (T-amplitude form). Picks up an extra
                     //   2 Σ_{i,i',a} P[i,i'] f_ov[i,a] t1[i',a]
@@ -1466,7 +1553,7 @@ real_t DMET::compute_energy() {
                         E_frag_aoproj = E_frag;
                     }
 
-                    results[f] = {E_frag, E_frag_aoproj, E1_ao, E2_ao, N_frag};
+                    results[f] = {E_frag, E_frag_aoproj, E1_ao, E2_ao, N_frag, E_T_frag};
                     lambda_ok_v[f] = lambda_ok;
                     gpu_used[f] = my_tid;
                     solved[f] = true;
@@ -1474,6 +1561,28 @@ real_t DMET::compute_energy() {
                     tracked_cudaFree(d_t1); tracked_cudaFree(d_t2);
                     tracked_cudaFree(d_eri_mo);
                     tracked_cudaFree(d_eigvals);
+
+                    // Per-fragment heartbeat: total wall time and the per-fragment
+                    // energy summary. Goes to stderr so it's visible even though the
+                    // outer CoutSilencer suppresses CCSD/Lambda iter prints on stdout.
+                    if (full_pipeline) {
+                        const double t_frag_sec = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t_frag_start).count();
+                        if (with_triples) {
+                            std::fprintf(stderr,
+                                "[DMET frag %d/%d] done (%.1fs)  E(T-amp)=%.6f"
+                                "  E(DMET)=%.6f  E(T)=%.6f [GPU %d]\n",
+                                idx + 1, total_unique, t_frag_sec,
+                                E_frag, E_frag_aoproj, E_T_frag, my_tid);
+                        } else {
+                            std::fprintf(stderr,
+                                "[DMET frag %d/%d] done (%.1fs)  E(T-amp)=%.6f"
+                                "  E(DMET)=%.6f [GPU %d]\n",
+                                idx + 1, total_unique, t_frag_sec,
+                                E_frag, E_frag_aoproj, my_tid);
+                        }
+                        std::fflush(stderr);
+                    }
                 }
             } // end omp parallel
         } // end CoutSilencer
@@ -1510,30 +1619,38 @@ real_t DMET::compute_energy() {
                                   << results[f].E_corr_frag_aoproj
                                   << " (E1=" << std::setprecision(6) << results[f].E1_aoproj
                                   << " E2=" << std::setprecision(6) << results[f].E2_aoproj
-                                  << ")"
-                                  << " N_frag=" << std::setprecision(4) << results[f].N_frag
+                                  << ")";
+                        if (with_triples) {
+                            std::cout << " E_(T)=" << std::setprecision(6)
+                                      << results[f].E_T;
+                        }
+                        std::cout << " N_frag=" << std::setprecision(4) << results[f].N_frag
                                   << (lambda_ok_v[f] ? " (Lambda OK)" : " (L=T)")
                                   << " [GPU " << gpu_used[f] << "]" << std::endl;
                     }
                 } else if (canon >= 0) {
                     std::cout << "  Fragment " << f << ": equivalent to " << canon
-                              << " (E_T=" << std::setprecision(10) << results[f].E_corr_frag
+                              << " (E_T-amp=" << std::setprecision(10) << results[f].E_corr_frag
                               << ", E_DMET=" << std::setprecision(10)
-                              << results[f].E_corr_frag_aoproj
-                              << ", N=" << std::setprecision(4) << results[f].N_frag
+                              << results[f].E_corr_frag_aoproj;
+                    if (with_triples) {
+                        std::cout << ", E_(T)=" << std::setprecision(6) << results[f].E_T;
+                    }
+                    std::cout << ", N=" << std::setprecision(4) << results[f].N_frag
                               << ") [from GPU " << gpu_used[canon] << "]" << std::endl;
                 }
             }
         }
 
         // ---- Aggregate ----
-        real_t N_total = 0.0, E_total = 0.0, E_total_aoproj = 0.0;
+        real_t N_total = 0.0, E_total = 0.0, E_total_aoproj = 0.0, E_T_total = 0.0;
         for (size_t f = 0; f < fragments_.size(); f++) {
             N_total += results[f].N_frag;
             E_total += results[f].E_corr_frag;
             E_total_aoproj += results[f].E_corr_frag_aoproj;
+            E_T_total += results[f].E_T;
         }
-        return {N_total, E_total, E_total_aoproj};
+        return {N_total, E_total, E_total_aoproj, E_T_total};
     };
 
     // ================================================================
@@ -1543,7 +1660,7 @@ real_t DMET::compute_energy() {
     std::cout << "\n---- μ optimization ----" << std::endl;
 
     // First evaluation at μ=0
-    auto [N0, E0, E0_aoproj] = evaluate_at_mu(0.0, true);
+    auto [N0, E0, E0_aoproj, E0_T] = evaluate_at_mu(0.0, true);
     real_t N_err = N0 - N_elec;
 
     std::cout << "  μ=0: Σ N_frag=" << std::setprecision(4) << N0
@@ -1552,6 +1669,7 @@ real_t DMET::compute_energy() {
     real_t mu_opt = 0.0;
     real_t E_corr_opt = E0;
     real_t E_corr_opt_aoproj = E0_aoproj;
+    real_t E_T_opt = E0_T;
     // Set when a Final-eval at μ ≠ 0 has been done; controls Summary label.
     bool refinement_applied = false;
 
@@ -1600,9 +1718,9 @@ real_t DMET::compute_energy() {
                       << std::defaultfloat << ")..." << std::endl;
             for (int iter = 0; iter < max_iter; iter++) {
                 real_t mu_mid = 0.5 * (mu_lo + mu_hi);
-                auto [N_mid, E_mid, E_mid_ao] = evaluate_at_mu(mu_mid, false);
+                auto [N_mid, E_mid, E_mid_ao, E_mid_T] = evaluate_at_mu(mu_mid, false);
                 real_t err_mid = N_mid - N_elec;
-                (void)E_mid; (void)E_mid_ao;  // bisection uses only N_mid
+                (void)E_mid; (void)E_mid_ao; (void)E_mid_T;  // bisection uses only N_mid
 
                 std::cout << "    iter " << std::setw(2) << iter + 1
                           << ": μ=" << std::setprecision(6) << mu_mid
@@ -1635,17 +1753,19 @@ real_t DMET::compute_energy() {
         if (std::abs(mu_opt) > 1e-12) {
             std::cout << "  Final evaluation at μ_DMET = "
                       << std::setprecision(6) << mu_opt << std::endl;
-            real_t N_final = 0.0, E_final = 0.0, E_final_ao = 0.0;
-            std::tie(N_final, E_final, E_final_ao) = evaluate_at_mu(mu_opt, true);
+            real_t N_final = 0.0, E_final = 0.0, E_final_ao = 0.0, E_final_T = 0.0;
+            std::tie(N_final, E_final, E_final_ao, E_final_T) = evaluate_at_mu(mu_opt, true);
             (void)N_final;
             E_corr_opt = E_final;
             E_corr_opt_aoproj = E_final_ao;
+            E_T_opt = E_final_T;
             refinement_applied = true;
         } else {
             // μ_opt = 0 — the initial verbose eval already produced the
-            // correct energies in (E0, E0_aoproj).
+            // correct energies in (E0, E0_aoproj, E0_T).
             E_corr_opt = E0;
             E_corr_opt_aoproj = E0_aoproj;
+            E_T_opt = E0_T;
         }
     } else {
         std::cout << "  μ=0 satisfies electron count (err=" << std::scientific << N_err
@@ -1656,7 +1776,8 @@ real_t DMET::compute_energy() {
     //  Summary
     // ================================================================
 
-    std::cout << "\n---- DMET-CCSD Summary ----" << std::endl;
+    const char* hdr = with_triples ? "DMET-CCSD(T)" : "DMET-CCSD";
+    std::cout << "\n---- " << hdr << " Summary ----" << std::endl;
     if (refinement_applied) {
         std::cout << "  Chemical potential μ_DMET (CCSD-relaxed): "
                   << std::setprecision(6) << mu_opt << " Ha" << std::endl;
@@ -1664,15 +1785,19 @@ real_t DMET::compute_energy() {
         std::cout << "  Chemical potential μ: "
                   << std::setprecision(6) << mu_opt << " Ha" << std::endl;
     }
-    std::cout << "  Total DMET-CCSD correlation energy (T-amp democratic): "
+    std::cout << "  Total " << hdr << " correlation energy (T-amp democratic): "
               << std::fixed << std::setprecision(10) << E_corr_opt << " Ha" << std::endl;
-    std::cout << "  Total DMET-CCSD correlation energy (DMET, Vayesta):     "
+    std::cout << "  Total " << hdr << " correlation energy (DMET, Vayesta):     "
               << std::setprecision(10) << E_corr_opt_aoproj << " Ha" << std::endl;
+    if (with_triples) {
+        std::cout << "  Total (T) perturbative correction (Σ per-fragment):     "
+                  << std::setprecision(10) << E_T_opt << " Ha" << std::endl;
+    }
     std::cout << "  HF energy: " << std::setprecision(10) << rhf_.get_total_energy() << " Ha" << std::endl;
-    std::cout << "  DMET-CCSD total energy (T-amp): "
-              << std::setprecision(10) << rhf_.get_total_energy() + E_corr_opt << " Ha" << std::endl;
-    std::cout << "  DMET-CCSD total energy (DMET):  "
-              << std::setprecision(10) << rhf_.get_total_energy() + E_corr_opt_aoproj << " Ha" << std::endl;
+    std::cout << "  " << hdr << " total energy (T-amp): "
+              << std::setprecision(10) << rhf_.get_total_energy() + E_corr_opt + E_T_opt << " Ha" << std::endl;
+    std::cout << "  " << hdr << " total energy (DMET):  "
+              << std::setprecision(10) << rhf_.get_total_energy() + E_corr_opt_aoproj + E_T_opt << " Ha" << std::endl;
     std::cout << std::defaultfloat;
 
     // Release replicated full-B copies (frees ~num_gpus × naux × nao² × 8 bytes)
@@ -1680,7 +1805,10 @@ real_t DMET::compute_energy() {
         eri_distributed->free_replicated_B();
     }
 
-    return E_corr_opt;
+    // Return correlation energy. For DMET-CCSD we use the T-amp democratic value
+    // (preserves existing behavior). For DMET-CCSD(T) we add the (T) contribution
+    // on top so that rhf_'s post_hf_energy_ contains the full CCSD+(T) correction.
+    return E_corr_opt + E_T_opt;
 }
 
 // ============================================================================
@@ -1689,12 +1817,22 @@ real_t DMET::compute_energy() {
 
 real_t ERI_Stored_RHF::compute_dmet_ccsd() {
     DMET dmet(rhf_, *this);
-    return dmet.compute_energy();
+    return dmet.compute_energy(/*with_triples=*/false);
+}
+
+real_t ERI_Stored_RHF::compute_dmet_ccsd_t() {
+    DMET dmet(rhf_, *this);
+    return dmet.compute_energy(/*with_triples=*/true);
 }
 
 real_t ERI_RI_RHF::compute_dmet_ccsd() {
     DMET dmet(rhf_, *this);
-    return dmet.compute_energy();
+    return dmet.compute_energy(/*with_triples=*/false);
+}
+
+real_t ERI_RI_RHF::compute_dmet_ccsd_t() {
+    DMET dmet(rhf_, *this);
+    return dmet.compute_energy(/*with_triples=*/true);
 }
 
 } // namespace gansu

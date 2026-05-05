@@ -183,6 +183,14 @@ public:
     }
 
     /**
+     * @brief Compute DMET-CCSD(T) energy (CCSD + perturbative triples per fragment)
+     * @return DMET-CCSD(T) correlation energy (CCSD + (T) summed)
+     */
+    virtual real_t compute_dmet_ccsd_t(){
+        THROW_EXCEPTION("DMET-CCSD(T) is not supported for the selected ERI method.");
+    }
+
+    /**
      * @brief Compute FCI energy
         * @return FCI energy
         * @details This function computes the FCI energy.
@@ -292,6 +300,7 @@ public:
             || method == PostHFMethod::EOM_CC2 // The stored ERI method supports EOM-CC2
             || method == PostHFMethod::EOM_CCSD // The stored ERI method supports EOM-CCSD
             || method == PostHFMethod::DMET_CCSD // DMET-CCSD
+            || method == PostHFMethod::DMET_CCSD_T // DMET-CCSD(T)
           ){
             return true;
         }
@@ -368,6 +377,7 @@ public:
          || method == PostHFMethod::EOM_CCSD
          || method == PostHFMethod::FCI
          || method == PostHFMethod::DMET_CCSD
+         || method == PostHFMethod::DMET_CCSD_T
           ){
             return true;
         }

@@ -241,6 +241,13 @@ public:
     /// DMET: bisection tolerance on |Σ N_frag − N_elec|. Default 1e-5 (tight, GANSU native).
     /// Vayesta-compat: 4.2e-3 for benzene/STO-3G (= 1e-4 × 42, matches Vayesta's max_elec_err).
     double get_dmet_n_tol() const { return dmet_n_tol_; }
+    /// Geometry optimization parameters (used in optimize_geometry path)
+    int get_opt_max_iter() const { return opt_max_iter_; }
+    double get_opt_grad_threshold() const { return opt_grad_threshold_; }
+    double get_opt_rms_grad_threshold() const { return opt_rms_grad_threshold_; }
+    double get_opt_energy_threshold() const { return opt_energy_threshold_; }
+    double get_opt_disp_threshold() const { return opt_disp_threshold_; }
+    double get_opt_step_max() const { return opt_step_max_; }
 
     /**
      * @brief Get Shell-pair type info
@@ -405,6 +412,12 @@ protected:
     double dmet_threshold_ = 1e-6;     ///< SVD threshold for DMET bath orbital selection
     bool dmet_mu_refine_ccsd_ = false;  ///< DMET: refine μ with CCSD-relaxed density
     double dmet_n_tol_ = 1e-5;  ///< DMET: bisection tolerance on |Σ N_frag − N_elec|
+    int opt_max_iter_ = 200;    ///< Geometry optimization max iterations
+    double opt_grad_threshold_ = 3.0e-4;
+    double opt_rms_grad_threshold_ = 2.0e-4;
+    double opt_energy_threshold_ = 1.0e-6;
+    double opt_disp_threshold_ = 3.0e-4;
+    double opt_step_max_ = 0.3;
     const int max_iter; ///< Maximum number of iterations
     int iter_; ///< Number of iterations
     real_t energy_difference_; ///< Energy difference between the current and the previous iteration

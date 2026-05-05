@@ -128,6 +128,7 @@ Basis sets are specified by name. GANSU automatically resolves the path.
 | `ccsd_t` | CCSD(T) |
 | `ccsd_density` | CCSD + Lambda + 1-RDM |
 | `dmet` | DMET-CCSD (fragment-based correlation, multi-GPU, auto X-H bond fragmentation) |
+| `dmet_ccsd_t` | DMET-CCSD(T) — same fragment construction plus perturbative triples per fragment |
 | `fci` | Full CI |
 | `cis` | CIS excited states |
 | `adc2` | ADC(2) excited states |
@@ -208,6 +209,11 @@ DMET-CCSD partitions the molecule into atom-localized fragments, builds an embed
 ./gansu -x ../xyz/Benzene.xyz -g sto-3g --eri_method ri \
     -ag ../auxiliary_basis/cc-pvdz-rifit.gbs \
     --post_hf_method dmet --num_gpus 4
+
+# DMET-CCSD(T) — perturbative triples added per fragment at converged μ_DMET
+./gansu -x ../xyz/Benzene.xyz -g sto-3g --eri_method ri \
+    -ag ../auxiliary_basis/cc-pvdz-rifit.gbs \
+    --post_hf_method dmet_ccsd_t --num_gpus 4
 
 # Manual fragment specification (atom indices, 0-indexed)
 ./gansu -x ../xyz/Benzene.xyz -g sto-3g --post_hf_method dmet \

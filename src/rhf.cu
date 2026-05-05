@@ -281,6 +281,8 @@ void RHF::post_process_after_scf() {
         eri_method_->compute_eom_ccsd(get_n_excited_states());
     }else if(post_hf_method == PostHFMethod::DMET_CCSD){
         post_hf_energy_ = eri_method_->compute_dmet_ccsd();
+    }else if(post_hf_method == PostHFMethod::DMET_CCSD_T){
+        post_hf_energy_ = eri_method_->compute_dmet_ccsd_t();
     }else{
         THROW_EXCEPTION("Invalid post-HF method.");
     }
@@ -1058,6 +1060,8 @@ void RHF::report() {
             std::cout << "EOM-CCSD" << std::endl;
         }else if(get_post_hf_method() == PostHFMethod::DMET_CCSD){
             std::cout << "DMET-CCSD" << std::endl;
+        }else if(get_post_hf_method() == PostHFMethod::DMET_CCSD_T){
+            std::cout << "DMET-CCSD(T)" << std::endl;
         }
 
         const auto& exc_energies = get_excitation_energies();
