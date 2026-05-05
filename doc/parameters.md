@@ -207,7 +207,7 @@ Method names are case-insensitive. Hyphen variants are accepted (`scs-mp2` ≡ `
 | --- | --- |
 | none | No post-HF method applied (HF only) |
 | FCI | Full Configuration Interaction. Exact within the basis. Cost grows factorially — only feasible for very small systems |
-| MP2 | Møller–Plesset perturbation theory of 2nd order. $E_{\mathrm{MP2}} = \sum_{ijab} \frac{\langle ij\|ab\rangle [2(ia\|jb) - (ib\|ja)]}{\varepsilon_i+\varepsilon_j-\varepsilon_a-\varepsilon_b}$. Splits into opposite-spin (OS) and same-spin (SS) components |
+| MP2 | Møller–Plesset perturbation theory of 2nd order. Spin-orbital form: $E_{\mathrm{MP2}} = \tfrac{1}{4}\sum_{ijab} \frac{\|\langle ij\|\|ab\rangle\|^2}{\varepsilon_i+\varepsilon_j-\varepsilon_a-\varepsilon_b}$ with antisymmetrized $\langle ij\|\|ab\rangle = (ia\|jb) - (ib\|ja)$. Closed-shell (RMP2) reduces to $\sum_{ijab}\frac{(ia\|jb)\,[2(ia\|jb)-(ib\|ja)]}{\varepsilon_i+\varepsilon_j-\varepsilon_a-\varepsilon_b}$. Splits into opposite-spin (OS) and same-spin (SS) components |
 | SCS_MP2 | Spin-Component-Scaled MP2 (Grimme 2003). $E = c_{\mathrm{OS}} E_{\mathrm{OS}} + c_{\mathrm{SS}} E_{\mathrm{SS}}$ with $c_{\mathrm{OS}} = 6/5$, $c_{\mathrm{SS}} = 1/3$. More accurate than MP2 at the same cost |
 | SOS_MP2 | Scaled Opposite-Spin MP2 (Jung & Head-Gordon 2004). Drops the same-spin term and rescales: $E = 1.3 \cdot E_{\mathrm{OS}}$. Same-spin omission removes the exchange integral path, enabling cheaper algorithms |
 | LT_MP2 | Laplace-Transform MP2. Replaces the orbital-energy denominator with $\frac{1}{x} \approx \sum_k w_k e^{-t_k x}$ (double-exponential quadrature). Decouples occupied/virtual indices, useful for RI-MP2 acceleration. Aliases: `lt-mp2`, `laplace_mp2` |
