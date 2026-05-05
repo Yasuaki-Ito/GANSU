@@ -19,7 +19,7 @@
 | convergence_energy_threshold | Energy convergence threshold | double | 1.0e-6 |
 | int1e_method | Method to use for one-electron integrals | string | hybrid |
 | eri_method | Method to use for two-electron repulsion integrals | string | stored |
-| post_hf_method | Post-Hartree-Fock method to use (FCI, MP2, SCS_MP2, SOS_MP2, LT_MP2, LT_SOS_MP2, MP3, MP4, CC2, CCSD, CCSD_T, CCSD_DENSITY, DMET_CCSD, DMET_CCSD_T, CIS, ADC2, SOS_ADC2, ADC2X, EOM_MP2, EOM_CC2, EOM_CCSD) | string | none |
+| post_hf_method | Post-Hartree-Fock method to use (FCI, MP2, SCS_MP2, SOS_MP2, LT_MP2, LT_SOS_MP2, MP3, MP4, CC2, CCSD, CCSD_T, CCSD_DENSITY, DMET_CCSD, DMET_CCSD_T, CIS, ADC2, SOS_ADC2, LT_SOS_ADC2, ADC2X, EOM_MP2, EOM_CC2, EOM_CCSD) | string | none |
 | n_excited_states | Number of excited states to compute | int | 5 |
 | spin_type | Spin type for excited states (singlet, triplet) | string | singlet |
 | adc2_solver | Solver for ADC(2) (auto, schur_static, schur_omega, full) | string | auto |
@@ -198,19 +198,43 @@ If any of the following conditions are met, an exception is thrown:
 
 #### post_hf_method - Post-Hartree-Fock method to use
 * default: none
-* none - No post-Hartree-Fock method is applied
-* FCI - Full Configuration Interaction method (FCI)
-* MP2 - Møller-Plesset perturbation theory of second order (MP2)
-* MP3 - Møller-Plesset perturbation theory of third order (MP3)
-* CC2 - Coupled Cluster with approximate doubles (CC2)
-* CCSD - Coupled Cluster with Single and Double excitations (CCSD)
-* CCSD_T - Coupled Cluster with Single, Double, and perturbative Triple excitations (CCSD(T))
-* CIS - Configuration Interaction Singles (excited states)
-* ADC2 - Algebraic Diagrammatic Construction of second order, ADC(2)-s (excited states)
-* ADC2X - Algebraic Diagrammatic Construction of second order, extended, ADC(2)-x (excited states)
-* EOM_MP2 - Equation-of-Motion MP2 (excited states)
-* EOM_CC2 - Equation-of-Motion CC2 (excited states)
-* EOM_CCSD - Equation-of-Motion CCSD (excited states)
+
+Method names are case-insensitive. Hyphen variants are accepted (`scs-mp2` ≡ `scs_mp2`, `adc2-x` ≡ `adc2x`, `dmet-ccsd(t)` ≡ `dmet_ccsd_t`, etc.).
+
+##### Ground-state correlation methods
+
+| Value | Description |
+| --- | --- |
+| none | No post-HF method applied (HF only) |
+| FCI | Full Configuration Interaction. Exact within the basis. Cost grows factorially — only feasible for very small systems |
+| MP2 | Møller–Plesset perturbation theory of 2nd order. $E_{\mathrm{MP2}} = \sum_{ijab} \frac{\langle ij\|ab\rangle [2(ia\|jb) - (ib\|ja)]}{\varepsilon_i+\varepsilon_j-\varepsilon_a-\varepsilon_b}$. Splits into opposite-spin (OS) and same-spin (SS) components |
+| SCS_MP2 | Spin-Component-Scaled MP2 (Grimme 2003). $E = c_{\mathrm{OS}} E_{\mathrm{OS}} + c_{\mathrm{SS}} E_{\mathrm{SS}}$ with $c_{\mathrm{OS}} = 6/5$, $c_{\mathrm{SS}} = 1/3$. More accurate than MP2 at the same cost |
+| SOS_MP2 | Scaled Opposite-Spin MP2 (Jung & Head-Gordon 2004). Drops the same-spin term and rescales: $E = 1.3 \cdot E_{\mathrm{OS}}$. Same-spin omission removes the exchange integral path, enabling cheaper algorithms |
+| LT_MP2 | Laplace-Transform MP2. Replaces the orbital-energy denominator with $\frac{1}{x} \approx \sum_k w_k e^{-t_k x}$ (double-exponential quadrature). Decouples occupied/virtual indices, useful for RI-MP2 acceleration. Aliases: `lt-mp2`, `laplace_mp2` |
+| LT_SOS_MP2 | Laplace transform applied to SOS-MP2. The combination of opposite-spin-only and Laplace decoupling gives $\mathcal{O}(N^4)$ scaling with RI. Aliases: `lt-sos-mp2`, `laplace_sos_mp2` |
+| MP3 | MP3. Adds 3rd-order doubles correction over MP2. $\mathcal{O}(N^6)$ |
+| MP4 | MP4 (full: SDQ + (T) contributions). $\mathcal{O}(N^7)$. Alias: `mp4` |
+| CC2 | Coupled-Cluster with approximate doubles. Doubles are kept at MP1 quality but coupled iteratively to singles. $\mathcal{O}(N^5)$ |
+| CCSD | Coupled-Cluster with Singles and Doubles. $\mathcal{O}(N^6)$. Iterative |
+| CCSD_T | CCSD(T) — CCSD plus perturbative triples evaluated once at the converged CCSD amplitudes. The "gold standard" for ground-state correlation. $\mathcal{O}(N^7)$ for the (T) step |
+| CCSD_DENSITY | CCSD + Λ-equation solve + 1-RDM construction. Used internally by DMET and for natural-orbital / property analysis. Same energy as CCSD; adds Λ + 1-RDM cost |
+| DMET_CCSD | Density Matrix Embedding Theory with CCSD as the impurity solver. Auto-fragmentation by X–H bonds (or `dmet_fragments` manual spec). See [DMET-CCSD parameters](#dmet-ccsd-parameters) |
+| DMET_CCSD_T | DMET-CCSD plus per-fragment perturbative triples evaluated at the converged $\mu_{\mathrm{DMET}}$. Aliases: `dmet-ccsd_t`, `dmet_ccsd(t)`, `dmet-ccsd(t)`, `dmet_ccsdt` |
+
+##### Excited-state methods
+
+| Value | Description |
+| --- | --- |
+| CIS | Configuration Interaction Singles. Diagonalizes $\langle\Phi_i^a\|H-E_0\|\Phi_j^b\rangle$. Lowest-cost excited-state method ($\mathcal{O}(N^4)$); generally over-estimates excitation energies by ~1 eV |
+| ADC2 | Algebraic Diagrammatic Construction of 2nd order, strict variant ADC(2)-s. M22 (doubles–doubles block) is purely diagonal: $D_2 = \varepsilon_a + \varepsilon_b - \varepsilon_i - \varepsilon_j$ |
+| SOS_ADC2 | Scaled-Opposite-Spin ADC(2). Same-spin doubles dropped, OS scaled. Aliases: `sos-adc2`, `sos_adc(2)` |
+| LT_SOS_ADC2 | SOS-ADC(2) with Laplace-transformed denominators — $\mathcal{O}(N^4)$ with RI + Laplace quadrature. Aliases: `lt-sos-adc2`, `lt_sos_adc(2)` |
+| ADC2X | ADC(2) extended (`adc(2)-x`). M22 includes first-order off-diagonal terms (oooo, vvvv, voov), giving lower (more accurate) excitation energies than ADC(2)-s. Always uses the full Davidson solver. Aliases: `adc2-x`, `adc(2)-x` |
+| EOM_MP2 | Equation-of-Motion MP2 (≈ ADC(2) but Stanton–Bartlett style). M22 has off-diagonal couplings via T2 |
+| EOM_CC2 | Equation-of-Motion CC2. Doubles kept at CC2 quality. M22 is exactly diagonal — Schur complement is exact (no approximation in `schur_omega`) |
+| EOM_CCSD | Equation-of-Motion CCSD. Most accurate single-reference excited-state method available here |
+
+For excited-state methods, see the [Excited state parameters](#excited-state-parameters) section for `n_excited_states`, `spin_type`, and per-method solver (`adc2_solver`, `eom_mp2_solver`, `eom_cc2_solver`).
 
 #### schwarz_screening_threshold - schwarz screening threshold
 * default:  1.0e-12
@@ -398,8 +422,9 @@ ADC(2)-x includes explicit electron correlation in the doubles space, generally 
 
 * default: energy
 * energy - Single-point energy calculation only
-* gradient - Single-point energy calculation followed by energy gradient evaluation
-* optimize - Geometry optimization using analytical energy gradients
+* gradient - Single-point energy calculation followed by analytical energy gradient evaluation
+* optimize - Geometry optimization using analytical energy gradients (BFGS by default)
+* hessian - Single-point energy followed by analytical Hessian and harmonic vibrational frequencies (mass-weighted normal modes, IR intensities). Translational/rotational modes are projected out
 
 ```bash
 # Single-point energy (default)
@@ -410,6 +435,9 @@ ADC(2)-x includes explicit electron correlation in the doubles space, generally 
 
 # Geometry optimization
 ./gansu -x ../xyz/H2O.xyz -g sto-3g -r optimize
+
+# Analytical Hessian + vibrational frequencies
+./gansu -x ../xyz/H2O.xyz -g sto-3g -r hessian
 ```
 
 #### optimizer - Optimization algorithm for geometry optimization
@@ -571,3 +599,74 @@ Bisection of μ stops when |Σ_F N_frag(μ) − N_elec| < `dmet_n_tol`. Default 
 # Verbose per-fragment diagnostics (for debugging)
 GANSU_DMET_VERBOSE=1 ./gansu ... --post_hf_method dmet
 ```
+
+
+## Hardware / backend parameters
+
+| Parameter | Description | Type | Default |
+| --- | --- | --- | --- |
+| num_gpus | Number of GPUs for multi-GPU RI-HF | int | -1 |
+| --cpu | Run entirely on CPU (no GPU required) | flag | off |
+| --list-basis | List available built-in basis sets and exit | flag | — |
+
+#### num_gpus - Number of GPUs for multi-GPU RI-HF
+
+* default: -1 (auto-detect all visible GPUs)
+* Multi-GPU parallelism is currently implemented for **RI-HF** (`eri_method = RI`) and **DMET fragment-parallel** execution. Other ERI methods (`stored`, `Direct`) run on a single GPU regardless of this setting
+* Set to a positive integer to cap the number of GPUs used (e.g. `--num_gpus 2` on a 4-GPU node)
+* For DMET, fragments are distributed across GPUs in Replicated mode (each GPU holds the full RI tensor) when memory permits; otherwise Distributed mode is used (RI tensor sharded by aux index, NCCL AllReduce for Fock build)
+
+```bash
+# Single-GPU RI-HF
+./gansu -x ../xyz/large_molecular/fullerene.xyz -g sto-3g \
+    --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs
+
+# 4-GPU RI-HF
+./gansu -x ../xyz/large_molecular/fullerene.xyz -g sto-3g \
+    --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --num_gpus 4
+
+# Multi-GPU DMET-CCSD(T) on water hexamer
+./gansu -x ../xyz/H2O_hexamer_prism_opt.xyz -g sto-3g \
+    --eri_method ri -ag ../auxiliary_basis/def2-svp-rifit.gbs \
+    --post_hf_method dmet_ccsd_t --num_gpus 4
+```
+
+#### --cpu - CPU-only execution
+
+* default: off (GPU is used)
+* When the `--cpu` flag is passed, GANSU runs entirely on CPU using OpenMP-parallelized integral and tensor kernels. No NVIDIA GPU is required
+* Supported: HF (RHF/UHF/ROHF), gradients, Hessians, all post-HF methods (MP2/3/4, CCSD, CCSD(T), CIS, ADC(2), EOM-CCSD, FCI), DMET-CCSD
+* Performance is substantially lower than the GPU path; use for development, debugging, or environments without CUDA
+
+```bash
+./gansu -x ../xyz/H2O.xyz -g sto-3g --cpu
+./gansu -x ../xyz/H2O.xyz -g sto-3g -r hessian --cpu
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --post_hf_method ccsd --cpu
+```
+
+#### --list-basis - List available basis sets
+
+* Prints the names of all built-in basis sets shipped under `basis/` and exits without running a calculation
+* Useful for discovering the exact basis name to pass to `-g`
+
+```bash
+./gansu --list-basis
+```
+
+
+## ECP parameters
+
+| Parameter | Description | Type | Default |
+| --- | --- | --- | --- |
+| ecp_filename | Path to ECP (Effective Core Potential) file | string | (none) |
+
+#### ecp_filename - Effective Core Potential file
+
+* default: (empty — all-electron calculation)
+* When set, the specified ECP replaces the core electrons of the listed elements with a parameterized potential. Useful for heavy elements where relativistic / large-core effects matter
+* File format follows the Gaussian-style ECP block convention (matches the entries on Basis Set Exchange)
+
+```bash
+./gansu -x ../xyz/heavy_atom.xyz -g cc-pvdz --ecp_filename ../basis/cc-pvdz-pp.ecp
+```
+
