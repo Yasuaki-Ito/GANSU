@@ -882,6 +882,9 @@ public:
     ~ERI_Stored_RHF() = default; ///< destructor
 
     real_t compute_mp2_energy() override;
+    real_t compute_thc_mp2_energy() override;
+    real_t compute_thc_sos_mp2_energy() override;
+    void   compute_thc_sos_adc2(int n_states) override;
     real_t compute_scs_mp2_energy() override;
     real_t compute_sos_mp2_energy() override;
     void compute_mp2_effective_densities(real_t* d_P_eff, real_t* d_W_eff, real_t* d_Gamma_eff, real_t* d_P_2el) override;
@@ -976,6 +979,8 @@ private:
     void compute_eom_ccsd(int n_states) override;
     real_t compute_dmet_ccsd() override;
     real_t compute_dmet_ccsd_t() override;
+
+    void compute_thc_sos_adc2(int n_states) override;  // Phase 2.3: RI-Z path
 
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();

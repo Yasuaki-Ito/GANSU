@@ -33,6 +33,10 @@ set(GPU_TEST_SOURCES
     test_davidson_solver.cu
     test_validation.cu
     test_rys_quadrature.cu
+    test_thc_grid.cu
+    test_thc_collocation.cu
+    test_thc_decomposition.cu
+    test_thc_mp2.cu
 )
 
 # CPU backend test source files (separate executable to avoid GPU state pollution)

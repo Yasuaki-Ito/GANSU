@@ -18,6 +18,7 @@
 #include <string>   // std::string
 #include <fstream>
 #include <iomanip>
+#include <chrono>
 
 //#include <omp.h>
 
@@ -32,6 +33,12 @@
 #include "davidson_solver.hpp"
 #include "oscillator_strength.hpp"
 #include "profiler.hpp"
+#include "thc_grid.hpp"
+#include "thc_collocation.hpp"
+#include "thc_decomposition.hpp"
+#include "thc_mp2.hpp"   // for transform_X_to_mo_gpu
+#include "thc_sos_adc2_operator.hpp"
+#include "multi_gpu_manager.hpp"
 
 namespace gansu{
 
@@ -1694,6 +1701,306 @@ void ERI_RI_RHF::compute_sos_laplace_adc2(int n_states) {
     tracked_cudaFree(d_B_ab);
     tracked_cudaFree(d_B_ij);
     tracked_cudaFree(d_B_ia);
+}
+
+// ============================================================
+//  THC-SOS-ADC(2) excited states (Phase 2.3: RI-Z path)
+//
+//  Same Davidson + ω-iteration driver as ERI_Stored_RHF::compute_thc_sos_adc2,
+//  but the LS-THC core matrix Z is built from RI's 3-index AO tensor instead
+//  of the analytic 4-index ERI:
+//
+//     Z = M^+ V (M^+)^T = (M^+ B) (M^+ B)^T,
+//
+//  with B = intermediate_matrix_B_ ((N_bas² × naux) col-major lda=N_bas²).
+//  Avoids materialising the O(N_bas^4) ERI tensor; cost is O(N_bas² × N_g × naux).
+// ============================================================
+void ERI_RI_RHF::compute_thc_sos_adc2(int n_states) {
+#ifdef GANSU_CPU_ONLY
+    THROW_EXCEPTION("THC-SOS-ADC(2) requires GPU build.");
+#else
+    const int N_bas = rhf_.get_num_basis();
+    const int n_occ = rhf_.get_num_electrons() / 2;
+    const int n_vir = N_bas - n_occ;
+    const int N_orb = N_bas;
+    const int singles_dim = n_occ * n_vir;
+    const int naux = num_auxiliary_basis_;
+
+    if (rhf_.get_num_frozen_core() != 0) {
+        THROW_EXCEPTION("THC-SOS-ADC(2): frozen core not yet supported.");
+    }
+
+    const bool enable_b3a3_log = rhf_.get_thc_b3a3();
+    std::cout << "\n---- THC-SOS-ADC(2) ("
+              << (enable_b3a3_log ? "Coulomb + B3 + A3" : "Coulomb-only")
+              << ", RI-Z) ----" << std::endl;
+    std::cout << "  nocc=" << n_occ << ", nvir=" << n_vir
+              << ", singles=" << singles_dim
+              << ", naux=" << naux
+              << ", nstates=" << n_states << std::endl;
+
+    // ---- Phase 2.0a infrastructure (grid + X) ----
+    auto& atoms_dh = const_cast<DeviceHostMemory<Atom>&>(rhf_.get_atoms());
+    atoms_dh.toHost();
+    std::vector<Atom> atoms_h(atoms_dh.host_ptr(),
+                               atoms_dh.host_ptr() + atoms_dh.size());
+
+    auto& prims_dh = const_cast<DeviceHostMemory<PrimitiveShell>&>(rhf_.get_primitive_shells());
+    prims_dh.toHost();
+    std::vector<PrimitiveShell> prims_h(prims_dh.host_ptr(),
+                                         prims_dh.host_ptr() + prims_dh.size());
+
+    auto& norms_dh = const_cast<DeviceHostMemory<real_t>&>(rhf_.get_cgto_normalization_factors());
+    norms_dh.toHost();
+    std::vector<real_t> norms_h(norms_dh.host_ptr(),
+                                 norms_dh.host_ptr() + norms_dh.size());
+
+    ThcGridOptions opts;
+    {
+        const int lev = rhf_.get_thc_lebedev_order();
+        switch (lev) {
+            case 110: opts.lebedev = LebedevOrder::L110; break;
+            case 194: opts.lebedev = LebedevOrder::L194; break;
+            case 302: opts.lebedev = LebedevOrder::L302; break;
+            default: THROW_EXCEPTION("thc_lebedev_order must be 110, 194, or 302");
+        }
+    }
+    opts.n_radial = rhf_.get_thc_n_radial();
+    opts.weight_eps = 0.0;
+    MolecularGrid grid = build_molecular_grid(atoms_h, opts);
+    grid.host_to_device();
+
+    const auto t_fit_start = std::chrono::steady_clock::now();
+    auto report_elapsed = [&](const char* label) {
+        const double s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_fit_start).count();
+        std::cout << "  [THC t=" << std::fixed << std::setprecision(1) << s
+                  << "s] " << label << std::endl;
+    };
+    std::cout << "  [THC] Grid: " << grid.num_points
+              << " points (" << atoms_h.size() << " atoms × n_radial="
+              << opts.n_radial << " × Lebedev=" << static_cast<int>(opts.lebedev)
+              << ")" << std::endl;
+    auto X_full_dh = compute_X_ao_gpu(N_bas, prims_h, norms_h, grid);
+    report_elapsed("AO collocation X built (GPU 0)");
+
+    // Optional Phase 2.3 (B) density-based pruning.
+    int N_g_eff = static_cast<int>(grid.num_points);
+    auto* X_for_thc = X_full_dh.get();
+    std::unique_ptr<DeviceHostMatrix<real_t>> X_pruned_dh;
+    const double rho_thr = rhf_.get_thc_density_threshold();
+    if (rho_thr > 0.0) {
+        const auto& density_dh = rhf_.get_density_matrix();
+        int kept = 0;
+        X_pruned_dh = prune_X_by_density_gpu(
+            X_full_dh->device_ptr(), density_dh.device_ptr(),
+            N_bas, N_g_eff, static_cast<real_t>(rho_thr), &kept);
+        std::cout << "  [density-prune] " << N_g_eff << " → " << kept
+                  << " points (ρ > " << rho_thr << ")" << std::endl;
+        N_g_eff = kept;
+        X_for_thc = X_pruned_dh.get();
+        report_elapsed("density pruning done (GPU 0)");
+    }
+
+    // ---- Acquire AO B-tensor pointer.
+    //   ERI_RI_RHF (single-GPU non-distributed): intermediate_matrix_B_ holds full B.
+    //   ERI_RI_Distributed_RHF: intermediate_matrix_B_ is a 1×1 dummy; the AO B
+    //   lives in d_B_local_ (per-GPU naux slices).  For multi-GPU we gather them
+    //   onto GPU 0 into d_B_gathered.
+    const real_t* d_B_ao_full = intermediate_matrix_B_.device_ptr();
+    real_t* d_B_gathered = nullptr;
+    if (auto* dist = dynamic_cast<ERI_RI_Distributed_RHF*>(this)) {
+        const auto& B_local = dist->get_d_B_local();
+        const auto& naux_local = dist->get_naux_local();
+        const int num_gpus_dist = dist->num_gpus();
+        const std::size_t N2 = static_cast<std::size_t>(N_bas) * N_bas;
+
+        if (num_gpus_dist == 1) {
+            d_B_ao_full = B_local[0];
+            if (naux_local[0] != naux) {
+                THROW_EXCEPTION("THC-SOS-ADC(2) RI-Z: naux_local[0] mismatch with naux.");
+            }
+        } else {
+            // Multi-GPU: gather B onto GPU 0 as a contiguous (N² × naux) col-major block.
+            // Each GPU g contributes naux_local[g] cols, in order.
+            MultiGpuManager::DeviceGuard guard0(0);
+            tracked_cudaMalloc(&d_B_gathered,
+                               N2 * static_cast<std::size_t>(naux) * sizeof(real_t));
+            std::size_t col_offset = 0;  // running aux-col index on GPU 0
+            for (int g = 0; g < num_gpus_dist; ++g) {
+                const std::size_t bytes =
+                    N2 * static_cast<std::size_t>(naux_local[g]) * sizeof(real_t);
+                cudaMemcpyPeer(d_B_gathered + col_offset * N2, /*dst device*/ 0,
+                               B_local[g], /*src device*/ g, bytes);
+                col_offset += naux_local[g];
+            }
+            cudaDeviceSynchronize();
+            if (col_offset != static_cast<std::size_t>(naux)) {
+                tracked_cudaFree(d_B_gathered);
+                THROW_EXCEPTION("THC-SOS-ADC(2) RI-Z gather: naux mismatch.");
+            }
+            d_B_ao_full = d_B_gathered;
+            std::cout << "  [RI-Z] Gathered B from " << num_gpus_dist
+                      << " GPUs (" << (N2 * naux * sizeof(real_t) / (1024 * 1024))
+                      << " MB on GPU 0)" << std::endl;
+            report_elapsed("B-gather done");
+        }
+    }
+
+    // ---- LS-THC Z via RI 3-index B (no analytic ERI needed) ----
+    const int thc_max_rank = rhf_.get_thc_max_rank();
+    int rank = 0;
+    real_t s_max = 0, s_min = 0;
+    std::unique_ptr<DeviceHostMatrix<real_t>> Z_dh;
+    if (thc_max_rank > 0) {
+        const int q = rhf_.get_thc_rsvd_power_iter();
+        std::cout << "  [LS-THC fit] randomized SVD on GPU 0, max_rank="
+                  << thc_max_rank
+                  << ", power_iter=" << q
+                  << " (N²=" << (N_bas * N_bas)
+                  << ", N_g=" << N_g_eff << ")" << std::endl;
+        Z_dh = compute_Z_via_rand_svd_ri_gpu(
+            X_for_thc->device_ptr(),
+            d_B_ao_full,
+            N_bas, N_g_eff, naux,
+            thc_max_rank, /*n_power_iter=*/q,
+            rhf_.get_thc_rel_cutoff(), &rank, &s_max, &s_min);
+    } else {
+        std::cout << "  [LS-THC fit] dense eigendecomp on GPU 0 (N²="
+                  << (N_bas * N_bas) << ", N_g=" << N_g_eff << ")" << std::endl;
+        Z_dh = compute_Z_via_M_svd_ri_gpu(
+            X_for_thc->device_ptr(),
+            d_B_ao_full,
+            N_bas, N_g_eff, naux,
+            rhf_.get_thc_rel_cutoff(), &rank, &s_max, &s_min);
+    }
+    report_elapsed("LS-THC Z built");
+
+    std::cout << "  THC: N_g=" << N_g_eff
+              << ", rank(M)=" << rank << "/" << N_bas * (N_bas + 1) / 2
+              << ", sigma_max=" << s_max
+              << ", sigma_min_kept=" << s_min << std::endl;
+
+    auto& C_dh   = rhf_.get_coefficient_matrix();
+    auto& eps_dh = rhf_.get_orbital_energies();
+    auto X_mo_dh = transform_X_to_mo_gpu(
+        X_for_thc->device_ptr(), C_dh.device_ptr(),
+        N_bas, N_orb, N_g_eff);
+    report_elapsed("X_mo (MO collocation) built");
+
+    // Z is built; the AO-side scaffolding is no longer needed.  Freeing now
+    // saves several GB on GPU 0 before the (large) operator buffers go up.
+    if (d_B_gathered) {
+        MultiGpuManager::DeviceGuard guard0(0);
+        tracked_cudaFree(d_B_gathered);
+        d_B_gathered = nullptr;
+    }
+    X_full_dh.reset();
+    X_pruned_dh.reset();
+
+    // ---- Build THC-SOS-ADC(2) operator ----
+    const double c_os = 1.17;
+    const int n_laplace = rhf_.get_thc_n_laplace();
+
+    const int num_gpus = rhf_.get_num_gpus();
+    const bool enable_b3a3 = enable_b3a3_log;
+    const bool enable_b3 = rhf_.get_thc_b3();
+    const bool enable_a3 = rhf_.get_thc_a3();
+    if (enable_b3a3) {
+        std::cout << "  B3=" << (enable_b3 ? "on" : "off")
+                  << " A3=" << (enable_a3 ? "on" : "off") << std::endl;
+    }
+    int num_gpus_eff = num_gpus;
+#ifndef GANSU_CPU_ONLY
+    if (num_gpus_eff < 1) {
+        num_gpus_eff = MultiGpuManager::instance().num_devices();
+        if (num_gpus_eff < 1) num_gpus_eff = 1;
+    }
+#else
+    if (num_gpus_eff < 1) num_gpus_eff = 1;
+#endif
+    std::cout << "  [THC] Constructing operator (M11 + per-GPU buffers on "
+              << num_gpus_eff << " GPU(s))..." << std::endl;
+    THCSOSADC2Operator op(
+        X_mo_dh->device_ptr(),
+        Z_dh->device_ptr(),
+        eps_dh.device_ptr(),
+        n_occ, n_vir, N_orb,
+        N_g_eff,
+        c_os, n_laplace,
+        num_gpus, enable_b3a3, enable_b3, enable_a3);
+    report_elapsed("operator built — entering Davidson");
+
+    // ---- Davidson + ω-iteration ----
+    DavidsonConfig dav_config;
+    dav_config.num_eigenvalues = n_states;
+    dav_config.convergence_threshold = 1e-6;
+    dav_config.max_subspace_size = std::min(singles_dim, std::max(30, 4 * n_states));
+    dav_config.max_iterations = 200;
+    dav_config.use_preconditioner = true;
+    dav_config.symmetric = true;
+    dav_config.verbose = 2;  // print per-iteration sigma timing + residual
+
+    std::vector<real_t> excitation_energies(n_states, 0.0);
+
+    op.set_omega(0.0);
+    {
+        DavidsonSolver init_solver(op, dav_config);
+        init_solver.solve();
+        const auto& evals = init_solver.get_eigenvalues();
+        for (int k = 0; k < n_states && k < (int)evals.size(); ++k) {
+            excitation_energies[k] = static_cast<real_t>(evals[k]);
+        }
+    }
+
+    std::cout << "  [THC] Initial (omega=0):";
+    for (int k = 0; k < n_states; ++k) {
+        std::cout << " " << std::fixed << std::setprecision(6) << excitation_energies[k];
+    }
+    std::cout << std::endl;
+
+    const double omega_thr = 1e-6;
+    const int max_omega_iter = 15;
+
+    for (int root = 0; root < n_states; ++root) {
+        double omega = static_cast<double>(excitation_energies[root]);
+        for (int iter = 0; iter < max_omega_iter; ++iter) {
+            op.set_omega(static_cast<real_t>(omega));
+            DavidsonSolver solver(op, dav_config);
+            solver.solve();
+            const auto& evals = solver.get_eigenvalues();
+            const double omega_new = (root < (int)evals.size())
+                                      ? evals[root] : omega;
+            const double delta = std::abs(omega_new - omega);
+            std::cout << "  [THC] root " << (root + 1) << " iter " << (iter + 1)
+                      << ": omega=" << std::fixed << std::setprecision(8) << omega_new
+                      << " d=" << std::scientific << std::setprecision(2) << delta
+                      << std::defaultfloat << std::endl;
+            if (delta < omega_thr) {
+                excitation_energies[root] = static_cast<real_t>(omega_new);
+                std::cout << "  [THC] root " << (root + 1) << ": converged" << std::endl;
+                break;
+            }
+            omega = omega_new;
+        }
+        excitation_energies[root] = static_cast<real_t>(omega);
+    }
+
+    rhf_.set_excitation_energies(std::vector<double>(
+        excitation_energies.begin(), excitation_energies.end()));
+
+    std::cout << "\n  THC-SOS-ADC(2) excitation energies (Hartree):" << std::endl;
+    for (int k = 0; k < n_states; ++k) {
+        std::cout << "    state " << (k + 1) << ": "
+                  << std::fixed << std::setprecision(8)
+                  << excitation_energies[k] << " Ha = "
+                  << std::setprecision(4)
+                  << (excitation_energies[k] * 27.2114) << " eV"
+                  << std::endl;
+    }
+
+    // d_B_gathered already freed right after Z build (above).
+#endif
 }
 
 } // namespace gansu

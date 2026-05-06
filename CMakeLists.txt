@@ -217,6 +217,11 @@ set(SOURCES
     src/multi_gpu_manager.cu
     src/eri_ri_distributed.cu
     src/dmet.cu
+    src/thc_grid.cu
+    src/thc_collocation.cu
+    src/thc_decomposition.cu
+    src/thc_mp2.cu
+    src/thc_sos_adc2_operator.cu
 )
 
 if(NOT ENABLE_GPU)

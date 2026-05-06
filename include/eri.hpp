@@ -96,6 +96,18 @@ public:
         THROW_EXCEPTION("MP2 energy computation is not supported for the selected ERI method.");
     }
 
+    virtual real_t compute_thc_mp2_energy(){
+        THROW_EXCEPTION("THC-MP2 energy computation is not supported for the selected ERI method (use eri_method=stored).");
+    }
+
+    virtual real_t compute_thc_sos_mp2_energy(){
+        THROW_EXCEPTION("THC-SOS-MP2 energy computation is not supported for the selected ERI method (use eri_method=stored).");
+    }
+
+    virtual void compute_thc_sos_adc2(int /*n_states*/){
+        THROW_EXCEPTION("THC-SOS-ADC(2) is not supported for the selected ERI method (use eri_method=stored).");
+    }
+
     virtual real_t compute_lt_mp2_energy(){
         THROW_EXCEPTION("LT-MP2 energy computation is not supported for the selected ERI method.");
     }
@@ -301,6 +313,9 @@ public:
             || method == PostHFMethod::EOM_CCSD // The stored ERI method supports EOM-CCSD
             || method == PostHFMethod::DMET_CCSD // DMET-CCSD
             || method == PostHFMethod::DMET_CCSD_T // DMET-CCSD(T)
+            || method == PostHFMethod::THC_MP2 // Tensor Hypercontraction MP2
+            || method == PostHFMethod::THC_SOS_MP2 // THC + Laplace SOS-MP2
+            || method == PostHFMethod::THC_SOS_ADC2 // THC SOS-ADC(2) excited states
           ){
             return true;
         }
@@ -378,6 +393,7 @@ public:
          || method == PostHFMethod::FCI
          || method == PostHFMethod::DMET_CCSD
          || method == PostHFMethod::DMET_CCSD_T
+         || method == PostHFMethod::THC_SOS_ADC2  // RI-Z path (Phase 2.3)
           ){
             return true;
         }

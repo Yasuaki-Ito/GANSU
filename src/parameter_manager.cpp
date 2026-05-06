@@ -88,7 +88,18 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"opt_rms_grad_threshold", "2.0e-4"},              // real_t: RMS gradient (Hartree/Bohr)
         {"opt_energy_threshold", "1.0e-6"},                // real_t: energy change threshold (Hartree)
         {"opt_disp_threshold", "3.0e-4"},                  // real_t: max displacement (Bohr)
-        {"opt_step_max", "0.3"}                            // real_t: trust-region radius (Bohr)
+        {"opt_step_max", "0.3"},                           // real_t: trust-region radius (Bohr)
+        {"thc_n_radial", "50"},                            // int: THC grid radial points per atom (Treutler-Ahlrichs M3)
+        {"thc_lebedev_order", "194"},                      // int: THC angular grid (110, 194, 302)
+        {"thc_n_laplace", "12"},                           // int: Laplace quadrature points for THC-SOS-MP2
+        {"thc_rel_cutoff", "1e-7"},                        // real_t: relative SVD cutoff in LS-THC
+        {"thc_sos_c_os", "1.3"},                           // real_t: opposite-spin scaling factor for THC-SOS-MP2
+        {"thc_b3a3", "0"},                                 // bool (0/1): enable B3+A3 Schur correction. Off by default — present implementation over-corrects ~1.5 eV (LS-THC structural)
+        {"thc_b3", "1"},                                   // bool (0/1): per-term toggle for B3 (consulted only when thc_b3a3=1, diagnostic use)
+        {"thc_a3", "1"},                                   // bool (0/1): per-term toggle for A3 (consulted only when thc_b3a3=1, diagnostic use)
+        {"thc_density_threshold", "0"},                    // real_t: drop grid points with electron density ρ ≤ threshold (Phase 2.3 (B); 0 = no pruning, typical 1e-8)
+        {"thc_max_rank", "0"},                             // int: cap LS-THC rank with randomized SVD (avoids O(N⁴) M·M^T eigendecomp). 0 = full eigendecomp (default for small systems); positive = randomized SVD with that rank cap. Use for N_bas ≥ 200
+        {"thc_rsvd_power_iter", "4"}                       // int: power iterations for randomized SVD (only used when thc_max_rank > 0). q=2 is the textbook minimum, q=4-5 is needed for slow-decay spectra (LS-THC tail)
     };
 
 

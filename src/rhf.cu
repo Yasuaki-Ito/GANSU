@@ -241,6 +241,12 @@ void RHF::post_process_after_scf() {
         post_hf_energy_ = eri_method_->compute_fci_energy();
     }else if(post_hf_method == PostHFMethod::MP2){
         post_hf_energy_ = eri_method_->compute_mp2_energy();
+    }else if(post_hf_method == PostHFMethod::THC_MP2){
+        post_hf_energy_ = eri_method_->compute_thc_mp2_energy();
+    }else if(post_hf_method == PostHFMethod::THC_SOS_MP2){
+        post_hf_energy_ = eri_method_->compute_thc_sos_mp2_energy();
+    }else if(post_hf_method == PostHFMethod::THC_SOS_ADC2){
+        eri_method_->compute_thc_sos_adc2(get_n_excited_states());
     }else if(post_hf_method == PostHFMethod::SCS_MP2){
         post_hf_energy_ = eri_method_->compute_scs_mp2_energy();
     }else if(post_hf_method == PostHFMethod::SOS_MP2){

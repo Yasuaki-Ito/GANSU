@@ -25,6 +25,12 @@
 #include "cphf_solver.hpp"
 #include "ccsd_lambda.hpp"
 #include "progress.hpp"
+#include "thc_grid.hpp"
+#include "thc_collocation.hpp"
+#include "thc_decomposition.hpp"
+#include "thc_mp2.hpp"
+#include "thc_sos_adc2_operator.hpp"
+#include "davidson_solver.hpp"
 
 #include "ao2mo.cuh"
 
@@ -1679,6 +1685,371 @@ real_t ERI_Stored_RHF::compute_scs_mp2_energy() {
 
 real_t ERI_Stored_RHF::compute_sos_mp2_energy() {
     return compute_scaled_mp2_energy_impl(rhf_, eri_matrix_.device_ptr(), 1);
+}
+
+// ============================================================
+//  THC-MP2 (Phase 2.0a)
+//
+//  Pipeline (all GPU, double precision):
+//    1. Build molecular grid (Lebedev L194 + Treutler-M3 + Becke)
+//    2. AO collocation X^P_mu = phi_mu(r_P)
+//    3. LS-THC: Z = M^+ V_eri (M^+)^T  via cuSOLVER eigendecomp on M M^T
+//    4. MO transform X_mo = C^T X_ao
+//    5. Reconstruct (pq|rs)_THC = M_mo Z M_mo^T
+//    6. Standard MP2 reduction
+//
+//  Validated against analytic MP2 to ~1e-12 Ha on H2O / sto-3g (test_thc_mp2).
+//  Currently RHF closed-shell with Stored ERI; Phase 2.1 will switch the
+//  V_eri input from stored to RI 3-index integrals.
+// ============================================================
+real_t ERI_Stored_RHF::compute_thc_mp2_energy() {
+#ifdef GANSU_CPU_ONLY
+    THROW_EXCEPTION("THC-MP2 requires GPU build (CPU-only path not yet implemented).");
+#else
+    const int N_bas = rhf_.get_num_basis();
+    const int n_occ = rhf_.get_num_electrons() / 2;
+
+    // Pull host copies of the molecule data.
+    auto& atoms_dh = const_cast<DeviceHostMemory<Atom>&>(rhf_.get_atoms());
+    atoms_dh.toHost();
+    std::vector<Atom> atoms_h(atoms_dh.host_ptr(),
+                               atoms_dh.host_ptr() + atoms_dh.size());
+
+    auto& prims_dh = const_cast<DeviceHostMemory<PrimitiveShell>&>(rhf_.get_primitive_shells());
+    prims_dh.toHost();
+    std::vector<PrimitiveShell> prims_h(prims_dh.host_ptr(),
+                                         prims_dh.host_ptr() + prims_dh.size());
+
+    auto& norms_dh = const_cast<DeviceHostMemory<real_t>&>(rhf_.get_cgto_normalization_factors());
+    norms_dh.toHost();
+    std::vector<real_t> norms_h(norms_dh.host_ptr(),
+                                 norms_dh.host_ptr() + norms_dh.size());
+
+    // Build grid + collocation (Phase 2.0a defaults).
+    ThcGridOptions opts;
+    {
+        const int lev = rhf_.get_thc_lebedev_order();
+        switch (lev) {
+            case 110: opts.lebedev = LebedevOrder::L110; break;
+            case 194: opts.lebedev = LebedevOrder::L194; break;
+            case 302: opts.lebedev = LebedevOrder::L302; break;
+            default:
+                THROW_EXCEPTION("thc_lebedev_order must be 110, 194, or 302 (got "
+                                + std::to_string(lev) + ")");
+        }
+    }
+    opts.n_radial = rhf_.get_thc_n_radial();
+    opts.weight_eps = 0.0;
+    MolecularGrid grid = build_molecular_grid(atoms_h, opts);
+    grid.host_to_device();
+
+    auto X_dh = compute_X_ao_gpu(N_bas, prims_h, norms_h, grid);
+
+    // LS-THC core matrix Z from the AO ERI tensor (col-major, length N^4).
+    int rank = 0;
+    real_t s_max = 0, s_min = 0;
+    auto Z_dh = compute_Z_via_M_svd_gpu(
+        X_dh->device_ptr(), eri_matrix_.device_ptr(),
+        N_bas, static_cast<int>(grid.num_points),
+        rhf_.get_thc_rel_cutoff(), &rank, &s_max, &s_min);
+
+    std::cout << "  THC-MP2: N_g=" << grid.num_points
+              << ", rank(M)=" << rank << "/" << N_bas * (N_bas + 1) / 2
+              << ", sigma_max=" << s_max
+              << ", sigma_min_kept=" << s_min << std::endl;
+
+    // MO basis: X_mo = C^T X_ao
+    auto& C_dh = rhf_.get_coefficient_matrix();
+    auto X_mo_dh = transform_X_to_mo_gpu(
+        X_dh->device_ptr(), C_dh.device_ptr(),
+        N_bas, N_bas, static_cast<int>(grid.num_points));
+
+    // (pq|rs)_THC tensor in MO basis
+    auto eri_mo_dh = reconstruct_eri_thc_gpu(
+        X_mo_dh->device_ptr(), Z_dh->device_ptr(),
+        N_bas, static_cast<int>(grid.num_points));
+
+    // MP2 reduction
+    auto& eps_dh = rhf_.get_orbital_energies();
+    const real_t E = compute_mp2_energy_from_mo_eri_gpu(
+        eri_mo_dh->device_ptr(), eps_dh.device_ptr(),
+        n_occ, N_bas);
+
+    std::cout << "  THC-MP2 correlation energy: " << std::setprecision(12)
+              << E << " Ha" << std::endl;
+    return E;
+#endif
+}
+
+// ============================================================
+//  THC-SOS-MP2 + Laplace (Phase 2.1)
+//
+//  Same Phase 2.0a front-end (grid + collocation + LS-THC + MO transform),
+//  then a Laplace + SOS contraction that runs at O(N_g^3) per quadrature
+//  point (no four-index MO ERI tensor materialised).
+// ============================================================
+real_t ERI_Stored_RHF::compute_thc_sos_mp2_energy() {
+#ifdef GANSU_CPU_ONLY
+    THROW_EXCEPTION("THC-SOS-MP2 requires GPU build (CPU-only path not yet implemented).");
+#else
+    const int N_bas = rhf_.get_num_basis();
+    const int n_occ = rhf_.get_num_electrons() / 2;
+
+    // Pull host copies of the molecule data.
+    auto& atoms_dh = const_cast<DeviceHostMemory<Atom>&>(rhf_.get_atoms());
+    atoms_dh.toHost();
+    std::vector<Atom> atoms_h(atoms_dh.host_ptr(),
+                               atoms_dh.host_ptr() + atoms_dh.size());
+
+    auto& prims_dh = const_cast<DeviceHostMemory<PrimitiveShell>&>(rhf_.get_primitive_shells());
+    prims_dh.toHost();
+    std::vector<PrimitiveShell> prims_h(prims_dh.host_ptr(),
+                                         prims_dh.host_ptr() + prims_dh.size());
+
+    auto& norms_dh = const_cast<DeviceHostMemory<real_t>&>(rhf_.get_cgto_normalization_factors());
+    norms_dh.toHost();
+    std::vector<real_t> norms_h(norms_dh.host_ptr(),
+                                 norms_dh.host_ptr() + norms_dh.size());
+
+    ThcGridOptions opts;
+    {
+        const int lev = rhf_.get_thc_lebedev_order();
+        switch (lev) {
+            case 110: opts.lebedev = LebedevOrder::L110; break;
+            case 194: opts.lebedev = LebedevOrder::L194; break;
+            case 302: opts.lebedev = LebedevOrder::L302; break;
+            default:
+                THROW_EXCEPTION("thc_lebedev_order must be 110, 194, or 302 (got "
+                                + std::to_string(lev) + ")");
+        }
+    }
+    opts.n_radial = rhf_.get_thc_n_radial();
+    opts.weight_eps = 0.0;
+    MolecularGrid grid = build_molecular_grid(atoms_h, opts);
+    grid.host_to_device();
+
+    auto X_dh = compute_X_ao_gpu(N_bas, prims_h, norms_h, grid);
+
+    int rank = 0;
+    real_t s_max = 0, s_min = 0;
+    auto Z_dh = compute_Z_via_M_svd_gpu(
+        X_dh->device_ptr(), eri_matrix_.device_ptr(),
+        N_bas, static_cast<int>(grid.num_points),
+        rhf_.get_thc_rel_cutoff(), &rank, &s_max, &s_min);
+
+    std::cout << "  THC-SOS-MP2: N_g=" << grid.num_points
+              << ", rank(M)=" << rank << "/" << N_bas * (N_bas + 1) / 2
+              << ", sigma_max=" << s_max
+              << ", sigma_min_kept=" << s_min << std::endl;
+
+    auto& C_dh  = rhf_.get_coefficient_matrix();
+    auto& eps_dh = rhf_.get_orbital_energies();
+    auto X_mo_dh = transform_X_to_mo_gpu(
+        X_dh->device_ptr(), C_dh.device_ptr(),
+        N_bas, N_bas, static_cast<int>(grid.num_points));
+
+    const int n_laplace = rhf_.get_thc_n_laplace();
+    const double c_os    = rhf_.get_thc_sos_c_os();
+    const int num_gpus   = rhf_.get_num_gpus();   // -1 = auto, 1 = single, >1 = multi
+    const real_t E = compute_thc_sos_mp2_energy_gpu(
+        X_mo_dh->device_ptr(), Z_dh->device_ptr(), eps_dh.device_ptr(),
+        n_occ, N_bas, static_cast<int>(grid.num_points),
+        n_laplace, c_os, num_gpus);
+
+    std::cout << "  THC-SOS-MP2 (c_os=" << c_os
+              << ", n_laplace=" << n_laplace
+              << ", num_gpus=" << num_gpus
+              << "): " << std::setprecision(12) << E << " Ha" << std::endl;
+    return E;
+#endif
+}
+
+// ============================================================
+//  THC-SOS-ADC(2) excited states (Phase 2.2a MVP)
+//
+//  Uses Phase 2.0a infrastructure (grid + collocation + LS-THC + MO transform)
+//  to build X^P_p and Z, then runs Davidson with omega-iteration through
+//  THCSOSADC2Operator.  RHF closed-shell, Coulomb-only Schur correction.
+// ============================================================
+void ERI_Stored_RHF::compute_thc_sos_adc2(int n_states) {
+#ifdef GANSU_CPU_ONLY
+    THROW_EXCEPTION("THC-SOS-ADC(2) requires GPU build.");
+#else
+    const int N_bas = rhf_.get_num_basis();
+    const int n_occ = rhf_.get_num_electrons() / 2;
+    const int n_vir = N_bas - n_occ;
+    const int N_orb = N_bas;
+    const int singles_dim = n_occ * n_vir;
+
+    if (rhf_.get_num_frozen_core() != 0) {
+        THROW_EXCEPTION("THC-SOS-ADC(2): frozen core not yet supported.");
+    }
+
+    const bool enable_b3a3_log = rhf_.get_thc_b3a3();
+    std::cout << "\n---- THC-SOS-ADC(2) ("
+              << (enable_b3a3_log ? "Coulomb + B3 + A3" : "Coulomb-only")
+              << ", stored ERI) ----" << std::endl;
+    std::cout << "  nocc=" << n_occ << ", nvir=" << n_vir
+              << ", singles=" << singles_dim
+              << ", nstates=" << n_states << std::endl;
+
+    // ---- Phase 2.0a infrastructure (grid + X + Z) ----
+    auto& atoms_dh = const_cast<DeviceHostMemory<Atom>&>(rhf_.get_atoms());
+    atoms_dh.toHost();
+    std::vector<Atom> atoms_h(atoms_dh.host_ptr(),
+                               atoms_dh.host_ptr() + atoms_dh.size());
+
+    auto& prims_dh = const_cast<DeviceHostMemory<PrimitiveShell>&>(rhf_.get_primitive_shells());
+    prims_dh.toHost();
+    std::vector<PrimitiveShell> prims_h(prims_dh.host_ptr(),
+                                         prims_dh.host_ptr() + prims_dh.size());
+
+    auto& norms_dh = const_cast<DeviceHostMemory<real_t>&>(rhf_.get_cgto_normalization_factors());
+    norms_dh.toHost();
+    std::vector<real_t> norms_h(norms_dh.host_ptr(),
+                                 norms_dh.host_ptr() + norms_dh.size());
+
+    ThcGridOptions opts;
+    {
+        const int lev = rhf_.get_thc_lebedev_order();
+        switch (lev) {
+            case 110: opts.lebedev = LebedevOrder::L110; break;
+            case 194: opts.lebedev = LebedevOrder::L194; break;
+            case 302: opts.lebedev = LebedevOrder::L302; break;
+            default: THROW_EXCEPTION("thc_lebedev_order must be 110, 194, or 302");
+        }
+    }
+    opts.n_radial = rhf_.get_thc_n_radial();
+    opts.weight_eps = 0.0;
+    MolecularGrid grid = build_molecular_grid(atoms_h, opts);
+    grid.host_to_device();
+
+    auto X_full_dh = compute_X_ao_gpu(N_bas, prims_h, norms_h, grid);
+
+    // Optional Phase 2.3 (B) density-based pruning.
+    int N_g_eff = static_cast<int>(grid.num_points);
+    auto* X_for_thc = X_full_dh.get();
+    std::unique_ptr<DeviceHostMatrix<real_t>> X_pruned_dh;
+    const double rho_thr = rhf_.get_thc_density_threshold();
+    if (rho_thr > 0.0) {
+        const auto& density_dh = rhf_.get_density_matrix();
+        int kept = 0;
+        X_pruned_dh = prune_X_by_density_gpu(
+            X_full_dh->device_ptr(), density_dh.device_ptr(),
+            N_bas, N_g_eff, static_cast<real_t>(rho_thr), &kept);
+        std::cout << "  [density-prune] " << N_g_eff << " → " << kept
+                  << " points (ρ > " << rho_thr << ")" << std::endl;
+        N_g_eff = kept;
+        X_for_thc = X_pruned_dh.get();
+    }
+
+    int rank = 0;
+    real_t s_max = 0, s_min = 0;
+    auto Z_dh = compute_Z_via_M_svd_gpu(
+        X_for_thc->device_ptr(), eri_matrix_.device_ptr(),
+        N_bas, N_g_eff,
+        rhf_.get_thc_rel_cutoff(), &rank, &s_max, &s_min);
+
+    std::cout << "  THC: N_g=" << N_g_eff
+              << ", rank(M)=" << rank << "/" << N_bas * (N_bas + 1) / 2
+              << ", sigma_max=" << s_max
+              << ", sigma_min_kept=" << s_min << std::endl;
+
+    auto& C_dh   = rhf_.get_coefficient_matrix();
+    auto& eps_dh = rhf_.get_orbital_energies();
+    auto X_mo_dh = transform_X_to_mo_gpu(
+        X_for_thc->device_ptr(), C_dh.device_ptr(),
+        N_bas, N_orb, N_g_eff);
+
+    // ---- Build THC-SOS-ADC(2) operator ----
+    const double c_os = 1.17;  // Hellweg-Grun-Hattig optimised value for ADC(2)
+    const int n_laplace = rhf_.get_thc_n_laplace();
+
+    const int num_gpus = rhf_.get_num_gpus();
+    const bool enable_b3a3 = enable_b3a3_log;
+    const bool enable_b3 = rhf_.get_thc_b3();
+    const bool enable_a3 = rhf_.get_thc_a3();
+    if (enable_b3a3) {
+        std::cout << "  B3=" << (enable_b3 ? "on" : "off")
+                  << " A3=" << (enable_a3 ? "on" : "off") << std::endl;
+    }
+    THCSOSADC2Operator op(
+        X_mo_dh->device_ptr(),
+        Z_dh->device_ptr(),
+        eps_dh.device_ptr(),
+        n_occ, n_vir, N_orb,
+        N_g_eff,
+        c_os, n_laplace,
+        num_gpus, enable_b3a3, enable_b3, enable_a3);
+
+    // ---- Davidson + omega iteration ----
+    DavidsonConfig dav_config;
+    dav_config.num_eigenvalues = n_states;
+    dav_config.convergence_threshold = 1e-6;
+    dav_config.max_subspace_size = std::min(singles_dim, std::max(30, 4 * n_states));
+    dav_config.max_iterations = 200;
+    dav_config.use_preconditioner = true;
+    dav_config.symmetric = true;
+    dav_config.verbose = 2;  // print per-iteration sigma timing + residual
+
+    std::vector<real_t> excitation_energies(n_states, 0.0);
+
+    op.set_omega(0.0);
+    {
+        DavidsonSolver init_solver(op, dav_config);
+        init_solver.solve();
+        const auto& evals = init_solver.get_eigenvalues();
+        for (int k = 0; k < n_states && k < (int)evals.size(); ++k) {
+            excitation_energies[k] = static_cast<real_t>(evals[k]);
+        }
+    }
+
+    std::cout << "  [THC] Initial (omega=0):";
+    for (int k = 0; k < n_states; ++k) {
+        std::cout << " " << std::fixed << std::setprecision(6) << excitation_energies[k];
+    }
+    std::cout << std::endl;
+
+    const double omega_thr = 1e-6;
+    const int max_omega_iter = 15;
+
+    for (int root = 0; root < n_states; ++root) {
+        double omega = static_cast<double>(excitation_energies[root]);
+        for (int iter = 0; iter < max_omega_iter; ++iter) {
+            op.set_omega(static_cast<real_t>(omega));
+            DavidsonSolver solver(op, dav_config);
+            solver.solve();
+            const auto& evals = solver.get_eigenvalues();
+            const double omega_new = (root < (int)evals.size())
+                                      ? evals[root] : omega;
+            const double delta = std::abs(omega_new - omega);
+            std::cout << "  [THC] root " << (root + 1) << " iter " << (iter + 1)
+                      << ": omega=" << std::fixed << std::setprecision(8) << omega_new
+                      << " d=" << std::scientific << std::setprecision(2) << delta
+                      << std::defaultfloat << std::endl;
+            if (delta < omega_thr) {
+                excitation_energies[root] = static_cast<real_t>(omega_new);
+                std::cout << "  [THC] root " << (root + 1) << ": converged" << std::endl;
+                break;
+            }
+            omega = omega_new;
+        }
+        excitation_energies[root] = static_cast<real_t>(omega);
+    }
+
+    rhf_.set_excitation_energies(std::vector<double>(
+        excitation_energies.begin(), excitation_energies.end()));
+
+    std::cout << "\n  THC-SOS-ADC(2) excitation energies (Hartree):" << std::endl;
+    for (int k = 0; k < n_states; ++k) {
+        std::cout << "    state " << (k + 1) << ": "
+                  << std::fixed << std::setprecision(8)
+                  << excitation_energies[k] << " Ha = "
+                  << std::setprecision(4)
+                  << (excitation_energies[k] * 27.2114) << " eV"
+                  << std::endl;
+    }
+#endif
 }
 
 // ============================================================

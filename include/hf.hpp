@@ -249,6 +249,22 @@ public:
     double get_opt_disp_threshold() const { return opt_disp_threshold_; }
     double get_opt_step_max() const { return opt_step_max_; }
 
+    /// THC parameters (used by THC-MP2 / THC-SOS-MP2 / THC-ADC(2) paths)
+    int    get_thc_n_radial() const { return thc_n_radial_; }
+    int    get_thc_lebedev_order() const { return thc_lebedev_order_; }
+    int    get_thc_n_laplace() const { return thc_n_laplace_; }
+    double get_thc_rel_cutoff() const { return thc_rel_cutoff_; }
+    double get_thc_sos_c_os() const { return thc_sos_c_os_; }
+    bool   get_thc_b3a3() const { return thc_b3a3_; }
+    bool   get_thc_b3() const { return thc_b3_; }
+    bool   get_thc_a3() const { return thc_a3_; }
+    double get_thc_density_threshold() const { return thc_density_threshold_; }
+    int    get_thc_max_rank() const { return thc_max_rank_; }
+    int    get_thc_rsvd_power_iter() const { return thc_rsvd_power_iter_; }
+
+    /// Number of GPUs requested (-1 = auto-detect, 1 = single, > 1 = multi).
+    int    get_num_gpus() const { return num_gpus_; }
+
     /**
      * @brief Get Shell-pair type info
      */
@@ -418,6 +434,22 @@ protected:
     double opt_energy_threshold_ = 1.0e-6;
     double opt_disp_threshold_ = 3.0e-4;
     double opt_step_max_ = 0.3;
+
+    // THC parameters
+    int    thc_n_radial_ = 50;
+    int    thc_lebedev_order_ = 194;
+    int    thc_n_laplace_ = 12;
+    double thc_rel_cutoff_ = 1.0e-7;
+    double thc_sos_c_os_ = 1.3;
+    bool   thc_b3a3_ = true;
+    bool   thc_b3_ = true;
+    bool   thc_a3_ = true;
+    double thc_density_threshold_ = 0.0;
+    int    thc_max_rank_ = 0;
+    int    thc_rsvd_power_iter_ = 4;
+
+    // Multi-GPU
+    int    num_gpus_ = 1;
     const int max_iter; ///< Maximum number of iterations
     int iter_; ///< Number of iterations
     real_t energy_difference_; ///< Energy difference between the current and the previous iteration

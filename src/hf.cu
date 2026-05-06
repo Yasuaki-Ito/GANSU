@@ -118,6 +118,18 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     opt_energy_threshold_ = parameters.get<double>("opt_energy_threshold");
     opt_disp_threshold_ = parameters.get<double>("opt_disp_threshold");
     opt_step_max_ = parameters.get<double>("opt_step_max");
+    thc_n_radial_ = parameters.get<int>("thc_n_radial");
+    thc_lebedev_order_ = parameters.get<int>("thc_lebedev_order");
+    thc_n_laplace_ = parameters.get<int>("thc_n_laplace");
+    thc_rel_cutoff_ = parameters.get<double>("thc_rel_cutoff");
+    thc_sos_c_os_ = parameters.get<double>("thc_sos_c_os");
+    thc_b3a3_ = parameters.get<bool>("thc_b3a3");
+    thc_b3_ = parameters.get<bool>("thc_b3");
+    thc_a3_ = parameters.get<bool>("thc_a3");
+    thc_density_threshold_ = parameters.get<double>("thc_density_threshold");
+    thc_max_rank_ = parameters.get<int>("thc_max_rank");
+    thc_rsvd_power_iter_ = parameters.get<int>("thc_rsvd_power_iter");
+    num_gpus_ = parameters.get<int>("num_gpus");
 
     // Validate run_type
     if(run_type_ != "energy" && run_type_ != "gradient" && run_type_ != "optimize" && run_type_ != "hessian"){
@@ -202,6 +214,17 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
              || post_hf_method_str == "dmet_ccsdt"){
         std::cout << "Message: Post-HF method is DMET-CCSD(T)." << std::endl;
         post_hf_method_ = PostHFMethod::DMET_CCSD_T;
+    }else if(post_hf_method_str == "thc_mp2" || post_hf_method_str == "thc-mp2"){
+        std::cout << "Message: Post-HF method is THC-MP2." << std::endl;
+        post_hf_method_ = PostHFMethod::THC_MP2;
+    }else if(post_hf_method_str == "thc_sos_mp2" || post_hf_method_str == "thc-sos-mp2"
+             || post_hf_method_str == "thc_sos-mp2"){
+        std::cout << "Message: Post-HF method is THC-SOS-MP2." << std::endl;
+        post_hf_method_ = PostHFMethod::THC_SOS_MP2;
+    }else if(post_hf_method_str == "thc_sos_adc2" || post_hf_method_str == "thc-sos-adc2"
+             || post_hf_method_str == "thc_sos_adc(2)" || post_hf_method_str == "thc-sos-adc(2)"){
+        std::cout << "Message: Post-HF method is THC-SOS-ADC(2) (Phase 2.2a MVP)." << std::endl;
+        post_hf_method_ = PostHFMethod::THC_SOS_ADC2;
     }else{
         throw std::runtime_error("Error: Unknown post-HF method: " + post_hf_method_str);
     }

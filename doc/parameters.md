@@ -233,6 +233,7 @@ Method names are case-insensitive. Hyphen variants are accepted (`scs-mp2` ≡ `
 | EOM_MP2 | Equation-of-Motion MP2 (≈ ADC(2) but Stanton–Bartlett style). M22 has off-diagonal couplings via T2 |
 | EOM_CC2 | Equation-of-Motion CC2. Doubles kept at CC2 quality. M22 is exactly diagonal — Schur complement is exact (no approximation in `schur_omega`) |
 | EOM_CCSD | Equation-of-Motion CCSD. Most accurate single-reference excited-state method available here |
+| THC_SOS_ADC2 | Tensor Hypercontraction SOS-ADC(2) with Laplace transform (`O(N^3)` sigma build). LS-THC factorisation $V_{\mu\nu\lambda\sigma}\!\approx\!\sum_{PQ}X^P_\mu X^P_\nu Z_{PQ}X^Q_\lambda X^Q_\sigma$ on a Becke–Lebedev grid. Schur-folded Davidson + ω-iter. Set `--eri_method ri` (with auxiliary basis) for the memory-light Phase 2.3 RI-Z path; `--eri_method stored` works at small scales. See [THC parameters](#thc-parameters). Aliases: `thc-sos-adc2`, `thc_sos_adc(2)` |
 
 For excited-state methods, see the [Excited state parameters](#excited-state-parameters) section for `n_excited_states`, `spin_type`, and per-method solver (`adc2_solver`, `eom_mp2_solver`, `eom_cc2_solver`).
 
@@ -600,6 +601,58 @@ Bisection of μ stops when |Σ_F N_frag(μ) − N_elec| < `dmet_n_tol`. Default 
 GANSU_DMET_VERBOSE=1 ./gansu ... --post_hf_method dmet
 ```
 
+
+## THC parameters
+
+Used by `--post_hf_method thc_sos_adc2`. The grid+collocation+LS-THC infrastructure also serves the placeholder `thc_mp2` / `thc_sos_mp2` paths.
+
+| Parameter | Description | Type | Default |
+| --- | --- | --- | --- |
+| `thc_n_radial` | Treutler–Ahlrichs M3 radial points per atom | int | 50 |
+| `thc_lebedev_order` | Lebedev angular order: 110, 194, or 302 | int | 194 |
+| `thc_n_laplace` | Laplace quadrature points (SOS-MP2 / SOS-ADC(2)) | int | 12 |
+| `thc_rel_cutoff` | LS-THC SVD relative cutoff for the rank of M | real | 1e-7 |
+| `thc_sos_c_os` | Opposite-spin scaling factor for SOS-MP2 (ADC(2) uses internal 1.17) | real | 1.3 |
+| `thc_density_threshold` | Drop grid points with electron density ρ ≤ threshold (Phase 2.3 (B)). 0 disables | real | 0 |
+| `thc_b3a3` | Master switch for B3-exchange + A3-Coulomb Schur corrections (Phase 2.2b). Off by default — present implementation over-corrects by ~1.5 eV (LS-THC structural limit) | bool | false |
+| `thc_b3` | Per-term toggle for B3 (only consulted when `thc_b3a3=true`) | bool | true |
+| `thc_a3` | Per-term toggle for A3 (only consulted when `thc_b3a3=true`) | bool | true |
+
+### Recommended usage
+
+* **Default (Coulomb-only Schur)** — gives CIS-level excitation energies; matches RI-Coulomb-only-SOS-Schur up to grid quality. Production-ready
+* **B3+A3 enabled** — implementation is complete but over-corrects (LS-THC structural). Use only for debugging / benchmarking. Per-term toggles `thc_b3` / `thc_a3` allow isolated study
+* **RI-Z path** — `--eri_method ri -ag <aux_basis>` selects the memory-light Phase 2.3 (A) path; the LS-THC core $Z$ is built from the RI 3-index tensor without ever materialising the analytic 4-index ERI. Multi-GPU is supported via auto-gather of `d_B_local_` to GPU 0
+* **Density pruning** — `--thc_density_threshold 1e-8` typical. Drops grid points where the SCF density falls below threshold; preserves excitation-energy precision (8-digit agreement in H2O/sto-3g testing) and reduces N_g 3–10 %
+
+### Memory budget
+
+Per-GPU RAM cost on benzene/cc-pVDZ scale:
+
+| Buffer | Size | n=15/L=194 (N_g=33232) |
+| --- | --- | --- |
+| 3 × N_g² | Y, ZY, T (Coulomb) | 26.5 GB |
+| Z replica | LS-THC core | 8.8 GB |
+| 3 × N_g² extra | B3+A3 (Z_occ, W, U) | 26.5 GB |
+| Other (M, F, MT, X_mo, …) | ov × N_g · O(1) | ~1 GB |
+
+A100 80 GB fits Coulomb-only at `thc_n_radial 20–25 / lebedev 194` and Coulomb+B3+A3 at `thc_n_radial 15 / lebedev 194` for benzene-class systems.
+
+### Example
+
+```bash
+# Production: Phase 2.3 RI-Z + density pruning, Coulomb-only
+./gansu -x ../xyz/large_molecular/Benzene.xyz -g cc-pvdz -m RHF \
+    --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs \
+    --post_hf_method thc_sos_adc2 \
+    --n_excited_states 5 \
+    --thc_n_radial 15 --thc_lebedev_order 194 --thc_n_laplace 8 \
+    --thc_density_threshold 1e-8
+
+# Diagnostic: B3+A3 with per-term toggles
+./gansu -x ../xyz/H2O.xyz -g sto-3g -m RHF \
+    --post_hf_method thc_sos_adc2 --thc_b3a3 true --thc_b3 true --thc_a3 false
+```
 
 ## Hardware / backend parameters
 

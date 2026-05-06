@@ -39,7 +39,10 @@ enum class PostHFMethod {
     EOM_CC2,
     EOM_CCSD,
     DMET_CCSD,
-    DMET_CCSD_T
+    DMET_CCSD_T,
+    THC_MP2,      // Tensor Hypercontraction MP2 (Phase 2.0a)
+    THC_SOS_MP2,  // THC + Laplace SOS-MP2 (Phase 2.1, O(N^3) per Laplace pt)
+    THC_SOS_ADC2  // THC + Laplace SOS-ADC(2) excited states (Phase 2.2a, MVP)
 };
 
 } // namespace gansu
