@@ -262,6 +262,26 @@ public:
     int    get_thc_max_rank() const { return thc_max_rank_; }
     int    get_thc_rsvd_power_iter() const { return thc_rsvd_power_iter_; }
 
+    /// DLPNO parameters. -1 sentinels mean "fall back to preset" (resolved in dlpno_params.hpp)
+    const std::string& get_dlpno_preset() const { return dlpno_preset_; }
+    const std::string& get_dlpno_localizer() const { return dlpno_localizer_; }
+    double get_dlpno_t_cut_pno()     const { return dlpno_t_cut_pno_; }
+    double get_dlpno_t_cut_do()      const { return dlpno_t_cut_do_; }
+    double get_dlpno_t_cut_pairs()   const { return dlpno_t_cut_pairs_; }
+    double get_dlpno_t_cut_mkn()     const { return dlpno_t_cut_mkn_; }
+    double get_dlpno_t_cut_triples() const { return dlpno_t_cut_triples_; }
+    double get_dlpno_t_cut_tno()     const { return dlpno_t_cut_tno_; }
+    double get_dlpno_pair_distance_cutoff() const { return dlpno_pair_distance_cutoff_; }
+    int    get_dlpno_max_iter() const { return dlpno_max_iter_; }
+    int    get_dlpno_diis_size() const { return dlpno_diis_size_; }
+    int    get_dlpno_localizer_max_sweep() const { return dlpno_localizer_max_sweep_; }
+    double get_dlpno_localizer_conv() const { return dlpno_localizer_conv_; }
+    int    get_dlpno_lmp2_max_iter() const { return dlpno_lmp2_max_iter_; }
+    double get_dlpno_lmp2_conv()     const { return dlpno_lmp2_conv_; }
+    int    get_dlpno_sc_pno_iter()   const { return dlpno_sc_pno_iter_; }
+    bool   get_dlpno_pno_os_only()   const { return dlpno_pno_os_only_; }
+    int    get_dlpno_verbose() const { return dlpno_verbose_; }
+
     /// Number of GPUs requested (-1 = auto-detect, 1 = single, > 1 = multi).
     int    get_num_gpus() const { return num_gpus_; }
 
@@ -447,6 +467,26 @@ protected:
     double thc_density_threshold_ = 0.0;
     int    thc_max_rank_ = 0;
     int    thc_rsvd_power_iter_ = 4;
+
+    // DLPNO parameters (raw user input; -1 sentinels mean "use preset")
+    std::string dlpno_preset_ = "normal";
+    std::string dlpno_localizer_ = "pm";
+    double dlpno_t_cut_pno_ = -1.0;
+    double dlpno_t_cut_do_ = -1.0;
+    double dlpno_t_cut_pairs_ = -1.0;
+    double dlpno_t_cut_mkn_ = -1.0;
+    double dlpno_t_cut_triples_ = -1.0;
+    double dlpno_t_cut_tno_ = -1.0;
+    double dlpno_pair_distance_cutoff_ = 15.0;
+    int    dlpno_max_iter_ = 50;
+    int    dlpno_diis_size_ = 6;
+    int    dlpno_localizer_max_sweep_ = 200;
+    double dlpno_localizer_conv_ = 1e-10;
+    int    dlpno_lmp2_max_iter_ = 60;
+    double dlpno_lmp2_conv_ = 1e-8;
+    int    dlpno_sc_pno_iter_ = 1;
+    bool   dlpno_pno_os_only_ = false;
+    int    dlpno_verbose_ = 1;
 
     // Multi-GPU
     int    num_gpus_ = 1;

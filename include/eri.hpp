@@ -203,6 +203,30 @@ public:
     }
 
     /**
+     * @brief Compute DLPNO-MP2 correlation energy (Phase 1)
+     * @return DLPNO-MP2 correlation energy
+     */
+    virtual real_t compute_dlpno_mp2(){
+        THROW_EXCEPTION("DLPNO-MP2 is not supported for the selected ERI method.");
+    }
+
+    /**
+     * @brief Compute DLPNO-CCSD correlation energy (Phase 2)
+     * @return DLPNO-CCSD correlation energy
+     */
+    virtual real_t compute_dlpno_ccsd(){
+        THROW_EXCEPTION("DLPNO-CCSD is not supported for the selected ERI method.");
+    }
+
+    /**
+     * @brief Compute DLPNO-CCSD(T) correlation energy (Phase 3)
+     * @return DLPNO-CCSD(T) correlation energy (CCSD + (T) summed)
+     */
+    virtual real_t compute_dlpno_ccsd_t(){
+        THROW_EXCEPTION("DLPNO-CCSD(T) is not supported for the selected ERI method.");
+    }
+
+    /**
      * @brief Compute FCI energy
         * @return FCI energy
         * @details This function computes the FCI energy.
@@ -394,6 +418,9 @@ public:
          || method == PostHFMethod::DMET_CCSD
          || method == PostHFMethod::DMET_CCSD_T
          || method == PostHFMethod::THC_SOS_ADC2  // RI-Z path (Phase 2.3)
+         || method == PostHFMethod::DLPNO_MP2
+         || method == PostHFMethod::DLPNO_CCSD
+         || method == PostHFMethod::DLPNO_CCSD_T
           ){
             return true;
         }

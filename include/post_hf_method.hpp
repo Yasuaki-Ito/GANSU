@@ -42,7 +42,10 @@ enum class PostHFMethod {
     DMET_CCSD_T,
     THC_MP2,      // Tensor Hypercontraction MP2 (Phase 2.0a)
     THC_SOS_MP2,  // THC + Laplace SOS-MP2 (Phase 2.1, O(N^3) per Laplace pt)
-    THC_SOS_ADC2  // THC + Laplace SOS-ADC(2) excited states (Phase 2.2a, MVP)
+    THC_SOS_ADC2, // THC + Laplace SOS-ADC(2) excited states (Phase 2.2a, MVP)
+    DLPNO_MP2,    // Domain-based Local PNO MP2 (Phase 1)
+    DLPNO_CCSD,   // Domain-based Local PNO CCSD (Phase 2)
+    DLPNO_CCSD_T  // Domain-based Local PNO CCSD(T) (Phase 3)
 };
 
 } // namespace gansu

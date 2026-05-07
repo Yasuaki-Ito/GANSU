@@ -37,6 +37,10 @@ set(GPU_TEST_SOURCES
     test_thc_collocation.cu
     test_thc_decomposition.cu
     test_thc_mp2.cu
+    test_dlpno_localizer.cu
+    test_dlpno_pao.cu
+    test_dlpno_mp2.cu
+    test_dlpno_ccsd.cu
 )
 
 # CPU backend test source files (separate executable to avoid GPU state pollution)

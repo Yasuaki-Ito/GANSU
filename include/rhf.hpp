@@ -982,6 +982,10 @@ private:
 
     void compute_thc_sos_adc2(int n_states) override;  // Phase 2.3: RI-Z path
 
+    real_t compute_dlpno_mp2() override;     // DLPNO Phase 1
+    real_t compute_dlpno_ccsd() override;    // DLPNO Phase 2
+    real_t compute_dlpno_ccsd_t() override;  // DLPNO Phase 3 (skeleton)
+
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
         const DeviceHostMatrix<real_t>& coefficient_matrix = rhf_.get_coefficient_matrix();

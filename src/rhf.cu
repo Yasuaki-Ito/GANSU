@@ -289,6 +289,12 @@ void RHF::post_process_after_scf() {
         post_hf_energy_ = eri_method_->compute_dmet_ccsd();
     }else if(post_hf_method == PostHFMethod::DMET_CCSD_T){
         post_hf_energy_ = eri_method_->compute_dmet_ccsd_t();
+    }else if(post_hf_method == PostHFMethod::DLPNO_MP2){
+        post_hf_energy_ = eri_method_->compute_dlpno_mp2();
+    }else if(post_hf_method == PostHFMethod::DLPNO_CCSD){
+        post_hf_energy_ = eri_method_->compute_dlpno_ccsd();
+    }else if(post_hf_method == PostHFMethod::DLPNO_CCSD_T){
+        post_hf_energy_ = eri_method_->compute_dlpno_ccsd_t();
     }else{
         THROW_EXCEPTION("Invalid post-HF method.");
     }

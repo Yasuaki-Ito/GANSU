@@ -129,6 +129,27 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     thc_density_threshold_ = parameters.get<double>("thc_density_threshold");
     thc_max_rank_ = parameters.get<int>("thc_max_rank");
     thc_rsvd_power_iter_ = parameters.get<int>("thc_rsvd_power_iter");
+
+    // DLPNO parameters (raw user values; -1 sentinel resolved by dlpno_params.hpp)
+    dlpno_preset_                = toLowerCase(parameters.get<std::string>("dlpno_preset"));
+    dlpno_localizer_             = toLowerCase(parameters.get<std::string>("dlpno_localizer"));
+    dlpno_t_cut_pno_             = parameters.get<double>("dlpno_t_cut_pno");
+    dlpno_t_cut_do_              = parameters.get<double>("dlpno_t_cut_do");
+    dlpno_t_cut_pairs_           = parameters.get<double>("dlpno_t_cut_pairs");
+    dlpno_t_cut_mkn_             = parameters.get<double>("dlpno_t_cut_mkn");
+    dlpno_t_cut_triples_         = parameters.get<double>("dlpno_t_cut_triples");
+    dlpno_t_cut_tno_             = parameters.get<double>("dlpno_t_cut_tno");
+    dlpno_pair_distance_cutoff_  = parameters.get<double>("dlpno_pair_distance_cutoff");
+    dlpno_max_iter_              = parameters.get<int>("dlpno_max_iter");
+    dlpno_diis_size_             = parameters.get<int>("dlpno_diis_size");
+    dlpno_localizer_max_sweep_   = parameters.get<int>("dlpno_localizer_max_sweep");
+    dlpno_localizer_conv_        = parameters.get<double>("dlpno_localizer_conv");
+    dlpno_lmp2_max_iter_         = parameters.get<int>("dlpno_lmp2_max_iter");
+    dlpno_lmp2_conv_             = parameters.get<double>("dlpno_lmp2_conv");
+    dlpno_sc_pno_iter_           = parameters.get<int>("dlpno_sc_pno_iter");
+    dlpno_pno_os_only_           = parameters.get<bool>("dlpno_pno_os_only");
+    dlpno_verbose_               = parameters.get<int>("dlpno_verbose");
+
     num_gpus_ = parameters.get<int>("num_gpus");
 
     // Validate run_type
@@ -225,6 +246,17 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
              || post_hf_method_str == "thc_sos_adc(2)" || post_hf_method_str == "thc-sos-adc(2)"){
         std::cout << "Message: Post-HF method is THC-SOS-ADC(2) (Phase 2.2a MVP)." << std::endl;
         post_hf_method_ = PostHFMethod::THC_SOS_ADC2;
+    }else if(post_hf_method_str == "dlpno_mp2" || post_hf_method_str == "dlpno-mp2"){
+        std::cout << "Message: Post-HF method is DLPNO-MP2." << std::endl;
+        post_hf_method_ = PostHFMethod::DLPNO_MP2;
+    }else if(post_hf_method_str == "dlpno_ccsd" || post_hf_method_str == "dlpno-ccsd" || post_hf_method_str == "dlpno"){
+        std::cout << "Message: Post-HF method is DLPNO-CCSD." << std::endl;
+        post_hf_method_ = PostHFMethod::DLPNO_CCSD;
+    }else if(post_hf_method_str == "dlpno_ccsd_t" || post_hf_method_str == "dlpno-ccsd_t"
+             || post_hf_method_str == "dlpno_ccsd(t)" || post_hf_method_str == "dlpno-ccsd(t)"
+             || post_hf_method_str == "dlpno_ccsdt"){
+        std::cout << "Message: Post-HF method is DLPNO-CCSD(T)." << std::endl;
+        post_hf_method_ = PostHFMethod::DLPNO_CCSD_T;
     }else{
         throw std::runtime_error("Error: Unknown post-HF method: " + post_hf_method_str);
     }

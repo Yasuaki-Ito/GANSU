@@ -99,7 +99,26 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"thc_a3", "1"},                                   // bool (0/1): per-term toggle for A3 (consulted only when thc_b3a3=1, diagnostic use)
         {"thc_density_threshold", "0"},                    // real_t: drop grid points with electron density ρ ≤ threshold (Phase 2.3 (B); 0 = no pruning, typical 1e-8)
         {"thc_max_rank", "0"},                             // int: cap LS-THC rank with randomized SVD (avoids O(N⁴) M·M^T eigendecomp). 0 = full eigendecomp (default for small systems); positive = randomized SVD with that rank cap. Use for N_bas ≥ 200
-        {"thc_rsvd_power_iter", "4"}                       // int: power iterations for randomized SVD (only used when thc_max_rank > 0). q=2 is the textbook minimum, q=4-5 is needed for slow-decay spectra (LS-THC tail)
+        {"thc_rsvd_power_iter", "4"},                      // int: power iterations for randomized SVD (only used when thc_max_rank > 0). q=2 is the textbook minimum, q=4-5 is needed for slow-decay spectra (LS-THC tail)
+        // ----- DLPNO parameters -----
+        {"dlpno_preset", "normal"},                        // string: loose / normal / tight / very_tight (ORCA-compatible)
+        {"dlpno_localizer", "pm"},                         // string: pm (Pipek-Mezey, default) / boys (Foster-Boys) / ibo
+        {"dlpno_t_cut_pno", "-1"},                         // real_t: PNO occupation cutoff. -1 = use preset value
+        {"dlpno_t_cut_do", "-1"},                          // real_t: PAO redundancy (overlap eigenvalue) cutoff. -1 = use preset
+        {"dlpno_t_cut_pairs", "-1"},                       // real_t: strong/weak pair MP2 cutoff (Ha). -1 = use preset
+        {"dlpno_t_cut_mkn", "-1"},                         // real_t: Boughton-Pulay Mulliken cumulative threshold. -1 = use preset
+        {"dlpno_t_cut_triples", "-1"},                     // real_t: triple-screening threshold for (T). -1 = use preset
+        {"dlpno_t_cut_tno", "-1"},                         // real_t: TNO occupation cutoff for (T). -1 = use preset
+        {"dlpno_pair_distance_cutoff", "15.0"},            // real_t: distance-based pair pre-screening (Bohr). 0 = off
+        {"dlpno_max_iter", "50"},                          // int: DLPNO-CCSD residual max iterations
+        {"dlpno_diis_size", "6"},                          // int: DIIS subspace size for DLPNO-CCSD
+        {"dlpno_localizer_max_sweep", "200"},              // int: PM/Boys Jacobi sweep upper bound
+        {"dlpno_localizer_conv", "1e-10"},                 // real_t: localizer ΔP² convergence threshold
+        {"dlpno_lmp2_max_iter", "60"},                     // int: iterative LMP2 amplitude solver max iterations
+        {"dlpno_lmp2_conv", "1e-8"},                       // real_t: LMP2 residual convergence (max-abs amplitude residual)
+        {"dlpno_sc_pno_iter", "1"},                        // int: extra rounds of self-consistent PNO refinement (0 = single-shot PNO selection from semi-canonical guess)
+        {"dlpno_pno_os_only", "0"},                        // bool: PNO selection from opposite-spin amplitudes only (D = T^T T + T T^T). Default 0 = use full LMP2 density (Riplinger 2013, T̃^T T + T̃ T^T) which slightly outperforms the OS-only form for full closed-shell MP2 energy evaluation. Set to 1 only when pairing with SOS-MP2 (c_os scaling, SS dropped).
+        {"dlpno_verbose", "1"}                             // int: 0=summary, 1=phase, 2=per-pair, 3=residual
     };
 
 

@@ -222,6 +222,13 @@ set(SOURCES
     src/thc_decomposition.cu
     src/thc_mp2.cu
     src/thc_sos_adc2_operator.cu
+    src/dlpno_localizer.cu
+    src/dlpno_pao.cu
+    src/dlpno_domain.cu
+    src/dlpno_pno.cu
+    src/dlpno_pair_data.cu
+    src/dlpno_mp2.cu
+    src/dlpno_ccsd.cu
 )
 
 if(NOT ENABLE_GPU)
