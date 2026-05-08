@@ -1809,6 +1809,7 @@ void ERI_RI_RHF::compute_thc_sos_adc2(int n_states) {
     //   onto GPU 0 into d_B_gathered.
     const real_t* d_B_ao_full = intermediate_matrix_B_.device_ptr();
     real_t* d_B_gathered = nullptr;
+#ifdef GANSU_MULTI_GPU
     if (auto* dist = dynamic_cast<ERI_RI_Distributed_RHF*>(this)) {
         const auto& B_local = dist->get_d_B_local();
         const auto& naux_local = dist->get_naux_local();
@@ -1846,6 +1847,7 @@ void ERI_RI_RHF::compute_thc_sos_adc2(int n_states) {
             report_elapsed("B-gather done");
         }
     }
+#endif // GANSU_MULTI_GPU
 
     // ---- LS-THC Z via RI 3-index B (no analytic ERI needed) ----
     const int thc_max_rank = rhf_.get_thc_max_rank();

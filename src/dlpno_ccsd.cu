@@ -117,6 +117,7 @@ inline Phase24Integrals precompute_phase24_integrals(
     //   independent slab of pairs. Falls back to single-GPU serial when
     //   the back-end is not distributed (or has a single GPU).
     int num_gpus = 1;
+#ifdef GANSU_MULTI_GPU
     if (auto* eri_dist = dynamic_cast<const ERI_RI_Distributed_RHF*>(&eri)) {
         if (eri_dist->num_gpus() > 1) {
             const bool ok = const_cast<ERI_RI_Distributed_RHF*>(eri_dist)
@@ -124,6 +125,7 @@ inline Phase24Integrals precompute_phase24_integrals(
             if (ok) num_gpus = eri_dist->num_gpus();
         }
     }
+#endif // GANSU_MULTI_GPU
 #ifdef _OPENMP
     if (num_gpus > 1) {
         omp_set_dynamic(0);
@@ -804,12 +806,14 @@ real_t ERI_RI_RHF::compute_dlpno_ccsd_t() {
     // dynamic_cast checks whether *this is actually the distributed
     // RI back-end; if not, fall back to single-GPU.
     int num_gpus = 1;
+#ifdef GANSU_MULTI_GPU
     if (auto* eri_dist =
             dynamic_cast<ERI_RI_Distributed_RHF*>(this)) {
         if (eri_dist->num_gpus() > 1) {
             num_gpus = eri_dist->num_gpus();
         }
     }
+#endif // GANSU_MULTI_GPU
     const real_t e_triples =
         run_phase33_triple_loop(res, num_gpus, rhf_.get_dlpno_verbose());
 

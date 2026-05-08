@@ -227,6 +227,7 @@ set(SOURCES
     src/dlpno_domain.cu
     src/dlpno_pno.cu
     src/dlpno_pair_data.cu
+    src/dlpno_picache_gpu.cu
     src/dlpno_mp2.cu
     src/dlpno_ccsd.cu
 )

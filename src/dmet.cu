@@ -889,6 +889,7 @@ real_t DMET::compute_energy(bool with_triples) {
     //                           Fragment loop is serial but each ERI build is
     //                           multi-GPU parallel.
     int num_gpus = 1;
+#ifdef GANSU_MULTI_GPU
     auto* eri_distributed =
         dynamic_cast<ERI_RI_Distributed_RHF*>(const_cast<ERI*>(&eri_));
     if (eri_distributed && eri_distributed->num_gpus() > 1) {
@@ -905,6 +906,10 @@ real_t DMET::compute_energy(bool with_triples) {
     } else {
         std::cout << "  Multi-GPU strategy: single GPU (serial)" << std::endl;
     }
+#else
+    std::cout << "  Multi-GPU strategy: single GPU (serial; built without GANSU_MULTI_GPU)"
+              << std::endl;
+#endif // GANSU_MULTI_GPU
 
     // Pre-cluster fragments by μ-independent equivalence. Each fragment maps to
     // a canonical representative; only canonical fragments are solved, others
@@ -1801,9 +1806,11 @@ real_t DMET::compute_energy(bool with_triples) {
     std::cout << std::defaultfloat;
 
     // Release replicated full-B copies (frees ~num_gpus × naux × nao² × 8 bytes)
+#ifdef GANSU_MULTI_GPU
     if (eri_distributed && eri_distributed->b_is_replicated()) {
         eri_distributed->free_replicated_B();
     }
+#endif // GANSU_MULTI_GPU
 
     // Return correlation energy. For DMET-CCSD we use the T-amp democratic value
     // (preserves existing behavior). For DMET-CCSD(T) we add the (T) contribution

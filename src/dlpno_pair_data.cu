@@ -24,6 +24,7 @@
 
 #include "diis.hpp"
 #include "dlpno_pno.hpp"
+#include "dlpno_picache_gpu.hpp"
 
 namespace gansu {
 
@@ -181,34 +182,26 @@ LMP2Status iterate_lmp2(
         pi_cache[i_ij].resize(pairs.size());
     }
 
+    // Step 6.0 — GPU port for pi_cache build (CPU fallback when GPU is
+    // unavailable or alloc fails). Padded barS uploaded once here.
+    std::vector<int> n_pno_per_pair(pairs.size(), 0);
+    int max_n = 0;
+    for (size_t i = 0; i < pairs.size(); ++i) {
+        n_pno_per_pair[i] = pairs[i].n_pno;
+        if (pairs[i].n_pno > max_n) max_n = pairs[i].n_pno;
+    }
+    PiCacheGpu pgpu(barS_cache, n_pno_per_pair, max_n);
+
     for (int iter = 0; iter < max_iter; ++iter) {
         for (size_t idx = 0; idx < pairs.size(); ++idx) {
             Y_old[idx] = pairs[idx].Y;
         }
 
-        // ---- Build pi_cache from Y_old. ----
+        // ---- Build pi_cache from Y_old (GPU strided batched, see
+        //      include/dlpno_picache_gpu.hpp for layout/falls back to CPU).
         {
             const auto t_pi0 = prof_clock::now();
-            #pragma omp parallel for schedule(static)
-            for (long long i_ij = 0; i_ij < static_cast<long long>(pairs.size());
-                 ++i_ij)
-            {
-                const int n_ij = pairs[i_ij].n_pno;
-                if (n_ij == 0) continue;
-                for (size_t i_kl = 0; i_kl < pairs.size(); ++i_kl) {
-                    const int n_kl = pairs[i_kl].n_pno;
-                    if (n_kl == 0) {
-                        pi_cache[i_ij][i_kl].resize(0, 0);
-                        continue;
-                    }
-                    const RowMatXd& barS = barS_cache[i_ij][i_kl];
-                    Eigen::Map<const RowMatXd> Y_canon(
-                        Y_old[i_kl].data(), n_kl, n_kl);
-                    const RowMatXd half = barS * Y_canon;
-                    pi_cache[i_ij][i_kl].noalias() =
-                        half * barS.transpose();
-                }
-            }
+            pgpu.rebuild(Y_old, pi_cache);
             dt_picache += std::chrono::duration<double>(
                 prof_clock::now() - t_pi0).count();
         }
@@ -493,6 +486,17 @@ LMP2Status iterate_dlpno_ccsd_t2(
         }
     }
 
+    // Step 6.0 — GPU port for pi_cache build (CPU fallback when GPU is
+    // unavailable). Padded barS uploaded once on construction; per-iter
+    // rebuild() does H2D Y_old → 2 strided batched DGEMMs → D2H pi.
+    std::vector<int> n_pno_per_pair(pairs.size(), 0);
+    int max_n_pno = 0;
+    for (size_t i = 0; i < pairs.size(); ++i) {
+        n_pno_per_pair[i] = pairs[i].n_pno;
+        if (pairs[i].n_pno > max_n_pno) max_n_pno = pairs[i].n_pno;
+    }
+    PiCacheGpu pgpu(barS_cache, n_pno_per_pair, max_n_pno);
+
     // ---- pi_T_stack (Step 3): per-iter (k, l, d)-stacked projection ----
     // pi_T_stack[idx](a, (k·nocc + l)·n + d) = π_{k, l}^{oriented}[a, d]
     // where oriented means k plays the "first" role
@@ -591,8 +595,14 @@ LMP2Status iterate_dlpno_ccsd_t2(
         }
 
         // ---- Build pi_cache from Y_old (re-built each iter). ----
+        // Step 6.0: pi_cache build itself is GPU strided-batched (or CPU
+        // fallback inside pgpu). pi_T_stack assembly stays on CPU and just
+        // re-blocks the host pi_cache result; it's cheap relative to the
+        // matmul cost so leaving it for Step 6.1.
         {
             const auto t_pi0 = prof_clock::now();
+            pgpu.rebuild(Y_old, pi_cache);
+
             #pragma omp parallel for schedule(static)
             for (long long i_ij = 0; i_ij < static_cast<long long>(pairs.size());
                  ++i_ij)
@@ -602,22 +612,6 @@ LMP2Status iterate_dlpno_ccsd_t2(
                     pi_T_stack[i_ij].resize(0, 0);
                     continue;
                 }
-                for (size_t i_kl = 0; i_kl < pairs.size(); ++i_kl) {
-                    const int n_kl = pairs[i_kl].n_pno;
-                    if (n_kl == 0) {
-                        pi_cache[i_ij][i_kl].resize(0, 0);
-                        continue;
-                    }
-                    const RowMatXd& barS = barS_cache[i_ij][i_kl];
-                    Eigen::Map<const RowMatXd> Y_canon(
-                        Y_old[i_kl].data(), n_kl, n_kl);
-                    // Split triple product into two GEMMs to avoid Eigen
-                    // lazy-eval temporaries.
-                    const RowMatXd half = barS * Y_canon;          // n_ij × n_kl
-                    pi_cache[i_ij][i_kl].noalias() =
-                        half * barS.transpose();                   // n_ij × n_ij
-                }
-
                 // pi_T_stack[i_ij](a, (k·nocc + l)·n_ij + d) = π_{k,l}^{oriented}[a, d]
                 pi_T_stack[i_ij].setZero(
                     n_ij,
