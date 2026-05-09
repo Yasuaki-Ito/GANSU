@@ -49,13 +49,21 @@ public:
      * @param barS_cache  [N_pair][N_pair] each (n_ij × n_kl), 0×0 if either pair empty
      * @param n_pno_per_pair  size N_pair, n_pno_[i] = pairs[i].n_pno (0 = empty)
      * @param max_n  max over n_pno_per_pair (caller computed)
+     * @param pair_lookup  optional [nocc·nocc] map (k,l) → canonical pair idx.
+     *                     When non-null, enables Step 6.1 stacked mode.
+     * @param setup_i_per_pair  optional [N_pair] list of setups[idx].i — needed
+     *                          to decide pi_canon^T vs pi_canon orientation.
+     * @param nocc  occupied count (only used in stacked mode).
      *
      * Throws std::runtime_error on cudaMalloc / cuBLAS failure. In that
      * case the caller should fall back to the CPU Eigen kernel.
      */
     PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
                const std::vector<int>& n_pno_per_pair,
-               int max_n);
+               int max_n,
+               const std::vector<int>* pair_lookup = nullptr,
+               const std::vector<int>* setup_i_per_pair = nullptr,
+               int nocc = 0);
 
     ~PiCacheGpu();
 
@@ -78,26 +86,87 @@ public:
                  std::vector<std::vector<RowMatXd>>& pi_cache_out);
 
     /**
+     * @brief Step 6.1 — also produce pi_T_stack on the same call.
+     *
+     * pi_T_stack_out[i_ij](a, (k·nocc + l)·n_ij + d) = π_{k, l}^{oriented}[a, d]
+     * where oriented = pi_canon (skl.i == k) or pi_canon^T (skl.i != k),
+     * and pi_canon = barS · Y_old · barS^T at (i_ij, idx_kl=pair_lookup[k·nocc+l]).
+     *
+     * Empty (i_ij or i_kl) ⇒ corresponding output region is zero.
+     * pi_T_stack_out[i_ij] is resized to (n_ij × nocc²·n_ij) on output.
+     *
+     * Requires the constructor to have been called with non-null
+     * pair_lookup / setup_i_per_pair. Otherwise falls back to the CPU
+     * pi_cache build + a CPU pi_T_stack assembly that the caller can
+     * skip if it has its own stack-build code.
+     */
+    void rebuild_with_stack(const std::vector<std::vector<real_t>>& Y_old,
+                            std::vector<std::vector<RowMatXd>>& pi_cache_out,
+                            std::vector<RowMatXd>& pi_T_stack_out);
+
+    /**
      * @brief Whether the GPU path is active. False = CPU fallback is in use.
      * Returns true when the constructor successfully built device buffers.
      */
     bool active() const noexcept { return active_; }
 
+    /**
+     * @brief Whether Step 6.1 stacked-mode buffers are live. False = stacked
+     * outputs go via the CPU fallback path inside `rebuild_with_stack`.
+     */
+    bool stacked() const noexcept { return stacked_; }
+
+    /**
+     * @brief Step 6.2 — read-only device buffer getters for downstream
+     * GPU users (e.g. ResidGpu) that want to operate on the same in-memory
+     * pi_T_stack and per-pair metadata.
+     *
+     * The pointers reflect the latest state after the most recent
+     * `rebuild_with_stack` call. They are nullptr when stacked() is false.
+     *
+     * Layout reference:
+     *   - device_pi_T_stack: per-pair flat (n_ij × nocc²·n_ij) row-major,
+     *     contiguous segments at `device_idx_offset_pi_T()[i_ij]`.
+     *   - device_pair_lookup: nocc² ints, pair_lookup[k·nocc + l] = canonical idx.
+     *   - device_setup_i / device_n_pno: N_pair ints, setups[idx].i / pairs[idx].n_pno.
+     *   - device_idx_offset_pi_T: (N_pair+1) size_t cumulative offsets into pi_T_stack.
+     */
+    const real_t*  device_pi_T_stack()      const noexcept;
+    const real_t*  device_Y_pad()           const noexcept;  // padded Y_old after last rebuild
+    const int*     device_pair_lookup()     const noexcept;
+    const int*     device_setup_i()         const noexcept;
+    const int*     device_n_pno()           const noexcept;
+    const size_t*  device_idx_offset_pi_T() const noexcept;
+    int            device_max_n()           const noexcept { return max_n_; }
+    int            device_N_pair()          const noexcept { return N_pair_; }
+    int            device_nocc()            const noexcept { return nocc_; }
+
 private:
     struct Impl;
     Impl* p_ = nullptr;
     bool active_ = false;
+    bool stacked_ = false;
 
     // CPU fallback for !active() — keeps the public API stable when GPU
     // is unavailable. Same pi_cache_out layout.
     void rebuild_cpu_(const std::vector<std::vector<real_t>>& Y_old,
                       std::vector<std::vector<RowMatXd>>& pi_cache_out);
 
+    // CPU fallback for !stacked() — produces pi_T_stack from a host pi_cache.
+    void build_stack_cpu_(const std::vector<std::vector<RowMatXd>>& pi_cache,
+                          std::vector<RowMatXd>& pi_T_stack_out);
+
     // For the CPU fallback only: keep a const view into the input barS_cache.
     const std::vector<std::vector<RowMatXd>>* barS_cache_ref_ = nullptr;
     std::vector<int> n_pno_;
     int N_pair_ = 0;
     int max_n_ = 0;
+
+    // Step 6.1 metadata captured at construction (used by both GPU and
+    // CPU fallback paths of build_stack_cpu_).
+    std::vector<int> pair_lookup_;        // size nocc² (or empty)
+    std::vector<int> setup_i_per_pair_;   // size N_pair (or empty)
+    int nocc_ = 0;
 };
 
 } // namespace gansu

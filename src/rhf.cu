@@ -18,6 +18,7 @@
  */
 
 #include "rhf.hpp"
+#include <memory>
 #include "cphf_solver.hpp"
 #include "progress.hpp"
 #include <cassert>

@@ -18,6 +18,7 @@
  */
 
 #include "thc_decomposition.hpp"
+#include <memory>
 
 #include <Eigen/Dense>
 #include <cmath>

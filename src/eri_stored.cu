@@ -13,6 +13,7 @@
  */
 
 #include <algorithm>
+#include <memory>
 #include <iomanip>
 #include <iostream>
 #include <assert.h>

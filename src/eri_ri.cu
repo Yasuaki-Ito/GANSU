@@ -13,6 +13,7 @@
  */
 
 #include <algorithm>
+#include <memory>
 
 #include <cstdlib>  // std::getenv
 #include <string>   // std::string

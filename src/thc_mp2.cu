@@ -8,6 +8,7 @@
  */
 
 #include "thc_mp2.hpp"
+#include <memory>
 
 #include <Eigen/Dense>
 #include <stdexcept>

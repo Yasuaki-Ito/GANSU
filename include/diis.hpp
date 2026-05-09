@@ -43,6 +43,16 @@ public:
         }
     }
 
+    // Clear all history. Used by callers that detect convergence pathologies
+    // (residual rebound, singular B) and want to restart DIIS from a clean
+    // subspace rather than silently fall back to plain Jacobi.
+    void clear() {
+        xs.clear();
+        es.clear();
+    }
+
+    int history_size() const { return (int)xs.size(); }
+
     // dot product of two vectors
     static double dot(const std::vector<double>& a, const std::vector<double>& b) {
         double s = 0.0;

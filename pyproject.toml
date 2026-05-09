@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "GPU Accelerated Numerical Simulation Utility for quantum chemistry"
 readme = "README.md"
 license = {text = "BSD-3-Clause"}
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 authors = [
     {name = "Hiroshima University / Fujitsu Limited"},
 ]
@@ -18,10 +18,20 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Chemistry",
+    "Operating System :: POSIX :: Linux",
 ]
 dependencies = [
     "numpy",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cublas-cu12",
+    "nvidia-cusolver-cu12",
+    "nvidia-cusparse-cu12",
+    "nvidia-nccl-cu12",
 ]
 
 [project.scripts]
@@ -40,4 +50,5 @@ gansu = [
     "data/auxiliary_basis/*.gbs",
     "lib/libgansu.so",
     "lib/libgansu.dylib",
+    "_native_meta.json",
 ]

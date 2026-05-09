@@ -2168,47 +2168,151 @@ real_t ERI_RI_Distributed_RHF::compute_sos_mp2_energy() {
 //    Single-GPU:   num_gpus_ == 1 → run pipeline on GPU 0
 // ============================================================================
 
+// Step 6.3 — single CUDA kernel that replaces the per-Q cublasDgeam transpose
+// loop in build_eri_from_B_pipeline / ERI_RI::build_mo_eri.
+//
+// Input  d_B_tmp  layout (naux × nao × nmo) row-major,  element [Q, ν, p]
+//                                                       at Q·nao·nmo + ν·nmo + p
+// Output d_B_tmp2 layout (naux × nmo × nao) row-major,  element [Q, p, ν]
+//                                                       at Q·nmo·nao + p·nao + ν
+//
+// Threads tile (p, ν) per Q. Reads are coalesced along p (innermost in input);
+// writes are strided by nao but the transposed buffer is small enough that
+// memory bandwidth, not coalescing, sets the lower bound here.
+__global__ void transpose_b_tmp_per_aux_kernel(
+    const real_t* __restrict__ d_in,
+    real_t*       __restrict__ d_out,
+    int naux, int nmo, int nao)
+{
+    const int Q  = blockIdx.z;
+    const int p  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nu = blockIdx.y * blockDim.y + threadIdx.y;
+    if (Q >= naux || p >= nmo || nu >= nao) return;
+
+    const size_t in_off  = (static_cast<size_t>(Q) * nao + nu)
+                         * static_cast<size_t>(nmo) + p;
+    const size_t out_off = (static_cast<size_t>(Q) * nmo + p)
+                         * static_cast<size_t>(nao) + nu;
+    d_out[out_off] = d_in[in_off];
+}
+
+static void launch_transpose_b_tmp(const real_t* d_in, real_t* d_out,
+                                   int naux, int nmo, int nao,
+                                   cudaStream_t stream = 0)
+{
+    constexpr int TILE_X = 32;
+    constexpr int TILE_Y = 8;
+    dim3 block(TILE_X, TILE_Y, 1);
+    dim3 grid((nmo + TILE_X - 1) / TILE_X,
+              (nao + TILE_Y - 1) / TILE_Y,
+              naux);
+    transpose_b_tmp_per_aux_kernel<<<grid, block, 0, stream>>>(
+        d_in, d_out, naux, nmo, nao);
+}
+
 // Helper: standard (right half-transform → transpose → left half-transform → ERI)
 // pipeline using a full-B pointer on the calling device. Returns eri_mo on the
 // caller's device.
+//
+// Step 6.3b — per-pair cudaMalloc/Free for the d_B_tmp / d_B_tmp2 / d_B_mo
+// scratch buffers cost ~10 ms/pair at hexamer scale (3 × cudaMalloc + 3 ×
+// cudaMemset(zero) + 3 × cudaFree). We cache them in a thread-local pool that
+// grows on demand.
+//
+// Step 6.3c — if d_eri_out is non-null, the final DGEMM writes there directly
+// and the function returns d_eri_out (caller-owned buffer). When null (legacy
+// path), a fresh buffer is allocated as before and the caller frees it.
 static real_t* build_eri_from_B_pipeline(
     const real_t* d_C, int nmo, int nao, int naux,
-    const real_t* d_B, cublasHandle_t handle)
+    const real_t* d_B, cublasHandle_t handle,
+    real_t* d_eri_out = nullptr)
 {
     const double alpha = 1.0, beta = 0.0;
     const size_t nmo2 = (size_t)nmo * nmo;
 
-    real_t* d_B_tmp = nullptr;
-    tracked_cudaMalloc(&d_B_tmp, (size_t)naux * nao * nmo * sizeof(real_t));
+    // ---- Step 6.3b: thread-local scratch pool (per device) ----
+    static thread_local real_t* ws_B_tmp       = nullptr;
+    static thread_local real_t* ws_B_tmp2      = nullptr;
+    static thread_local real_t* ws_B_mo        = nullptr;
+    static thread_local size_t  ws_B_tmp_bytes = 0;   // size of B_tmp / B_tmp2
+    static thread_local size_t  ws_B_mo_bytes  = 0;
+    static thread_local int     ws_device      = -1;
+
+    int curr_dev = 0;
+    cudaGetDevice(&curr_dev);
+    const size_t need_B_tmp_bytes = (size_t)naux * nao * nmo * sizeof(real_t);
+    const size_t need_B_mo_bytes  = (size_t)naux * nmo2 * sizeof(real_t);
+
+    auto free_ws = [&]() {
+        if (ws_B_tmp)  { tracked_cudaFree(ws_B_tmp);  ws_B_tmp  = nullptr; }
+        if (ws_B_tmp2) { tracked_cudaFree(ws_B_tmp2); ws_B_tmp2 = nullptr; }
+        if (ws_B_mo)   { tracked_cudaFree(ws_B_mo);   ws_B_mo   = nullptr; }
+        ws_B_tmp_bytes = 0;
+        ws_B_mo_bytes  = 0;
+    };
+
+    if (curr_dev != ws_device) {
+        // Workspace is on a different device — free it (under that device's
+        // context) and re-allocate fresh on the current one.
+        if (ws_device >= 0 && (ws_B_tmp || ws_B_tmp2 || ws_B_mo)) {
+            const int saved = curr_dev;
+            cudaSetDevice(ws_device);
+            free_ws();
+            cudaSetDevice(saved);
+        } else {
+            // ws_device == -1, no buffers yet.
+            free_ws();
+        }
+        ws_device = curr_dev;
+    }
+
+    if (need_B_tmp_bytes > ws_B_tmp_bytes) {
+        if (ws_B_tmp)  { tracked_cudaFree(ws_B_tmp);  ws_B_tmp  = nullptr; }
+        if (ws_B_tmp2) { tracked_cudaFree(ws_B_tmp2); ws_B_tmp2 = nullptr; }
+        tracked_cudaMalloc(&ws_B_tmp,  need_B_tmp_bytes);
+        tracked_cudaMalloc(&ws_B_tmp2, need_B_tmp_bytes);
+        ws_B_tmp_bytes = need_B_tmp_bytes;
+    }
+    if (need_B_mo_bytes > ws_B_mo_bytes) {
+        if (ws_B_mo) { tracked_cudaFree(ws_B_mo); ws_B_mo = nullptr; }
+        tracked_cudaMalloc(&ws_B_mo, need_B_mo_bytes);
+        ws_B_mo_bytes = need_B_mo_bytes;
+    }
+
+    real_t* d_B_tmp  = ws_B_tmp;
+    real_t* d_B_tmp2 = ws_B_tmp2;
+    real_t* d_B_mo   = ws_B_mo;
+
     cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
         nmo, (long long)naux * nao, nao,
         &alpha, d_C, nmo, d_B, nao, &beta, d_B_tmp, nmo);
 
-    real_t* d_B_tmp2 = nullptr;
-    tracked_cudaMalloc(&d_B_tmp2, (size_t)naux * nao * nmo * sizeof(real_t));
-    for (int Q = 0; Q < naux; Q++) {
-        cublasDgeam(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            nao, nmo, &alpha,
-            d_B_tmp + (size_t)Q * nao * nmo, nmo,
-            &beta, nullptr, nao,
-            d_B_tmp2 + (size_t)Q * nmo * nao, nao);
+    // Step 6.3: single kernel launch in lieu of naux × cublasDgeam (the
+    // per-Q dispatch overhead was ~1.3s out of 21s pair_setup at hexamer
+    // scale, 576 × 465 = 268k cublasDgeam calls).
+    {
+        cudaStream_t stream = nullptr;
+        cublasGetStream(handle, &stream);
+        launch_transpose_b_tmp(d_B_tmp, d_B_tmp2, naux, nmo, nao, stream);
     }
-    tracked_cudaFree(d_B_tmp);
 
-    real_t* d_B_mo = nullptr;
-    tracked_cudaMalloc(&d_B_mo, (size_t)naux * nmo2 * sizeof(real_t));
     cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
         nmo, (long long)naux * nmo, nao,
         &alpha, d_C, nmo, d_B_tmp2, nao, &beta, d_B_mo, nmo);
-    tracked_cudaFree(d_B_tmp2);
 
-    real_t* d_eri_mo = nullptr;
-    tracked_cudaMalloc(&d_eri_mo, nmo2 * nmo2 * sizeof(real_t));
+    real_t* d_eri_mo = d_eri_out;
+    if (d_eri_mo == nullptr) {
+        // Legacy path: allocate a fresh output buffer; caller frees.
+        tracked_cudaMalloc(&d_eri_mo, nmo2 * nmo2 * sizeof(real_t));
+    }
     cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
         nmo2, nmo2, naux,
         &alpha, d_B_mo, nmo2, d_B_mo, nmo2, &beta, d_eri_mo, nmo2);
-    tracked_cudaFree(d_B_mo);
 
+    // ws_B_tmp / ws_B_tmp2 / ws_B_mo are NOT freed here — they live in the
+    // thread-local cache and are reused across calls. d_eri_mo is either
+    // a freshly allocated buffer (caller frees) or the caller-supplied
+    // d_eri_out (no free needed).
     return d_eri_mo;
 }
 
@@ -2298,6 +2402,41 @@ real_t* ERI_RI_Distributed_RHF::build_mo_eri(const real_t* d_C, int nmo) const {
         d_C, nmo, nao, naux_local_[0], d_B_local_[0], handle);
     cudaDeviceSynchronize();
     return d_eri_mo;
+}
+
+// Step 6.3c — workspace variant for the replicated-B path. Writes the MO ERI
+// directly into the caller-supplied d_eri_out buffer (must be ≥ nmo⁴ doubles).
+// For the multi-GPU NCCL distributed path the caller-provided buffer can't
+// be used directly (each GPU produces a partial result that's AllReduced
+// in-place), so we fall back to the legacy build_mo_eri + cudaMemcpy.
+void ERI_RI_Distributed_RHF::build_mo_eri_into(const real_t* d_C, int nmo,
+                                               real_t* d_eri_out) const
+{
+    const int nao = num_basis_;
+    const int naux = num_auxiliary_basis_;
+    const size_t nmo2 = (size_t)nmo * nmo;
+
+    if (b_replicated_) {
+        // Fast path: pipeline writes into d_eri_out, no extra alloc/copy.
+        int curr_dev;
+        cudaGetDevice(&curr_dev);
+        if (curr_dev < 0 || curr_dev >= num_gpus_ || !d_B_full_per_gpu_[curr_dev]) {
+            throw std::runtime_error("build_mo_eri_into: replicated B requested but device "
+                                     + std::to_string(curr_dev) + " has no copy");
+        }
+        cublasHandle_t handle = gpu::GPUHandle::cublas();
+        build_eri_from_B_pipeline(
+            d_C, nmo, nao, naux, d_B_full_per_gpu_[curr_dev], handle,
+            d_eri_out);
+        cudaDeviceSynchronize();
+        return;
+    }
+
+    // Distributed multi-GPU or single-GPU non-replicated paths: fall back
+    // to the base-class default (build_mo_eri + cudaMemcpyDeviceToDevice
+    // into d_eri_out + tracked_cudaFree). DLPNO pair_setup never reaches
+    // here in practice because Step 6.3 Phase A pre-replicates B.
+    ERI::build_mo_eri_into(d_C, nmo, d_eri_out);
 }
 
 // ============================================================================

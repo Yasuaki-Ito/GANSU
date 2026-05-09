@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1.6
+#
+# manylinux_2_28-compliant build environment for the GANSU PyPI wheel.
+#
+# Base: PyPA's official manylinux_2_28 image (RHEL 8, glibc 2.28,
+# gcc-toolset-14, patchelf, auditwheel, all CPython versions). On top we
+# install the CUDA 12.9 toolkit from NVIDIA's RHEL 8 RPM repo.
+#
+# CUDA 12.9 is needed both because GANSU's CMakeLists requires >= 12.9 and
+# because earlier CUDA versions (e.g. 12.6) do not support the gcc-14 host
+# compiler that ships in the current manylinux image.
+#
+# Produces wheels installable on Ubuntu 18.04+, Debian 10+, RHEL 8+ and
+# similar — the broadest reach achievable for a CUDA Python package today.
+
+FROM quay.io/pypa/manylinux_2_28_x86_64
+
+ARG CUDA=12-9
+
+RUN dnf config-manager --add-repo \
+        https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo \
+ && dnf install -y \
+        cuda-nvcc-${CUDA} \
+        cuda-cudart-devel-${CUDA} \
+        libcublas-devel-${CUDA} \
+        libcusolver-devel-${CUDA} \
+        libcusparse-devel-${CUDA} \
+        libcurand-devel-${CUDA} \
+        libnccl-devel \
+ && dnf clean all && rm -rf /var/cache/dnf
+
+ENV CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:/opt/python/cp311-cp311/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+
+# Modern CMake (manylinux image's CMake is older than GANSU's 3.31 requirement)
+# and the Python build toolchain. Python 3.11 is used for the build itself —
+# the resulting wheel is `py3-none-...` so any 3.x works at install time.
+RUN pip install --no-cache-dir \
+        "cmake>=3.31" ninja \
+        build wheel auditwheel setuptools
+
+# Disable git's "dubious ownership" check. The repo is bind-mounted from the
+# host, so its files are owned by the host user (e.g. WSL's $UID), while the
+# container runs as root. Without this, FetchContent's `git clone` of Eigen
+# fails on checkout. The setting affects only this throwaway build container.
+RUN git config --system --add safe.directory '*'
+
+WORKDIR /work
+CMD ["bash", "script/build_wheel.sh"]

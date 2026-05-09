@@ -17,6 +17,7 @@
  */
 
 #include "thc_collocation.hpp"
+#include <memory>
 
 #include <cmath>
 #include <cassert>

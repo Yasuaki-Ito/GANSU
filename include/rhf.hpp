@@ -1114,6 +1114,13 @@ public:
     /// Build MO ERI from distributed B_local: gather full B on GPU 0, then delegate
     real_t* build_mo_eri(const real_t* d_C, int nmo) const override;
 
+    /// Step 6.3c — workspace variant. Writes MO ERI into the caller-supplied
+    /// d_eri_out (≥ nmo⁴ doubles). Replicated path runs the pipeline directly
+    /// on d_eri_out; distributed/multi-GPU paths fall back to the base-class
+    /// default (allocate + copy).
+    void build_mo_eri_into(const real_t* d_C, int nmo,
+                           real_t* d_eri_out) const override;
+
     /**
      * @brief Replicate the full B intermediate to every GPU.
      *

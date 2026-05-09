@@ -160,14 +160,15 @@ static std::vector<AngPt> product_angular_grid(int n_theta, int n_phi) {
 //  Cartesian angular components for shell type l
 // ============================================================
 static std::vector<std::array<int,3>> cartesian_components(int l) {
-    if (l == 0) return {{0,0,0}};
-    if (l == 1) return {{1,0,0}, {0,1,0}, {0,0,1}};
-    if (l == 2) return {{2,0,0}, {0,2,0}, {0,0,2}, {1,1,0}, {1,0,1}, {0,1,1}};
-    if (l == 3) return {{3,0,0}, {0,3,0}, {0,0,3}, {1,2,0}, {2,1,0}, {2,0,1}, {1,0,2}, {0,1,2}, {0,2,1}, {1,1,1}};
-    std::vector<std::array<int,3>> comps;
+    using A = std::array<int,3>;
+    if (l == 0) return {A{0,0,0}};
+    if (l == 1) return {A{1,0,0}, A{0,1,0}, A{0,0,1}};
+    if (l == 2) return {A{2,0,0}, A{0,2,0}, A{0,0,2}, A{1,1,0}, A{1,0,1}, A{0,1,1}};
+    if (l == 3) return {A{3,0,0}, A{0,3,0}, A{0,0,3}, A{1,2,0}, A{2,1,0}, A{2,0,1}, A{1,0,2}, A{0,1,2}, A{0,2,1}, A{1,1,1}};
+    std::vector<A> comps;
     for (int lx = l; lx >= 0; lx--)
         for (int ly = l-lx; ly >= 0; ly--)
-            comps.push_back({lx, ly, l-lx-ly});
+            comps.push_back(A{lx, ly, l-lx-ly});
     return comps;
 }
 

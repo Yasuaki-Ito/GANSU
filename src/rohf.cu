@@ -18,6 +18,7 @@
  */
 
 #include "types.hpp"
+#include <memory>
 #include "rohf.hpp"
 #include "gpu_manager.hpp"
 #include "utils.hpp" // THROW_EXCEPTION

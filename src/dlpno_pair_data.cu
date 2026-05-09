@@ -16,6 +16,8 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <stdexcept>
 
 #ifdef _OPENMP
@@ -25,6 +27,7 @@
 #include "diis.hpp"
 #include "dlpno_pno.hpp"
 #include "dlpno_picache_gpu.hpp"
+#include "dlpno_resid_gpu.hpp"
 
 namespace gansu {
 
@@ -458,7 +461,26 @@ LMP2Status iterate_dlpno_ccsd_t2(
     // Layout: each pair contributes its n_pno² Y entries, padded by the per-
     // pair offset table. Error vector is the per-pair Jacobi update
     // ΔY_{ij} = -R/D collected per iteration.
-    DIIS diis(8, 2);
+    //
+    // max_hist=6 (was 8 in Phase 2.7): on large systems where the residual
+    // norm shrinks across many orders of magnitude, the oldest 2 entries in
+    // an 8-deep window become near-orthogonal to the latest update direction
+    // and contribute mostly to B's null space. A shorter window keeps DIIS
+    // working on a more locally-coherent subspace.
+    DIIS diis(6, 2);
+    // Phase 2.7b: track prev_r_max to detect convergence pathology. On large
+    // saturated systems (e.g. cholesterol cc-pVDZ, 5886 pairs) DIIS can stall
+    // around 1e-7 with near-parallel error vectors; the B matrix becomes
+    // numerically singular, extrapolation either throws or produces a
+    // non-improving step. Two reset triggers:
+    //   (1) rebound: r_max increases by >5% — a clear sign of trouble.
+    //   (2) stagnation: 4 consecutive iters with factor > 0.92 — DIIS has
+    //       degraded to plain-Jacobi rate and history is poisoning the
+    //       subspace; refresh fixes the asymptotic creep.
+    real_t prev_r_max = std::numeric_limits<real_t>::max();
+    int n_stalled = 0;
+    constexpr real_t kStallFactor = 0.92;
+    constexpr int    kStallCount  = 4;
     std::vector<size_t> y_offset(pairs.size() + 1, 0);
     for (size_t idx = 0; idx < pairs.size(); ++idx) {
         const int n_p = pairs[idx].n_pno;
@@ -486,16 +508,38 @@ LMP2Status iterate_dlpno_ccsd_t2(
         }
     }
 
-    // Step 6.0 — GPU port for pi_cache build (CPU fallback when GPU is
-    // unavailable). Padded barS uploaded once on construction; per-iter
-    // rebuild() does H2D Y_old → 2 strided batched DGEMMs → D2H pi.
+    // Step 6.0 + 6.1 — GPU port for pi_cache + pi_T_stack build (CPU
+    // fallback when GPU memory is insufficient). barS, pair_lookup,
+    // setups[idx].i, and per-pair n_pno_per_pair are uploaded once on
+    // construction; per-iter rebuild_with_stack() does H2D Y → strided
+    // batched DGEMM (Step 6.0) → custom pack kernel (Step 6.1) → D2H both.
     std::vector<int> n_pno_per_pair(pairs.size(), 0);
     int max_n_pno = 0;
     for (size_t i = 0; i < pairs.size(); ++i) {
         n_pno_per_pair[i] = pairs[i].n_pno;
         if (pairs[i].n_pno > max_n_pno) max_n_pno = pairs[i].n_pno;
     }
-    PiCacheGpu pgpu(barS_cache, n_pno_per_pair, max_n_pno);
+    std::vector<int> setup_i_per_pair(pairs.size(), 0);
+    for (size_t i = 0; i < pairs.size(); ++i) {
+        setup_i_per_pair[i] = setups[i].i;
+    }
+    PiCacheGpu pgpu(barS_cache, n_pno_per_pair, max_n_pno,
+                    &pair_lookup, &setup_i_per_pair, nocc);
+
+    // Step 6.2 — GPU port for ph-ladder R contributions. Borrows pi_T_stack
+    // and per-pair metadata from pgpu; uploads iter-invariant V_meta_T/TT,
+    // T_meta, and W_bare_ov{ov,vo}_{i,j} on construction. Falls back to
+    // active()=false (and per-pair CPU ph-ladder kicks back in) when GPU
+    // memory is insufficient or pgpu isn't in stacked mode.
+    std::unique_ptr<ResidGpu> rgpu;
+    if (phase24 != nullptr && phase24->nocc == nocc && pgpu.stacked()) {
+        rgpu = std::make_unique<ResidGpu>(
+            pgpu, setups, pairs, *phase24, F_LMO, nocc, max_n_pno);
+    }
+    std::vector<RowMatXd> R_ph_acc;
+    if (rgpu && rgpu->active()) {
+        R_ph_acc.assign(pairs.size(), RowMatXd());
+    }
 
     // ---- pi_T_stack (Step 3): per-iter (k, l, d)-stacked projection ----
     // pi_T_stack[idx](a, (k·nocc + l)·n + d) = π_{k, l}^{oriented}[a, d]
@@ -594,52 +638,24 @@ LMP2Status iterate_dlpno_ccsd_t2(
             Y_old[idx] = pairs[idx].Y;
         }
 
-        // ---- Build pi_cache from Y_old (re-built each iter). ----
-        // Step 6.0: pi_cache build itself is GPU strided-batched (or CPU
-        // fallback inside pgpu). pi_T_stack assembly stays on CPU and just
-        // re-blocks the host pi_cache result; it's cheap relative to the
-        // matmul cost so leaving it for Step 6.1.
+        // ---- Build pi_cache + pi_T_stack from Y_old (re-built each iter).
+        // Step 6.1: pgpu.rebuild_with_stack does both — GPU strided-batched
+        // pi_cache build (Step 6.0), then a custom pack kernel that reads
+        // pi_pad on-device, applies the (k, l)-oriented transpose flag, and
+        // writes pi_T_stack[i_ij] in unpadded ragged layout. Falls back
+        // internally to the CPU OMP middleCols loop if stacked-mode
+        // buffers couldn't be allocated.
         {
             const auto t_pi0 = prof_clock::now();
-            pgpu.rebuild(Y_old, pi_cache);
-
-            #pragma omp parallel for schedule(static)
-            for (long long i_ij = 0; i_ij < static_cast<long long>(pairs.size());
-                 ++i_ij)
-            {
-                const int n_ij = pairs[i_ij].n_pno;
-                if (n_ij == 0) {
-                    pi_T_stack[i_ij].resize(0, 0);
-                    continue;
-                }
-                // pi_T_stack[i_ij](a, (k·nocc + l)·n_ij + d) = π_{k,l}^{oriented}[a, d]
-                pi_T_stack[i_ij].setZero(
-                    n_ij,
-                    static_cast<size_t>(nocc) * nocc * n_ij);
-                for (int k = 0; k < nocc; ++k) {
-                    for (int l = 0; l < nocc; ++l) {
-                        const int idx_kl = pair_lookup[k * nocc + l];
-                        if (pairs[idx_kl].n_pno == 0) continue;
-                        const PairSetup& skl = setups[idx_kl];
-                        const RowMatXd& pi_canon =
-                            pi_cache[i_ij][idx_kl];
-                        const size_t col_off =
-                            (static_cast<size_t>(k) * nocc + l) * n_ij;
-                        if (skl.i != k) {
-                            pi_T_stack[i_ij].middleCols(col_off, n_ij) =
-                                pi_canon.transpose();
-                        } else {
-                            pi_T_stack[i_ij].middleCols(col_off, n_ij) =
-                                pi_canon;
-                        }
-                    }
-                }
-            }
+            pgpu.rebuild_with_stack(Y_old, pi_cache, pi_T_stack);
             dt_picache += std::chrono::duration<double>(
                 prof_clock::now() - t_pi0).count();
         }
 
         // ---- Refresh ΔF_{ki} (hole dressing). ----
+        // Step 6.5: dF_ki must be ready BEFORE rgpu's inter-pair Fock kernels
+        // launch (they read d_dF_ki). Compute it on CPU first, then hand
+        // off to rgpu->compute_async(dF_ki).
         const auto t_dFki_0 = prof_clock::now();
         std::fill(dF_ki.begin(), dF_ki.end(), 0.0);
         if (phase24 != nullptr && phase24->nocc == nocc) {
@@ -701,6 +717,19 @@ LMP2Status iterate_dlpno_ccsd_t2(
         }
         dt_dFki += std::chrono::duration<double>(prof_clock::now() - t_dFki_0).count();
 
+        // ---- Step 6.2/6.4/6.5: per-iter R contributions on GPU. ----
+        // R_ph_acc[idx] (n × n) is added inside the resid OMP loop below
+        // in lieu of the per-pair CPU build_stack/W_block code AND (with
+        // Step 6.5) the per-pair inter-pair Fock i+j sweeps.
+        //
+        // The async variant launches all GPU work (slice + W_block + 8
+        // contractions + 2 Fock kernels) on the default stream so DFpair
+        // (the next CPU block) can run concurrently. compute_finalize()
+        // syncs on the recorded event before the resid loop reads R_ph_acc.
+        if (rgpu && rgpu->active()) {
+            rgpu->compute_async(dF_ki);
+        }
+
         // ---- Refresh ΔF^{(ij)} per-pair particle dressing matrix. ----
         // Step 3 batched form: the previous nocc² inner loop is replaced by a
         // single (n × nocc²·n × n) DGEMM per pair using pi_T_stack and
@@ -728,6 +757,12 @@ LMP2Status iterate_dlpno_ccsd_t2(
             }
         }
         dt_DFpair += std::chrono::duration<double>(prof_clock::now() - t_DFpair_0).count();
+
+        // Step 6.4: sync on rgpu's async D2H + unpack to R_ph_acc. After
+        // this point R_ph_acc[idx] is ready for the resid OMP loop.
+        if (rgpu && rgpu->active()) {
+            rgpu->compute_finalize(R_ph_acc);
+        }
 
         // Phase A — parallelise the per-pair residual + Jacobi update.
         // Each thread handles its own slab of pair indices: writes to
@@ -767,10 +802,20 @@ LMP2Status iterate_dlpno_ccsd_t2(
             }
             // ---------------------------------------------------------
 
+            // Step 6.5: when ResidGpu is active, both inter-pair Fock i+j
+            // sweeps live in R_ph_acc[idx] (added below alongside the
+            // ph-ladder result). Skip the per-pair CPU sweeps.
+            const bool skip_cpu_inter_pair_fock =
+                (rgpu && rgpu->active()
+                 && idx < static_cast<long long>(R_ph_acc.size())
+                 && R_ph_acc[idx].rows() == n
+                 && R_ph_acc[idx].cols() == n);
+
             // Inter-pair Fock coupling on i.
             // Phase 2.4.1: F_eff[i,k] = F_LMO[i,k] + ΔF[k,i] where ΔF uses
             // pair (i,i)'s amplitudes (l=i restriction of canonical F_ki).
             // dF_ki[k*nocc + i] = 0 when phase24 is null (Phase 2.3.x only).
+            if (!skip_cpu_inter_pair_fock)
             for (int k = 0; k < nocc; ++k) {
                 if (k == sij.i) continue;
                 const real_t F_ik =
@@ -794,6 +839,7 @@ LMP2Status iterate_dlpno_ccsd_t2(
             // Inter-pair Fock coupling on j.
             // Phase 2.4.1: F_eff[l,j] = F_LMO[l,j] + ΔF[l,j] using pair
             // (j,j)'s amplitudes (l=j restriction).
+            if (!skip_cpu_inter_pair_fock)
             for (int l = 0; l < nocc; ++l) {
                 if (l == sij.j) continue;
                 const real_t F_lj =
@@ -883,7 +929,13 @@ LMP2Status iterate_dlpno_ccsd_t2(
                 //          = pi_T_stack · W_repeat
                 //   with W_repeat[(kl)·n + d, b] = W_kl_eff[kl] · δ_{db}
                 //   (block-diagonal in d, scaled by W_kl_eff per (k, l) row block).
-                if (idx < static_cast<long long>(V_stacked_oooo.size())
+                //
+                // Step 6.6: when ResidGpu is active, the oooo lad result is
+                // already accumulated into R_ph_acc[idx] by the GPU pipeline.
+                // Skip the per-pair CPU sweep.
+                const bool skip_cpu_oooo = skip_cpu_inter_pair_fock;
+                if (!skip_cpu_oooo
+                    && idx < static_cast<long long>(V_stacked_oooo.size())
                     && V_stacked_oooo[idx].size() > 0
                     && pi_T_stack[idx].size() > 0)
                 {
@@ -947,7 +999,17 @@ LMP2Status iterate_dlpno_ccsd_t2(
                 //   Σ_k π_kj  · W_k_i2^T  = PI_kj_TT   · W_block_i2^T
                 //
                 // (j-side mirrors with PI_ki and W_block_j[2] ← I = sij.j.)
-                if (idx < static_cast<long long>(V_meta_T.size())
+                // Step 6.2: when ResidGpu is active, R_ph_acc[idx] already
+                // holds the i-side + j-side ph-ladder contributions. Skip
+                // the CPU build_stack/W_block path entirely.
+                if (rgpu && rgpu->active()
+                    && idx < static_cast<long long>(R_ph_acc.size())
+                    && R_ph_acc[idx].rows() == n
+                    && R_ph_acc[idx].cols() == n)
+                {
+                    R.noalias() += R_ph_acc[idx];
+                }
+                else if (idx < static_cast<long long>(V_meta_T.size())
                     && V_meta_T[idx].size() > 0)
                 {
                     const int nn = nocc * n;
@@ -1109,8 +1171,36 @@ LMP2Status iterate_dlpno_ccsd_t2(
         // the extrapolated Y is a residual-norm-minimising linear combination
         // of the recent iterates — robust against the non-monotonic damping
         // patterns produced by aggressive ladder pieces.
+        //
+        // Phase 2.7b: reset DIIS history on three triggers — (1) rebound
+        // (r_max increases by >5%), (2) stagnation (factor > 0.92 for 4
+        // consecutive iters → DIIS is stuck at plain-Jacobi rate), and
+        // (3) singular B at extrapolation. Without these, on large saturated
+        // systems the subspace becomes near-rank-deficient at ~1e-7 and the
+        // remaining iterations creep at the un-accelerated rate (~0.92/iter).
         const auto t_diis_0 = prof_clock::now();
         if (flat_size > 0) {
+            const bool rebound = (iter > 0) && (r_max > prev_r_max * 1.05);
+            if (iter > 0 && r_max > prev_r_max * kStallFactor) {
+                ++n_stalled;
+            } else {
+                n_stalled = 0;
+            }
+            const bool stagnation = (n_stalled >= kStallCount);
+            if (rebound || stagnation) {
+                if (verbose >= 2 && diis.history_size() > 0) {
+                    const char* why = rebound ? "rebound" : "stagnation";
+                    std::cout << "[DLPNO] DIIS reset on " << why
+                              << " (max|R|: "
+                              << std::scientific << std::setprecision(3)
+                              << prev_r_max << " -> " << r_max
+                              << ", history=" << diis.history_size();
+                    if (stagnation) std::cout << ", stalled=" << n_stalled;
+                    std::cout << ")" << std::endl;
+                }
+                diis.clear();
+                n_stalled = 0;
+            }
             diis.push(y_flat, e_flat);
             if (diis.can_extrapolate()) {
                 try {
@@ -1128,11 +1218,21 @@ LMP2Status iterate_dlpno_ccsd_t2(
                             }
                     }
                 } catch (const std::runtime_error&) {
-                    // singular DIIS B matrix → keep plain Jacobi update.
+                    // singular DIIS B matrix → reset history so the next
+                    // iteration starts from a clean subspace instead of
+                    // accumulating more near-parallel error vectors.
+                    if (verbose >= 2) {
+                        std::cout << "[DLPNO] DIIS reset on singular B"
+                                  << " (history=" << diis.history_size()
+                                  << ")" << std::endl;
+                    }
+                    diis.clear();
+                    n_stalled = 0;
                 }
             }
         }
         dt_diis += std::chrono::duration<double>(prof_clock::now() - t_diis_0).count();
+        prev_r_max = r_max;
 
         st.max_R = r_max;
         if (verbose >= 2) {

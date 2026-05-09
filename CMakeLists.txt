@@ -44,7 +44,9 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(ENABLE_GPU)
     # set compute capability
-    set(CMAKE_CUDA_ARCHITECTURES 80 86 90)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 80 86 90)
+    endif()
     # Enable line info and debug info for CUDA when in Debug mode
     set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -lineinfo")
     set(CMAKE_CUDA_STANDARD 17)
@@ -228,6 +230,7 @@ set(SOURCES
     src/dlpno_pno.cu
     src/dlpno_pair_data.cu
     src/dlpno_picache_gpu.cu
+    src/dlpno_resid_gpu.cu
     src/dlpno_mp2.cu
     src/dlpno_ccsd.cu
 )
@@ -270,6 +273,12 @@ target_link_libraries(gansu
     )
 
 if(ENABLE_GPU)
+    # Make the CUDA toolkit headers (cuda_runtime.h etc.) visible to plain
+    # .cpp sources of this target — by default they are only on the include
+    # path for .cu files. Required on minimal toolchains (manylinux/UBI8
+    # Docker images) where /usr/local/cuda/include is not in the system
+    # search path; harmless on distros where it already is.
+    target_include_directories(gansu PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(gansu cublas cusolver ${CUDA_LIBRARIES})
     # Delay-load cuBLAS/cuSOLVER DLLs (Windows only) so binary runs without GPU
     if(WIN32)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <array>
 #include <cmath>
 #include <string>
 #include <algorithm>
@@ -134,7 +135,7 @@ inline void get_cartesian_components(int l, std::vector<std::array<int,3>>& comp
     comps.clear();
     for (int i = l; i >= 0; i--)
         for (int j = l - i; j >= 0; j--)
-            comps.push_back({i, j, l - i - j});
+            comps.push_back(std::array<int,3>{i, j, l - i - j});
 }
 
 } // namespace detail

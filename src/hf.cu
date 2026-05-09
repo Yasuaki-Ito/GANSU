@@ -20,6 +20,7 @@
  * @details This file contains the implementation of the HF class.
  */
 #include <cmath> // sqrt
+#include <memory>
 #include <cassert>
 #include <algorithm> // std::sort
 #include <cmath> // sqrt

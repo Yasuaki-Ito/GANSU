@@ -21,9 +21,15 @@ Or with context manager:
 """
 
 import ctypes
+import hashlib
+import json
 import os
+import platform as _platform_module
 import sys
 import contextlib
+import urllib.error
+import urllib.request
+from pathlib import Path
 import numpy as np
 from gansu._basis import resolve_basis, resolve_auxiliary_basis, list_basis_sets
 
@@ -31,39 +37,182 @@ from gansu._basis import resolve_basis, resolve_auxiliary_basis, list_basis_sets
 #  Library loading
 # ---------------------------------------------------------------------------
 
-def _find_lib():
-    """Find libgansu.so in standard locations."""
-    _pkg = os.path.dirname(__file__)
-    _root = os.path.join(_pkg, "..", "..")
-    candidates = [
-        os.environ.get("GANSU_LIB", ""),
-        # Development: build/libgansu.so
-        os.path.join(_root, "build", "libgansu.so"),
-        os.path.join(_root, "build", "libgansu.dylib"),
-        # Binary distribution: lib/libgansu.so
-        os.path.join(_root, "lib", "libgansu.so"),
-        os.path.join(_root, "lib", "libgansu.dylib"),
-        # Bundled inside package: gansu/lib/
-        os.path.join(_pkg, "lib", "libgansu.so"),
-        os.path.join(_pkg, "lib", "libgansu.dylib"),
-        "libgansu.so",
-    ]
-    for p in candidates:
-        if p and os.path.isfile(p):
-            return p
-    return None
+# GitHub Releases URL pattern for the native shared library. The CI workflow
+# uploads `libgansu-<version>-<platform>.so` (and a matching .sha256) as
+# release assets, and the version + checksum are baked into the wheel via
+# _native_meta.json so a thin wheel can fetch the correct binary at runtime.
+GITHUB_RELEASE_URL_TEMPLATE = (
+    "https://github.com/Yasuaki-Ito/GANSU/releases/download/"
+    "v{version}/libgansu-{version}-{platform}.so"
+)
+
+
+def _platform_id():
+    """Return the platform identifier embedded in the .so asset filename."""
+    if sys.platform.startswith("linux"):
+        return f"linux-{_platform_module.machine().lower()}"
+    raise RuntimeError(
+        f"GANSU currently only ships binaries for Linux x86_64; "
+        f"detected platform {sys.platform!r}.")
+
+
+def _native_meta():
+    """Load native-library metadata (version + sha256) shipped with the wheel."""
+    meta_path = Path(__file__).parent / "_native_meta.json"
+    if not meta_path.is_file():
+        return None
+    with open(meta_path) as f:
+        return json.load(f)
+
+
+def _user_cache_dir(version):
+    """Per-version directory for the cached native library."""
+    base = os.environ.get("GANSU_CACHE")
+    if base:
+        return Path(base) / version
+    xdg = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return Path(xdg) / "gansu" / version
+
+
+def _sha256_of_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _download_with_progress(url, dest):
+    """Stream `url` to `dest` (atomic via .part), printing progress to stderr."""
+    print(f"==> Downloading libgansu.so from {url}", file=sys.stderr)
+
+    def hook(blocknum, blocksize, totalsize):
+        if totalsize <= 0:
+            return
+        done = min(totalsize, blocknum * blocksize)
+        pct = done * 100 // totalsize
+        print(f"\r    {done >> 20} / {totalsize >> 20} MB ({pct}%) ",
+              end="", file=sys.stderr, flush=True)
+
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    urllib.request.urlretrieve(url, str(tmp), reporthook=hook)
+    print("", file=sys.stderr)
+    tmp.replace(dest)
+
+
+def _find_or_fetch_lib():
+    """Resolve libgansu.so via env override / wheel-bundled / dev tree /
+    user cache / auto-download from GitHub Releases, in that priority order.
+
+    This makes the package work in three modes without any user action:
+    * `pip install gansu` → thin wheel, downloads the .so on first use.
+    * Direct-URL or offline install with the .so already on disk →
+      pointed at via `GANSU_LIB` or placed under `~/.cache/gansu/<ver>/`.
+    * In-tree development → picks up `build/libgansu.so` from a local cmake.
+    """
+    pkg_dir = Path(__file__).parent
+    repo_root = pkg_dir.parent.parent
+
+    # 1. Explicit override
+    env = os.environ.get("GANSU_LIB", "")
+    if env and Path(env).is_file():
+        return env
+
+    # 2. Bundled with this wheel (offline / heavy-wheel install)
+    for name in ("libgansu.so", "libgansu.dylib"):
+        p = pkg_dir / "lib" / name
+        if p.is_file():
+            return str(p)
+
+    # 3. In-tree development build
+    for p in (repo_root / "build" / "libgansu.so",
+              repo_root / "build" / "libgansu.dylib",
+              repo_root / "lib" / "libgansu.so"):
+        if p.is_file():
+            return str(p)
+
+    # 4. User cache (already downloaded for this version)
+    meta = _native_meta()
+    if meta is None:
+        raise RuntimeError(
+            "libgansu.so not found and no _native_meta.json shipped in this "
+            "wheel — cannot auto-download. Set GANSU_LIB to a local copy of "
+            "the library or reinstall the wheel.")
+
+    version = meta["version"]
+    expected_sha = meta["sha256"]
+    cached = _user_cache_dir(version) / "libgansu.so"
+    if cached.is_file():
+        if _sha256_of_file(cached) == expected_sha:
+            return str(cached)
+        cached.unlink()  # corrupted, fall through to re-download
+
+    # 5. Auto-download from GitHub Releases
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    url = GITHUB_RELEASE_URL_TEMPLATE.format(
+        version=version, platform=_platform_id())
+    try:
+        _download_with_progress(url, cached)
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"Failed to download libgansu.so from {url}: {e}\n"
+            f"Workaround: download the file manually and either set "
+            f"GANSU_LIB to its path or place it at {cached}.") from e
+
+    actual_sha = _sha256_of_file(cached)
+    if actual_sha != expected_sha:
+        cached.unlink()
+        raise RuntimeError(
+            f"Downloaded libgansu.so has SHA256 {actual_sha}, expected "
+            f"{expected_sha}. The release asset may have been tampered with "
+            f"or replaced. Aborting.")
+    return str(cached)
+
 
 _lib = None
+
+
+def _preload_cuda_libs():
+    """Preload CUDA shared libraries from nvidia-*-cu12 wheels, if installed.
+
+    When GANSU is installed via pip wheel, libcublas / libcusolver / libnccl
+    are provided by the `nvidia-*-cu12` packages under
+    `site-packages/nvidia/<lib>/lib/`. These directories are not on the dynamic
+    linker's search path, so we dlopen them with RTLD_GLOBAL before loading
+    libgansu.so. If the packages are not installed (development mode with a
+    system-wide CUDA toolkit), this is a silent no-op.
+    """
+    import importlib.util
+
+    # Order matters: cusparse before cusolver (cusolver depends on cusparse).
+    nvidia_libs = [
+        ("nvidia.cuda_runtime", "libcudart.so.12"),
+        ("nvidia.cublas", "libcublasLt.so.12"),
+        ("nvidia.cublas", "libcublas.so.12"),
+        ("nvidia.cusparse", "libcusparse.so.12"),
+        ("nvidia.cusolver", "libcusolver.so.11"),
+        ("nvidia.nccl", "libnccl.so.2"),
+    ]
+    for pkg, soname in nvidia_libs:
+        spec = importlib.util.find_spec(pkg)
+        if spec is None or spec.submodule_search_locations is None:
+            continue
+        for base in spec.submodule_search_locations:
+            so_path = os.path.join(base, "lib", soname)
+            if os.path.isfile(so_path):
+                try:
+                    ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+                break
+
 
 def _get_lib():
     global _lib
     if _lib is not None:
         return _lib
-    path = _find_lib()
-    if path is None:
-        raise RuntimeError(
-            "Cannot find libgansu.so. Set GANSU_LIB env var or build with "
-            "'cmake .. && make gansu_shared'")
+    _preload_cuda_libs()
+    path = _find_or_fetch_lib()
     _lib = ctypes.CDLL(path)
     _setup_signatures(_lib)
     return _lib

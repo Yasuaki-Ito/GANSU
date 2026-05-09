@@ -456,6 +456,23 @@ real_t* ERI_Stored::build_mo_eri(const real_t* d_C, int nmo) const {
     return d_eri_mo;
 }
 
+void ERI::build_mo_eri_into(const real_t* d_C, int nmo,
+                            real_t* d_eri_out) const {
+    // Step 6.3c — default fallback: delegate to build_mo_eri (which allocates
+    // a fresh buffer), copy into the caller's d_eri_out, then free. Subclasses
+    // that have a direct pipeline (ERI_RI, ERI_RI_Distributed_RHF) override
+    // this to write into d_eri_out in-place.
+    const size_t nmo4 = (size_t)nmo * nmo * nmo * nmo;
+    real_t* d_owned = build_mo_eri(d_C, nmo);
+    if (gpu::gpu_available()) {
+        cudaMemcpy(d_eri_out, d_owned, nmo4 * sizeof(real_t),
+                   cudaMemcpyDeviceToDevice);
+    } else {
+        std::memcpy(d_eri_out, d_owned, nmo4 * sizeof(real_t));
+    }
+    tracked_cudaFree(d_owned);
+}
+
 void ERI::compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const {
     const real_t* d_eri_ao = get_eri_matrix_device();
     if (!d_eri_ao) {
@@ -511,11 +528,65 @@ void ERI_RI::compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const 
     tracked_cudaFree(d_V);
 }
 
+#ifndef GANSU_CPU_ONLY
+// Step 6.3 — single CUDA kernel that replaces the per-Q cublasDgeam transpose
+// loop in ERI_RI::build_mo_eri (and its distributed-RI cousin in
+// eri_ri_distributed.cu). Each thread copies one element with a (ν, p) ↔ (p, ν)
+// swap inside the per-aux block. See eri_ri_distributed.cu for the full
+// derivation; the layout is the same here.
+namespace {
+__global__ void eri_ri_transpose_b_tmp_per_aux_kernel(
+    const real_t* __restrict__ d_in,
+    real_t*       __restrict__ d_out,
+    int naux, int nmo, int nao)
+{
+    const int Q  = blockIdx.z;
+    const int p  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nu = blockIdx.y * blockDim.y + threadIdx.y;
+    if (Q >= naux || p >= nmo || nu >= nao) return;
+    const size_t in_off  = (static_cast<size_t>(Q) * nao + nu)
+                         * static_cast<size_t>(nmo) + p;
+    const size_t out_off = (static_cast<size_t>(Q) * nmo + p)
+                         * static_cast<size_t>(nao) + nu;
+    d_out[out_off] = d_in[in_off];
+}
+inline void launch_eri_ri_transpose_b_tmp(
+    const real_t* d_in, real_t* d_out,
+    int naux, int nmo, int nao, cudaStream_t stream)
+{
+    constexpr int TILE_X = 32;
+    constexpr int TILE_Y = 8;
+    dim3 block(TILE_X, TILE_Y, 1);
+    dim3 grid((nmo + TILE_X - 1) / TILE_X,
+              (nao + TILE_Y - 1) / TILE_Y,
+              naux);
+    eri_ri_transpose_b_tmp_per_aux_kernel<<<grid, block, 0, stream>>>(
+        d_in, d_out, naux, nmo, nao);
+}
+} // anonymous namespace
+#endif // !GANSU_CPU_ONLY
+
 real_t* ERI_RI::build_mo_eri(const real_t* d_C, int nmo) const {
+    // Step 6.3c — thin wrapper around build_mo_eri_into to preserve the
+    // legacy "caller frees" API. New callers should prefer build_mo_eri_into
+    // with a pre-allocated workspace (see DLPNO pair_setup).
+    if (!gpu::gpu_available()) {
+        return ERI::build_mo_eri(d_C, nmo);
+    }
+    const size_t nmo4 = (size_t)nmo * nmo * nmo * nmo;
+    real_t* d_eri_mo = nullptr;
+    tracked_cudaMalloc(&d_eri_mo, nmo4 * sizeof(real_t));
+    build_mo_eri_into(d_C, nmo, d_eri_mo);
+    return d_eri_mo;
+}
+
+void ERI_RI::build_mo_eri_into(const real_t* d_C, int nmo,
+                               real_t* d_eri_out) const {
     // CPU fallback: delegate to the base-class implementation which uses
     // get_eri_matrix_device() (via reconstruct_ao_eri) + O(N^5) quarter transform.
     if (!gpu::gpu_available()) {
-        return ERI::build_mo_eri(d_C, nmo);
+        ERI::build_mo_eri_into(d_C, nmo, d_eri_out);
+        return;
     }
 
     // Build MO ERI directly: B(Q,μν) → B_mo(Q,pq) → (pq|rs) = B_mo^T B_mo
@@ -523,7 +594,7 @@ real_t* ERI_RI::build_mo_eri(const real_t* d_C, int nmo) const {
     //
     // Step 1: Right half-transform  B(Q,μ,ν) · C(ν,q) → B_tmp(Q,μ,q)
     // Step 2: Left half-transform   C(μ,p)^T · B_tmp(Q,μ,q) → B_mo(Q,p,q)
-    // Step 3: MO ERI = B_mo^T · B_mo
+    // Step 3: MO ERI = B_mo^T · B_mo  →  d_eri_out (caller-allocated)
     //
     // B layout: row-major (naux, nao, nao) → cuBLAS sees column-major (nao, nao*naux)
     // C layout: row-major (nao, nmo) → cuBLAS sees column-major (nmo, nao)
@@ -535,9 +606,58 @@ real_t* ERI_RI::build_mo_eri(const real_t* d_C, int nmo) const {
     cublasHandle_t handle = gpu::GPUHandle::cublas();
     const double alpha = 1.0, beta = 0.0;
 
-    // Allocate workspace: B_tmp (naux * nao * nmo)
-    real_t* d_B_tmp = nullptr;
-    tracked_cudaMalloc(&d_B_tmp, (size_t)naux * nao * nmo * sizeof(real_t));
+    // ---- Step 6.3b: thread-local scratch pool (per device) ----
+    // Caches d_B_tmp / d_B_tmp2 / d_B_mo across calls so that DLPNO
+    // pair_setup (~465 build_mo_eri invocations at hexamer scale) avoids
+    // 3 × cudaMalloc + 3 × cudaMemset(zero) + 3 × cudaFree per pair.
+    static thread_local real_t* ws_B_tmp       = nullptr;
+    static thread_local real_t* ws_B_tmp2      = nullptr;
+    static thread_local real_t* ws_B_mo        = nullptr;
+    static thread_local size_t  ws_B_tmp_bytes = 0;
+    static thread_local size_t  ws_B_mo_bytes  = 0;
+    static thread_local int     ws_device      = -1;
+
+    int curr_dev = 0;
+#ifndef GANSU_CPU_ONLY
+    cudaGetDevice(&curr_dev);
+#endif
+    const size_t need_B_tmp_bytes = (size_t)naux * nao * nmo * sizeof(real_t);
+    const size_t need_B_mo_bytes  = (size_t)naux * nmo2 * sizeof(real_t);
+
+    if (curr_dev != ws_device) {
+        if (ws_device >= 0 && (ws_B_tmp || ws_B_tmp2 || ws_B_mo)) {
+#ifndef GANSU_CPU_ONLY
+            const int saved = curr_dev;
+            cudaSetDevice(ws_device);
+#endif
+            if (ws_B_tmp)  { tracked_cudaFree(ws_B_tmp);  ws_B_tmp  = nullptr; }
+            if (ws_B_tmp2) { tracked_cudaFree(ws_B_tmp2); ws_B_tmp2 = nullptr; }
+            if (ws_B_mo)   { tracked_cudaFree(ws_B_mo);   ws_B_mo   = nullptr; }
+            ws_B_tmp_bytes = 0;
+            ws_B_mo_bytes  = 0;
+#ifndef GANSU_CPU_ONLY
+            cudaSetDevice(saved);
+#endif
+        }
+        ws_device = curr_dev;
+    }
+
+    if (need_B_tmp_bytes > ws_B_tmp_bytes) {
+        if (ws_B_tmp)  { tracked_cudaFree(ws_B_tmp);  ws_B_tmp  = nullptr; }
+        if (ws_B_tmp2) { tracked_cudaFree(ws_B_tmp2); ws_B_tmp2 = nullptr; }
+        tracked_cudaMalloc(&ws_B_tmp,  need_B_tmp_bytes);
+        tracked_cudaMalloc(&ws_B_tmp2, need_B_tmp_bytes);
+        ws_B_tmp_bytes = need_B_tmp_bytes;
+    }
+    if (need_B_mo_bytes > ws_B_mo_bytes) {
+        if (ws_B_mo) { tracked_cudaFree(ws_B_mo); ws_B_mo = nullptr; }
+        tracked_cudaMalloc(&ws_B_mo, need_B_mo_bytes);
+        ws_B_mo_bytes = need_B_mo_bytes;
+    }
+
+    real_t* d_B_tmp  = ws_B_tmp;
+    real_t* d_B_tmp2 = ws_B_tmp2;
+    real_t* d_B_mo   = ws_B_mo;
 
     // Step 1: Right half-transform (batched over Q slices)
     // For each Q: B_tmp(Q, μ, q) = Σ_ν B(Q, μ, ν) · C(ν, q)
@@ -572,30 +692,35 @@ real_t* ERI_RI::build_mo_eri(const real_t* d_C, int nmo) const {
     // Simplest: transpose B_tmp to get B_tmp2(Q, q, μ) then multiply by C
     // B_tmp2(naux*nmo, nao) then B_mo2 = B_tmp2 · C → (naux*nmo, nmo)
 
-    real_t* d_B_tmp2 = nullptr;
-    tracked_cudaMalloc(&d_B_tmp2, (size_t)naux * nao * nmo * sizeof(real_t));
-
     // Transpose: for each Q, transpose (nao, nmo) → (nmo, nao)
     // B_tmp[Q*nao*nmo + μ*nmo + q] → B_tmp2[Q*nmo*nao + q*nao + μ]
-    // Use cublasDgeam for batch transpose
+    //
+    // Step 6.3: replaced the per-Q cublasDgeam dispatch loop (576 × 465
+    // = 268k calls at hexamer scale) with a single custom kernel launch.
+#ifndef GANSU_CPU_ONLY
+    {
+        cudaStream_t stream = nullptr;
+        cublasGetStream(handle, &stream);
+        launch_eri_ri_transpose_b_tmp(d_B_tmp, d_B_tmp2, naux, nmo, nao, stream);
+    }
+#else
+    // CPU-only build: this entire `if (gpu_available())` branch is unreachable
+    // at runtime, but the cublasDgeam stubs in cuda_compat keep the code
+    // compilable.
     for (int Q = 0; Q < naux; Q++) {
         cublasDgeam(handle,
             CUBLAS_OP_T, CUBLAS_OP_N,
             nao, nmo,
             &alpha,
-            d_B_tmp + (size_t)Q * nao * nmo, nmo,  // col-major (nmo, nao) → transpose to (nao, nmo)
+            d_B_tmp + (size_t)Q * nao * nmo, nmo,
             &beta,
             nullptr, nao,
-            d_B_tmp2 + (size_t)Q * nmo * nao, nao); // result (nao, nmo) in col-major
+            d_B_tmp2 + (size_t)Q * nmo * nao, nao);
     }
-
-    tracked_cudaFree(d_B_tmp);
+#endif
 
     // Now B_tmp2 is (naux*nmo, nao) in row-major = (nao, naux*nmo) in col-major
     // Step 2 DGEMM: B_mo = B_tmp2 · C → (naux*nmo, nmo) in row-major
-    real_t* d_B_mo = nullptr;
-    tracked_cudaMalloc(&d_B_mo, (size_t)naux * nmo2 * sizeof(real_t));
-
     cublasDgemm(handle,
         CUBLAS_OP_N, CUBLAS_OP_N,
         nmo, (long long)naux * nmo, nao,
@@ -605,14 +730,9 @@ real_t* ERI_RI::build_mo_eri(const real_t* d_C, int nmo) const {
         &beta,
         d_B_mo, nmo);        // (nmo, naux*nmo) col-major = (naux*nmo, nmo) row-major
 
-    tracked_cudaFree(d_B_tmp2);
-
-    // Step 3: MO ERI = B_mo^T · B_mo
+    // Step 3: MO ERI = B_mo^T · B_mo  →  d_eri_out (caller-supplied)
     // B_mo is (naux, nmo²) row-major = (nmo², naux) col-major
     // ERI = B_cm · B_cm^T = (nmo², naux) × (naux, nmo²) = (nmo², nmo²) col-major
-    real_t* d_eri_mo = nullptr;
-    tracked_cudaMalloc(&d_eri_mo, nmo2 * nmo2 * sizeof(real_t));
-
     cublasDgemm(handle,
         CUBLAS_OP_N, CUBLAS_OP_T,
         nmo2, nmo2, naux,
@@ -620,9 +740,10 @@ real_t* ERI_RI::build_mo_eri(const real_t* d_C, int nmo) const {
         d_B_mo, nmo2,
         d_B_mo, nmo2,
         &beta,
-        d_eri_mo, nmo2);
+        d_eri_out, nmo2);
 
-    tracked_cudaFree(d_B_mo);
+    // ws_B_tmp / ws_B_tmp2 / ws_B_mo are NOT freed — they live in the
+    // thread-local cache and are reused on subsequent calls.
     cudaDeviceSynchronize();
 
     if (hf_.get_verbose()) {
@@ -630,8 +751,6 @@ real_t* ERI_RI::build_mo_eri(const real_t* d_C, int nmo) const {
                   << (nmo2 * nmo2 * sizeof(real_t)) / (1024*1024) << " MB"
                   << " (skipped nao^4 = " << ((size_t)nao*nao*nao*nao*sizeof(real_t))/(1024*1024) << " MB)" << std::endl;
     }
-
-    return d_eri_mo;
 }
 
 void ERI_RI::precompute_schwarz_and_shell_pairs() {

@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #include "dlpno_mp2.hpp"
+#include <memory>
 
 #include <Eigen/Dense>
 #include <algorithm>
@@ -192,6 +193,29 @@ DLPNOLMP2Result solve_dlpno_lmp2(
 
     Eigen::Map<const RowMatXd> Fmat(h_F, nao_, nao_);
 
+    // Step 6.3 — Force build_mo_eri to use the replicated single-GPU path
+    // for the per-pair pair_setup loop (otherwise the multi-GPU distributed
+    // path adds ~5–10 ms NCCL/peer/sync overhead per pair × 465 pairs).
+    // Idempotent: a no-op if already replicated; precompute_phase24 / DMET
+    // call the same routine later and reuse the same buffers.
+#ifdef GANSU_MULTI_GPU
+    if (auto* eri_dist = dynamic_cast<const ERI_RI_Distributed_RHF*>(&eri)) {
+        if (eri_dist->num_gpus() > 1) {
+            const_cast<ERI_RI_Distributed_RHF*>(eri_dist)
+                ->replicate_B_to_all_gpus();
+        }
+    }
+#endif
+
+    // Step 6.3c — caller-side workspace for build_mo_eri output (d_eri / h_eri).
+    // Without this, each pair allocates a fresh 16 MB d_eri_mo (cudaMalloc +
+    // cudaMemset) AND a per-iter `std::vector<real_t> h_eri_mo(n_emb⁴, 0.0)`
+    // on the host (zero-init another ~16 MB). Reusing one growable buffer
+    // across all 465 pairs avoids both.
+    real_t* d_eri_ws = nullptr;
+    std::unique_ptr<real_t[]> h_eri_ws;
+    size_t ws_eri_capacity = 0;  // in number of doubles
+
     const auto t_pair_setup_0 = clock::now();
     for (int i = 0; i < nocc_; ++i) {
         for (int j = i; j < nocc_; ++j) {
@@ -250,14 +274,26 @@ DLPNOLMP2Result solve_dlpno_lmp2(
             cudaMemcpy(d_C_pair, C_pair.data(),
                 static_cast<size_t>(nao_) * n_emb * sizeof(real_t),
                 cudaMemcpyHostToDevice);
-            real_t* d_eri_mo = eri.build_mo_eri(d_C_pair, n_emb);
+
+            // Step 6.3c: grow the d_eri / h_eri workspace if this pair's
+            // n_emb⁴ exceeds the cached capacity. After the first few pairs,
+            // capacity stabilises at the running maximum and no further
+            // allocations occur.
             const size_t n_emb4 = static_cast<size_t>(n_emb) * n_emb
                                 * n_emb * n_emb;
-            std::vector<real_t> h_eri_mo(n_emb4, 0.0);
-            cudaMemcpy(h_eri_mo.data(), d_eri_mo,
+            if (n_emb4 > ws_eri_capacity) {
+                if (d_eri_ws) tracked_cudaFree(d_eri_ws);
+                tracked_cudaMalloc(&d_eri_ws, n_emb4 * sizeof(real_t));
+                // new T[N] is default-initialised (no zero-fill for trivial
+                // types) — saves the per-iter 16 MB host memset.
+                h_eri_ws.reset(new real_t[n_emb4]);
+                ws_eri_capacity = n_emb4;
+            }
+
+            eri.build_mo_eri_into(d_C_pair, n_emb, d_eri_ws);
+            cudaMemcpy(h_eri_ws.get(), d_eri_ws,
                        n_emb4 * sizeof(real_t), cudaMemcpyDeviceToHost);
             tracked_cudaFree(d_C_pair);
-            tracked_cudaFree(d_eri_mo);
 
             const int j_col = diag ? 0 : 1;
             std::vector<real_t> V(
@@ -269,7 +305,7 @@ DLPNOLMP2Result solve_dlpno_lmp2(
                         + static_cast<size_t>(n_lmo + a) * n_emb * n_emb
                         + static_cast<size_t>(j_col) * n_emb
                         + static_cast<size_t>(n_lmo + b);
-                    V[a * n_pao + b] = h_eri_mo[idx];
+                    V[a * n_pao + b] = h_eri_ws[idx];
                 }
 
             // Diagnostic pre-PNO MP2 in semi-canonical PAO basis.
@@ -301,6 +337,13 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     }
     dt_pair_setup += std::chrono::duration<double>(
         clock::now() - t_pair_setup_0).count();
+
+    // Step 6.3c: release the build_mo_eri output workspace.
+    if (d_eri_ws) {
+        tracked_cudaFree(d_eri_ws);
+        d_eri_ws = nullptr;
+    }
+    h_eri_ws.reset();
 
     // -----------------------------------------------------------------------
     // 5. Initial PairData (round 0): semi-canonical T_pao seeds the PNO

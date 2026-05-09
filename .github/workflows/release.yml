@@ -1,0 +1,108 @@
+name: Build and publish wheel
+
+# Triggers:
+#   - Tag push `v*`           → build, attach assets to a GitHub Release,
+#                               and publish the thin wheel to PyPI.
+#   - Manual workflow_dispatch → build only (artifact only, no release)
+#
+# Distribution split:
+#   - Thin wheel (~10 MB)  → PyPI  +  GitHub Release
+#       Users get `pip install gansu` UX. The wheel ships a manifest
+#       (version + sha256) and the loader downloads libgansu.so from the
+#       matching GitHub Release on first use.
+#   - libgansu.so (~150 MB) + .sha256 → GitHub Release only
+#       Fetched on demand by the loader, or downloaded manually for
+#       offline / airgapped install (point GANSU_LIB at it).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space on runner
+        # GitHub-hosted runners ship with ~14 GB free; manylinux + CUDA
+        # toolkit + a 6-arch nvcc build tree easily exceeds that. Trim
+        # the preinstalled tooling we don't need.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af || true
+          sudo apt-get clean
+          df -h
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build wheel + native library
+        # Cap nvcc parallelism — Blackwell/Hopper fatbin compilation can
+        # exhaust the 7 GB RAM of a standard runner if all cores spawn
+        # nvcc workers.
+        env:
+          JOBS: "2"
+        run: bash packaging/build_wheel_docker.sh
+
+      - name: Inspect outputs
+        run: |
+          ls -lh wheelhouse/
+          unzip -l wheelhouse/gansu-*.whl | head -40
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: wheelhouse/
+          retention-days: 30
+
+  release-github:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create/update GitHub Releases
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: wheelhouse
+
+      - name: Create / update GitHub Release with all assets
+        uses: softprops/action-gh-release@v2
+        with:
+          # All three: thin wheel, libgansu.so, libgansu.so.sha256
+          files: wheelhouse/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  publish-pypi:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Trusted Publishing (PEP 740) — no API token required. One-time
+    # PyPI-side setup: Account settings → Publishing → Add trusted
+    # publisher with this repo + workflow + environment name.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/gansu
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: wheelhouse
+
+      - name: Drop the .so and .sha256 (PyPI only takes the wheel)
+        run: |
+          mkdir -p pypi-upload
+          mv wheelhouse/gansu-*.whl pypi-upload/
+          ls -lh pypi-upload/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: pypi-upload/

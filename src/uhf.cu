@@ -24,6 +24,7 @@
 
  #include <limits> // numeric_limits<double>::max();
  #include <iomanip> // std::setprecision
+ #include <memory>
  
  
  namespace gansu{

@@ -20,6 +20,7 @@
 #pragma once
 
 #include "hf.hpp"
+#include <memory>
 #include "rhf.hpp"
 #include "uhf.hpp"
 #include "rohf.hpp"

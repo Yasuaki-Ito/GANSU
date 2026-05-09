@@ -22,6 +22,7 @@
 #pragma once
 
 #include "types.hpp"
+#include <memory>
 #include "basis_set.hpp"
 #include "molecular.hpp"
 

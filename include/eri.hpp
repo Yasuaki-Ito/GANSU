@@ -72,6 +72,16 @@ public:
     /// Default: uses get_eri_matrix_device() + 4-index AO→MO transform.
     virtual real_t* build_mo_eri(const real_t* d_C, int nmo) const;
 
+    /// Step 6.3c — workspace variant. Writes the (nmo⁴) MO ERI into the caller-
+    /// supplied `d_eri_out` device buffer, which must hold at least
+    /// `(size_t)nmo*nmo*nmo*nmo` real_t elements. Caller owns the buffer
+    /// (no free per call). Lets DLPNO `pair_setup` reuse a single max-size
+    /// workspace across all 465 build_mo_eri invocations, avoiding the
+    /// per-pair `cudaMalloc + cudaMemset` of a 16 MB output buffer.
+    /// Default: delegates to build_mo_eri + cudaMemcpy + tracked_cudaFree.
+    virtual void build_mo_eri_into(const real_t* d_C, int nmo,
+                                   real_t* d_eri_out) const;
+
     /// Compute G(D) = 2J[D] - K[D] (two-electron response) from an arbitrary density matrix.
     /// Default: uses get_eri_matrix_device() + computeFockMatrix_RHF with zero core Hamiltonian.
     virtual void compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const;
@@ -391,6 +401,11 @@ public:
     /// Build full MO ERI directly from B: B→B_mo→(pq|rs) without nao⁴ intermediate
     /// Returns device pointer to MO ERI [nmo⁴]. Caller must free with tracked_cudaFree.
     real_t* build_mo_eri(const real_t* d_C, int nmo) const override;
+
+    /// Step 6.3c — workspace variant. Writes MO ERI directly into caller-
+    /// supplied d_eri_out, avoiding the per-call cudaMalloc + cudaMemset.
+    void build_mo_eri_into(const real_t* d_C, int nmo,
+                           real_t* d_eri_out) const override;
 
     /// Compute G(D) using RI B-matrix based J/K build (no AO ERI reconstruction needed).
     void compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const override;
