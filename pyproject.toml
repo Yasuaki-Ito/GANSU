@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gansu"
-version = "0.1.0"
+version = "2026.5.9"
 description = "GPU Accelerated Numerical Simulation Utility for quantum chemistry"
 readme = "README.md"
 license = {text = "BSD-3-Clause"}
