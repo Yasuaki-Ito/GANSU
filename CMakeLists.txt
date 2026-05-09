@@ -44,9 +44,19 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(ENABLE_GPU)
     # set compute capability
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 80 86 90)
+    # Only override CUDA archs if the user has not given an explicit value
+    # (e.g. via -DCMAKE_CUDA_ARCHITECTURES=... or in their cache). The string
+    # comparison guards against CMake 3.24+'s autodetect leaving the variable
+    # set to an unhelpful default — we want our 80;86;90 to win in fresh
+    # builds while still letting the wheel CI pass 80;86;89;90;100;120.
+    if(NOT CMAKE_CUDA_ARCHITECTURES OR
+       CMAKE_CUDA_ARCHITECTURES STREQUAL "" OR
+       CMAKE_CUDA_ARCHITECTURES STREQUAL "native" OR
+       CMAKE_CUDA_ARCHITECTURES STREQUAL "all" OR
+       CMAKE_CUDA_ARCHITECTURES STREQUAL "all-major")
+        set(CMAKE_CUDA_ARCHITECTURES 80 86 90 CACHE STRING "" FORCE)
     endif()
+    message(STATUS "CUDA archs: ${CMAKE_CUDA_ARCHITECTURES}")
     # Enable line info and debug info for CUDA when in Debug mode
     set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -lineinfo")
     set(CMAKE_CUDA_STANDARD 17)
