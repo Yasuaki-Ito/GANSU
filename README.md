@@ -147,9 +147,55 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
 
 ## Installation
 
-### Prerequisites
+### Quick install via pip (recommended)
 
-#### GPU mode (default)
+```bash
+pip install gansu
+```
+
+That's it — no CUDA toolkit required on the user side, no compilation, no `cmake`. The PyPI wheel ships a thin Python wrapper (~2.6 MB) and declares the CUDA runtime libraries (`nvidia-cublas-cu12`, `nvidia-cusolver-cu12`, `nvidia-nccl-cu12`, etc.) as dependencies, so they are pulled in automatically. The GPU-accelerated shared library `libgansu.so` (~460 MB, multi-arch fatbin covering SM 8.0–12.0) is downloaded from the matching [GitHub Release](https://github.com/Yasuaki-Ito/GANSU/releases/latest) on first use and cached under `~/.cache/gansu/<version>/` with SHA-256 verification.
+
+**System requirements:**
+* Linux x86_64 (manylinux_2_28+, i.e. Ubuntu 18.04+, Debian 10+, RHEL 8+ and equivalents)
+* Python 3.10+
+* NVIDIA driver ≥ 525.60.13 (CUDA 12.x runtime compatible)
+* NVIDIA GPU with Compute Capability 8.0+ (Ampere / Ada / Hopper / Blackwell)
+
+**Quick test:**
+```python
+import gansu
+
+gansu.init()
+m = gansu.Molecule("H2O.xyz", basis="sto-3g")
+print(f"RHF energy: {m.run(method='RHF').total_energy:.6f} Ha")
+gansu.finalize()
+```
+
+#### Direct URL install (e.g. for pinning a specific release)
+
+```bash
+pip install https://github.com/Yasuaki-Ito/GANSU/releases/download/v2026.5.9/gansu-2026.5.9-py3-none-manylinux_2_28_x86_64.whl
+```
+
+#### Offline / airgapped install
+
+Download both the wheel and the matching shared library from a release page on a machine that has internet access, then on the target machine:
+
+```bash
+pip install ./gansu-2026.5.9-py3-none-manylinux_2_28_x86_64.whl
+export GANSU_LIB=/path/to/libgansu-2026.5.9-linux-x86_64.so
+python -c "import gansu; gansu.init()"
+```
+
+`GANSU_LIB` short-circuits the auto-download so the loader uses the explicit local copy.
+
+### Build from source
+
+The remaining sections — Prerequisites, Directory Structure, and Build instructions — are for developers and users who want to build GANSU themselves (e.g. to enable extended angular-momentum support, modify the source, or run on a non-`x86_64` Linux platform). Pure users can stop here and skip ahead to [Usage](#usage).
+
+#### Prerequisites
+
+##### GPU mode (default)
 * Hardware
   * NVIDIA GPU with CUDA Compute Capability 8.0, 8.6, 9.0 or later
   * x86_64 / ARM architecture
@@ -163,7 +209,7 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
   * [OpenBLAS](https://www.openblas.net/) (optional but recommended, `sudo apt install libopenblas-dev` on Ubuntu) — automatically detected by CMake; significantly accelerates CPU-mode computation
   * [NCCL](https://developer.nvidia.com/nccl) (optional, required for multi-GPU support) — `sudo apt install libnccl-dev` on Ubuntu, or included in CUDA Toolkit
 
-#### CPU-only mode (`--cpu`)
+##### CPU-only mode (`--cpu`)
 When a GPU is available, pass `--cpu` to force CPU execution. All features are supported with OpenMP parallelization.
 No additional dependencies beyond the GPU mode prerequisites are required.
 
