@@ -303,6 +303,61 @@ r3 = gansu.Molecule("../xyz/Benzene.xyz", basis="sto-3g").run(
 gansu.finalize()
 ```
 
+### 6c. DLPNO-CCSD / DLPNO-CCSD(T) (Local Correlation)
+
+DLPNO methods scale near-linearly with system size by combining occupied LMO localization,
+PAO + per-LMO atom domains, per-pair PNO truncation, and strong/weak-pair partitioning.
+Closed-shell RHF only; requires the RI back-end.
+
+```python
+import gansu
+
+gansu.init()
+
+# Water hexamer DLPNO-CCSD(T) with the default "normal" preset
+r = gansu.Molecule(
+    "../xyz/large_molecular/water_hexamer.xyz",
+    basis="cc-pvdz",
+).run(
+    post_hf="dlpno_ccsd_t",
+    eri_method="ri",
+    auxiliary_gbsfilename="../auxiliary_basis/cc-pvdz-rifit.gbs",
+    dlpno_preset="normal",          # loose / normal / tight / very_tight
+    num_gpus=8,
+)
+print(f"HF:                 {r.total_energy:.6f} Ha")
+print(f"DLPNO-CCSD(T) corr: {r.post_hf_energy:.6f} Ha")
+print(f"Total:              {r.total_energy + r.post_hf_energy:.6f} Ha")
+
+# Tighter accuracy
+r2 = gansu.Molecule("...").run(
+    post_hf="dlpno_ccsd_t",
+    eri_method="ri",
+    auxiliary_gbsfilename="...",
+    dlpno_preset="tight",
+)
+
+gansu.finalize()
+```
+
+### 6d. Exporting Localized Orbitals
+
+```python
+import gansu
+
+gansu.init()
+
+# Write Pipek-Mezey occupied LMOs to output_lmo.molden (alongside the SCF).
+# Works for RHF / UHF / ROHF; the canonical virtual orbitals are retained.
+gansu.Molecule("../xyz/Benzene.xyz", basis="cc-pvdz").run(
+    export_lmo_molden=True,
+)
+# Open output_lmo.molden in Avogadro / Jmol / VMD / MOrbVis to visualize
+# the bond-localized σ orbitals and lone pairs.
+
+gansu.finalize()
+```
+
 ### 7. Potential Energy Scan (Bond Stretching)
 
 ```python

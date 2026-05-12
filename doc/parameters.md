@@ -37,13 +37,21 @@
 | mulliken | Perform Mulliken population analysis | bool | false |
 | mayer | Perform Mayer bond order analysis | bool | false |
 | wiberg | Perform Wiberg bond order analysis | bool | false |
-| export_molden | Output Molden file | bool | false |
+| export_molden | Output Molden file (canonical MOs) | bool | false |
+| export_lmo_molden | Output Molden file with Pipek-Mezey localized occupied orbitals (RHF/UHF/ROHF; see [DLPNO-CCSD / DLPNO-CCSD(T) parameters](#dlpno-ccsd--dlpno-ccsdt-parameters)) | bool | false |
 | ecp_filename | Path to ECP file for effective core potentials | string | |
 | num_gpus | Number of GPUs for multi-GPU RI-HF (-1 = auto-detect all available) | int | -1 |
 | dmet_fragments | DMET fragment specification (e.g. `"{0,6} {1,7}"`); empty = auto-detect by X-H bonds | string | "" |
 | dmet_threshold | SVD threshold for DMET bath orbital selection (σ < threshold excluded) | double | 1.0e-6 |
 | dmet_n_tol | DMET bisection tolerance on \|Σ N_frag − N_elec\| (Vayesta-compat: 4.2e-3 for benzene) | double | 1.0e-5 |
 | dmet_mu_refine_ccsd | DMET 2-stage μ optimization (Stage 1: HF density, Stage 2: CCSD-relaxed density) | bool | false |
+| dlpno_preset | DLPNO truncation preset (loose / normal / tight / very_tight, ORCA-compatible). See [DLPNO-CCSD / DLPNO-CCSD(T) parameters](#dlpno-ccsd--dlpno-ccsdt-parameters) | string | normal |
+| dlpno_localizer | DLPNO occupied localization method (pm / boys / ibo) | string | pm |
+| dlpno_lmp2_max_iter | DLPNO LMP2 / CCSD T2 iter max (shared) | int | 100 |
+| dlpno_lmp2_conv | DLPNO LMP2 residual convergence | double | 1e-8 |
+| dlpno_sc_pno_iter | DLPNO self-consistent PNO refinement rounds | int | 1 |
+| dlpno_pair_distance_cutoff | DLPNO pair distance pre-screening (Bohr) | double | 15.0 |
+| dlpno_verbose | DLPNO log verbosity (0/1/2/3) | int | 1 |
 | opt_max_iter | Geometry optimization max iterations | int | 200 |
 | opt_grad_threshold | Convergence: max gradient component (Hartree/Bohr) | double | 3.0e-4 |
 | opt_rms_grad_threshold | Convergence: RMS gradient (Hartree/Bohr) | double | 2.0e-4 |
@@ -220,6 +228,8 @@ Method names are case-insensitive. Hyphen variants are accepted (`scs-mp2` ≡ `
 | CCSD_DENSITY | CCSD + Λ-equation solve + 1-RDM construction. Used internally by DMET and for natural-orbital / property analysis. Same energy as CCSD; adds Λ + 1-RDM cost |
 | DMET_CCSD | Density Matrix Embedding Theory with CCSD as the impurity solver. Auto-fragmentation by X–H bonds (or `dmet_fragments` manual spec). See [DMET-CCSD parameters](#dmet-ccsd-parameters) |
 | DMET_CCSD_T | DMET-CCSD plus per-fragment perturbative triples evaluated at the converged $\mu_{\mathrm{DMET}}$. Aliases: `dmet-ccsd_t`, `dmet_ccsd(t)`, `dmet-ccsd(t)`, `dmet_ccsdt` |
+| DLPNO_CCSD | Domain-based Local Pair Natural Orbital CCSD (Riplinger & Neese 2013, 2016). Closed-shell RHF only; requires RI. Pipek-Mezey occupied LMOs → PAO + per-LMO atom domains → per-pair PNO truncation → strong/weak-pair partitioning. Aliases: `dlpno-ccsd`. See [DLPNO-CCSD / DLPNO-CCSD(T) parameters](#dlpno-ccsd--dlpno-ccsdt-parameters) |
+| DLPNO_CCSD_T | DLPNO-CCSD plus perturbative triples evaluated on per-triple TNO bases via batched GPU kernels. PySCF-equivalent 6-W formulation. Aliases: `dlpno-ccsd_t`, `dlpno_ccsd(t)`, `dlpno-ccsd(t)`, `dlpno_ccsdt` |
 
 ##### Excited-state methods
 
@@ -325,6 +335,13 @@ Otherwise, the two-electron repulsion integrals (ERIs) are set to zero.
 * default:  false
 * true - Export Molden file after the SCF calculation (output filename: output.molden)
 * false - Do not output Molden file
+
+#### export_lmo_molden - Export Pipek-Mezey localized occupied orbitals
+* default:  false
+* true - Localize occupied MOs via Pipek-Mezey and write them to `output_lmo.molden`. Occupied block contains the LMOs (C_LMO = C_occ · U); virtual block keeps the canonical orbitals. For UHF, α and β are localized independently. For ROHF, doubly-occupied and singly-occupied subspaces are localized separately so closed-shell core and open-shell electrons do not mix. The orbital energies written for each LMO are the diagonal Fock-in-LMO-basis values $\varepsilon_i^{\mathrm{LMO}} = \sum_k |U_{ki}|^2 \cdot \varepsilon_k^{\mathrm{can}}$ (exact since canonical $F$ is diagonal in the canonical MO basis).
+* false - Do not export localized orbitals
+
+Compatible Molden viewers: [MOrbVis](https://yasuaki-ito.github.io/morbvis/), [Avogadro](https://avogadro.cc/), Jmol, VMD, [Pegamoid](https://github.com/Jellby/Pegamoid).
 
 
 ## Excited state parameters
@@ -599,6 +616,66 @@ Bisection of μ stops when |Σ_F N_frag(μ) − N_elec| < `dmet_n_tol`. Default 
 
 # Verbose per-fragment diagnostics (for debugging)
 GANSU_DMET_VERBOSE=1 ./gansu ... --post_hf_method dmet
+```
+
+
+## DLPNO-CCSD / DLPNO-CCSD(T) parameters
+
+| Parameter | Description | Type | Default |
+| --- | --- | --- | --- |
+| dlpno_preset | Truncation preset (`loose`, `normal`, `tight`, `very_tight`) — sets all `t_cut_*` cutoffs to ORCA-compatible values | string | normal |
+| dlpno_localizer | Occupied localization method (`pm`, `boys`, `ibo`) | string | pm |
+| dlpno_t_cut_pno | PNO occupation cutoff. `-1` = use preset value | double | -1 |
+| dlpno_t_cut_do | PAO redundancy threshold (overlap eigenvalue). `-1` = preset | double | -1 |
+| dlpno_t_cut_pairs | Strong/weak pair MP2 cutoff in Ha. `-1` = preset | double | -1 |
+| dlpno_t_cut_mkn | Boughton-Pulay Mulliken cumulative threshold for domain selection. `-1` = preset | double | -1 |
+| dlpno_t_cut_triples | Triple screening threshold for (T). `-1` = preset | double | -1 |
+| dlpno_t_cut_tno | TNO occupation cutoff for (T). `-1` = preset | double | -1 |
+| dlpno_pair_distance_cutoff | Pair distance pre-screening cutoff in Bohr. `0` = off | double | 15.0 |
+| dlpno_max_iter | DLPNO-CCSD residual max iterations | int | 50 |
+| dlpno_diis_size | DIIS subspace size for DLPNO-CCSD | int | 6 |
+| dlpno_localizer_max_sweep | Pipek-Mezey / Boys Jacobi sweep upper bound | int | 200 |
+| dlpno_localizer_conv | Localizer functional ΔL convergence threshold | double | 1e-10 |
+| dlpno_lmp2_max_iter | LMP2 / CCSD T2 dressing iter max (shared cap) | int | 100 |
+| dlpno_lmp2_conv | LMP2 residual convergence (max\|R\|) | double | 1e-8 |
+| dlpno_sc_pno_iter | Self-consistent PNO refinement rounds (`0` = single-shot from semi-canonical guess) | int | 1 |
+| dlpno_pno_os_only | PNO selection from opposite-spin amplitudes only (use with SOS-MP2 scaling) | bool | false |
+| dlpno_verbose | `0`=summary, `1`=phase, `2`=per-pair profile, `3`=residual | int | 1 |
+| export_lmo_molden | Write Pipek-Mezey localized occupied MOs to `output_lmo.molden` | bool | false |
+
+DLPNO-CCSD and DLPNO-CCSD(T) (Riplinger, Neese, Pinski, Sandhoefer 2013/2016) achieve near-canonical CCSD(T) accuracy at near-linear scaling by exploiting four nested locality layers: (1) occupied LMOs (Pipek-Mezey), (2) projected atomic orbitals (PAO) + per-LMO atom domains, (3) per-pair PNO truncation, and (4) strong/weak-pair partitioning where weak pairs are reduced to MP2.
+
+This release implements the **closed-shell RHF** variant; UHF / ROHF DLPNO is not yet available. The RI back-end (`--eri_method ri` plus an `-ag <aux>`) is required.
+
+### dlpno_preset — ORCA-compatible preset values
+
+| Preset | t_cut_pno | t_cut_do | t_cut_pairs | t_cut_triples | t_cut_tno |
+| --- | --- | --- | --- | --- | --- |
+| loose      | 1.0e-6   | 2.0e-2 | 1.0e-3 | 1.0e-6 | 1.0e-9  |
+| normal     | 3.33e-7  | 1.0e-2 | 1.0e-4 | 1.0e-7 | 1.0e-9  |
+| tight      | 1.0e-7   | 5.0e-3 | 1.0e-5 | 1.0e-8 | 1.0e-10 |
+| very_tight | 1.0e-8   | 2.0e-3 | 1.0e-6 | 1.0e-9 | 1.0e-10 |
+
+Individual `dlpno_t_cut_*` parameters override the preset when set to a non-negative value.
+
+### Examples
+
+```bash
+# DLPNO-CCSD on water hexamer (normal preset)
+./gansu -x ../xyz/large_molecular/water_hexamer.xyz -g cc-pvdz \
+    --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs \
+    --post_hf_method dlpno_ccsd --dlpno_preset normal --num_gpus 8
+
+# DLPNO-CCSD(T) with tight preset for benchmarking
+./gansu -x ../xyz/large_molecular/water_hexamer.xyz -g cc-pvdz \
+    --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs \
+    --post_hf_method dlpno_ccsd_t --dlpno_preset tight --num_gpus 8
+
+# Detailed per-section profile (debug)
+./gansu ... --post_hf_method dlpno_ccsd_t --dlpno_verbose 2
+
+# Export Pipek-Mezey localized orbitals for visualization
+./gansu -x ../xyz/Benzene.xyz -g cc-pvdz --export_lmo_molden 1
 ```
 
 

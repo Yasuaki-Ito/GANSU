@@ -37,6 +37,7 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
     * Coupled Cluster (RCC2, RCCSD, RCCSD(T))
     * CCSD Lambda equations and 1-RDM (relaxed correlation density)
     * Density Matrix Embedding Theory with CCSD solver (DMET-CCSD, DMET-CCSD(T)) — fragment-based correlation, semi-canonical CCSD with f_ov support, μ-bisection density consistency, multi-GPU fragment parallelism, automatic X-H bond fragment detection, optional perturbative triples per fragment
+    * Domain-based Local Pair Natural Orbital Coupled Cluster (DLPNO-CCSD, DLPNO-CCSD(T)) — Pipek-Mezey occupied localization, PAO + per-LMO domain, pair natural orbitals with PNO truncation, weak-pair MP2 reduction, multi-GPU per-triple parallelism with batched cuBLAS DGEMM kernels (RHF closed-shell, requires RI)
     * Full Configuration Interaction (RFCI)
     * RI support for all post-HF methods (AO ERI reconstructed from B matrix, nao⁴ intermediate skipped via direct MO ERI construction)
     * Semi-Direct RI and Direct-RI MP2 (B matrix built on-the-fly, no persistent naux×nao² storage)
@@ -102,6 +103,7 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
         * Tested by [MOrbVis](https://yasuaki-ito.github.io/morbvis/), [Avogadro](https://avogadro.cc/), and [Pegamoid](https://github.com/Jellby/Pegamoid)
       ![Orbital renderred by MOrbVis](/doc/images/orbital.png)
       *Resulting molecular orbital of Benzene by MOrbVis*
+    * Export Pipek-Mezey localized occupied orbitals (LMOs) in Molden format (`--export_lmo_molden`, RHF / UHF / ROHF)
 * Effective Core Potentials (ECP)
     * LANL2DZ, cc-pVnZ-PP basis sets for heavy elements
     * GPU-accelerated ECP integral computation
@@ -131,7 +133,11 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
   * Time-Dependent Hartree-Fock (TDHF)
 * Energy Gradient
   * RI-native gradient (3-center integral derivatives)
-  * Post-HF energy gradient (MP2, CCSD, etc.)
+  * Post-HF energy gradient (MP2, CCSD, DLPNO, etc.)
+* DLPNO methods
+  * UHF / ROHF DLPNO (currently RHF closed-shell only)
+  * Non-RI DLPNO (currently requires RI)
+  * DLPNO gradient / dipole / response
 * Energy Hessian
   * Analytical h1ao/s1ao derivatives (currently uses finite differences)
   * UHF Hessian
@@ -324,6 +330,13 @@ make
 
 # DMET-CCSD(T) (perturbative triples per fragment)
 ./gansu -x ../xyz/Benzene.xyz -g sto-3g --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method dmet_ccsd_t --num_gpus 4
+
+# DLPNO-CCSD / DLPNO-CCSD(T) — local correlation, scales to ~100 atoms with RI
+./gansu -x ../xyz/large_molecular/water_hexamer.xyz -g cc-pvdz --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method dlpno_ccsd --dlpno_preset normal
+./gansu -x ../xyz/large_molecular/water_hexamer.xyz -g cc-pvdz --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method dlpno_ccsd_t --dlpno_preset normal
+
+# Export Pipek-Mezey localized orbitals for visualization (Avogadro/Jmol/VMD)
+./gansu -x ../xyz/Benzene.xyz -g cc-pvdz --export_lmo_molden 1
 
 # CPU-only mode
 ./gansu -x ../xyz/H2O.xyz -g sto-3g --cpu

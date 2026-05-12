@@ -129,6 +129,8 @@ Basis sets are specified by name. GANSU automatically resolves the path.
 | `ccsd_density` | CCSD + Lambda + 1-RDM |
 | `dmet` | DMET-CCSD (fragment-based correlation, multi-GPU, auto X-H bond fragmentation) |
 | `dmet_ccsd_t` | DMET-CCSD(T) — same fragment construction plus perturbative triples per fragment |
+| `dlpno_ccsd` | DLPNO-CCSD (closed-shell RHF, local-correlation CCSD, requires RI) |
+| `dlpno_ccsd_t` | DLPNO-CCSD(T) — perturbative triples on per-triple TNO bases, multi-GPU batched |
 | `fci` | Full CI |
 | `cis` | CIS excited states |
 | `adc2` | ADC(2) excited states |
@@ -237,6 +239,45 @@ The output reports both T-amplitude democratic energy and the standard QC-DMET (
   HF energy:                              -227.8926 Ha
   DMET-CCSD total energy (DMET):          -228.3864 Ha
 ```
+
+### 4c. DLPNO-CCSD / DLPNO-CCSD(T) (Local Correlation)
+
+DLPNO-CCSD and DLPNO-CCSD(T) (Riplinger & Neese, 2013/2016) exploit four nested locality layers — occupied LMO localization (Pipek-Mezey), projected atomic orbitals + per-LMO atom domains, per-pair PNO truncation, and strong/weak-pair partitioning — to achieve near-canonical CCSD(T) accuracy at near-linear scaling. GANSU implements the **closed-shell RHF** variant with GPU-accelerated per-triple kernels (cuBLAS batched DGEMM, memory-aware chunked flush) and multi-GPU per-triple parallelism. The RI back-end is required.
+
+```bash
+# DLPNO-CCSD on water hexamer (normal preset)
+./gansu -x ../xyz/large_molecular/water_hexamer.xyz -g cc-pvdz \
+    --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs \
+    --post_hf_method dlpno_ccsd --dlpno_preset normal --num_gpus 8
+
+# DLPNO-CCSD(T) — adds perturbative triples (TNO basis, PySCF-equivalent 6-W formula)
+./gansu -x ../xyz/large_molecular/water_hexamer.xyz -g cc-pvdz \
+    --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs \
+    --post_hf_method dlpno_ccsd_t --dlpno_preset normal --num_gpus 8
+
+# Tighter accuracy (closer to canonical, larger PNO/TNO basis)
+./gansu ... --post_hf_method dlpno_ccsd_t --dlpno_preset tight
+
+# Per-section profile (DLPNO-(T) triple loop breakdown)
+./gansu ... --post_hf_method dlpno_ccsd_t --dlpno_verbose 2
+```
+
+ORCA-compatible truncation presets: `loose` / `normal` (default) / `tight` / `very_tight`. See [DLPNO-CCSD / DLPNO-CCSD(T) parameters](parameters.md#dlpno-ccsd--dlpno-ccsdt-parameters) for the underlying `t_cut_*` cutoffs and fine-tuning options.
+
+### 4d. Exporting Localized Orbitals
+
+The Pipek-Mezey localization from the DLPNO pipeline can be repurposed to write occupied LMOs to a Molden file for visualization in Avogadro / Jmol / VMD / MOrbVis. Works for any SCF method (RHF / UHF / ROHF) — DLPNO is not actually run.
+
+```bash
+# Closed-shell: 1 localization, writes occupied LMOs + canonical virtuals
+./gansu -x ../xyz/Benzene.xyz -g cc-pvdz --export_lmo_molden 1
+# → output_lmo.molden
+
+# UHF: α and β occupied blocks localized independently
+./gansu -x ../xyz/radical.xyz -g cc-pvdz -m UHF --export_lmo_molden 1
+```
+
+For ROHF, doubly-occupied and singly-occupied subspaces are localized separately so closed-shell core and open-shell electrons do not mix. Pass `--export_molden 1 --export_lmo_molden 1` together to emit both canonical (`output.molden`) and localized (`output_lmo.molden`) files in a single run.
 
 ### 5. Energy Gradient
 
