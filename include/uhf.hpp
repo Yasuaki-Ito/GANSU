@@ -149,6 +149,7 @@ public:
      * @param filename File name
      */
     void export_molden_file(const std::string& filename) override;
+    void export_lmo_molden_file(const std::string& filename) override;
 
     /**
      * @brief Post process after SCF convergence

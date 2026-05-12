@@ -124,6 +124,7 @@ public:
      * @param filename File name
      */
     void export_molden_file(const std::string& filename) override;
+    void export_lmo_molden_file(const std::string& filename) override;
 
     /**
      * @brief Post process after SCF convergence
@@ -1139,6 +1140,16 @@ public:
 
     /// Whether replicate_B_to_all_gpus() has been called and not freed.
     bool b_is_replicated() const { return b_replicated_; }
+
+    /// Phase 3.2.2b — return device pointer to the replicated full B on
+    /// the requested GPU, or nullptr if replication has not been performed
+    /// or `gpu_id` is out of range. Layout: (naux × nao²) row-major.
+    const real_t* get_replicated_B_device(int gpu_id) const {
+        if (!b_replicated_) return nullptr;
+        if (gpu_id < 0 || gpu_id >= static_cast<int>(d_B_full_per_gpu_.size()))
+            return nullptr;
+        return d_B_full_per_gpu_[gpu_id];
+    }
 
     /// DMET-CCSD entry point that takes advantage of B replication for fragment-parallel multi-GPU.
     real_t compute_dmet_ccsd() override;

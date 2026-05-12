@@ -26,6 +26,8 @@
 #else
 #include <cuda_runtime.h>
 #endif
+#include <algorithm>
+#include <array>
 #include <iostream>
 #include <stdexcept>
 #include <cstring>
@@ -33,6 +35,7 @@
 #include <iomanip>
 #include <sstream>
 #include <unordered_map>
+#include <vector>
 
 #include "utils.hpp" // THROW_EXCEPTION
 
@@ -54,6 +57,12 @@ namespace gansu::detail {
     inline auto real_cudaMemcpy = ::cudaMemcpy;
     inline auto real_cudaMemcpyAsync = ::cudaMemcpyAsync;
     inline auto real_cudaMemset = ::cudaMemset;
+    // cudaMalloc has both a void** overload (C runtime) and a template T**
+    // overload (cudart C++ wrapper). Use a small lambda thunk that always
+    // dispatches to ::cudaMalloc to keep the signature stable after macro
+    // redirect. Same for cudaFree.
+    inline auto real_cudaMalloc = [](void** p, size_t n) { return ::cudaMalloc(p, n); };
+    inline auto real_cudaFree   = [](void* p) { return ::cudaFree(p); };
 }
 
 /**
@@ -120,26 +129,65 @@ namespace gansu{
  * CudaMemoryManager<T> tracks memory per type T, so allocations of different types
  * (e.g., unsigned long long vs double) are counted separately. This global tracker
  * aggregates all allocations regardless of type to report correct total/peak memory.
+ *
+ * Multi-GPU: `*_by_device_` maps store per-device statistics. Allocation/deallocation
+ * is associated with a device id captured at tracked_cudaMalloc time (cudaGetDevice).
+ * The flat `current_bytes_/peak_bytes_/total_bytes_` fields remain the cross-device
+ * totals so callers that don't care about per-GPU breakdown keep working.
  */
 struct GlobalGpuMemoryTracker {
     inline static size_t current_bytes_ = 0;
     inline static size_t total_bytes_ = 0;
     inline static size_t peak_bytes_ = 0;
+    inline static std::unordered_map<int, size_t> current_by_device_;
+    inline static std::unordered_map<int, size_t> total_by_device_;
+    inline static std::unordered_map<int, size_t> peak_by_device_;
     inline static std::mutex mutex_;
 
-    static void track_allocation(size_t bytes) {
+    static void track_allocation(size_t bytes, int device = -1) {
         std::lock_guard<std::mutex> lock(mutex_);
         current_bytes_ += bytes;
         total_bytes_ += bytes;
         if (current_bytes_ > peak_bytes_) peak_bytes_ = current_bytes_;
+        if (device >= 0) {
+            auto& cur = current_by_device_[device];
+            cur += bytes;
+            total_by_device_[device] += bytes;
+            auto& pk = peak_by_device_[device];
+            if (cur > pk) pk = cur;
+        }
     }
-    static void track_deallocation(size_t bytes) {
+    static void track_deallocation(size_t bytes, int device = -1) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (current_bytes_ >= bytes) current_bytes_ -= bytes;
+        if (device >= 0) {
+            auto it = current_by_device_.find(device);
+            if (it != current_by_device_.end()) {
+                if (it->second >= bytes) it->second -= bytes;
+                else it->second = 0;
+            }
+        }
     }
     static size_t get_current() { std::lock_guard<std::mutex> lock(mutex_); return current_bytes_; }
     static size_t get_peak() { std::lock_guard<std::mutex> lock(mutex_); return peak_bytes_; }
     static size_t get_total() { std::lock_guard<std::mutex> lock(mutex_); return total_bytes_; }
+
+    /// Snapshot of (current, total, peak) keyed by device id. Only devices
+    /// that saw at least one tracked allocation are present.
+    static std::unordered_map<int, std::array<size_t, 3>> get_per_device_snapshot() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::unordered_map<int, std::array<size_t, 3>> out;
+        for (const auto& kv : peak_by_device_) {
+            const int dev = kv.first;
+            size_t cur = 0, tot = 0;
+            auto cit = current_by_device_.find(dev);
+            if (cit != current_by_device_.end()) cur = cit->second;
+            auto tit = total_by_device_.find(dev);
+            if (tit != total_by_device_.end()) tot = tit->second;
+            out[dev] = {cur, tot, kv.second};
+        }
+        return out;
+    }
 };
 
 
@@ -159,6 +207,7 @@ protected:
     size_t size_;     ///< Number of elements in the memory
     size_t device_bytes_; ///< Number of bytes allocated on device for this instance
     size_t host_bytes_;   ///< Number of bytes allocated on host for this instance
+    int    device_id_ = -1; ///< Owning GPU id captured at allocate(); -1 for CPU mode / unknown
 
     // Static members for memory statistics (shared across all instances)
     inline static size_t current_allocated_bytes_ = 0;  ///< Current total allocated device memory
@@ -186,8 +235,8 @@ public:
     virtual ~CudaMemoryManager() {
         if (gpu::gpu_available()) {
             if (device_ptr_) {
-                cudaFree(device_ptr_);
-                track_deallocation(device_bytes_);
+                gansu::detail::real_cudaFree(device_ptr_);
+                track_deallocation(device_bytes_, device_id_);
             }
             if (host_ptr_) {
                 cudaFreeHost(host_ptr_);
@@ -209,7 +258,7 @@ public:
      */
     void release() {
         if (gpu::gpu_available()) {
-            if (device_ptr_) { cudaFree(device_ptr_); track_deallocation(device_bytes_); }
+            if (device_ptr_) { gansu::detail::real_cudaFree(device_ptr_); track_deallocation(device_bytes_, device_id_); }
             if (host_ptr_) cudaFreeHost(host_ptr_);
         } else {
             if (host_ptr_) std::free(host_ptr_);
@@ -219,6 +268,7 @@ public:
         size_ = 0;
         device_bytes_ = 0;
         host_bytes_ = 0;
+        device_id_ = -1;
     }
 
     /**
@@ -280,6 +330,23 @@ public:
     static void report_memory_statistics() {
         std::cout << std::endl;
         std::cout << "[Device Memory Statistics]" << std::endl;
+        // Per-device breakdown (only devices that saw a tracked allocation).
+        const auto per_dev = GlobalGpuMemoryTracker::get_per_device_snapshot();
+        if (per_dev.size() > 1) {
+            std::vector<int> devs;
+            devs.reserve(per_dev.size());
+            for (const auto& kv : per_dev) devs.push_back(kv.first);
+            std::sort(devs.begin(), devs.end());
+            for (int dev : devs) {
+                const auto& s = per_dev.at(dev);   // {current, total, peak}
+                std::cout << "  GPU " << dev
+                          << ":  current=" << format_bytes(s[0])
+                          << "  total=" << format_bytes(s[1])
+                          << "  peak=" << format_bytes(s[2])
+                          << std::endl;
+            }
+            std::cout << "  All GPUs (sum):" << std::endl;
+        }
         std::cout << "Current allocated: " << format_bytes(GlobalGpuMemoryTracker::get_current()) << std::endl;
         std::cout << "Total allocated: " << format_bytes(GlobalGpuMemoryTracker::get_total()) << std::endl;
         std::cout << "Peak usage: " << format_bytes(GlobalGpuMemoryTracker::get_peak()) << std::endl;
@@ -326,27 +393,29 @@ public:
     /**
      * @brief Updates memory statistics when memory is allocated.
      * @param bytes Number of bytes allocated.
+     * @param device Owning device id (-1 for CPU mode / unknown).
      */
-    static void track_allocation(size_t bytes) {
+    static void track_allocation(size_t bytes, int device = -1) {
         std::lock_guard<std::mutex> lock(memory_stats_mutex_);
         current_allocated_bytes_ += bytes;
         total_allocated_bytes_ += bytes;
         if (current_allocated_bytes_ > peak_allocated_bytes_) {
             peak_allocated_bytes_ = current_allocated_bytes_;
         }
-        GlobalGpuMemoryTracker::track_allocation(bytes);
+        GlobalGpuMemoryTracker::track_allocation(bytes, device);
     }
 
     /**
      * @brief Updates memory statistics when memory is deallocated.
      * @param bytes Number of bytes deallocated.
+     * @param device Owning device id (captured at alloc time, -1 if unknown).
      */
-    static void track_deallocation(size_t bytes) {
+    static void track_deallocation(size_t bytes, int device = -1) {
         std::lock_guard<std::mutex> lock(memory_stats_mutex_);
         if (current_allocated_bytes_ >= bytes) {
             current_allocated_bytes_ -= bytes;
         }
-        GlobalGpuMemoryTracker::track_deallocation(bytes);
+        GlobalGpuMemoryTracker::track_deallocation(bytes, device);
     }
 
     /**
@@ -398,7 +467,8 @@ public:
                 THROW_EXCEPTION("Failed to allocate host memory (CPU mode)");
             }
             this->device_ptr_ = this->host_ptr_; // Same pointer
-            this->track_allocation(this->device_bytes_);
+            this->device_id_ = -1;
+            this->track_allocation(this->device_bytes_, -1);
             return;
         }
 
@@ -416,7 +486,7 @@ public:
         }
 
         this->device_bytes_ = this->size_ * sizeof(T);
-        err = cudaMalloc(&this->device_ptr_, this->device_bytes_);
+        err = gansu::detail::real_cudaMalloc(reinterpret_cast<void**>(&this->device_ptr_), this->device_bytes_);
         if (err != cudaSuccess) {
             // Get current memory statistics for error message
             size_t current_mem = this->get_current_allocated_bytes();
@@ -431,8 +501,9 @@ public:
         // Zero-initialize device memory (required by kernels that use atomicAdd)
         cudaMemset(this->device_ptr_, 0, this->device_bytes_);
 
-        // Track successful allocation
-        this->track_allocation(this->device_bytes_);
+        // Track successful allocation (capture owning device for per-GPU stats)
+        cudaGetDevice(&this->device_id_);
+        this->track_allocation(this->device_bytes_, this->device_id_);
     }
 
     void toDevice() override {
@@ -862,12 +933,13 @@ protected:
 // ========== Memory Tracking Wrapper Functions ==========
 
 /**
- * @brief Global map to track allocated memory sizes
+ * @brief Global map to track allocated memory sizes (and owning device).
  *
- * This map stores the size of each allocated memory block, keyed by the pointer address.
- * This is necessary because cudaFree doesn't provide size information.
+ * Stores (size, device_id) for each allocated pointer. Required because cudaFree
+ * doesn't provide either; the device id is captured at allocation time via
+ * cudaGetDevice() so per-device stats stay correct under multi-GPU OpenMP.
  */
-inline std::unordered_map<void*, size_t> g_allocated_memory_map;
+inline std::unordered_map<void*, std::pair<size_t, int>> g_allocated_memory_map;
 inline std::mutex g_allocated_memory_map_mutex;
 
 /**
@@ -890,25 +962,33 @@ inline cudaError_t tracked_cudaMalloc(T** ptr, size_t size) {
             throw std::runtime_error("tracked_cudaMalloc: CPU calloc failed (size=" + std::to_string(size) + ")");
         }
         { std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
-          g_allocated_memory_map[*ptr] = size; }
-        CudaMemoryManager<T>::track_allocation(size);
+          g_allocated_memory_map[*ptr] = {size, -1}; }
+        CudaMemoryManager<T>::track_allocation(size, -1);
         return cudaSuccess;
     }
 
-    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(ptr), size);
+    // Use real_cudaMalloc to avoid recursion via the cudaMalloc → tracked_cudaMalloc
+    // macro redirect installed at the end of this header.
+    cudaError_t err = gansu::detail::real_cudaMalloc(reinterpret_cast<void**>(ptr), size);
 
     if (err == cudaSuccess) {
         // Zero-initialize device memory to prevent stale data contamination
         cudaMemset(*ptr, 0, size);
 
+        // Capture device id at alloc time so the matching free credits the
+        // right per-device counter (cudaFree itself can be called from any
+        // thread/device but the bytes belong to the alloc-time device).
+        int dev = -1;
+        cudaGetDevice(&dev);
+
         // Track allocation in map
         {
             std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
-            g_allocated_memory_map[*ptr] = size;
+            g_allocated_memory_map[*ptr] = {size, dev};
         }
 
         // Update memory statistics
-        CudaMemoryManager<T>::track_allocation(size);
+        CudaMemoryManager<T>::track_allocation(size, dev);
     } else {
         size_t current_mem = GlobalGpuMemoryTracker::get_current();
         std::ostringstream oss;
@@ -936,13 +1016,15 @@ inline cudaError_t tracked_cudaFree(void* ptr) {
         return cudaSuccess;
     }
 
-    // Get the size of the allocation
+    // Get the size and owning device of the allocation
     size_t size = 0;
+    int    dev  = -1;
     {
         std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
         auto it = g_allocated_memory_map.find(ptr);
         if (it != g_allocated_memory_map.end()) {
-            size = it->second;
+            size = it->second.first;
+            dev  = it->second.second;
             g_allocated_memory_map.erase(it);
         }
     }
@@ -951,11 +1033,11 @@ inline cudaError_t tracked_cudaFree(void* ptr) {
         // CPU mode: memory was allocated with calloc
         std::free(ptr);
     } else {
-        cudaFree(ptr);
+        gansu::detail::real_cudaFree(ptr);
     }
 
     if (size > 0) {
-        GlobalGpuMemoryTracker::track_deallocation(size);
+        GlobalGpuMemoryTracker::track_deallocation(size, dev);
     }
 
     return cudaSuccess;
@@ -979,19 +1061,21 @@ inline cudaError_t tracked_cudaMallocAsync(T** ptr, size_t size, cudaStream_t st
         *ptr = static_cast<T*>(std::calloc(1, size));
         if (!*ptr) throw std::runtime_error("tracked_cudaMallocAsync: CPU calloc failed");
         { std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
-          g_allocated_memory_map[*ptr] = size; }
-        CudaMemoryManager<T>::track_allocation(size);
+          g_allocated_memory_map[*ptr] = {size, -1}; }
+        CudaMemoryManager<T>::track_allocation(size, -1);
         return cudaSuccess;
     }
 
     cudaError_t err = cudaMallocAsync(reinterpret_cast<void**>(ptr), size, stream);
 
     if (err == cudaSuccess) {
+        int dev = -1;
+        cudaGetDevice(&dev);
         {
             std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
-            g_allocated_memory_map[*ptr] = size;
+            g_allocated_memory_map[*ptr] = {size, dev};
         }
-        CudaMemoryManager<T>::track_allocation(size);
+        CudaMemoryManager<T>::track_allocation(size, dev);
     } else {
         size_t current_mem = GlobalGpuMemoryTracker::get_current();
         std::cerr << "tracked_cudaMallocAsync failed: " << cudaGetErrorString(err) << "\n"
@@ -1019,11 +1103,13 @@ inline cudaError_t tracked_cudaFreeAsync(void* ptr, cudaStream_t stream) {
     }
 
     size_t size = 0;
+    int    dev  = -1;
     {
         std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
         auto it = g_allocated_memory_map.find(ptr);
         if (it != g_allocated_memory_map.end()) {
-            size = it->second;
+            size = it->second.first;
+            dev  = it->second.second;
             g_allocated_memory_map.erase(it);
         }
     }
@@ -1035,7 +1121,7 @@ inline cudaError_t tracked_cudaFreeAsync(void* ptr, cudaStream_t stream) {
     }
 
     if (size > 0) {
-        GlobalGpuMemoryTracker::track_deallocation(size);
+        GlobalGpuMemoryTracker::track_deallocation(size, dev);
     }
 
     return cudaSuccess;
@@ -1044,3 +1130,14 @@ inline cudaError_t tracked_cudaFreeAsync(void* ptr, cudaStream_t stream) {
 
 
 } // namespace gansu
+
+// Globally redirect plain cudaMalloc/cudaFree to the tracked wrappers so that
+// per-GPU memory statistics capture allocations from every translation unit
+// (incl. files using raw cudaMalloc such as eri_ri_distributed.cu). The
+// internal callers inside this header use gansu::detail::real_cudaMalloc and
+// real_cudaFree directly so they bypass the macro and avoid recursion. These
+// macros are purely textual and only match the exact tokens `cudaMalloc` /
+// `cudaFree` — cudaMallocHost, cudaMallocAsync, cudaFreeHost, cudaFreeAsync
+// are different identifiers and are unaffected.
+#define cudaMalloc gansu::tracked_cudaMalloc
+#define cudaFree gansu::tracked_cudaFree

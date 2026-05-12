@@ -54,8 +54,15 @@ struct DLPNOParams {
     int max_iter = 50;
     int diis_size = 6;
 
-    // Iterative LMP2 amplitude solver (Jacobi)
-    int lmp2_max_iter = 60;
+    // Iterative LMP2 amplitude solver (Jacobi).
+    // Note: same cap is reused for the CCSD T2 dressing iteration in
+    // iterate_dlpno_ccsd_t2. CCSD on hexamer-class systems with intra-pair
+    // dressing has an asymptotic convergence rate ~0.92-0.95/iter (slower
+    // than plain LMP2 ~0.7-0.8) — 60 iters is too tight, hitting the cap at
+    // max|R|~1.1e-8 just shy of 1e-8 target. 100 gives sufficient headroom
+    // for >2 additional orders of magnitude on hard systems while leaving
+    // easy LMP2 cases (which converge in <50 iters) unaffected.
+    int lmp2_max_iter = 100;
     real_t lmp2_conv = 1e-8;
     // Number of self-consistent PNO refinement rounds (0 = single shot)
     int sc_pno_iter = 1;

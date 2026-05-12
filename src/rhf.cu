@@ -20,7 +20,9 @@
 #include "rhf.hpp"
 #include <memory>
 #include "cphf_solver.hpp"
+#include "multi_gpu_manager.hpp"   // for actual GPU count in post-HF summary
 #include "progress.hpp"
+#include "dlpno_localizer.hpp"     // for export_lmo_molden_file (PM localization)
 #include <cassert>
 #include "ao2mo.cuh"
 #ifdef GANSU_MULTI_GPU
@@ -1038,43 +1040,82 @@ void RHF::report() {
     if(get_post_hf_method() != PostHFMethod::None){
         std::cout << std::endl;
         std::cout << "[Calculation Summary (Post-HF)]" << std::endl;
-        std::cout << "Post-HF method: ";
-        if(get_post_hf_method() == PostHFMethod::FCI){
-            std::cout << "FCI" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::MP2){
-            std::cout << "MP2" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::SCS_MP2){
-            std::cout << "SCS-MP2" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::SOS_MP2){
-            std::cout << "SOS-MP2" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::LT_MP2){
-            std::cout << "LT-MP2" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::LT_SOS_MP2){
-            std::cout << "LT-SOS-MP2" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::MP3){
-            std::cout << "MP3" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::CC2){
-            std::cout << "CC2" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::CCSD){
-            std::cout << "CCSD" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::CCSD_T){
-            std::cout << "CCSD(T)" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::CIS){
-            std::cout << "CIS" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::ADC2){
-            std::cout << "ADC(2)" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::ADC2X){
-            std::cout << "ADC(2)-x" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::EOM_MP2){
-            std::cout << "EOM-MP2" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::EOM_CC2){
-            std::cout << "EOM-CC2" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::EOM_CCSD){
-            std::cout << "EOM-CCSD" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::DMET_CCSD){
-            std::cout << "DMET-CCSD" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::DMET_CCSD_T){
-            std::cout << "DMET-CCSD(T)" << std::endl;
+
+        // Method name — covers every PostHFMethod enum value.
+        const PostHFMethod m = get_post_hf_method();
+        const char* method_name = "(unknown)";
+        switch (m) {
+            case PostHFMethod::FCI:           method_name = "FCI"; break;
+            case PostHFMethod::MP2:           method_name = "MP2"; break;
+            case PostHFMethod::SCS_MP2:       method_name = "SCS-MP2"; break;
+            case PostHFMethod::SOS_MP2:       method_name = "SOS-MP2"; break;
+            case PostHFMethod::LT_MP2:        method_name = "LT-MP2"; break;
+            case PostHFMethod::LT_SOS_MP2:    method_name = "LT-SOS-MP2"; break;
+            case PostHFMethod::MP3:           method_name = "MP3"; break;
+            case PostHFMethod::MP4:           method_name = "MP4"; break;
+            case PostHFMethod::CC2:           method_name = "CC2"; break;
+            case PostHFMethod::CCSD:          method_name = "CCSD"; break;
+            case PostHFMethod::CCSD_T:        method_name = "CCSD(T)"; break;
+            case PostHFMethod::CCSD_DENSITY:  method_name = "CCSD + 1-RDM (Lambda)"; break;
+            case PostHFMethod::CIS:           method_name = "CIS"; break;
+            case PostHFMethod::ADC2:          method_name = "ADC(2)"; break;
+            case PostHFMethod::SOS_ADC2:      method_name = "SOS-ADC(2)"; break;
+            case PostHFMethod::LT_SOS_ADC2:   method_name = "LT-SOS-ADC(2)"; break;
+            case PostHFMethod::ADC2X:         method_name = "ADC(2)-x"; break;
+            case PostHFMethod::EOM_MP2:       method_name = "EOM-MP2"; break;
+            case PostHFMethod::EOM_CC2:       method_name = "EOM-CC2"; break;
+            case PostHFMethod::EOM_CCSD:      method_name = "EOM-CCSD"; break;
+            case PostHFMethod::DMET_CCSD:     method_name = "DMET-CCSD"; break;
+            case PostHFMethod::DMET_CCSD_T:   method_name = "DMET-CCSD(T)"; break;
+            case PostHFMethod::THC_MP2:       method_name = "THC-MP2"; break;
+            case PostHFMethod::THC_SOS_MP2:   method_name = "THC-SOS-MP2"; break;
+            case PostHFMethod::THC_SOS_ADC2:  method_name = "THC-SOS-ADC(2)"; break;
+            case PostHFMethod::DLPNO_MP2:     method_name = "DLPNO-MP2"; break;
+            case PostHFMethod::DLPNO_CCSD:    method_name = "DLPNO-CCSD"; break;
+            case PostHFMethod::DLPNO_CCSD_T:  method_name = "DLPNO-CCSD(T)"; break;
+            case PostHFMethod::None:          method_name = "(none)"; break;
+        }
+        std::cout << "Post-HF method: " << method_name << std::endl;
+
+        // Method-specific configuration / parallelism info.
+        const bool is_dlpno = (m == PostHFMethod::DLPNO_MP2
+                            || m == PostHFMethod::DLPNO_CCSD
+                            || m == PostHFMethod::DLPNO_CCSD_T);
+        const bool is_dmet  = (m == PostHFMethod::DMET_CCSD
+                            || m == PostHFMethod::DMET_CCSD_T);
+        // Resolve actual GPU count: get_num_gpus() may be -1 (auto-detect);
+        // MultiGpuManager reports what was actually initialised at runtime.
+        const int n_gpu_actual = MultiGpuManager::instance().num_devices();
+        if (is_dlpno) {
+            std::cout << "  DLPNO preset:   " << get_dlpno_preset() << std::endl;
+            const int ns = get_last_dlpno_n_strong();
+            const int nw = get_last_dlpno_n_weak();
+            const int ne = get_last_dlpno_n_empty();
+            const int n_pairs = ns + nw + ne;
+            if (n_pairs > 0) {
+                std::cout << "  Pairs:          " << ns << " strong + " << nw
+                          << " weak";
+                if (ne > 0) std::cout << " (" << ne << " empty)";
+                std::cout << " / " << n_pairs << " total" << std::endl;
+            }
+            if (m == PostHFMethod::DLPNO_CCSD_T) {
+                const int n_tot = get_last_dlpno_n_triples_total();
+                const int n_act = get_last_dlpno_n_triples_active();
+                if (n_tot > 0) {
+                    std::cout << "  Triples (i≤j≤k): " << n_act << " active / "
+                              << n_tot << " total" << std::endl;
+                }
+            }
+            std::cout << "  GPUs used:      " << n_gpu_actual << std::endl;
+        }
+        if (is_dmet) {
+            const std::string& frags = get_dmet_fragments_str();
+            const int nf = get_last_dmet_n_fragments();
+            std::cout << "  DMET fragments: "
+                      << (nf > 0 ? std::to_string(nf) + " " : std::string())
+                      << "(" << (frags.empty() ? "auto X-H bonds" : frags) << ")"
+                      << std::endl;
+            std::cout << "  GPUs used:      " << n_gpu_actual << std::endl;
         }
 
         const auto& exc_energies = get_excitation_energies();
@@ -1204,7 +1245,7 @@ void RHF::export_molden_file(const std::string& filename) {
     }
 
 //    ofs << std::endl; // empty line
-    
+
     // write the orbital energies
     ofs << "[MO]" << std::endl;
     orbital_energies.toHost();
@@ -1221,6 +1262,134 @@ void RHF::export_molden_file(const std::string& filename) {
 
     ofs.close();
 
+}
+
+// ---------------------------------------------------------------------------
+//  Pipek-Mezey localized occupied MOs → Molden file
+// ---------------------------------------------------------------------------
+//  Re-uses the same [Atoms]/[GTO] header as the canonical writer, but the
+//  occupied block in [MO] is replaced by LMOs (C_occ · U). Virtual block keeps
+//  the canonical orbitals so molden viewers (Avogadro/Jmol/VMD) still show a
+//  full nao-set. Orbital energies for the occupied LMOs are the diagonal
+//  Fock-in-LMO-basis values ε_i^LMO = (U^T diag(ε_can) U)_{ii} so they sort
+//  meaningfully in viewers.
+// ---------------------------------------------------------------------------
+void RHF::export_lmo_molden_file(const std::string& filename) {
+    std::ofstream ofs(filename);
+    if (!ofs) {
+        throw std::runtime_error("Failed to open the file: " + filename);
+    }
+
+    // --- Header / Atoms / GTO (verbatim from export_molden_file) -----------
+    ofs << "[Molden Format]" << std::endl;
+    ofs << "[Title]" << std::endl;
+    ofs << "generated by GANSU (LMO export)" << std::endl;
+    ofs << "[Atoms] (Angs)" << std::endl;
+    for(size_t i=0; i<atoms.size(); i++){
+        ofs << atomic_number_to_element_name(atoms[i].atomic_number) << " "
+            << i+1 << " "
+            << atoms[i].atomic_number << " "
+            << bohr_to_angstrom(atoms[i].coordinate.x) << " "
+            << bohr_to_angstrom(atoms[i].coordinate.y) << " "
+            << bohr_to_angstrom(atoms[i].coordinate.z) << std::endl;
+    }
+    ofs << "[GTO]" << std::endl;
+    primitive_shells.toHost();
+    std::vector<int> num_primitives(num_basis, 0);
+    std::vector<int> shell_types(num_basis, 0);
+    for(size_t i=0; i<primitive_shells.size(); i++){
+        num_primitives[primitive_shells[i].basis_index]++;
+        shell_types[primitive_shells[i].basis_index] = primitive_shells[i].shell_type;
+    }
+    for(size_t i=0; i<atoms.size(); i++){
+        ofs << i+1 << " " << 0 << std::endl;
+        BasisRange basis_range = get_atom_to_basis_range()[i];
+        for(size_t j=basis_range.start_index; j<basis_range.end_index; j++){
+            if(num_primitives[j] == 0) continue;
+            ofs << " " << shell_type_to_shell_name(shell_types[j]) << " " << num_primitives[j] << " " << "1.00" << std::endl;
+            for(size_t k=0; k<primitive_shells.size(); k++){
+                if(primitive_shells[k].basis_index == j){
+                    ofs << "    " << primitive_shells[k].exponent << " " << primitive_shells[k].coefficient << std::endl;
+                }
+            }
+        }
+        ofs << std::endl;
+    }
+
+    // --- Localize occupied MOs via Pipek-Mezey -----------------------------
+    coefficient_matrix.toHost();
+    overlap_matrix.toHost();
+    orbital_energies.toHost();
+    const int nao  = static_cast<int>(num_basis);
+    const int nocc = static_cast<int>(num_electrons / 2);
+
+    // Extract C_occ (nao × nocc, row-major) and S (nao × nao, row-major).
+    std::vector<real_t> C_occ(static_cast<size_t>(nao) * nocc);
+    for (int mu = 0; mu < nao; ++mu)
+        for (int i = 0; i < nocc; ++i)
+            C_occ[static_cast<size_t>(mu) * nocc + i] = coefficient_matrix(mu, i);
+    std::vector<real_t> S(static_cast<size_t>(nao) * nao);
+    for (int mu = 0; mu < nao; ++mu)
+        for (int nu = 0; nu < nao; ++nu)
+            S[static_cast<size_t>(mu) * nao + nu] = overlap_matrix(mu, nu);
+
+    // Per-atom AO ranges (PM functional requires Mulliken-on-atom partition).
+    std::vector<std::pair<int,int>> atom_ao_ranges;
+    atom_ao_ranges.reserve(atoms.size());
+    for(size_t a = 0; a < atoms.size(); ++a){
+        const auto& br = get_atom_to_basis_range()[a];
+        atom_ao_ranges.emplace_back(br.start_index, br.end_index);
+    }
+
+    auto loc = localize_pipek_mezey(
+        C_occ.data(), S.data(),
+        nao, nocc, atom_ao_ranges,
+        /*max_sweep=*/200, /*conv_tol=*/1e-10, /*verbose=*/1);
+
+    // LMO Fock-diagonal "pseudo-energies": ε_i^LMO = Σ_k U_{ki}² · ε_k^can
+    // (this is exact for Hartree-Fock since canonical F is diagonal in the
+    // canonical MO basis). Used only for sorting/display in molden viewers.
+    std::vector<real_t> eps_lmo(nocc, 0.0);
+    for (int i = 0; i < nocc; ++i) {
+        real_t s = 0.0;
+        for (int k = 0; k < nocc; ++k) {
+            const real_t u = loc.U[static_cast<size_t>(k) * nocc + i];
+            s += u * u * orbital_energies[k];
+        }
+        eps_lmo[i] = s;
+    }
+
+    // --- [MO] block: LMOs (occupied) + canonical virtuals -----------------
+    ofs << "[MO]" << std::endl;
+    // Occupied: write C_LMO column by column.
+    for (int i = 0; i < nocc; ++i) {
+        ofs << "Sym= A" << std::endl;
+        ofs << "Ene= " << eps_lmo[i] << std::endl;
+        ofs << "Spin= Alpha" << std::endl;
+        ofs << "Occup= 2.0" << std::endl;
+        for (int mu = 0; mu < nao; ++mu) {
+            ofs << " " << mu+1 << " " << std::setprecision(17)
+                << loc.C_LMO[static_cast<size_t>(mu) * nocc + i] << std::endl;
+        }
+    }
+    // Virtual: keep canonical.
+    for (int i = nocc; i < nao; ++i) {
+        ofs << "Sym= A" << std::endl;
+        ofs << "Ene= " << orbital_energies[i] << std::endl;
+        ofs << "Spin= Alpha" << std::endl;
+        ofs << "Occup= 0.0" << std::endl;
+        for (int mu = 0; mu < nao; ++mu) {
+            ofs << " " << mu+1 << " " << std::setprecision(17)
+                << coefficient_matrix(mu, i) << std::endl;
+        }
+    }
+    ofs.close();
+
+    std::cout << "[LMO Molden] wrote " << nocc << " Pipek-Mezey LMOs + "
+              << (nao - nocc) << " canonical virtuals to " << filename
+              << "  (PM: " << loc.n_sweeps << " sweeps, L = "
+              << loc.functional_initial << " → " << loc.functional_final << ")"
+              << std::endl;
 }
 
 

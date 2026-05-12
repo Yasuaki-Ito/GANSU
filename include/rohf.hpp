@@ -141,6 +141,7 @@ public:
      * @param filename File name
      */
     void export_molden_file(const std::string& filename) override;
+    void export_lmo_molden_file(const std::string& filename) override;
 
     const ROHF_ParameterSet& get_ROHF_parameters() const { return ROHF_parameters; } ///< Get the ROHF parameters
 

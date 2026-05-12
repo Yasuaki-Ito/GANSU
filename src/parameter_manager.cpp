@@ -68,6 +68,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"mayer", "0"},                             // int (bool)
         {"wiberg", "0"},                            // int (bool)
         {"export_molden", "0"},                     // int (bool)
+        {"export_lmo_molden", "0"},                 // int (bool) — export Pipek-Mezey localized occupied orbitals as <basename>_lmo.molden for visualization (Avogadro/Jmol/VMD)
         {"int1e_method", "hybrid"},                 // string
         {"n_excited_states", "5"},                   // int
         {"adc2_solver", "auto"},                     // string (auto, schur_static, schur_omega, full)
@@ -114,7 +115,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"dlpno_diis_size", "6"},                          // int: DIIS subspace size for DLPNO-CCSD
         {"dlpno_localizer_max_sweep", "200"},              // int: PM/Boys Jacobi sweep upper bound
         {"dlpno_localizer_conv", "1e-10"},                 // real_t: localizer ΔP² convergence threshold
-        {"dlpno_lmp2_max_iter", "60"},                     // int: iterative LMP2 amplitude solver max iterations
+        {"dlpno_lmp2_max_iter", "100"},                    // int: iterative LMP2 amplitude solver max iterations (also caps CCSD T2 dressing iter; hexamer-class CCSD T2 needs ~70-80 iters at conv 1e-8)
         {"dlpno_lmp2_conv", "1e-8"},                       // real_t: LMP2 residual convergence (max-abs amplitude residual)
         {"dlpno_sc_pno_iter", "1"},                        // int: extra rounds of self-consistent PNO refinement (0 = single-shot PNO selection from semi-canonical guess)
         {"dlpno_pno_os_only", "0"},                        // bool: PNO selection from opposite-spin amplitudes only (D = T^T T + T T^T). Default 0 = use full LMP2 density (Riplinger 2013, T̃^T T + T̃ T^T) which slightly outperforms the OS-only form for full closed-shell MP2 energy evaluation. Set to 1 only when pairing with SOS-MP2 (c_os scaling, SS dropped).

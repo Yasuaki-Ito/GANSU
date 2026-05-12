@@ -725,6 +725,9 @@ real_t DMET::compute_energy(bool with_triples) {
     std::cout << "  Number of fragments: " << fragments_.size() << std::endl;
     std::cout << "  SVD threshold: " << std::scientific << svd_threshold_ << std::defaultfloat << std::endl;
 
+    // Register fragment count so the post-HF summary can report it.
+    rhf_.set_last_dmet_n_fragments(static_cast<int>(fragments_.size()));
+
     for (size_t f = 0; f < fragments_.size(); f++) {
         std::cout << "  Fragment " << f << ": atoms={";
         for (size_t i = 0; i < fragments_[f].atom_indices.size(); i++) {

@@ -105,7 +105,8 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     is_mulliken_analysis_(parameters.get<bool>("mulliken")),
     is_mayer_bond_order_analysis_(parameters.get<bool>("mayer")),
     is_wiberg_bond_order_analysis_(parameters.get<bool>("wiberg")),
-    is_export_molden_(parameters.get<bool>("export_molden"))
+    is_export_molden_(parameters.get<bool>("export_molden")),
+    is_export_lmo_molden_(parameters.get<bool>("export_lmo_molden"))
 {
     adc_c_t_ = parameters.get<double>("adc_c_t");
     adc_c_c_ = parameters.get<double>("adc_c_c");
@@ -245,7 +246,7 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
         post_hf_method_ = PostHFMethod::THC_SOS_MP2;
     }else if(post_hf_method_str == "thc_sos_adc2" || post_hf_method_str == "thc-sos-adc2"
              || post_hf_method_str == "thc_sos_adc(2)" || post_hf_method_str == "thc-sos-adc(2)"){
-        std::cout << "Message: Post-HF method is THC-SOS-ADC(2) (Phase 2.2a MVP)." << std::endl;
+        std::cout << "Message: Post-HF method is THC-SOS-ADC(2)." << std::endl;
         post_hf_method_ = PostHFMethod::THC_SOS_ADC2;
     }else if(post_hf_method_str == "dlpno_mp2" || post_hf_method_str == "dlpno-mp2"){
         std::cout << "Message: Post-HF method is DLPNO-MP2." << std::endl;
@@ -1170,6 +1171,9 @@ void HF::report(){
 
     if(is_export_molden_){
         export_molden_file("output.molden"); // Export the molecular orbitals to a molden file
+    }
+    if(is_export_lmo_molden_){
+        export_lmo_molden_file("output_lmo.molden"); // Export Pipek-Mezey localized occupied MOs
     }
 }
 

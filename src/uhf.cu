@@ -21,6 +21,8 @@
  #include "uhf.hpp"
  #include "utils.hpp" // THROW_EXCEPTION
  #include "ecp_integrals.hpp"
+ #include "dlpno_localizer.hpp" // for export_lmo_molden_file (PM localization)
+ #include "multi_gpu_manager.hpp"   // for actual GPU count in post-HF summary
 
  #include <limits> // numeric_limits<double>::max();
  #include <iomanip> // std::setprecision
@@ -544,22 +546,80 @@ std::vector<double> UHF::compute_Energy_Gradient() {
     if(get_post_hf_method() != PostHFMethod::None){
         std::cout << std::endl;
         std::cout << "[Calculation Summary (Post-HF)]" << std::endl;
-        std::cout << "Post-HF method: ";
-        if(get_post_hf_method() == PostHFMethod::FCI){
-            std::cout << "FCI" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::MP2){
-            std::cout << "MP2" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::SCS_MP2){
-            std::cout << "SCS-MP2" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::SOS_MP2){
-            std::cout << "SOS-MP2" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::MP3){
-            std::cout << "MP3" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::CCSD){
-            std::cout << "CCSD" << std::endl;
-        }else if(get_post_hf_method() == PostHFMethod::CCSD_T){
-            std::cout << "CCSD(T)" << std::endl;
+
+        const PostHFMethod m = get_post_hf_method();
+        const char* method_name = "(unknown)";
+        switch (m) {
+            case PostHFMethod::FCI:           method_name = "FCI"; break;
+            case PostHFMethod::MP2:           method_name = "MP2 (unrestricted)"; break;
+            case PostHFMethod::SCS_MP2:       method_name = "SCS-MP2 (unrestricted)"; break;
+            case PostHFMethod::SOS_MP2:       method_name = "SOS-MP2 (unrestricted)"; break;
+            case PostHFMethod::LT_MP2:        method_name = "LT-MP2 (unrestricted)"; break;
+            case PostHFMethod::LT_SOS_MP2:    method_name = "LT-SOS-MP2 (unrestricted)"; break;
+            case PostHFMethod::MP3:           method_name = "MP3 (unrestricted)"; break;
+            case PostHFMethod::MP4:           method_name = "MP4 (unrestricted)"; break;
+            case PostHFMethod::CC2:           method_name = "CC2 (unrestricted)"; break;
+            case PostHFMethod::CCSD:          method_name = "CCSD (unrestricted)"; break;
+            case PostHFMethod::CCSD_T:        method_name = "CCSD(T) (unrestricted)"; break;
+            case PostHFMethod::CCSD_DENSITY:  method_name = "CCSD + 1-RDM (unrestricted)"; break;
+            case PostHFMethod::CIS:           method_name = "CIS (unrestricted)"; break;
+            case PostHFMethod::ADC2:          method_name = "ADC(2) (unrestricted)"; break;
+            case PostHFMethod::SOS_ADC2:      method_name = "SOS-ADC(2) (unrestricted)"; break;
+            case PostHFMethod::LT_SOS_ADC2:   method_name = "LT-SOS-ADC(2) (unrestricted)"; break;
+            case PostHFMethod::ADC2X:         method_name = "ADC(2)-x (unrestricted)"; break;
+            case PostHFMethod::EOM_MP2:       method_name = "EOM-MP2 (unrestricted)"; break;
+            case PostHFMethod::EOM_CC2:       method_name = "EOM-CC2 (unrestricted)"; break;
+            case PostHFMethod::EOM_CCSD:      method_name = "EOM-CCSD (unrestricted)"; break;
+            case PostHFMethod::DMET_CCSD:     method_name = "DMET-CCSD (unrestricted)"; break;
+            case PostHFMethod::DMET_CCSD_T:   method_name = "DMET-CCSD(T) (unrestricted)"; break;
+            case PostHFMethod::THC_MP2:       method_name = "THC-MP2 (unrestricted)"; break;
+            case PostHFMethod::THC_SOS_MP2:   method_name = "THC-SOS-MP2 (unrestricted)"; break;
+            case PostHFMethod::THC_SOS_ADC2:  method_name = "THC-SOS-ADC(2) (unrestricted)"; break;
+            case PostHFMethod::DLPNO_MP2:     method_name = "DLPNO-MP2 (unrestricted)"; break;
+            case PostHFMethod::DLPNO_CCSD:    method_name = "DLPNO-CCSD (unrestricted)"; break;
+            case PostHFMethod::DLPNO_CCSD_T:  method_name = "DLPNO-CCSD(T) (unrestricted)"; break;
+            case PostHFMethod::None:          method_name = "(none)"; break;
         }
+        std::cout << "Post-HF method: " << method_name << std::endl;
+
+        const bool is_dlpno = (m == PostHFMethod::DLPNO_MP2
+                            || m == PostHFMethod::DLPNO_CCSD
+                            || m == PostHFMethod::DLPNO_CCSD_T);
+        const bool is_dmet  = (m == PostHFMethod::DMET_CCSD
+                            || m == PostHFMethod::DMET_CCSD_T);
+        const int n_gpu_actual = MultiGpuManager::instance().num_devices();
+        if (is_dlpno) {
+            std::cout << "  DLPNO preset:   " << get_dlpno_preset() << std::endl;
+            const int ns = get_last_dlpno_n_strong();
+            const int nw = get_last_dlpno_n_weak();
+            const int ne = get_last_dlpno_n_empty();
+            const int n_pairs = ns + nw + ne;
+            if (n_pairs > 0) {
+                std::cout << "  Pairs:          " << ns << " strong + " << nw
+                          << " weak";
+                if (ne > 0) std::cout << " (" << ne << " empty)";
+                std::cout << " / " << n_pairs << " total" << std::endl;
+            }
+            if (m == PostHFMethod::DLPNO_CCSD_T) {
+                const int n_tot = get_last_dlpno_n_triples_total();
+                const int n_act = get_last_dlpno_n_triples_active();
+                if (n_tot > 0) {
+                    std::cout << "  Triples (i≤j≤k): " << n_act << " active / "
+                              << n_tot << " total" << std::endl;
+                }
+            }
+            std::cout << "  GPUs used:      " << n_gpu_actual << std::endl;
+        }
+        if (is_dmet) {
+            const std::string& frags = get_dmet_fragments_str();
+            const int nf = get_last_dmet_n_fragments();
+            std::cout << "  DMET fragments: "
+                      << (nf > 0 ? std::to_string(nf) + " " : std::string())
+                      << "(" << (frags.empty() ? "auto X-H bonds" : frags) << ")"
+                      << std::endl;
+            std::cout << "  GPUs used:      " << n_gpu_actual << std::endl;
+        }
+
         std::cout << "Post-HF energy correction: " << std::setprecision(17) << get_post_hf_energy() << " [hartree]" << std::endl;
         std::cout << "Total Energy (including post-HF correction): " << std::setprecision(17) << get_total_energy() + get_post_hf_energy() << " [hartree]" << std::endl;
     }
@@ -639,6 +699,134 @@ void UHF::export_molden_file(const std::string& filename) {
     }
 
     ofs.close();
+}
+
+// ---------------------------------------------------------------------------
+//  UHF Pipek-Mezey localized occupied MOs → Molden file
+//  α and β occupied blocks are localized independently. Virtual block keeps
+//  canonical orbitals for both spins. Orbital "energies" of LMOs are diagonal
+//  Fock-in-LMO-basis values (sums of |U_{ki}|² · ε_k^can).
+// ---------------------------------------------------------------------------
+void UHF::export_lmo_molden_file(const std::string& filename) {
+    std::ofstream ofs(filename);
+    if (!ofs) {
+        THROW_EXCEPTION("Failed to open the file: " + filename);
+    }
+
+    ofs << "[Molden Format]" << std::endl;
+    ofs << "[Title]" << std::endl;
+    ofs << "generated by GANSU (UHF LMO export)" << std::endl;
+    ofs << "[Atoms] (Angs)" << std::endl;
+    for(size_t i=0; i<atoms.size(); i++){
+        ofs << atomic_number_to_element_name(atoms[i].atomic_number) << " "
+            << i+1 << " "
+            << atoms[i].atomic_number << " "
+            << bohr_to_angstrom(atoms[i].coordinate.x) << " "
+            << bohr_to_angstrom(atoms[i].coordinate.y) << " "
+            << bohr_to_angstrom(atoms[i].coordinate.z) << std::endl;
+    }
+    ofs << "[GTO]" << std::endl;
+    primitive_shells.toHost();
+    std::vector<int> num_primitives(num_basis, 0);
+    std::vector<int> shell_types(num_basis, 0);
+    for(size_t i=0; i<primitive_shells.size(); i++){
+        num_primitives[primitive_shells[i].basis_index]++;
+        shell_types[primitive_shells[i].basis_index] = primitive_shells[i].shell_type;
+    }
+    for(size_t i=0; i<atoms.size(); i++){
+        ofs << i+1 << " " << 0 << std::endl;
+        BasisRange basis_range = get_atom_to_basis_range()[i];
+        for(size_t j=basis_range.start_index; j<basis_range.end_index; j++){
+            if(num_primitives[j] == 0) continue;
+            ofs << " " << shell_type_to_shell_name(shell_types[j]) << " " << num_primitives[j] << " " << "1.00" << std::endl;
+            for(size_t k=0; k<primitive_shells.size(); k++){
+                if(primitive_shells[k].basis_index == j){
+                    ofs << "\t" << primitive_shells[k].exponent << " " << primitive_shells[k].coefficient << std::endl;
+                }
+            }
+        }
+        ofs << std::endl;
+    }
+    ofs << std::endl;
+
+    // --- Pull host copies ---
+    orbital_energies_a.toHost();
+    orbital_energies_b.toHost();
+    coefficient_matrix_a.toHost();
+    coefficient_matrix_b.toHost();
+    overlap_matrix.toHost();
+    const int nao = static_cast<int>(num_basis);
+
+    std::vector<real_t> S(static_cast<size_t>(nao) * nao);
+    for (int mu = 0; mu < nao; ++mu)
+        for (int nu = 0; nu < nao; ++nu)
+            S[static_cast<size_t>(mu) * nao + nu] = overlap_matrix(mu, nu);
+
+    std::vector<std::pair<int,int>> atom_ao_ranges;
+    atom_ao_ranges.reserve(atoms.size());
+    for(size_t a = 0; a < atoms.size(); ++a){
+        const auto& br = get_atom_to_basis_range()[a];
+        atom_ao_ranges.emplace_back(br.start_index, br.end_index);
+    }
+
+    // Helper lambda: localize one spin block and write it to molden.
+    auto write_spin_block = [&](int n_occ_spin,
+                                const auto& coef,        // coefficient_matrix_a or _b
+                                const auto& eps_arr,     // orbital_energies_a or _b
+                                const std::string& spin_label) {
+        std::vector<real_t> C_occ(static_cast<size_t>(nao) * n_occ_spin);
+        for (int mu = 0; mu < nao; ++mu)
+            for (int i = 0; i < n_occ_spin; ++i)
+                C_occ[static_cast<size_t>(mu) * n_occ_spin + i] = coef(mu, i);
+
+        auto loc = localize_pipek_mezey(
+            C_occ.data(), S.data(),
+            nao, n_occ_spin, atom_ao_ranges,
+            /*max_sweep=*/200, /*conv_tol=*/1e-10, /*verbose=*/1);
+
+        std::vector<real_t> eps_lmo(n_occ_spin, 0.0);
+        for (int i = 0; i < n_occ_spin; ++i) {
+            real_t s = 0.0;
+            for (int k = 0; k < n_occ_spin; ++k) {
+                const real_t u = loc.U[static_cast<size_t>(k) * n_occ_spin + i];
+                s += u * u * eps_arr[k];
+            }
+            eps_lmo[i] = s;
+        }
+        // Occupied LMOs
+        for (int i = 0; i < n_occ_spin; ++i) {
+            ofs << "Sym= A" << std::endl;
+            ofs << "Ene= " << eps_lmo[i] << std::endl;
+            ofs << "Spin= " << spin_label << std::endl;
+            ofs << "Occup= 1.0" << std::endl;
+            for (int mu = 0; mu < nao; ++mu) {
+                ofs << " " << mu+1 << " " << std::setprecision(17)
+                    << loc.C_LMO[static_cast<size_t>(mu) * n_occ_spin + i] << std::endl;
+            }
+        }
+        // Canonical virtuals
+        for (int i = n_occ_spin; i < nao; ++i) {
+            ofs << "Sym= A" << std::endl;
+            ofs << "Ene= " << eps_arr[i] << std::endl;
+            ofs << "Spin= " << spin_label << std::endl;
+            ofs << "Occup= 0.0" << std::endl;
+            for (int mu = 0; mu < nao; ++mu) {
+                ofs << " " << mu+1 << " " << std::setprecision(17)
+                    << coef(mu, i) << std::endl;
+            }
+        }
+        std::cout << "[LMO Molden] " << spin_label << ": "
+                  << n_occ_spin << " PM LMOs, "
+                  << loc.n_sweeps << " sweeps, L = "
+                  << loc.functional_initial << " → " << loc.functional_final
+                  << std::endl;
+    };
+
+    ofs << "[MO]" << std::endl;
+    write_spin_block(static_cast<int>(num_alpha_spins), coefficient_matrix_a, orbital_energies_a, "Alpha");
+    write_spin_block(static_cast<int>(num_beta_spins),  coefficient_matrix_b, orbital_energies_b, "Beta");
+    ofs.close();
+    std::cout << "[LMO Molden] wrote UHF localized α+β to " << filename << std::endl;
 }
 
 std::vector<real_t> UHF::analyze_mulliken_population() const {

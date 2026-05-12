@@ -41,6 +41,7 @@ set(GPU_TEST_SOURCES
     test_dlpno_pao.cu
     test_dlpno_mp2.cu
     test_dlpno_ccsd.cu
+    test_dlpno_tno.cu
 )
 
 # CPU backend test source files (separate executable to avoid GPU state pollution)

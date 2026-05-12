@@ -183,14 +183,28 @@ extern "C" int gansu_run(gansu_handle_t h) {
         // Reset memory tracking counters — after hf.reset() freed everything,
         // counters should be near zero. Recalculate from the authoritative map.
         {
-            size_t actual = 0;
+            size_t actual_total = 0;
+            std::unordered_map<int, size_t> actual_by_dev;
             {
                 std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
-                for (const auto& kv : g_allocated_memory_map) actual += kv.second;
+                for (const auto& kv : g_allocated_memory_map) {
+                    const size_t bytes = kv.second.first;
+                    const int    dev   = kv.second.second;
+                    actual_total += bytes;
+                    if (dev >= 0) actual_by_dev[dev] += bytes;
+                }
             }
             {
                 std::lock_guard<std::mutex> lock(GlobalGpuMemoryTracker::mutex_);
-                GlobalGpuMemoryTracker::current_bytes_ = actual;
+                GlobalGpuMemoryTracker::current_bytes_ = actual_total;
+                // Refresh per-device current counters to match the live map.
+                for (auto& kv : GlobalGpuMemoryTracker::current_by_device_) {
+                    auto it = actual_by_dev.find(kv.first);
+                    kv.second = (it != actual_by_dev.end()) ? it->second : 0;
+                }
+                for (const auto& kv : actual_by_dev) {
+                    GlobalGpuMemoryTracker::current_by_device_[kv.first] = kv.second;
+                }
             }
             CudaMemoryManager<real_t>::reset_memory_statistics();
         }

@@ -286,6 +286,28 @@ public:
     /// Number of GPUs requested (-1 = auto-detect, 1 = single, > 1 = multi).
     int    get_num_gpus() const { return num_gpus_; }
 
+    /// Post-HF runtime statistics — populated by the post-HF driver as it
+    /// runs so that the post-HF summary can report the actual problem size.
+    /// All default to 0 if the corresponding method was not used.
+    int  get_last_dmet_n_fragments() const { return last_dmet_n_fragments_; }
+    void set_last_dmet_n_fragments(int n) { last_dmet_n_fragments_ = n; }
+
+    int  get_last_dlpno_n_strong() const { return last_dlpno_n_strong_; }
+    int  get_last_dlpno_n_weak()   const { return last_dlpno_n_weak_; }
+    int  get_last_dlpno_n_empty()  const { return last_dlpno_n_empty_; }
+    void set_last_dlpno_pairs(int strong, int weak, int empty) {
+        last_dlpno_n_strong_ = strong;
+        last_dlpno_n_weak_   = weak;
+        last_dlpno_n_empty_  = empty;
+    }
+
+    int  get_last_dlpno_n_triples_total()  const { return last_dlpno_n_triples_total_; }
+    int  get_last_dlpno_n_triples_active() const { return last_dlpno_n_triples_active_; }
+    void set_last_dlpno_triples(int total, int active) {
+        last_dlpno_n_triples_total_  = total;
+        last_dlpno_n_triples_active_ = active;
+    }
+
     /**
      * @brief Get Shell-pair type info
      */
@@ -483,7 +505,7 @@ protected:
     int    dlpno_diis_size_ = 6;
     int    dlpno_localizer_max_sweep_ = 200;
     double dlpno_localizer_conv_ = 1e-10;
-    int    dlpno_lmp2_max_iter_ = 60;
+    int    dlpno_lmp2_max_iter_ = 100;
     double dlpno_lmp2_conv_ = 1e-8;
     int    dlpno_sc_pno_iter_ = 1;
     bool   dlpno_pno_os_only_ = false;
@@ -491,6 +513,14 @@ protected:
 
     // Multi-GPU
     int    num_gpus_ = 1;
+
+    // Post-HF runtime statistics (set by drivers, read by post-HF summary).
+    int    last_dmet_n_fragments_      = 0;
+    int    last_dlpno_n_strong_        = 0;
+    int    last_dlpno_n_weak_          = 0;
+    int    last_dlpno_n_empty_         = 0;
+    int    last_dlpno_n_triples_total_ = 0;
+    int    last_dlpno_n_triples_active_ = 0;
     const int max_iter; ///< Maximum number of iterations
     int iter_; ///< Number of iterations
     real_t energy_difference_; ///< Energy difference between the current and the previous iteration
@@ -555,7 +585,8 @@ protected:
     const bool is_mulliken_analysis_; ///< Mulliken population analysis flag
     const bool is_mayer_bond_order_analysis_; ///< Mayer bond order analysis flag
     const bool is_wiberg_bond_order_analysis_; ///< Wiberg bond order analysis
-    const bool is_export_molden_; ///< Export Molden file flag
+    const bool is_export_molden_; ///< Export Molden file flag (canonical MOs)
+    const bool is_export_lmo_molden_; ///< Export Pipek-Mezey localized occupied MOs as <basename>_lmo.molden
 
     /**
      * @brief Virtual function to compute the Fock matrix
@@ -675,6 +706,11 @@ public:
      * @details This function is implemented in the derived class.
      */
     virtual void export_molden_file(const std::string& filename) = 0;
+
+    /// Export Pipek-Mezey localized occupied orbitals as a Molden file.
+    /// Occupied block is replaced by LMOs (C_LMO = C_occ · U); virtual block
+    /// retains the canonical orbitals. UHF/ROHF localise α and β separately.
+    virtual void export_lmo_molden_file(const std::string& filename) = 0;
 
 
     /**

@@ -240,7 +240,7 @@ DLPNOLocalizationResult localize_foster_boys(
     int /*verbose*/)
 {
     throw std::runtime_error(
-        "Foster-Boys localizer is not implemented yet (DLPNO Phase 0). "
+        "Foster-Boys localizer is not implemented yet. "
         "Use --dlpno_localizer pm.");
 }
 
@@ -284,7 +284,7 @@ DLPNOLocalizationResult localize_occupied(
     if (method == "ibo") {
         // IBO requires a minimal-basis projection (Knizia 2013). Defer.
         throw std::runtime_error(
-            "IBO localizer is not implemented yet (DLPNO Phase 0). "
+            "IBO localizer is not implemented yet. "
             "Use --dlpno_localizer pm.");
     }
     throw std::runtime_error("Unknown DLPNO localizer: '" + method + "'");
