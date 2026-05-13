@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include "gpu_manager.hpp"
+#include "multi_gpu_manager.hpp"  // MultiGpuManager, DeviceGuard
 #endif
 
 namespace gansu {
@@ -70,9 +71,10 @@ __global__ void slice_pi_N_T_for_I_kernel(
     const int*    __restrict__ d_pair_lookup,
     real_t*       __restrict__ d_pi_N_pad,
     real_t*       __restrict__ d_pi_T_pad,
-    int N_pair, int nocc, int max_n)
+    int N_pair, int nocc, int max_n,
+    int pair_begin)
 {
-    const int idx = blockIdx.x;
+    const int idx = blockIdx.x + pair_begin;
     const int l   = blockIdx.y;
     if (idx >= N_pair || l >= nocc) return;
 
@@ -137,9 +139,10 @@ __global__ void inter_pair_fock_i_kernel(
     const real_t* __restrict__ d_dF_ki,
     real_t*       __restrict__ d_R_pad,
     int N_pair, int nocc, int max_n,
-    real_t threshold)
+    real_t threshold,
+    int pair_begin)
 {
-    const int idx = blockIdx.x;
+    const int idx = blockIdx.x + pair_begin;
     if (idx >= N_pair) return;
 
     const int n_ij = d_n_pno[idx];
@@ -195,9 +198,10 @@ __global__ void inter_pair_fock_j_kernel(
     const real_t* __restrict__ d_dF_ki,
     real_t*       __restrict__ d_R_pad,
     int N_pair, int nocc, int max_n,
-    real_t threshold)
+    real_t threshold,
+    int pair_begin)
 {
-    const int idx = blockIdx.x;
+    const int idx = blockIdx.x + pair_begin;
     if (idx >= N_pair) return;
 
     const int n_ij = d_n_pno[idx];
@@ -234,7 +238,7 @@ __global__ void inter_pair_fock_j_kernel(
     }
 }
 
-// Step 6.6 — fused oooo ladder kernel.
+// Step 6.6 — fused oooo ladder kernel (Phase 2.2 refactor with shared-mem W_eff).
 //
 // Per pair idx (with non-empty n_pno = n_ij) and (a, b) ∈ [0, n_ij)²:
 //   R[idx][a, b] += Σ_{kl} W_eff[idx][kl] · π_{kl}^{oriented}[a, b]
@@ -242,15 +246,21 @@ __global__ void inter_pair_fock_j_kernel(
 //        W_dress[idx][kl] = Σ_{d, c} V_lk(d, c) · Y_old(c, d)
 //                         = Σ_{d, c} V_stacked[idx][kl, d·max_n + c] · Y_pad[idx][c·max_n + d]
 //
-// Each thread runs a doubly-nested loop: outer kl ∈ [0, nocc²), inner
-// (d, c) ∈ [0, n_ij)². V_lk and Y_pad reads are warp-broadcast (all 144
-// threads in a block share the same V/Y per inner iteration, so L1 cache
-// handles the redundancy efficiently). pi_T_stack reads are coalesced
-// across b (innermost threadIdx). R_pad writes are coalesced.
-//
-// (Step 6.6b experimented with splitting this into compute-W_eff +
-//  apply-W_eff kernels — no measurable speedup since the cache-broadcast
-//  pattern already amortised the W_dress redundancy in the fused form.)
+// Optimisation history:
+//   - Original (Step 6.6a fused, used until 2026-05-13): each thread re-
+//     computed W_dress[kl] independently for its (a, b). With n_ij up to 8,
+//     this meant 64× redundant inner-loop work per kl. The hope was that
+//     the L1/L2 caches would absorb the redundancy via warp-broadcast,
+//     but nsys profiling (hexamer cc-pVDZ, 8×A100) showed the kernel
+//     dominating 91.5% of GPU time at 76 ms/call — the strided Y_pad reads
+//     (Y_col[cc * max_n]) blew the cache.
+//   - This version: each block (= one pair) cooperatively computes the
+//     nocc² values of W_eff[kl] ONCE into shared memory, then loops over
+//     (a, b) to accumulate Σ_kl W_eff[kl] · pi(a, kl, b). Eliminates the
+//     64× redundancy. Shared mem use = nocc² × 8 B (typically 7-30 KB,
+//     fits in 48 KB default per-block limit).
+//   - Expected per-kernel speedup: ~10-50× depending on n_ij and cache
+//     behavior. Benefits 1-GPU and multi-GPU paths equally.
 __global__ void oooo_lad_kernel(
     const real_t* __restrict__ d_V_stacked_oooo_pad,
     const real_t* __restrict__ d_W_oooo,
@@ -259,9 +269,12 @@ __global__ void oooo_lad_kernel(
     const size_t* __restrict__ d_idx_offset_pi_T,
     const int*    __restrict__ d_n_pno,
     real_t*       __restrict__ d_R_pad,
-    int N_pair, int nocc, int max_n)
+    int N_pair, int nocc, int max_n,
+    int pair_begin)
 {
-    const int idx = blockIdx.x;
+    extern __shared__ real_t s_W_eff[];  // size nocc² doubles
+
+    const int idx = blockIdx.x + pair_begin;
     if (idx >= N_pair) return;
 
     const int n_ij = d_n_pno[idx];
@@ -274,28 +287,42 @@ __global__ void oooo_lad_kernel(
     const size_t y_pair_off = static_cast<size_t>(idx) * max_nn;
     const size_t pi_kl_stride = static_cast<size_t>(n_ij);
 
-    // Step 6.6 fix: strided per-thread loop for max_n > sqrt(1024).
+    const int tid       = threadIdx.y * blockDim.x + threadIdx.x;
+    const int nthreads  = blockDim.x * blockDim.y;
+
+    // ---- Phase 1: cooperatively compute s_W_eff[kl] for all kl ∈ [0, nocc²). ----
+    // Threads stride through kl. Per kl: read W_oooo + compute W_dress
+    // (n_ij² mul-adds on V and Y). Strided Y access remains here but only
+    // done ONCE per kl per block (not 64× as before).
+    for (int kl = tid; kl < nocc2; kl += nthreads) {
+        const real_t* V_lk = d_V_stacked_oooo_pad
+                           + v_pair_off
+                           + static_cast<size_t>(kl) * max_nn;
+        real_t W_dress = real_t(0);
+        for (int dd = 0; dd < n_ij; ++dd) {
+            const real_t* V_row = V_lk + static_cast<size_t>(dd) * max_n;
+            const real_t* Y_col = d_Y_pad + y_pair_off + dd;
+            for (int cc = 0; cc < n_ij; ++cc) {
+                W_dress += V_row[cc] * Y_col[static_cast<size_t>(cc) * max_n];
+            }
+        }
+        s_W_eff[kl] = d_W_oooo[w_pair_off + kl] + W_dress;
+    }
+    __syncthreads();
+
+    // ---- Phase 2: each thread handles its (a, b), Σ_kl W_eff[kl] · pi(a, kl, b). ----
+    // pi_T_stack layout: per-pair contiguous segment at d_idx_offset_pi_T[idx],
+    // pi[a, (k·nocc + l)·n_ij + d]. With kl = k·nocc + l, "b" plays the
+    // role of "d" here (we read pi at (a, kl·n_ij + b)). pi reads vary by
+    // n_ij stride across kl (strided), but threads within a warp read
+    // adjacent b indices for fixed kl (coalesced across the warp).
     for (int a = threadIdx.y; a < n_ij; a += blockDim.y) {
         for (int b = threadIdx.x; b < n_ij; b += blockDim.x) {
             const size_t pi_pair_off = d_idx_offset_pi_T[idx]
                                      + static_cast<size_t>(a) * nocc * nocc * n_ij + b;
             real_t acc = real_t(0);
             for (int kl = 0; kl < nocc2; ++kl) {
-                const real_t* V_lk = d_V_stacked_oooo_pad
-                                   + v_pair_off
-                                   + static_cast<size_t>(kl) * max_nn;
-
-                // W_dress = Σ_{d, c < n_ij} V_lk(d, c) · Y_old(c, d)
-                real_t W_dress = real_t(0);
-                for (int dd = 0; dd < n_ij; ++dd) {
-                    const real_t* V_row = V_lk + static_cast<size_t>(dd) * max_n;
-                    const real_t* Y_col = d_Y_pad + y_pair_off + dd;
-                    for (int cc = 0; cc < n_ij; ++cc) {
-                        W_dress += V_row[cc] * Y_col[static_cast<size_t>(cc) * max_n];
-                    }
-                }
-
-                const real_t W_eff = d_W_oooo[w_pair_off + kl] + W_dress;
+                const real_t W_eff  = s_W_eff[kl];
                 const real_t pi_val = d_pi_T_stack[pi_pair_off
                                                  + static_cast<size_t>(kl) * pi_kl_stride];
                 acc += W_eff * pi_val;
@@ -318,9 +345,10 @@ __global__ void slice_PI_outer_for_J_kernel(
     const int*    __restrict__ d_pair_lookup,
     real_t*       __restrict__ d_PI_stack_pad,
     real_t*       __restrict__ d_PI_TT_pad,
-    int N_pair, int nocc, int max_n)
+    int N_pair, int nocc, int max_n,
+    int pair_begin)
 {
-    const int idx = blockIdx.x;
+    const int idx = blockIdx.x + pair_begin;
     const int k   = blockIdx.y;
     if (idx >= N_pair || k >= nocc) return;
 
@@ -494,6 +522,10 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
     }
 
 #ifndef GANSU_CPU_ONLY
+    // Multi-GPU: bind to pgpu's device. Allocations and uploads land on the
+    // requested device thanks to the DeviceGuard.
+    MultiGpuManager::DeviceGuard _guard(pgpu.device_id());
+
     // GPU activation gates.
     if (!pgpu.stacked() || !gpu::gpu_available()
         || N_pair_ == 0 || max_n_ <= 0 || nocc_ <= 0)
@@ -605,7 +637,15 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
         return;
     }
 
-    s.cublas = gpu::GPUHandle::cublas();
+    // Per-device cuBLAS handle. Fallback to thread-local single-GPU handle.
+    s.cublas = nullptr;
+    {
+        auto& mgm = MultiGpuManager::instance();
+        if (mgm.num_devices() > pgpu.device_id()) {
+            s.cublas = mgm.cublas(pgpu.device_id());
+        }
+        if (!s.cublas) s.cublas = gpu::GPUHandle::cublas();
+    }
     if (!s.cublas) {
         s.free_all();
         delete p_; p_ = nullptr; active_ = false;
@@ -805,6 +845,9 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
 ResidGpu::~ResidGpu() {
 #ifndef GANSU_CPU_ONLY
     if (p_) {
+        // Free buffers on the same device they were allocated on.
+        int dev = pgpu_ ? pgpu_->device_id() : 0;
+        MultiGpuManager::DeviceGuard _guard(dev);
         p_->free_all();
         delete p_;
         p_ = nullptr;
@@ -834,11 +877,17 @@ void ResidGpu::compute_async_phladder_only_()
     if (!active_) return;
 
 #ifndef GANSU_CPU_ONLY
+    MultiGpuManager::DeviceGuard _guard(pgpu_->device_id());
     Impl& s = *p_;
     const int N      = N_pair_;
     const int nocc   = nocc_;
     const int max_n  = max_n_;
     const int max_nn = s.max_nn;
+    // Slab partition (from pgpu). For single-GPU operation slab = [0, N).
+    const int ib     = pgpu_->pair_begin();
+    const int ie     = pgpu_->pair_end();
+    const int slab_n = ie - ib;
+    if (slab_n <= 0) return;
 
     // Sanity: pgpu_ must still be in stacked mode with current pi_T_stack.
     const real_t* d_pi_T_stack    = pgpu_->device_pi_T_stack();
@@ -854,34 +903,36 @@ void ResidGpu::compute_async_phladder_only_()
     // Step 6.6 fix: cap block at TILE=16 (256 threads) to keep within
     // CUDA's 1024 threads/block limit when max_n > 32 (e.g. Benzene cc-pVDZ).
     // Kernels iterate strided over the (a, d) range internally.
+    //
+    // Multi-GPU: grid_x = slab_n (kernel adds pair_begin to recover global idx).
     {
         constexpr int TILE = 16;
         const int tile_x = (max_n < TILE) ? max_n : TILE;
         const int tile_y = (max_n < TILE) ? max_n : TILE;
         dim3 block(static_cast<unsigned>(tile_x),
                    static_cast<unsigned>(tile_y), 1);
-        dim3 grid(static_cast<unsigned>(N),
+        dim3 grid(static_cast<unsigned>(slab_n),
                   static_cast<unsigned>(nocc), 1);
 
         // i-side: I = sij.i, J = sij.j
         slice_pi_N_T_for_I_kernel<<<grid, block>>>(
             d_pi_T_stack, d_idx_offset, d_n_pno, s.d_I_i, d_pair_lookup,
             s.d_pi_N_i_pad, s.d_pi_T_i_pad,
-            N, nocc, max_n);
+            N, nocc, max_n, ib);
         slice_PI_outer_for_J_kernel<<<grid, block>>>(
             d_pi_T_stack, d_idx_offset, d_n_pno, s.d_I_j, d_pair_lookup,
             s.d_PI_kj_stack_pad, s.d_PI_kj_TT_pad,
-            N, nocc, max_n);
+            N, nocc, max_n, ib);
 
         // j-side: I = sij.j, J = sij.i
         slice_pi_N_T_for_I_kernel<<<grid, block>>>(
             d_pi_T_stack, d_idx_offset, d_n_pno, s.d_I_j, d_pair_lookup,
             s.d_pi_N_j_pad, s.d_pi_T_j_pad,
-            N, nocc, max_n);
+            N, nocc, max_n, ib);
         slice_PI_outer_for_J_kernel<<<grid, block>>>(
             d_pi_T_stack, d_idx_offset, d_n_pno, s.d_I_i, d_pair_lookup,
             s.d_PI_ki_stack_pad, s.d_PI_ki_TT_pad,
-            N, nocc, max_n);
+            N, nocc, max_n, ib);
 
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) {
@@ -930,33 +981,39 @@ void ResidGpu::compute_async_phladder_only_()
                                  real_t* d_V_buf,   // V_meta_T (W_block_i/j) or V_meta_TT (W_block_i2/j2)
                                  bool   add_T_term)  // include +0.5·pi_N·T_meta?
     {
-        // Init from bare W_block (already in (a, k·max_n + c) padded layout).
-        check_cuda_(cudaMemcpyAsync(d_W_block, d_W_bare, bytes_block_full,
-                                    cudaMemcpyDeviceToDevice, /*stream=*/0),
-                    "D2D W_bare → W_block");
+        // Init from bare W_block (only the slab portion — non-slab entries
+        // are untouched on this device; peer GPUs handle their own slabs).
+        const size_t slab_block_bytes =
+            static_cast<size_t>(slab_n) * stride_block * sizeof(real_t);
+        check_cuda_(cudaMemcpyAsync(
+            d_W_block + static_cast<size_t>(ib) * stride_block,
+            d_W_bare  + static_cast<size_t>(ib) * stride_block,
+            slab_block_bytes,
+            cudaMemcpyDeviceToDevice, /*stream=*/0),
+            "D2D W_bare → W_block (slab)");
 
-        // W_block += -0.5 · pi_T^T · V (one batched DGEMM, β=1).
+        // W_block += -0.5 · pi_T^T · V (one batched DGEMM over slab, β=1).
         check_cublas_(cublasDgemmStridedBatched(
             s.cublas, CUBLAS_OP_N, CUBLAS_OP_T,
             /*m=*/ max_nn, /*n=*/ max_n, /*k=*/ max_nn,
             &neg_half,
-            d_V_buf, max_nn, stride_meta,
-            d_pi_T,  max_n,  stride_stack,
+            d_V_buf + static_cast<size_t>(ib) * stride_meta,   max_nn, stride_meta,
+            d_pi_T  + static_cast<size_t>(ib) * stride_stack,  max_n,  stride_stack,
             &one,
-            d_W_block, max_nn, stride_block,
-            N), "W_block += -0.5·pi_T^T·V");
+            d_W_block + static_cast<size_t>(ib) * stride_block, max_nn, stride_block,
+            slab_n), "W_block += -0.5·pi_T^T·V (slab)");
 
         if (add_T_term) {
-            // W_block += +0.5 · pi_N · T_meta.
+            // W_block += +0.5 · pi_N · T_meta (slab batched).
             check_cublas_(cublasDgemmStridedBatched(
                 s.cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                 /*m=*/ max_nn, /*n=*/ max_n, /*k=*/ max_nn,
                 &plus_half,
-                s.d_T_meta_pad, max_nn, stride_meta,
-                d_pi_N, max_nn, stride_block,
+                s.d_T_meta_pad + static_cast<size_t>(ib) * stride_meta,  max_nn, stride_meta,
+                d_pi_N + static_cast<size_t>(ib) * stride_block,         max_nn, stride_block,
                 &one,
-                d_W_block, max_nn, stride_block,
-                N), "W_block += +0.5·pi_N·T_meta");
+                d_W_block + static_cast<size_t>(ib) * stride_block, max_nn, stride_block,
+                slab_n), "W_block += +0.5·pi_N·T_meta (slab)");
         }
     };
 
@@ -977,17 +1034,26 @@ void ResidGpu::compute_async_phladder_only_()
                       s.d_V_meta_TT_pad,  /*add_T_term=*/false);
 
     // ---- Stage 3: contract into R_ph_pad ----
-    // R_ph[idx] (row-major n × n) starts at zero.
-    check_cuda_(cudaMemsetAsync(s.d_R_ph_pad, 0,
-                                static_cast<size_t>(N) * stride_R * sizeof(real_t),
-                                /*stream=*/0),
-                "memset R_ph");
+    // R_ph[idx] (row-major n × n) starts at zero. Only zero the slab; the
+    // rest of d_R_ph_pad belongs to peer GPUs' results (never D2H'd here).
+    check_cuda_(cudaMemsetAsync(
+        s.d_R_ph_pad + static_cast<size_t>(ib) * stride_R, 0,
+        static_cast<size_t>(slab_n) * stride_R * sizeof(real_t),
+        /*stream=*/0),
+        "memset R_ph (slab)");
 
     // Helper: result_row[a, b] += α · A_row · B_row, where A_row is (m_row × k_row)
     //         and B_row is (k_row × n_row). In col-major: C_col += α · B_col · A_col.
     //         We always pass with TransA = TransB = N here unless the math has X^T.
     //         For X^T patterns, set Trans flag and adjust dim/ld accordingly.
     //
+    // All 8 contractions below run only over the slab; non-slab pairs on
+    // this device are handled by peer GPUs. We pre-shift the per-pair
+    // batch base pointers by `ib * stride_*` and pass `slab_n` as batch.
+    const size_t off_stack = static_cast<size_t>(ib) * stride_stack;
+    const size_t off_block = static_cast<size_t>(ib) * stride_block;
+    const size_t off_R     = static_cast<size_t>(ib) * stride_R;
+
     // Op 1: R_ph += 2 · W_block_i · PI_kj_stack       (n × nn × n)
     //   row-major:  C_row = α · A_row · B_row  with A=W_block_i(max_n×max_nn),
     //               B=PI_kj_stack(max_nn×max_n). Result (max_n×max_n).
@@ -999,22 +1065,22 @@ void ResidGpu::compute_async_phladder_only_()
         s.cublas, CUBLAS_OP_N, CUBLAS_OP_N,
         max_n, max_n, max_nn,
         &two,
-        s.d_PI_kj_stack_pad, max_n, stride_stack,
-        s.d_W_block_i_pad,   max_nn, stride_block,
+        s.d_PI_kj_stack_pad + off_stack, max_n, stride_stack,
+        s.d_W_block_i_pad   + off_block, max_nn, stride_block,
         &one,
-        s.d_R_ph_pad, max_n, stride_R,
-        N), "R += 2·W_i·PI_kj");
+        s.d_R_ph_pad + off_R, max_n, stride_R,
+        slab_n), "R += 2·W_i·PI_kj");
 
     // Op 2: R_ph -= W_block_i2 · PI_kj_stack
     check_cublas_(cublasDgemmStridedBatched(
         s.cublas, CUBLAS_OP_N, CUBLAS_OP_N,
         max_n, max_n, max_nn,
         &neg_one,
-        s.d_PI_kj_stack_pad, max_n, stride_stack,
-        s.d_W_block_i2_pad,  max_nn, stride_block,
+        s.d_PI_kj_stack_pad + off_stack, max_n, stride_stack,
+        s.d_W_block_i2_pad  + off_block, max_nn, stride_block,
         &one,
-        s.d_R_ph_pad, max_n, stride_R,
-        N), "R -= W_i2·PI_kj");
+        s.d_R_ph_pad + off_R, max_n, stride_R,
+        slab_n), "R -= W_i2·PI_kj");
 
     // Op 3: R_ph -= W_block_i · PI_kj_TT^T
     //   row-major: C = W · K^T  (W=W_block_i, K=PI_kj_TT)
@@ -1025,91 +1091,70 @@ void ResidGpu::compute_async_phladder_only_()
         s.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
         max_n, max_n, max_nn,
         &neg_one,
-        s.d_PI_kj_TT_pad,    max_nn, stride_block,
-        s.d_W_block_i_pad,   max_nn, stride_block,
+        s.d_PI_kj_TT_pad   + off_block, max_nn, stride_block,
+        s.d_W_block_i_pad  + off_block, max_nn, stride_block,
         &one,
-        s.d_R_ph_pad, max_n, stride_R,
-        N), "R -= W_i·PI_kj_TT^T");
+        s.d_R_ph_pad + off_R, max_n, stride_R,
+        slab_n), "R -= W_i·PI_kj_TT^T");
 
     // Op 4: R_ph -= PI_kj_TT · W_block_i2^T
     //   row-major: C = K · W^T   (K=PI_kj_TT, W=W_block_i2)
     //   col-major: C_col = W_col^T · K_col
     //   m=max_n, n=max_n, k=max_nn, TransA=T, TransB=N
-    //   A=W_block_i2 lda=max_nn, B=PI_kj_TT ldb=max_nn (it's (max_n × max_nn) row-major
-    //     → col-major (max_nn × max_n) ld=max_nn). With TransB=N, op(B)=B_col=(max_nn × max_n) ✓
-    //   Wait: C_col = W_col^T · K_col. W_col is (max_nn × max_n), so W_col^T is (max_n × max_nn).
-    //         For C_col(m×n) = op(A)·op(B): m=max_n, k=max_nn, n=max_n.
-    //         op(A) = W_col^T = (max_n × max_nn) ⇒ A=W_block_i2_col with TransA=T, lda=max_nn.
-    //         op(B) = K_col   = (max_nn × max_n) ⇒ B=PI_kj_TT_col with TransB=N, ldb=max_nn.
+    //   A=W_block_i2 lda=max_nn, B=PI_kj_TT ldb=max_nn.
     check_cublas_(cublasDgemmStridedBatched(
         s.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
         max_n, max_n, max_nn,
         &neg_one,
-        s.d_W_block_i2_pad, max_nn, stride_block,
-        s.d_PI_kj_TT_pad,   max_nn, stride_block,
+        s.d_W_block_i2_pad + off_block, max_nn, stride_block,
+        s.d_PI_kj_TT_pad   + off_block, max_nn, stride_block,
         &one,
-        s.d_R_ph_pad, max_n, stride_R,
-        N), "R -= PI_kj_TT·W_i2^T");
+        s.d_R_ph_pad + off_R, max_n, stride_R,
+        slab_n), "R -= PI_kj_TT·W_i2^T");
 
     // Op 5 (j-side): R_ph += 2 · PI_ki_stack^T · W_block_j^T
-    //   row-major: C = PI^T · W^T   = (W · PI)^T. Result is (n × n) so transpose-equality.
-    //   col-major: C_col = (PI^T · W^T)_col = ((W·PI)^T)_col = (W·PI)_row = W_row · PI_row
-    //                    = W_col^T · PI_col^T
-    //   m=max_n, n=max_n, k=max_nn, TransA=T, TransB=T
-    //   A=W_block_j_col (max_nn × max_n) ld=max_nn → with TransA=T op(A)=(max_n × max_nn).
-    //   B=PI_ki_stack_col (max_n × max_nn) ld=max_n → with TransB=T op(B)=(max_nn × max_n).
     check_cublas_(cublasDgemmStridedBatched(
         s.cublas, CUBLAS_OP_T, CUBLAS_OP_T,
         max_n, max_n, max_nn,
         &two,
-        s.d_W_block_j_pad,   max_nn, stride_block,
-        s.d_PI_ki_stack_pad, max_n,  stride_stack,
+        s.d_W_block_j_pad   + off_block, max_nn, stride_block,
+        s.d_PI_ki_stack_pad + off_stack, max_n,  stride_stack,
         &one,
-        s.d_R_ph_pad, max_n, stride_R,
-        N), "R += 2·PI_ki^T·W_j^T");
+        s.d_R_ph_pad + off_R, max_n, stride_R,
+        slab_n), "R += 2·PI_ki^T·W_j^T");
 
     // Op 6: R_ph -= PI_ki_stack^T · W_block_j2^T
     check_cublas_(cublasDgemmStridedBatched(
         s.cublas, CUBLAS_OP_T, CUBLAS_OP_T,
         max_n, max_n, max_nn,
         &neg_one,
-        s.d_W_block_j2_pad,  max_nn, stride_block,
-        s.d_PI_ki_stack_pad, max_n,  stride_stack,
+        s.d_W_block_j2_pad  + off_block, max_nn, stride_block,
+        s.d_PI_ki_stack_pad + off_stack, max_n,  stride_stack,
         &one,
-        s.d_R_ph_pad, max_n, stride_R,
-        N), "R -= PI_ki^T·W_j2^T");
+        s.d_R_ph_pad + off_R, max_n, stride_R,
+        slab_n), "R -= PI_ki^T·W_j2^T");
 
     // Op 7: R_ph -= PI_ki_TT · W_block_j^T
-    //   row-major: C = K · W^T  (K=PI_ki_TT (n×nn), W=W_block_j (n×nn) → W^T (nn×n))
-    //   col-major: C_col = W_col^T · K_col
-    //   m=max_n, n=max_n, k=max_nn, TransA=T, TransB=N
-    //   A=W_block_j_col (max_nn × max_n), TransA=T → (max_n × max_nn), lda=max_nn.
-    //   B=PI_ki_TT_col (max_nn × max_n), TransB=N → (max_nn × max_n), ldb=max_nn.
     check_cublas_(cublasDgemmStridedBatched(
         s.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
         max_n, max_n, max_nn,
         &neg_one,
-        s.d_W_block_j_pad, max_nn, stride_block,
-        s.d_PI_ki_TT_pad,  max_nn, stride_block,
+        s.d_W_block_j_pad + off_block, max_nn, stride_block,
+        s.d_PI_ki_TT_pad  + off_block, max_nn, stride_block,
         &one,
-        s.d_R_ph_pad, max_n, stride_R,
-        N), "R -= PI_ki_TT·W_j^T");
+        s.d_R_ph_pad + off_R, max_n, stride_R,
+        slab_n), "R -= PI_ki_TT·W_j^T");
 
     // Op 8: R_ph -= W_block_j2 · PI_ki_stack
-    //   row-major: C = W · PI  (W=W_block_j2 (n×nn), PI=PI_ki_stack (nn×n))
-    //   col-major: C_col = PI_col · W_col
-    //   m=max_n, n=max_n, k=max_nn, TransA=N, TransB=N
-    //   A=PI_ki_stack_col (max_n × max_nn), lda=max_n.
-    //   B=W_block_j2_col (max_nn × max_n), ldb=max_nn.
     check_cublas_(cublasDgemmStridedBatched(
         s.cublas, CUBLAS_OP_N, CUBLAS_OP_N,
         max_n, max_n, max_nn,
         &neg_one,
-        s.d_PI_ki_stack_pad, max_n,  stride_stack,
-        s.d_W_block_j2_pad,  max_nn, stride_block,
+        s.d_PI_ki_stack_pad + off_stack, max_n,  stride_stack,
+        s.d_W_block_j2_pad  + off_block, max_nn, stride_block,
         &one,
-        s.d_R_ph_pad, max_n, stride_R,
-        N), "R -= W_j2·PI_ki");
+        s.d_R_ph_pad + off_R, max_n, stride_R,
+        slab_n), "R -= W_j2·PI_ki");
 
 #endif // !GANSU_CPU_ONLY
 }
@@ -1118,15 +1163,23 @@ void ResidGpu::compute_async_finalize_pipeline_()
 {
     if (!active_) return;
 #ifndef GANSU_CPU_ONLY
+    MultiGpuManager::DeviceGuard _guard(pgpu_->device_id());
     Impl& s = *p_;
-    const int N     = N_pair_;
     const int max_n = max_n_;
     const long long stride_R = static_cast<long long>(max_n) * max_n;
-    const size_t bytes_R = static_cast<size_t>(N) * stride_R * sizeof(real_t);
-    check_cuda_(cudaMemcpyAsync(s.h_R_ph_pad, s.d_R_ph_pad,
-                                bytes_R, cudaMemcpyDeviceToHost,
-                                /*stream=*/0),
-                "async D2H R_ph_pad");
+    // D2H only the slab portion. Peer GPUs populate other slabs into the
+    // host h_R_ph_pad buffer (shared at the iterate_dlpno_ccsd_t2 level via
+    // the per-pair R_ph_out vector — each GPU writes its slab segment).
+    const int ib     = pgpu_->pair_begin();
+    const int slab_n = pgpu_->pair_end() - ib;
+    if (slab_n > 0) {
+        const size_t off_R   = static_cast<size_t>(ib) * stride_R;
+        const size_t bytes_R = static_cast<size_t>(slab_n) * stride_R * sizeof(real_t);
+        check_cuda_(cudaMemcpyAsync(s.h_R_ph_pad + off_R, s.d_R_ph_pad + off_R,
+                                    bytes_R, cudaMemcpyDeviceToHost,
+                                    /*stream=*/0),
+                    "async D2H R_ph_pad (slab)");
+    }
     check_cuda_(cudaEventRecord(s.completion_event, /*stream=*/0),
                 "record completion event");
     s.async_in_flight = true;
@@ -1138,12 +1191,16 @@ void ResidGpu::compute_async(const std::vector<real_t>& dF_ki_host)
     if (!active_) return;
 
 #ifndef GANSU_CPU_ONLY
+    MultiGpuManager::DeviceGuard _guard(pgpu_->device_id());
     Impl& s = *p_;
     const int N     = N_pair_;
     const int nocc  = nocc_;
     const int max_n = max_n_;
+    const int ib     = pgpu_->pair_begin();
+    const int slab_n = pgpu_->pair_end() - ib;
 
     // 1. Upload dF_ki (async on default stream) for this iter.
+    //    NOTE: dF_ki is GLOBAL (nocc × nocc) — uploaded full on every device.
     if (static_cast<int>(dF_ki_host.size()) >= nocc * nocc) {
         check_cuda_(cudaMemcpyAsync(s.d_dF_ki, dF_ki_host.data(),
                                     static_cast<size_t>(nocc) * nocc * sizeof(real_t),
@@ -1158,7 +1215,11 @@ void ResidGpu::compute_async(const std::vector<real_t>& dF_ki_host)
     // 3. Inter-pair Fock i+j kernels accumulate into the SAME d_R_ph_pad
     //    in row-major (max_n × max_n) layout per pair. They queue on the
     //    default stream, so they implicitly wait for ph-ladder kernels to
-    //    finish before launching.
+    //    finish before launching. Slab-restricted via pair_begin arg.
+    if (slab_n <= 0) {
+        compute_async_finalize_pipeline_();
+        return;
+    }
     const real_t threshold = 1e-14;  // matches kFLMOThresh in dlpno_pair_data.cu
     {
         // Step 6.6 fix: cap block at TILE=16 (see Stage 1 comment).
@@ -1167,7 +1228,7 @@ void ResidGpu::compute_async(const std::vector<real_t>& dF_ki_host)
         const int tile_y = (max_n < TILE) ? max_n : TILE;
         dim3 block(static_cast<unsigned>(tile_x),
                    static_cast<unsigned>(tile_y), 1);
-        dim3 grid(static_cast<unsigned>(N), 1, 1);
+        dim3 grid(static_cast<unsigned>(slab_n), 1, 1);
 
         const real_t* d_pi_T_stack    = pgpu_->device_pi_T_stack();
         const size_t* d_idx_offset    = pgpu_->device_idx_offset_pi_T();
@@ -1177,21 +1238,28 @@ void ResidGpu::compute_async(const std::vector<real_t>& dF_ki_host)
         inter_pair_fock_i_kernel<<<grid, block>>>(
             d_pi_T_stack, d_idx_offset, d_n_pno, d_pair_lookup,
             s.d_I_i, s.d_I_j, s.d_F_LMO, s.d_dF_ki,
-            s.d_R_ph_pad, N, nocc, max_n, threshold);
+            s.d_R_ph_pad, N, nocc, max_n, threshold, ib);
         inter_pair_fock_j_kernel<<<grid, block>>>(
             d_pi_T_stack, d_idx_offset, d_n_pno, d_pair_lookup,
             s.d_I_i, s.d_I_j, s.d_F_LMO, s.d_dF_ki,
-            s.d_R_ph_pad, N, nocc, max_n, threshold);
+            s.d_R_ph_pad, N, nocc, max_n, threshold, ib);
 
         // Step 6.6: fused oooo ladder kernel — borrows d_Y_pad from pgpu
         // (set by the most recent rebuild_with_stack call). Accumulates
         // into d_R_ph_pad alongside ph-ladder + inter-pair Fock.
+        //
+        // Phase 2.2 refactor: kernel uses dynamic shared memory of size
+        // nocc² × sizeof(real_t) for the per-block W_eff[kl] cache. For
+        // nocc=30 (hexamer) this is 7.2 KB, for nocc=60 (cholesterol class)
+        // 28.8 KB — both well under the 48 KB default per-block limit.
         const real_t* d_Y_pad = pgpu_->device_Y_pad();
         if (d_Y_pad) {
-            oooo_lad_kernel<<<grid, block>>>(
+            const size_t shmem_bytes =
+                static_cast<size_t>(nocc) * nocc * sizeof(real_t);
+            oooo_lad_kernel<<<grid, block, shmem_bytes>>>(
                 s.d_V_stacked_oooo_pad, s.d_W_oooo,
                 d_pi_T_stack, d_Y_pad, d_idx_offset, d_n_pno,
-                s.d_R_ph_pad, N, nocc, max_n);
+                s.d_R_ph_pad, N, nocc, max_n, ib);
         }
 
         const cudaError_t e = cudaGetLastError();
@@ -1210,15 +1278,24 @@ void ResidGpu::compute_async(const std::vector<real_t>& dF_ki_host)
 
 void ResidGpu::compute_finalize(std::vector<RowMatXd>& R_ph_out)
 {
-    R_ph_out.assign(static_cast<size_t>(N_pair_), RowMatXd());
+    // Multi-GPU: caller pre-sizes R_ph_out to N_pair on the *first* slab call
+    // each iter; subsequent slab calls must NOT clobber peer slabs' results.
+    // We resize only if the vector hasn't been sized yet.
+    if (R_ph_out.size() != static_cast<size_t>(N_pair_)) {
+        R_ph_out.assign(static_cast<size_t>(N_pair_), RowMatXd());
+    }
 
     if (!active_) return;
 
 #ifndef GANSU_CPU_ONLY
+    MultiGpuManager::DeviceGuard _guard(pgpu_->device_id());
     Impl& s = *p_;
     const int N      = N_pair_;
     const int max_n  = max_n_;
     const long long stride_R = static_cast<long long>(max_n) * max_n;
+    const int ib  = pgpu_->pair_begin();
+    const int ie  = pgpu_->pair_end();
+    (void)N;
 
     if (!s.async_in_flight) {
         // Defensive: caller invoked finalize without a matching compute_async.
@@ -1231,9 +1308,10 @@ void ResidGpu::compute_finalize(std::vector<RowMatXd>& R_ph_out)
                 "wait completion event");
     s.async_in_flight = false;
 
-    // ---- Unpad to host vec<RowMatXd>. ----
+    // ---- Unpad to host vec<RowMatXd>. Only fill the slab; other slabs
+    //      are populated by peer ResidGpu instances on other devices. ----
     #pragma omp parallel for schedule(static)
-    for (long long idx = 0; idx < N; ++idx) {
+    for (long long idx = ib; idx < ie; ++idx) {
         const int n = n_pno_[idx];
         if (n == 0) {
             R_ph_out[idx].resize(0, 0);

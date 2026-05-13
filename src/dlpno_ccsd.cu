@@ -134,12 +134,14 @@ inline Phase24Integrals precompute_phase24_integrals(
         }
     }
 #endif // GANSU_MULTI_GPU
-#ifdef _OPENMP
-    if (num_gpus > 1) {
-        omp_set_dynamic(0);
-        omp_set_num_threads(num_gpus);
-    }
-#endif
+    // Save the current OMP thread count so we can restore it after this
+    // parallel region. We use `num_threads(num_gpus)` on the pragma itself
+    // (which forces exactly num_gpus threads regardless of global state),
+    // but `omp_set_num_threads` was being called globally here previously,
+    // which clamped subsequent OMP regions (vmeta / dFki / resid in
+    // iterate_dlpno_ccsd_t2) to only num_gpus threads — a 5-9× slowdown on
+    // multi-CPU hosts. The num_threads clause alone is sufficient; do NOT
+    // mutate the process-wide OMP state here.
 
     #pragma omp parallel num_threads(num_gpus)
     {
@@ -555,6 +557,24 @@ real_t DLPNOCCSD::compute_energy()
                   << dt_pre << " s" << std::endl;
     }
 
+    // Multi-GPU pair partition for CCSD T2 iteration. Picked up from the
+    // distributed RI back-end if it has replicated B (each device can build
+    // pi_cache / R_ph independently from its own B copy).
+    int t2_num_gpus = 1;
+#ifdef GANSU_MULTI_GPU
+    if (auto* eri_dist = dynamic_cast<const ERI_RI_Distributed_RHF*>(&eri_)) {
+        if (eri_dist->num_gpus() > 1) {
+            const bool ok = const_cast<ERI_RI_Distributed_RHF*>(eri_dist)
+                                ->replicate_B_to_all_gpus();
+            if (ok) t2_num_gpus = eri_dist->num_gpus();
+        }
+    }
+#endif
+    if (params_.verbose >= 1) {
+        std::cout << "[DLPNO-CCSD-PROF] T2 iter num_gpus=" << t2_num_gpus
+                  << std::endl;
+    }
+
     LMP2Status t2_status{};
     const auto t_iter_0 = prof_clock::now();
     {
@@ -565,7 +585,7 @@ real_t DLPNOCCSD::compute_energy()
             nocc_, nao_, t2_max_iter, t2_conv,
             /*enable_dressing=*/true,
             params_.verbose, "CCSD T2 iteration",
-            &phase24);
+            &phase24, t2_num_gpus);
     }
     const double dt_iter = std::chrono::duration<double>(
         prof_clock::now() - t_iter_0).count();
@@ -837,12 +857,11 @@ real_t run_phase33_triple_loop(const DLPNOLMP2Result& res,
     // Per-thread ERI norm diagnostics.
     std::vector<real_t>    local_K_norm_sum(n_threads, 0.0);
 
-#ifdef _OPENMP
-    if (n_threads > 1) {
-        omp_set_dynamic(0);
-        omp_set_num_threads(n_threads);
-    }
-#endif
+    // Note: do NOT call omp_set_num_threads(n_threads) globally here — the
+    // `num_threads(n_threads)` clause on the pragma below correctly forces
+    // n_threads for the (T) triple loop, and mutating global OMP state
+    // clamps any subsequent CPU OMP region to n_threads (5-9× slowdown
+    // observed in iterate_dlpno_ccsd_t2 on multi-CPU hosts).
 
     // Per-thread GPU helper for compute_triple_t_energy. Constructed inside
     // the OMP region so that cudaSetDevice has already pinned the right GPU.

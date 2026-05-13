@@ -28,6 +28,9 @@
 #include "dlpno_pno.hpp"
 #include "dlpno_picache_gpu.hpp"
 #include "dlpno_resid_gpu.hpp"
+#ifndef GANSU_CPU_ONLY
+#include "multi_gpu_manager.hpp"
+#endif
 
 namespace gansu {
 
@@ -133,7 +136,8 @@ LMP2Status iterate_lmp2(
     const real_t*                 h_S,
     int nocc, int nao,
     int max_iter, real_t conv_tol,
-    int verbose, const char* round_tag)
+    int verbose, const char* round_tag,
+    int num_gpus)
 {
     LMP2Status st;
     Eigen::Map<const RowMatXd> Smat(h_S, nao, nao);
@@ -193,7 +197,104 @@ LMP2Status iterate_lmp2(
         n_pno_per_pair[i] = pairs[i].n_pno;
         if (pairs[i].n_pno > max_n) max_n = pairs[i].n_pno;
     }
-    PiCacheGpu pgpu(barS_cache, n_pno_per_pair, max_n);
+
+    // ---- Multi-GPU pair-slab partition (n_pno²-weighted greedy). ----
+    // For single-GPU (num_gpus<=1) we build one PiCacheGpu instance over
+    // the full [0, N_pair) range, preserving the previous behavior bit-exactly.
+    //
+    // Auto-fallback: same threshold logic as iterate_dlpno_ccsd_t2. For
+    // LMP2 the per-iter work is lighter (no oooo lad / ph-ladder), so the
+    // crossover N_pair is higher than for CCSD T2.
+#ifdef GANSU_CPU_ONLY
+    const int n_gpus = 1;
+#else
+    int n_gpus = (num_gpus < 1) ? 1 : num_gpus;
+    if (n_gpus > 1) {
+        long long work_estimate = 0;
+        for (size_t i = 0; i < pairs.size(); ++i) {
+            const long long n = pairs[i].n_pno;
+            work_estimate += n * n;
+        }
+        work_estimate *= static_cast<long long>(nocc) * nocc;
+        // Empirical cholesterol cc-pVDZ benchmark (2026-05-13, A100 8×) showed
+        // multi-GPU iter dispatch is net-negative even at cholesterol scale:
+        // 1-GPU LMP2 363s vs 8-GPU 1060s (2.9× slower); 1-GPU CCSD T2 iter
+        // 531s vs 8-GPU 1200s (2.3× slower). picache D2H pi_pad (~40 GB/iter
+        // at cholesterol) does NOT parallelise across 8 GPUs — wall time
+        // stays at ~11s/iter on 8 GPUs vs 2s/iter on 1 GPU. Suspected cause:
+        // PCIe / D2H serialisation in the CUDA driver across simultaneous
+        // GPU contexts. Threshold raised to 1e11 to effectively always
+        // fall back, preserving the slab code for future fabric upgrades
+        // (NVLink switch / NVSwitch / PCIe Gen5 with independent root
+        // complexes per GPU) where this might reverse.
+        constexpr long long kMinWorkPerGpu = 100000000000LL;
+        const long long per_gpu = work_estimate / n_gpus;
+        if (per_gpu < kMinWorkPerGpu) {
+            if (verbose >= 1) {
+                std::cout << "[DLPNO-LMP2-PROF] " << round_tag
+                          << " multi-GPU auto-fallback to n_gpus=1"
+                          << " (work=" << work_estimate
+                          << " per-GPU=" << per_gpu
+                          << " < threshold=" << kMinWorkPerGpu << ")"
+                          << std::endl;
+            }
+            n_gpus = 1;
+        } else {
+            MultiGpuManager::instance().initialize(n_gpus);
+        }
+    }
+#endif
+    const int N_pair = static_cast<int>(pairs.size());
+    std::vector<int> slab_starts(n_gpus + 1, 0);
+    {
+        long long total_w = 0;
+        std::vector<long long> w(N_pair, 0);
+        for (int i = 0; i < N_pair; ++i) {
+            const long long n = pairs[i].n_pno;
+            w[i] = n * n;  // dominant per-pair compute scales as n_pno²
+            total_w += w[i];
+        }
+        long long target = (total_w + n_gpus - 1) / n_gpus;
+        long long acc = 0;
+        int g = 0;
+        for (int i = 0; i < N_pair && g < n_gpus - 1; ++i) {
+            acc += w[i];
+            if (acc >= target * (g + 1)) {
+                slab_starts[g + 1] = i + 1;
+                ++g;
+            }
+        }
+        slab_starts[n_gpus] = N_pair;
+        // Defensive: clamp any unset entries.
+        for (int d = 1; d < n_gpus; ++d) {
+            if (slab_starts[d] < slab_starts[d - 1])
+                slab_starts[d] = slab_starts[d - 1];
+        }
+    }
+
+    std::vector<std::unique_ptr<PiCacheGpu>> pgpus(n_gpus);
+    if (n_gpus == 1) {
+        pgpus[0] = std::make_unique<PiCacheGpu>(
+            barS_cache, n_pno_per_pair, max_n, nullptr, nullptr, 0,
+            0, N_pair, 0);
+    } else {
+#ifndef GANSU_CPU_ONLY
+        // Construct each instance on its own device. Serial construction is
+        // fine — the heavy upload is barS, and they run on independent
+        // devices so cudaMemcpy is per-device anyway.
+        for (int d = 0; d < n_gpus; ++d) {
+            MultiGpuManager::DeviceGuard guard(d);
+            pgpus[d] = std::make_unique<PiCacheGpu>(
+                barS_cache, n_pno_per_pair, max_n,
+                nullptr, nullptr, 0,
+                slab_starts[d], slab_starts[d + 1], d);
+        }
+#else
+        pgpus[0] = std::make_unique<PiCacheGpu>(
+            barS_cache, n_pno_per_pair, max_n, nullptr, nullptr, 0,
+            0, N_pair, 0);
+#endif
+    }
 
     for (int iter = 0; iter < max_iter; ++iter) {
         for (size_t idx = 0; idx < pairs.size(); ++idx) {
@@ -204,7 +305,22 @@ LMP2Status iterate_lmp2(
         //      include/dlpno_picache_gpu.hpp for layout/falls back to CPU).
         {
             const auto t_pi0 = prof_clock::now();
-            pgpu.rebuild(Y_old, pi_cache);
+            if (n_gpus > 1) {
+#ifndef GANSU_CPU_ONLY
+                #pragma omp parallel num_threads(n_gpus)
+                {
+#ifdef _OPENMP
+                    const int d = omp_get_thread_num();
+#else
+                    const int d = 0;
+#endif
+                    MultiGpuManager::DeviceGuard guard(d);
+                    pgpus[d]->rebuild(Y_old, pi_cache);
+                }
+#endif
+            } else {
+                pgpus[0]->rebuild(Y_old, pi_cache);
+            }
             dt_picache += std::chrono::duration<double>(
                 prof_clock::now() - t_pi0).count();
         }
@@ -377,12 +493,13 @@ LMP2Status iterate_dlpno_ccsd_t2(
     int max_iter, real_t conv_tol,
     bool enable_dressing,
     int verbose, const char* round_tag,
-    const Phase24Integrals* phase24)
+    const Phase24Integrals* phase24,
+    int num_gpus)
 {
     if (!enable_dressing) {
         return iterate_lmp2(
             setups, pairs, pair_lookup, F_LMO, h_S,
-            nocc, nao, max_iter, conv_tol, verbose, round_tag);
+            nocc, nao, max_iter, conv_tol, verbose, round_tag, num_gpus);
     }
 
     LMP2Status st;
@@ -523,21 +640,137 @@ LMP2Status iterate_dlpno_ccsd_t2(
     for (size_t i = 0; i < pairs.size(); ++i) {
         setup_i_per_pair[i] = setups[i].i;
     }
-    PiCacheGpu pgpu(barS_cache, n_pno_per_pair, max_n_pno,
-                    &pair_lookup, &setup_i_per_pair, nocc);
 
-    // Step 6.2 — GPU port for ph-ladder R contributions. Borrows pi_T_stack
-    // and per-pair metadata from pgpu; uploads iter-invariant V_meta_T/TT,
-    // T_meta, and W_bare_ov{ov,vo}_{i,j} on construction. Falls back to
-    // active()=false (and per-pair CPU ph-ladder kicks back in) when GPU
-    // memory is insufficient or pgpu isn't in stacked mode.
-    std::unique_ptr<ResidGpu> rgpu;
-    if (phase24 != nullptr && phase24->nocc == nocc && pgpu.stacked()) {
-        rgpu = std::make_unique<ResidGpu>(
-            pgpu, setups, pairs, *phase24, F_LMO, nocc, max_n_pno);
+    // ---- Multi-GPU pair-slab partition (n_pno²-weighted greedy). ----
+    // Each device handles its own slab of pair indices. Single-GPU
+    // (num_gpus<=1) creates one instance covering the full range,
+    // which preserves the previous behavior bit-exactly.
+    //
+    // Auto-fallback: multi-GPU dispatch overhead (sync cudaMemcpy +
+    // cudaEventSynchronize + OMP team coordination, ~400 ms/iter for 8
+    // GPUs on A100/H200) only pays off when per-iter GPU compute is
+    // large enough to amortise it. Empirically (hexamer cc-pVDZ, 92 iter
+    // benchmark + nsys 2026-05-13) the post-oooo-shared-mem-refactor
+    // kernel work scales as N_pair × n_pno² × nocc² flops, and the
+    // crossover happens around ~2×10⁸ flops per GPU per iter. Below that,
+    // 1-GPU outperforms 8-GPU by 2-3×.
+#ifdef GANSU_CPU_ONLY
+    const int n_gpus = 1;
+#else
+    int n_gpus = (num_gpus < 1) ? 1 : num_gpus;
+    if (n_gpus > 1) {
+        long long work_estimate = 0;
+        for (size_t i = 0; i < pairs.size(); ++i) {
+            const long long n = pairs[i].n_pno;
+            work_estimate += n * n;
+        }
+        work_estimate *= static_cast<long long>(nocc) * nocc;
+        // Empirical cholesterol cc-pVDZ benchmark (2026-05-13, A100 8×) showed
+        // multi-GPU iter dispatch is net-negative even at cholesterol scale:
+        // 1-GPU LMP2 363s vs 8-GPU 1060s (2.9× slower); 1-GPU CCSD T2 iter
+        // 531s vs 8-GPU 1200s (2.3× slower). picache D2H pi_pad (~40 GB/iter
+        // at cholesterol) does NOT parallelise across 8 GPUs — wall time
+        // stays at ~11s/iter on 8 GPUs vs 2s/iter on 1 GPU. Suspected cause:
+        // PCIe / D2H serialisation in the CUDA driver across simultaneous
+        // GPU contexts. Threshold raised to 1e11 to effectively always
+        // fall back, preserving the slab code for future fabric upgrades
+        // (NVLink switch / NVSwitch / PCIe Gen5 with independent root
+        // complexes per GPU) where this might reverse.
+        constexpr long long kMinWorkPerGpu = 100000000000LL;
+        const long long per_gpu = work_estimate / n_gpus;
+        if (per_gpu < kMinWorkPerGpu) {
+            if (verbose >= 1) {
+                std::cout << "[DLPNO-ITER-PROF] " << round_tag
+                          << " multi-GPU auto-fallback to n_gpus=1"
+                          << " (work=" << work_estimate
+                          << " per-GPU=" << per_gpu
+                          << " < threshold=" << kMinWorkPerGpu << ")"
+                          << std::endl;
+            }
+            n_gpus = 1;
+        } else {
+            MultiGpuManager::instance().initialize(n_gpus);
+        }
+    }
+#endif
+    const int N_pair = static_cast<int>(pairs.size());
+    std::vector<int> slab_starts(n_gpus + 1, 0);
+    {
+        long long total_w = 0;
+        std::vector<long long> w(N_pair, 0);
+        for (int i = 0; i < N_pair; ++i) {
+            const long long n = pairs[i].n_pno;
+            w[i] = n * n;
+            total_w += w[i];
+        }
+        long long target = (total_w + n_gpus - 1) / n_gpus;
+        long long acc = 0;
+        int g = 0;
+        for (int i = 0; i < N_pair && g < n_gpus - 1; ++i) {
+            acc += w[i];
+            if (acc >= target * (g + 1)) {
+                slab_starts[g + 1] = i + 1;
+                ++g;
+            }
+        }
+        slab_starts[n_gpus] = N_pair;
+        for (int d = 1; d < n_gpus; ++d) {
+            if (slab_starts[d] < slab_starts[d - 1])
+                slab_starts[d] = slab_starts[d - 1];
+        }
+    }
+
+    // Construct N_gpus PiCacheGpu instances (one per device).
+    std::vector<std::unique_ptr<PiCacheGpu>> pgpus(n_gpus);
+    if (n_gpus == 1) {
+        pgpus[0] = std::make_unique<PiCacheGpu>(
+            barS_cache, n_pno_per_pair, max_n_pno,
+            &pair_lookup, &setup_i_per_pair, nocc,
+            0, N_pair, 0);
+    } else {
+#ifndef GANSU_CPU_ONLY
+        for (int d = 0; d < n_gpus; ++d) {
+            MultiGpuManager::DeviceGuard guard(d);
+            pgpus[d] = std::make_unique<PiCacheGpu>(
+                barS_cache, n_pno_per_pair, max_n_pno,
+                &pair_lookup, &setup_i_per_pair, nocc,
+                slab_starts[d], slab_starts[d + 1], d);
+        }
+#else
+        pgpus[0] = std::make_unique<PiCacheGpu>(
+            barS_cache, n_pno_per_pair, max_n_pno,
+            &pair_lookup, &setup_i_per_pair, nocc,
+            0, N_pair, 0);
+#endif
+    }
+
+    // Step 6.2 — GPU port for ph-ladder R contributions. One ResidGpu per
+    // device, borrowing the per-device pgpu and uploading iter-invariant
+    // V_meta_T/TT, T_meta, and W_bare_ov{ov,vo}_{i,j} to that device.
+    // Falls back to active()=false per device when memory is insufficient.
+    std::vector<std::unique_ptr<ResidGpu>> rgpus(n_gpus);
+    if (phase24 != nullptr && phase24->nocc == nocc) {
+#ifndef GANSU_CPU_ONLY
+        for (int d = 0; d < n_gpus; ++d) {
+            MultiGpuManager::DeviceGuard guard(d);
+            if (pgpus[d] && pgpus[d]->stacked()) {
+                rgpus[d] = std::make_unique<ResidGpu>(
+                    *pgpus[d], setups, pairs, *phase24, F_LMO, nocc, max_n_pno);
+            }
+        }
+#else
+        if (pgpus[0] && pgpus[0]->stacked()) {
+            rgpus[0] = std::make_unique<ResidGpu>(
+                *pgpus[0], setups, pairs, *phase24, F_LMO, nocc, max_n_pno);
+        }
+#endif
+    }
+    bool any_rgpu_active = false;
+    for (int d = 0; d < n_gpus; ++d) {
+        if (rgpus[d] && rgpus[d]->active()) { any_rgpu_active = true; break; }
     }
     std::vector<RowMatXd> R_ph_acc;
-    if (rgpu && rgpu->active()) {
+    if (any_rgpu_active) {
         R_ph_acc.assign(pairs.size(), RowMatXd());
     }
 
@@ -645,9 +878,49 @@ LMP2Status iterate_dlpno_ccsd_t2(
         // writes pi_T_stack[i_ij] in unpadded ragged layout. Falls back
         // internally to the CPU OMP middleCols loop if stacked-mode
         // buffers couldn't be allocated.
+        //
+        // Multi-GPU: each pgpus[d] writes its slab range of pi_cache rows
+        // and pi_T_stack entries; per-device omp threads run in parallel.
         {
             const auto t_pi0 = prof_clock::now();
-            pgpu.rebuild_with_stack(Y_old, pi_cache, pi_T_stack);
+            // When ResidGpu is active on EVERY slab (all_rgpu_active), every
+            // host-side pi_cache consumer in the resid loop below is gated
+            // out: the inter-pair Fock sweeps, build_stack_for_I path, and
+            // the oooo CPU sweep are all replaced by R_ph_acc[idx] which
+            // every rgpus[d] guarantees to fill (compute_finalize covers its
+            // entire slab, slabs partition [0, N_pair) exhaustively). The
+            // d_pi_pad → host D2H (4-5 s/iter at cholesterol scale) is then
+            // pure waste — pass skip_pi_cache_host=true to skip it. Note we
+            // require ALL rgpus active rather than ANY, because a single
+            // failed-allocation slab would leave R_ph_acc[idx] empty and the
+            // per-idx CPU fallback (lines 1113/1137/else-branch below) would
+            // read uninitialized pi_cache. pi_T_stack host is still produced
+            // because DFpair always consumes it on CPU.
+            bool all_rgpu_active = (n_gpus > 0);
+            for (int d = 0; d < n_gpus; ++d) {
+                if (!(rgpus[d] && rgpus[d]->active())) {
+                    all_rgpu_active = false; break;
+                }
+            }
+            const bool skip_pi_cache_host = all_rgpu_active;
+            if (n_gpus > 1) {
+#ifndef GANSU_CPU_ONLY
+                #pragma omp parallel num_threads(n_gpus)
+                {
+#ifdef _OPENMP
+                    const int d = omp_get_thread_num();
+#else
+                    const int d = 0;
+#endif
+                    MultiGpuManager::DeviceGuard guard(d);
+                    pgpus[d]->rebuild_with_stack(Y_old, pi_cache, pi_T_stack,
+                                                 skip_pi_cache_host);
+                }
+#endif
+            } else {
+                pgpus[0]->rebuild_with_stack(Y_old, pi_cache, pi_T_stack,
+                                             skip_pi_cache_host);
+            }
             dt_picache += std::chrono::duration<double>(
                 prof_clock::now() - t_pi0).count();
         }
@@ -726,8 +999,28 @@ LMP2Status iterate_dlpno_ccsd_t2(
         // contractions + 2 Fock kernels) on the default stream so DFpair
         // (the next CPU block) can run concurrently. compute_finalize()
         // syncs on the recorded event before the resid loop reads R_ph_acc.
-        if (rgpu && rgpu->active()) {
-            rgpu->compute_async(dF_ki);
+        //
+        // Multi-GPU: each rgpus[d] handles its slab; dF_ki is global and
+        // is uploaded full on every device.
+        if (any_rgpu_active) {
+            if (n_gpus > 1) {
+#ifndef GANSU_CPU_ONLY
+                #pragma omp parallel num_threads(n_gpus)
+                {
+#ifdef _OPENMP
+                    const int d = omp_get_thread_num();
+#else
+                    const int d = 0;
+#endif
+                    MultiGpuManager::DeviceGuard guard(d);
+                    if (rgpus[d] && rgpus[d]->active()) {
+                        rgpus[d]->compute_async(dF_ki);
+                    }
+                }
+#endif
+            } else if (rgpus[0] && rgpus[0]->active()) {
+                rgpus[0]->compute_async(dF_ki);
+            }
         }
 
         // ---- Refresh ΔF^{(ij)} per-pair particle dressing matrix. ----
@@ -760,8 +1053,32 @@ LMP2Status iterate_dlpno_ccsd_t2(
 
         // Step 6.4: sync on rgpu's async D2H + unpack to R_ph_acc. After
         // this point R_ph_acc[idx] is ready for the resid OMP loop.
-        if (rgpu && rgpu->active()) {
-            rgpu->compute_finalize(R_ph_acc);
+        //
+        // Multi-GPU: each rgpus[d] fills its slab portion of R_ph_acc.
+        if (any_rgpu_active) {
+            if (n_gpus > 1) {
+#ifndef GANSU_CPU_ONLY
+                // Pre-size R_ph_acc to N_pair so peer-slab writes don't
+                // accidentally resize during the parallel finalize.
+                if (R_ph_acc.size() != pairs.size()) {
+                    R_ph_acc.assign(pairs.size(), RowMatXd());
+                }
+                #pragma omp parallel num_threads(n_gpus)
+                {
+#ifdef _OPENMP
+                    const int d = omp_get_thread_num();
+#else
+                    const int d = 0;
+#endif
+                    MultiGpuManager::DeviceGuard guard(d);
+                    if (rgpus[d] && rgpus[d]->active()) {
+                        rgpus[d]->compute_finalize(R_ph_acc);
+                    }
+                }
+#endif
+            } else if (rgpus[0] && rgpus[0]->active()) {
+                rgpus[0]->compute_finalize(R_ph_acc);
+            }
         }
 
         // Phase A — parallelise the per-pair residual + Jacobi update.
@@ -806,7 +1123,7 @@ LMP2Status iterate_dlpno_ccsd_t2(
             // sweeps live in R_ph_acc[idx] (added below alongside the
             // ph-ladder result). Skip the per-pair CPU sweeps.
             const bool skip_cpu_inter_pair_fock =
-                (rgpu && rgpu->active()
+                (any_rgpu_active
                  && idx < static_cast<long long>(R_ph_acc.size())
                  && R_ph_acc[idx].rows() == n
                  && R_ph_acc[idx].cols() == n);
@@ -1002,7 +1319,7 @@ LMP2Status iterate_dlpno_ccsd_t2(
                 // Step 6.2: when ResidGpu is active, R_ph_acc[idx] already
                 // holds the i-side + j-side ph-ladder contributions. Skip
                 // the CPU build_stack/W_block path entirely.
-                if (rgpu && rgpu->active()
+                if (any_rgpu_active
                     && idx < static_cast<long long>(R_ph_acc.size())
                     && R_ph_acc[idx].rows() == n
                     && R_ph_acc[idx].cols() == n)

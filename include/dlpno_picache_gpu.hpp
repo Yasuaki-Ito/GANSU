@@ -54,6 +54,15 @@ public:
      * @param setup_i_per_pair  optional [N_pair] list of setups[idx].i — needed
      *                          to decide pi_canon^T vs pi_canon orientation.
      * @param nocc  occupied count (only used in stacked mode).
+     * @param pair_begin / pair_end  output-row slab `[pair_begin, pair_end)`.
+     *                  For multi-GPU pair partitioning. When `pair_end < 0`,
+     *                  defaults to `[0, N_pair)` (single-GPU behavior).
+     *                  All input data (barS for ALL i_kl columns) is still
+     *                  uploaded — only the OUTPUT pi rows / pi_T_stack rows
+     *                  for i_ij in this slab are computed and downloaded.
+     * @param device_id  Logical CUDA device id (used with MultiGpuManager when
+     *                  num_gpus > 1). Defaults to 0 (use current device's
+     *                  thread-local cublas handle).
      *
      * Throws std::runtime_error on cudaMalloc / cuBLAS failure. In that
      * case the caller should fall back to the CPU Eigen kernel.
@@ -63,7 +72,10 @@ public:
                int max_n,
                const std::vector<int>* pair_lookup = nullptr,
                const std::vector<int>* setup_i_per_pair = nullptr,
-               int nocc = 0);
+               int nocc = 0,
+               int pair_begin = 0,
+               int pair_end = -1,
+               int device_id = 0);
 
     ~PiCacheGpu();
 
@@ -99,10 +111,22 @@ public:
      * pair_lookup / setup_i_per_pair. Otherwise falls back to the CPU
      * pi_cache build + a CPU pi_T_stack assembly that the caller can
      * skip if it has its own stack-build code.
+     *
+     * @param skip_pi_cache_host  When true AND the GPU path is active AND
+     *        stacked mode is live, skip the d_pi_pad → host D2H plus the
+     *        host-side unpadding into pi_cache_out. The on-device d_pi_pad
+     *        is still produced (the pack kernel needs it for pi_T_stack),
+     *        and pi_T_stack_out is still filled as usual. Use this when
+     *        the caller's downstream consumers read pi_cache only via
+     *        the device buffers (ResidGpu) or never read it at all in the
+     *        current iter — see iterate_dlpno_ccsd_t2 with any_rgpu_active.
+     *        On the CPU fallback / non-stacked path the flag is ignored
+     *        and pi_cache_out is populated as before.
      */
     void rebuild_with_stack(const std::vector<std::vector<real_t>>& Y_old,
                             std::vector<std::vector<RowMatXd>>& pi_cache_out,
-                            std::vector<RowMatXd>& pi_T_stack_out);
+                            std::vector<RowMatXd>& pi_T_stack_out,
+                            bool skip_pi_cache_host = false);
 
     /**
      * @brief Whether the GPU path is active. False = CPU fallback is in use.
@@ -141,6 +165,11 @@ public:
     int            device_N_pair()          const noexcept { return N_pair_; }
     int            device_nocc()            const noexcept { return nocc_; }
 
+    /// Slab info (output-row range and CUDA device).
+    int            pair_begin()              const noexcept { return pair_begin_; }
+    int            pair_end()                const noexcept { return pair_end_; }
+    int            device_id()               const noexcept { return device_id_; }
+
 private:
     struct Impl;
     Impl* p_ = nullptr;
@@ -156,17 +185,42 @@ private:
     void build_stack_cpu_(const std::vector<std::vector<RowMatXd>>& pi_cache,
                           std::vector<RowMatXd>& pi_T_stack_out);
 
+    // GPU-only kernels for the per-iter rebuild (Y pad → H2D → 2× batched
+    // DGEMM filling d_pi_pad on device). No D2H. Used when skip_pi_cache_host
+    // is requested via rebuild_with_stack so the host pi_cache_out can be
+    // skipped while still feeding d_pi_pad to the pack kernel below.
+    void rebuild_gpu_kernels_(const std::vector<std::vector<real_t>>& Y_old);
+
+    // D2H d_pi_pad → h_pi_pad (slab range) and unpad into pi_cache_out.
+    // Only called when the host pi_cache is actually needed downstream.
+    void download_pi_cache_(std::vector<std::vector<RowMatXd>>& pi_cache_out);
+
     // For the CPU fallback only: keep a const view into the input barS_cache.
     const std::vector<std::vector<RowMatXd>>* barS_cache_ref_ = nullptr;
     std::vector<int> n_pno_;
     int N_pair_ = 0;
     int max_n_ = 0;
 
+    // CPU-path acceleration: precomputed list of indices with n_pno > 0.
+    // - active_i_kl_: full N_pair range (used as inner loop in rebuild_cpu_)
+    // - active_i_ij_: restricted to the slab [pair_begin_, pair_end_)
+    // Built once in the constructor; iterating only these in rebuild_cpu_
+    // turns the 34M outer×inner sweep on cholesterol into ~3.8M active calls.
+    std::vector<int> active_i_kl_;
+    std::vector<int> active_i_ij_;
+
     // Step 6.1 metadata captured at construction (used by both GPU and
     // CPU fallback paths of build_stack_cpu_).
     std::vector<int> pair_lookup_;        // size nocc² (or empty)
     std::vector<int> setup_i_per_pair_;   // size N_pair (or empty)
     int nocc_ = 0;
+
+    // Multi-GPU slab info: this instance owns output rows for
+    // i_ij ∈ [pair_begin_, pair_end_) on CUDA device device_id_.
+    // For single-GPU operation pair_begin_=0, pair_end_=N_pair_, device_id_=0.
+    int pair_begin_ = 0;
+    int pair_end_   = 0;
+    int device_id_  = 0;
 };
 
 } // namespace gansu

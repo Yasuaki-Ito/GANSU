@@ -396,6 +396,18 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     const int sc_pno_iter = std::max(0, params.sc_pno_iter);
     const int total_rounds = needs_iter ? (sc_pno_iter + 1) : 1;
 
+    // Multi-GPU pair partition for LMP2 iteration: replicate B (already
+    // forced above), then drive iterate_lmp2 with num_gpus instances of
+    // PiCacheGpu — each handles a slab of pairs.
+    int lmp2_num_gpus = 1;
+#ifdef GANSU_MULTI_GPU
+    if (auto* eri_dist = dynamic_cast<const ERI_RI_Distributed_RHF*>(&eri)) {
+        if (eri_dist->num_gpus() > 1) {
+            lmp2_num_gpus = eri_dist->num_gpus();
+        }
+    }
+#endif
+
     LMP2Status last_status;
     if (needs_iter) {
         for (int round = 0; round < total_rounds; ++round) {
@@ -405,7 +417,7 @@ DLPNOLMP2Result solve_dlpno_lmp2(
             last_status = iterate_lmp2(
                 setups, pairs, pair_lookup, F_LMO, h_S,
                 nocc_, nao_, max_iter, conv_tol,
-                params.verbose, tag);
+                params.verbose, tag, lmp2_num_gpus);
             dt_iterate += std::chrono::duration<double>(
                 clock::now() - t_iter0).count();
 

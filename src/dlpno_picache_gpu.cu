@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include "gpu_manager.hpp"   // gpu::GPUHandle, gpu::gpu_available
+#include "multi_gpu_manager.hpp"  // MultiGpuManager, DeviceGuard (multi-GPU dispatch)
 #endif
 
 namespace gansu {
@@ -177,7 +178,10 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
                        int max_n,
                        const std::vector<int>* pair_lookup,
                        const std::vector<int>* setup_i_per_pair,
-                       int nocc)
+                       int nocc,
+                       int pair_begin,
+                       int pair_end,
+                       int device_id)
     : n_pno_(n_pno_per_pair),
       N_pair_(static_cast<int>(n_pno_per_pair.size())),
       max_n_(max_n),
@@ -187,12 +191,41 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
     if (pair_lookup)        pair_lookup_       = *pair_lookup;
     if (setup_i_per_pair)   setup_i_per_pair_  = *setup_i_per_pair;
 
+    // Slab info (output rows). pair_end<0 means use full range.
+    pair_begin_ = (pair_begin < 0) ? 0 : pair_begin;
+    pair_end_   = (pair_end   < 0) ? N_pair_ : pair_end;
+    if (pair_begin_ > N_pair_) pair_begin_ = N_pair_;
+    if (pair_end_   > N_pair_) pair_end_   = N_pair_;
+    if (pair_end_   < pair_begin_) pair_end_ = pair_begin_;
+    device_id_ = device_id;
+
+    // CPU-path acceleration: snapshot the indices with n_pno > 0 so
+    // rebuild_cpu_ can iterate only the active sub-grid (1952² instead of
+    // 5886² on cholesterol). n_pno_ is fixed for the lifetime of this
+    // instance (the iter loop in iterate_dlpno_ccsd_t2 / iterate_lmp2 does
+    // not re-truncate PNOs between iters — re-truncation is a separate
+    // SC-PNO round that constructs a new PiCacheGpu).
+    active_i_kl_.reserve(static_cast<size_t>(N_pair_));
+    for (int k = 0; k < N_pair_; ++k) {
+        if (n_pno_[k] > 0) active_i_kl_.push_back(k);
+    }
+    active_i_ij_.reserve(static_cast<size_t>(pair_end_ - pair_begin_));
+    for (int k = pair_begin_; k < pair_end_; ++k) {
+        if (n_pno_[k] > 0) active_i_ij_.push_back(k);
+    }
+
 #ifndef GANSU_CPU_ONLY
     // Decide whether to take the GPU path.
     if (!gpu::gpu_available() || N_pair_ == 0 || max_n_ == 0) {
         active_ = false;
         return;
     }
+
+    // For multi-GPU pair partitioning, route allocations to the requested
+    // device (caller is expected to have set device or pass device_id; we
+    // ensure correctness with DeviceGuard here so destructor and rebuild()
+    // calls land on the same device).
+    MultiGpuManager::DeviceGuard _guard(device_id_);
 
     p_ = new Impl();
     Impl& s = *p_;
@@ -319,7 +352,17 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
         }
     }
 
-    s.cublas = gpu::GPUHandle::cublas();
+    // Multi-GPU: use per-device cuBLAS handle from MultiGpuManager. For the
+    // single-GPU path (device_id_=0, MGM not initialised) fall back to the
+    // thread-local handle from gpu::GPUHandle.
+    s.cublas = nullptr;
+    {
+        auto& mgm = MultiGpuManager::instance();
+        if (mgm.num_devices() > device_id_) {
+            s.cublas = mgm.cublas(device_id_);
+        }
+        if (s.cublas == nullptr) s.cublas = gpu::GPUHandle::cublas();
+    }
     if (s.cublas == nullptr) {
         s.free_all();
         delete p_; p_ = nullptr; active_ = false;
@@ -375,6 +418,8 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
 PiCacheGpu::~PiCacheGpu() {
 #ifndef GANSU_CPU_ONLY
     if (p_) {
+        // Free buffers on the device that allocated them.
+        MultiGpuManager::DeviceGuard _guard(device_id_);
         p_->free_all();
         delete p_;
         p_ = nullptr;
@@ -386,34 +431,63 @@ PiCacheGpu::~PiCacheGpu() {
 //  CPU fallback — equivalent to the original Eigen kernel in
 //  iterate_lmp2 / iterate_dlpno_ccsd_t2 (kept here so the caller can use a
 //  single API path regardless of GPU availability).
+//
+//  Optimizations on top of the original per-pair Eigen loop:
+//   (1) active_i_ij_ / active_i_kl_ — precomputed indices with n_pno > 0
+//       turn the 5886² outer×inner sweep on cholesterol into a 1952² active
+//       sub-grid (≈10× fewer iterations). Inactive cells in pi_cache_out
+//       stay default-constructed 0×0 — no `resize(0, 0)` needed each iter.
+//       Both lists are built once in the constructor; n_pno_ is fixed
+//       across the entire iter loop (PNO re-truncation lives in the SC-PNO
+//       refresh, which constructs a fresh PiCacheGpu).
+//   (2) thread-local scratch `half_buf` — eliminates the per-pair heap
+//       allocation that `const RowMatXd half = barS * Y_canon` triggers
+//       (~50 ns × 1952² × 53 iter ≈ 10s on cholesterol). We pre-allocate
+//       max_n × max_n doubles per thread and map a Map<RowMatXd> view of
+//       shape (n_ij × n_kl) on top of it each pair-pair — no realloc.
+//   (3) schedule(static) over active_i_ij_ — even thread load (vs the
+//       original sweep that gave threads a mix of active+inactive outers).
 // ---------------------------------------------------------------------------
 void PiCacheGpu::rebuild_cpu_(
     const std::vector<std::vector<real_t>>& Y_old,
     std::vector<std::vector<RowMatXd>>& pi_cache_out)
 {
     const auto& barS_cache = *barS_cache_ref_;
+    const int max_n = max_n_;
+    const long long n_active_ij = static_cast<long long>(active_i_ij_.size());
+    const int* const active_kl_ptr = active_i_kl_.data();
+    const int n_active_kl = static_cast<int>(active_i_kl_.size());
 
-    #pragma omp parallel for schedule(static)
-    for (long long i_ij = 0; i_ij < static_cast<long long>(N_pair_); ++i_ij) {
-        const int n_ij = n_pno_[i_ij];
-        if (n_ij == 0) {
-            for (int i_kl = 0; i_kl < N_pair_; ++i_kl) {
-                pi_cache_out[i_ij][i_kl].resize(0, 0);
+    #pragma omp parallel
+    {
+        // Thread-local scratch for the intermediate `half = barS · Y_canon`.
+        // Sized once to max_n × max_n; per pair-pair a fresh Map<RowMatXd>
+        // view of shape (n_ij × n_kl) re-uses the same memory. The buffer
+        // is overwritten every call, so the unused trailing entries don't
+        // contaminate downstream consumers.
+        std::vector<real_t> half_buf(
+            static_cast<size_t>(max_n) * static_cast<size_t>(max_n));
+
+        #pragma omp for schedule(static)
+        for (long long idx = 0; idx < n_active_ij; ++idx) {
+            const int i_ij = active_i_ij_[idx];
+            const int n_ij = n_pno_[i_ij];
+            // n_ij > 0 guaranteed by the active_i_ij_ list construction.
+
+            const auto& barS_row = barS_cache[i_ij];
+            auto&       pi_row   = pi_cache_out[i_ij];
+
+            for (int j = 0; j < n_active_kl; ++j) {
+                const int i_kl = active_kl_ptr[j];
+                const int n_kl = n_pno_[i_kl];
+
+                const RowMatXd& barS = barS_row[i_kl];
+                Eigen::Map<const RowMatXd> Y_canon(
+                    Y_old[i_kl].data(), n_kl, n_kl);
+                Eigen::Map<RowMatXd> half(half_buf.data(), n_ij, n_kl);
+                half.noalias() = barS * Y_canon;
+                pi_row[i_kl].noalias() = half * barS.transpose();
             }
-            continue;
-        }
-        for (int i_kl = 0; i_kl < N_pair_; ++i_kl) {
-            const int n_kl = n_pno_[i_kl];
-            if (n_kl == 0) {
-                pi_cache_out[i_ij][i_kl].resize(0, 0);
-                continue;
-            }
-            const RowMatXd& barS = barS_cache[i_ij][i_kl];
-            Eigen::Map<const RowMatXd> Y_canon(
-                Y_old[i_kl].data(), n_kl, n_kl);
-            const RowMatXd half = barS * Y_canon;            // n_ij × n_kl
-            pi_cache_out[i_ij][i_kl].noalias() =
-                half * barS.transpose();                     // n_ij × n_ij
         }
     }
 }
@@ -430,16 +504,31 @@ void PiCacheGpu::rebuild(const std::vector<std::vector<real_t>>& Y_old,
     }
 
 #ifndef GANSU_CPU_ONLY
+    MultiGpuManager::DeviceGuard _guard(device_id_);
+    rebuild_gpu_kernels_(Y_old);
+    download_pi_cache_(pi_cache_out);
+#endif // !GANSU_CPU_ONLY
+}
+
+#ifndef GANSU_CPU_ONLY
+// ---------------------------------------------------------------------------
+//  rebuild_gpu_kernels_ — GPU-side work only: pad Y → H2D, two batched DGEMMs
+//  filling d_pi_pad on device. No D2H of d_pi_pad. Caller must hold a
+//  DeviceGuard on device_id_. Used both by rebuild() (which then downloads
+//  via download_pi_cache_) and by rebuild_with_stack() when the caller has
+//  asked to skip the host pi_cache (skip_pi_cache_host=true).
+// ---------------------------------------------------------------------------
+void PiCacheGpu::rebuild_gpu_kernels_(
+    const std::vector<std::vector<real_t>>& Y_old)
+{
     Impl& s = *p_;
     const int N      = N_pair_;
     const int max_n  = max_n_;
     const long long stride_pair = s.stride_pair;          // max_n²
+    const int ib = pair_begin_;
+    const int ie = pair_end_;
 
     const size_t bytes_outer = static_cast<size_t>(N)
-                             * static_cast<size_t>(max_n)
-                             * static_cast<size_t>(max_n) * sizeof(real_t);
-    const size_t bytes_full  = static_cast<size_t>(N)
-                             * static_cast<size_t>(N)
                              * static_cast<size_t>(max_n)
                              * static_cast<size_t>(max_n) * sizeof(real_t);
 
@@ -459,12 +548,14 @@ void PiCacheGpu::rebuild(const std::vector<std::vector<real_t>>& Y_old,
         }
     }
 
-    // H2D
+    // H2D Y_pad (full N × max_n²; all i_kl columns of Y are needed regardless
+    // of slab restriction on output rows).
     check_cuda_(cudaMemcpy(s.d_Y_pad, s.h_Y_pad,
                            bytes_outer, cudaMemcpyHostToDevice),
                 "rebuild H2D Y_pad");
 
     // -------- Per-i_ij outer loop, two strided batched DGEMMs over i_kl.
+    //          Only computes the slab range [pair_begin_, pair_end_).
     const real_t one  = 1.0;
     const real_t zero = 0.0;
 
@@ -478,7 +569,7 @@ void PiCacheGpu::rebuild(const std::vector<std::vector<real_t>>& Y_old,
     //     the first n_ij columns of half_col (= first n_ij rows of half_row).
     //     Half_row's (n_kl..max_n-1) columns are zero by construction since
     //     they sum over zeroed rows of Y_row.
-    for (int i_ij = 0; i_ij < N; ++i_ij) {
+    for (int i_ij = ib; i_ij < ie; ++i_ij) {
         const int n_ij = n_pno_[i_ij];
         if (n_ij == 0) continue;
 
@@ -489,10 +580,6 @@ void PiCacheGpu::rebuild(const std::vector<std::vector<real_t>>& Y_old,
                       + static_cast<size_t>(i_ij)
                       * static_cast<size_t>(N) * stride_pair;
 
-        // Stage 1: half_col = Y_col · barS_col   (TransA=N, TransB=N)
-        //   m=max_n (full rows of half_col, since rows ≥ n_kl trivially zero),
-        //   n=n_ij  (clip to valid cols of half_col = valid rows of half_row),
-        //   k=max_n.
         check_cublas_(cublasDgemmStridedBatched(
             s.cublas, CUBLAS_OP_N, CUBLAS_OP_N,
             /*m=*/ max_n, /*n=*/ n_ij, /*k=*/ max_n,
@@ -503,9 +590,6 @@ void PiCacheGpu::rebuild(const std::vector<std::vector<real_t>>& Y_old,
             s.d_half_pad, /*ldc=*/ max_n, /*strideC=*/ stride_pair,
             N), "stage1 strided batched");
 
-        // Stage 2: pi_col = barS_col^T · half_col   (TransA=T, TransB=N)
-        //   m=n_ij, n=n_ij, k=max_n.
-        //   k=max_n is safe because half_col rows ≥ n_kl are zero (see above).
         check_cublas_(cublasDgemmStridedBatched(
             s.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
             /*m=*/ n_ij, /*n=*/ n_ij, /*k=*/ max_n,
@@ -516,15 +600,50 @@ void PiCacheGpu::rebuild(const std::vector<std::vector<real_t>>& Y_old,
             dC_row,       /*ldc=*/ max_n, /*strideC=*/ stride_pair,
             N), "stage2 strided batched");
     }
+}
 
-    // D2H
-    check_cuda_(cudaMemcpy(s.h_pi_pad, s.d_pi_pad,
-                           bytes_full, cudaMemcpyDeviceToHost),
-                "rebuild D2H pi_pad");
+// ---------------------------------------------------------------------------
+//  download_pi_cache_ — D2H d_pi_pad → h_pi_pad (slab range only) and unpad
+//  into pi_cache_out. Caller must hold DeviceGuard. Run after
+//  rebuild_gpu_kernels_ when the host pi_cache is needed.
+// ---------------------------------------------------------------------------
+void PiCacheGpu::download_pi_cache_(
+    std::vector<std::vector<RowMatXd>>& pi_cache_out)
+{
+    Impl& s = *p_;
+    const int N      = N_pair_;
+    const int max_n  = max_n_;
+    const int ib = pair_begin_;
+    const int ie = pair_end_;
+    const int slab_n = ie - ib;
+
+    // Slab D2H size: only the slab's output rows of pi_pad.
+    const size_t bytes_slab  = static_cast<size_t>(std::max(0, slab_n))
+                             * static_cast<size_t>(N)
+                             * static_cast<size_t>(max_n)
+                             * static_cast<size_t>(max_n) * sizeof(real_t);
+
+    // D2H — only the slab range (per-pair N × max_n² block starting at
+    // pair_begin_, length slab_n contiguous in i_ij).
+    if (slab_n > 0) {
+        const size_t row_bytes = static_cast<size_t>(N)
+                               * static_cast<size_t>(max_n)
+                               * static_cast<size_t>(max_n) * sizeof(real_t);
+        const size_t off_bytes = static_cast<size_t>(ib) * row_bytes;
+        check_cuda_(cudaMemcpy(
+            reinterpret_cast<char*>(s.h_pi_pad) + off_bytes,
+            reinterpret_cast<const char*>(s.d_pi_pad) + off_bytes,
+            bytes_slab, cudaMemcpyDeviceToHost),
+            "rebuild D2H pi_pad (slab)");
+    }
 
     // -------- Unpad h_pi_pad → pi_cache_out (host).
+    //          Threads outside the slab leave their pi_cache_out rows
+    //          untouched (other PiCacheGpu instances on peer GPUs populate
+    //          them in the multi-GPU dispatch). On single-GPU operation
+    //          (ib=0, ie=N) the entire vector is populated as before.
     #pragma omp parallel for schedule(static)
-    for (long long i_ij = 0; i_ij < static_cast<long long>(N); ++i_ij) {
+    for (long long i_ij = ib; i_ij < ie; ++i_ij) {
         const int n_ij = n_pno_[i_ij];
         if (n_ij == 0) {
             for (int i_kl = 0; i_kl < N; ++i_kl) {
@@ -553,8 +672,8 @@ void PiCacheGpu::rebuild(const std::vector<std::vector<real_t>>& Y_old,
             }
         }
     }
-#endif // !GANSU_CPU_ONLY
 }
+#endif // !GANSU_CPU_ONLY
 
 // ---------------------------------------------------------------------------
 //  Step 6.2 — read-only device buffer getters for ResidGpu cooperation.
@@ -613,9 +732,11 @@ void PiCacheGpu::build_stack_cpu_(
     const int nocc  = nocc_;
     const auto& pl  = pair_lookup_;
     const auto& si  = setup_i_per_pair_;
+    const int ib   = pair_begin_;
+    const int ie   = pair_end_;
 
     #pragma omp parallel for schedule(static)
-    for (long long i_ij = 0; i_ij < static_cast<long long>(N_pair_); ++i_ij) {
+    for (long long i_ij = ib; i_ij < ie; ++i_ij) {
         const int n_ij = n_pno_[i_ij];
         if (n_ij == 0) {
             pi_T_stack_out[i_ij].resize(0, 0);
@@ -648,45 +769,78 @@ void PiCacheGpu::build_stack_cpu_(
 void PiCacheGpu::rebuild_with_stack(
     const std::vector<std::vector<real_t>>& Y_old,
     std::vector<std::vector<RowMatXd>>& pi_cache_out,
-    std::vector<RowMatXd>& pi_T_stack_out)
+    std::vector<RowMatXd>& pi_T_stack_out,
+    bool skip_pi_cache_host)
 {
-    // Always produce pi_cache first (GPU when active_, CPU otherwise).
-    rebuild(Y_old, pi_cache_out);
+    // Fast path: when the GPU + stacked-mode buffers are both live AND the
+    // caller has told us pi_cache_out is dead this iter (any_rgpu_active),
+    // run only the GPU kernels for d_pi_pad and skip the D2H + host unpad.
+    // The pack kernel below still reads d_pi_pad on device, so pi_T_stack
+    // is unaffected. pi_T_stack_out is still filled (DFpair needs it).
+    const bool skip_host_pi = skip_pi_cache_host && active_ && stacked_;
+
+    if (skip_host_pi) {
+#ifndef GANSU_CPU_ONLY
+        MultiGpuManager::DeviceGuard _guard(device_id_);
+        rebuild_gpu_kernels_(Y_old);
+#endif
+    } else {
+        // Default path: produce pi_cache (GPU when active_, CPU otherwise).
+        rebuild(Y_old, pi_cache_out);
+    }
 
     if (!stacked_) {
         // CPU fallback for pi_T_stack — same algorithm as the original
         // middleCols loop, just relocated here so the caller sees one API.
+        // (Only reachable when skip_host_pi was false above, since skip_host_pi
+        //  implies stacked_.)
         build_stack_cpu_(pi_cache_out, pi_T_stack_out);
         return;
     }
 
 #ifndef GANSU_CPU_ONLY
+    MultiGpuManager::DeviceGuard _guard(device_id_);
     Impl& s = *p_;
     const int N      = N_pair_;
     const int max_n  = max_n_;
     const int nocc   = nocc_;
+    const int ib    = pair_begin_;
+    const int ie    = pair_end_;
+    const int slab_n = ie - ib;
+
+    // Per-pair offsets into d_pi_T_stack — needed to compute the slab range.
+    std::vector<size_t> idx_offset_host(static_cast<size_t>(N + 1), 0);
+    for (int i = 0; i < N; ++i) {
+        const size_t n = static_cast<size_t>(n_pno_[i]);
+        idx_offset_host[i + 1] = idx_offset_host[i]
+            + n * n
+            * static_cast<size_t>(nocc)
+            * static_cast<size_t>(nocc);
+    }
 
     // d_pi_pad now holds the latest pi_cache values (set by the rebuild()
     // call above — those buffers are members of *p_ and persist).
     //
     // Zero d_pi_T_stack so empty (i_ij or i_kl) cells stay clean. The kernel
     // also short-circuits empty inputs but we cover the n_kl=0 ⇒ skipped
-    // dst region just in case.
-    const size_t bytes_pi_T = s.pi_T_stack_total * sizeof(real_t);
-    if (bytes_pi_T > 0) {
-        check_cuda_(cudaMemsetAsync(s.d_pi_T_stack, 0, bytes_pi_T,
-                                    /*stream=*/0),
-                    "memset d_pi_T_stack");
+    // dst region just in case. Slab-aware: only zero the slab portion.
+    const size_t bytes_pi_T_slab = (idx_offset_host[ie] - idx_offset_host[ib])
+                                 * sizeof(real_t);
+    if (bytes_pi_T_slab > 0) {
+        check_cuda_(cudaMemsetAsync(
+            s.d_pi_T_stack + idx_offset_host[ib],
+            0, bytes_pi_T_slab, /*stream=*/0),
+            "memset d_pi_T_stack (slab)");
     }
 
-    // Launch the pack kernel.
-    //   grid = (N_pair, nocc²), block = (max_n_d, max_n_a)
-    //   Each thread writes pi_T_stack[i_ij][a, kl·n_ij + d].
-    if (N > 0 && nocc > 0 && max_n > 0) {
-        // Step 6.6 fix: cap block at TILE=16 (256 threads) so max_n > 32
-        // (e.g. Benzene cc-pVDZ has max_n ~ 30-50) doesn't exceed CUDA's
-        // 1024 threads/block. Kernel uses strided per-thread loops to
-        // cover the full max_n × max_n cell range.
+    // Launch the pack kernel. We use the FULL grid (N × nocc²) — running
+    // a wider grid is cheap (~10 µs) and avoids adding slab-aware indexing
+    // to the kernel. Rows outside the slab read from stale/uninitialised
+    // d_pi_pad (rebuild() above wrote only slab rows), so d_pi_T_stack
+    // outside the slab will be garbage on this device. That's fine because
+    // the D2H below only copies the slab portion; peer GPUs populate the
+    // other slabs into the shared host h_pi_T_stack buffers / output vectors.
+    if (slab_n > 0 && nocc > 0 && max_n > 0) {
         constexpr int TILE = 16;
         const int tile_x = (max_n < TILE) ? max_n : TILE;
         const int tile_y = (max_n < TILE) ? max_n : TILE;
@@ -710,27 +864,20 @@ void PiCacheGpu::rebuild_with_stack(
         }
     }
 
-    // D2H
-    if (bytes_pi_T > 0) {
-        check_cuda_(cudaMemcpy(s.h_pi_T_stack, s.d_pi_T_stack,
-                               bytes_pi_T, cudaMemcpyDeviceToHost),
-                    "D2H pi_T_stack");
+    // D2H — only the slab range of pi_T_stack.
+    if (bytes_pi_T_slab > 0) {
+        check_cuda_(cudaMemcpy(s.h_pi_T_stack + idx_offset_host[ib],
+                               s.d_pi_T_stack + idx_offset_host[ib],
+                               bytes_pi_T_slab, cudaMemcpyDeviceToHost),
+                    "D2H pi_T_stack (slab)");
     }
 
     // Host scatter: per-pair contiguous segment → pi_T_stack_out[idx] (n_ij × nocc²·n_ij).
     // The device layout already matches the unpadded host layout, so this
-    // is a single memcpy per pair.
-    std::vector<size_t> idx_offset_host(static_cast<size_t>(N + 1), 0);
-    for (int i = 0; i < N; ++i) {
-        const size_t n = static_cast<size_t>(n_pno_[i]);
-        idx_offset_host[i + 1] = idx_offset_host[i]
-            + n * n
-            * static_cast<size_t>(nocc)
-            * static_cast<size_t>(nocc);
-    }
-
+    // is a single memcpy per pair. Only fills the slab range; other slabs
+    // are populated by peer PiCacheGpu instances on other GPUs.
     #pragma omp parallel for schedule(static)
-    for (long long i_ij = 0; i_ij < static_cast<long long>(N); ++i_ij) {
+    for (long long i_ij = ib; i_ij < ie; ++i_ij) {
         const int n_ij = n_pno_[i_ij];
         if (n_ij == 0) {
             pi_T_stack_out[i_ij].resize(0, 0);
