@@ -54,6 +54,14 @@ struct PairData {
     std::vector<real_t> L;
     /// Amplitudes in W basis. Updated in place during the Jacobi sweep.
     std::vector<real_t> Y;                ///< [n_pno × n_pno]
+    /// Λ_2 (lambda) amplitudes in W basis, same shape as Y.
+    /// For DLPNO-MP2 (Sub-phase 1 of the DLPNO-CCSD-Λ project): closed-form
+    ///   Y_lambda[a,b] = 2 Y[a,b] - Y[b,a]
+    /// For DLPNO-CCSD (Sub-phase 2): updated iteratively via DLPNO Λ residual.
+    /// Empty (size 0) if Lambda solver has not been run.
+    /// Reference: Datta, Kossmann, Neese, J. Chem. Phys. 145, 114101 (2016)
+    /// and c:\Users\yasuaki\Dropbox\AQUA\DLPNO_Lambda.md.
+    std::vector<real_t> Y_lambda;         ///< [n_pno × n_pno]
 };
 
 /**

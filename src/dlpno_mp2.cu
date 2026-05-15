@@ -19,13 +19,17 @@
 #include <stdexcept>
 #include <vector>
 
+#include "ccsd_lambda.hpp"
 #include "device_host_memory.hpp"
+#include "dlpno_density.hpp"
 #include "dlpno_domain.hpp"
+#include "dlpno_lambda.hpp"
 #include "dlpno_localizer.hpp"
 #include "dlpno_pair_data.hpp"
 #include "dlpno_pao.hpp"
 #include "dlpno_pno.hpp"
 #include "eri.hpp"
+#include "oscillator_strength.hpp"
 #include "rhf.hpp"
 
 namespace gansu {
@@ -530,6 +534,178 @@ real_t DLPNOMP2::compute_energy()
     auto res = solve_dlpno_lmp2(rhf_, eri_, params_);
     E_pao_ = res.E_pao_total;
     E_pno_ = res.E_pno_total;
+
+    // ----------------------------------------------------------------
+    // Sub-phase 1 hook: build DLPNO-MP2 Λ + 1-RDM and report sanity.
+    // (DLPNO_Lambda.md §4.2-4.3, Sub-step 1.1-1.5)
+    //
+    // Production gate: only runs when --dlpno_compute_density true.
+    // Print gated by verbose >= 1 (additionally).
+    // ----------------------------------------------------------------
+    if (rhf_.get_dlpno_compute_density()) {
+        compute_dlpno_mp2_lambda(res.pairs);
+
+        // Pull the canonical MO coefficients and AO overlap from the RHF
+        // reference (host side; populated after SCF).
+        rhf_.get_coefficient_matrix().toHost();
+        rhf_.get_overlap_matrix().toHost();
+        const real_t* C_full = rhf_.get_coefficient_matrix().host_ptr();
+        const real_t* S_AO   = rhf_.get_overlap_matrix().host_ptr();
+        const int nao        = nao_;
+        const int n_lmo      = nocc_;
+        const int n_can_vir  = nao - nocc_;
+        const int nmo        = n_lmo + n_can_vir;
+
+        // Extract canonical virtual block (column-major slice from C).
+        // C is row-major [nao × nao] with column = MO index. Virtual columns
+        // are nocc_ .. nao-1.
+        std::vector<real_t> C_can_vir(
+            static_cast<size_t>(nao) * n_can_vir, 0.0);
+        for (int mu = 0; mu < nao; ++mu)
+            for (int a = 0; a < n_can_vir; ++a)
+                C_can_vir[static_cast<size_t>(mu) * n_can_vir + a]
+                    = C_full[static_cast<size_t>(mu) * nao + (nocc_ + a)];
+
+        std::vector<real_t> D_mo(
+            static_cast<size_t>(nmo) * nmo, 0.0);
+        build_dlpno_mp2_1rdm_mo(
+            res.setups, res.pairs, res.pair_lookup,
+            n_lmo, n_can_vir, S_AO, C_can_vir.data(), nao, D_mo.data());
+
+        if (params_.verbose >= 1) {
+            // Sanity diagnostics.
+            real_t tr = 0.0;
+            for (int p = 0; p < nmo; ++p)
+                tr += D_mo[static_cast<size_t>(p) * nmo + p];
+
+            real_t off_diag_max = 0.0;
+            for (int p = 0; p < nmo; ++p)
+                for (int q = 0; q < nmo; ++q)
+                    if (p != q)
+                        off_diag_max = std::max(
+                            off_diag_max,
+                            std::abs(D_mo[static_cast<size_t>(p) * nmo + q]));
+
+            real_t occ_diag_dev = 0.0;
+            for (int i = 0; i < n_lmo; ++i)
+                occ_diag_dev = std::max(
+                    occ_diag_dev,
+                    std::abs(D_mo[static_cast<size_t>(i) * nmo + i] - 2.0));
+
+            real_t vir_diag_max = 0.0;
+            for (int a = 0; a < n_can_vir; ++a)
+                vir_diag_max = std::max(
+                    vir_diag_max,
+                    std::abs(D_mo[static_cast<size_t>(n_lmo + a) * nmo
+                                  + (n_lmo + a)]));
+
+            // Frobenius norms of each block (for PySCF comparison vs
+            // reference_mp2.json's dm1_oo_norm / dm1_vv_norm / dm1_ov_norm).
+            real_t oo_norm_sq = 0.0, vv_norm_sq = 0.0, ov_norm_sq = 0.0;
+            for (int p = 0; p < n_lmo; ++p)
+                for (int q = 0; q < n_lmo; ++q) {
+                    real_t v = D_mo[static_cast<size_t>(p) * nmo + q];
+                    oo_norm_sq += v * v;
+                }
+            for (int p = 0; p < n_can_vir; ++p)
+                for (int q = 0; q < n_can_vir; ++q) {
+                    real_t v = D_mo[static_cast<size_t>(n_lmo + p) * nmo
+                                    + (n_lmo + q)];
+                    vv_norm_sq += v * v;
+                }
+            for (int p = 0; p < n_lmo; ++p)
+                for (int q = 0; q < n_can_vir; ++q) {
+                    real_t v = D_mo[static_cast<size_t>(p) * nmo
+                                    + (n_lmo + q)];
+                    ov_norm_sq += v * v;
+                }
+
+            std::cout << "[DLPNO-MP2-LAMBDA] Sub-phase 1 sanity:" << std::endl;
+            std::cout << "  tr(D_mo)            = " << std::fixed
+                      << std::setprecision(8) << tr
+                      << "  (expect " << (2 * n_lmo) << ")" << std::endl;
+            std::cout << "  max |D_mo(occ_diag - 2)| = " << std::scientific
+                      << std::setprecision(3) << occ_diag_dev << std::endl;
+            std::cout << "  max |D_mo(vir_diag)|     = " << std::scientific
+                      << std::setprecision(3) << vir_diag_max << std::endl;
+            std::cout << "  max |D_mo(off-diag)|     = " << std::scientific
+                      << std::setprecision(3) << off_diag_max << std::endl;
+            std::cout << "  ||D_mo[oo]||_F           = " << std::fixed
+                      << std::setprecision(6) << std::sqrt(oo_norm_sq)
+                      << std::endl;
+            std::cout << "  ||D_mo[vv]||_F           = " << std::fixed
+                      << std::setprecision(6) << std::sqrt(vv_norm_sq)
+                      << std::endl;
+            std::cout << "  ||D_mo[ov]||_F           = " << std::fixed
+                      << std::setprecision(6) << std::sqrt(ov_norm_sq)
+                      << "   (Level A MP2: expect 0)" << std::endl;
+            std::cout << "  D_mo diagonal:           ";
+            for (int p = 0; p < std::min(nmo, 12); ++p) {
+                std::cout << " " << std::fixed << std::setprecision(5)
+                          << D_mo[static_cast<size_t>(p) * nmo + p];
+            }
+            if (nmo > 12) std::cout << " ...";
+            std::cout << std::endl;
+
+            // ----------------------------------------------------------------
+            // Sub-step 1.6b: AO transform + dipole moment.
+            //
+            // dipole = -Σ_μν D_AO[μ,ν] · ⟨μ|r|ν⟩ + Σ_atom Z_atom · R_atom
+            // (electron part negative because of e⁻ charge sign;
+            //  origin = (0,0,0), units a.u. (e·Bohr) → convert to Debye)
+            // ----------------------------------------------------------------
+            std::vector<real_t> D_ao(
+                static_cast<size_t>(nao) * nao, 0.0);
+            transform_density_mo_to_ao_cpu(nao, C_full, D_mo.data(),
+                                           D_ao.data());
+
+            std::vector<real_t> dip_x_ao, dip_y_ao, dip_z_ao;
+            const auto& shells = rhf_.get_primitive_shells();
+            const auto& cgto_norm = rhf_.get_cgto_normalization_factors();
+            const auto& shell_infos = rhf_.get_shell_type_infos();
+            compute_ao_dipole_integrals(
+                shells.host_ptr(), shells.size(),
+                cgto_norm.host_ptr(), nao, shell_infos,
+                dip_x_ao, dip_y_ao, dip_z_ao);
+
+            real_t mu_e_x = 0.0, mu_e_y = 0.0, mu_e_z = 0.0;
+            for (int mu = 0; mu < nao; ++mu) {
+                for (int nu = 0; nu < nao; ++nu) {
+                    const real_t Dmn = D_ao[static_cast<size_t>(mu) * nao + nu];
+                    const size_t k = static_cast<size_t>(mu) * nao + nu;
+                    mu_e_x += Dmn * dip_x_ao[k];
+                    mu_e_y += Dmn * dip_y_ao[k];
+                    mu_e_z += Dmn * dip_z_ao[k];
+                }
+            }
+            // Electron dipole is negative (electron has charge -e).
+            mu_e_x = -mu_e_x;  mu_e_y = -mu_e_y;  mu_e_z = -mu_e_z;
+
+            // Nuclear contribution: + Σ Z_a · R_a (R already in Bohr).
+            real_t mu_n_x = 0.0, mu_n_y = 0.0, mu_n_z = 0.0;
+            const auto& atoms = rhf_.get_atoms();
+            for (size_t a = 0; a < atoms.size(); ++a) {
+                const auto& at = atoms.host_ptr()[a];
+                const real_t Z = static_cast<real_t>(at.effective_charge);
+                mu_n_x += Z * at.coordinate.x;
+                mu_n_y += Z * at.coordinate.y;
+                mu_n_z += Z * at.coordinate.z;
+            }
+
+            // Total in atomic units (e·Bohr), convert to Debye.
+            const real_t kAUtoDebye = 2.5417464157;
+            real_t dx = (mu_e_x + mu_n_x) * kAUtoDebye;
+            real_t dy = (mu_e_y + mu_n_y) * kAUtoDebye;
+            real_t dz = (mu_e_z + mu_n_z) * kAUtoDebye;
+            real_t dmag = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+            std::cout << "  dipole [Debye]: x=" << std::fixed
+                      << std::setprecision(4) << dx
+                      << "  y=" << dy << "  z=" << dz
+                      << "  |D|=" << dmag << std::endl;
+        }
+    }
+
     return res.E_pno_total;
 }
 

@@ -139,6 +139,8 @@ set(GRADIENT_SOURCES
     src/grad/grad_k.cu
     src/grad/grad_v.cu
     src/grad/grad_g.cu
+    src/grad/grad_2c.cu
+    src/grad/grad_3c.cu
     src/grad/rys_grad_g.cu
     src/grad/rys_hessian_g.cu
     src/grad/hessian_s.cu
@@ -186,6 +188,8 @@ set(SOURCES
     src/eri.cu
     src/eri_ri.cu
     src/eri_ri_posthf.cu
+    src/eri_ri_gradient.cu
+    src/eri_ri_distributed_gradient.cu
     src/eri_stored.cu
     src/eri_stored_fci.cu
     src/eri_stored_cis.cu
@@ -247,6 +251,7 @@ set(SOURCES
     src/dlpno_proj_gpu.cu
     src/dlpno_mp2.cu
     src/dlpno_ccsd.cu
+    src/dlpno_mp2_lambda.cu
 )
 
 if(NOT ENABLE_GPU)
@@ -278,6 +283,8 @@ target_link_libraries(gansu
         grad_k
         grad_v
         grad_g
+        grad_2c
+        grad_3c
         rys_grad_g
         rys_hessian_g
         hessian_s

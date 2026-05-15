@@ -282,6 +282,7 @@ public:
     int    get_dlpno_sc_pno_iter()   const { return dlpno_sc_pno_iter_; }
     bool   get_dlpno_pno_os_only()   const { return dlpno_pno_os_only_; }
     int    get_dlpno_verbose() const { return dlpno_verbose_; }
+    bool   get_dlpno_compute_density() const { return dlpno_compute_density_; }
 
     /// Number of GPUs requested (-1 = auto-detect, 1 = single, > 1 = multi).
     int    get_num_gpus() const { return num_gpus_; }
@@ -510,6 +511,7 @@ protected:
     int    dlpno_sc_pno_iter_ = 1;
     bool   dlpno_pno_os_only_ = false;
     int    dlpno_verbose_ = 1;
+    bool   dlpno_compute_density_ = false;  ///< Sub-phase 1+: build Λ + 1-RDM after MP2/CCSD
 
     // Multi-GPU
     int    num_gpus_ = 1;

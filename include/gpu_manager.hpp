@@ -68,6 +68,10 @@ double innerProduct(const double* d_vector_A, const double* d_vector_B, double* 
 void invertMatrix(double* d_A, const int N);
 void choleskyDecomposition(double* d_A, const int N);
 
+// Energy-weighted density (overlap-gradient W matrix). Dispatches between
+// GPU (compute_W_Matrix_kernel) and CPU (compute_W_Matrix_cpu).
+void compute_W(real_t* d_W_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, const int num_basis, const int num_electron);
+
 void computeCoreHamiltonianMatrix(const std::vector<ShellTypeInfo>& shell_type_infos, Atom* d_atoms, PrimitiveShell* d_primitive_shells, real_t* d_boys_grid, real_t* d_cgto_normalization_factors, real_t* d_overlap_matrix, real_t* d_core_hamiltonian_matrix, const int num_atoms, const int num_basis, const std::string int1e_method, const bool verbose=false);
 void computeCoefficientMatrix(const real_t* d_fock_matrix, const real_t* d_transform_matrix, real_t* d_coefficient_matrix, const int num_basis, real_t* d_orbital_energies=nullptr);
 

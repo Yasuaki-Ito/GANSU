@@ -119,7 +119,8 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"dlpno_lmp2_conv", "1e-8"},                       // real_t: LMP2 residual convergence (max-abs amplitude residual)
         {"dlpno_sc_pno_iter", "1"},                        // int: extra rounds of self-consistent PNO refinement (0 = single-shot PNO selection from semi-canonical guess)
         {"dlpno_pno_os_only", "0"},                        // bool: PNO selection from opposite-spin amplitudes only (D = T^T T + T T^T). Default 0 = use full LMP2 density (Riplinger 2013, T̃^T T + T̃ T^T) which slightly outperforms the OS-only form for full closed-shell MP2 energy evaluation. Set to 1 only when pairing with SOS-MP2 (c_os scaling, SS dropped).
-        {"dlpno_verbose", "1"}                             // int: 0=summary, 1=phase, 2=per-pair, 3=residual
+        {"dlpno_verbose", "1"},                            // int: 0=summary, 1=phase, 2=per-pair, 3=residual
+        {"dlpno_compute_density", "0"}                     // bool: build DLPNO Λ + 1-RDM after MP2/CCSD energy (Sub-phase 1+ of DLPNO-CCSD-Λ project). Default 0 = energy only (no extra cost). Set 1 for DMET / properties / dipole; print sanity block + dipole when combined with dlpno_verbose >= 1.
     };
 
 

@@ -2498,22 +2498,39 @@ bool ERI_RI_Distributed_RHF::replicate_B_to_all_gpus() {
     for (int g = 1; g < num_gpus_; g++)
         offsets[g] = offsets[g - 1] + (size_t)naux_local_[g - 1] * nao2;
 
+    // NCCL Broadcast path: launch one Broadcast per source root, grouped so
+    // the underlying ring/tree topology is exploited instead of 64 pairwise
+    // peer-copies serialized on default streams. On NVLink fabrics this is
+    // typically 5-10× faster than the pairwise approach; on PCIe-only it is
+    // similar to (or marginally better than) pairwise.
+    auto& mgr_b = MultiGpuManager::instance();
+    nccl::group_start();
     for (int src = 0; src < num_gpus_; src++) {
-        const size_t bytes_src = (size_t)naux_local_[src] * nao2 * sizeof(real_t);
-        for (int dst = 0; dst < num_gpus_; dst++) {
-            cudaSetDevice(dst);
-            if (dst == src) {
-                cudaMemcpy(d_B_full_per_gpu_[dst] + offsets[src], d_B_local_[src],
-                           bytes_src, cudaMemcpyDeviceToDevice);
-            } else {
-                cudaMemcpyPeer(d_B_full_per_gpu_[dst] + offsets[src], dst,
-                               d_B_local_[src], src, bytes_src);
+        const size_t count_src = (size_t)naux_local_[src] * nao2;
+        for (int d = 0; d < num_gpus_; d++) {
+            cudaSetDevice(d);
+            // On the root rank we send from d_B_local_[src]; on others we
+            // receive into d_B_full_per_gpu_[d] + offsets[src]. ncclBroadcast
+            // takes one (sendbuff, recvbuff) pair per rank; we use the same
+            // recv-side pointer on all ranks (including root, which copies
+            // its sendbuff into the local recv-slot first).
+            const real_t* sendbuff = (d == src) ? d_B_local_[src]
+                                                : (d_B_full_per_gpu_[d] + offsets[src]);
+            real_t* recvbuff = d_B_full_per_gpu_[d] + offsets[src];
+            ncclResult_t rc = ncclBroadcast(sendbuff, recvbuff, count_src,
+                                            ncclFloat64, src,
+                                            mgr_b.nccl_comm(d),
+                                            mgr_b.comm_stream(d));
+            if (rc != ncclSuccess) {
+                throw std::runtime_error(std::string("[replicate_B NCCL] ") +
+                                         ncclGetErrorString(rc));
             }
         }
     }
+    nccl::group_end();
     for (int g = 0; g < num_gpus_; g++) {
         cudaSetDevice(g);
-        cudaDeviceSynchronize();
+        cudaStreamSynchronize(mgr_b.comm_stream(g));
     }
     cudaSetDevice(0);
 

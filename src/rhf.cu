@@ -116,9 +116,18 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
                 mgr.initialize(num_gpus);
             }
             std::cout << "[RI] " << mgr.num_devices() << " device(s)" << std::endl;
-            auto eri = std::make_unique<ERI_RI_Distributed_RHF>(*this, auxiliary_molecular);
-            eri->set_storage_mode(ERI_RI_Distributed_RHF::StorageMode::GPU_Resident);
-            set_eri_method(std::move(eri));
+            if (mgr.num_devices() == 1) {
+                // Single GPU: avoid the distributed class entirely so that
+                // analytical paths needing the full B matrix (e.g. RI gradient)
+                // can use it directly. The lightweight constructor used by
+                // ERI_RI_Distributed_RHF leaves intermediate_matrix_B_ as a 1x1
+                // dummy, which breaks the single-GPU RI gradient path.
+                set_eri_method(std::make_unique<ERI_RI_RHF>(*this, auxiliary_molecular));
+            } else {
+                auto eri = std::make_unique<ERI_RI_Distributed_RHF>(*this, auxiliary_molecular);
+                eri->set_storage_mode(ERI_RI_Distributed_RHF::StorageMode::GPU_Resident);
+                set_eri_method(std::move(eri));
+            }
         }
 #else
         set_eri_method(std::make_unique<ERI_RI_RHF>(*this, auxiliary_molecular));
@@ -908,22 +917,32 @@ std::vector<double> RHF::compute_Energy_Gradient() {
         return gradient;
     }
 
-    // HF gradient (default)
-    auto gradient = gpu::computeEnergyGradient_RHF(
-        shell_type_infos,
-        shell_pair_type_infos,
-        atoms.device_ptr(),
-        density_matrix.device_ptr(),
-        coefficient_matrix.device_ptr(),
-        orbital_energies.device_ptr(),
-        primitive_shells.device_ptr(),
-        boys_grid.device_ptr(),
-        cgto_normalization_factors.device_ptr(),
-        static_cast<int>(atoms.size()),
-        num_basis,
-        num_electrons,
-        verbose
-    );
+    // HF gradient: dispatch to the analytical RI path when the active ERI method
+    // exposes it (currently ERI_RI; ERI_RI_Distributed_RHF added in Phase 4).
+    std::vector<double> gradient;
+    if (eri_method_->supports_ri_gradient()) {
+        gradient = eri_method_->compute_ri_gradient(
+            density_matrix.device_ptr(),
+            coefficient_matrix.device_ptr(),
+            orbital_energies.device_ptr(),
+            num_electrons);
+    } else {
+        gradient = gpu::computeEnergyGradient_RHF(
+            shell_type_infos,
+            shell_pair_type_infos,
+            atoms.device_ptr(),
+            density_matrix.device_ptr(),
+            coefficient_matrix.device_ptr(),
+            orbital_energies.device_ptr(),
+            primitive_shells.device_ptr(),
+            boys_grid.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
+            static_cast<int>(atoms.size()),
+            num_basis,
+            num_electrons,
+            verbose
+        );
+    }
 
     // Add ECP gradient contribution if present
     if (has_ecp_) {

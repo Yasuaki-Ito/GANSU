@@ -52,6 +52,7 @@
 | dlpno_sc_pno_iter | DLPNO self-consistent PNO refinement rounds | int | 1 |
 | dlpno_pair_distance_cutoff | DLPNO pair distance pre-screening (Bohr) | double | 15.0 |
 | dlpno_verbose | DLPNO log verbosity (0/1/2/3) | int | 1 |
+| dlpno_compute_density | Build DLPNO Λ + 1-RDM after MP2/CCSD energy (Sub-phase 1+ of DLPNO-CCSD-Λ project, required for DMET integration / properties / dipole) | bool | false |
 | opt_max_iter | Geometry optimization max iterations | int | 200 |
 | opt_grad_threshold | Convergence: max gradient component (Hartree/Bohr) | double | 3.0e-4 |
 | opt_rms_grad_threshold | Convergence: RMS gradient (Hartree/Bohr) | double | 2.0e-4 |

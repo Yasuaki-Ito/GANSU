@@ -23,11 +23,15 @@
 #include <omp.h>
 #endif
 
+#include "ccsd_lambda.hpp"        // transform_density_mo_to_ao_cpu (Sub-phase 3B properties)
 #include "device_host_memory.hpp"
+#include "dlpno_density.hpp"      // build_dlpno_ccsd_1rdm_mo_closedform (Sub-phase 2)
+#include "dlpno_lambda.hpp"       // compute_dlpno_ccsd_lambda_closedform (Sub-phase 2)
 #include "dlpno_mp2.hpp"          // solve_dlpno_lmp2 + DLPNOLMP2Result
 #include "dlpno_pair_data.hpp"    // PairSetup, PairData
 #include "dlpno_eri_gpu.hpp"      // EriBuildGpu (Phase 3.2.7 ERI GPU port)
 #include "dlpno_proj_gpu.hpp"     // TripleProjGpu (Phase 3.2.8 T2 proj GPU port)
+#include "oscillator_strength.hpp"  // compute_ao_dipole_integrals (Sub-phase 3B properties)
 #include "dlpno_t_gpu.hpp"        // TripleTGpu (Phase 3.2.6 GPU port)
 #include "dlpno_tno.hpp"          // TNOBuilder, TNOData (Phase 3.2.0)
 #include "eri.hpp"
@@ -647,6 +651,193 @@ real_t DLPNOCCSD::compute_energy()
                   << "\n[DLPNO-CCSD]   E(T1 contribution)  = " << E_T1
                   << "\n[DLPNO-CCSD]   E(total CCSD corr)  = " << E_total
                   << std::endl;
+    }
+
+    // ----------------------------------------------------------------
+    // Sub-phase 2 strategy (a) hook: build DLPNO-CCSD Λ + 1-RDM via the
+    // closed-form approximation (Y_lambda = 2 Y - Y^T applied to CCSD T2,
+    // Λ_1 = 0, plus explicit T1 contribution to ov/vo blocks).
+    //
+    // Production gate: dlpno_compute_density. Print gated by verbose >= 1.
+    // See c:\Users\yasuaki\Dropbox\AQUA\DLPNO_Lambda.md §12 for the
+    // strategy choice rationale and the route to upgrading to the exact
+    // Datta 2016 Λ residual (strategy X).
+    // ----------------------------------------------------------------
+    if (rhf_.get_dlpno_compute_density()) {
+        // Sub-step 2X.1: iterative Λ_2 in the LMP2 limit (no F-eff dressing
+        // yet). At strict mode the closed-form initial guess is the fixed
+        // point and the iteration converges in 1 sweep. With PM-localized
+        // LMOs the F_LMO off-diagonal cross-pair coupling refines Λ_2 away
+        // from the closed-form value.
+        // Sub-step 2X.2a empirical finding: intra-pair-only dressing is
+        // unbalanced and degrades agreement with canonical CCSD Λ
+        // (||D[oo]||_F deviates by 8.7e-3 vs 2.5e-5 for the LMP2-limit
+        // closed-form path). This mirrors the T-iteration history where
+        // Phase 2.5 alone diverged. Reverting to enable_dressing=false
+        // (= Sub-step 2X.1 LMP2 limit, closed-form Λ_2 = 2 Y - Y^T) which
+        // already agrees with PySCF canonical CCSD oo/vv blocks to 1e-5.
+        // The full dressing layer (cross-pair F_eff + particle + ladders)
+        // is deferred to Sub-step 2X.2b-d, ideally only after Sub-phase 3
+        // (DMET integration) demonstrates that the closed-form is
+        // insufficient for the target use case.
+        std::vector<std::vector<real_t>> Lambda1;
+        DLPNOLambdaStatus lam_status = iterate_dlpno_ccsd_lambda(
+            res.setups, res.pairs, Lambda1, T1, res.pair_lookup,
+            res.F_LMO, h_S, nocc_, nao_,
+            params_.lmp2_max_iter, params_.lmp2_conv,
+            /*enable_dressing=*/false,                    // 2X.1 LMP2 limit (revert from 2X.2a)
+            params_.verbose, "DLPNO-Λ",
+            /*phase24=*/nullptr,
+            /*num_gpus=*/1);
+
+        rhf_.get_coefficient_matrix().toHost();
+        const real_t* C_full = rhf_.get_coefficient_matrix().host_ptr();
+        const int n_lmo     = nocc_;
+        const int n_can_vir = nao_ - nocc_;
+        const int nmo       = n_lmo + n_can_vir;
+
+        // Extract canonical virtual block from full C [nao × nao].
+        std::vector<real_t> C_can_vir(
+            static_cast<size_t>(nao_) * n_can_vir, 0.0);
+        for (int mu = 0; mu < nao_; ++mu)
+            for (int a = 0; a < n_can_vir; ++a)
+                C_can_vir[static_cast<size_t>(mu) * n_can_vir + a]
+                    = C_full[static_cast<size_t>(mu) * nao_ + (nocc_ + a)];
+
+        std::vector<real_t> D_mo(
+            static_cast<size_t>(nmo) * nmo, 0.0);
+        build_dlpno_ccsd_1rdm_mo_closedform(
+            res.setups, res.pairs, res.pair_lookup, T1,
+            n_lmo, n_can_vir, h_S, C_can_vir.data(), nao_, D_mo.data());
+
+        if (params_.verbose >= 1) {
+            // Sanity: trace + block norms (mirror DLPNO-MP2 sanity layout).
+            real_t tr = 0.0;
+            for (int p = 0; p < nmo; ++p)
+                tr += D_mo[static_cast<size_t>(p) * nmo + p];
+
+            real_t oo_norm_sq = 0.0, vv_norm_sq = 0.0, ov_norm_sq = 0.0;
+            for (int p = 0; p < n_lmo; ++p)
+                for (int q = 0; q < n_lmo; ++q) {
+                    real_t v = D_mo[static_cast<size_t>(p) * nmo + q];
+                    oo_norm_sq += v * v;
+                }
+            for (int p = 0; p < n_can_vir; ++p)
+                for (int q = 0; q < n_can_vir; ++q) {
+                    real_t v = D_mo[static_cast<size_t>(n_lmo + p) * nmo
+                                    + (n_lmo + q)];
+                    vv_norm_sq += v * v;
+                }
+            for (int p = 0; p < n_lmo; ++p)
+                for (int q = 0; q < n_can_vir; ++q) {
+                    real_t v = D_mo[static_cast<size_t>(p) * nmo
+                                    + (n_lmo + q)];
+                    ov_norm_sq += v * v;
+                }
+
+            std::cout << "[DLPNO-CCSD-LAMBDA] Sub-phase 2 (closed-form approx):"
+                      << std::endl;
+            std::cout << "  tr(D_mo)            = " << std::fixed
+                      << std::setprecision(8) << tr
+                      << "  (expect " << (2 * n_lmo) << ")" << std::endl;
+            std::cout << "  ||D_mo[oo]||_F           = " << std::fixed
+                      << std::setprecision(6) << std::sqrt(oo_norm_sq)
+                      << std::endl;
+            std::cout << "  ||D_mo[vv]||_F           = " << std::fixed
+                      << std::setprecision(6) << std::sqrt(vv_norm_sq)
+                      << std::endl;
+            std::cout << "  ||D_mo[ov]||_F           = " << std::fixed
+                      << std::setprecision(6) << std::sqrt(ov_norm_sq)
+                      << "   (closed-form: T1 contribution)" << std::endl;
+            std::cout << "  D_mo diagonal:           ";
+            for (int p = 0; p < std::min(nmo, 12); ++p) {
+                std::cout << " " << std::fixed << std::setprecision(5)
+                          << D_mo[static_cast<size_t>(p) * nmo + p];
+            }
+            if (nmo > 12) std::cout << " ...";
+            std::cout << std::endl;
+
+            // ----------------------------------------------------------------
+            // Sub-phase 3 (B): properties wire-in for whole-molecule
+            // DLPNO-CCSD. Mirror of the DLPNO-MP2 dipole + Mulliken path
+            // (DLPNOMP2::compute_energy in src/dlpno_mp2.cu).
+            //
+            // dipole = -Σ_μν D_AO[μ,ν] · ⟨μ|r|ν⟩ + Σ_atom Z_atom · R_atom
+            // Mulliken q_A = Z_A - Σ_{μ ∈ A, ν} D_AO[μ,ν] · S_AO[μ,ν]
+            // ----------------------------------------------------------------
+            std::vector<real_t> D_ao(
+                static_cast<size_t>(nao_) * nao_, 0.0);
+            transform_density_mo_to_ao_cpu(nao_, C_full, D_mo.data(),
+                                           D_ao.data());
+
+            std::vector<real_t> dip_x_ao, dip_y_ao, dip_z_ao;
+            const auto& shells   = rhf_.get_primitive_shells();
+            const auto& cgto_norm = rhf_.get_cgto_normalization_factors();
+            const auto& shell_infos = rhf_.get_shell_type_infos();
+            compute_ao_dipole_integrals(
+                shells.host_ptr(), shells.size(),
+                cgto_norm.host_ptr(), nao_, shell_infos,
+                dip_x_ao, dip_y_ao, dip_z_ao);
+
+            real_t mu_e_x = 0.0, mu_e_y = 0.0, mu_e_z = 0.0;
+            for (int mu = 0; mu < nao_; ++mu) {
+                for (int nu = 0; nu < nao_; ++nu) {
+                    const real_t Dmn =
+                        D_ao[static_cast<size_t>(mu) * nao_ + nu];
+                    const size_t k =
+                        static_cast<size_t>(mu) * nao_ + nu;
+                    mu_e_x += Dmn * dip_x_ao[k];
+                    mu_e_y += Dmn * dip_y_ao[k];
+                    mu_e_z += Dmn * dip_z_ao[k];
+                }
+            }
+            mu_e_x = -mu_e_x; mu_e_y = -mu_e_y; mu_e_z = -mu_e_z;
+
+            real_t mu_n_x = 0.0, mu_n_y = 0.0, mu_n_z = 0.0;
+            const auto& atoms = rhf_.get_atoms();
+            for (size_t a = 0; a < atoms.size(); ++a) {
+                const auto& at = atoms.host_ptr()[a];
+                const real_t Z = static_cast<real_t>(at.effective_charge);
+                mu_n_x += Z * at.coordinate.x;
+                mu_n_y += Z * at.coordinate.y;
+                mu_n_z += Z * at.coordinate.z;
+            }
+            const real_t kAUtoDebye = 2.5417464157;
+            real_t dx = (mu_e_x + mu_n_x) * kAUtoDebye;
+            real_t dy = (mu_e_y + mu_n_y) * kAUtoDebye;
+            real_t dz = (mu_e_z + mu_n_z) * kAUtoDebye;
+            real_t dmag = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+            std::cout << "  dipole [Debye]: x=" << std::fixed
+                      << std::setprecision(4) << dx
+                      << "  y=" << dy << "  z=" << dz
+                      << "  |D|=" << dmag << std::endl;
+
+            // Mulliken population analysis: q_A = Z_A - Σ_{μ ∈ A, ν} D[μ,ν] · S[μ,ν]
+            // (closed-shell convention: D includes occupation factor 2).
+            rhf_.get_overlap_matrix().toHost();
+            const real_t* S_AO_h = rhf_.get_overlap_matrix().host_ptr();
+            const auto& a2b = rhf_.get_atom_to_basis_range();
+            std::cout << "  Mulliken charges:";
+            for (size_t a = 0; a < atoms.size(); ++a) {
+                const auto& at = atoms.host_ptr()[a];
+                const real_t Z = static_cast<real_t>(at.effective_charge);
+                real_t pop = 0.0;
+                const int mu_lo = static_cast<int>(a2b[a].start_index);
+                const int mu_hi = static_cast<int>(a2b[a].end_index);
+                for (int mu = mu_lo; mu < mu_hi; ++mu) {
+                    for (int nu = 0; nu < nao_; ++nu) {
+                        pop += D_ao[static_cast<size_t>(mu) * nao_ + nu]
+                             * S_AO_h[static_cast<size_t>(mu) * nao_ + nu];
+                    }
+                }
+                const real_t q = Z - pop;
+                std::cout << "  " << at.atomic_number << "(" << a << "):"
+                          << std::showpos << std::fixed
+                          << std::setprecision(4) << q << std::noshowpos;
+            }
+            std::cout << std::endl;
+        }
     }
 
     return E_total;

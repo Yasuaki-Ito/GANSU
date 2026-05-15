@@ -86,6 +86,21 @@ public:
     /// Default: uses get_eri_matrix_device() + computeFockMatrix_RHF with zero core Hamiltonian.
     virtual void compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const;
 
+    /// Compute the full analytical RI-RHF gradient (1-electron + S + N + RI 2-electron).
+    /// Default: throws — only ERI_RI (and its distributed subclass) implement this.
+    /// Caller passes the density / coefficient / orbital-energy buffers (device-resident).
+    /// Returns 3*num_atoms doubles in atom-major (x, y, z) order.
+    virtual std::vector<double> compute_ri_gradient(
+        const real_t* /*d_density_matrix*/,
+        const real_t* /*d_coefficient_matrix*/,
+        const real_t* /*d_orbital_energies*/,
+        const int     /*num_electron*/) {
+        throw std::runtime_error("compute_ri_gradient(): not implemented for this ERI method");
+    }
+
+    /// Whether this ERI method has an analytical RI gradient implementation.
+    virtual bool supports_ri_gradient() const { return false; }
+
     /**
      * @brief Check if the post-HF method is supported
      * @param method Post-HF method
@@ -409,6 +424,44 @@ public:
 
     /// Compute G(D) using RI B-matrix based J/K build (no AO ERI reconstruction needed).
     void compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const override;
+
+    /// Full analytical RI-RHF gradient. See §2.5 of RI_Gradient.md for the math.
+    /// Path:
+    ///   1) Rebuild (P|Q), Cholesky → L (recomputed since not persisted).
+    ///   2) B̄_P = L^{-T} B_P via DTRSM on the P axis.
+    ///   3) w_P = Σ_{μν} B_{P,μν} D_{μν}  (Coulomb fitting density).
+    ///   4) Γ^(3)_{P,μν} = w_P D_{μν} − ½(D B̄_P D)_{μν}.
+    ///   5) Γ^(2)_{PQ}   = −½ w_P w_Q + ¼ Tr[D B̄_P D B̄_Q].
+    ///   6) Contract Γ^(3) with 3c2e derivatives (compute_gradients_3c2e).
+    ///   7) Contract Γ^(2) with 2c2e derivatives (compute_gradients_2c2e).
+    ///   8) Add 1e, S (energy-weighted W), N (nuclear repulsion).
+    std::vector<double> compute_ri_gradient(
+        const real_t* d_density_matrix,
+        const real_t* d_coefficient_matrix,
+        const real_t* d_orbital_energies,
+        const int num_electron) override;
+
+    bool supports_ri_gradient() const override { return true; }
+
+    /// Worker that does the actual gradient computation. The public
+    /// compute_ri_gradient is a thin wrapper around this with the defaults
+    /// (full B from intermediate_matrix_B_, full P range, includes 1-electron).
+    /// Distributed overrides supply their own d_B_full pointer (replicated
+    /// per-device) and local P range, and use include_one_electron to elect
+    /// which GPU contributes the 1e/S/N/W gradient (typically only GPU 0).
+    ///
+    /// Postcondition: returns a length-(3 × num_atoms) gradient vector on host.
+    /// If include_one_electron is false, only the 2-electron RI contribution
+    /// (3c2e + 2c2e kernel work for the given P range) is returned.
+    std::vector<double> compute_ri_gradient_impl(
+        const real_t* d_density_matrix,
+        const real_t* d_coefficient_matrix,
+        const real_t* d_orbital_energies,
+        const int num_electron,
+        const real_t* d_B_full,
+        const size_t P_local_start,
+        const size_t P_local_end,
+        const bool include_one_electron);
 
     bool supports_post_hf_method(PostHFMethod method) const override {
         if( method == PostHFMethod::None

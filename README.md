@@ -382,7 +382,7 @@ https://opensource.org/licenses/BSD-3-Clause
 ## Citation
 The journal article reference describing GANSU is:
 
-* Yasuaki Ito, Satoki Tsuji, Koji Nakano, and Akihiko Kasagi, GANSU: A GPU-Native Quantum Chemistry Framework for Efficient Hartree–Fock and Post-HF Calculations. Eng, vol. 7, 205, 2026. ([DOI](https://doi.org/10.3390/eng7050205))
+* Yasuaki Ito, Satoki Tsuji, Koji Nakano, and Akihiko Kasagi, GANSU: A GPU-Native Quantum Chemistry Framework for Efficient Hartree–Fock and Post-HF Calculations. Eng, vol. 7, no. 5, 205, 2026. ([DOI](https://doi.org/10.3390/eng7050205))
 
 ## Publications
   1. Satoki Tsuji, Yasuaki Ito, Haruto Fujii, Nobuya Yokogawa, Kanta Suzuki, Koji Nakano, Victor Parque, Akihiko Kasagi, Dynamic Schwarz Screening for GPU-Accelerated Fock Matrix Computation, Concurrency and Computation: Practice and Experience, vol. 38, no. 9, e70583, 2026. ([DOI](https://doi.org/10.1002/cpe.70583))

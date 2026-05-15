@@ -1058,6 +1058,22 @@ public:
     ERI_RI_Distributed_RHF(RHF& rhf, const Molecular& auxiliary_molecular);
     ~ERI_RI_Distributed_RHF();
 
+    bool supports_ri_gradient() const override { return true; }
+
+    /// Distributed RI gradient. Replicates B to every GPU (using
+    /// replicate_B_to_all_gpus), then in an OpenMP parallel section each GPU
+    /// runs the single-GPU compute_ri_gradient_impl for its local aux-primitive
+    /// range, with the 1-electron contribution computed only on GPU 0. Per-GPU
+    /// host-side gradient vectors are summed at the end.
+    ///
+    /// Falls back to gather-on-GPU0 single-GPU path if B replication fails
+    /// (e.g., per-GPU memory too tight).
+    std::vector<double> compute_ri_gradient(
+        const real_t* d_density_matrix,
+        const real_t* d_coefficient_matrix,
+        const real_t* d_orbital_energies,
+        const int num_electron) override;
+
     /// Run parent's precomputation for Schwarz + shell pairs, then distributed B build
     void precomputation() override;
 
