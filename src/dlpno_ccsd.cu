@@ -29,6 +29,7 @@
 #include "dlpno_lambda.hpp"       // compute_dlpno_ccsd_lambda_closedform (Sub-phase 2)
 #include "dlpno_mp2.hpp"          // solve_dlpno_lmp2 + DLPNOLMP2Result
 #include "dlpno_pair_data.hpp"    // PairSetup, PairData
+#include "dlpno_phase24_extract.hpp"  // launch_phase24_extract (S7b)
 #include "dlpno_eri_gpu.hpp"      // EriBuildGpu (Phase 3.2.7 ERI GPU port)
 #include "dlpno_proj_gpu.hpp"     // TripleProjGpu (Phase 3.2.8 T2 proj GPU port)
 #include "oscillator_strength.hpp"  // compute_ao_dipole_integrals (Sub-phase 3B properties)
@@ -174,20 +175,24 @@ inline Phase24Integrals precompute_phase24_integrals(
 #endif
         if (num_gpus > 1) cudaSetDevice(tid);
 
-        // Step S7a — per-thread workspace reuse + pinned host staging.
-        //   d_C_ext_ws : packed (nao × n_emb) C_ext, capacity-grow
-        //   d_eri_ws   : full n_emb⁴ MO ERI output buffer, capacity-grow
-        //   h_eri_ws   : pinned host mirror of d_eri_ws, capacity-grow
-        //                (replaces the per-pair `std::vector<real_t>(n_emb⁴, 0)`
-        //                 which paid ~1.6 GB pageable alloc + zero-init +
-        //                 ~5 GB/s pageable D2H — pinned hits ~12-25 GB/s with
-        //                 no per-pair allocation overhead).
-        // All three are freed at the end of the parallel region.
-        real_t* d_C_ext_ws        = nullptr;
-        real_t* d_eri_ws          = nullptr;
-        real_t* h_eri_ws          = nullptr;  // pinned
-        size_t  ws_C_ext_capacity = 0;
-        size_t  ws_eri_capacity   = 0;
+        // Step S7a + S7b — per-thread workspace reuse + pinned host staging.
+        //   d_C_ext_ws    : packed (nao × n_emb) C_ext, capacity-grow
+        //   d_eri_ws      : full n_emb⁴ MO ERI output buffer, capacity-grow
+        //   d_packed_ws   : (S7b) packed device buffer holding the 14 W/T/V
+        //                   extracts back-to-back, capacity-grow. The full
+        //                   n_emb⁴ tensor never leaves the GPU after S7b.
+        //   h_packed_ws   : (S7b) pinned host mirror of d_packed_ws. Size is
+        //                   ~17× smaller than the previous h_eri_ws (which
+        //                   shadowed the full n_emb⁴ buffer) for cholesterol-
+        //                   class molecules, slashing per-pair D2H traffic.
+        // All four are freed at the end of the parallel region.
+        real_t* d_C_ext_ws         = nullptr;
+        real_t* d_eri_ws           = nullptr;
+        real_t* d_packed_ws        = nullptr;
+        real_t* h_packed_ws        = nullptr;  // pinned
+        size_t  ws_C_ext_capacity  = 0;
+        size_t  ws_eri_capacity    = 0;
+        size_t  ws_packed_capacity = 0;
 
     #pragma omp for schedule(static, 1)
     for (long long idx = 0; idx < static_cast<long long>(n_pairs); ++idx) {
@@ -220,16 +225,15 @@ inline Phase24Integrals precompute_phase24_integrals(
         cudaMemcpy(d_C_ext_ws, C_ext.data(),
             n_C_ext * sizeof(real_t), cudaMemcpyHostToDevice);
 
-        const size_t n_emb2 = static_cast<size_t>(n_emb) * n_emb;
-        const size_t n_emb3 = n_emb2 * n_emb;
-        const size_t n_emb4 = n_emb3 * n_emb;
+        const size_t n_emb4 =
+            static_cast<size_t>(n_emb) * n_emb * n_emb * n_emb;
 
-        // Step S7a — grow d_eri / h_eri workspaces.
+        // Step S7a — grow d_eri workspace (still n_emb⁴ since build_mo_eri_into
+        // writes the full tensor; only the host-side mirror was eliminated by
+        // S7b in favour of a much smaller packed extract buffer).
         if (n_emb4 > ws_eri_capacity) {
             if (d_eri_ws) tracked_cudaFree(d_eri_ws);
             tracked_cudaMalloc(&d_eri_ws, n_emb4 * sizeof(real_t));
-            if (h_eri_ws) cudaFreeHost(h_eri_ws);
-            cudaMallocHost(&h_eri_ws, n_emb4 * sizeof(real_t));
             ws_eri_capacity = n_emb4;
         }
 
@@ -237,251 +241,74 @@ inline Phase24Integrals precompute_phase24_integrals(
         // (avoids the legacy build_mo_eri's per-call cudaMalloc).
         eri.build_mo_eri_into(d_C_ext_ws, n_emb, d_eri_ws);
 
-        // Pinned D2H — ~2-4× faster than the previous pageable
-        // std::vector<real_t> destination.
-        cudaMemcpy(h_eri_ws, d_eri_ws,
-            n_emb4 * sizeof(real_t), cudaMemcpyDeviceToHost);
+        // Step S7b — GPU-side extraction of the 14 W/T/V blocks into one
+        // packed device buffer, then a single (much smaller) D2H to pinned
+        // host. For cholesterol cc-pVDZ this replaces a ~2.9 GB pinned D2H
+        // and 13 strided host extract loops with ~170 MB D2H + 14 sequential
+        // host memcpys — ~17× smaller transfer and dramatically more
+        // cache-friendly unpacking.
+        const bool is_diag = (s.i == s.j);
+        const Phase24ExtractLayout layout =
+            compute_phase24_extract_layout(n_lmo, n_pno, is_diag);
 
-        // Alias so the (unchanged) host extracts below read from the
-        // pinned buffer instead of an owned std::vector.
-        const real_t* h_eri_mo = h_eri_ws;
-
-        // Extract T_pair^{(ij)}[k, c, l, d]
-        //   = 2 ERI[k, n_lmo+c, l, n_lmo+d] - ERI[k, n_lmo+d, l, n_lmo+c].
-        // Layout: ((k * nocc + l) * n_pno + c) * n_pno + d.
-        out.T_pair[idx].assign(
-            static_cast<size_t>(n_lmo) * n_lmo * n_pno * n_pno, 0.0);
-        for (int k = 0; k < n_lmo; ++k)
-            for (int l = 0; l < n_lmo; ++l)
-                for (int c = 0; c < n_pno; ++c)
-                    for (int d = 0; d < n_pno; ++d) {
-                        const size_t idx_kcld =
-                            static_cast<size_t>(k) * n_emb3 +
-                            static_cast<size_t>(n_lmo + c) * n_emb2 +
-                            static_cast<size_t>(l) * n_emb +
-                            static_cast<size_t>(n_lmo + d);
-                        const size_t idx_kdlc =
-                            static_cast<size_t>(k) * n_emb3 +
-                            static_cast<size_t>(n_lmo + d) * n_emb2 +
-                            static_cast<size_t>(l) * n_emb +
-                            static_cast<size_t>(n_lmo + c);
-                        const size_t out_idx =
-                            ((static_cast<size_t>(k) * n_lmo + l) * n_pno + c) * n_pno + d;
-                        out.T_pair[idx][out_idx] =
-                            2.0 * h_eri_mo[idx_kcld] - h_eri_mo[idx_kdlc];
-                    }
-
-        // Extract W_pair^{(ij)}[a, b, c, d] = canonical W_abcd at T1=0
-        //   = v(A, B, C, D) = (ac|bd) chemist (= <ab|cd> physicist).
-        // Mulliken layout: eri_mo[A, C, B, D] = (AC|BD).
-        out.W_pair[idx].assign(
-            static_cast<size_t>(n_pno) * n_pno * n_pno * n_pno, 0.0);
-        for (int a = 0; a < n_pno; ++a)
-            for (int b = 0; b < n_pno; ++b)
-                for (int c = 0; c < n_pno; ++c)
-                    for (int d = 0; d < n_pno; ++d) {
-                        const size_t idx_acbd =
-                            static_cast<size_t>(n_lmo + a) * n_emb3 +
-                            static_cast<size_t>(n_lmo + c) * n_emb2 +
-                            static_cast<size_t>(n_lmo + b) * n_emb +
-                            static_cast<size_t>(n_lmo + d);
-                        const size_t out_idx =
-                            ((static_cast<size_t>(a) * n_pno + b) * n_pno + c) * n_pno + d;
-                        out.W_pair[idx][out_idx] = h_eri_mo[idx_acbd];
-                    }
-
-        // Extract W_oooo^{(ij)}[k, l] = canonical W_klij at T1=0
-        //   = v(k, l, i, j) = (ki|lj) chemist (= <kl|ij> physicist).
-        // Mulliken layout: eri_mo[k, i, l, j] = (ki|lj).
-        out.W_oooo[idx].assign(static_cast<size_t>(n_lmo) * n_lmo, 0.0);
-        for (int k = 0; k < n_lmo; ++k)
-            for (int l = 0; l < n_lmo; ++l) {
-                const size_t idx_kilj =
-                    static_cast<size_t>(k) * n_emb3 +
-                    static_cast<size_t>(s.i) * n_emb2 +
-                    static_cast<size_t>(l) * n_emb +
-                    static_cast<size_t>(s.j);
-                out.W_oooo[idx][k * n_lmo + l] = h_eri_mo[idx_kilj];
-            }
-
-        // Extract ovov / ovvo blocks: (a k | I c) and (a k | c I) for I=i,j.
-        // Layout: (a * nocc + k) * n_pno + c.
-        const size_t n_pno2 = static_cast<size_t>(n_pno) * n_lmo * n_pno;
-        out.W_ovov_i[idx].assign(n_pno2, 0.0);
-        out.W_ovov_j[idx].assign(n_pno2, 0.0);
-        out.W_ovvo_i[idx].assign(n_pno2, 0.0);
-        out.W_ovvo_j[idx].assign(n_pno2, 0.0);
-        for (int a = 0; a < n_pno; ++a)
-            for (int k = 0; k < n_lmo; ++k)
-                for (int c = 0; c < n_pno; ++c) {
-                    const size_t out_idx =
-                        (static_cast<size_t>(a) * n_lmo + k) * n_pno + c;
-                    // Canonical W_akic at T1=0 uses v(A,k,I,C) = (AI|kC) =
-                    // (a I | k c) chemist. Storage layout reuses index order
-                    // (a, k, c) but the integral itself is (a I | k c).
-                    //   chemist (pq|rs) = eri_mo[p,q,r,s], so:
-                    //   (a I | k c) = eri_mo[n_lmo+a, I, k, n_lmo+c]
-                    {
-                        const size_t e =
-                            static_cast<size_t>(n_lmo + a) * n_emb3 +
-                            static_cast<size_t>(s.i) * n_emb2 +
-                            static_cast<size_t>(k) * n_emb +
-                            static_cast<size_t>(n_lmo + c);
-                        out.W_ovov_i[idx][out_idx] = h_eri_mo[e];
-                    }
-                    {
-                        const size_t e =
-                            static_cast<size_t>(n_lmo + a) * n_emb3 +
-                            static_cast<size_t>(s.j) * n_emb2 +
-                            static_cast<size_t>(k) * n_emb +
-                            static_cast<size_t>(n_lmo + c);
-                        out.W_ovov_j[idx][out_idx] = h_eri_mo[e];
-                    }
-                    // Canonical W_akci at T1=0 uses v(A,k,C,I) = (AC|kI) =
-                    // (a c | k I) chemist. (VV|OO arrangement.)
-                    //   = eri_mo[n_lmo+a, n_lmo+c, k, I]
-                    {
-                        const size_t e =
-                            static_cast<size_t>(n_lmo + a) * n_emb3 +
-                            static_cast<size_t>(n_lmo + c) * n_emb2 +
-                            static_cast<size_t>(k) * n_emb +
-                            static_cast<size_t>(s.i);
-                        out.W_ovvo_i[idx][out_idx] = h_eri_mo[e];
-                    }
-                    {
-                        const size_t e =
-                            static_cast<size_t>(n_lmo + a) * n_emb3 +
-                            static_cast<size_t>(n_lmo + c) * n_emb2 +
-                            static_cast<size_t>(k) * n_emb +
-                            static_cast<size_t>(s.j);
-                        out.W_ovvo_j[idx][out_idx] = h_eri_mo[e];
-                    }
-                }
-
-        // Extract V_ovov_pair^{(ij)}[l, k, d, c] = (ld|kc) — OV|OV slice.
-        out.V_ovov_pair[idx].assign(
-            static_cast<size_t>(n_lmo) * n_lmo * n_pno * n_pno, 0.0);
-        for (int l = 0; l < n_lmo; ++l)
-            for (int k = 0; k < n_lmo; ++k)
-                for (int d = 0; d < n_pno; ++d)
-                    for (int c = 0; c < n_pno; ++c) {
-                        const size_t e =
-                            static_cast<size_t>(l) * n_emb3 +
-                            static_cast<size_t>(n_lmo + d) * n_emb2 +
-                            static_cast<size_t>(k) * n_emb +
-                            static_cast<size_t>(n_lmo + c);
-                        const size_t out_idx =
-                            ((static_cast<size_t>(l) * n_lmo + k) * n_pno + d) * n_pno + c;
-                        out.V_ovov_pair[idx][out_idx] = h_eri_mo[e];
-                    }
-
-        // Sub-step 2X.3.1: Extract W_ovvv_diag[i] = (i, a, b, c) for
-        // diagonal pair (i,i) only. Used by the Λ_1 leading source term
-        // 2·Σ_bc W_ovvv_diag[i](a,c,b)·mvv1[b,c] - permutation. The mvv1
-        // intermediate in pair (i,i)'s PNO basis is recovered from
-        // DF_per_pair[idx_ii] computed by the T iteration. Layout:
-        //   W_ovvv_diag[i][((a · n_pno + b) · n_pno + c)] = (i, a, b, c)
-        // i.e. chemist notation eri_mo[i, n_lmo+a, n_lmo+b, n_lmo+c].
-        if (s.i == s.j) {
-            const int i_lmo = s.i;
-            out.W_ovvv_diag[i_lmo].assign(
-                static_cast<size_t>(n_pno) * n_pno * n_pno, 0.0);
-            for (int a = 0; a < n_pno; ++a) {
-                for (int b = 0; b < n_pno; ++b) {
-                    for (int c = 0; c < n_pno; ++c) {
-                        const size_t e =
-                            static_cast<size_t>(i_lmo) * n_emb3 +
-                            static_cast<size_t>(n_lmo + a) * n_emb2 +
-                            static_cast<size_t>(n_lmo + b) * n_emb +
-                            static_cast<size_t>(n_lmo + c);
-                        const size_t out_idx =
-                            (static_cast<size_t>(a) * n_pno + b) * n_pno + c;
-                        out.W_ovvv_diag[i_lmo][out_idx] = h_eri_mo[e];
-                    }
-                }
-            }
+        if (layout.total > ws_packed_capacity) {
+            if (d_packed_ws) tracked_cudaFree(d_packed_ws);
+            tracked_cudaMalloc(&d_packed_ws, layout.total * sizeof(real_t));
+            if (h_packed_ws) cudaFreeHost(h_packed_ws);
+            cudaMallocHost(&h_packed_ws, layout.total * sizeof(real_t));
+            ws_packed_capacity = layout.total;
         }
 
-        // Sub-step 2X.3.6b: Extract OVVO / OOVV for pair (i,j) in pair PNO
-        // basis. Used by the L1·OVVO and L1·OOVV terms of Λ_1:
-        //   W_ovvo_lambda[idx][a, b]     = eri_mo[s.i, n_lmo+a, n_lmo+b, s.j]
-        //                                  ≡ (s.i a | b s.j)  — "i-role"
-        //   W_ovvo_lambda_alt[idx][a, b] = eri_mo[s.j, n_lmo+a, n_lmo+b, s.i]
-        //                                  ≡ (s.j a | b s.i)  — "j-role"
-        //   W_oovv_lambda[idx][b, a]     = eri_mo[s.i, s.j, n_lmo+b, n_lmo+a]
-        //                                  ≡ (s.i s.j | b a)  (symmetric in (i,j))
-        // a, b in pair (i,j) PNO basis (n_pno values each).
-        out.W_ovvo_lambda[idx].assign(
-            static_cast<size_t>(n_pno) * n_pno, 0.0);
-        out.W_ovvo_lambda_alt[idx].assign(
-            static_cast<size_t>(n_pno) * n_pno, 0.0);
-        out.W_oovv_lambda[idx].assign(
-            static_cast<size_t>(n_pno) * n_pno, 0.0);
-        for (int a = 0; a < n_pno; ++a) {
-            for (int b = 0; b < n_pno; ++b) {
-                // (s.i a | b s.j)
-                const size_t e_ovvo_i =
-                    static_cast<size_t>(s.i) * n_emb3 +
-                    static_cast<size_t>(n_lmo + a) * n_emb2 +
-                    static_cast<size_t>(n_lmo + b) * n_emb +
-                    static_cast<size_t>(s.j);
-                // (s.j a | b s.i)
-                const size_t e_ovvo_j =
-                    static_cast<size_t>(s.j) * n_emb3 +
-                    static_cast<size_t>(n_lmo + a) * n_emb2 +
-                    static_cast<size_t>(n_lmo + b) * n_emb +
-                    static_cast<size_t>(s.i);
-                // (s.i s.j | b a)
-                const size_t e_oovv =
-                    static_cast<size_t>(s.i) * n_emb3 +
-                    static_cast<size_t>(s.j) * n_emb2 +
-                    static_cast<size_t>(n_lmo + b) * n_emb +
-                    static_cast<size_t>(n_lmo + a);
-                const size_t out_ab = static_cast<size_t>(a) * n_pno + b;
-                const size_t out_ba = static_cast<size_t>(b) * n_pno + a;
-                out.W_ovvo_lambda[idx][out_ab]     = h_eri_mo[e_ovvo_i];
-                out.W_ovvo_lambda_alt[idx][out_ab] = h_eri_mo[e_ovvo_j];
-                out.W_oovv_lambda[idx][out_ba]     = h_eri_mo[e_oovv];
-            }
-        }
+        launch_phase24_extract(
+            d_eri_ws, d_packed_ws, layout,
+            n_emb, n_lmo, n_pno, s.i, s.j, is_diag,
+            /*stream=*/0);
 
-        // Sub-step 2X.3.7a: Extract OVOO per pair (i,j) in two orientations
-        // (i-role and j-role). Used by term 3 (OVOO·moo1) and term 8 (L2·OVOO).
-        //   W_ovoo_lambda[idx][a, k]     = eri_mo[s.i, n_lmo+a, s.j, k]
-        //                                  ≡ (s.i a | s.j k)  — "i-role"
-        //   W_ovoo_lambda_alt[idx][a, k] = eri_mo[s.j, n_lmo+a, s.i, k]
-        //                                  ≡ (s.j a | s.i k)  — "j-role"
-        // Layout: a·nocc + k (row-major). a in pair (i,j) PNO, k LMO.
-        out.W_ovoo_lambda[idx].assign(
-            static_cast<size_t>(n_pno) * n_lmo, 0.0);
-        out.W_ovoo_lambda_alt[idx].assign(
-            static_cast<size_t>(n_pno) * n_lmo, 0.0);
-        for (int a = 0; a < n_pno; ++a) {
-            for (int k = 0; k < n_lmo; ++k) {
-                const size_t e_ovoo_i =
-                    static_cast<size_t>(s.i) * n_emb3 +
-                    static_cast<size_t>(n_lmo + a) * n_emb2 +
-                    static_cast<size_t>(s.j) * n_emb +
-                    static_cast<size_t>(k);
-                const size_t e_ovoo_j =
-                    static_cast<size_t>(s.j) * n_emb3 +
-                    static_cast<size_t>(n_lmo + a) * n_emb2 +
-                    static_cast<size_t>(s.i) * n_emb +
-                    static_cast<size_t>(k);
-                const size_t out_ak = static_cast<size_t>(a) * n_lmo + k;
-                out.W_ovoo_lambda[idx][out_ak]     = h_eri_mo[e_ovoo_i];
-                out.W_ovoo_lambda_alt[idx][out_ak] = h_eri_mo[e_ovoo_j];
+        // Synchronous D2H — implicit wait for the kernels above (default
+        // stream). After this, h_packed_ws holds all 14 blocks back-to-back
+        // at the offsets recorded in `layout`.
+        cudaMemcpy(h_packed_ws, d_packed_ws,
+            layout.total * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+        // Unpack pinned packed buffer → per-block std::vector<real_t>
+        // destinations. memcpy is sequential and cache-friendly compared
+        // with the previous strided host gather over the full n_emb⁴ tensor.
+        auto copy_block = [&](std::vector<real_t>& dst,
+                              size_t off, size_t sz) {
+            dst.assign(sz, 0.0);
+            if (sz > 0) {
+                std::memcpy(dst.data(), h_packed_ws + off,
+                            sz * sizeof(real_t));
             }
+        };
+
+        copy_block(out.T_pair[idx],       layout.off_T_pair,   layout.sz_T_pair);
+        copy_block(out.W_pair[idx],       layout.off_W_pair,   layout.sz_W_pair);
+        copy_block(out.W_oooo[idx],       layout.off_W_oooo,   layout.sz_W_oooo);
+        copy_block(out.W_ovov_i[idx],     layout.off_W_ovov_i, layout.sz_W_ovov);
+        copy_block(out.W_ovov_j[idx],     layout.off_W_ovov_j, layout.sz_W_ovov);
+        copy_block(out.W_ovvo_i[idx],     layout.off_W_ovvo_i, layout.sz_W_ovov);
+        copy_block(out.W_ovvo_j[idx],     layout.off_W_ovvo_j, layout.sz_W_ovov);
+        copy_block(out.V_ovov_pair[idx],  layout.off_V_ovov,   layout.sz_V_ovov);
+        if (is_diag) {
+            copy_block(out.W_ovvv_diag[s.i],
+                       layout.off_W_ovvv_diag, layout.sz_W_ovvv_diag);
         }
+        copy_block(out.W_ovvo_lambda[idx],     layout.off_W_ovvo_lambda,     layout.sz_pno2);
+        copy_block(out.W_ovvo_lambda_alt[idx], layout.off_W_ovvo_lambda_alt, layout.sz_pno2);
+        copy_block(out.W_oovv_lambda[idx],     layout.off_W_oovv_lambda,     layout.sz_pno2);
+        copy_block(out.W_ovoo_lambda[idx],     layout.off_W_ovoo_lambda,     layout.sz_ovoo);
+        copy_block(out.W_ovoo_lambda_alt[idx], layout.off_W_ovoo_lambda_alt, layout.sz_ovoo);
 
         (void)s;  // s used above; suppress -Wunused if conditional.
     }
 
-    // Step S7a — release per-thread workspaces (one alloc per buffer
+    // Step S7a + S7b — release per-thread workspaces (one alloc per buffer
     // per thread, reused across the thread's pair slice).
-    if (d_C_ext_ws) tracked_cudaFree(d_C_ext_ws);
-    if (d_eri_ws)   tracked_cudaFree(d_eri_ws);
-    if (h_eri_ws)   cudaFreeHost(h_eri_ws);
+    if (d_C_ext_ws)  tracked_cudaFree(d_C_ext_ws);
+    if (d_eri_ws)    tracked_cudaFree(d_eri_ws);
+    if (d_packed_ws) tracked_cudaFree(d_packed_ws);
+    if (h_packed_ws) cudaFreeHost(h_packed_ws);
     }  // end omp parallel
     return out;
 }

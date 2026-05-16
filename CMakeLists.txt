@@ -249,6 +249,7 @@ set(SOURCES
     src/dlpno_t_gpu.cu
     src/dlpno_eri_gpu.cu
     src/dlpno_proj_gpu.cu
+    src/dlpno_phase24_extract.cu
     src/dlpno_mp2.cu
     src/dlpno_ccsd.cu
     src/dlpno_mp2_lambda.cu
