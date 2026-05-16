@@ -83,28 +83,45 @@ void build_dlpno_mp2_1rdm_mo(
     real_t*                       D_mo_out);
 
 /**
- * @brief Build DLPNO-CCSD 1-RDM in canonical MO basis — APPROXIMATION
- *        (Sub-phase 2 strategy (a)).
+ * @brief Build DLPNO-CCSD 1-RDM in canonical MO basis.
  *
  * Wraps build_dlpno_mp2_1rdm_mo() to populate the oo + vv blocks (using
- * CCSD T2 + closed-form Y_lambda = 2T - T^T), then adds the explicit T1
- * contribution to the ov/vo blocks:
+ * CCSD T2 + closed-form Y_lambda = 2T - T^T), then adds explicit T1 and
+ * Λ_1 contributions to the ov/vo blocks.
  *
- *   D[ov][i, a] = D[vo][a, i] = (back-transform of T1[i] from pair-(i,i)
- *                               PAO basis to canonical virtual basis)
+ * Canonical CCSD 1-RDM (PySCF closed-shell ccsd_rdm._gamma1_intermediates
+ * spin-traced, see GANSU [src/ccsd_lambda.cu](src/ccsd_lambda.cu)
+ * build_ccsd_1rdm_mo_cpu lines 1389-1518):
  *
- * The closed-form approximation for Y_lambda implies Λ_1 = 0; the explicit
- * T1 here is the leading "Hartree-Fock-like" contribution to the ov/vo
- * blocks of the canonical CCSD 1-RDM (ccsd_rdm._gamma1_intermediates dvo
- * line: dvo = t1.T + …small T1·T2 corrections that are dropped here).
+ *   dov[i, a] = L1[i, a]
+ *   dvo[a, i] = T1[i, a]
+ *             + Σ_me θ[i,m,a,e] · L1[m, e]
+ *             - Σ_m xt1[m,i] · T1[m, a]
+ *             - Σ_e T1[i, e] · xt2[e, a]
+ *   D[ov][i, a] = dov[i,a] + dvo[a,i]   (symmetrised)
  *
- * Trace conservation: holds (the ov/vo additions are pure off-diagonal,
- * traceless contributions to the symmetric MO density).
+ *   θ = 2 T2 - T2^T
+ *   xt1[m,i] = Σ_nef L2[m,n,e,f] · θ[i,n,e,f]
+ *   xt2[e,a] = Σ_mnf L2[m,n,a,f] · θ[m,n,e,f]
  *
- * @param T1   Per-LMO T1 amplitudes; T1[i] is in pair (i,i)'s semi-canonical
- *             PAO basis (length setups[pair_lookup[i*nocc+i]].n_pao).
- *             Pass an empty vector or vectors of size 0 to skip the T1
- *             contribution and recover the MP2 result.
+ * Sub-phase 2 strategies:
+ *   - Λ_1 = 0 (closed-form, default): D[ov][i,a] = T1[i,a]. This is the
+ *     Sub-step 2X.1/2X.2c baseline path — ~6.3 % off canonical dipole.
+ *   - Λ_1 ≠ 0 (Sub-step 2X.3.2+): D[ov][i,a] = T1[i,a] + Λ_1[i,a]. At T1=0
+ *     this is just Λ_1; θ·L1 cross terms are deferred to Sub-step 2X.3.5
+ *     (kicks in only when T1 itself is non-zero, i.e. after Phase 2.6c).
+ *
+ * Trace conservation: the ov/vo additions are pure off-diagonal, so the
+ * MO trace is unchanged (still N_elec from the HF + oo + vv blocks).
+ *
+ * @param T1       Per-LMO T1 amplitudes in pair (i,i)'s semi-canonical PAO
+ *                 basis (length setups[pair_lookup[i*nocc+i]].n_pao). Pass
+ *                 empty / size 0 vectors to skip the T1 contribution.
+ * @param Lambda1  Same shape as T1; per-LMO Λ_1 amplitudes in pair (i,i)'s
+ *                 PAO basis. Default empty → Λ_1 = 0 (closed-form Sub-step
+ *                 2X.1 path preserved). When supplied with non-empty entries
+ *                 the leading L1 contribution is added to D[ov]/D[vo] (Sub-
+ *                 step 2X.3.4 — closes most of the closed-form dipole gap).
  */
 void build_dlpno_ccsd_1rdm_mo_closedform(
     const std::vector<PairSetup>&         setups,
@@ -116,6 +133,7 @@ void build_dlpno_ccsd_1rdm_mo_closedform(
     const real_t*                         S_AO,
     const real_t*                         C_can_vir,
     int                                   nao,
-    real_t*                               D_mo_out);
+    real_t*                               D_mo_out,
+    const std::vector<std::vector<real_t>>& Lambda1 = {});
 
 } // namespace gansu

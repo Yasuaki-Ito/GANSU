@@ -40,6 +40,9 @@
 #include <iostream>
 #include <vector>
 #include <Eigen/Dense>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace gansu {
 
@@ -132,13 +135,35 @@ DLPNOLambdaStatus iterate_dlpno_ccsd_lambda(
     const real_t*                            h_S,
     int nocc, int nao,
     int max_iter, real_t conv_tol,
-    bool enable_dressing,                                    // 2X.2a +
+    bool enable_dressing,
     int verbose, const char* round_tag,
-    const struct Phase24Integrals*           /*phase24*/,    // 2X.2c (cross-pair)
-    int /*num_gpus*/)                                         // 2X later
+    const struct Phase24Integrals*           phase24,        // 2X.2c
+    int /*num_gpus*/)                                         // 2X.5 later
 {
-    // Λ_1 = 0 in this sub-step (Sub-step 2X.3 will iterate it).
+    // -----------------------------------------------------------------
+    // Sub-step 2X.3.0: Λ_1 storage allocation (proper sizes per LMO).
+    //
+    // Lambda1[i] sits in pair (i,i)'s semi-canonical PAO basis, length
+    // setups[pair_lookup[i*nocc+i]].n_pao  — same shape and basis as T1
+    // amplitudes stored in DLPNO-CCSD (see iterate_dlpno_ccsd_t2 Phase
+    // 2.6c TODO). For Sub-step 2X.3.0 (this commit) we just allocate
+    // zero-filled storage. Sub-step 2X.3.1 adds the T2-driven OVVV·mvv1
+    // source via new W_ovvv fields on Phase24Integrals; Sub-step 2X.3.2
+    // wires the Jacobi update for Λ_1 alongside Λ_2.
+    //
+    // The closed-shell semi-canonical PAO basis satisfies the Brillouin
+    // condition f_{i,a_ii} = 0 within each pair (the PAO is the
+    // eigenbasis of F restricted to the pair domain). Cross-pair F
+    // elements f_{i, a_jj} for i ≠ j are non-zero but the leading Λ_1
+    // source comes from T2-OVVV contractions, NOT from f_{ia}.
     Lambda1.assign(nocc, {});
+    for (int i = 0; i < nocc; ++i) {
+        const int idx_ii = pair_lookup[i * nocc + i];
+        if (idx_ii < 0 || idx_ii >= static_cast<int>(setups.size())) continue;
+        const int n_pao_ii = setups[idx_ii].n_pao;
+        if (n_pao_ii <= 0) continue;
+        Lambda1[i].assign(static_cast<size_t>(n_pao_ii), 0.0);
+    }
 
     // Initial guess: Λ_2 = 2 Y - Y^T (closed-form). For converged Y in
     // strict mode + LMP2 limit this is also the exact solution, so the
@@ -148,27 +173,133 @@ DLPNOLambdaStatus iterate_dlpno_ccsd_lambda(
     compute_dlpno_mp2_lambda(pairs);
 
     constexpr real_t kFLMOThresh = 1e-14;
+    const bool use_phase24 =
+        enable_dressing && phase24 != nullptr && phase24->nocc == nocc;
 
-    // ----------------------------------------------------------------
-    // Sub-step 2X.2a: intra-pair diagonal hole dressing (ΔF_ii) only.
+    // ================================================================
+    // Sub-step 2X.2c: F-eff dressing intermediates computed from T2.
     //
-    // For canonical CCSD Λ the diagonal F_eff dressing reads
-    //   ΔF_{ii} = Σ_l Σ_{cd} T_il^{cd} · (2 L_il^{cd} - L_il^{dc})
-    // which is the (k=i) diagonal of the Phase 2.4.x dF_ki matrix. Here we
-    // only implement the Phase 2.3.3 fallback (l=i restriction), reading
-    // from each pair's local L (= K integrals in W basis):
-    //   ΔF_{ii} ≈ Σ_{cd} (2 L_ii^{cd} - L_ii^{dc}) · Y_ii^{cd}
-    // The Λ_2 residual then receives  R -= (ΔF_ii + ΔF_jj) · Λ_old.
+    // dF_ki[k, i]  = ΔF_{ki} = Σ_l Σ_{cd} T_pair^{(il)}[k,c,l,d] · Y_il^{cd}
+    //                (full l sum; mirrors iterate_dlpno_ccsd_t2 line 933-990)
+    // DF_per_pair[idx]  = ΔF^{(ij)}_{ac}, signed per-pair particle dressing
+    //                = -Σ_{kl,d} T_pair^{(ij)}[k,c,l,d] · Y_kl^{ad}_proj
+    //                (mirrors iterate_dlpno_ccsd_t2 line 1033-1052 once
+    //                 collapsed; here we use the explicit (k,l,c,d) sum
+    //                 since the pi_T_stack cache is not built up.)
     //
-    // Computed ONCE before the iteration (T2 is fixed at this point);
-    // gated by enable_dressing so the LMP2-limit (2X.1) path is preserved
-    // when dressing=false.
+    // Both depend only on T2 (= pairs[idx].Y, fixed during Λ iter), so
+    // computed ONCE before the iter loop.
     //
-    // Sub-step 2X.2c will swap this fallback for the full Phase24Integrals-
-    // based Σ_l T_pair^{(il)} · Y_il sum (matches T-iteration dressing).
-    // ----------------------------------------------------------------
-    std::vector<real_t> dF_diag(nocc, 0.0);   // ΔF_ii (per LMO)
-    if (enable_dressing) {
+    // When `use_phase24` is false (no Phase24Integrals provided OR dressing
+    // disabled) we fall back to Sub-step 2X.2a: only ΔF_ii on the diagonal
+    // from local L^{(ii)}; full cross-pair dressing is off.
+    // ================================================================
+    std::vector<real_t> dF_ki(static_cast<size_t>(nocc) * nocc, 0.0);
+    std::vector<RowMatXd> DF_per_pair(pairs.size());
+
+    if (use_phase24) {
+        // Full hole dressing: full l sum.
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int k = 0; k < nocc; ++k) {
+            for (int i = 0; i < nocc; ++i) {
+                real_t s = 0.0;
+                for (int l = 0; l < nocc; ++l) {
+                    const int idx_il = pair_lookup[i * nocc + l];
+                    const PairSetup& sil = setups[idx_il];
+                    const PairData&  pil = pairs[idx_il];
+                    const int n_il = pil.n_pno;
+                    if (n_il == 0) continue;
+
+                    Eigen::Map<const RowMatXd> Y_stored(
+                        pil.Y.data(), n_il, n_il);
+                    const bool transp = (sil.i != i);
+
+                    const real_t* T_il =
+                        phase24->T_pair[idx_il].data();
+                    const size_t stride_kl =
+                        static_cast<size_t>(n_il) * n_il;
+                    Eigen::Map<const RowMatXd> T_kl(
+                        T_il + static_cast<size_t>(k * nocc + l) * stride_kl,
+                        n_il, n_il);
+                    if (transp) {
+                        s += (T_kl.array() *
+                              Y_stored.transpose().array()).sum();
+                    } else {
+                        s += (T_kl.array() * Y_stored.array()).sum();
+                    }
+                }
+                dF_ki[static_cast<size_t>(k) * nocc + i] = s;
+            }
+        }
+
+        // Full particle dressing per pair (i,j):
+        //   DF[idx][a, c] = -Σ_{(k,l), d} π_{kl}^{ij,oriented}[a, d] · T_kl[c, d]
+        //                 ≈ -Σ_{(k,l), d} (barS · Y_kl · barS^T)[a, d] · T_kl[c, d]
+        // We use the simple per-(k,l) loop here (CPU reference). The
+        // production GPU path will hook into pi_T_stack / T_meta_dpair
+        // caches once Sub-step 2X.5 lands.
+        std::vector<real_t> bQ_ij_T_S_scratch_dummy;
+        (void)bQ_ij_T_S_scratch_dummy;
+
+        #pragma omp parallel for schedule(static)
+        for (long long idx_ll = 0;
+             idx_ll < static_cast<long long>(pairs.size()); ++idx_ll) {
+            const size_t idx = static_cast<size_t>(idx_ll);
+            const PairData&  pij = pairs[idx];
+            const int n_ij = pij.n_pno;
+            if (n_ij == 0) { DF_per_pair[idx].resize(0, 0); continue; }
+            DF_per_pair[idx].setZero(n_ij, n_ij);
+
+            RowMatXd barS_kl;       // [n_ij × n_kl]
+            RowMatXd pi_kl;         // [n_ij × n_kl]
+            for (int k = 0; k < nocc; ++k) {
+                for (int l = 0; l < nocc; ++l) {
+                    const int idx_kl = pair_lookup[k * nocc + l];
+                    const PairSetup& skl = setups[idx_kl];
+                    const PairData&  pkl = pairs[idx_kl];
+                    const int n_kl = pkl.n_pno;
+                    if (n_kl == 0) continue;
+
+                    // barS^(ij,kl) projection
+                    compute_barS_lambda(
+                        pij.bar_Q.data(), n_ij,
+                        pkl.bar_Q.data(), n_kl,
+                        h_S, nao, barS_kl);
+
+                    Eigen::Map<const RowMatXd> Y_kl(
+                        pkl.Y.data(), n_kl, n_kl);
+
+                    // π_{kl}^{ij}[a, d] = barS · Y_kl^{oriented} · barS^T
+                    //   oriented so (k, l) plays the "first" role
+                    //   (transpose Y when stored pair is (l, k))
+                    if (skl.i != k) {
+                        pi_kl.noalias() =
+                            barS_kl * Y_kl.transpose() * barS_kl.transpose();
+                    } else {
+                        pi_kl.noalias() =
+                            barS_kl * Y_kl * barS_kl.transpose();
+                    }
+                    // pi_kl is here [n_ij × n_ij] after projection.
+
+                    // T_pair^{(ij)}[k, c, l, d] is in phase24->T_pair[idx]
+                    // indexed at ((k*nocc + l) * n_ij + c) * n_ij + d.
+                    const real_t* T_ij =
+                        phase24->T_pair[idx].data();
+                    const size_t stride_kl_ij =
+                        static_cast<size_t>(n_ij) * n_ij;
+                    Eigen::Map<const RowMatXd> T_kl_ij(
+                        T_ij + static_cast<size_t>(k * nocc + l) * stride_kl_ij,
+                        n_ij, n_ij);
+                    // DF[a, c] -= Σ_d π[a, d] · T_kl[c, d]
+                    //          = -(π · T_kl^T)[a, c]
+                    DF_per_pair[idx].noalias() -=
+                        pi_kl * T_kl_ij.transpose();
+                }
+            }
+        }
+    } else if (enable_dressing) {
+        // Sub-step 2X.2a fallback: only diagonal ΔF_ii from local L^{(ii)}.
+        // Off-diagonal dF_ki and per-pair DF stay at zero.
         for (int i = 0; i < nocc; ++i) {
             const int idx_ii = pair_lookup[i * nocc + i];
             const PairData&  p = pairs[idx_ii];
@@ -180,7 +311,95 @@ DLPNOLambdaStatus iterate_dlpno_ccsd_lambda(
             for (int c = 0; c < n_ii; ++c)
                 for (int d = 0; d < n_ii; ++d)
                     s += (2.0 * L(c, d) - L(d, c)) * Y(c, d);
-            dF_diag[i] = s;
+            dF_ki[static_cast<size_t>(i) * nocc + i] = s;
+        }
+    }
+
+    // ================================================================
+    // Sub-step 2X.3.2 + 2X.3.6a: Λ_1 residual = T2-driven source (const)
+    //                          + L1-driven self-dressing (terms 4 + 5).
+    //
+    // At T1 = 0 the surviving canonical Λ_1 source terms (verified
+    // against ccsd_lambda.cu update_lambda_full, lines 813-1041) split
+    // into:
+    //
+    //   R0[i, α]  (constant in Λ iter — depends only on T2):
+    //     term 1 :  + 2·Σ_bc OVVV(i, a, c, b)·mvv1(b, c)
+    //               -   Σ_bc OVVV(i, b, c, a)·mvv1(b, c)
+    //               (Sub-step 2X.3.2; OVVV from W_ovvv_diag[i],
+    //                mvv1 = DF_per_pair[idx_ii] in pair (i,i) PNO)
+    //
+    //   R_self[i, α]  (re-evaluated each iter — Λ_1-driven):
+    //     term 4 :  - Σ_β L1_old[i, β] · Mvv1_pao[i][β, α]
+    //               (vv self-dressing, off-diag of canonical L1·v1;
+    //                Mvv1_pao = M^{(ii)} · DF_per_pair[idx_ii] · M^{(ii)T}
+    //                placed in pair (i,i) PAO basis to match L1 storage)
+    //     term 5 :  - Σ_j L1_old[j, α_in_ii_pao] · moo[i, j]
+    //               (oo self-dressing, off-diag of canonical -L1·v2;
+    //                moo[i, j] = dF_ki[j·nocc+i], reuses Sub-step 2X.2c
+    //                Phase24 cross-pair F-eff dressing; for j ≠ i a
+    //                cross-pair barS transform brings L1[j] from pair
+    //                (j,j) PAO basis into pair (i,i) PAO basis.)
+    //
+    // Jacobi update: Λ_1[i, α] -= (R0 + R_self)[i, α] / (eps_a[α] - F_ii).
+    // L1 self-iter is interleaved with the Λ_2 sweep inside the main
+    // iter loop below. Convergence is reached when max(|R_L2|, |R_L1|)
+    // < conv_tol.
+    //
+    // Higher-order terms (θ·L1 cross — term 2; L1·OVVO/OOVV — term 6;
+    // OVOO·moo1 — term 3; L2-coupled sources — terms 7, 8) are deferred
+    // to Sub-steps 2X.3.6b/c, 2X.3.7a-c.
+    // ================================================================
+
+    std::vector<std::vector<real_t>> R0_pao(nocc);
+    std::vector<RowMatXd>            Mvv1_pao(nocc);
+
+    if (use_phase24) {
+        for (int i = 0; i < nocc; ++i) {
+            const int idx_ii = pair_lookup[i * nocc + i];
+            if (idx_ii < 0 || idx_ii >= static_cast<int>(setups.size())) continue;
+            const PairSetup& s_ii = setups[idx_ii];
+            const PairData&  p_ii = pairs[idx_ii];
+            const int n_pno_ii = p_ii.n_pno;
+            const int n_pao_ii = s_ii.n_pao;
+            if (n_pno_ii == 0 || n_pao_ii == 0) continue;
+            if (DF_per_pair[idx_ii].rows() != n_pno_ii ||
+                DF_per_pair[idx_ii].cols() != n_pno_ii) continue;
+
+            const RowMatXd& mvv1_pno = DF_per_pair[idx_ii];
+            Eigen::Map<const RowMatXd> M(p_ii.M.data(), n_pao_ii, n_pno_ii);
+
+            // --- term 1 source (constant in Λ iter) ---
+            // R0_pno[a] = 2·Σ_{b,c} W(a,c,b)·mvv1(b,c) - Σ_{b,c} W(b,c,a)·mvv1(b,c)
+            if (i < static_cast<int>(phase24->W_ovvv_diag.size())
+                && !phase24->W_ovvv_diag[i].empty()) {
+                const real_t* W = phase24->W_ovvv_diag[i].data();
+                Eigen::VectorXd R_pno = Eigen::VectorXd::Zero(n_pno_ii);
+                for (int a = 0; a < n_pno_ii; ++a) {
+                    real_t r = 0.0;
+                    for (int c = 0; c < n_pno_ii; ++c) {
+                        for (int b = 0; b < n_pno_ii; ++b) {
+                            const size_t idx_acb =
+                                (static_cast<size_t>(a) * n_pno_ii + c) * n_pno_ii + b;
+                            const size_t idx_bca =
+                                (static_cast<size_t>(b) * n_pno_ii + c) * n_pno_ii + a;
+                            const real_t m_bc = mvv1_pno(b, c);
+                            r += 2.0 * W[idx_acb] * m_bc
+                               -       W[idx_bca] * m_bc;
+                        }
+                    }
+                    R_pno(a) = r;
+                }
+                const Eigen::VectorXd R_pao_vec = M * R_pno;
+                R0_pao[i].assign(R_pao_vec.data(),
+                                 R_pao_vec.data() + n_pao_ii);
+            } else {
+                R0_pao[i].assign(n_pao_ii, 0.0);
+            }
+
+            // --- Mvv1_pao[i] = M · mvv1_pno · M^T (n_pao_ii × n_pao_ii) ---
+            // Used by term 4 self-dressing inside the iter loop.
+            Mvv1_pao[i].noalias() = M * mvv1_pno * M.transpose();
         }
     }
 
@@ -227,23 +446,31 @@ DLPNOLambdaStatus iterate_dlpno_ccsd_lambda(
                         (pij.Lambda[a] + pij.Lambda[b] - shift)
                         * L2_old_ij(a, b);
 
-            // Sub-step 2X.2a: intra-pair diagonal hole dressing
-            //   R -= (ΔF_ii + ΔF_jj) · Λ_old
+            // ---- Sub-step 2X.2a/c: intra-pair diagonal hole dressing ----
+            // R -= (ΔF_ii + ΔF_jj) · Λ_old
             // (Mirrors Phase 2.3.3 of iterate_dlpno_ccsd_t2 line 1110-1119.
-            //  Same prefactor / sign convention because the Λ_2 equation
-            //  inherits the F_eff structure from the Lagrangian via
-            //  L_CCSD = ⟨0|(1+Λ) e^{-T} ̄H e^T |0⟩.)
+            //  Both 2X.2a (fallback, diagonal only) and 2X.2c (full Phase24
+            //  path) store ΔF_ii in dF_ki[i*nocc+i].)
             if (enable_dressing) {
-                const real_t dF_sum = dF_diag[sij.i] + dF_diag[sij.j];
+                const real_t dF_sum =
+                    dF_ki[static_cast<size_t>(sij.i) * nocc + sij.i]
+                  + dF_ki[static_cast<size_t>(sij.j) * nocc + sij.j];
                 if (dF_sum != 0.0) {
                     R_buf.noalias() -= dF_sum * RowMatXd(L2_old_ij);
                 }
             }
 
-            // Cross-pair coupling on i (k != sij.i) using Λ from pair (k,j).
+            // ---- Cross-pair Fock coupling on i (k != sij.i) ----
+            // F_eff[i, k] = F_LMO[i, k] + ΔF_{ki}    (full off-diagonal F_eff
+            //                                         is built only when
+            //                                         use_phase24 == true;
+            //                                         otherwise dF_ki off-
+            //                                         diagonal stays zero).
             for (int k = 0; k < nocc; ++k) {
                 if (k == sij.i) continue;
-                const real_t F_ik = F_LMO[sij.i * nocc + k];
+                const real_t F_ik =
+                    F_LMO[sij.i * nocc + k]
+                  + dF_ki[static_cast<size_t>(k) * nocc + sij.i];
                 if (std::fabs(F_ik) < kFLMOThresh) continue;
 
                 const int idx_kj = pair_lookup[k * nocc + sij.j];
@@ -260,8 +487,6 @@ DLPNOLambdaStatus iterate_dlpno_ccsd_lambda(
                                                  pkj.n_pno, pkj.n_pno);
 
                 // π_kj^(ij) = barS · Λ_kj · barS^T   [n × n]
-                // Orientation handling: if stored pair is (j,k) instead of
-                // (k,j), Λ_kj  = (Λ_jk)^T.
                 if (skj.i != k) {
                     pi_buf.noalias() = barS_buf
                                      * L2_kj.transpose()
@@ -274,10 +499,12 @@ DLPNOLambdaStatus iterate_dlpno_ccsd_lambda(
                 R_buf.noalias() -= F_ik * pi_buf;
             }
 
-            // Cross-pair coupling on j (l != sij.j) using Λ from pair (i,l).
+            // ---- Cross-pair Fock coupling on j (l != sij.j) ----
             for (int l = 0; l < nocc; ++l) {
                 if (l == sij.j) continue;
-                const real_t F_lj = F_LMO[l * nocc + sij.j];
+                const real_t F_lj =
+                    F_LMO[l * nocc + sij.j]
+                  + dF_ki[static_cast<size_t>(l) * nocc + sij.j];
                 if (std::fabs(F_lj) < kFLMOThresh) continue;
 
                 const int idx_il = pair_lookup[sij.i * nocc + l];
@@ -304,6 +531,29 @@ DLPNOLambdaStatus iterate_dlpno_ccsd_lambda(
                 R_buf.noalias() -= F_lj * pi_buf;
             }
 
+            // ---- Sub-step 2X.2c: particle F_eff dressing per pair (ij) ----
+            //
+            // Canonical CCSD Λ_2 picks up two terms from ∂L/∂t_2:
+            //   R += Σ_c Λ_2[ij,a,c] · F̃_v[c,b]     (b-side)
+            //   R += Σ_c F̃_v[c,a] · Λ_2[ij,c,b]     (a-side, via P-symmetry)
+            // i.e., R += Λ · F̃_v + F̃_v^T · Λ
+            //   where F̃_v == DF_per_pair[idx] in our storage convention.
+            //
+            // The T_2 iter applies the *transposed* dressing (R += F̃ · Y +
+            // Y · F̃^T) because T_2 sits on the other side of the Lagrangian
+            // derivative. In semi-canonical DLPNO PNO basis F̃ is NOT
+            // symmetric, so the transpose matters.
+            //
+            // Strict-mode validation (Sub-step 2X.2c sentinel test) locks
+            // the sign and transpose convention against canonical CCSD Λ_2.
+            if (use_phase24) {
+                const RowMatXd& DF = DF_per_pair[idx];
+                if (DF.size() == static_cast<Eigen::Index>(n) * n) {
+                    R_buf.noalias() += RowMatXd(L2_old_ij) * DF;
+                    R_buf.noalias() += DF.transpose() * RowMatXd(L2_old_ij);
+                }
+            }
+
             // Jacobi update.
             real_t r_max_pair = 0.0;
             for (int a = 0; a < n; ++a) {
@@ -318,14 +568,248 @@ DLPNOLambdaStatus iterate_dlpno_ccsd_lambda(
             r_max = std::max(r_max, r_max_pair);
         }
 
+        // ============================================================
+        // Sub-step 2X.3.6a: Λ_1 self-iter sweep (terms 4 + 5).
+        //
+        // Direct Jacobi mirroring the Λ_2 sweep convention (line 558-573):
+        // the eigenvalue diagonal (ε_α - F_ii)·Λ_1_old enters R alongside
+        // the off-diagonal source terms, so `Λ_1 -= R/denom` overwrites Λ_1
+        // each iter (`L1_old · diag / denom = L1_old` cancels Λ_1_old).
+        //
+        // At T1 = 0 the residual is
+        //   R[i, α] = R0[i, α]                                        (term 1, const)
+        //           + (ε_α - F_ii) · Λ_1_old[i, α]                    (eigenvalue diag)
+        //           - (Mvv1_pao[i]^T · Λ_1_old[i])[α]                 (term 4, vv)
+        //           - Σ_j Λ_1_old[j → ii_pao basis](α) · moo[i, j]    (term 5, oo)
+        // At convergence R = 0 ⇒ Λ_1[i, α] = (R_offdiag without diag)/denom,
+        // matching canonical Stanton-Bartlett Λ_1 fixed point.
+        //
+        // Cross-basis transform for term 5 off-diagonal j ≠ i:
+        //   L1_j_in_ii_pao = M^{(ii)} · barS^{(ii,jj)} · M^{(jj)T} · L1[j]
+        // mirrors the cross-pair Fock coupling pattern used in the Λ_2
+        // sweep above (line 469-538).
+        // ============================================================
+        if (use_phase24) {
+            std::vector<std::vector<real_t>> L1_old(Lambda1);
+
+            RowMatXd barS_ii_jj;
+            for (int i = 0; i < nocc; ++i) {
+                const int idx_ii = pair_lookup[i * nocc + i];
+                if (idx_ii < 0 || idx_ii >= static_cast<int>(setups.size())) continue;
+                const PairSetup& s_ii = setups[idx_ii];
+                const PairData&  p_ii = pairs[idx_ii];
+                const int n_pao_ii = s_ii.n_pao;
+                const int n_pno_ii = p_ii.n_pno;
+                if (n_pao_ii == 0 || n_pno_ii == 0) continue;
+                if (static_cast<int>(R0_pao[i].size()) != n_pao_ii) continue;
+                if (Mvv1_pao[i].rows() != n_pao_ii ||
+                    Mvv1_pao[i].cols() != n_pao_ii) continue;
+
+                const real_t F_ii_local =
+                    F_LMO[static_cast<size_t>(i) * nocc + i];
+
+                // Start from constant T2 source.
+                Eigen::VectorXd R = Eigen::Map<const Eigen::VectorXd>(
+                    R0_pao[i].data(), n_pao_ii);
+
+                // term 4: R -= Mvv1_pao[i]^T · L1_old[i]
+                const bool have_L1_i =
+                    (static_cast<int>(L1_old[i].size()) == n_pao_ii);
+                if (have_L1_i) {
+                    Eigen::Map<const Eigen::VectorXd> L1_i(
+                        L1_old[i].data(), n_pao_ii);
+                    R.noalias() -= Mvv1_pao[i].transpose() * L1_i;
+                }
+
+                // term 5: R -= Σ_j L1_old[j → ii_pao basis] · moo[i, j]
+                Eigen::Map<const RowMatXd> M_ii(
+                    p_ii.M.data(), n_pao_ii, n_pno_ii);
+                for (int j = 0; j < nocc; ++j) {
+                    const real_t moo_ij =
+                        dF_ki[static_cast<size_t>(j) * nocc + i];
+                    if (std::fabs(moo_ij) < kFLMOThresh) continue;
+                    if (static_cast<int>(L1_old[j].size()) == 0) continue;
+
+                    if (j == i) {
+                        // Same basis — direct scaling.
+                        Eigen::Map<const Eigen::VectorXd> L1_j(
+                            L1_old[j].data(), n_pao_ii);
+                        R.noalias() -= moo_ij * L1_j;
+                    } else {
+                        const int idx_jj = pair_lookup[j * nocc + j];
+                        if (idx_jj < 0
+                            || idx_jj >= static_cast<int>(setups.size()))
+                            continue;
+                        const PairSetup& s_jj = setups[idx_jj];
+                        const PairData&  p_jj = pairs[idx_jj];
+                        const int n_pao_jj = s_jj.n_pao;
+                        const int n_pno_jj = p_jj.n_pno;
+                        if (n_pao_jj == 0 || n_pno_jj == 0) continue;
+                        if (static_cast<int>(L1_old[j].size()) != n_pao_jj)
+                            continue;
+
+                        // L1[j] in pair (j,j) PAO → pair (j,j) PNO
+                        Eigen::Map<const RowMatXd> M_jj(
+                            p_jj.M.data(), n_pao_jj, n_pno_jj);
+                        Eigen::Map<const Eigen::VectorXd> L1_j(
+                            L1_old[j].data(), n_pao_jj);
+                        const Eigen::VectorXd L1_j_pno_jj = M_jj.transpose() * L1_j;
+
+                        // pair (j,j) PNO → pair (i,i) PNO via barS^{(ii,jj)}
+                        compute_barS_lambda(p_ii.bar_Q.data(), n_pno_ii,
+                                            p_jj.bar_Q.data(), n_pno_jj,
+                                            h_S, nao, barS_ii_jj);
+                        const Eigen::VectorXd L1_j_pno_ii =
+                            barS_ii_jj * L1_j_pno_jj;
+
+                        // pair (i,i) PNO → pair (i,i) PAO via M_ii
+                        const Eigen::VectorXd L1_j_pao_ii =
+                            M_ii * L1_j_pno_ii;
+
+                        R.noalias() -= moo_ij * L1_j_pao_ii;
+                    }
+                }
+
+                // ================================================
+                // Sub-step 2X.3.6b: term 6 — L1·OVVO and L1·OOVV
+                //   R[i, α] += 2 · Σ_{jb} L1[j, b]·OVVO[i, α, b, j]
+                //              -   Σ_{jb} L1[j, b]·OOVV[i, j, b, α]
+                //
+                // Pair (i,j) is stored at idx_ij with s.i ≤ s.j. We pick
+                // the appropriate OVVO orientation:
+                //   - if i == s.i → W_ovvo_lambda (i-role: (s.i a | b s.j))
+                //   - if i == s.j → W_ovvo_lambda_alt (j-role: (s.j a | b s.i))
+                // OOVV is symmetric in the LMO pair indices so a single
+                // W_oovv_lambda storage covers both orientations.
+                //
+                // Steps:
+                //   1. Transform L1[j_pao_jj] → L1_pno_ij via M^(jj)^T then
+                //      barS^(ij, jj).
+                //   2. Contract:
+                //        R_pno_ij[a] = 2·W_ovvo_oriented[a,b]·L1_j[b]
+                //                    -   W_oovv[b,a]·L1_j[b]
+                //   3. Transform R_pno_ij → R_pao_ii via barS^(ii, ij), then
+                //      M^(ii), and accumulate into R.
+                // ================================================
+                RowMatXd barS_ij_jj_b, barS_ii_ij_b;
+                for (int j = 0; j < nocc; ++j) {
+                    const int idx_ij = pair_lookup[i * nocc + j];
+                    if (idx_ij < 0
+                        || idx_ij >= static_cast<int>(setups.size()))
+                        continue;
+                    if (idx_ij >= static_cast<int>(
+                            phase24->W_ovvo_lambda.size()))
+                        continue;
+                    if (phase24->W_ovvo_lambda[idx_ij].empty()) continue;
+
+                    const PairSetup& s_ij = setups[idx_ij];
+                    const PairData&  p_ij = pairs[idx_ij];
+                    const int n_pno_ij = p_ij.n_pno;
+                    if (n_pno_ij == 0) continue;
+
+                    const int idx_jj = pair_lookup[j * nocc + j];
+                    if (idx_jj < 0
+                        || idx_jj >= static_cast<int>(setups.size()))
+                        continue;
+                    const PairSetup& s_jj = setups[idx_jj];
+                    const PairData&  p_jj = pairs[idx_jj];
+                    const int n_pao_jj = s_jj.n_pao;
+                    const int n_pno_jj = p_jj.n_pno;
+                    if (n_pao_jj == 0 || n_pno_jj == 0) continue;
+                    if (static_cast<int>(L1_old[j].size()) != n_pao_jj)
+                        continue;
+
+                    // Select OVVO orientation based on which LMO of the
+                    // stored pair matches the iter's `i` index.
+                    const real_t* W_ovvo_data = nullptr;
+                    if (s_ij.i == i) {
+                        W_ovvo_data = phase24->W_ovvo_lambda[idx_ij].data();
+                    } else if (s_ij.j == i) {
+                        if (idx_ij >= static_cast<int>(
+                                phase24->W_ovvo_lambda_alt.size()))
+                            continue;
+                        if (phase24->W_ovvo_lambda_alt[idx_ij].empty())
+                            continue;
+                        W_ovvo_data =
+                            phase24->W_ovvo_lambda_alt[idx_ij].data();
+                    } else {
+                        continue;  // pair (i,j) lookup mismatch — shouldn't happen
+                    }
+
+                    // Step 1: L1[j] in pair (j,j) PAO → pair (i,j) PNO
+                    Eigen::Map<const RowMatXd> M_jj(
+                        p_jj.M.data(), n_pao_jj, n_pno_jj);
+                    Eigen::Map<const Eigen::VectorXd> L1_j(
+                        L1_old[j].data(), n_pao_jj);
+                    const Eigen::VectorXd L1_j_pno_jj =
+                        M_jj.transpose() * L1_j;
+                    compute_barS_lambda(p_ij.bar_Q.data(), n_pno_ij,
+                                        p_jj.bar_Q.data(), n_pno_jj,
+                                        h_S, nao, barS_ij_jj_b);
+                    const Eigen::VectorXd L1_j_pno_ij =
+                        barS_ij_jj_b * L1_j_pno_jj;
+
+                    // Step 2: contract with W_ovvo (oriented) / W_oovv
+                    Eigen::Map<const RowMatXd> W_ovvo(
+                        W_ovvo_data, n_pno_ij, n_pno_ij);
+                    Eigen::Map<const RowMatXd> W_oovv(
+                        phase24->W_oovv_lambda[idx_ij].data(),
+                        n_pno_ij, n_pno_ij);
+                    Eigen::VectorXd R_pno_ij =
+                        2.0 * (W_ovvo * L1_j_pno_ij)
+                        - (W_oovv.transpose() * L1_j_pno_ij);
+
+                    // Step 3: pair (i,j) PNO → pair (i,i) PNO via barS^(ii,ij),
+                    //         then pair (i,i) PNO → pair (i,i) PAO via M_ii.
+                    compute_barS_lambda(p_ii.bar_Q.data(), n_pno_ii,
+                                        p_ij.bar_Q.data(), n_pno_ij,
+                                        h_S, nao, barS_ii_ij_b);
+                    const Eigen::VectorXd R_pno_ii =
+                        barS_ii_ij_b * R_pno_ij;
+                    const Eigen::VectorXd R_contrib =
+                        M_ii * R_pno_ii;
+
+                    R.noalias() += R_contrib;
+                }
+
+                // Add eigenvalue diagonal (ε_α - F_ii)·Λ_1_old[i, α] so
+                // `Λ_1 -= R/denom` overwrites Λ_1[i, α] in one Jacobi step
+                // (direct convention, same as the Λ_2 sweep above).
+                if (have_L1_i) {
+                    for (int alpha = 0; alpha < n_pao_ii; ++alpha) {
+                        R(alpha) += (s_ii.eps_a[alpha] - F_ii_local)
+                                  * L1_old[i][alpha];
+                    }
+                }
+
+                // Jacobi update + convergence tracking.
+                real_t r_max_l1_i = 0.0;
+                for (int alpha = 0; alpha < n_pao_ii; ++alpha) {
+                    const real_t denom = s_ii.eps_a[alpha] - F_ii_local;
+                    if (std::fabs(denom) < 1.0e-14) continue;
+                    Lambda1[i][alpha] -= R(alpha) / denom;
+                    r_max_l1_i =
+                        std::max(r_max_l1_i, std::fabs(R(alpha)));
+                }
+                r_max = std::max(r_max, r_max_l1_i);
+            }
+        }
+
         s.iters = iter + 1;
         s.max_R = r_max;
 
         if (verbose >= 2) {
+            real_t lam1_norm_sq = 0.0;
+            for (int i = 0; i < nocc; ++i) {
+                for (real_t v : Lambda1[i]) lam1_norm_sq += v * v;
+            }
             std::cout << "[" << (round_tag ? round_tag : "DLPNO-Λ")
                       << "] iter " << s.iters
                       << "  max|R|=" << std::scientific
-                      << std::setprecision(3) << r_max << std::endl;
+                      << std::setprecision(3) << r_max
+                      << "  |Λ_1|=" << std::scientific
+                      << std::setprecision(8) << std::sqrt(lam1_norm_sq)
+                      << std::endl;
         }
 
         if (r_max < conv_tol) {
@@ -340,6 +824,19 @@ DLPNOLambdaStatus iterate_dlpno_ccsd_lambda(
                   << " in " << s.iters
                   << " iter, max|R|=" << std::scientific
                   << std::setprecision(3) << s.max_R << std::endl;
+
+        if (use_phase24) {
+            real_t lam1_norm_sq = 0.0;
+            for (int i = 0; i < nocc; ++i) {
+                for (real_t v : Lambda1[i]) lam1_norm_sq += v * v;
+            }
+            std::cout << "[" << (round_tag ? round_tag : "DLPNO-Λ")
+                      << "] Λ_1 norm (after T2 source) = "
+                      << std::scientific << std::setprecision(8)
+                      << std::sqrt(lam1_norm_sq)
+                      << "  (self-iter ran " << s.iters << " iter)"
+                      << std::endl;
+        }
     }
     return s;
 }
@@ -743,32 +1240,44 @@ void build_dlpno_ccsd_1rdm_mo_closedform(
     const real_t*                            S_AO,
     const real_t*                            C_can_vir,
     int                                      nao,
-    real_t*                                  D_mo_out)
+    real_t*                                  D_mo_out,
+    const std::vector<std::vector<real_t>>&  Lambda1)
 {
     // 1. oo + vv + HF blocks (reuse MP2 path; ov/vo left at zero).
     build_dlpno_mp2_1rdm_mo(setups, pairs, pair_lookup,
                             n_lmo, n_can_vir, S_AO, C_can_vir, nao,
                             D_mo_out);
 
-    // 2. Skip T1 contribution if not provided.
-    if (T1.empty() || static_cast<int>(T1.size()) != n_lmo) return;
-
     const int nmo = n_lmo + n_can_vir;
     Eigen::Map<const RowMatXd> S(S_AO,        nao, nao);
     Eigen::Map<const RowMatXd> C(C_can_vir,   nao, n_can_vir);
 
-    // For each LMO i, back-transform T1[i] (in pair (i,i) PAO basis) to
-    // canonical virtual basis and add to D[ov][i, a] = D[vo][a, i].
+    // For each LMO i, back-transform T1[i] and Λ_1[i] (both in pair (i,i)'s
+    // PAO basis) to the canonical virtual basis. Both contributions sum
+    // into the D[ov]/D[vo] block following the canonical CCSD 1-RDM
+    // formula D[ov][i,a] = dov[i,a] + dvo[a,i] = L1[i,a] + T1[i,a] + …
+    // (cross-terms O(T1·L1) deferred to Sub-step 2X.3.5 — only fire when
+    // T1 is non-zero, which requires Phase 2.6c to land first).
     std::vector<real_t> d_buf;  // d_ii [n_can_vir × n_pao]
 
-    for (int i = 0; i < n_lmo; ++i) {
-        if (T1[i].empty()) continue;
+    const bool have_T1 =
+        !T1.empty() && static_cast<int>(T1.size()) == n_lmo;
+    const bool have_L1 =
+        !Lambda1.empty() && static_cast<int>(Lambda1.size()) == n_lmo;
+    if (!have_T1 && !have_L1) return;
 
+    for (int i = 0; i < n_lmo; ++i) {
         const int idx_ii = pair_lookup[i * n_lmo + i];
         if (idx_ii < 0 || idx_ii >= static_cast<int>(setups.size())) continue;
         const auto& s = setups[idx_ii];
         const int n_pao = s.n_pao;
-        if (n_pao == 0 || static_cast<int>(T1[i].size()) != n_pao) continue;
+        if (n_pao == 0) continue;
+
+        const bool i_has_T1 =
+            have_T1 && static_cast<int>(T1[i].size()) == n_pao;
+        const bool i_has_L1 =
+            have_L1 && static_cast<int>(Lambda1[i].size()) == n_pao;
+        if (!i_has_T1 && !i_has_L1) continue;
 
         // d_ii[a, a_pao] = (C_can_vir^T · S_AO · C_can_pair_ii)[a, a_pao]
         d_buf.assign(static_cast<size_t>(n_can_vir) * n_pao, 0.0);
@@ -776,14 +1285,21 @@ void build_dlpno_ccsd_1rdm_mo_closedform(
         RowMatXd SCii = S * Cii;                  // [nao × n_pao]
         RowMatXd d    = C.transpose() * SCii;     // [n_can_vir × n_pao]
 
-        // T1_can[a] = Σ_a_pao d[a, a_pao] · T1[i][a_pao]
-        Eigen::VectorXd T1_pao(n_pao);
-        for (int a = 0; a < n_pao; ++a) T1_pao(a) = T1[i][a];
-        Eigen::VectorXd T1_can = d * T1_pao;       // [n_can_vir]
+        // Combined T1 + Λ_1 vector in pair (i,i)'s PAO basis.
+        Eigen::VectorXd amp_pao = Eigen::VectorXd::Zero(n_pao);
+        if (i_has_T1) {
+            for (int a = 0; a < n_pao; ++a)
+                amp_pao(a) += T1[i][a];
+        }
+        if (i_has_L1) {
+            for (int a = 0; a < n_pao; ++a)
+                amp_pao(a) += Lambda1[i][a];
+        }
+        Eigen::VectorXd amp_can = d * amp_pao;     // [n_can_vir]
 
-        // Place T1_can in D[ov] and D[vo] (Hermitian).
+        // Place into D[ov] and D[vo] (Hermitian).
         for (int a = 0; a < n_can_vir; ++a) {
-            const real_t v = T1_can(a);
+            const real_t v = amp_can(a);
             D_mo_out[static_cast<size_t>(i) * nmo + (n_lmo + a)] += v;
             D_mo_out[static_cast<size_t>(n_lmo + a) * nmo + i]   += v;
         }

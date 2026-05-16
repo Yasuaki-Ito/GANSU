@@ -121,6 +121,19 @@ inline Phase24Integrals precompute_phase24_integrals(
     out.W_ovvo_i.assign(n_pairs, {});
     out.W_ovvo_j.assign(n_pairs, {});
     out.V_ovov_pair.assign(n_pairs, {});
+    // Sub-step 2X.3.1: OVVV for diagonal pairs only — sized [nocc] of
+    // [n_pno_ii³]. Filled below inside the per-pair build whenever
+    // setup.i == setup.j. Pairs not encountered (e.g. zero-PNO pairs)
+    // leave the entry empty.
+    out.W_ovvv_diag.assign(res.nocc, {});
+    // Sub-step 2X.3.6b: OVVO / OOVV per strong pair (i,j) for the L1·OVVO
+    // and L1·OOVV cross-pair source terms of Λ_1 (term 6 of the canonical
+    // catalogue). Filled below per pair alongside the existing W_ovvo_i/j.
+    // OVVO needs two orientations (i-role and j-role) since (s.i a | b s.j)
+    // and (s.j a | b s.i) are genuinely different ERIs.
+    out.W_ovvo_lambda.assign(n_pairs, {});
+    out.W_ovvo_lambda_alt.assign(n_pairs, {});
+    out.W_oovv_lambda.assign(n_pairs, {});
 
     // Phase B — multi-GPU pair-parallel integral build.
     //   Detect distributed RI back-end with replicated B; if available,
@@ -323,6 +336,76 @@ inline Phase24Integrals precompute_phase24_integrals(
                             ((static_cast<size_t>(l) * n_lmo + k) * n_pno + d) * n_pno + c;
                         out.V_ovov_pair[idx][out_idx] = h_eri_mo[e];
                     }
+
+        // Sub-step 2X.3.1: Extract W_ovvv_diag[i] = (i, a, b, c) for
+        // diagonal pair (i,i) only. Used by the Λ_1 leading source term
+        // 2·Σ_bc W_ovvv_diag[i](a,c,b)·mvv1[b,c] - permutation. The mvv1
+        // intermediate in pair (i,i)'s PNO basis is recovered from
+        // DF_per_pair[idx_ii] computed by the T iteration. Layout:
+        //   W_ovvv_diag[i][((a · n_pno + b) · n_pno + c)] = (i, a, b, c)
+        // i.e. chemist notation eri_mo[i, n_lmo+a, n_lmo+b, n_lmo+c].
+        if (s.i == s.j) {
+            const int i_lmo = s.i;
+            out.W_ovvv_diag[i_lmo].assign(
+                static_cast<size_t>(n_pno) * n_pno * n_pno, 0.0);
+            for (int a = 0; a < n_pno; ++a) {
+                for (int b = 0; b < n_pno; ++b) {
+                    for (int c = 0; c < n_pno; ++c) {
+                        const size_t e =
+                            static_cast<size_t>(i_lmo) * n_emb3 +
+                            static_cast<size_t>(n_lmo + a) * n_emb2 +
+                            static_cast<size_t>(n_lmo + b) * n_emb +
+                            static_cast<size_t>(n_lmo + c);
+                        const size_t out_idx =
+                            (static_cast<size_t>(a) * n_pno + b) * n_pno + c;
+                        out.W_ovvv_diag[i_lmo][out_idx] = h_eri_mo[e];
+                    }
+                }
+            }
+        }
+
+        // Sub-step 2X.3.6b: Extract OVVO / OOVV for pair (i,j) in pair PNO
+        // basis. Used by the L1·OVVO and L1·OOVV terms of Λ_1:
+        //   W_ovvo_lambda[idx][a, b]     = eri_mo[s.i, n_lmo+a, n_lmo+b, s.j]
+        //                                  ≡ (s.i a | b s.j)  — "i-role"
+        //   W_ovvo_lambda_alt[idx][a, b] = eri_mo[s.j, n_lmo+a, n_lmo+b, s.i]
+        //                                  ≡ (s.j a | b s.i)  — "j-role"
+        //   W_oovv_lambda[idx][b, a]     = eri_mo[s.i, s.j, n_lmo+b, n_lmo+a]
+        //                                  ≡ (s.i s.j | b a)  (symmetric in (i,j))
+        // a, b in pair (i,j) PNO basis (n_pno values each).
+        out.W_ovvo_lambda[idx].assign(
+            static_cast<size_t>(n_pno) * n_pno, 0.0);
+        out.W_ovvo_lambda_alt[idx].assign(
+            static_cast<size_t>(n_pno) * n_pno, 0.0);
+        out.W_oovv_lambda[idx].assign(
+            static_cast<size_t>(n_pno) * n_pno, 0.0);
+        for (int a = 0; a < n_pno; ++a) {
+            for (int b = 0; b < n_pno; ++b) {
+                // (s.i a | b s.j)
+                const size_t e_ovvo_i =
+                    static_cast<size_t>(s.i) * n_emb3 +
+                    static_cast<size_t>(n_lmo + a) * n_emb2 +
+                    static_cast<size_t>(n_lmo + b) * n_emb +
+                    static_cast<size_t>(s.j);
+                // (s.j a | b s.i)
+                const size_t e_ovvo_j =
+                    static_cast<size_t>(s.j) * n_emb3 +
+                    static_cast<size_t>(n_lmo + a) * n_emb2 +
+                    static_cast<size_t>(n_lmo + b) * n_emb +
+                    static_cast<size_t>(s.i);
+                // (s.i s.j | b a)
+                const size_t e_oovv =
+                    static_cast<size_t>(s.i) * n_emb3 +
+                    static_cast<size_t>(s.j) * n_emb2 +
+                    static_cast<size_t>(n_lmo + b) * n_emb +
+                    static_cast<size_t>(n_lmo + a);
+                const size_t out_ab = static_cast<size_t>(a) * n_pno + b;
+                const size_t out_ba = static_cast<size_t>(b) * n_pno + a;
+                out.W_ovvo_lambda[idx][out_ab]     = h_eri_mo[e_ovvo_i];
+                out.W_ovvo_lambda_alt[idx][out_ab] = h_eri_mo[e_ovvo_j];
+                out.W_oovv_lambda[idx][out_ba]     = h_eri_mo[e_oovv];
+            }
+        }
 
         (void)s;  // s used above; suppress -Wunused if conditional.
     }
@@ -664,30 +747,28 @@ real_t DLPNOCCSD::compute_energy()
     // Datta 2016 Λ residual (strategy X).
     // ----------------------------------------------------------------
     if (rhf_.get_dlpno_compute_density()) {
-        // Sub-step 2X.1: iterative Λ_2 in the LMP2 limit (no F-eff dressing
-        // yet). At strict mode the closed-form initial guess is the fixed
-        // point and the iteration converges in 1 sweep. With PM-localized
-        // LMOs the F_LMO off-diagonal cross-pair coupling refines Λ_2 away
-        // from the closed-form value.
-        // Sub-step 2X.2a empirical finding: intra-pair-only dressing is
-        // unbalanced and degrades agreement with canonical CCSD Λ
-        // (||D[oo]||_F deviates by 8.7e-3 vs 2.5e-5 for the LMP2-limit
-        // closed-form path). This mirrors the T-iteration history where
-        // Phase 2.5 alone diverged. Reverting to enable_dressing=false
-        // (= Sub-step 2X.1 LMP2 limit, closed-form Λ_2 = 2 Y - Y^T) which
-        // already agrees with PySCF canonical CCSD oo/vv blocks to 1e-5.
-        // The full dressing layer (cross-pair F_eff + particle + ladders)
-        // is deferred to Sub-step 2X.2b-d, ideally only after Sub-phase 3
-        // (DMET integration) demonstrates that the closed-form is
-        // insufficient for the target use case.
+        // Sub-step 2X.1 (default, LMP2 limit): closed-form Λ_2 = 2 Y - Y^T
+        // converges in 1 sweep at strict mode and agrees with canonical
+        // CCSD oo/vv blocks to ~1e-5 (PM-localised baseline). The closed-
+        // form dipole however sits 6.3% off canonical because Λ_1 = 0 and
+        // the Λ_2 F-eff dressing is missing.
+        //
+        // Sub-step 2X.2c (opt-in via --dlpno_lambda_full_dressing 1): turn
+        // on the full Path A dressing (phase24-based dF_ki + per-pair DF).
+        // Aims to bring the dipole error well below 1%. The historical 2X.2a
+        // intra-pair-only attempt degraded oo/vv to ||D[oo]||_F = 8.7e-3
+        // (vs 2.5e-5 for closed-form); the full Phase24 path restores
+        // balance by mirroring the T-iteration dressing exactly. Validated
+        // here in the strict mode sentinel test (Phase2X_2c_*).
+        const bool use_full_dressing = rhf_.get_dlpno_lambda_full_dressing();
         std::vector<std::vector<real_t>> Lambda1;
         DLPNOLambdaStatus lam_status = iterate_dlpno_ccsd_lambda(
             res.setups, res.pairs, Lambda1, T1, res.pair_lookup,
             res.F_LMO, h_S, nocc_, nao_,
             params_.lmp2_max_iter, params_.lmp2_conv,
-            /*enable_dressing=*/false,                    // 2X.1 LMP2 limit (revert from 2X.2a)
+            /*enable_dressing=*/use_full_dressing,
             params_.verbose, "DLPNO-Λ",
-            /*phase24=*/nullptr,
+            /*phase24=*/use_full_dressing ? &phase24 : nullptr,
             /*num_gpus=*/1);
 
         rhf_.get_coefficient_matrix().toHost();
@@ -706,9 +787,14 @@ real_t DLPNOCCSD::compute_energy()
 
         std::vector<real_t> D_mo(
             static_cast<size_t>(nmo) * nmo, 0.0);
+        // Sub-step 2X.3.4: pass Λ_1 amplitudes to the 1-RDM builder so the
+        // D[ov]/D[vo] block picks up the L1 contribution. Without the flag
+        // Lambda1 remains size-0 inner vectors (Sub-step 2X.3.0 scaffold)
+        // and the call collapses to the closed-form Λ_1 = 0 path.
         build_dlpno_ccsd_1rdm_mo_closedform(
             res.setups, res.pairs, res.pair_lookup, T1,
-            n_lmo, n_can_vir, h_S, C_can_vir.data(), nao_, D_mo.data());
+            n_lmo, n_can_vir, h_S, C_can_vir.data(), nao_, D_mo.data(),
+            Lambda1);
 
         if (params_.verbose >= 1) {
             // Sanity: trace + block norms (mirror DLPNO-MP2 sanity layout).

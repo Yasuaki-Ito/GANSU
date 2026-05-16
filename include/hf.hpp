@@ -283,6 +283,14 @@ public:
     bool   get_dlpno_pno_os_only()   const { return dlpno_pno_os_only_; }
     int    get_dlpno_verbose() const { return dlpno_verbose_; }
     bool   get_dlpno_compute_density() const { return dlpno_compute_density_; }
+    /// Sub-phase 2X.2c+: enable full F-eff dressing in the DLPNO-CCSD Λ
+    /// iteration (phase24-based cross-pair dF_ki + per-pair DF). Default
+    /// off — current production density uses the LMP2-limit closed-form
+    /// Λ_2 = 2 Y - Y^T which agrees with canonical CCSD oo/vv blocks to
+    /// ~1e-5. The full dressing path is iterated independently to close
+    /// the closed-form 6.3% off-canonical dipole gap. When stable will
+    /// become the production default. See DLPNO_Lambda.md §12.
+    bool   get_dlpno_lambda_full_dressing() const { return dlpno_lambda_full_dressing_; }
 
     /// Number of GPUs requested (-1 = auto-detect, 1 = single, > 1 = multi).
     int    get_num_gpus() const { return num_gpus_; }
@@ -512,6 +520,7 @@ protected:
     bool   dlpno_pno_os_only_ = false;
     int    dlpno_verbose_ = 1;
     bool   dlpno_compute_density_ = false;  ///< Sub-phase 1+: build Λ + 1-RDM after MP2/CCSD
+    bool   dlpno_lambda_full_dressing_ = false;  ///< Sub-phase 2X.2c: full Λ F-eff dressing
 
     // Multi-GPU
     int    num_gpus_ = 1;

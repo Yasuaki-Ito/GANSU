@@ -120,7 +120,8 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"dlpno_sc_pno_iter", "1"},                        // int: extra rounds of self-consistent PNO refinement (0 = single-shot PNO selection from semi-canonical guess)
         {"dlpno_pno_os_only", "0"},                        // bool: PNO selection from opposite-spin amplitudes only (D = T^T T + T T^T). Default 0 = use full LMP2 density (Riplinger 2013, T̃^T T + T̃ T^T) which slightly outperforms the OS-only form for full closed-shell MP2 energy evaluation. Set to 1 only when pairing with SOS-MP2 (c_os scaling, SS dropped).
         {"dlpno_verbose", "1"},                            // int: 0=summary, 1=phase, 2=per-pair, 3=residual
-        {"dlpno_compute_density", "0"}                     // bool: build DLPNO Λ + 1-RDM after MP2/CCSD energy (Sub-phase 1+ of DLPNO-CCSD-Λ project). Default 0 = energy only (no extra cost). Set 1 for DMET / properties / dipole; print sanity block + dipole when combined with dlpno_verbose >= 1.
+        {"dlpno_compute_density", "0"},                    // bool: build DLPNO Λ + 1-RDM after MP2/CCSD energy (Sub-phase 1+ of DLPNO-CCSD-Λ project). Default 0 = energy only (no extra cost). Set 1 for DMET / properties / dipole; print sanity block + dipole when combined with dlpno_verbose >= 1.
+        {"dlpno_lambda_full_dressing", "0"}                // bool: Sub-phase 2X.2c. Enable full F-eff dressing (phase24-based dF_ki + DF_per_pair) in the DLPNO-CCSD Λ iteration. Default 0 = LMP2-limit closed-form Λ_2 = 2 Y - Y^T (agrees with canonical CCSD oo/vv to ~1e-5). Set 1 to engage the full Path A dressing to close the 6.3% off-canonical dipole gap; iteration costs ~50% more than closed-form. See DLPNO_Lambda.md §12.
     };
 
 

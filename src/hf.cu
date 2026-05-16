@@ -152,6 +152,7 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     dlpno_pno_os_only_           = parameters.get<bool>("dlpno_pno_os_only");
     dlpno_verbose_               = parameters.get<int>("dlpno_verbose");
     dlpno_compute_density_       = parameters.get<bool>("dlpno_compute_density");
+    dlpno_lambda_full_dressing_  = parameters.get<bool>("dlpno_lambda_full_dressing");
 
     num_gpus_ = parameters.get<int>("num_gpus");
 

@@ -151,6 +151,57 @@ struct Phase24Integrals {
     /// Used in W_akic / W_akci ring-diagram dressing.
     std::vector<std::vector<real_t>> V_ovov_pair;    ///< [n_pairs] of [nocc² · n_pno²]
 
+    /// Sub-step 2X.3.1: OVVV integrals for diagonal pairs (i,i), used by
+    /// the leading T2-driven Λ_1 source term
+    ///   R_Λ_1[i,a_ii] ⊃ 2·Σ_bc W_ovvv_diag[i](a,c,b)·mvv1[b,c]
+    ///                 -   Σ_bc W_ovvv_diag[i](b,c,a)·mvv1[b,c]
+    /// where mvv1 in pair (i,i)'s PNO basis is recoverable from
+    /// DF_per_pair[idx_ii] computed by the T iteration.
+    ///
+    /// Storage: one entry per LMO i (NOT per pair). Each entry holds
+    /// (i, a, b, c) ≡ eri_mo[i, n_lmo+a, n_lmo+b, n_lmo+c] for pair (i,i),
+    /// where a, b, c index the pair's PNO basis (n_pno_ii values each).
+    /// Layout: ((a * n_pno_ii + b) * n_pno_ii + c).
+    ///
+    /// Scaling: nocc · n_pno_ii³, e.g. cholesterol (nocc=75, n_pno≈30) is
+    /// ~16 MB total — fits even at TEOS scale.
+    std::vector<std::vector<real_t>> W_ovvv_diag;    ///< [nocc] of [n_pno_ii³]
+
+    /// Sub-step 2X.3.6b: OVVO and OOVV integrals per strong pair (i,j),
+    /// used by the L1·OVVO / L1·OOVV cross-pair source terms in Λ_1:
+    ///   R_Λ_1[i,α_ii] ⊃ +2 · Σ_{j,b} L_1[j,b]·OVVO[i,α,b,j]
+    ///                  -   Σ_{j,b} L_1[j,b]·OOVV[i,j,b,α]
+    /// (term 6 of the canonical Λ_1 catalogue, T1=0 limit).
+    ///
+    /// Pair storage: pairs are stored with s.i ≤ s.j. The Λ_1 iter
+    /// computes R for both orderings (loop_i = s.i, loop_j = s.j) and
+    /// (loop_i = s.j, loop_j = s.i), so two OVVO orientations are needed:
+    ///   W_ovvo_lambda[idx][a, b]     = (s.i a | b s.j)  — "i-role"
+    ///   W_ovvo_lambda_alt[idx][a, b] = (s.j a | b s.i)  — "j-role"
+    /// (these are genuinely different ERIs; no 8-fold symmetry relates them.)
+    ///
+    /// OOVV is symmetric in the LMO pair indices via (pq|rs) = (qp|rs):
+    ///   (s.i s.j | b a) = (s.j s.i | b a)
+    /// so a single OOVV storage suffices for both orientations.
+    ///
+    /// Layout per pair: indices a, b are in pair (i,j) PNO basis (n_pno_ij²
+    /// each). The L1 in the iter loop is back-rotated through barS chains:
+    ///   L1_j_pno_ij = barS^(ij,jj) · M^(jj)^T · L1[j_pao_jj]
+    /// and the contracted residual is forward-rotated to pair (i,i) PAO:
+    ///   R_pao_ii += M^(ii) · barS^(ii,ij) · R_pno_ij
+    /// matching the cross-pair Fock coupling pattern of the Λ_2 sweep.
+    ///
+    /// Layout (all row-major):
+    ///   W_ovvo_lambda[idx][a·n_pno + b]     = eri_mo[s.i, n_lmo+a, n_lmo+b, s.j]
+    ///   W_ovvo_lambda_alt[idx][a·n_pno + b] = eri_mo[s.j, n_lmo+a, n_lmo+b, s.i]
+    ///   W_oovv_lambda[idx][b·n_pno + a]     = eri_mo[s.i, s.j, n_lmo+b, n_lmo+a]
+    ///
+    /// Scaling: n_pair_strong · n_pno_ij² · 24 B (3 × 8 B); TEOS-class
+    /// (n_pair_strong ≈ 8e3, n_pno ≈ 50) sits at ~300 MB. Cholesterol-class
+    /// (n_pair_strong ≈ 4e3, n_pno ≈ 30) is ~45 MB.
+    std::vector<std::vector<real_t>> W_ovvo_lambda;     ///< [n_pairs] of [n_pno_ij²]
+    std::vector<std::vector<real_t>> W_ovvo_lambda_alt; ///< [n_pairs] of [n_pno_ij²]
+    std::vector<std::vector<real_t>> W_oovv_lambda;     ///< [n_pairs] of [n_pno_ij²]
 };
 
 /**
