@@ -16,7 +16,13 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include <vector>
 
 #include "ccsd_lambda.hpp"
@@ -56,6 +62,37 @@ EigDecomp eig_sym(const real_t* M, int n)
     for (int k = 0; k < n; ++k) out.eigvals[k] = es.eigenvalues()(k);
     Eigen::Map<RowMatXd>(out.eigvecs.data(), n, n) = es.eigenvectors();
     return out;
+}
+
+// Step S2a — GPU kernel to extract the V block from the full pair-MO ERI.
+//
+// Layout: d_eri stores the n_emb⁴ ERI in (i, k, j, l) row-major order.
+// The V block needed by LMP2 is the (LMO_i, PAO_a, LMO_j, PAO_b) slice:
+//     V[a, b] = d_eri[0·n_emb³ + (n_lmo + a)·n_emb² + j_col·n_emb
+//                     + (n_lmo + b)]
+// with n_lmo = 1 (diag pair) or 2 (off-diag), j_col = 0 / 1 correspondingly.
+//
+// Replaces the per-pair D2H of n_emb⁴ doubles (~16 MB for n_emb=63 at
+// hexamer) followed by a host strided-copy with: per-pair extraction on
+// device + D2H of only n_pao² doubles (~30 KB). Eliminates the entire
+// n_emb⁴ host buffer and the ~3 s of cumulative D2H bandwidth across
+// the 465 pair_setup iterations.
+__global__ void extract_V_block_kernel(
+    const real_t* __restrict__ d_eri,
+    real_t*       __restrict__ d_V,
+    int n_emb, int n_lmo, int n_pao, int j_col)
+{
+    const int a = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    if (a >= n_pao || b >= n_pao) return;
+
+    const size_t idx = static_cast<size_t>(n_lmo + a)
+                       * static_cast<size_t>(n_emb)
+                       * static_cast<size_t>(n_emb)
+                     + static_cast<size_t>(j_col)
+                       * static_cast<size_t>(n_emb)
+                     + static_cast<size_t>(n_lmo + b);
+    d_V[a * n_pao + b] = d_eri[idx];
 }
 
 } // anonymous namespace
@@ -189,7 +226,6 @@ DLPNOLMP2Result solve_dlpno_lmp2(
 
     std::vector<PairSetup>& setups       = result.setups;
     std::vector<int>&       pair_lookup  = result.pair_lookup;
-    setups.reserve(static_cast<size_t>(n_pairs_total));
     pair_lookup.assign(static_cast<size_t>(nocc_) * nocc_, -1);
 
     long long n_pao_kept_sum = 0;
@@ -202,27 +238,77 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     // path adds ~5–10 ms NCCL/peer/sync overhead per pair × 465 pairs).
     // Idempotent: a no-op if already replicated; precompute_phase24 / DMET
     // call the same routine later and reuse the same buffers.
+    //
+    // Step S2b — Additionally detect num_gpus for OpenMP pair-parallel
+    // dispatch below: when the RI back-end is distributed and B is
+    // replicated, fan out the per-pair build_mo_eri calls across GPUs
+    // (same pattern as precompute_phase24_integrals).
+    int num_gpus = 1;
 #ifdef GANSU_MULTI_GPU
     if (auto* eri_dist = dynamic_cast<const ERI_RI_Distributed_RHF*>(&eri)) {
         if (eri_dist->num_gpus() > 1) {
-            const_cast<ERI_RI_Distributed_RHF*>(eri_dist)
-                ->replicate_B_to_all_gpus();
+            const bool ok = const_cast<ERI_RI_Distributed_RHF*>(eri_dist)
+                                ->replicate_B_to_all_gpus();
+            if (ok) num_gpus = eri_dist->num_gpus();
         }
     }
 #endif
 
-    // Step 6.3c — caller-side workspace for build_mo_eri output (d_eri / h_eri).
-    // Without this, each pair allocates a fresh 16 MB d_eri_mo (cudaMalloc +
-    // cudaMemset) AND a per-iter `std::vector<real_t> h_eri_mo(n_emb⁴, 0.0)`
-    // on the host (zero-init another ~16 MB). Reusing one growable buffer
-    // across all 465 pairs avoids both.
-    real_t* d_eri_ws = nullptr;
-    std::unique_ptr<real_t[]> h_eri_ws;
-    size_t ws_eri_capacity = 0;  // in number of doubles
-
-    const auto t_pair_setup_0 = clock::now();
+    // Step S2b — pre-build (i, j) pair index + pair_lookup so the loop
+    // body can write into setups[idx] by index (no order-dependent
+    // push_back, which would race under OpenMP).
+    std::vector<std::pair<int,int>> pair_ij;
+    pair_ij.reserve(static_cast<size_t>(n_pairs_total));
     for (int i = 0; i < nocc_; ++i) {
         for (int j = i; j < nocc_; ++j) {
+            const long long idx = static_cast<long long>(pair_ij.size());
+            pair_ij.emplace_back(i, j);
+            pair_lookup[i * nocc_ + j] = static_cast<int>(idx);
+            pair_lookup[j * nocc_ + i] = static_cast<int>(idx);
+        }
+    }
+    setups.assign(static_cast<size_t>(n_pairs_total), PairSetup{});
+
+    // Reductions across the parallel region.
+    long long n_pao_kept_sum_par = 0;
+    real_t    E_pao_total_par    = 0.0;
+
+    const auto t_pair_setup_0 = clock::now();
+
+    #pragma omp parallel num_threads(num_gpus) \
+        reduction(+:n_pao_kept_sum_par, E_pao_total_par)
+    {
+#ifdef _OPENMP
+        const int tid = omp_get_thread_num();
+#else
+        const int tid = 0;
+#endif
+        if (num_gpus > 1) cudaSetDevice(tid);
+
+        // Step 6.3c / Step S2a — per-thread workspaces. Grow once per
+        // thread to the running max n_emb / n_pao seen by that thread;
+        // freed at end of parallel region.
+        //
+        //   d_C_pair_ws / ws_C_pair_capacity : per-pair C_pair buffer
+        //   d_eri_ws    / ws_eri_capacity    : full n_emb⁴ ERI output
+        //   d_V_ws      / ws_V_capacity      : extracted V block (n_pao²)
+        //
+        // Per-pair D2H drops from n_emb⁴ ≈ 16 MB to n_pao² ≈ 30 KB via
+        // extract_V_block_kernel.
+        real_t* d_C_pair_ws        = nullptr;
+        real_t* d_eri_ws           = nullptr;
+        real_t* d_V_ws             = nullptr;
+        size_t  ws_C_pair_capacity = 0;
+        size_t  ws_eri_capacity    = 0;
+        size_t  ws_V_capacity      = 0;
+
+        // schedule(dynamic, 1) — per-pair cost varies with n_pao (12-60
+        // at hexamer, even wider on cholesterol), so dynamic outperforms
+        // static for load balance across GPUs.
+        #pragma omp for schedule(dynamic, 1)
+        for (long long idx = 0; idx < n_pairs_total; ++idx) {
+            const int i = pair_ij[static_cast<size_t>(idx)].first;
+            const int j = pair_ij[static_cast<size_t>(idx)].second;
             const bool diag = (i == j);
             const real_t pair_factor = diag ? 1.0 : 2.0;
 
@@ -240,13 +326,10 @@ DLPNOLMP2Result solve_dlpno_lmp2(
             s.pair_factor = pair_factor;
 
             if (n_pao == 0) {
-                pair_lookup[i * nocc_ + j] =
-                    pair_lookup[j * nocc_ + i] =
-                        static_cast<int>(setups.size());
-                setups.push_back(std::move(s));
+                setups[static_cast<size_t>(idx)] = std::move(s);
                 continue;
             }
-            n_pao_kept_sum += n_pao;
+            n_pao_kept_sum_par += n_pao;
 
             Eigen::Map<const RowMatXd> Cpao(
                 dom.C_pao_orth.data(), nao_, n_pao);
@@ -272,45 +355,51 @@ DLPNOLMP2Result solve_dlpno_lmp2(
                 for (int a = 0; a < n_pao; ++a)
                     C_pair[mu * n_emb + n_lmo + a] = C_can_pair(mu, a);
             }
-            real_t* d_C_pair = nullptr;
-            tracked_cudaMalloc(&d_C_pair,
-                static_cast<size_t>(nao_) * n_emb * sizeof(real_t));
-            cudaMemcpy(d_C_pair, C_pair.data(),
-                static_cast<size_t>(nao_) * n_emb * sizeof(real_t),
-                cudaMemcpyHostToDevice);
 
-            // Step 6.3c: grow the d_eri / h_eri workspace if this pair's
-            // n_emb⁴ exceeds the cached capacity. After the first few pairs,
-            // capacity stabilises at the running maximum and no further
-            // allocations occur.
+            // Step S2a — grow per-thread d_C_pair workspace.
+            const size_t n_C = static_cast<size_t>(nao_) * n_emb;
+            if (n_C > ws_C_pair_capacity) {
+                if (d_C_pair_ws) tracked_cudaFree(d_C_pair_ws);
+                tracked_cudaMalloc(&d_C_pair_ws, n_C * sizeof(real_t));
+                ws_C_pair_capacity = n_C;
+            }
+            cudaMemcpy(d_C_pair_ws, C_pair.data(),
+                n_C * sizeof(real_t), cudaMemcpyHostToDevice);
+
+            // Step 6.3c — grow per-thread d_eri workspace.
             const size_t n_emb4 = static_cast<size_t>(n_emb) * n_emb
                                 * n_emb * n_emb;
             if (n_emb4 > ws_eri_capacity) {
                 if (d_eri_ws) tracked_cudaFree(d_eri_ws);
                 tracked_cudaMalloc(&d_eri_ws, n_emb4 * sizeof(real_t));
-                // new T[N] is default-initialised (no zero-fill for trivial
-                // types) — saves the per-iter 16 MB host memset.
-                h_eri_ws.reset(new real_t[n_emb4]);
                 ws_eri_capacity = n_emb4;
             }
 
-            eri.build_mo_eri_into(d_C_pair, n_emb, d_eri_ws);
-            cudaMemcpy(h_eri_ws.get(), d_eri_ws,
-                       n_emb4 * sizeof(real_t), cudaMemcpyDeviceToHost);
-            tracked_cudaFree(d_C_pair);
+            // Step S2a — grow per-thread d_V workspace.
+            const size_t n_V = static_cast<size_t>(n_pao) * n_pao;
+            if (n_V > ws_V_capacity) {
+                if (d_V_ws) tracked_cudaFree(d_V_ws);
+                tracked_cudaMalloc(&d_V_ws, n_V * sizeof(real_t));
+                ws_V_capacity = n_V;
+            }
 
+            eri.build_mo_eri_into(d_C_pair_ws, n_emb, d_eri_ws);
+
+            // Step S2a — extract V block on device, then D2H only n_pao²
+            // doubles instead of the full n_emb⁴ ERI tensor.
             const int j_col = diag ? 0 : 1;
-            std::vector<real_t> V(
-                static_cast<size_t>(n_pao) * n_pao, 0.0);
-            for (int a = 0; a < n_pao; ++a)
-                for (int b = 0; b < n_pao; ++b) {
-                    const size_t idx =
-                          static_cast<size_t>(0) * n_emb * n_emb * n_emb
-                        + static_cast<size_t>(n_lmo + a) * n_emb * n_emb
-                        + static_cast<size_t>(j_col) * n_emb
-                        + static_cast<size_t>(n_lmo + b);
-                    V[a * n_pao + b] = h_eri_ws[idx];
-                }
+            {
+                const dim3 block(16, 16);
+                const dim3 grid(
+                    static_cast<unsigned>((n_pao + 15) / 16),
+                    static_cast<unsigned>((n_pao + 15) / 16));
+                extract_V_block_kernel<<<grid, block>>>(
+                    d_eri_ws, d_V_ws, n_emb, n_lmo, n_pao, j_col);
+            }
+
+            std::vector<real_t> V(n_V, 0.0);
+            cudaMemcpy(V.data(), d_V_ws,
+                       n_V * sizeof(real_t), cudaMemcpyDeviceToHost);
 
             // Diagnostic pre-PNO MP2 in semi-canonical PAO basis.
             real_t E_pair_pao = 0.0;
@@ -323,7 +412,7 @@ DLPNOLMP2Result solve_dlpno_lmp2(
                         / (eps_a[b] + eps_a[a] - s.F_ii - s.F_jj);
                     E_pair_pao += Vab * (2.0 * Tab - Tba);
                 }
-            E_pao_total += pair_factor * E_pair_pao;
+            E_pao_total_par += pair_factor * E_pair_pao;
 
             // Cache invariants for SC-PNO rounds.
             s.C_can_pair.assign(
@@ -333,21 +422,26 @@ DLPNOLMP2Result solve_dlpno_lmp2(
             s.eps_a = std::move(fdec.eigvals);
             s.V     = std::move(V);
 
-            pair_lookup[i * nocc_ + j] =
-                pair_lookup[j * nocc_ + i] =
-                    static_cast<int>(setups.size());
-            setups.push_back(std::move(s));
+            setups[static_cast<size_t>(idx)] = std::move(s);
         }
+
+        // Step S2a — release per-thread workspaces (one cudaMalloc per
+        // buffer per thread, reused across the thread's pair slice).
+        if (d_C_pair_ws) tracked_cudaFree(d_C_pair_ws);
+        if (d_eri_ws)    tracked_cudaFree(d_eri_ws);
+        if (d_V_ws)      tracked_cudaFree(d_V_ws);
     }
+
+    n_pao_kept_sum = n_pao_kept_sum_par;
+    E_pao_total    = E_pao_total_par;
+
+    // Restore device 0 as the active device (parallel region may have
+    // left thread 0 on a non-zero device on entry, but threads other
+    // than 0 set their own device above — the main thread's device is
+    // unchanged for num_gpus > 1 since the master thread is tid 0).
+    if (num_gpus > 1) cudaSetDevice(0);
     dt_pair_setup += std::chrono::duration<double>(
         clock::now() - t_pair_setup_0).count();
-
-    // Step 6.3c: release the build_mo_eri output workspace.
-    if (d_eri_ws) {
-        tracked_cudaFree(d_eri_ws);
-        d_eri_ws = nullptr;
-    }
-    h_eri_ws.reset();
 
     // -----------------------------------------------------------------------
     // 5. Initial PairData (round 0): semi-canonical T_pao seeds the PNO
@@ -388,6 +482,88 @@ DLPNOLMP2Result solve_dlpno_lmp2(
                   << "  avg n_pno=" << avg_pno
                   << "  E(PAO)=" << std::scientific << std::setprecision(8)
                   << E_pao_total << std::endl;
+
+        // Per-stage T2 amplitude count reduction + per-pair (i,j) workload
+        // distribution. Useful for sizing parallel slabs and estimating
+        // load balance. Counts include the (i,j)↔(j,i) symmetry expansion
+        // via pair_factor so they are comparable to canonical = nocc²·nvir².
+        const int    nvir = nao_ - nocc_;
+        const size_t canonical_T2 = static_cast<size_t>(nocc_) * nocc_
+                                  * static_cast<size_t>(nvir) * nvir;
+        size_t pao_T2 = 0, pno_T2 = 0;
+        int n_pao_min = std::numeric_limits<int>::max();
+        int n_pao_max = 0;
+        int n_pno_min = std::numeric_limits<int>::max();
+        int n_pno_max = 0;
+        int n_pao_empty = 0, n_pno_empty = 0;
+        std::vector<int> n_pao_vec, n_pno_vec_nz;
+        n_pao_vec.reserve(setups.size());
+        n_pno_vec_nz.reserve(setups.size());
+        for (size_t idx = 0; idx < setups.size(); ++idx) {
+            const int npao = setups[idx].n_pao;
+            const int npno = pairs[idx].n_pno;
+            const auto pf  = static_cast<size_t>(setups[idx].pair_factor);
+            pao_T2 += pf * static_cast<size_t>(npao) * npao;
+            pno_T2 += pf * static_cast<size_t>(npno) * npno;
+            n_pao_vec.push_back(npao);
+            if (npao == 0) ++n_pao_empty;
+            else {
+                if (npao < n_pao_min) n_pao_min = npao;
+                if (npao > n_pao_max) n_pao_max = npao;
+            }
+            if (npno == 0) ++n_pno_empty;
+            else {
+                if (npno < n_pno_min) n_pno_min = npno;
+                if (npno > n_pno_max) n_pno_max = npno;
+                n_pno_vec_nz.push_back(npno);
+            }
+        }
+        if (n_pao_empty == static_cast<int>(setups.size())) n_pao_min = 0;
+        if (n_pno_vec_nz.empty()) n_pno_min = 0;
+        auto median_of = [](std::vector<int>& v) -> int {
+            if (v.empty()) return 0;
+            std::nth_element(v.begin(), v.begin() + v.size()/2, v.end());
+            return v[v.size()/2];
+        };
+        const int n_pao_med = median_of(n_pao_vec);
+        const int n_pno_med = median_of(n_pno_vec_nz);
+        const double r_pao = canonical_T2 ? double(pao_T2) / canonical_T2 : 0.0;
+        const double r_pno = canonical_T2 ? double(pno_T2) / canonical_T2 : 0.0;
+        const double r_pno_pao = pao_T2 ? double(pno_T2) / double(pao_T2) : 0.0;
+        std::cout << "[DLPNO-MP2] T2 amplitude count reduction"
+                  << " (full (i,j) count, vs canonical nocc^2*nvir^2):\n"
+                  << "  canonical  = " << canonical_T2
+                  << "  (nocc=" << nocc_ << ", nvir=" << nvir << ")\n"
+                  << "  PAO domain = " << pao_T2
+                  << "  ratio=" << std::scientific << std::setprecision(3) << r_pao
+                  << "  (1/" << std::fixed << std::setprecision(1)
+                  << (r_pao > 0.0 ? 1.0 / r_pao : 0.0) << "x)\n"
+                  << "  PNO        = " << pno_T2
+                  << "  ratio=" << std::scientific << std::setprecision(3) << r_pno
+                  << "  (1/" << std::fixed << std::setprecision(1)
+                  << (r_pno > 0.0 ? 1.0 / r_pno : 0.0) << "x of canonical, 1/"
+                  << (r_pno_pao > 0.0 ? 1.0 / r_pno_pao : 0.0) << "x of PAO)"
+                  << std::endl;
+        std::cout << "[DLPNO-MP2] per-pair (i,j) variable count stats"
+                  << "  (parallelization reference):\n"
+                  << "  n_pao  min=" << n_pao_min
+                  << " max=" << n_pao_max
+                  << " avg=" << std::fixed << std::setprecision(1) << avg_pao
+                  << " med=" << n_pao_med
+                  << " empty=" << n_pao_empty << "/" << setups.size() << "\n"
+                  << "  n_pno  min=" << n_pno_min
+                  << " max=" << n_pno_max
+                  << " avg=" << std::fixed << std::setprecision(1) << avg_pno
+                  << " med=" << n_pno_med
+                  << " empty=" << n_pno_empty << "/" << setups.size()
+                  << "  (max workload n_pno^2=" << (n_pno_max * n_pno_max)
+                  << ", peak/avg^2="
+                  << std::fixed << std::setprecision(1)
+                  << (avg_pno > 0.0
+                      ? double(n_pno_max * n_pno_max) / (avg_pno * avg_pno)
+                      : 0.0)
+                  << "x)"
+                  << std::endl;
     }
 
     // -----------------------------------------------------------------------

@@ -174,6 +174,21 @@ inline Phase24Integrals precompute_phase24_integrals(
 #endif
         if (num_gpus > 1) cudaSetDevice(tid);
 
+        // Step S7a — per-thread workspace reuse + pinned host staging.
+        //   d_C_ext_ws : packed (nao × n_emb) C_ext, capacity-grow
+        //   d_eri_ws   : full n_emb⁴ MO ERI output buffer, capacity-grow
+        //   h_eri_ws   : pinned host mirror of d_eri_ws, capacity-grow
+        //                (replaces the per-pair `std::vector<real_t>(n_emb⁴, 0)`
+        //                 which paid ~1.6 GB pageable alloc + zero-init +
+        //                 ~5 GB/s pageable D2H — pinned hits ~12-25 GB/s with
+        //                 no per-pair allocation overhead).
+        // All three are freed at the end of the parallel region.
+        real_t* d_C_ext_ws        = nullptr;
+        real_t* d_eri_ws          = nullptr;
+        real_t* h_eri_ws          = nullptr;  // pinned
+        size_t  ws_C_ext_capacity = 0;
+        size_t  ws_eri_capacity   = 0;
+
     #pragma omp for schedule(static, 1)
     for (long long idx = 0; idx < static_cast<long long>(n_pairs); ++idx) {
         const PairSetup& s = res.setups[idx];
@@ -195,23 +210,41 @@ inline Phase24Integrals precompute_phase24_integrals(
                     p.bar_Q[mu * n_pno + a];
         }
 
-        real_t* d_C_ext = nullptr;
-        tracked_cudaMalloc(&d_C_ext,
-            static_cast<size_t>(nao) * n_emb * sizeof(real_t));
-        cudaMemcpy(d_C_ext, C_ext.data(),
-            static_cast<size_t>(nao) * n_emb * sizeof(real_t),
-            cudaMemcpyHostToDevice);
-        real_t* d_eri_mo = eri.build_mo_eri(d_C_ext, n_emb);
+        // Step S7a — grow d_C_ext workspace if this pair is bigger.
+        const size_t n_C_ext = static_cast<size_t>(nao) * n_emb;
+        if (n_C_ext > ws_C_ext_capacity) {
+            if (d_C_ext_ws) tracked_cudaFree(d_C_ext_ws);
+            tracked_cudaMalloc(&d_C_ext_ws, n_C_ext * sizeof(real_t));
+            ws_C_ext_capacity = n_C_ext;
+        }
+        cudaMemcpy(d_C_ext_ws, C_ext.data(),
+            n_C_ext * sizeof(real_t), cudaMemcpyHostToDevice);
 
         const size_t n_emb2 = static_cast<size_t>(n_emb) * n_emb;
         const size_t n_emb3 = n_emb2 * n_emb;
         const size_t n_emb4 = n_emb3 * n_emb;
 
-        std::vector<real_t> h_eri_mo(n_emb4, 0.0);
-        cudaMemcpy(h_eri_mo.data(), d_eri_mo,
+        // Step S7a — grow d_eri / h_eri workspaces.
+        if (n_emb4 > ws_eri_capacity) {
+            if (d_eri_ws) tracked_cudaFree(d_eri_ws);
+            tracked_cudaMalloc(&d_eri_ws, n_emb4 * sizeof(real_t));
+            if (h_eri_ws) cudaFreeHost(h_eri_ws);
+            cudaMallocHost(&h_eri_ws, n_emb4 * sizeof(real_t));
+            ws_eri_capacity = n_emb4;
+        }
+
+        // Build MO ERI directly into the per-thread device workspace
+        // (avoids the legacy build_mo_eri's per-call cudaMalloc).
+        eri.build_mo_eri_into(d_C_ext_ws, n_emb, d_eri_ws);
+
+        // Pinned D2H — ~2-4× faster than the previous pageable
+        // std::vector<real_t> destination.
+        cudaMemcpy(h_eri_ws, d_eri_ws,
             n_emb4 * sizeof(real_t), cudaMemcpyDeviceToHost);
-        tracked_cudaFree(d_C_ext);
-        tracked_cudaFree(d_eri_mo);
+
+        // Alias so the (unchanged) host extracts below read from the
+        // pinned buffer instead of an owned std::vector.
+        const real_t* h_eri_mo = h_eri_ws;
 
         // Extract T_pair^{(ij)}[k, c, l, d]
         //   = 2 ERI[k, n_lmo+c, l, n_lmo+d] - ERI[k, n_lmo+d, l, n_lmo+c].
@@ -443,6 +476,12 @@ inline Phase24Integrals precompute_phase24_integrals(
 
         (void)s;  // s used above; suppress -Wunused if conditional.
     }
+
+    // Step S7a — release per-thread workspaces (one alloc per buffer
+    // per thread, reused across the thread's pair slice).
+    if (d_C_ext_ws) tracked_cudaFree(d_C_ext_ws);
+    if (d_eri_ws)   tracked_cudaFree(d_eri_ws);
+    if (h_eri_ws)   cudaFreeHost(h_eri_ws);
     }  // end omp parallel
     return out;
 }
@@ -485,6 +524,10 @@ real_t DLPNOCCSD::compute_energy()
 
     int n_strong = 0, n_weak = 0, n_empty = 0;
     real_t E_strong = 0.0, E_weak = 0.0;
+    size_t T2_strong = 0, T2_weak = 0;
+    std::vector<int> n_pno_strong, n_pno_weak;
+    n_pno_strong.reserve(res.setups.size());
+    n_pno_weak.reserve(res.setups.size());
 
     for (size_t idx = 0; idx < res.setups.size(); ++idx) {
         const PairSetup& s = res.setups[idx];
@@ -497,10 +540,14 @@ real_t DLPNOCCSD::compute_energy()
                              * (2.0 * p.Y[a * p.n_pno + b]
                                 - p.Y[b * p.n_pno + a]);
         const real_t e_pair = s.pair_factor * e_intrinsic;
+        const auto   pf     = static_cast<size_t>(s.pair_factor);
+        const size_t n2     = pf * static_cast<size_t>(p.n_pno) * p.n_pno;
         if (std::fabs(e_intrinsic) < params_.t_cut_pairs) {
-            ++n_weak;  E_weak  += e_pair;
+            ++n_weak;  E_weak  += e_pair; T2_weak  += n2;
+            n_pno_weak.push_back(p.n_pno);
         } else {
-            ++n_strong; E_strong += e_pair;
+            ++n_strong; E_strong += e_pair; T2_strong += n2;
+            n_pno_strong.push_back(p.n_pno);
         }
     }
 
@@ -511,6 +558,46 @@ real_t DLPNOCCSD::compute_energy()
                   << (n_empty > 0
                       ? "  (empty=" + std::to_string(n_empty) + ")" : "")
                   << std::endl;
+
+        // Per-group T2 amplitude counts (full (i,j) count via pair_factor)
+        // + per-pair n_pno stats. Strong pairs go through full CCSD T2
+        // iteration; weak pairs are frozen at MP2 amplitudes.
+        auto stat_line = [](const char* tag, int n_pairs,
+                            size_t t2, const std::vector<int>& v) {
+            int vmin = 0, vmax = 0, vmed = 0;
+            double vavg = 0.0;
+            if (!v.empty()) {
+                auto vv = v;
+                std::nth_element(vv.begin(), vv.begin() + vv.size()/2, vv.end());
+                vmed = vv[vv.size()/2];
+                long long sum = 0;
+                vmin = vv[0]; vmax = vv[0];
+                for (int x : vv) {
+                    sum += x;
+                    if (x < vmin) vmin = x;
+                    if (x > vmax) vmax = x;
+                }
+                vavg = double(sum) / v.size();
+            }
+            std::cout << "  " << tag
+                      << "  pairs=" << n_pairs
+                      << "  T2 elem=" << t2
+                      << "  n_pno: min=" << vmin
+                      << " max=" << vmax
+                      << " avg=" << std::fixed << std::setprecision(1) << vavg
+                      << " med=" << vmed;
+            if (n_pairs > 0) {
+                std::cout << "  workload max/avg^2="
+                          << std::fixed << std::setprecision(1)
+                          << (vavg > 0.0 ? double(vmax * vmax) / (vavg * vavg)
+                                         : 0.0)
+                          << "x";
+            }
+            std::cout << std::endl;
+        };
+        stat_line("strong (full CCSD T2):", n_strong, T2_strong, n_pno_strong);
+        if (n_weak > 0)
+            stat_line("weak   (MP2 only)   :", n_weak,   T2_weak,   n_pno_weak);
     }
 
     // Register pair stats so the post-HF summary can report them.

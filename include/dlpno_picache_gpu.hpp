@@ -190,7 +190,17 @@ private:
     // DGEMM filling d_pi_pad on device). No D2H. Used when skip_pi_cache_host
     // is requested via rebuild_with_stack so the host pi_cache_out can be
     // skipped while still feeding d_pi_pad to the pack kernel below.
+    // Step Z: throws if d_pi_pad is tiled (tile_size_ < N_act_ij_) — use
+    // rebuild_with_stack in that case, which orchestrates the tile loop.
     void rebuild_gpu_kernels_(const std::vector<std::vector<real_t>>& Y_old);
+
+    // Step Z helpers — split rebuild_gpu_kernels_ into per-iter Y prep
+    // and per-tile DGEMM compute, so the tile loop in rebuild_with_stack
+    // can interleave compute with pack into d_pi_T_stack and reuse the
+    // tile buffer for the next tile.
+    void pack_Y_and_transpose_(
+        const std::vector<std::vector<real_t>>& Y_old);
+    void compute_pi_tile_(int tile_start, int tile_end);
 
     // D2H d_pi_pad → h_pi_pad (slab range) and unpad into pi_cache_out.
     // Only called when the host pi_cache is actually needed downstream.
@@ -209,6 +219,28 @@ private:
     // turns the 34M outer×inner sweep on cholesterol into ~3.8M active calls.
     std::vector<int> active_i_kl_;
     std::vector<int> active_i_ij_;
+
+    // Step Z — compact storage support for the GPU path.
+    //
+    // The full N_pair × N_pair × max_n² padded layout for d_barS_pad and
+    // d_pi_pad is structurally infeasible at cholesterol scale (5886² ·
+    // 26² · 8 = 175 GB per buffer). Step Z stores only the active
+    // (i_ij, i_kl) sub-grid (n_active² × max_n² ≈ 20 GB at cholesterol)
+    // and additionally tiles d_pi_pad in the active_i_ij dimension so it
+    // fits in ~5 GB at any moment.
+    //
+    //   active_kl_pos_[i_kl] = position of i_kl in active_i_kl_, or -1
+    //                          if i_kl has n_pno = 0.
+    //   active_ij_pos_[i_ij] = position of i_ij in active_i_ij_, or -1
+    //                          if i_ij is outside the slab or has n_pno = 0.
+    //   tile_size_           = number of active i_ij rows that d_pi_pad
+    //                          can hold at once (chosen at construction
+    //                          from free GPU memory).
+    std::vector<int> active_kl_pos_;
+    std::vector<int> active_ij_pos_;
+    int N_act_ij_ = 0;
+    int N_act_kl_ = 0;
+    int tile_size_ = 0;
 
     // Step 6.1 metadata captured at construction (used by both GPU and
     // CPU fallback paths of build_stack_cpu_).

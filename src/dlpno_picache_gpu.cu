@@ -45,6 +45,48 @@ inline void check_cublas_(cublasStatus_t s, const char* what) {
     }
 }
 
+// Step S1 + Step Z — GPU scatter kernel for compact barS_pad.
+//
+// Source layout (`d_barS_flat`, contiguous per active (i_ij, i_kl) pair):
+//   d_barS_flat[d_block_src_off[bi] + r·n_kl + c] = barS[i_ij][i_kl](r, c)
+// where bi = ai · N_act_kl + ak, with active_i_ij_[ai] = i_ij,
+// active_i_kl_[ak] = i_kl. Only active pairs (n_pno > 0) are included.
+//
+// Destination (`d_barS_pad`, COMPACT [N_act_ij · N_act_kl · max_n²]):
+//   d_barS_pad[(ai · N_act_kl + ak) · max_n² + r·max_n + c] = barS(r, c)
+//
+// Padding (rows/cols past n_ij / n_kl) is pre-zeroed by cudaMemset before
+// the kernel.
+__global__ void scatter_barS_kernel(
+    const real_t* __restrict__ d_barS_flat,
+    const size_t* __restrict__ d_block_src_off,
+    const int*    __restrict__ d_n_pno_active_ij,  // n_pno indexed by ai
+    const int*    __restrict__ d_n_pno_active_kl,  // n_pno indexed by ak
+    real_t*       __restrict__ d_barS_pad,
+    int N_act_kl, int max_n)
+{
+    const int ai = blockIdx.x;
+    const int ak = blockIdx.y;
+
+    const int n_ij = d_n_pno_active_ij[ai];
+    const int n_kl = d_n_pno_active_kl[ak];
+    if (n_ij == 0 || n_kl == 0) return;
+
+    const size_t bi      = static_cast<size_t>(ai) * N_act_kl + ak;
+    const size_t src_off = d_block_src_off[bi];
+    const size_t dst_off = bi
+                         * static_cast<size_t>(max_n)
+                         * static_cast<size_t>(max_n);
+
+    for (int r = threadIdx.y; r < n_ij; r += blockDim.y) {
+        const size_t dst_row = dst_off + static_cast<size_t>(r) * max_n;
+        const size_t src_row = src_off + static_cast<size_t>(r) * n_kl;
+        for (int c = threadIdx.x; c < n_kl; c += blockDim.x) {
+            d_barS_pad[dst_row + c] = d_barS_flat[src_row + c];
+        }
+    }
+}
+
 } // anonymous namespace
 
 struct PiCacheGpu::Impl {
@@ -81,6 +123,15 @@ struct PiCacheGpu::Impl {
     real_t*  h_pi_T_stack  = nullptr;     // pinned mirror
     size_t   pi_T_stack_total = 0;        // sum of n_pno²·nocc²
 
+    // Step Z stacked-mode buffers — orig idx → compact active position.
+    int*     d_active_ij_pos = nullptr;   // [N_pair]
+    int*     d_active_kl_pos = nullptr;   // [N_pair]
+
+    // Step Z — ak → orig pair idx (for the transpose kernel writing to
+    // d_Y_pad_T at the original pair offset). Allocated in the always-on
+    // GPU init block (not stacked-mode-specific).
+    int*     d_active_i_kl   = nullptr;   // [N_act_kl_]
+
     // Borrowed cuBLAS handle (thread_local from GPUHandle).
     cublasHandle_t cublas = nullptr;
 
@@ -98,12 +149,17 @@ struct PiCacheGpu::Impl {
         if (d_idx_offset)  cudaFree(d_idx_offset);
         if (d_pi_T_stack)  cudaFree(d_pi_T_stack);
         if (h_pi_T_stack)  cudaFreeHost(h_pi_T_stack);
+        if (d_active_ij_pos) cudaFree(d_active_ij_pos);
+        if (d_active_kl_pos) cudaFree(d_active_kl_pos);
+        if (d_active_i_kl)   cudaFree(d_active_i_kl);
         d_barS_pad = d_Y_pad = d_Y_pad_T = d_half_pad = d_pi_pad = nullptr;
         h_Y_pad = h_pi_pad = nullptr;
         d_pair_lookup = d_setup_i = d_n_pno = nullptr;
         d_idx_offset = nullptr;
         d_pi_T_stack = nullptr;
         h_pi_T_stack = nullptr;
+        d_active_ij_pos = d_active_kl_pos = nullptr;
+        d_active_i_kl = nullptr;
     }
 };
 
@@ -128,32 +184,53 @@ struct PiCacheGpu::Impl {
 // TEOS scale. The point is to convert the strided column-wise reads of
 // d_Y_pad in `oooo_lad_kernel` Phase 1 into sequential row-wise reads of
 // d_Y_pad_T, restoring L1 cache-line efficiency.
+//
+// Step Z: d_Y_pad is now COMPACT (indexed by active position ak), but
+// d_Y_pad_T must remain FULL (N_pair × max_n²) because oooo_lad_kernel
+// in ResidGpu indexes it by orig pair idx (i_ij). This kernel reads
+// d_Y_pad at the compact position d_active_i_kl[ak], and writes the
+// transpose to d_Y_pad_T at the ORIGINAL pair idx. Inactive pairs are
+// left at zero (pre-set by cudaMemset in the constructor).
 __global__ void transpose_Y_pad_kernel(
-    const real_t* __restrict__ d_Y_pad,
-    real_t*       __restrict__ d_Y_pad_T,
-    int N_pair, int max_n)
+    const real_t* __restrict__ d_Y_pad,           // compact: indexed by ak
+    real_t*       __restrict__ d_Y_pad_T,         // FULL: indexed by orig
+    const int*    __restrict__ d_active_i_kl,     // ak → orig
+    int N_act_kl, int max_n)
 {
-    const int idx = blockIdx.x;
-    if (idx >= N_pair) return;
-    const size_t pair_off = static_cast<size_t>(idx)
-                          * static_cast<size_t>(max_n)
-                          * static_cast<size_t>(max_n);
+    const int ak = blockIdx.x;
+    if (ak >= N_act_kl) return;
+    const int orig_idx = d_active_i_kl[ak];
+    const size_t src_off = static_cast<size_t>(ak)
+                         * static_cast<size_t>(max_n)
+                         * static_cast<size_t>(max_n);
+    const size_t dst_off = static_cast<size_t>(orig_idx)
+                         * static_cast<size_t>(max_n)
+                         * static_cast<size_t>(max_n);
     for (int r = threadIdx.y; r < max_n; r += blockDim.y) {
         for (int c = threadIdx.x; c < max_n; c += blockDim.x) {
-            d_Y_pad_T[pair_off + static_cast<size_t>(r) * max_n + c] =
-                d_Y_pad[pair_off + static_cast<size_t>(c) * max_n + r];
+            d_Y_pad_T[dst_off + static_cast<size_t>(r) * max_n + c] =
+                d_Y_pad[src_off + static_cast<size_t>(c) * max_n + r];
         }
     }
 }
 
+// Step Z — d_pi_pad is now COMPACT + TILED:
+//   d_pi_pad[(ai_in_tile · N_act_kl + ak) · max_n² + r·max_n + c]
+// with ai_in_tile = active_ij_pos_[i_ij] - tile_start and
+// ak = active_kl_pos_[idx_kl]. Empty (i_ij, idx_kl) pairs (active_*_pos = -1)
+// contribute zero to d_pi_T_stack. The kernel reads d_active_ij_pos /
+// d_active_kl_pos to translate orig indices into compact-tile coordinates.
 __global__ void pack_pi_T_stack_kernel(
-    const real_t* __restrict__ d_pi_pad,
+    const real_t* __restrict__ d_pi_pad,            // tile compact
     const int*    __restrict__ d_pair_lookup,
     const int*    __restrict__ d_setup_i,
     const int*    __restrict__ d_n_pno,
     const size_t* __restrict__ d_idx_offset,
+    const int*    __restrict__ d_active_ij_pos,     // orig i_ij → active ai (-1)
+    const int*    __restrict__ d_active_kl_pos,     // orig i_kl → active ak (-1)
     real_t*       __restrict__ d_pi_T_stack,
-    int N_pair, int nocc, int max_n)
+    int N_pair, int nocc, int max_n,
+    int N_act_kl, int tile_start, int tile_end)
 {
     const int i_ij = blockIdx.x;
     const int kl   = blockIdx.y;          // = k * nocc + l
@@ -162,21 +239,25 @@ __global__ void pack_pi_T_stack_kernel(
     const int n_ij = d_n_pno[i_ij];
     if (n_ij == 0) return;
 
+    // Tile range check: skip pairs not in this tile.
+    const int ai = d_active_ij_pos[i_ij];
+    if (ai < tile_start || ai >= tile_end) return;
+    const int ai_in_tile = ai - tile_start;
+
     const int idx_kl = d_pair_lookup[kl];
     const int n_kl   = d_n_pno[idx_kl];
     const int k      = kl / nocc;
     const int s_i_kl = d_setup_i[idx_kl];
+    const int ak     = d_active_kl_pos[idx_kl];  // -1 if n_kl == 0
 
-    // Step 6.6 fix — block (TILE × TILE) with strided per-thread loop so
-    // we never exceed CUDA's 1024 threads/block when max_n > 32 (small
-    // dense molecules like Benzene cc-pVDZ have max_n ~ 30-50).
     for (int a = threadIdx.y; a < n_ij; a += blockDim.y) {
         for (int d = threadIdx.x; d < n_ij; d += blockDim.x) {
             real_t v = real_t(0);
-            if (n_kl > 0) {
+            if (n_kl > 0 && ak >= 0) {
                 const real_t* src = d_pi_pad
-                    + (static_cast<size_t>(i_ij) * static_cast<size_t>(N_pair)
-                       + static_cast<size_t>(idx_kl))
+                    + (static_cast<size_t>(ai_in_tile)
+                       * static_cast<size_t>(N_act_kl)
+                       + static_cast<size_t>(ak))
                     * static_cast<size_t>(max_n) * static_cast<size_t>(max_n);
                 if (s_i_kl != k) {
                     v = src[static_cast<size_t>(d) * max_n + static_cast<size_t>(a)];
@@ -248,6 +329,20 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
         if (n_pno_[k] > 0) active_i_ij_.push_back(k);
     }
 
+    // Step Z — compact storage maps. active_*_pos_[orig_idx] gives the
+    // position of orig_idx in active_i_*_, or -1 if the pair is empty /
+    // outside the slab.
+    N_act_ij_ = static_cast<int>(active_i_ij_.size());
+    N_act_kl_ = static_cast<int>(active_i_kl_.size());
+    active_kl_pos_.assign(static_cast<size_t>(N_pair_), -1);
+    for (int ak = 0; ak < N_act_kl_; ++ak) {
+        active_kl_pos_[active_i_kl_[ak]] = ak;
+    }
+    active_ij_pos_.assign(static_cast<size_t>(N_pair_), -1);
+    for (int ai = 0; ai < N_act_ij_; ++ai) {
+        active_ij_pos_[active_i_ij_[ai]] = ai;
+    }
+
 #ifndef GANSU_CPU_ONLY
     // Decide whether to take the GPU path.
     if (!gpu::gpu_available() || N_pair_ == 0 || max_n_ == 0) {
@@ -267,15 +362,37 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
     s.max_n       = max_n_;
     s.nocc        = nocc_;
     s.stride_pair = static_cast<long long>(max_n_) * max_n_;
-    s.stride_outer = s.stride_pair * static_cast<long long>(N_pair_);
+    // Note: stride_outer no longer used by Step Z compact path but kept
+    // populated for any legacy reader. Compact strides are below.
+    s.stride_outer = s.stride_pair * static_cast<long long>(N_act_kl_);
 
-    const size_t n_pair_pair = static_cast<size_t>(N_pair_)
-                             * static_cast<size_t>(N_pair_);
-    const size_t bytes_full  = n_pair_pair * static_cast<size_t>(max_n_)
-                             * static_cast<size_t>(max_n_) * sizeof(real_t);
-    const size_t bytes_outer = static_cast<size_t>(N_pair_)
-                             * static_cast<size_t>(max_n_)
-                             * static_cast<size_t>(max_n_) * sizeof(real_t);
+    // ----------------------------------------------------------------------
+    // Step Z — compact + tiled buffer sizing.
+    //
+    //   d_barS_pad : compact [N_act_ij × N_act_kl × max_n²] (~20 GB cholesterol)
+    //   d_Y_pad    : compact [N_act_kl × max_n²]  (~tiny, internal use only)
+    //   d_Y_pad_T  : FULL    [N_pair    × max_n²]  (~32 MB cholesterol; oooo_lad
+    //                in ResidGpu reads it by orig pair idx, so must be full)
+    //   d_half_pad : per-output-row scratch [N_act_kl × max_n²]
+    //   d_pi_pad   : tile [tile_size × N_act_kl × max_n²] (~few GB)
+    //   d_pi_T_stack: full sparse [Σ n_pno²·nocc²]  (unchanged)
+    //
+    // The full N_pair²·max_n² padded layout (~175 GB at cholesterol) is
+    // structurally infeasible; even compact (~20 GB each) two of them +
+    // pi_T (~21 GB) exceeds 55 GB free. Tiling d_pi_pad in the active i_ij
+    // dimension is what brings total need below the device budget.
+    // ----------------------------------------------------------------------
+    const size_t bytes_barS_compact =
+        static_cast<size_t>(N_act_ij_) * static_cast<size_t>(N_act_kl_)
+        * static_cast<size_t>(max_n_) * static_cast<size_t>(max_n_)
+        * sizeof(real_t);
+    const size_t bytes_Y_compact =
+        static_cast<size_t>(N_act_kl_) * static_cast<size_t>(max_n_)
+        * static_cast<size_t>(max_n_) * sizeof(real_t);
+    const size_t bytes_Y_T_full =
+        static_cast<size_t>(N_pair_) * static_cast<size_t>(max_n_)
+        * static_cast<size_t>(max_n_) * sizeof(real_t);
+    const size_t per_pi_row_bytes = bytes_Y_compact;  // = N_act_kl × max_n² × 8
 
     // Step 6.1 stacked-mode budget (only when pair_lookup + setup_i + nocc>0).
     const bool want_stacked = pair_lookup && setup_i_per_pair && nocc_ > 0
@@ -293,30 +410,85 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
     }
     const size_t bytes_pi_T = pi_T_total * sizeof(real_t);
 
-    // Probe free memory; we need 2 × bytes_full + 2 × bytes_outer + bytes_pi_T
-    // plus a safety margin. Fall back if not enough.
+    // Probe free memory and choose tile_size_ so d_pi_pad fits.
     {
         size_t free_b = 0, total_b = 0;
         if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
             delete p_; p_ = nullptr; active_ = false; return;
         }
-        // Step 6.7: +1 outer (d_Y_pad_T) for oooo_lad coalescing.
-        const size_t need = 2 * bytes_full + 3 * bytes_outer + bytes_pi_T
-                          + (size_t)64 * 1024 * 1024;  // 64 MB margin
-        if (need > free_b) {
+        // Fixed needs (everything except d_pi_pad):
+        //   d_barS_pad + d_Y_pad + d_Y_pad_T (full) + d_half_pad + d_pi_T_stack + margin
+        const size_t margin = (size_t)256 * 1024 * 1024;  // 256 MB
+        const size_t fixed_need = bytes_barS_compact
+                                + bytes_Y_compact      // d_Y_pad
+                                + bytes_Y_T_full       // d_Y_pad_T (FULL)
+                                + bytes_Y_compact      // d_half_pad
+                                + bytes_pi_T
+                                + margin;
+        if (fixed_need > free_b || N_act_ij_ == 0) {
+            // Even without d_pi_pad we don't fit, or no active pairs to compute.
             delete p_; p_ = nullptr; active_ = false; return;
         }
+        const size_t avail_for_pi = free_b - fixed_need;
+        if (per_pi_row_bytes == 0) {
+            delete p_; p_ = nullptr; active_ = false; return;
+        }
+        // Tile up to N_act_ij_ rows; cap at avail_for_pi.
+        size_t max_tile = avail_for_pi / per_pi_row_bytes;
+        if (max_tile == 0) {
+            delete p_; p_ = nullptr; active_ = false; return;
+        }
+        if (max_tile > static_cast<size_t>(N_act_ij_)) {
+            max_tile = static_cast<size_t>(N_act_ij_);
+        }
+        // Cap tile size at a reasonable upper bound to avoid huge transient
+        // buffers (~8 GB) — beyond that, returns from larger tile diminish.
+        const size_t cap_tile_bytes = (size_t)8 * 1024 * 1024 * 1024;  // 8 GB
+        if (max_tile * per_pi_row_bytes > cap_tile_bytes) {
+            max_tile = cap_tile_bytes / per_pi_row_bytes;
+            if (max_tile == 0) max_tile = 1;
+        }
+        tile_size_ = static_cast<int>(max_tile);
     }
+    const size_t bytes_pi_tile =
+        static_cast<size_t>(tile_size_) * per_pi_row_bytes;
 
     try {
-        check_cuda_(cudaMalloc(&s.d_barS_pad, bytes_full),  "cudaMalloc d_barS_pad");
-        check_cuda_(cudaMalloc(&s.d_pi_pad,   bytes_full),  "cudaMalloc d_pi_pad");
-        check_cuda_(cudaMalloc(&s.d_Y_pad,    bytes_outer), "cudaMalloc d_Y_pad");
-        check_cuda_(cudaMalloc(&s.d_Y_pad_T,  bytes_outer), "cudaMalloc d_Y_pad_T");
-        check_cuda_(cudaMalloc(&s.d_half_pad, bytes_outer), "cudaMalloc d_half_pad");
+        check_cuda_(cudaMalloc(&s.d_barS_pad, bytes_barS_compact),
+                    "cudaMalloc d_barS_pad (compact)");
+        check_cuda_(cudaMalloc(&s.d_pi_pad,   bytes_pi_tile),
+                    "cudaMalloc d_pi_pad (tile)");
+        check_cuda_(cudaMalloc(&s.d_Y_pad,    bytes_Y_compact),
+                    "cudaMalloc d_Y_pad (compact)");
+        check_cuda_(cudaMalloc(&s.d_Y_pad_T,  bytes_Y_T_full),
+                    "cudaMalloc d_Y_pad_T (full N_pair)");
+        // Step Z: zero-init d_Y_pad_T (full); transpose kernel only writes
+        // active positions, so inactive pair slots stay at zero.
+        check_cuda_(cudaMemset(s.d_Y_pad_T, 0, bytes_Y_T_full),
+                    "cudaMemset d_Y_pad_T");
+        check_cuda_(cudaMalloc(&s.d_half_pad, bytes_Y_compact),
+                    "cudaMalloc d_half_pad (compact)");
 
-        check_cuda_(cudaMallocHost(&s.h_Y_pad,  bytes_outer), "cudaMallocHost h_Y_pad");
-        check_cuda_(cudaMallocHost(&s.h_pi_pad, bytes_full),  "cudaMallocHost h_pi_pad");
+        check_cuda_(cudaMallocHost(&s.h_Y_pad,  bytes_Y_compact),
+                    "cudaMallocHost h_Y_pad (compact)");
+
+        // Step Z — persistent active_i_kl map for the transpose kernel.
+        if (N_act_kl_ > 0) {
+            check_cuda_(cudaMalloc(&s.d_active_i_kl,
+                            static_cast<size_t>(N_act_kl_) * sizeof(int)),
+                        "cudaMalloc d_active_i_kl");
+            check_cuda_(cudaMemcpy(s.d_active_i_kl, active_i_kl_.data(),
+                            static_cast<size_t>(N_act_kl_) * sizeof(int),
+                            cudaMemcpyHostToDevice),
+                        "H2D d_active_i_kl");
+        }
+        // Step S1: defer the 692 MB (hexamer) / 60 GB (cholesterol) pinned
+        // allocation of h_pi_pad until the first call to download_pi_cache_,
+        // which is bypassed entirely by Step 6's stacked-mode +
+        // skip_pi_cache_host=true path. cudaMallocHost of large buffers can
+        // dominate setup_pgpu (~200-500 ms for 692 MB pinning on Linux), and
+        // is pure waste when the CCSD T2 iter never asks for the host pi
+        // cache. download_pi_cache_ allocates on demand.
     } catch (const std::exception&) {
         s.free_all();
         delete p_; p_ = nullptr; active_ = false;
@@ -372,18 +544,36 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
                                    cudaMemcpyHostToDevice),
                         "H2D idx_offset");
 
+            // Step Z — active position maps on device for the pack kernel.
+            check_cuda_(cudaMalloc(&s.d_active_ij_pos,
+                                   static_cast<size_t>(N_pair_) * sizeof(int)),
+                        "cudaMalloc d_active_ij_pos");
+            check_cuda_(cudaMalloc(&s.d_active_kl_pos,
+                                   static_cast<size_t>(N_pair_) * sizeof(int)),
+                        "cudaMalloc d_active_kl_pos");
+            check_cuda_(cudaMemcpy(s.d_active_ij_pos, active_ij_pos_.data(),
+                                   static_cast<size_t>(N_pair_) * sizeof(int),
+                                   cudaMemcpyHostToDevice),
+                        "H2D d_active_ij_pos");
+            check_cuda_(cudaMemcpy(s.d_active_kl_pos, active_kl_pos_.data(),
+                                   static_cast<size_t>(N_pair_) * sizeof(int),
+                                   cudaMemcpyHostToDevice),
+                        "H2D d_active_kl_pos");
+
             s.pi_T_stack_total = pi_T_total;
             stacked_ = true;
         } catch (const std::exception&) {
             // Free stacked-mode buffers; keep Step 6.0 buffers — caller can
             // still use rebuild() and rebuild_with_stack() falls back to CPU
             // pi_T_stack assembly internally.
-            if (s.d_pair_lookup) { cudaFree(s.d_pair_lookup); s.d_pair_lookup = nullptr; }
-            if (s.d_setup_i)     { cudaFree(s.d_setup_i);     s.d_setup_i     = nullptr; }
-            if (s.d_n_pno)       { cudaFree(s.d_n_pno);       s.d_n_pno       = nullptr; }
-            if (s.d_idx_offset)  { cudaFree(s.d_idx_offset);  s.d_idx_offset  = nullptr; }
-            if (s.d_pi_T_stack)  { cudaFree(s.d_pi_T_stack);  s.d_pi_T_stack  = nullptr; }
-            if (s.h_pi_T_stack)  { cudaFreeHost(s.h_pi_T_stack); s.h_pi_T_stack = nullptr; }
+            if (s.d_pair_lookup)    { cudaFree(s.d_pair_lookup);    s.d_pair_lookup    = nullptr; }
+            if (s.d_setup_i)        { cudaFree(s.d_setup_i);        s.d_setup_i        = nullptr; }
+            if (s.d_n_pno)          { cudaFree(s.d_n_pno);          s.d_n_pno          = nullptr; }
+            if (s.d_idx_offset)     { cudaFree(s.d_idx_offset);     s.d_idx_offset     = nullptr; }
+            if (s.d_pi_T_stack)     { cudaFree(s.d_pi_T_stack);     s.d_pi_T_stack     = nullptr; }
+            if (s.h_pi_T_stack)     { cudaFreeHost(s.h_pi_T_stack); s.h_pi_T_stack     = nullptr; }
+            if (s.d_active_ij_pos)  { cudaFree(s.d_active_ij_pos);  s.d_active_ij_pos  = nullptr; }
+            if (s.d_active_kl_pos)  { cudaFree(s.d_active_kl_pos);  s.d_active_kl_pos  = nullptr; }
             stacked_ = false;
         }
     }
@@ -405,41 +595,144 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
         return;
     }
 
-    // -------- Pad host barS into a contiguous [N_pair·N_pair·max_n²] buffer.
-    // Layout: idx = (i_ij·N_pair + i_kl)·max_n² + r·max_n + c
+    // -------- Step S1: GPU scatter from compact host pack.
+    //
+    // Replaces the 692 MB host-side padded buffer (`h_barS_pad`) + the
+    // N_pair² × memcpy loop with a flat pack of active blocks only (~30
+    // MB at hexamer, ~25× smaller) + pinned H2D + a single device
+    // scatter kernel. Savings sources:
+    //   - 692 MB std::vector zero-init on host (~14 ms cold)        gone
+    //   - N_pair² small-block memcpy loop (~200-300 ms cache-cold)  gone
+    //   - 692 MB pageable H2D (~170 ms at PCIe4)                    → 30 MB pinned (~3 ms)
+    //   - Padding region (where blocks don't reach max_n) filled by cudaMemset on
+    //     device (~ms at H200 bandwidth) instead of host zero-init.
+    //
+    // Layout: d_barS_pad[(i_ij·N_pair + i_kl)·max_n² + r·max_n + c]
     //         row-major within each (max_n × max_n) padded block.
-    std::vector<real_t> h_barS_pad(n_pair_pair
-                                   * static_cast<size_t>(max_n_)
-                                   * static_cast<size_t>(max_n_),
-                                   real_t{0});
+    {
+        const int N_act_ij = static_cast<int>(active_i_ij_.size());
+        const int N_act_kl = static_cast<int>(active_i_kl_.size());
 
-    #pragma omp parallel for schedule(static)
-    for (long long i_ij = 0; i_ij < static_cast<long long>(N_pair_); ++i_ij) {
-        const int n_ij = n_pno_[i_ij];
-        if (n_ij == 0) continue;
-        for (int i_kl = 0; i_kl < N_pair_; ++i_kl) {
-            const int n_kl = n_pno_[i_kl];
-            if (n_kl == 0) continue;
-            const RowMatXd& bs = barS_cache[i_ij][i_kl];
-            // Skip empties defensively (a 0×0 with size 0).
-            if (bs.rows() == 0 || bs.cols() == 0) continue;
-            const size_t base = (static_cast<size_t>(i_ij)
-                               * static_cast<size_t>(N_pair_)
-                               + static_cast<size_t>(i_kl))
-                              * static_cast<size_t>(max_n_)
-                              * static_cast<size_t>(max_n_);
-            for (int r = 0; r < n_ij; ++r) {
-                std::memcpy(&h_barS_pad[base + static_cast<size_t>(r) * max_n_],
-                            bs.data() + static_cast<ptrdiff_t>(r) * n_kl,
-                            static_cast<size_t>(n_kl) * sizeof(real_t));
+        if (N_act_ij > 0 && N_act_kl > 0) {
+            const size_t n_blocks =
+                static_cast<size_t>(N_act_ij) * static_cast<size_t>(N_act_kl);
+
+            // Cumulative source offsets for each active (i_ij, i_kl) block.
+            std::vector<size_t> block_src_off(n_blocks + 1, 0);
+            for (int ai = 0; ai < N_act_ij; ++ai) {
+                const int n_ij = n_pno_[active_i_ij_[ai]];
+                for (int ak = 0; ak < N_act_kl; ++ak) {
+                    const int n_kl = n_pno_[active_i_kl_[ak]];
+                    const size_t bi =
+                        static_cast<size_t>(ai) * N_act_kl + ak;
+                    block_src_off[bi + 1] = block_src_off[bi]
+                        + static_cast<size_t>(n_ij) * n_kl;
+                }
             }
+            const size_t flat_size = block_src_off.back();
+
+            // Pinned host flat buffer (fast DMA). Zero-init so any
+            // defensively-empty barS_cache[i_ij][i_kl] block (where
+            // n_pno_[i_ij] > 0 and n_pno_[i_kl] > 0 but bs is 0×0)
+            // contributes zeros instead of leaking uninitialised pinned
+            // memory into d_barS_pad.
+            real_t* h_barS_flat = nullptr;
+            check_cuda_(cudaMallocHost(&h_barS_flat,
+                            flat_size * sizeof(real_t)),
+                        "cudaMallocHost h_barS_flat");
+            std::memset(h_barS_flat, 0, flat_size * sizeof(real_t));
+
+            #pragma omp parallel for collapse(2) schedule(static)
+            for (int ai = 0; ai < N_act_ij; ++ai) {
+                for (int ak = 0; ak < N_act_kl; ++ak) {
+                    const int i_ij = active_i_ij_[ai];
+                    const int i_kl = active_i_kl_[ak];
+                    const int n_ij = n_pno_[i_ij];
+                    const int n_kl = n_pno_[i_kl];
+                    const RowMatXd& bs = barS_cache[i_ij][i_kl];
+                    if (bs.rows() == 0 || bs.cols() == 0) continue;
+                    const size_t bi =
+                        static_cast<size_t>(ai) * N_act_kl + ak;
+                    std::memcpy(h_barS_flat + block_src_off[bi],
+                                bs.data(),
+                                static_cast<size_t>(n_ij) * n_kl
+                                    * sizeof(real_t));
+                }
+            }
+
+            // Build n_pno arrays indexed by active position (small).
+            std::vector<int> n_pno_active_ij(static_cast<size_t>(N_act_ij));
+            std::vector<int> n_pno_active_kl(static_cast<size_t>(N_act_kl));
+            for (int ai = 0; ai < N_act_ij; ++ai)
+                n_pno_active_ij[ai] = n_pno_[active_i_ij_[ai]];
+            for (int ak = 0; ak < N_act_kl; ++ak)
+                n_pno_active_kl[ak] = n_pno_[active_i_kl_[ak]];
+
+            // Device temporaries (kernel input only; freed after launch).
+            int*    d_n_pno_active_ij = nullptr;
+            int*    d_n_pno_active_kl = nullptr;
+            size_t* d_block_src_off   = nullptr;
+            real_t* d_barS_flat       = nullptr;
+
+            check_cuda_(cudaMalloc(&d_n_pno_active_ij,
+                            N_act_ij * sizeof(int)),
+                        "cudaMalloc d_n_pno_active_ij");
+            check_cuda_(cudaMalloc(&d_n_pno_active_kl,
+                            N_act_kl * sizeof(int)),
+                        "cudaMalloc d_n_pno_active_kl");
+            check_cuda_(cudaMalloc(&d_block_src_off,
+                            (n_blocks + 1) * sizeof(size_t)),
+                        "cudaMalloc d_block_src_off");
+            check_cuda_(cudaMalloc(&d_barS_flat,
+                            flat_size * sizeof(real_t)),
+                        "cudaMalloc d_barS_flat");
+
+            check_cuda_(cudaMemcpy(d_n_pno_active_ij, n_pno_active_ij.data(),
+                            N_act_ij * sizeof(int),
+                            cudaMemcpyHostToDevice),
+                        "H2D d_n_pno_active_ij");
+            check_cuda_(cudaMemcpy(d_n_pno_active_kl, n_pno_active_kl.data(),
+                            N_act_kl * sizeof(int),
+                            cudaMemcpyHostToDevice),
+                        "H2D d_n_pno_active_kl");
+            check_cuda_(cudaMemcpy(d_block_src_off, block_src_off.data(),
+                            (n_blocks + 1) * sizeof(size_t),
+                            cudaMemcpyHostToDevice),
+                        "H2D d_block_src_off");
+            check_cuda_(cudaMemcpy(d_barS_flat, h_barS_flat,
+                            flat_size * sizeof(real_t),
+                            cudaMemcpyHostToDevice),
+                        "H2D d_barS_flat");
+
+            // Pre-zero the COMPACT padding region.
+            check_cuda_(cudaMemset(s.d_barS_pad, 0, bytes_barS_compact),
+                        "cudaMemset d_barS_pad (compact)");
+
+            // Scatter kernel: one block per active (ai, ak) pair → compact
+            // destination [ai · N_act_kl + ak].
+            dim3 grid(static_cast<unsigned>(N_act_ij),
+                      static_cast<unsigned>(N_act_kl));
+            dim3 block(8, 8);
+            scatter_barS_kernel<<<grid, block>>>(
+                d_barS_flat, d_block_src_off,
+                d_n_pno_active_ij, d_n_pno_active_kl,
+                s.d_barS_pad, N_act_kl, max_n_);
+            check_cuda_(cudaGetLastError(), "scatter_barS_kernel launch");
+            check_cuda_(cudaDeviceSynchronize(),
+                        "scatter_barS_kernel sync");
+
+            cudaFree(d_barS_flat);
+            cudaFree(d_block_src_off);
+            cudaFree(d_n_pno_active_kl);
+            cudaFree(d_n_pno_active_ij);
+            cudaFreeHost(h_barS_flat);
+        } else {
+            // No active pairs: zero everything so downstream
+            // pi = barS · Y · barS^T trivially produces zero.
+            check_cuda_(cudaMemset(s.d_barS_pad, 0, bytes_barS_compact),
+                        "cudaMemset d_barS_pad (no active)");
         }
     }
-
-    // One-time H→D upload of barS_pad (synchronous; we don't reuse stream).
-    check_cuda_(cudaMemcpy(s.d_barS_pad, h_barS_pad.data(),
-                           bytes_full, cudaMemcpyHostToDevice),
-                "cudaMemcpy barS H2D");
 
     active_ = true;
 #else
@@ -541,8 +834,86 @@ void PiCacheGpu::rebuild(const std::vector<std::vector<real_t>>& Y_old,
 
 #ifndef GANSU_CPU_ONLY
     MultiGpuManager::DeviceGuard _guard(device_id_);
-    rebuild_gpu_kernels_(Y_old);
-    download_pi_cache_(pi_cache_out);
+
+    // Step Z — drive the tile loop with per-tile D2H + host scatter so
+    // pi_cache_out[i_ij][i_kl] is populated from the compact d_pi_pad
+    // (rows indexed by active ai, cols by active ak) without relying on
+    // the legacy N_pair × N_pair layout that download_pi_cache_ assumed.
+    Impl& s = *p_;
+    const int max_n = max_n_;
+    const long long stride_pair = s.stride_pair;
+    const size_t bytes_pi_tile_full =
+        static_cast<size_t>(tile_size_) * N_act_kl_
+        * static_cast<size_t>(max_n) * max_n * sizeof(real_t);
+
+    // Pinned host tile mirror — allocated on first call (sized to one tile,
+    // reused across iters). Replaces the old N_pair²-sized h_pi_pad which
+    // is no longer compatible with the compact d_pi_pad layout.
+    if (bytes_pi_tile_full > 0 && s.h_pi_pad == nullptr) {
+        check_cuda_(cudaMallocHost(&s.h_pi_pad, bytes_pi_tile_full),
+                    "cudaMallocHost h_pi_pad (tile, Step Z)");
+    }
+
+    pack_Y_and_transpose_(Y_old);
+
+    // Pre-resize pi_cache_out for inactive pairs (zero-size, so downstream
+    // consumers handle "no contribution"). Only ROWS in our slab; peer
+    // PiCacheGpus on other devices populate other slabs.
+    for (long long i_ij = pair_begin_; i_ij < pair_end_; ++i_ij) {
+        const int n_ij = n_pno_[i_ij];
+        if (n_ij == 0) {
+            for (int i_kl = 0; i_kl < N_pair_; ++i_kl) {
+                pi_cache_out[i_ij][i_kl].resize(0, 0);
+            }
+        }
+    }
+
+    for (int tile_start = 0; tile_start < N_act_ij_;
+             tile_start += tile_size_) {
+        const int tile_end = std::min(tile_start + tile_size_, N_act_ij_);
+        const int tile_rows = tile_end - tile_start;
+        compute_pi_tile_(tile_start, tile_end);
+
+        // D2H only this tile's worth.
+        const size_t bytes_this_tile =
+            static_cast<size_t>(tile_rows) * N_act_kl_
+            * static_cast<size_t>(max_n) * max_n * sizeof(real_t);
+        check_cuda_(cudaMemcpy(s.h_pi_pad, s.d_pi_pad,
+                               bytes_this_tile, cudaMemcpyDeviceToHost),
+                    "D2H d_pi_pad (tile, Step Z)");
+
+        // Host scatter: per active (ai_in_tile, ak) → pi_cache_out[i_ij][i_kl].
+        // pi block shape is (n_ij × n_ij) — n_kl only appears in the
+        // intermediate compute, not the output.
+        #pragma omp parallel for schedule(static)
+        for (int ai_in_tile = 0; ai_in_tile < tile_rows; ++ai_in_tile) {
+            const int ai = ai_in_tile + tile_start;
+            const int i_ij = active_i_ij_[ai];
+            const int n_ij = n_pno_[i_ij];
+            // Zero out non-active i_kl columns first (inactive pairs).
+            // Active pair list is dense, so it's faster to loop all
+            // and only resize on inactive than to check per-pair.
+            for (int i_kl = 0; i_kl < N_pair_; ++i_kl) {
+                if (active_kl_pos_[i_kl] < 0) {
+                    pi_cache_out[i_ij][i_kl].resize(0, 0);
+                }
+            }
+            for (int ak = 0; ak < N_act_kl_; ++ak) {
+                const int i_kl = active_i_kl_[ak];
+                pi_cache_out[i_ij][i_kl].resize(n_ij, n_ij);
+                const real_t* src = s.h_pi_pad
+                    + (static_cast<size_t>(ai_in_tile) * N_act_kl_
+                       + static_cast<size_t>(ak))
+                    * static_cast<size_t>(stride_pair);
+                real_t* dst = pi_cache_out[i_ij][i_kl].data();
+                for (int r = 0; r < n_ij; ++r) {
+                    std::memcpy(dst + static_cast<ptrdiff_t>(r) * n_ij,
+                                src + static_cast<size_t>(r) * max_n,
+                                static_cast<size_t>(n_ij) * sizeof(real_t));
+                }
+            }
+        }
+    }
 #endif // !GANSU_CPU_ONLY
 }
 
@@ -557,75 +928,107 @@ void PiCacheGpu::rebuild(const std::vector<std::vector<real_t>>& Y_old,
 void PiCacheGpu::rebuild_gpu_kernels_(
     const std::vector<std::vector<real_t>>& Y_old)
 {
+    // Step Z: NOTE — d_pi_pad is now a TILE buffer (tile_size_ × N_act_kl ×
+    // max_n²). This routine fills d_pi_pad ONE TILE AT A TIME; callers
+    // that need d_pi_pad on device for downstream consumption must do so
+    // tile-by-tile too. The canonical pipeline runs through
+    // rebuild_with_stack, which packs each tile into d_pi_T_stack before
+    // moving on to the next tile.
+    //
+    // For backward compatibility with the rebuild()/download_pi_cache_
+    // path (host pi_cache_out), the caller invokes
+    // rebuild_one_tile_(tile_start, tile_end) explicitly per tile. This
+    // top-level function is now only valid when d_pi_pad has capacity for
+    // all N_act_ij_ rows (tile_size_ == N_act_ij_), so a single tile fits.
+    //
+    // The common case where tile_size_ < N_act_ij_ (cholesterol) MUST use
+    // rebuild_with_stack instead — this routine throws if invoked then.
     Impl& s = *p_;
-    const int N      = N_pair_;
-    const int max_n  = max_n_;
-    const long long stride_pair = s.stride_pair;          // max_n²
-    const int ib = pair_begin_;
-    const int ie = pair_end_;
+    if (tile_size_ < N_act_ij_) {
+        throw std::runtime_error(
+            "PiCacheGpu::rebuild_gpu_kernels_: d_pi_pad is tiled "
+            "(tile_size_ < N_act_ij_) — use rebuild_with_stack");
+    }
+    // Pack Y, transpose, then run a single full "tile" covering all rows.
+    pack_Y_and_transpose_(Y_old);
+    compute_pi_tile_(/*tile_start=*/0, /*tile_end=*/N_act_ij_);
+    (void)s;
+}
 
-    const size_t bytes_outer = static_cast<size_t>(N)
-                             * static_cast<size_t>(max_n)
-                             * static_cast<size_t>(max_n) * sizeof(real_t);
+// ---------------------------------------------------------------------------
+// Step Z helper — pack Y_old into compact h_Y_pad/d_Y_pad and build the
+// transpose. Called once per rebuild (before the tile loop).
+// ---------------------------------------------------------------------------
+void PiCacheGpu::pack_Y_and_transpose_(
+    const std::vector<std::vector<real_t>>& Y_old)
+{
+    Impl& s = *p_;
+    const int max_n = max_n_;
+    const long long stride_pair = s.stride_pair;
 
-    // -------- Pad Y_old into pinned host buffer h_Y_pad.
-    // Layout: h_Y_pad[i_kl · max_n² + r · max_n + c]
-    std::memset(s.h_Y_pad, 0, bytes_outer);
+    const size_t bytes_Y_compact =
+        static_cast<size_t>(N_act_kl_) * static_cast<size_t>(max_n)
+        * static_cast<size_t>(max_n) * sizeof(real_t);
+
+    // Pack Y_old → h_Y_pad, indexed by active position ak (not orig i_kl).
+    std::memset(s.h_Y_pad, 0, bytes_Y_compact);
     #pragma omp parallel for schedule(static)
-    for (long long i_kl = 0; i_kl < static_cast<long long>(N); ++i_kl) {
+    for (int ak = 0; ak < N_act_kl_; ++ak) {
+        const int i_kl = active_i_kl_[ak];
         const int n_kl = n_pno_[i_kl];
-        if (n_kl == 0) continue;
         const real_t* src = Y_old[i_kl].data();
-        real_t* dst = s.h_Y_pad + static_cast<size_t>(i_kl) * stride_pair;
+        real_t* dst = s.h_Y_pad + static_cast<size_t>(ak) * stride_pair;
         for (int r = 0; r < n_kl; ++r) {
             std::memcpy(dst + static_cast<size_t>(r) * max_n,
                         src + static_cast<ptrdiff_t>(r) * n_kl,
                         static_cast<size_t>(n_kl) * sizeof(real_t));
         }
     }
-
-    // H2D Y_pad (full N × max_n²; all i_kl columns of Y are needed regardless
-    // of slab restriction on output rows).
     check_cuda_(cudaMemcpy(s.d_Y_pad, s.h_Y_pad,
-                           bytes_outer, cudaMemcpyHostToDevice),
-                "rebuild H2D Y_pad");
+                           bytes_Y_compact, cudaMemcpyHostToDevice),
+                "rebuild H2D Y_pad (compact)");
 
-    // Step 6.7: Build d_Y_pad_T (per-pair transpose) for oooo_lad coalescing.
-    // Negligible cost compared to the H2D above; same lifetime as d_Y_pad.
-    {
+    // Transpose grid over active_i_kl positions; each block reads compact
+    // d_Y_pad[ak] and writes transposed to d_Y_pad_T[orig_i_kl] so that
+    // oooo_lad_kernel in ResidGpu sees the legacy full-N_pair layout.
+    if (N_act_kl_ > 0) {
         const int block_dim = (max_n <= 16) ? max_n : 16;
         const dim3 t_block(block_dim, block_dim);
-        const dim3 t_grid(static_cast<unsigned>(N));
+        const dim3 t_grid(static_cast<unsigned>(N_act_kl_));
         transpose_Y_pad_kernel<<<t_grid, t_block>>>(
-            s.d_Y_pad, s.d_Y_pad_T, N, max_n);
+            s.d_Y_pad, s.d_Y_pad_T,
+            s.d_active_i_kl, N_act_kl_, max_n);
         check_cuda_(cudaGetLastError(), "transpose_Y_pad_kernel launch");
     }
+}
 
-    // -------- Per-i_ij outer loop, two strided batched DGEMMs over i_kl.
-    //          Only computes the slab range [pair_begin_, pair_end_).
+// ---------------------------------------------------------------------------
+// Step Z helper — compute one tile of d_pi_pad (rows in compact active i_ij
+// space [tile_start, tile_end)). d_pi_pad indexing inside the tile is
+// (ai - tile_start) × N_act_kl × max_n². batched DGEMM over the active i_kl
+// columns (N_act_kl batches), with both barS and Y read from compact buffers.
+// ---------------------------------------------------------------------------
+void PiCacheGpu::compute_pi_tile_(int tile_start, int tile_end)
+{
+    Impl& s = *p_;
+    const int max_n = max_n_;
+    const long long stride_pair = s.stride_pair;
+    const int N_kl = N_act_kl_;
     const real_t one  = 1.0;
     const real_t zero = 0.0;
 
-    // Conventions:
-    //   - All buffers in memory are row-major padded (max_n × max_n) per block.
-    //   - cuBLAS reads them as column-major X_col = X_row^T (ld=max_n).
-    //   - Goal: half_row = barS_row · Y_row,   pi_row = half_row · barS_row^T
-    //     ⇔ half_col = Y_col · barS_col,      pi_col  = barS_col^T · half_col.
-    //   - Padding: barS_row valid (n_ij × n_kl) upper-left, Y_row valid
-    //     (n_kl × n_kl) upper-left, both zero outside. Stage 1 writes only
-    //     the first n_ij columns of half_col (= first n_ij rows of half_row).
-    //     Half_row's (n_kl..max_n-1) columns are zero by construction since
-    //     they sum over zeroed rows of Y_row.
-    for (int i_ij = ib; i_ij < ie; ++i_ij) {
+    // Conventions: compact d_barS_pad rows are indexed by ai (full N_act_kl
+    // columns per row). cuBLAS sees the same column-major view as before.
+    for (int ai = tile_start; ai < tile_end; ++ai) {
+        const int i_ij = active_i_ij_[ai];
         const int n_ij = n_pno_[i_ij];
-        if (n_ij == 0) continue;
+        if (n_ij == 0) continue;  // active list filtered this, but be safe
 
         real_t* dA_row = s.d_barS_pad
-                      + static_cast<size_t>(i_ij)
-                      * static_cast<size_t>(N) * stride_pair;
+                      + static_cast<size_t>(ai) * N_kl * stride_pair;
         real_t* dC_row = s.d_pi_pad
-                      + static_cast<size_t>(i_ij)
-                      * static_cast<size_t>(N) * stride_pair;
+                      + static_cast<size_t>(ai - tile_start) * N_kl
+                        * stride_pair;
 
         check_cublas_(cublasDgemmStridedBatched(
             s.cublas, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -635,7 +1038,7 @@ void PiCacheGpu::rebuild_gpu_kernels_(
             dA_row,       /*ldb=*/ max_n, /*strideB=*/ stride_pair,
             &zero,
             s.d_half_pad, /*ldc=*/ max_n, /*strideC=*/ stride_pair,
-            N), "stage1 strided batched");
+            N_kl), "stage1 strided batched (tile)");
 
         check_cublas_(cublasDgemmStridedBatched(
             s.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -645,7 +1048,7 @@ void PiCacheGpu::rebuild_gpu_kernels_(
             s.d_half_pad, /*ldb=*/ max_n, /*strideB=*/ stride_pair,
             &zero,
             dC_row,       /*ldc=*/ max_n, /*strideC=*/ stride_pair,
-            N), "stage2 strided batched");
+            N_kl), "stage2 strided batched (tile)");
     }
 }
 
@@ -657,6 +1060,22 @@ void PiCacheGpu::rebuild_gpu_kernels_(
 void PiCacheGpu::download_pi_cache_(
     std::vector<std::vector<RowMatXd>>& pi_cache_out)
 {
+    // Step Z — d_pi_pad is now compact + tiled (rows indexed by active ai,
+    // not orig i_ij). The legacy N_pair × N_pair × max_n² slab D2H below
+    // no longer reads the right bytes. Callers that need pi_cache_out
+    // populated should use rebuild_with_stack with skip_pi_cache_host=true
+    // followed by their own consumer of pi_T_stack, or run on a smaller
+    // system where the path is tile_size_ == N_act_ij_ and we can implement
+    // single-tile compact scatter.
+    //
+    // For now, throw if anyone reaches here — Step 6 era always uses the
+    // skip path, so this should not fire in practice. If it does, the
+    // intended fix is a compact-aware scatter that walks active_i_ij_ /
+    // active_i_kl_ instead of the orig (i_ij, i_kl) sweep.
+    throw std::runtime_error(
+        "PiCacheGpu::download_pi_cache_: incompatible with Step Z compact "
+        "d_pi_pad layout. Use rebuild_with_stack with skip_pi_cache_host=true.");
+
     Impl& s = *p_;
     const int N      = N_pair_;
     const int max_n  = max_n_;
@@ -669,6 +1088,18 @@ void PiCacheGpu::download_pi_cache_(
                              * static_cast<size_t>(N)
                              * static_cast<size_t>(max_n)
                              * static_cast<size_t>(max_n) * sizeof(real_t);
+
+    // Step S1: lazy allocation of h_pi_pad. Step 6's stacked-mode +
+    // skip_pi_cache_host=true path bypasses download_pi_cache_ entirely,
+    // so this large pinned buffer is allocated only when actually needed.
+    if (slab_n > 0 && s.h_pi_pad == nullptr) {
+        const size_t bytes_full = static_cast<size_t>(N)
+                                * static_cast<size_t>(N)
+                                * static_cast<size_t>(max_n)
+                                * static_cast<size_t>(max_n) * sizeof(real_t);
+        check_cuda_(cudaMallocHost(&s.h_pi_pad, bytes_full),
+                    "cudaMallocHost h_pi_pad (lazy)");
+    }
 
     // D2H — only the slab range (per-pair N × max_n² block starting at
     // pair_begin_, length slab_n contiguous in i_ij).
@@ -833,21 +1264,10 @@ void PiCacheGpu::rebuild_with_stack(
     // is unaffected. pi_T_stack_out is still filled (DFpair needs it).
     const bool skip_host_pi = skip_pi_cache_host && active_ && stacked_;
 
-    if (skip_host_pi) {
-#ifndef GANSU_CPU_ONLY
-        MultiGpuManager::DeviceGuard _guard(device_id_);
-        rebuild_gpu_kernels_(Y_old);
-#endif
-    } else {
-        // Default path: produce pi_cache (GPU when active_, CPU otherwise).
-        rebuild(Y_old, pi_cache_out);
-    }
-
     if (!stacked_) {
         // CPU fallback for pi_T_stack — same algorithm as the original
         // middleCols loop, just relocated here so the caller sees one API.
-        // (Only reachable when skip_host_pi was false above, since skip_host_pi
-        //  implies stacked_.)
+        rebuild(Y_old, pi_cache_out);
         build_stack_cpu_(pi_cache_out, pi_T_stack_out);
         return;
     }
@@ -861,6 +1281,7 @@ void PiCacheGpu::rebuild_with_stack(
     const int ib    = pair_begin_;
     const int ie    = pair_end_;
     const int slab_n = ie - ib;
+    const long long stride_pair = s.stride_pair;
 
     // Per-pair offsets into d_pi_T_stack — needed to compute the slab range.
     std::vector<size_t> idx_offset_host(static_cast<size_t>(N + 1), 0);
@@ -872,12 +1293,8 @@ void PiCacheGpu::rebuild_with_stack(
             * static_cast<size_t>(nocc);
     }
 
-    // d_pi_pad now holds the latest pi_cache values (set by the rebuild()
-    // call above — those buffers are members of *p_ and persist).
-    //
-    // Zero d_pi_T_stack so empty (i_ij or i_kl) cells stay clean. The kernel
-    // also short-circuits empty inputs but we cover the n_kl=0 ⇒ skipped
-    // dst region just in case. Slab-aware: only zero the slab portion.
+    // Zero the slab range of d_pi_T_stack. Empty (i_ij, i_kl) cells skip
+    // their writes; we need them zero on entry so they don't carry stale data.
     const size_t bytes_pi_T_slab = (idx_offset_host[ie] - idx_offset_host[ib])
                                  * sizeof(real_t);
     if (bytes_pi_T_slab > 0) {
@@ -887,14 +1304,31 @@ void PiCacheGpu::rebuild_with_stack(
             "memset d_pi_T_stack (slab)");
     }
 
-    // Launch the pack kernel. We use the FULL grid (N × nocc²) — running
-    // a wider grid is cheap (~10 µs) and avoids adding slab-aware indexing
-    // to the kernel. Rows outside the slab read from stale/uninitialised
-    // d_pi_pad (rebuild() above wrote only slab rows), so d_pi_T_stack
-    // outside the slab will be garbage on this device. That's fine because
-    // the D2H below only copies the slab portion; peer GPUs populate the
-    // other slabs into the shared host h_pi_T_stack buffers / output vectors.
-    if (slab_n > 0 && nocc > 0 && max_n > 0) {
+    // Step Z — unified tile loop: pack Y once, then per-tile compute +
+    // (optional) D2H scatter to pi_cache_out + pack into pi_T_stack.
+    // skip_host_pi path skips the D2H + scatter (Step 6 fast path).
+    pack_Y_and_transpose_(Y_old);
+
+    // Pinned tile mirror for D2H scatter (non-skip only). Sized one tile.
+    const size_t bytes_pi_tile_full =
+        static_cast<size_t>(tile_size_) * N_act_kl_
+        * static_cast<size_t>(max_n) * max_n * sizeof(real_t);
+    if (!skip_host_pi && bytes_pi_tile_full > 0 && s.h_pi_pad == nullptr) {
+        check_cuda_(cudaMallocHost(&s.h_pi_pad, bytes_pi_tile_full),
+                    "cudaMallocHost h_pi_pad (tile)");
+    }
+
+    // Init pi_cache_out: zero-size blocks for all pairs in our slab.
+    // We'll fill active blocks per-tile below.
+    if (!skip_host_pi) {
+        for (long long i_ij = ib; i_ij < ie; ++i_ij) {
+            for (int i_kl = 0; i_kl < N; ++i_kl) {
+                pi_cache_out[i_ij][i_kl].resize(0, 0);
+            }
+        }
+    }
+
+    if (slab_n > 0 && nocc > 0 && max_n > 0 && N_act_ij_ > 0 && tile_size_ > 0) {
         constexpr int TILE = 16;
         const int tile_x = (max_n < TILE) ? max_n : TILE;
         const int tile_y = (max_n < TILE) ? max_n : TILE;
@@ -902,19 +1336,62 @@ void PiCacheGpu::rebuild_with_stack(
                    static_cast<unsigned>(tile_y), 1);
         dim3 grid(static_cast<unsigned>(N),
                   static_cast<unsigned>(nocc * nocc), 1);
-        pack_pi_T_stack_kernel<<<grid, block>>>(
-            s.d_pi_pad,
-            s.d_pair_lookup,
-            s.d_setup_i,
-            s.d_n_pno,
-            s.d_idx_offset,
-            s.d_pi_T_stack,
-            N, nocc, max_n);
-        const cudaError_t e = cudaGetLastError();
-        if (e != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("PiCacheGpu pack kernel launch failed: ")
-                + cudaGetErrorString(e));
+
+        for (int tile_start = 0; tile_start < N_act_ij_;
+                 tile_start += tile_size_) {
+            const int tile_end = std::min(tile_start + tile_size_,
+                                          N_act_ij_);
+            const int tile_rows = tile_end - tile_start;
+            compute_pi_tile_(tile_start, tile_end);
+
+            // Non-skip path: D2H tile + host scatter to pi_cache_out.
+            if (!skip_host_pi) {
+                const size_t bytes_this_tile =
+                    static_cast<size_t>(tile_rows) * N_act_kl_
+                    * static_cast<size_t>(max_n) * max_n * sizeof(real_t);
+                check_cuda_(cudaMemcpy(s.h_pi_pad, s.d_pi_pad,
+                                       bytes_this_tile, cudaMemcpyDeviceToHost),
+                            "D2H d_pi_pad (tile, rebuild_with_stack)");
+                #pragma omp parallel for schedule(static)
+                for (int ai_in_tile = 0; ai_in_tile < tile_rows; ++ai_in_tile) {
+                    const int ai = ai_in_tile + tile_start;
+                    const int i_ij = active_i_ij_[ai];
+                    const int n_ij = n_pno_[i_ij];
+                    for (int ak = 0; ak < N_act_kl_; ++ak) {
+                        const int i_kl = active_i_kl_[ak];
+                        pi_cache_out[i_ij][i_kl].resize(n_ij, n_ij);
+                        const real_t* src = s.h_pi_pad
+                            + (static_cast<size_t>(ai_in_tile) * N_act_kl_
+                               + static_cast<size_t>(ak))
+                            * static_cast<size_t>(stride_pair);
+                        real_t* dst = pi_cache_out[i_ij][i_kl].data();
+                        for (int r = 0; r < n_ij; ++r) {
+                            std::memcpy(dst + static_cast<ptrdiff_t>(r) * n_ij,
+                                        src + static_cast<size_t>(r) * max_n,
+                                        static_cast<size_t>(n_ij)
+                                            * sizeof(real_t));
+                        }
+                    }
+                }
+            }
+
+            pack_pi_T_stack_kernel<<<grid, block>>>(
+                s.d_pi_pad,
+                s.d_pair_lookup,
+                s.d_setup_i,
+                s.d_n_pno,
+                s.d_idx_offset,
+                s.d_active_ij_pos,
+                s.d_active_kl_pos,
+                s.d_pi_T_stack,
+                N, nocc, max_n,
+                N_act_kl_, tile_start, tile_end);
+            const cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("PiCacheGpu pack kernel launch failed: ")
+                    + cudaGetErrorString(e));
+            }
         }
     }
 
