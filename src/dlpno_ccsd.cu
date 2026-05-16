@@ -134,6 +134,11 @@ inline Phase24Integrals precompute_phase24_integrals(
     out.W_ovvo_lambda.assign(n_pairs, {});
     out.W_ovvo_lambda_alt.assign(n_pairs, {});
     out.W_oovv_lambda.assign(n_pairs, {});
+    // Sub-step 2X.3.7a: OVOO per strong pair (i,j) for the OVOO·moo1
+    // T2-source term of Λ_1 (term 3). Also shared with term 8 in 2X.3.7c.
+    // Two orientations needed.
+    out.W_ovoo_lambda.assign(n_pairs, {});
+    out.W_ovoo_lambda_alt.assign(n_pairs, {});
 
     // Phase B — multi-GPU pair-parallel integral build.
     //   Detect distributed RI back-end with replicated B; if available,
@@ -404,6 +409,35 @@ inline Phase24Integrals precompute_phase24_integrals(
                 out.W_ovvo_lambda[idx][out_ab]     = h_eri_mo[e_ovvo_i];
                 out.W_ovvo_lambda_alt[idx][out_ab] = h_eri_mo[e_ovvo_j];
                 out.W_oovv_lambda[idx][out_ba]     = h_eri_mo[e_oovv];
+            }
+        }
+
+        // Sub-step 2X.3.7a: Extract OVOO per pair (i,j) in two orientations
+        // (i-role and j-role). Used by term 3 (OVOO·moo1) and term 8 (L2·OVOO).
+        //   W_ovoo_lambda[idx][a, k]     = eri_mo[s.i, n_lmo+a, s.j, k]
+        //                                  ≡ (s.i a | s.j k)  — "i-role"
+        //   W_ovoo_lambda_alt[idx][a, k] = eri_mo[s.j, n_lmo+a, s.i, k]
+        //                                  ≡ (s.j a | s.i k)  — "j-role"
+        // Layout: a·nocc + k (row-major). a in pair (i,j) PNO, k LMO.
+        out.W_ovoo_lambda[idx].assign(
+            static_cast<size_t>(n_pno) * n_lmo, 0.0);
+        out.W_ovoo_lambda_alt[idx].assign(
+            static_cast<size_t>(n_pno) * n_lmo, 0.0);
+        for (int a = 0; a < n_pno; ++a) {
+            for (int k = 0; k < n_lmo; ++k) {
+                const size_t e_ovoo_i =
+                    static_cast<size_t>(s.i) * n_emb3 +
+                    static_cast<size_t>(n_lmo + a) * n_emb2 +
+                    static_cast<size_t>(s.j) * n_emb +
+                    static_cast<size_t>(k);
+                const size_t e_ovoo_j =
+                    static_cast<size_t>(s.j) * n_emb3 +
+                    static_cast<size_t>(n_lmo + a) * n_emb2 +
+                    static_cast<size_t>(s.i) * n_emb +
+                    static_cast<size_t>(k);
+                const size_t out_ak = static_cast<size_t>(a) * n_lmo + k;
+                out.W_ovoo_lambda[idx][out_ak]     = h_eri_mo[e_ovoo_i];
+                out.W_ovoo_lambda_alt[idx][out_ak] = h_eri_mo[e_ovoo_j];
             }
         }
 

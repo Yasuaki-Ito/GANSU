@@ -1012,3 +1012,122 @@ TEST(DLPNOCCSD, Phase2X_3_6b_Lambda1_OvvoOovv_TermsFire)
     EXPECT_LT(std::fabs(ccsd_corr - ccsd_corr_off), 1.0e-12)
         << "Λ_1 self-iter with term 6 should not change CCSD energy.";
 }
+
+// =========================================================================
+// Sub-step 2X.3.7a — Term 3 of the canonical Λ_1 catalogue: OVOO·moo1
+// T2-source. Adds two new per-strong-pair tensors to Phase24Integrals:
+//   W_ovoo_lambda[idx_ij][a, k]     = (s.i a | s.j k)   ≡ OVOO[s.i, a, s.j, k]
+//   W_ovoo_lambda_alt[idx_ij][a, k] = (s.j a | s.i k)   ≡ OVOO[s.j, a, s.i, k]
+// in pair (i,j) PNO for a, LMO for k. moo1 reuses the existing dF_ki
+// intermediate (= canonical moo at T1=0).
+//
+// The contraction is purely T2-driven (depends on moo1 = T2 dressing of
+// Fock + L2/L1-independent), so it shifts the constant R0 of the Λ_1
+// iter and contributes additively to the final Λ_1 amplitudes.
+//
+// Cost (TEOS-class): n_pair_strong · n_pno · nocc · 16 B ≈ 1.3 GB.
+//
+// Sentinel checks:
+//   1. Λ_1 norm in a sane range; energy bit-exact (no T feedback).
+//   2. Λ_1 norm DIFFERS from the 2X.3.6b-only path (9.4246189e-3 from
+//      the prior commit's H2O/sto-3g trace) — confirms term 3 fires.
+//   3. Λ self-iter still converges in a reasonable iter count (< 50).
+// =========================================================================
+TEST(DLPNOCCSD, Phase2X_3_7a_Lambda1_OvooMoo1_TermFires)
+{
+    const std::string xyz   = "../xyz/H2O.xyz";
+    const std::string basis = "../basis/sto-3g.gbs";
+    const std::string aux   = "../auxiliary_basis/cc-pvdz-rifit.gbs";
+
+    cudaDeviceSynchronize();
+    cudaGetLastError();
+    ParameterManager params;
+    params["xyzfilename"] = xyz;
+    params["gbsfilename"] = basis;
+    params["auxiliary_gbsfilename"] = aux;
+    params["method"] = "RHF";
+    params["eri_method"] = "ri";
+    params["post_hf_method"] = "dlpno_ccsd";
+    params["initial_guess"] = "core";
+    params["convergence_energy_threshold"] = "1e-10";
+    params["dlpno_localizer"]       = "none";
+    params["dlpno_preset"]          = "normal";
+    params["dlpno_t_cut_pno"]       = "0";
+    params["dlpno_t_cut_do"]        = "1e-14";
+    params["dlpno_t_cut_mkn"]       = "0";
+    params["dlpno_t_cut_pairs"]     = "0";
+    params["dlpno_compute_density"] = "1";
+    params["dlpno_verbose"]         = "1";
+    params["dlpno_lambda_full_dressing"] = "1";
+
+    std::streambuf* orig = std::cout.rdbuf();
+    std::ostringstream sink;
+    std::cout.rdbuf(sink.rdbuf());
+
+    real_t ccsd_corr = 0.0;
+    try {
+        auto hf = HFBuilder::buildHF(params);
+        hf->solve();
+        ccsd_corr = hf->get_post_hf_energy();
+    } catch (const std::exception& e) {
+        std::cout.rdbuf(orig);
+        GTEST_SKIP() << "Cannot run DLPNO-CCSD: " << e.what();
+        return;
+    }
+    std::cout.rdbuf(orig);
+
+    const std::string log = sink.str();
+    const real_t lam1_norm = parse_lambda1_norm(log);
+    const int     iters    = parse_lambda_iters(log);
+
+    std::cout << std::setprecision(10) << std::fixed
+              << "  Λ_1 norm (2X.3.7a w/ term 3) = "
+              << std::scientific << lam1_norm << "\n"
+              << "  Self-iter ran                = " << iters << " iter\n"
+              << "  Single-shot baseline         = 7.79e-3 (2X.3.2)\n"
+              << "  2X.3.6b baseline             = 9.4246189e-3\n"
+              << "  CCSD corr                    = "
+              << std::fixed << ccsd_corr << "\n";
+
+    // 1. Norm strictly positive and in sane range.
+    EXPECT_GT(lam1_norm, 1.0e-10)
+        << "Λ_1 norm not detected — full_dressing path didn't engage";
+    EXPECT_GT(lam1_norm, 5.0e-3)
+        << "Λ_1 norm collapsed — likely sign error in W_ovoo orientation";
+    EXPECT_LT(lam1_norm, 5.0e-2)
+        << "Λ_1 norm exploded — divergent term 3 contribution";
+
+    // 2. Iter converged in reasonable count.
+    EXPECT_GT(iters, 1) << "Λ iter terminated at iter 1 — bug";
+    EXPECT_LT(iters, 50) << "Λ iter taking too long — instability";
+
+    // 3. Λ_1 norm differs from the 2X.3.6b-only value (9.4246189e-3).
+    //    Term 3 contributes via T2-driven moo1, independent of L1.
+    const real_t lam1_at_3_6b = 9.4246189e-3;
+    const real_t delta = std::fabs(lam1_norm - lam1_at_3_6b);
+    EXPECT_GT(delta, 1.0e-7)
+        << "Λ_1 norm did not budge from 2X.3.6b baseline — "
+        << "term 3 (OVOO·moo1) likely not firing.";
+
+    // 4. CCSD correlation energy bit-exact vs Λ_1=0 baseline.
+    real_t ccsd_corr_off = 0.0;
+    try {
+        auto r = run_post_hf(xyz, basis, aux, "dlpno_ccsd", {
+            {"dlpno_localizer",       "none"},
+            {"dlpno_preset",          "normal"},
+            {"dlpno_t_cut_pno",       "0"},
+            {"dlpno_t_cut_do",        "1e-14"},
+            {"dlpno_t_cut_mkn",       "0"},
+            {"dlpno_t_cut_pairs",     "0"},
+            {"dlpno_compute_density", "1"},
+            {"dlpno_verbose",         "0"},
+            {"dlpno_lambda_full_dressing", "0"},
+        });
+        ccsd_corr_off = r.post_hf;
+    } catch (const std::exception& e) {
+        GTEST_SKIP() << "Cannot run baseline DLPNO-CCSD: " << e.what();
+        return;
+    }
+    EXPECT_LT(std::fabs(ccsd_corr - ccsd_corr_off), 1.0e-12)
+        << "Λ_1 self-iter with term 3 should not change CCSD energy.";
+}

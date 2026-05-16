@@ -516,6 +516,12 @@ LMP2Status iterate_dlpno_ccsd_t2(
     double dt_DFpair  = 0.0;
     double dt_resid   = 0.0;
     double dt_diis    = 0.0;
+    // Step 6.8 diagnostics — break "other" into named sub-buckets.
+    double dt_setup_pgpu     = 0.0;  // one-time PiCacheGpu ctor (barS H2D)
+    double dt_setup_rgpu     = 0.0;  // one-time ResidGpu ctor (V_meta + V_oooo H2D)
+    double dt_yold_copy      = 0.0;  // per-iter, pairs.Y -> Y_old snapshot
+    double dt_compute_async  = 0.0;  // per-iter, rgpu->compute_async() launch
+    double dt_iter_misc      = 0.0;  // per-iter, post-DIIS bookkeeping
     const auto t_iter_total_0 = prof_clock::now();
 
     std::vector<std::vector<real_t>> Y_old(pairs.size());
@@ -721,6 +727,7 @@ LMP2Status iterate_dlpno_ccsd_t2(
     }
 
     // Construct N_gpus PiCacheGpu instances (one per device).
+    const auto t_setup_pgpu_0 = prof_clock::now();
     std::vector<std::unique_ptr<PiCacheGpu>> pgpus(n_gpus);
     if (n_gpus == 1) {
         pgpus[0] = std::make_unique<PiCacheGpu>(
@@ -743,11 +750,14 @@ LMP2Status iterate_dlpno_ccsd_t2(
             0, N_pair, 0);
 #endif
     }
+    dt_setup_pgpu += std::chrono::duration<double>(
+        prof_clock::now() - t_setup_pgpu_0).count();
 
     // Step 6.2 — GPU port for ph-ladder R contributions. One ResidGpu per
     // device, borrowing the per-device pgpu and uploading iter-invariant
     // V_meta_T/TT, T_meta, and W_bare_ov{ov,vo}_{i,j} to that device.
     // Falls back to active()=false per device when memory is insufficient.
+    const auto t_setup_rgpu_0 = prof_clock::now();
     std::vector<std::unique_ptr<ResidGpu>> rgpus(n_gpus);
     if (phase24 != nullptr && phase24->nocc == nocc) {
 #ifndef GANSU_CPU_ONLY
@@ -773,6 +783,8 @@ LMP2Status iterate_dlpno_ccsd_t2(
     if (any_rgpu_active) {
         R_ph_acc.assign(pairs.size(), RowMatXd());
     }
+    dt_setup_rgpu += std::chrono::duration<double>(
+        prof_clock::now() - t_setup_rgpu_0).count();
 
     // ---- pi_T_stack (Step 3): per-iter (k, l, d)-stacked projection ----
     // pi_T_stack[idx](a, (k·nocc + l)·n + d) = π_{k, l}^{oriented}[a, d]
@@ -867,8 +879,13 @@ LMP2Status iterate_dlpno_ccsd_t2(
     }
 
     for (int iter = 0; iter < max_iter; ++iter) {
-        for (size_t idx = 0; idx < pairs.size(); ++idx) {
-            Y_old[idx] = pairs[idx].Y;
+        {
+            const auto t_yold_0 = prof_clock::now();
+            for (size_t idx = 0; idx < pairs.size(); ++idx) {
+                Y_old[idx] = pairs[idx].Y;
+            }
+            dt_yold_copy += std::chrono::duration<double>(
+                prof_clock::now() - t_yold_0).count();
         }
 
         // ---- Build pi_cache + pi_T_stack from Y_old (re-built each iter).
@@ -1002,25 +1019,30 @@ LMP2Status iterate_dlpno_ccsd_t2(
         //
         // Multi-GPU: each rgpus[d] handles its slab; dF_ki is global and
         // is uploaded full on every device.
-        if (any_rgpu_active) {
-            if (n_gpus > 1) {
+        {
+            const auto t_ca_0 = prof_clock::now();
+            if (any_rgpu_active) {
+                if (n_gpus > 1) {
 #ifndef GANSU_CPU_ONLY
-                #pragma omp parallel num_threads(n_gpus)
-                {
+                    #pragma omp parallel num_threads(n_gpus)
+                    {
 #ifdef _OPENMP
-                    const int d = omp_get_thread_num();
+                        const int d = omp_get_thread_num();
 #else
-                    const int d = 0;
+                        const int d = 0;
 #endif
-                    MultiGpuManager::DeviceGuard guard(d);
-                    if (rgpus[d] && rgpus[d]->active()) {
-                        rgpus[d]->compute_async(dF_ki);
+                        MultiGpuManager::DeviceGuard guard(d);
+                        if (rgpus[d] && rgpus[d]->active()) {
+                            rgpus[d]->compute_async(dF_ki);
+                        }
                     }
-                }
 #endif
-            } else if (rgpus[0] && rgpus[0]->active()) {
-                rgpus[0]->compute_async(dF_ki);
+                } else if (rgpus[0] && rgpus[0]->active()) {
+                    rgpus[0]->compute_async(dF_ki);
+                }
             }
+            dt_compute_async += std::chrono::duration<double>(
+                prof_clock::now() - t_ca_0).count();
         }
 
         // ---- Refresh ΔF^{(ij)} per-pair particle dressing matrix. ----
@@ -1549,6 +1571,8 @@ LMP2Status iterate_dlpno_ccsd_t2(
             }
         }
         dt_diis += std::chrono::duration<double>(prof_clock::now() - t_diis_0).count();
+
+        const auto t_misc_0 = prof_clock::now();
         prev_r_max = r_max;
 
         st.max_R = r_max;
@@ -1558,6 +1582,8 @@ LMP2Status iterate_dlpno_ccsd_t2(
                       << "  max|R|=" << std::scientific
                       << std::setprecision(3) << r_max << std::endl;
         }
+        dt_iter_misc += std::chrono::duration<double>(
+            prof_clock::now() - t_misc_0).count();
         if (r_max < conv_tol) {
             st.iters     = iter + 1;
             st.converged = true;
@@ -1571,6 +1597,11 @@ LMP2Status iterate_dlpno_ccsd_t2(
         const double dt_acct =
             dt_barS + dt_vmeta + dt_picache
           + dt_dFki + dt_DFpair + dt_resid + dt_diis;
+        const double dt_other_named =
+            dt_setup_pgpu + dt_setup_rgpu
+          + dt_yold_copy + dt_compute_async + dt_iter_misc;
+        const double dt_other_residual =
+            (dt_total - dt_acct) - dt_other_named;
         std::cout << "[DLPNO-ITER-PROF] " << round_tag
                   << "  iters="    << st.iters
                   << "  total="    << std::fixed << std::setprecision(3) << dt_total << "s"
@@ -1582,6 +1613,18 @@ LMP2Status iterate_dlpno_ccsd_t2(
                   << "  resid="    << dt_resid
                   << "  diis="     << dt_diis
                   << "  other="    << (dt_total - dt_acct)
+                  << std::endl;
+        // Step 6.8: named breakdown of "other" — separate one-time GPU
+        // construction from per-iter overhead so we can target the dominant
+        // sub-bucket for further optimisation.
+        std::cout << "[DLPNO-ITER-PROF] " << round_tag
+                  << "  other-breakdown:"
+                  << "  setup_pgpu="    << dt_setup_pgpu
+                  << "  setup_rgpu="    << dt_setup_rgpu
+                  << "  yold_copy="     << dt_yold_copy
+                  << "  compute_async=" << dt_compute_async
+                  << "  iter_misc="     << dt_iter_misc
+                  << "  unaccounted="   << dt_other_residual
                   << std::endl;
     }
     return st;

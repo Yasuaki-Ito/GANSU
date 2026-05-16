@@ -157,6 +157,7 @@ public:
      */
     const real_t*  device_pi_T_stack()      const noexcept;
     const real_t*  device_Y_pad()           const noexcept;  // padded Y_old after last rebuild
+    const real_t*  device_Y_pad_T()         const noexcept;  // Step 6.7: per-pair transpose for oooo_lad coalescing
     const int*     device_pair_lookup()     const noexcept;
     const int*     device_setup_i()         const noexcept;
     const int*     device_n_pno()           const noexcept;

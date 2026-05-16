@@ -622,11 +622,14 @@ DLPNOLambdaStatus iterate_dlpno_ccsd_lambda(
                 }
 
                 // term 5: R -= Σ_j L1_old[j → ii_pao basis] · moo[i, j]
+                // Build convention: dF_ki[a·nocc+b] = canonical moo[a, b]
+                // (first index a, second b). Canonical term 5 wants moo[i, j],
+                // so use dF_ki[i·nocc+j] (not the transpose).
                 Eigen::Map<const RowMatXd> M_ii(
                     p_ii.M.data(), n_pao_ii, n_pno_ii);
                 for (int j = 0; j < nocc; ++j) {
                     const real_t moo_ij =
-                        dF_ki[static_cast<size_t>(j) * nocc + i];
+                        dF_ki[static_cast<size_t>(i) * nocc + j];
                     if (std::fabs(moo_ij) < kFLMOThresh) continue;
                     if (static_cast<int>(L1_old[j].size()) == 0) continue;
 
@@ -771,6 +774,110 @@ DLPNOLambdaStatus iterate_dlpno_ccsd_lambda(
 
                     R.noalias() += R_contrib;
                 }
+
+                // ================================================
+                // Sub-step 2X.3.7a: term 3 — OVOO·moo1 T2-source
+                //   R[i, α] += -2 · Σ_{j,k} OVOO[i, α, j, k]·moo1[k, j]
+                //              +   Σ_{j,k} OVOO[j, α, i, k]·moo1[k, j]
+                //
+                // moo1[k, j] = dF_ki[j·nocc + k] (existing DLPNO usage
+                // convention, consistent with term 5).
+                //
+                // For each pair (i, j) [j summed]:
+                //   1st term uses W_ovoo (orientation A:
+                //     s.i == i picks W_ovoo_lambda; s.j == i picks alt)
+                //   2nd term uses W_ovoo with OPPOSITE orientation
+                //     (selects the j-LMO-first storage)
+                //
+                // Steps:
+                //   R_pno_ij[a] = -2·W_first[a,k]·moo1[k,j] + W_second[a,k]·moo1[k,j]
+                //               summed over k.
+                //   Transform R_pno_ij → R_pao_ii via barS^(ii, ij), then M^(ii).
+                // ================================================
+                RowMatXd barS_ii_ij_3;
+                Eigen::VectorXd moo1_col_j(nocc);
+                for (int j = 0; j < nocc; ++j) {
+                    const int idx_ij = pair_lookup[i * nocc + j];
+                    if (idx_ij < 0
+                        || idx_ij >= static_cast<int>(setups.size()))
+                        continue;
+                    if (idx_ij >= static_cast<int>(
+                            phase24->W_ovoo_lambda.size()))
+                        continue;
+                    if (phase24->W_ovoo_lambda[idx_ij].empty()) continue;
+                    if (phase24->W_ovoo_lambda_alt[idx_ij].empty()) continue;
+
+                    const PairSetup& s_ij = setups[idx_ij];
+                    const PairData&  p_ij = pairs[idx_ij];
+                    const int n_pno_ij = p_ij.n_pno;
+                    if (n_pno_ij == 0) continue;
+
+                    // Select orientation. For 1st term OVOO[i, α, j, k]:
+                    //   first LMO == i_loop → choose storage by s.i
+                    // For 2nd term OVOO[j, α, i, k]:
+                    //   opposite orientation
+                    const real_t* W_first  = nullptr;
+                    const real_t* W_second = nullptr;
+                    if (s_ij.i == i) {
+                        W_first  = phase24->W_ovoo_lambda[idx_ij].data();
+                        W_second = phase24->W_ovoo_lambda_alt[idx_ij].data();
+                    } else if (s_ij.j == i) {
+                        W_first  = phase24->W_ovoo_lambda_alt[idx_ij].data();
+                        W_second = phase24->W_ovoo_lambda[idx_ij].data();
+                    } else {
+                        continue;  // shouldn't happen
+                    }
+
+                    // Build moo1_col_j[k] = moo1[k, j] = dF_ki[k·nocc + j]
+                    // (build convention: dF_ki[a·nocc+b] = canonical moo[a, b]).
+                    for (int k = 0; k < nocc; ++k) {
+                        moo1_col_j(k) = dF_ki[
+                            static_cast<size_t>(k) * nocc + j];
+                    }
+
+                    // R_pno_ij[a] = -2 · Σ_k W_first[a, k]·moo1_col_j[k]
+                    //              +   Σ_k W_second[a, k]·moo1_col_j[k]
+                    Eigen::Map<const RowMatXd> W_first_mat(
+                        W_first, n_pno_ij, nocc);
+                    Eigen::Map<const RowMatXd> W_second_mat(
+                        W_second, n_pno_ij, nocc);
+                    Eigen::VectorXd R_pno_ij =
+                        -2.0 * (W_first_mat  * moo1_col_j)
+                        +       (W_second_mat * moo1_col_j);
+
+                    // Transform R_pno_ij → R_pao_ii.
+                    compute_barS_lambda(p_ii.bar_Q.data(), n_pno_ii,
+                                        p_ij.bar_Q.data(), n_pno_ij,
+                                        h_S, nao, barS_ii_ij_3);
+                    const Eigen::VectorXd R_pno_ii =
+                        barS_ii_ij_3 * R_pno_ij;
+                    const Eigen::VectorXd R_contrib_3 =
+                        M_ii * R_pno_ii;
+
+                    R.noalias() += R_contrib_3;
+                }
+
+                // ================================================
+                // Sub-step 2X.3.7c (DEFERRED): term 8 — L2·OVOO
+                //
+                // Attempted leading-order-only implementation (WOOVO ≈
+                // OVOO1[k, c, j, i], i.e. line 440 of canonical WOOVO build)
+                // gave Λ_1 norm overshoot (2.08e-2 → 4.81e-2) and dipole
+                // undershoot (1.5921 → 1.4707 vs canonical 1.5775).
+                //
+                // Root cause: canonical WOOVO at T1=0 includes T2-dressed
+                // corrections (canonical ccsd_lambda.cu lines 441-444):
+                //   line 441: woovo[i,k,b,j] += ovoo1·theta
+                //   line 442: woovo[i,j,b,k] -= ovoo1·t2
+                //   line 443: woovo[i,j,b,k] -= ovoo1·t2 (different contraction)
+                //   line 444: woovo[i,j,c,k] += ovvv·tau    ← requires per-pair
+                //                                            OVVV (heavy, TEOS
+                //                                            issue per term 7)
+                //
+                // Without these corrections, term 8 alone over-contributes.
+                // Proper term 8 implementation needs to be deferred and
+                // bundled with term 7 (L2·OVVV) + full WOOVO dressings.
+                // ================================================
 
                 // Add eigenvalue diagonal (ε_α - F_ii)·Λ_1_old[i, α] so
                 // `Λ_1 -= R/denom` overwrites Λ_1[i, α] in one Jacobi step

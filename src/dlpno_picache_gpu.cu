@@ -60,6 +60,14 @@ struct PiCacheGpu::Impl {
     real_t* d_half_pad = nullptr;     // [N_pair · max_n²] scratch
     real_t* d_pi_pad   = nullptr;     // [N_pair · N_pair · max_n²]
 
+    // Step 6.7: per-pair transpose of d_Y_pad. Layout:
+    //   d_Y_pad_T[idx · max_n² + d · max_n + c] = Y[c, d]
+    //                                           = d_Y_pad[idx · max_n² + c · max_n + d]
+    // Used by oooo_lad_kernel Phase 1 to replace strided column-wise access
+    // with sequential row-wise access (~3-50× cache traffic reduction for
+    // the inner (dd, cc) double-loop, depending on max_n / n_pno).
+    real_t* d_Y_pad_T  = nullptr;     // [N_pair · max_n²]
+
     // Pinned host buffers (Step 6.0)
     real_t* h_Y_pad  = nullptr;
     real_t* h_pi_pad = nullptr;
@@ -79,6 +87,7 @@ struct PiCacheGpu::Impl {
     void free_all() {
         if (d_barS_pad)    cudaFree(d_barS_pad);
         if (d_Y_pad)       cudaFree(d_Y_pad);
+        if (d_Y_pad_T)     cudaFree(d_Y_pad_T);
         if (d_half_pad)    cudaFree(d_half_pad);
         if (d_pi_pad)      cudaFree(d_pi_pad);
         if (h_Y_pad)       cudaFreeHost(h_Y_pad);
@@ -89,7 +98,7 @@ struct PiCacheGpu::Impl {
         if (d_idx_offset)  cudaFree(d_idx_offset);
         if (d_pi_T_stack)  cudaFree(d_pi_T_stack);
         if (h_pi_T_stack)  cudaFreeHost(h_pi_T_stack);
-        d_barS_pad = d_Y_pad = d_half_pad = d_pi_pad = nullptr;
+        d_barS_pad = d_Y_pad = d_Y_pad_T = d_half_pad = d_pi_pad = nullptr;
         h_Y_pad = h_pi_pad = nullptr;
         d_pair_lookup = d_setup_i = d_n_pno = nullptr;
         d_idx_offset = nullptr;
@@ -112,6 +121,31 @@ struct PiCacheGpu::Impl {
 //  Empty pairs (n_ij=0 or n_kl=0) write zero (zero-fill via cudaMemsetAsync
 //  beforehand handles n_ij=0; n_kl=0 we explicitly write zero here).
 // ---------------------------------------------------------------------------
+// Step 6.7 — per-pair transpose kernel.
+//   d_Y_pad_T[idx, r, c] = d_Y_pad[idx, c, r]    (matrix transpose per pair)
+// Launched as <<<N_pair, dim3(16, 16)>>> with strided thread loops for
+// max_n > 16. Negligible cost: O(N_pair · max_n²) bytes, ~1 ms even at
+// TEOS scale. The point is to convert the strided column-wise reads of
+// d_Y_pad in `oooo_lad_kernel` Phase 1 into sequential row-wise reads of
+// d_Y_pad_T, restoring L1 cache-line efficiency.
+__global__ void transpose_Y_pad_kernel(
+    const real_t* __restrict__ d_Y_pad,
+    real_t*       __restrict__ d_Y_pad_T,
+    int N_pair, int max_n)
+{
+    const int idx = blockIdx.x;
+    if (idx >= N_pair) return;
+    const size_t pair_off = static_cast<size_t>(idx)
+                          * static_cast<size_t>(max_n)
+                          * static_cast<size_t>(max_n);
+    for (int r = threadIdx.y; r < max_n; r += blockDim.y) {
+        for (int c = threadIdx.x; c < max_n; c += blockDim.x) {
+            d_Y_pad_T[pair_off + static_cast<size_t>(r) * max_n + c] =
+                d_Y_pad[pair_off + static_cast<size_t>(c) * max_n + r];
+        }
+    }
+}
+
 __global__ void pack_pi_T_stack_kernel(
     const real_t* __restrict__ d_pi_pad,
     const int*    __restrict__ d_pair_lookup,
@@ -266,7 +300,8 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
         if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
             delete p_; p_ = nullptr; active_ = false; return;
         }
-        const size_t need = 2 * bytes_full + 2 * bytes_outer + bytes_pi_T
+        // Step 6.7: +1 outer (d_Y_pad_T) for oooo_lad coalescing.
+        const size_t need = 2 * bytes_full + 3 * bytes_outer + bytes_pi_T
                           + (size_t)64 * 1024 * 1024;  // 64 MB margin
         if (need > free_b) {
             delete p_; p_ = nullptr; active_ = false; return;
@@ -277,6 +312,7 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
         check_cuda_(cudaMalloc(&s.d_barS_pad, bytes_full),  "cudaMalloc d_barS_pad");
         check_cuda_(cudaMalloc(&s.d_pi_pad,   bytes_full),  "cudaMalloc d_pi_pad");
         check_cuda_(cudaMalloc(&s.d_Y_pad,    bytes_outer), "cudaMalloc d_Y_pad");
+        check_cuda_(cudaMalloc(&s.d_Y_pad_T,  bytes_outer), "cudaMalloc d_Y_pad_T");
         check_cuda_(cudaMalloc(&s.d_half_pad, bytes_outer), "cudaMalloc d_half_pad");
 
         check_cuda_(cudaMallocHost(&s.h_Y_pad,  bytes_outer), "cudaMallocHost h_Y_pad");
@@ -554,6 +590,17 @@ void PiCacheGpu::rebuild_gpu_kernels_(
                            bytes_outer, cudaMemcpyHostToDevice),
                 "rebuild H2D Y_pad");
 
+    // Step 6.7: Build d_Y_pad_T (per-pair transpose) for oooo_lad coalescing.
+    // Negligible cost compared to the H2D above; same lifetime as d_Y_pad.
+    {
+        const int block_dim = (max_n <= 16) ? max_n : 16;
+        const dim3 t_block(block_dim, block_dim);
+        const dim3 t_grid(static_cast<unsigned>(N));
+        transpose_Y_pad_kernel<<<t_grid, t_block>>>(
+            s.d_Y_pad, s.d_Y_pad_T, N, max_n);
+        check_cuda_(cudaGetLastError(), "transpose_Y_pad_kernel launch");
+    }
+
     // -------- Per-i_ij outer loop, two strided batched DGEMMs over i_kl.
     //          Only computes the slab range [pair_begin_, pair_end_).
     const real_t one  = 1.0;
@@ -688,6 +735,13 @@ const real_t* PiCacheGpu::device_pi_T_stack() const noexcept {
 const real_t* PiCacheGpu::device_Y_pad() const noexcept {
 #ifndef GANSU_CPU_ONLY
     return (p_ && active_) ? p_->d_Y_pad : nullptr;
+#else
+    return nullptr;
+#endif
+}
+const real_t* PiCacheGpu::device_Y_pad_T() const noexcept {
+#ifndef GANSU_CPU_ONLY
+    return (p_ && active_) ? p_->d_Y_pad_T : nullptr;
 #else
     return nullptr;
 #endif

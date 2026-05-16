@@ -31,6 +31,130 @@ namespace gansu {
 
 namespace {
 
+// Step 6.8c: RAII pinned host buffer for H2D staging. Replaces
+// std::vector<real_t>(N, 0) at ResidGpu construction time. Benefits:
+//   - cudaMallocHost on Linux uses pinned (page-locked) pages directly,
+//     avoiding the cold mmap page-fault that hits regular std::vector
+//     when first-touch happens on its 642 MB of zeros.
+//   - cudaMemcpy from pinned memory uses driver DMA without internal
+//     staging-buffer copies, ~3-4× faster than from pageable host memory.
+// Used as: PinnedHost h_V_T(N * per_pair_meta); h_V_T.zero(); ...; pack;
+//          cudaMemcpy(d_dst, h_V_T.get(), bytes, ...);  ~~RAII frees on scope exit.
+class PinnedHost {
+public:
+    PinnedHost() = default;
+    explicit PinnedHost(size_t n_doubles) {
+        if (n_doubles > 0) {
+            const cudaError_t e = cudaMallocHost(&p_, n_doubles * sizeof(real_t));
+            if (e != cudaSuccess) p_ = nullptr;
+        }
+        n_ = (p_ ? n_doubles : 0);
+    }
+    PinnedHost(const PinnedHost&) = delete;
+    PinnedHost& operator=(const PinnedHost&) = delete;
+    PinnedHost(PinnedHost&& other) noexcept : p_(other.p_), n_(other.n_) {
+        other.p_ = nullptr; other.n_ = 0;
+    }
+    PinnedHost& operator=(PinnedHost&& other) noexcept {
+        if (this != &other) { free_(); p_ = other.p_; n_ = other.n_;
+                              other.p_ = nullptr; other.n_ = 0; }
+        return *this;
+    }
+    ~PinnedHost() { free_(); }
+    real_t*       data()       noexcept { return p_; }
+    const real_t* data() const noexcept { return p_; }
+    size_t        size() const noexcept { return n_; }
+    bool          valid() const noexcept { return p_ != nullptr; }
+    void zero() noexcept {
+        if (p_) std::memset(p_, 0, n_ * sizeof(real_t));
+    }
+private:
+    void free_() noexcept {
+        if (p_) { cudaFreeHost(p_); p_ = nullptr; n_ = 0; }
+    }
+    real_t* p_ = nullptr;
+    size_t  n_ = 0;
+};
+
+// Step 6.9 — GPU pack kernel for V_meta_T / V_meta_TT / T_meta / V_stacked_oooo.
+//
+// Replaces the CPU-side pack of three+one ~642+213 MB padded buffers
+// (hexamer scale) with a direct GPU kernel that reads a single flat
+// source array (~35 MB at hexamer, ~25× less than the padded sinks
+// combined). The kernel walks (l, k) per pair and writes:
+//   V_meta_T_pad        [l·max_n + d, k·max_n + c] = V_ovov_pair[idx](l, k, d, c)
+//   V_meta_TT_pad       [l·max_n + d, k·max_n + c] = V_ovov_pair[idx](l, k, c, d)
+//   T_meta_pad          [l·max_n + d, k·max_n + c] = T_pair    [idx](k, l, c, d)
+//   V_stacked_oooo_pad  [(k·nocc + l)·max_n² + d·max_n + c] = V_lk(d, c)
+// (V_stacked_oooo's row axis is (k, l)-ordered, axes-swapped from the
+// V_meta_T destination; same source V_lk read.)
+//
+// Padding region (d, c ≥ n_pno) is pre-zeroed by cudaMemset; the kernel
+// only writes the valid n_pno × n_pno block.
+//
+// Source layout (d_V_flat / d_T_flat, per pair contiguous):
+//   V_ovov_pair[idx][((l·nocc + k)·n + d)·n + c] = V_lk(d, c)
+//   T_pair    [idx][((k·nocc + l)·n + c)·n + d] = T_kl(c, d)
+// Pair offsets in d_pair_src_off (cumulative size_t array of length
+// N_pair + 1, computed host-side).
+__global__ void pack_V_meta_kernel(
+    const real_t* __restrict__ d_V_flat,
+    const real_t* __restrict__ d_T_flat,
+    const int*    __restrict__ d_n_pno,
+    const size_t* __restrict__ d_pair_src_off,
+    real_t*       __restrict__ d_V_meta_T_pad,
+    real_t*       __restrict__ d_V_meta_TT_pad,
+    real_t*       __restrict__ d_T_meta_pad,
+    real_t*       __restrict__ d_V_stacked_oooo_pad,
+    int nocc, int max_n)
+{
+    const int idx = blockIdx.x;
+    const int n   = d_n_pno[idx];
+    if (n == 0) return;
+
+    const int    max_nn        = nocc * max_n;
+    const size_t per_pair_meta = static_cast<size_t>(max_nn)
+                               * static_cast<size_t>(max_nn);
+    const size_t per_pair_oooo = static_cast<size_t>(nocc) * nocc
+                               * static_cast<size_t>(max_n) * max_n;
+    const size_t pair_dst_off       = static_cast<size_t>(idx) * per_pair_meta;
+    const size_t pair_oooo_off      = static_cast<size_t>(idx) * per_pair_oooo;
+    const size_t pair_src_off       = d_pair_src_off[idx];
+
+    // Outer (l, k) loop, inner (d, c) strided by thread.
+    for (int l = 0; l < nocc; ++l) {
+        for (int k = 0; k < nocc; ++k) {
+            const size_t lk_off = static_cast<size_t>(l * nocc + k)
+                                * static_cast<size_t>(n) * n;
+            const size_t kl_off = static_cast<size_t>(k * nocc + l)
+                                * static_cast<size_t>(n) * n;
+            const real_t* V_lk = d_V_flat + pair_src_off + lk_off;
+            const real_t* T_kl = d_T_flat + pair_src_off + kl_off;
+            const size_t row_base = pair_dst_off
+                                  + static_cast<size_t>(l * max_n) * max_nn
+                                  + static_cast<size_t>(k * max_n);
+            // V_stacked_oooo row index = (k·nocc + l) (axes swapped vs V_meta).
+            const size_t oooo_block_off = pair_oooo_off
+                                        + (static_cast<size_t>(k) * nocc + l)
+                                          * static_cast<size_t>(max_n) * max_n;
+
+            for (int d = threadIdx.y; d < n; d += blockDim.y) {
+                const size_t row_off  = row_base
+                                      + static_cast<size_t>(d) * max_nn;
+                const size_t oooo_off = oooo_block_off
+                                      + static_cast<size_t>(d) * max_n;
+                for (int c = threadIdx.x; c < n; c += blockDim.x) {
+                    const real_t v_dc = V_lk[d * n + c];
+                    d_V_meta_T_pad       [row_off + c]  = v_dc;
+                    d_V_meta_TT_pad      [row_off + c]  = V_lk[c * n + d];
+                    d_T_meta_pad         [row_off + c]  = T_kl[c * n + d];
+                    d_V_stacked_oooo_pad [oooo_off + c] = v_dc;
+                }
+            }
+        }
+    }
+}
+
 inline void check_cuda_(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         throw std::runtime_error(std::string("ResidGpu CUDA error in ")
@@ -244,28 +368,32 @@ __global__ void inter_pair_fock_j_kernel(
 //   R[idx][a, b] += Σ_{kl} W_eff[idx][kl] · π_{kl}^{oriented}[a, b]
 // where  W_eff[idx][kl] = W_oooo[idx][kl] + W_dress[idx][kl]
 //        W_dress[idx][kl] = Σ_{d, c} V_lk(d, c) · Y_old(c, d)
-//                         = Σ_{d, c} V_stacked[idx][kl, d·max_n + c] · Y_pad[idx][c·max_n + d]
+//                         = Σ_{d, c} V_stacked[idx][kl, d·max_n + c] · Y_pad_T[idx][d·max_n + c]
 //
 // Optimisation history:
-//   - Original (Step 6.6a fused, used until 2026-05-13): each thread re-
-//     computed W_dress[kl] independently for its (a, b). With n_ij up to 8,
-//     this meant 64× redundant inner-loop work per kl. The hope was that
-//     the L1/L2 caches would absorb the redundancy via warp-broadcast,
-//     but nsys profiling (hexamer cc-pVDZ, 8×A100) showed the kernel
-//     dominating 91.5% of GPU time at 76 ms/call — the strided Y_pad reads
-//     (Y_col[cc * max_n]) blew the cache.
-//   - This version: each block (= one pair) cooperatively computes the
+//   - Step 6.6a fused (until 2026-05-13): each thread re-computed
+//     W_dress[kl] independently for its (a, b). With n_ij up to 8,
+//     this meant 64× redundant inner-loop work per kl. Strided Y reads
+//     blew the cache, nsys showed kernel dominating 91.5% of GPU time.
+//   - Step 6.6 shmem refactor: each block cooperatively computes the
 //     nocc² values of W_eff[kl] ONCE into shared memory, then loops over
-//     (a, b) to accumulate Σ_kl W_eff[kl] · pi(a, kl, b). Eliminates the
-//     64× redundancy. Shared mem use = nocc² × 8 B (typically 7-30 KB,
-//     fits in 48 KB default per-block limit).
-//   - Expected per-kernel speedup: ~10-50× depending on n_ij and cache
-//     behavior. Benefits 1-GPU and multi-GPU paths equally.
+//     (a, b) to accumulate. Eliminates 64× redundancy. Shared mem use
+//     = nocc² × 8 B (7-30 KB, fits 48 KB per-block limit). 2× kernel speedup.
+//   - Step 6.7 (this version): switch Phase 1's strided Y_pad access to
+//     pre-transposed `d_Y_pad_T` for fully sequential row-wise reads of
+//     the (dd, cc) inner loop. The inner sum is now element-wise product
+//     of two contiguous rows V_row[cc] · Y_pad_T_row[cc], hitting the
+//     same cache line for the whole cc loop instead of n_ij separate
+//     cache lines as before. Cache traffic ↓ by min(n_ij, max_n/8)×
+//     (typically 4-50× for production n_pno), with biggest gains at
+//     TEOS-class n_pno=50+. d_Y_pad_T is built once per outer T iter
+//     by `transpose_Y_pad_kernel` in PiCacheGpu::rebuild_pi, negligible
+//     extra cost (~ms-scale).
 __global__ void oooo_lad_kernel(
     const real_t* __restrict__ d_V_stacked_oooo_pad,
     const real_t* __restrict__ d_W_oooo,
     const real_t* __restrict__ d_pi_T_stack,
-    const real_t* __restrict__ d_Y_pad,
+    const real_t* __restrict__ d_Y_pad_T,   // Step 6.7: pre-transposed Y
     const size_t* __restrict__ d_idx_offset_pi_T,
     const int*    __restrict__ d_n_pno,
     real_t*       __restrict__ d_R_pad,
@@ -292,18 +420,21 @@ __global__ void oooo_lad_kernel(
 
     // ---- Phase 1: cooperatively compute s_W_eff[kl] for all kl ∈ [0, nocc²). ----
     // Threads stride through kl. Per kl: read W_oooo + compute W_dress
-    // (n_ij² mul-adds on V and Y). Strided Y access remains here but only
-    // done ONCE per kl per block (not 64× as before).
+    // (n_ij² mul-adds on V and Y_pad_T, both accessed sequentially row-wise
+    // for L1-friendly cache-line reuse).
     for (int kl = tid; kl < nocc2; kl += nthreads) {
         const real_t* V_lk = d_V_stacked_oooo_pad
                            + v_pair_off
                            + static_cast<size_t>(kl) * max_nn;
         real_t W_dress = real_t(0);
         for (int dd = 0; dd < n_ij; ++dd) {
-            const real_t* V_row = V_lk + static_cast<size_t>(dd) * max_n;
-            const real_t* Y_col = d_Y_pad + y_pair_off + dd;
+            const real_t* V_row  = V_lk + static_cast<size_t>(dd) * max_n;
+            const real_t* Y_row  = d_Y_pad_T + y_pair_off
+                                 + static_cast<size_t>(dd) * max_n;
+            // Y_pad_T[idx, dd, cc] = Y[cc, dd] (per-pair transpose),
+            // so the cc-loop is now sequential in both V_row and Y_row.
             for (int cc = 0; cc < n_ij; ++cc) {
-                W_dress += V_row[cc] * Y_col[static_cast<size_t>(cc) * max_n];
+                W_dress += V_row[cc] * Y_row[cc];
             }
         }
         s_W_eff[kl] = d_W_oooo[w_pair_off + kl] + W_dress;
@@ -688,47 +819,110 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
     //   V_meta_TT_pad[l*max_n + d, k*max_n + c] = V_lk(c, d)
     //   T_meta_pad   [l*max_n + d, k*max_n + c] = T_kl(c, d)
     {
-        std::vector<real_t> h_V_T (static_cast<size_t>(N_pair_) * per_pair_meta, real_t{0});
-        std::vector<real_t> h_V_TT(static_cast<size_t>(N_pair_) * per_pair_meta, real_t{0});
-        std::vector<real_t> h_T   (static_cast<size_t>(N_pair_) * per_pair_meta, real_t{0});
+        // Step 6.9: direct GPU pack. Replaces the CPU pack of 3 padded
+        // 214 MB buffers (642 MB pinned) with:
+        //   (1) flat concat of unpadded source on pinned host (~35 MB at
+        //       hexamer = 18× less than padded sink), single H2D,
+        //   (2) GPU kernel pack_V_meta_kernel that writes V_T/V_TT/T_meta
+        //       in one pass (read once, write 3×).
+        //
+        // Expected setup_rgpu (hexamer): 2.7s → 0.3-0.5s.
+        std::vector<size_t> pair_src_off_host(N_pair_ + 1, 0);
+        for (int idx = 0; idx < N_pair_; ++idx) {
+            const int n = n_pno_[idx];
+            const size_t pair_sz =
+                static_cast<size_t>(n) * n
+                * static_cast<size_t>(nocc) * nocc;
+            pair_src_off_host[idx + 1] = pair_src_off_host[idx] + pair_sz;
+        }
+        const size_t total_src_sz = pair_src_off_host.back();
+
+        // Host pinned source buffers.
+        PinnedHost h_V_flat(total_src_sz);
+        PinnedHost h_T_flat(total_src_sz);
+        if (!h_V_flat.valid() || !h_T_flat.valid()) {
+            delete p_; p_ = nullptr; active_ = false; return;
+        }
+
+        // Gather: just memcpy each pair's unpadded data into contiguous
+        // pinned buffer. No transposes or reshapes — those happen on GPU.
         #pragma omp parallel for schedule(static)
         for (long long idx = 0; idx < N_pair_; ++idx) {
             const int n = n_pno_[idx];
             if (n == 0) continue;
             if (phase24.V_ovov_pair[idx].empty()) continue;
             if (phase24.T_pair[idx].empty())     continue;
-            const real_t* V = phase24.V_ovov_pair[idx].data();
-            const real_t* T = phase24.T_pair[idx].data();
-            const size_t pair_off = static_cast<size_t>(idx) * per_pair_meta;
-            for (int l = 0; l < nocc; ++l) {
-                for (int k = 0; k < nocc; ++k) {
-                    const real_t* V_lk = V + (static_cast<size_t>(l) * nocc + k)
-                                         * static_cast<size_t>(n) * n;
-                    const real_t* T_kl = T + (static_cast<size_t>(k) * nocc + l)
-                                         * static_cast<size_t>(n) * n;
-                    for (int d = 0; d < n; ++d) {
-                        const size_t row_off = pair_off
-                            + (static_cast<size_t>(l) * max_n + d)
-                            * static_cast<size_t>(max_nn);
-                        real_t* row_VT  = h_V_T.data()  + row_off;
-                        real_t* row_VTT = h_V_TT.data() + row_off;
-                        real_t* row_T   = h_T.data()    + row_off;
-                        for (int c = 0; c < n; ++c) {
-                            const size_t col_off = static_cast<size_t>(k) * max_n + c;
-                            row_VT [col_off] = V_lk[d * n + c];
-                            row_VTT[col_off] = V_lk[c * n + d];
-                            row_T  [col_off] = T_kl[c * n + d];
-                        }
-                    }
-                }
-            }
+            const size_t off = pair_src_off_host[idx];
+            const size_t pair_sz =
+                pair_src_off_host[idx + 1] - off;
+            std::memcpy(h_V_flat.data() + off,
+                        phase24.V_ovov_pair[idx].data(),
+                        pair_sz * sizeof(real_t));
+            std::memcpy(h_T_flat.data() + off,
+                        phase24.T_pair[idx].data(),
+                        pair_sz * sizeof(real_t));
         }
-        check_cuda_(cudaMemcpy(s.d_V_meta_T_pad,  h_V_T.data(),  bytes_meta_full,
-                               cudaMemcpyHostToDevice), "H2D V_meta_T");
-        check_cuda_(cudaMemcpy(s.d_V_meta_TT_pad, h_V_TT.data(), bytes_meta_full,
-                               cudaMemcpyHostToDevice), "H2D V_meta_TT");
-        check_cuda_(cudaMemcpy(s.d_T_meta_pad,    h_T.data(),    bytes_meta_full,
-                               cudaMemcpyHostToDevice), "H2D T_meta");
+
+        // Device-side source + offsets.
+        real_t* d_V_flat = nullptr;
+        real_t* d_T_flat = nullptr;
+        size_t* d_pair_src_off = nullptr;
+        check_cuda_(cudaMalloc(&d_V_flat,
+                               total_src_sz * sizeof(real_t)),
+                    "cudaMalloc d_V_flat");
+        check_cuda_(cudaMalloc(&d_T_flat,
+                               total_src_sz * sizeof(real_t)),
+                    "cudaMalloc d_T_flat");
+        check_cuda_(cudaMalloc(&d_pair_src_off,
+                               (N_pair_ + 1) * sizeof(size_t)),
+                    "cudaMalloc d_pair_src_off");
+
+        check_cuda_(cudaMemcpy(d_V_flat, h_V_flat.data(),
+                               total_src_sz * sizeof(real_t),
+                               cudaMemcpyHostToDevice), "H2D V_flat");
+        check_cuda_(cudaMemcpy(d_T_flat, h_T_flat.data(),
+                               total_src_sz * sizeof(real_t),
+                               cudaMemcpyHostToDevice), "H2D T_flat");
+        check_cuda_(cudaMemcpy(d_pair_src_off, pair_src_off_host.data(),
+                               (N_pair_ + 1) * sizeof(size_t),
+                               cudaMemcpyHostToDevice),
+                    "H2D pair_src_off");
+
+        // Zero padding region (kernel only writes valid n × n block).
+        const size_t bytes_v_oooo_full =
+            static_cast<size_t>(N_pair_)
+          * static_cast<size_t>(nocc_) * nocc_
+          * static_cast<size_t>(max_n) * max_n
+          * sizeof(real_t);
+        check_cuda_(cudaMemset(s.d_V_meta_T_pad, 0, bytes_meta_full),
+                    "memset V_meta_T");
+        check_cuda_(cudaMemset(s.d_V_meta_TT_pad, 0, bytes_meta_full),
+                    "memset V_meta_TT");
+        check_cuda_(cudaMemset(s.d_T_meta_pad, 0, bytes_meta_full),
+                    "memset T_meta");
+        check_cuda_(cudaMemset(s.d_V_stacked_oooo_pad, 0, bytes_v_oooo_full),
+                    "memset V_stacked_oooo");
+
+        // Launch GPU pack. d_n_pno is borrowed from pgpu (uploaded once).
+        const int* d_n_pno = pgpu.device_n_pno();
+        if (d_n_pno == nullptr) {
+            cudaFree(d_V_flat); cudaFree(d_T_flat); cudaFree(d_pair_src_off);
+            delete p_; p_ = nullptr; active_ = false; return;
+        }
+        const dim3 block(16, 16);
+        const dim3 grid(static_cast<unsigned>(N_pair_));
+        pack_V_meta_kernel<<<grid, block>>>(
+            d_V_flat, d_T_flat, d_n_pno, d_pair_src_off,
+            s.d_V_meta_T_pad, s.d_V_meta_TT_pad, s.d_T_meta_pad,
+            s.d_V_stacked_oooo_pad,
+            nocc_, max_n_);
+        check_cuda_(cudaGetLastError(),
+                    "pack_V_meta_kernel launch");
+
+        // Free temporary device buffers (pack done).
+        cudaFree(d_V_flat);
+        cudaFree(d_T_flat);
+        cudaFree(d_pair_src_off);
     }
 
     // ---- Pack + upload W_bare_ovov_i/j and W_bare_ovvo_i/j into block layout ----
@@ -739,7 +933,14 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
                            real_t* d_dst,
                            const char* label)
     {
-        std::vector<real_t> h_W(static_cast<size_t>(N_pair_) * per_pair_block, real_t{0});
+        // Step 6.8c: pinned host staging.
+        PinnedHost h_W(static_cast<size_t>(N_pair_) * per_pair_block);
+        if (!h_W.valid()) {
+            check_cuda_(cudaErrorMemoryAllocation,
+                        "cudaMallocHost h_W for pack_W_bare");
+            return;
+        }
+        h_W.zero();
         #pragma omp parallel for schedule(static)
         for (long long idx = 0; idx < N_pair_; ++idx) {
             const int n = n_pno_[idx];
@@ -769,53 +970,19 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
     pack_W_bare(phase24.W_ovvo_i, s.d_W_bare_ovvo_i_pad, "H2D W_bare_ovvo_i");
     pack_W_bare(phase24.W_ovvo_j, s.d_W_bare_ovvo_j_pad, "H2D W_bare_ovvo_j");
 
-    // ---- Step 6.6: Pack + upload V_stacked_oooo (padded) and W_oooo. ----
-    // Source: phase24.V_ovov_pair[idx]: (l*nocc + k, d, c) flat → V_lk(d, c).
-    // Padded layout: V_stacked_oooo_pad[idx][kl, d*max_n + c] = V_lk(d, c)
-    //                where kl = k*nocc + l (note CPU code uses (k*nocc + l)
-    //                indexing on the row axis of V_stacked_oooo).
-    {
-        const size_t per_pair_v_oooo = static_cast<size_t>(nocc_) * nocc_
-                                     * static_cast<size_t>(max_n) * max_n;
-        const size_t bytes_v_oooo = static_cast<size_t>(N_pair_) * per_pair_v_oooo
-                                  * sizeof(real_t);
-        std::vector<real_t> h_V_oooo(static_cast<size_t>(N_pair_) * per_pair_v_oooo,
-                                     real_t{0});
-        #pragma omp parallel for schedule(static)
-        for (long long idx = 0; idx < N_pair_; ++idx) {
-            const int n = n_pno_[idx];
-            if (n == 0) continue;
-            if (idx >= static_cast<long long>(phase24.V_ovov_pair.size())) continue;
-            if (phase24.V_ovov_pair[idx].empty()) continue;
-            const real_t* V = phase24.V_ovov_pair[idx].data();
-            const size_t pair_off = static_cast<size_t>(idx) * per_pair_v_oooo;
-            for (int k = 0; k < nocc_; ++k) {
-                for (int l = 0; l < nocc_; ++l) {
-                    // CPU layout: V_stacked_oooo[idx] row index = (k*nocc + l)
-                    //             with V_lk row-major flat in the columns.
-                    const real_t* V_lk = V + (static_cast<size_t>(l) * nocc_ + k)
-                                         * static_cast<size_t>(n) * n;
-                    real_t* row_dst = h_V_oooo.data() + pair_off
-                                    + (static_cast<size_t>(k) * nocc_ + l)
-                                      * static_cast<size_t>(max_n) * max_n;
-                    for (int d = 0; d < n; ++d) {
-                        for (int c = 0; c < n; ++c) {
-                            row_dst[static_cast<size_t>(d) * max_n + c]
-                                = V_lk[d * n + c];
-                        }
-                    }
-                }
-            }
-        }
-        check_cuda_(cudaMemcpy(s.d_V_stacked_oooo_pad, h_V_oooo.data(),
-                               bytes_v_oooo, cudaMemcpyHostToDevice),
-                    "H2D V_stacked_oooo_pad");
-    }
+    // Step 6.9: V_stacked_oooo_pad is now written by pack_V_meta_kernel
+    // above (fused with V_meta_T/V_meta_TT/T_meta packing). The separate
+    // CPU pack + H2D scope that lived here is removed.
     // W_oooo[idx] is already (nocc²) flat per pair → direct upload (concat).
     {
         const size_t per_pair_w = static_cast<size_t>(nocc_) * nocc_;
         const size_t bytes_w = static_cast<size_t>(N_pair_) * per_pair_w * sizeof(real_t);
-        std::vector<real_t> h_W(static_cast<size_t>(N_pair_) * per_pair_w, real_t{0});
+        // Step 6.8c: pinned host staging (small, ~1 MB; pinning is cheap).
+        PinnedHost h_W(static_cast<size_t>(N_pair_) * per_pair_w);
+        if (!h_W.valid()) {
+            delete p_; p_ = nullptr; active_ = false; return;
+        }
+        h_W.zero();
         for (int idx = 0; idx < N_pair_; ++idx) {
             if (idx >= static_cast<int>(phase24.W_oooo.size())) continue;
             if (phase24.W_oooo[idx].size() == per_pair_w) {
@@ -1244,21 +1411,23 @@ void ResidGpu::compute_async(const std::vector<real_t>& dF_ki_host)
             s.d_I_i, s.d_I_j, s.d_F_LMO, s.d_dF_ki,
             s.d_R_ph_pad, N, nocc, max_n, threshold, ib);
 
-        // Step 6.6: fused oooo ladder kernel — borrows d_Y_pad from pgpu
-        // (set by the most recent rebuild_with_stack call). Accumulates
-        // into d_R_ph_pad alongside ph-ladder + inter-pair Fock.
+        // Step 6.6 + 6.7: fused oooo ladder kernel — borrows pre-transposed
+        // d_Y_pad_T from pgpu (set by the most recent rebuild_with_stack call).
+        // Accumulates into d_R_ph_pad alongside ph-ladder + inter-pair Fock.
         //
-        // Phase 2.2 refactor: kernel uses dynamic shared memory of size
+        // Step 6.6 refactor: kernel uses dynamic shared memory of size
         // nocc² × sizeof(real_t) for the per-block W_eff[kl] cache. For
         // nocc=30 (hexamer) this is 7.2 KB, for nocc=60 (cholesterol class)
         // 28.8 KB — both well under the 48 KB default per-block limit.
-        const real_t* d_Y_pad = pgpu_->device_Y_pad();
-        if (d_Y_pad) {
+        // Step 6.7: pre-transposed Y_pad_T eliminates the strided Y access
+        // in Phase 1 (cache-line waste was ~max(1, max_n / cache_line/8) ×).
+        const real_t* d_Y_pad_T = pgpu_->device_Y_pad_T();
+        if (d_Y_pad_T) {
             const size_t shmem_bytes =
                 static_cast<size_t>(nocc) * nocc * sizeof(real_t);
             oooo_lad_kernel<<<grid, block, shmem_bytes>>>(
                 s.d_V_stacked_oooo_pad, s.d_W_oooo,
-                d_pi_T_stack, d_Y_pad, d_idx_offset, d_n_pno,
+                d_pi_T_stack, d_Y_pad_T, d_idx_offset, d_n_pno,
                 s.d_R_ph_pad, N, nocc, max_n, ib);
         }
 

@@ -202,6 +202,26 @@ struct Phase24Integrals {
     std::vector<std::vector<real_t>> W_ovvo_lambda;     ///< [n_pairs] of [n_pno_ij²]
     std::vector<std::vector<real_t>> W_ovvo_lambda_alt; ///< [n_pairs] of [n_pno_ij²]
     std::vector<std::vector<real_t>> W_oovv_lambda;     ///< [n_pairs] of [n_pno_ij²]
+
+    /// Sub-step 2X.3.7a: OVOO integrals per strong pair (i,j), used by the
+    /// OVOO·moo1 T2-source term of Λ_1:
+    ///   R_Λ_1[i,α_ii] ⊃ -2 · Σ_{j,k} OVOO[i, α, j, k]·moo1[k, j]
+    ///                  +   Σ_{j,k} OVOO[j, α, i, k]·moo1[k, j]
+    /// (term 3 of the canonical Λ_1 catalogue, T1=0 limit).
+    /// Also shared with term 8 (L2·OVOO) in Sub-step 2X.3.7c.
+    ///
+    /// Pair storage with s.i ≤ s.j: the two OVOO orientations
+    ///   W_ovoo_lambda[idx][a, k]     = (s.i a | s.j k)  — "i-role"
+    ///   W_ovoo_lambda_alt[idx][a, k] = (s.j a | s.i k)  — "j-role"
+    /// are stored together. Indices: a in pair (i,j) PNO basis, k LMO.
+    /// Layout: a·nocc + k (row-major).
+    ///
+    /// Scaling: n_pair_strong · n_pno · nocc · 16 B (2 × 8 B). TEOS-class
+    /// (n_pair_strong ≈ 8e3, n_pno ≈ 50, nocc ≈ 200) is ~1.3 GB.
+    /// Cholesterol-class (n_pair_strong ≈ 4e3, n_pno ≈ 30, nocc ≈ 75)
+    /// is ~150 MB.
+    std::vector<std::vector<real_t>> W_ovoo_lambda;     ///< [n_pairs] of [n_pno·nocc]
+    std::vector<std::vector<real_t>> W_ovoo_lambda_alt; ///< [n_pairs] of [n_pno·nocc]
 };
 
 /**
