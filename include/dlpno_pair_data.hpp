@@ -248,7 +248,8 @@ LMP2Status iterate_lmp2(
     int nocc, int nao,
     int max_iter, real_t conv_tol,
     int verbose, const char* round_tag,
-    int num_gpus = 1);
+    int num_gpus = 1,
+    bool user_explicit_n_gpus = false);
 
 /**
  * @brief CCSD T2 amplitude iterator in per-pair PNO+W basis (Phase 2.3+).
@@ -292,6 +293,7 @@ LMP2Status iterate_dlpno_ccsd_t2(
     bool enable_dressing,
     int verbose, const char* round_tag,
     const Phase24Integrals* phase24 = nullptr,
-    int num_gpus = 1);
+    int num_gpus = 1,
+    bool user_explicit_n_gpus = false);
 
 } // namespace gansu

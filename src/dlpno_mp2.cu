@@ -120,7 +120,9 @@ DLPNOLMP2Result solve_dlpno_lmp2(
 
     DLPNOLMP2Result result;
     result.nao  = rhf.get_num_basis();
-    result.nocc = rhf.get_num_electrons() / 2;
+    // Frozen-core aware: nocc = active occupied (= total - num_frozen_core_).
+    // For --frozen_core none, num_frozen_core_ = 0 → identical to legacy.
+    result.nocc = rhf.get_num_active_occ();
     if (result.nocc <= 0) return result;
 
     const int nao_  = result.nao;
@@ -140,10 +142,30 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     const real_t* h_F   = rhf.get_fock_matrix().host_ptr();
     const real_t* h_eps = rhf.get_orbital_energies().host_ptr();
 
+    // Frozen-core: skip the first num_fc columns of the (nao × nao) MO
+    // coefficient matrix and the matching orbital-energy entries. With
+    // --frozen_core none, num_fc = 0 and behaviour is identical to legacy.
+    //
+    // We need TWO occupied buffers:
+    //   - C_occ (nao × nocc_active): input to the localizer and downstream
+    //     pair (i,j) loops. Frozen orbitals are excluded.
+    //   - C_occ_full (nao × nocc_full): input to build_pao_global, which
+    //     constructs the PAO basis as (I − D·S) with D = C_occ·C_occ^T.
+    //     The PAO projector must remove ALL occupied (frozen + active),
+    //     otherwise the frozen orbital leaks into the PAO virtual space
+    //     and CCSD picks up spurious frozen↔active T2 excitations.
+    const int num_fc = rhf.get_num_frozen_core();
+    const int nocc_full = nocc_ + num_fc;
+
+    std::vector<real_t> C_occ_full(
+        static_cast<size_t>(nao_) * nocc_full, 0.0);
     std::vector<real_t> C_occ(static_cast<size_t>(nao_) * nocc_, 0.0);
-    for (int mu = 0; mu < nao_; ++mu)
+    for (int mu = 0; mu < nao_; ++mu) {
+        for (int i = 0; i < nocc_full; ++i)
+            C_occ_full[mu * nocc_full + i] = h_C[mu * nao_ + i];
         for (int i = 0; i < nocc_; ++i)
-            C_occ[mu * nocc_ + i] = h_C[mu * nao_ + i];
+            C_occ[mu * nocc_ + i] = h_C[mu * nao_ + (num_fc + i)];
+    }
 
     std::vector<std::pair<int,int>> atom_ranges;
     atom_ranges.reserve(natoms);
@@ -187,7 +209,7 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     {
         Eigen::Map<const RowMatXd> U(h_U_loc, nocc_, nocc_);
         Eigen::VectorXd eps_o(nocc_);
-        for (int i = 0; i < nocc_; ++i) eps_o(i) = h_eps[i];
+        for (int i = 0; i < nocc_; ++i) eps_o(i) = h_eps[num_fc + i];
         RowMatXd UD = U;
         for (int k = 0; k < nocc_; ++k) UD.row(k) *= eps_o(k);
         RowMatXd FL = U.transpose() * UD;
@@ -210,7 +232,12 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     // 3. Global PAO matrix and per-LMO domains.
     // -----------------------------------------------------------------------
     const auto t_pao0 = clock::now();
-    auto C_pao_global = build_pao_global(h_C_LMO, h_S, nao_, nocc_);
+    // PAO projector must use ALL occupied (frozen + active). Pass
+    // C_occ_full instead of h_C_LMO so frozen orbitals are projected out
+    // of the PAO virtual space (otherwise CCSD T2 sees spurious
+    // frozen↔active excitations and diverges).
+    auto C_pao_global = build_pao_global(
+        C_occ_full.data(), h_S, nao_, nocc_full);
 
     auto lmo_domains = build_lmo_domains(
         h_C_LMO, h_S, nao_, nocc_, atom_ranges,
@@ -579,7 +606,14 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     // Multi-GPU pair partition for LMP2 iteration: replicate B (already
     // forced above), then drive iterate_lmp2 with num_gpus instances of
     // PiCacheGpu — each handles a slab of pairs.
+    //
+    // Option C (2026-05-19): user_explicit_n_gpus tracks whether the user
+    // passed `--num_gpus N > 0` explicitly (vs. the default `-1` auto).
+    // When explicit, the auto-fallback threshold in iterate_lmp2 is bypassed
+    // so the user intent is honoured (required for ResidGpu activation on
+    // cholesterol-class systems after S11 Phase 2).
     int lmp2_num_gpus = 1;
+    const bool user_explicit_n_gpus = (rhf.get_num_gpus() != -1);
 #ifdef GANSU_MULTI_GPU
     if (auto* eri_dist = dynamic_cast<const ERI_RI_Distributed_RHF*>(&eri)) {
         if (eri_dist->num_gpus() > 1) {
@@ -597,7 +631,8 @@ DLPNOLMP2Result solve_dlpno_lmp2(
             last_status = iterate_lmp2(
                 setups, pairs, pair_lookup, F_LMO, h_S,
                 nocc_, nao_, max_iter, conv_tol,
-                params.verbose, tag, lmp2_num_gpus);
+                params.verbose, tag, lmp2_num_gpus,
+                user_explicit_n_gpus);
             dt_iterate += std::chrono::duration<double>(
                 clock::now() - t_iter0).count();
 
@@ -701,7 +736,8 @@ DLPNOLMP2Result solve_dlpno_lmp2(
 DLPNOMP2::DLPNOMP2(RHF& rhf, const ERI& eri, DLPNOParams params)
     : rhf_(rhf), eri_(eri), params_(std::move(params)),
       nao_(rhf.get_num_basis()),
-      nocc_(rhf.get_num_electrons() / 2),
+      // Frozen-core aware (= total - num_frozen_core_; 0 if --frozen_core none).
+      nocc_(rhf.get_num_active_occ()),
       natoms_(static_cast<int>(rhf.get_atom_to_basis_range().size()))
 {}
 

@@ -9,6 +9,8 @@
  */
 #include "dlpno_picache_gpu.hpp"
 
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -119,9 +121,22 @@ struct PiCacheGpu::Impl {
     int*     d_setup_i     = nullptr;     // [N_pair] setups[idx].i
     int*     d_n_pno       = nullptr;     // [N_pair] pairs[idx].n_pno
     size_t*  d_idx_offset  = nullptr;     // [N_pair+1] cumulative pi_T_stack[idx] offset
-    real_t*  d_pi_T_stack  = nullptr;     // [Σ n_pno²·nocc²] unpadded
-    real_t*  h_pi_T_stack  = nullptr;     // pinned mirror
-    size_t   pi_T_stack_total = 0;        // sum of n_pno²·nocc²
+    real_t*  d_pi_T_stack  = nullptr;     // [Σ n_pno²·nocc²] unpadded (FULL N_pair on device)
+    real_t*  h_pi_T_stack  = nullptr;     // pinned mirror — Step S9 (2026-05-17):
+                                          // sized to the slab [pair_begin_, pair_end_)
+                                          // only, not the full N_pair sum. Saves
+                                          // ~18 GB/device on cholesterol with
+                                          // num_gpus=8 and lets concurrent
+                                          // cudaMallocHost on N_gpus PiCacheGpu
+                                          // instances avoid the kernel's
+                                          // process-wide mmap_lock contention.
+    size_t   pi_T_stack_total = 0;        // sum of n_pno²·nocc² (full N_pair, retained for legacy callers)
+    // Step S9 — slab-only pinned mirror metadata. Both are in element counts
+    // (not bytes). `h_pi_T_stack` is allocated to pi_T_slab_total elements.
+    // To read pair i_ij ∈ [pair_begin_, pair_end_), index with
+    // `h_pi_T_stack + (idx_offset_host[i_ij] - pi_T_slab_base_offset)`.
+    size_t   pi_T_slab_base_offset = 0;   // Σ_{i<pair_begin_} n_pno_[i]²·nocc²
+    size_t   pi_T_slab_total       = 0;   // Σ_{pair_begin_≤i<pair_end_} n_pno_[i]²·nocc²
 
     // Step Z stacked-mode buffers — orig idx → compact active position.
     int*     d_active_ij_pos = nullptr;   // [N_pair]
@@ -302,6 +317,23 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
       max_n_(max_n),
       nocc_(nocc)
 {
+    // Step S8 profiling: timestamp the constructor stages so we can attribute
+    // the cholesterol-class ~9 s/device cost to its components. Only the
+    // success path is timed; early-return paths skip the dump. Stages:
+    //   cpu_prep    : active list build + position maps + barS-cache refs
+    //   mem_probe   : cudaMemGetInfo + tile_size_ decision
+    //   alloc_base  : Step Z base buffer cudaMalloc + d_Y_pad_T cudaMemset
+    //   alloc_stack : stacked-mode cudaMalloc + slab-range cudaMallocHost
+    //                 h_pi_T_stack (Step S9: was full N_pair = ~21 GB, now
+    //                 slab-only ~2.6 GB at cholesterol/num_gpus=8) + 4 small
+    //                 H2D copies (pair_lookup / setup_i / n_pno / idx_offset
+    //                 / active_*_pos)
+    //   cublas      : MultiGpuManager cuBLAS handle resolution
+    //   barS_h2d    : host barS pack + pinned alloc + ~2.5 GB H2D + scatter
+    //                 kernel + cudaDeviceSynchronize
+    // [[maybe_unused]] in CPU-only builds where the printf is compiled out.
+    [[maybe_unused]] const auto t_ctor_0 = std::chrono::steady_clock::now();
+
     barS_cache_ref_ = &barS_cache;
     if (pair_lookup)        pair_lookup_       = *pair_lookup;
     if (setup_i_per_pair)   setup_i_per_pair_  = *setup_i_per_pair;
@@ -342,6 +374,8 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
     for (int ai = 0; ai < N_act_ij_; ++ai) {
         active_ij_pos_[active_i_ij_[ai]] = ai;
     }
+
+    [[maybe_unused]] const auto t_cpu_prep = std::chrono::steady_clock::now();
 
 #ifndef GANSU_CPU_ONLY
     // Decide whether to take the GPU path.
@@ -401,14 +435,26 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
                               && static_cast<int>(pair_lookup_.size()) == nocc_ * nocc_
                               && static_cast<int>(setup_i_per_pair_.size()) == N_pair_;
     size_t pi_T_total = 0;
+    // Step S9 — also accumulate slab-only counts. `pi_T_slab_base_offset` is
+    // the element offset of pair `pair_begin_` within the full pi_T_stack
+    // (i.e. the size of the prefix before this device's slab). `pi_T_slab_total`
+    // is the slab's own elem count. These let us size `h_pi_T_stack` to the
+    // slab only — the device side `d_pi_T_stack` keeps the full-N_pair layout
+    // so all the kernels that index via `d_idx_offset` work unchanged.
+    size_t pi_T_slab_base_off = 0;
+    size_t pi_T_slab_count    = 0;
     if (want_stacked) {
         for (int i = 0; i < N_pair_; ++i) {
             const size_t n = static_cast<size_t>(n_pno_[i]);
-            pi_T_total += n * n
-                        * static_cast<size_t>(nocc_) * static_cast<size_t>(nocc_);
+            const size_t add = n * n
+                             * static_cast<size_t>(nocc_) * static_cast<size_t>(nocc_);
+            if (i < pair_begin_)      pi_T_slab_base_off += add;
+            else if (i < pair_end_)   pi_T_slab_count    += add;
+            pi_T_total += add;
         }
     }
-    const size_t bytes_pi_T = pi_T_total * sizeof(real_t);
+    const size_t bytes_pi_T      = pi_T_total      * sizeof(real_t);
+    const size_t bytes_pi_T_slab = pi_T_slab_count * sizeof(real_t);
 
     // Probe free memory and choose tile_size_ so d_pi_pad fits.
     {
@@ -453,6 +499,8 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
     const size_t bytes_pi_tile =
         static_cast<size_t>(tile_size_) * per_pi_row_bytes;
 
+    const auto t_mem_probe = std::chrono::steady_clock::now();
+
     try {
         check_cuda_(cudaMalloc(&s.d_barS_pad, bytes_barS_compact),
                     "cudaMalloc d_barS_pad (compact)");
@@ -495,6 +543,8 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
         return;
     }
 
+    const auto t_alloc_base = std::chrono::steady_clock::now();
+
     // Step 6.1 stacked-mode allocations + uploads.
     if (want_stacked) {
         try {
@@ -514,8 +564,21 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
                         "cudaMalloc d_idx_offset");
             check_cuda_(cudaMalloc(&s.d_pi_T_stack, bytes_pi_T),
                         "cudaMalloc d_pi_T_stack");
-            check_cuda_(cudaMallocHost(&s.h_pi_T_stack, bytes_pi_T),
-                        "cudaMallocHost h_pi_T_stack");
+            // Step S9 — size the pinned host mirror to the slab range only.
+            // For a single-GPU run this is the same as bytes_pi_T; for
+            // num_gpus=8 it is ~1/8 the size, which cuts the per-device
+            // pinning time from ~8 s to ~1 s and (more importantly) lets
+            // 8 concurrent cudaMallocHost calls fight over the kernel
+            // mmap_lock for less wall time. Without the slab-only sizing,
+            // cholesterol CCSD T2 setup_pgpu was 63 s wall with all 8
+            // devices stuck in alloc_stack at the same time (per-stage
+            // profile, 2026-05-17).
+            if (bytes_pi_T_slab > 0) {
+                check_cuda_(cudaMallocHost(&s.h_pi_T_stack, bytes_pi_T_slab),
+                            "cudaMallocHost h_pi_T_stack (slab)");
+            }
+            s.pi_T_slab_base_offset = pi_T_slab_base_off;
+            s.pi_T_slab_total       = pi_T_slab_count;
 
             check_cuda_(cudaMemcpy(s.d_pair_lookup, pair_lookup_.data(),
                                    n_lookup * sizeof(int),
@@ -578,6 +641,8 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
         }
     }
 
+    const auto t_alloc_stack = std::chrono::steady_clock::now();
+
     // Multi-GPU: use per-device cuBLAS handle from MultiGpuManager. For the
     // single-GPU path (device_id_=0, MGM not initialised) fall back to the
     // thread-local handle from gpu::GPUHandle.
@@ -594,6 +659,8 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
         delete p_; p_ = nullptr; active_ = false;
         return;
     }
+
+    const auto t_cublas = std::chrono::steady_clock::now();
 
     // -------- Step S1: GPU scatter from compact host pack.
     //
@@ -732,6 +799,44 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
             check_cuda_(cudaMemset(s.d_barS_pad, 0, bytes_barS_compact),
                         "cudaMemset d_barS_pad (no active)");
         }
+    }
+
+    // Step S8 profiling — dump per-stage timings as a single atomic line
+    // per device (printf is line-atomic on glibc up to PIPE_BUF). The
+    // double-precision values below are in milliseconds. With multi-GPU
+    // OMP construction this will produce n_gpus lines, each tagged with
+    // its device_id_ for attribution. Bytes annotated so we can compute
+    // per-stage throughput (MB / ms = GB / s).
+    {
+        const auto t_barS_h2d = std::chrono::steady_clock::now();
+        using msd = std::chrono::duration<double, std::milli>;
+        const double ms_cpu      = msd(t_cpu_prep   - t_ctor_0).count();
+        const double ms_probe    = msd(t_mem_probe  - t_cpu_prep).count();
+        const double ms_alloc_b  = msd(t_alloc_base - t_mem_probe).count();
+        const double ms_alloc_s  = msd(t_alloc_stack- t_alloc_base).count();
+        const double ms_cublas   = msd(t_cublas     - t_alloc_stack).count();
+        const double ms_barS     = msd(t_barS_h2d   - t_cublas).count();
+        const double ms_total    = msd(t_barS_h2d   - t_ctor_0).count();
+        // pi_T sizes: `full` is the full-N_pair count (legacy reference,
+        // matches d_pi_T_stack on device); `slab` is the slab-only count
+        // (matches h_pi_T_stack pinned host alloc after Step S9).
+        const double mb_pi_T_full = static_cast<double>(bytes_pi_T)
+                                    / (1024.0 * 1024.0);
+        const double mb_pi_T_slab = static_cast<double>(bytes_pi_T_slab)
+                                    / (1024.0 * 1024.0);
+        const double mb_barS      = static_cast<double>(bytes_barS_compact)
+                                    / (1024.0 * 1024.0);
+        std::printf(
+            "[picache-ctor dev=%d slab=[%d,%d) N_act_ij=%d N_act_kl=%d max_n=%d]"
+            " cpu=%.1f probe=%.1f alloc_base=%.1f alloc_stack=%.1f"
+            " cublas=%.1f barS_h2d=%.1f total=%.1f ms"
+            " | pi_T_full=%.0f MB pi_T_slab=%.0f MB barS=%.0f MB stacked=%d\n",
+            device_id_, pair_begin_, pair_end_,
+            N_act_ij_, N_act_kl_, max_n_,
+            ms_cpu, ms_probe, ms_alloc_b, ms_alloc_s,
+            ms_cublas, ms_barS, ms_total,
+            mb_pi_T_full, mb_pi_T_slab, mb_barS, stacked_ ? 1 : 0);
+        std::fflush(stdout);
     }
 
     active_ = true;
@@ -1396,8 +1501,12 @@ void PiCacheGpu::rebuild_with_stack(
     }
 
     // D2H — only the slab range of pi_T_stack.
+    // Step S9: h_pi_T_stack is sized to the slab only, so the destination is
+    // its base (offset 0). The source on device keeps the full-N_pair layout
+    // (used by kernels that index via d_idx_offset), so we still read from
+    // d_pi_T_stack + idx_offset_host[ib].
     if (bytes_pi_T_slab > 0) {
-        check_cuda_(cudaMemcpy(s.h_pi_T_stack + idx_offset_host[ib],
+        check_cuda_(cudaMemcpy(s.h_pi_T_stack,
                                s.d_pi_T_stack + idx_offset_host[ib],
                                bytes_pi_T_slab, cudaMemcpyDeviceToHost),
                     "D2H pi_T_stack (slab)");
@@ -1407,6 +1516,12 @@ void PiCacheGpu::rebuild_with_stack(
     // The device layout already matches the unpadded host layout, so this
     // is a single memcpy per pair. Only fills the slab range; other slabs
     // are populated by peer PiCacheGpu instances on other GPUs.
+    // Step S9: h_pi_T_stack is slab-base (0 = pair_begin_). For pair i_ij ∈
+    // [pair_begin_, pair_end_), the corresponding source offset within the
+    // slab buffer is idx_offset_host[i_ij] - idx_offset_host[ib], i.e. the
+    // absolute offset minus the slab's leading prefix. This shift is a
+    // compile-time-zero cost when num_gpus=1 (ib=0).
+    const size_t slab_base = idx_offset_host[ib];
     #pragma omp parallel for schedule(static)
     for (long long i_ij = ib; i_ij < ie; ++i_ij) {
         const int n_ij = n_pno_[i_ij];
@@ -1421,7 +1536,7 @@ void PiCacheGpu::rebuild_with_stack(
                            * static_cast<size_t>(nocc)
                            * static_cast<size_t>(nocc) * sizeof(real_t);
         std::memcpy(pi_T_stack_out[i_ij].data(),
-                    s.h_pi_T_stack + idx_offset_host[i_ij],
+                    s.h_pi_T_stack + (idx_offset_host[i_ij] - slab_base),
                     bytes);
     }
 #endif // !GANSU_CPU_ONLY

@@ -19,6 +19,34 @@
 namespace gansu {
 
 /**
+ * @brief Per-stage GPU timing accumulators for compute_async().
+ *
+ * Populated by `compute_finalize()` via cudaEventElapsedTime between
+ * stage-boundary events recorded on the default stream. Times are in
+ * seconds (converted from cudaEventElapsedTime's ms output) and accumulate
+ * across all compute_async/compute_finalize round-trips since the last
+ * `reset_stage_times()` call. n_iter is the number of finalize calls
+ * contributing to the totals.
+ *
+ * Stages (in execution order on the default stream):
+ *   slice      : 4 pi-stack slicing kernels
+ *   w_block    : 8 strided-batched DGEMM (W_block_{i,i2,j,j2} build)
+ *   r_contract : 8 strided-batched DGEMM (R += W·PI contractions)
+ *   inter_fock : 2 inter-pair Fock kernels (i + j)
+ *   oooo       : oooo_lad_kernel
+ *   d2h        : async D2H of R_ph_pad slab
+ */
+struct ResidStageTimes {
+    double slice      = 0.0;
+    double w_block    = 0.0;
+    double r_contract = 0.0;
+    double inter_fock = 0.0;
+    double oooo       = 0.0;
+    double d2h        = 0.0;
+    int    n_iter     = 0;
+};
+
+/**
  * @brief Step 6.2 — GPU port for the per-iter ph-ladder contributions in
  *        iterate_dlpno_ccsd_t2's residual loop.
  *
@@ -119,6 +147,26 @@ public:
     void compute_finalize(std::vector<RowMatXd>& R_ph_out);
 
     /**
+     * @brief Stage-level timing accumulators for the GPU pipeline.
+     *
+     * Use to attribute the cholesterol-class 187 s residual budget to its
+     * 6 internal stages. `get_stage_times()` reads the current totals
+     * without resetting them; `reset_stage_times()` zeros all counters
+     * (intended to be called once after the per-round dump). When
+     * `active()` is false both return zeros / are no-ops.
+     *
+     * Timing is implemented via cudaEvent (default flags) recorded on
+     * the default stream between stages. Elapsed time is read inside
+     * compute_finalize() after the existing completion-event sync, so
+     * by the time we sample the events all stages are guaranteed
+     * complete. Overhead is ~6 × cudaEventRecord per iter (1-2 μs each
+     * on host launch, no device stall), negligible vs the per-iter
+     * pipeline cost.
+     */
+    ResidStageTimes get_stage_times() const;
+    void            reset_stage_times();
+
+    /**
      * @brief Step 6.5 — full async variant including inter-pair Fock i+j.
      *
      * `dF_ki_host` is the (nocc × nocc) row-major dressing matrix
@@ -161,6 +209,103 @@ private:
     int N_pair_ = 0;
     int max_n_  = 0;
     int nocc_   = 0;
+
+    // Step S10 scaffolding (2026-05-17) — infrastructure for the future
+    // active-only compact storage refactor that will allow ResidGpu to
+    // activate on cholesterol-class systems. The kernels in this version
+    // still index by orig pair idx (so the active list / position map are
+    // NOT used by any execution path yet); they exist only so the next
+    // session can flip the buffer allocation + kernel indexing in one
+    // coherent change without re-deriving the slab-active set.
+    //
+    //   active_pair_list_[a] = orig pair idx of the a-th active pair in
+    //                          THIS device's slab [pair_begin_, pair_end_).
+    //                          Built only for pairs with n_pno > 0.
+    //   active_pos_[orig_idx] = position `a` in active_pair_list_, or -1
+    //                          if orig_idx has n_pno == 0 OR lies outside
+    //                          the slab. Sized to N_pair_.
+    //   n_active_in_slab_    = active_pair_list_.size().
+    //
+    // pair_begin_ / pair_end_ are sourced from the borrowed PiCacheGpu so
+    // they match the slab assignment used by the kernels. The current
+    // budget calculation (full N_pair × per_pair, see ResidGpu ctor) is
+    // additionally logged alongside a projected `active × per_pair / 8`
+    // figure so we can confirm the refactor will close the memory gap
+    // before committing to the full reindex.
+    std::vector<int> active_pair_list_;
+    std::vector<int> active_pos_;
+    int              n_active_in_slab_ = 0;
+
+    // Step S11 Phase 1 scaffolding (2026-05-17 night-3) — bucket-by-n_ij
+    // grouping for the upcoming packed V_meta/T_meta refactor. Built in
+    // the constructor; consumed by `pack_V_meta_kernel` (Phase 1 — writes
+    // both the legacy padded AND the new packed buffers, gated on the
+    // packed alloc succeeding) and by Phase 2's bucket cuBLAS loops
+    // (W_block_build + r_contract; not yet wired).
+    //
+    // Buckets group THIS device's active slab pairs by their n_pno value
+    // (= n_ij). Within a bucket all pairs share one per-slot stride
+    // (nn_b² for meta, n_b·nn_b for block etc.), letting Phase 2 use
+    // `cublasDgemmStridedBatched` per bucket without pointer arrays.
+    //
+    //   bucket_n_ij_[b]             = the n_ij value defining bucket b
+    //   bucket_count_[b]            = pairs in bucket b
+    //   bucket_first_[b]            = start index into
+    //                                 bucket_active_pair_list_ for bucket b
+    //                                 (bucket_first_[b+1] - bucket_first_[b]
+    //                                  == bucket_count_[b]).
+    //   bucket_active_pair_list_    = active slab pairs, sorted by n_ij
+    //                                 (= concatenation of buckets in
+    //                                 ascending n_ij order). Same set as
+    //                                 `active_pair_list_` but in bucket
+    //                                 order, not orig pair-idx order.
+    //   per_pair_meta_off_[orig]    = element offset into the packed
+    //                                 V_meta_*_packed buffer for the pair
+    //                                 at orig pair idx (or 0 if the pair
+    //                                 is inactive; callers must guard via
+    //                                 active_pos_[orig] >= 0).
+    //   packed_meta_total_          = total packed element count across
+    //                                 all buckets (= sum of nn_ij² over
+    //                                 active slab pairs).
+    std::vector<int>    bucket_n_ij_;
+    std::vector<int>    bucket_count_;
+    std::vector<int>    bucket_first_;
+    std::vector<int>    bucket_active_pair_list_;
+    std::vector<size_t> per_pair_meta_off_;
+    size_t              packed_meta_total_ = 0;
+
+    // Step S11 Phase 2a (2026-05-18) — additional per-pair offset tables and
+    // totals for the remaining 14 packed cuBLAS buffers (W_bare/W_block/pi_N/
+    // pi_T/PI_stack/PI_TT/R). Built alongside per_pair_meta_off_ in the same
+    // bucket pass. Phase 2a allocates the packed buffers but the cuBLAS GEMMs
+    // still read the legacy padded buffers, so bit-exactness is preserved.
+    //
+    // Element offsets into the corresponding packed device buffer for the
+    // pair at orig pair idx:
+    //   per_pair_block_off_[orig] : stride n_b · nn_b (row-major n_b × nn_b)
+    //   per_pair_stack_off_[orig] : stride nn_b · n_b (row-major nn_b × n_b;
+    //                              numerically same total as block but kept
+    //                              separate because Phase 2c's cuBLAS lda
+    //                              differs: nn_b vs n_b)
+    //   per_pair_R_off_   [orig] : stride n_b²
+    // All values 0 for inactive pairs; callers must guard via active_pos_.
+    std::vector<size_t> per_pair_block_off_;
+    std::vector<size_t> per_pair_stack_off_;
+    std::vector<size_t> per_pair_R_off_;
+    size_t              packed_block_total_ = 0;
+    size_t              packed_stack_total_ = 0;
+    size_t              packed_R_total_     = 0;
+
+    // Per-bucket base offsets (host-only, length n_buckets + 1 as prefix
+    // sums). Phase 2c's cuBLAS bucket loops use bucket_base_*_[b] to derive
+    // the base device pointer for the bucket's strided-batched GEMM:
+    //   d_X_packed + bucket_base_*_[b]   (with batch = bucket_count_[b],
+    //                                     stride = per-pair element count).
+    // bucket_base_*_[n_buckets] equals the corresponding packed_*_total_.
+    std::vector<size_t> bucket_base_meta_;
+    std::vector<size_t> bucket_base_block_;
+    std::vector<size_t> bucket_base_stack_;
+    std::vector<size_t> bucket_base_R_;
 };
 
 } // namespace gansu

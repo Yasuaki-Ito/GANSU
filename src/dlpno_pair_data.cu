@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -33,6 +34,35 @@
 #endif
 
 namespace gansu {
+
+namespace {
+
+// Multi-GPU work threshold (per-GPU) for LMP2 / CCSD T2 dispatch. Below
+// this, callers fall back to n_gpus=1. The default 1e11 was picked from
+// the 2026-05-13 A100×8 benchmark where 8-GPU iter was 2-3× slower than
+// 1-GPU due to picache D2H pi_pad (~40 GB/iter) serialising on PCIe.
+//
+// Step Z (2026-05-16) made pi_pad GPU-resident (no large per-iter D2H),
+// so the assumption underlying the fallback may no longer hold. Override
+// at runtime with the env var `GANSU_DLPNO_MIN_WORK_PER_GPU`:
+//   GANSU_DLPNO_MIN_WORK_PER_GPU=0           # force respect num_gpus (no fallback)
+//   GANSU_DLPNO_MIN_WORK_PER_GPU=10000000    # custom small value
+// Read once on first call (env vars don't change mid-run).
+long long get_dlpno_min_work_per_gpu()
+{
+    static const long long val = []() -> long long {
+        const char* env = std::getenv("GANSU_DLPNO_MIN_WORK_PER_GPU");
+        if (env && *env) {
+            char* end = nullptr;
+            const long long v = std::strtoll(env, &end, 10);
+            if (end != env && v >= 0) return v;
+        }
+        return 100000000000LL;  // legacy default
+    }();
+    return val;
+}
+
+}  // namespace
 
 namespace {
 using RowMatXd = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -137,7 +167,8 @@ LMP2Status iterate_lmp2(
     int nocc, int nao,
     int max_iter, real_t conv_tol,
     int verbose, const char* round_tag,
-    int num_gpus)
+    int num_gpus,
+    bool user_explicit_n_gpus)
 {
     LMP2Status st;
     Eigen::Map<const RowMatXd> Smat(h_S, nao, nao);
@@ -163,7 +194,10 @@ LMP2Status iterate_lmp2(
         for (size_t i_ij = 0; i_ij < pairs.size(); ++i_ij) {
             barS_cache[i_ij].resize(pairs.size());
         }
-        #pragma omp parallel for schedule(static)
+        // dynamic(4): per-i_ij work is O(N_pair × n_ij² × nao); empty pairs
+        // (n_ij=0) `continue` fast. Static partitioning gives ~3× imbalance
+        // due to clumped empties; dynamic levels it.
+        #pragma omp parallel for schedule(dynamic, 4)
         for (long long i_ij = 0; i_ij < static_cast<long long>(pairs.size());
              ++i_ij)
         {
@@ -216,20 +250,19 @@ LMP2Status iterate_lmp2(
             work_estimate += n * n;
         }
         work_estimate *= static_cast<long long>(nocc) * nocc;
-        // Empirical cholesterol cc-pVDZ benchmark (2026-05-13, A100 8×) showed
-        // multi-GPU iter dispatch is net-negative even at cholesterol scale:
-        // 1-GPU LMP2 363s vs 8-GPU 1060s (2.9× slower); 1-GPU CCSD T2 iter
-        // 531s vs 8-GPU 1200s (2.3× slower). picache D2H pi_pad (~40 GB/iter
-        // at cholesterol) does NOT parallelise across 8 GPUs — wall time
-        // stays at ~11s/iter on 8 GPUs vs 2s/iter on 1 GPU. Suspected cause:
-        // PCIe / D2H serialisation in the CUDA driver across simultaneous
-        // GPU contexts. Threshold raised to 1e11 to effectively always
-        // fall back, preserving the slab code for future fabric upgrades
-        // (NVLink switch / NVSwitch / PCIe Gen5 with independent root
-        // complexes per GPU) where this might reverse.
-        constexpr long long kMinWorkPerGpu = 100000000000LL;
+        // Auto-fallback heuristic: skip when the user explicitly specified
+        // `--num_gpus N > 0` (Option C, 2026-05-19). The historical 1e11
+        // threshold predates Step Z (GPU-resident pi_pad) + S11 Phase 2
+        // (packed cuBLAS + ResidGpu activate); for cholesterol-class systems
+        // multi-GPU is now strictly required to activate ResidGpu, so
+        // honouring user intent is the right default. The env var
+        // GANSU_DLPNO_MIN_WORK_PER_GPU still lets users force the legacy
+        // heuristic on `--num_gpus -1` (auto) runs.
+        const long long kMinWorkPerGpu = get_dlpno_min_work_per_gpu();
         const long long per_gpu = work_estimate / n_gpus;
-        if (per_gpu < kMinWorkPerGpu) {
+        const bool fall_back =
+            !user_explicit_n_gpus && (per_gpu < kMinWorkPerGpu);
+        if (fall_back) {
             if (verbose >= 1) {
                 std::cout << "[DLPNO-LMP2-PROF] " << round_tag
                           << " multi-GPU auto-fallback to n_gpus=1"
@@ -279,10 +312,20 @@ LMP2Status iterate_lmp2(
             0, N_pair, 0);
     } else {
 #ifndef GANSU_CPU_ONLY
-        // Construct each instance on its own device. Serial construction is
-        // fine — the heavy upload is barS, and they run on independent
-        // devices so cudaMemcpy is per-device anyway.
-        for (int d = 0; d < n_gpus; ++d) {
+        // Step S8 (2026-05-17): parallel construction across devices.
+        // Each constructor reads shared input (barS_cache, n_pno_per_pair)
+        // read-only and writes only its own device memory + per-instance
+        // host members, so concurrent execution on distinct devices is
+        // race-free. Serialising it was previously hiding ~9 s/device of
+        // barS H2D + buffer alloc cost; at LMP2 scale (max_n=3) it is
+        // already cheap, but kept symmetric with the CCSD T2 path.
+        #pragma omp parallel num_threads(n_gpus)
+        {
+#ifdef _OPENMP
+            const int d = omp_get_thread_num();
+#else
+            const int d = 0;
+#endif
             MultiGpuManager::DeviceGuard guard(d);
             pgpus[d] = std::make_unique<PiCacheGpu>(
                 barS_cache, n_pno_per_pair, max_n,
@@ -326,9 +369,16 @@ LMP2Status iterate_lmp2(
         }
 
         // ---- Per-pair residual + Jacobi update (parallel over pairs). ----
+        // 2026-05-17 schedule change: matches the iterate_dlpno_ccsd_t2
+        // observation — at cholesterol scale 3919/5886 pairs are empty
+        // (n_pno=0, `continue` fast path) and the rest have n_pno spread
+        // 1..26 (avg 3.1 for LMP2). Static schedule clumps empties on
+        // some threads and strong pairs on others → ~3× imbalance. Switch
+        // to dynamic(4) so threads steal balance. Bit-exact: scheduling
+        // policy only, no computation reordering.
         const auto t_resid_0 = prof_clock::now();
         real_t r_max = 0.0;
-        #pragma omp parallel for schedule(static) reduction(max:r_max)
+        #pragma omp parallel for schedule(dynamic, 4) reduction(max:r_max)
         for (long long idx = 0; idx < static_cast<long long>(pairs.size()); ++idx) {
             PairData&        pij = pairs[idx];
             const PairSetup& sij = setups[idx];
@@ -494,12 +544,14 @@ LMP2Status iterate_dlpno_ccsd_t2(
     bool enable_dressing,
     int verbose, const char* round_tag,
     const Phase24Integrals* phase24,
-    int num_gpus)
+    int num_gpus,
+    bool user_explicit_n_gpus)
 {
     if (!enable_dressing) {
         return iterate_lmp2(
             setups, pairs, pair_lookup, F_LMO, h_S,
-            nocc, nao, max_iter, conv_tol, verbose, round_tag, num_gpus);
+            nocc, nao, max_iter, conv_tol, verbose, round_tag, num_gpus,
+            user_explicit_n_gpus);
     }
 
     LMP2Status st;
@@ -541,7 +593,10 @@ LMP2Status iterate_dlpno_ccsd_t2(
         for (size_t i_ij = 0; i_ij < pairs.size(); ++i_ij) {
             barS_cache[i_ij].resize(pairs.size());
         }
-        #pragma omp parallel for schedule(static)
+        // dynamic(4): per-i_ij work is O(N_pair × n_ij² × nao); empty pairs
+        // (n_ij=0) `continue` fast. Static partitioning gives ~3× imbalance
+        // due to clumped empties; dynamic levels it.
+        #pragma omp parallel for schedule(dynamic, 4)
         for (long long i_ij = 0; i_ij < static_cast<long long>(pairs.size());
              ++i_ij)
         {
@@ -671,20 +726,19 @@ LMP2Status iterate_dlpno_ccsd_t2(
             work_estimate += n * n;
         }
         work_estimate *= static_cast<long long>(nocc) * nocc;
-        // Empirical cholesterol cc-pVDZ benchmark (2026-05-13, A100 8×) showed
-        // multi-GPU iter dispatch is net-negative even at cholesterol scale:
-        // 1-GPU LMP2 363s vs 8-GPU 1060s (2.9× slower); 1-GPU CCSD T2 iter
-        // 531s vs 8-GPU 1200s (2.3× slower). picache D2H pi_pad (~40 GB/iter
-        // at cholesterol) does NOT parallelise across 8 GPUs — wall time
-        // stays at ~11s/iter on 8 GPUs vs 2s/iter on 1 GPU. Suspected cause:
-        // PCIe / D2H serialisation in the CUDA driver across simultaneous
-        // GPU contexts. Threshold raised to 1e11 to effectively always
-        // fall back, preserving the slab code for future fabric upgrades
-        // (NVLink switch / NVSwitch / PCIe Gen5 with independent root
-        // complexes per GPU) where this might reverse.
-        constexpr long long kMinWorkPerGpu = 100000000000LL;
+        // Auto-fallback heuristic: skip when the user explicitly specified
+        // `--num_gpus N > 0` (Option C, 2026-05-19). The historical 1e11
+        // threshold predates Step Z (GPU-resident pi_pad) + S11 Phase 2
+        // (packed cuBLAS + ResidGpu activate); for cholesterol-class systems
+        // multi-GPU is now strictly required to activate ResidGpu, so
+        // honouring user intent is the right default. The env var
+        // GANSU_DLPNO_MIN_WORK_PER_GPU still lets users force the legacy
+        // heuristic on `--num_gpus -1` (auto) runs.
+        const long long kMinWorkPerGpu = get_dlpno_min_work_per_gpu();
         const long long per_gpu = work_estimate / n_gpus;
-        if (per_gpu < kMinWorkPerGpu) {
+        const bool fall_back =
+            !user_explicit_n_gpus && (per_gpu < kMinWorkPerGpu);
+        if (fall_back) {
             if (verbose >= 1) {
                 std::cout << "[DLPNO-ITER-PROF] " << round_tag
                           << " multi-GPU auto-fallback to n_gpus=1"
@@ -736,7 +790,21 @@ LMP2Status iterate_dlpno_ccsd_t2(
             0, N_pair, 0);
     } else {
 #ifndef GANSU_CPU_ONLY
-        for (int d = 0; d < n_gpus; ++d) {
+        // Step S8 (2026-05-17): parallel construction across devices.
+        // Cholesterol cc-pVDZ benchmark (env GANSU_DLPNO_MIN_WORK_PER_GPU=0)
+        // measured setup_pgpu = 75.7 s for 8 sequential constructors,
+        // dwarfing the ~91 s picache win from multi-GPU dispatch. Each
+        // constructor only touches its own device (DeviceGuard) and writes
+        // per-instance members; barS_cache, n_pno_per_pair, pair_lookup,
+        // and setup_i_per_pair are read-only inputs. Expected: 75 → ~10 s
+        // (concurrent barS H2D + buffer alloc across 8 H200).
+        #pragma omp parallel num_threads(n_gpus)
+        {
+#ifdef _OPENMP
+            const int d = omp_get_thread_num();
+#else
+            const int d = 0;
+#endif
             MultiGpuManager::DeviceGuard guard(d);
             pgpus[d] = std::make_unique<PiCacheGpu>(
                 barS_cache, n_pno_per_pair, max_n_pno,
@@ -823,7 +891,9 @@ LMP2Status iterate_dlpno_ccsd_t2(
     std::vector<RowMatXd> T_meta_dpair(pairs.size());
     if (phase24 != nullptr && phase24->nocc == nocc) {
         const auto t_vm0 = prof_clock::now();
-        #pragma omp parallel for schedule(static)
+        // dynamic(4): per-pair V_meta / T_meta construction scales with
+        // n_pno²; empty pairs skip. Same imbalance pattern as resid loop.
+        #pragma omp parallel for schedule(dynamic, 4)
         for (long long idx = 0; idx < static_cast<long long>(pairs.size());
              ++idx)
         {
@@ -877,6 +947,32 @@ LMP2Status iterate_dlpno_ccsd_t2(
         dt_vmeta += std::chrono::duration<double>(
             prof_clock::now() - t_vm0).count();
     }
+
+    // ---- Per-thread CPU resid stage timers ----
+    // When ResidGpu's full memory budget doesn't fit (cholesterol-class:
+    // ~509 GB > 141 GB on H200), constructor falls back to active_=false
+    // and the per-pair residual loop runs the *full* CPU path: build_stack
+    // + 4 W_block CPU DGEMM + 8 R contraction DGEMM + inter_Fock + oooo
+    // + 4-virt W·Y + DF dressing. To attribute the ~190 s/cholesterol resid
+    // budget to its CPU sub-stages without touching the OMP-parallel inner
+    // loop, each thread accumulates into its own slot below; we sum + max
+    // at the end of the iter loop.
+    struct ResidCpuStage {
+        double t_r_init        = 0.0;  // R = L + diag·Y_old + dF_sum·Y_old
+        double t_inter_fock    = 0.0;  // Phase 2.4.1 i + j sweeps (CPU path)
+        double t_df_dressing   = 0.0;  // DF · Y_old + Y_old · DF^T
+        double t_w4virt        = 0.0;  // 4-virt W_flat·Y_flat DGEMV
+        double t_oooo          = 0.0;  // V_stacked_oooo·y + pi_T_stack·W_repeat
+        double t_phladder_cpu  = 0.0;  // build_stack + 4 W_block + 8 R contract
+        double t_gpu_add       = 0.0;  // R += R_ph_acc[idx] (active path only)
+        double t_jacobi_diis   = 0.0;  // Jacobi update + DIIS y_flat/e_flat pack
+    };
+#ifdef _OPENMP
+    const int kMaxThreads_resid_prof = omp_get_max_threads();
+#else
+    const int kMaxThreads_resid_prof = 1;
+#endif
+    std::vector<ResidCpuStage> resid_prof(kMaxThreads_resid_prof);
 
     for (int iter = 0; iter < max_iter; ++iter) {
         {
@@ -1054,7 +1150,8 @@ LMP2Status iterate_dlpno_ccsd_t2(
         //                 = -(pi_T_stack[idx] · T_meta_dpair[idx])[a, c]
         const auto t_DFpair_0 = prof_clock::now();
         if (phase24 != nullptr && phase24->nocc == nocc) {
-            #pragma omp parallel for schedule(static)
+            // dynamic(4): same workload-skew rationale as the residual loop.
+            #pragma omp parallel for schedule(dynamic, 4)
             for (long long idx = 0; idx < static_cast<long long>(pairs.size()); ++idx) {
                 const PairData&  pij = pairs[idx];
                 const int n_ij = pij.n_pno;
@@ -1109,12 +1206,35 @@ LMP2Status iterate_dlpno_ccsd_t2(
         // are exclusive; Y_old, dF_ki, DF_per_pair, F_LMO, h_S are read-only.
         const auto t_resid_0 = prof_clock::now();
         real_t r_max = 0.0;
-        #pragma omp parallel for schedule(static) reduction(max:r_max)
+        // 2026-05-17 schedule change: cholesterol cc-pVDZ profiling at v0
+        // (resid=188s, ResidGpu inactive due to ~509 GB > 141 GB H200 budget)
+        // showed CPU utilisation = 32% (per-thread-max=97s vs thread-sum=3796s
+        // ÷ 64 threads = 60s ideal). The per-pair workload scales as n_pno²,
+        // ranging from n=0 (empty, skip via `continue`) up to n=26 (peak)
+        // with avg=14.9 over strong pairs — a 40× workload spread on top of
+        // the empty-pair-clustering produced by upstream sort order. Static
+        // schedule pins thread 0 onto a clump of strong pairs while others
+        // race through empties. `dynamic(4)` lets free threads grab work
+        // (4-pair chunks: low atomic overhead vs imbalance risk), expected
+        // to flatten the 3× max/avg per-stage thread time → ~2.85× resid
+        // wall speedup at cholesterol with no algorithmic change.
+        // Bit-exact: scheduling policy only; each thread writes its own
+        // y_flat / e_flat slab at y_offset[idx] (no overlap), and
+        // reduction(max:r_max) is order-invariant.
+        #pragma omp parallel for schedule(dynamic, 4) reduction(max:r_max)
         for (long long idx = 0; idx < static_cast<long long>(pairs.size()); ++idx) {
             PairData&        pij = pairs[idx];
             const PairSetup& sij = setups[idx];
             const int n = pij.n_pno;
             if (n == 0) continue;
+
+#ifdef _OPENMP
+            const int tid_rp = omp_get_thread_num();
+#else
+            const int tid_rp = 0;
+#endif
+            ResidCpuStage& prof_slot = resid_prof[tid_rp];
+            const auto t_rinit_0 = prof_clock::now();
 
             Eigen::Map<RowMatXd>      Y_ij(pij.Y.data(), n, n);
             Eigen::Map<const RowMatXd> L_ij(pij.L.data(), n, n);
@@ -1140,6 +1260,9 @@ LMP2Status iterate_dlpno_ccsd_t2(
                 R.noalias() -= dF_sum * RowMatXd(Y_old_ij);
             }
             // ---------------------------------------------------------
+            prof_slot.t_r_init += std::chrono::duration<double>(
+                prof_clock::now() - t_rinit_0).count();
+            const auto t_inter_fock_0 = prof_clock::now();
 
             // Step 6.5: when ResidGpu is active, both inter-pair Fock i+j
             // sweeps live in R_ph_acc[idx] (added below alongside the
@@ -1199,6 +1322,10 @@ LMP2Status iterate_dlpno_ccsd_t2(
                 }
             }
 
+            prof_slot.t_inter_fock += std::chrono::duration<double>(
+                prof_clock::now() - t_inter_fock_0).count();
+            const auto t_df_dressing_0 = prof_clock::now();
+
             // ---- Particle F_eff dressing (Phase 2.3.2 / 2.4.2) ----
             // R += ΔF^{(ij)} · Y_old + Y_old · ΔF^{(ij),T}.
             //
@@ -1237,11 +1364,15 @@ LMP2Status iterate_dlpno_ccsd_t2(
             //   accuracy versus canonical CCSD is approximate (BARE Ws
             //   miss the ring-diagram contribution); a follow-up commit
             //   will fit the W T2 dressing for canonical agreement.
+            prof_slot.t_df_dressing += std::chrono::duration<double>(
+                prof_clock::now() - t_df_dressing_0).count();
+
             if (phase24 != nullptr && phase24->nocc == nocc
                 && idx < phase24->W_pair.size()
                 && phase24->W_pair[idx].size() ==
                        static_cast<size_t>(n) * n * n * n)
             {
+                const auto t_w4virt_0 = prof_clock::now();
                 // (a) 4-virtual ladder  R[a,b] += Σ_cd W_abcd Y_old[c,d].
                 //   Reshape W (n×n×n×n row-major) as a (n²)×(n²) matrix and
                 //   Y_old, R as length-n² vectors, then a single BLAS DGEMV
@@ -1257,6 +1388,9 @@ LMP2Status iterate_dlpno_ccsd_t2(
                         R_flat(R.data(), n * n);
                     R_flat.noalias() += W_flat * Y_flat;
                 }
+                prof_slot.t_w4virt += std::chrono::duration<double>(
+                    prof_clock::now() - t_w4virt_0).count();
+                const auto t_oooo_0 = prof_clock::now();
 
                 // (b) oooo ladder, batched (Step 3).
                 //   W_klij^{eff} = (ki|lj) + Σ_{cd} (kc|ld) · Y_{ij,old}^{cd}.
@@ -1338,15 +1472,21 @@ LMP2Status iterate_dlpno_ccsd_t2(
                 //   Σ_k π_kj  · W_k_i2^T  = PI_kj_TT   · W_block_i2^T
                 //
                 // (j-side mirrors with PI_ki and W_block_j[2] ← I = sij.j.)
+                prof_slot.t_oooo += std::chrono::duration<double>(
+                    prof_clock::now() - t_oooo_0).count();
+
                 // Step 6.2: when ResidGpu is active, R_ph_acc[idx] already
                 // holds the i-side + j-side ph-ladder contributions. Skip
                 // the CPU build_stack/W_block path entirely.
+                const auto t_phl_0 = prof_clock::now();
                 if (any_rgpu_active
                     && idx < static_cast<long long>(R_ph_acc.size())
                     && R_ph_acc[idx].rows() == n
                     && R_ph_acc[idx].cols() == n)
                 {
                     R.noalias() += R_ph_acc[idx];
+                    prof_slot.t_gpu_add += std::chrono::duration<double>(
+                        prof_clock::now() - t_phl_0).count();
                 }
                 else if (idx < static_cast<long long>(V_meta_T.size())
                     && V_meta_T[idx].size() > 0)
@@ -1432,6 +1572,28 @@ LMP2Status iterate_dlpno_ccsd_t2(
 
                         RowMatXd W_block_i (n, nn);
                         RowMatXd W_block_i2(n, nn);
+                        // Note (2026-05-18): the formula below is canonical
+                        // RCCSD W_akic / W_akci T2 dressing in disguise, NOT
+                        // BARE. Algebra:
+                        //   pi_T_i^T[a, l·n+d]  = t_lI^{(ij)}[a, d]
+                        //   pi_N_i  [a, l·n+d]  = t_Il^{(ij)}[a, d]
+                        //   T_meta  [l·n+d, k·n+c]
+                        //     = T_pair^{(ij)}[k,c,l,d]
+                        //     = 2(ld|kc) − (lc|kd)
+                        //   V_meta_T[l·n+d, k·n+c] = (ld|kc)
+                        //   V_meta_TT[l·n+d, k·n+c] = (lc|kd)
+                        // ⇒ −½ pi_T_i^T·V_meta_T  +  ½ pi_N_i·T_meta
+                        //     = ½ (ld|kc) τ_Il − ½ (lc|kd) t_Il    (W_akic)
+                        //   −½ pi_T_i^T·V_meta_TT
+                        //     = −½ (lc|kd) t_lI                    (W_akci)
+                        // matches PySCF cc_Wvoov / cc_Wvovo at T1=0.
+                        // See project_dlpno_bare_w_algebra.md (2026-05-18
+                        // audit correction): the legacy ad-hoc-looking form
+                        // IS canonical; the gap-claim comment block above is
+                        // wrong. The dressed_w flag below is retained as
+                        // future-ready infrastructure but is currently a
+                        // no-op (will be reused for any genuinely-new
+                        // algebraic variant identified later).
                         W_block_i .noalias()  =
                             -0.5 * pi_T_i.transpose() * V_meta_T [idx];
                         W_block_i .noalias() +=
@@ -1459,6 +1621,9 @@ LMP2Status iterate_dlpno_ccsd_t2(
 
                         RowMatXd W_block_j (n, nn);
                         RowMatXd W_block_j2(n, nn);
+                        // See i-side note: formula is canonical W_akic /
+                        // W_akci with I_lmo = sij.j (the i↔j symmetrisation
+                        // partner of the i-side block).
                         W_block_j .noalias()  =
                             -0.5 * pi_T_j.transpose() * V_meta_T [idx];
                         W_block_j .noalias() +=
@@ -1482,10 +1647,13 @@ LMP2Status iterate_dlpno_ccsd_t2(
                         R.noalias() -=
                              W_block_j2              * PI_ki_stack;
                     }
+                    prof_slot.t_phladder_cpu += std::chrono::duration<double>(
+                        prof_clock::now() - t_phl_0).count();
                 }
             }
             // ---------------------------------------------------------
 
+            const auto t_jacobi_0 = prof_clock::now();
             real_t r_max_pair = 0.0;
             const size_t off = y_offset[idx];
             for (int a = 0; a < n; ++a)
@@ -1502,6 +1670,8 @@ LMP2Status iterate_dlpno_ccsd_t2(
                     e_flat[k] = static_cast<double>(dY);
                 }
             r_max = std::max(r_max, r_max_pair);
+            prof_slot.t_jacobi_diis += std::chrono::duration<double>(
+                prof_clock::now() - t_jacobi_0).count();
         }
         dt_resid += std::chrono::duration<double>(prof_clock::now() - t_resid_0).count();
 
@@ -1626,6 +1796,134 @@ LMP2Status iterate_dlpno_ccsd_t2(
                   << "  iter_misc="     << dt_iter_misc
                   << "  unaccounted="   << dt_other_residual
                   << std::endl;
+        // Per-stage CPU breakdown of the resid bucket — fires regardless
+        // of ResidGpu state. Sum across threads = total CPU work; max
+        // across threads ≈ wall time per stage assuming balanced load.
+        // The active GPU path collapses everything except t_r_init /
+        // t_w4virt / t_gpu_add / t_jacobi_diis to ~0 since those CPU
+        // sub-stages are skipped via the skip_cpu_* flags; the inactive
+        // path runs everything on CPU and t_phladder_cpu typically
+        // dominates.
+        {
+            ResidCpuStage sum;
+            ResidCpuStage mx;
+            int n_threads_seen = 0;
+            for (const ResidCpuStage& t : resid_prof) {
+                const double s = t.t_r_init + t.t_inter_fock + t.t_df_dressing
+                               + t.t_w4virt + t.t_oooo + t.t_phladder_cpu
+                               + t.t_gpu_add + t.t_jacobi_diis;
+                if (s <= 0.0) continue;
+                sum.t_r_init       += t.t_r_init;
+                sum.t_inter_fock   += t.t_inter_fock;
+                sum.t_df_dressing  += t.t_df_dressing;
+                sum.t_w4virt       += t.t_w4virt;
+                sum.t_oooo         += t.t_oooo;
+                sum.t_phladder_cpu += t.t_phladder_cpu;
+                sum.t_gpu_add      += t.t_gpu_add;
+                sum.t_jacobi_diis  += t.t_jacobi_diis;
+                mx.t_r_init       = std::max(mx.t_r_init,       t.t_r_init);
+                mx.t_inter_fock   = std::max(mx.t_inter_fock,   t.t_inter_fock);
+                mx.t_df_dressing  = std::max(mx.t_df_dressing,  t.t_df_dressing);
+                mx.t_w4virt       = std::max(mx.t_w4virt,       t.t_w4virt);
+                mx.t_oooo         = std::max(mx.t_oooo,         t.t_oooo);
+                mx.t_phladder_cpu = std::max(mx.t_phladder_cpu, t.t_phladder_cpu);
+                mx.t_gpu_add      = std::max(mx.t_gpu_add,      t.t_gpu_add);
+                mx.t_jacobi_diis  = std::max(mx.t_jacobi_diis,  t.t_jacobi_diis);
+                ++n_threads_seen;
+            }
+            if (n_threads_seen > 0) {
+                const double mx_sum = mx.t_r_init + mx.t_inter_fock
+                                    + mx.t_df_dressing + mx.t_w4virt + mx.t_oooo
+                                    + mx.t_phladder_cpu + mx.t_gpu_add
+                                    + mx.t_jacobi_diis;
+                std::cout << "[DLPNO-RESID-CPU-PROF] " << round_tag
+                          << "  threads=" << n_threads_seen
+                          << "  per-thread-max (≈ wall, s)"
+                          << "  r_init="       << std::fixed << std::setprecision(3) << mx.t_r_init
+                          << "  inter_Fock="   << mx.t_inter_fock
+                          << "  df_dressing="  << mx.t_df_dressing
+                          << "  w4virt="       << mx.t_w4virt
+                          << "  oooo="         << mx.t_oooo
+                          << "  phladder_cpu=" << mx.t_phladder_cpu
+                          << "  gpu_add="      << mx.t_gpu_add
+                          << "  jacobi_diis="  << mx.t_jacobi_diis
+                          << "  stage_sum="    << mx_sum
+                          << std::endl;
+                if (verbose >= 2) {
+                    std::cout << "[DLPNO-RESID-CPU-PROF] " << round_tag
+                              << "  thread-sum (total CPU work, s)"
+                              << "  r_init="       << sum.t_r_init
+                              << "  inter_Fock="   << sum.t_inter_fock
+                              << "  df_dressing="  << sum.t_df_dressing
+                              << "  w4virt="       << sum.t_w4virt
+                              << "  oooo="         << sum.t_oooo
+                              << "  phladder_cpu=" << sum.t_phladder_cpu
+                              << "  gpu_add="      << sum.t_gpu_add
+                              << "  jacobi_diis="  << sum.t_jacobi_diis
+                              << std::endl;
+                }
+            }
+        }
+        // Per-stage GPU pipeline breakdown of the resid bucket. Sum
+        // across active devices; max gives the wall-clock-relevant per-
+        // iter pipeline length (cudaEventSync at finalize waits on the
+        // slowest device). The pipeline sum dominates dt_resid above by
+        // construction.
+        if (any_rgpu_active) {
+            ResidStageTimes sum;
+            ResidStageTimes mx;
+            int n_active = 0;
+            for (int d = 0; d < n_gpus; ++d) {
+                if (!rgpus[d] || !rgpus[d]->active()) continue;
+                const ResidStageTimes t = rgpus[d]->get_stage_times();
+                sum.slice      += t.slice;
+                sum.w_block    += t.w_block;
+                sum.r_contract += t.r_contract;
+                sum.inter_fock += t.inter_fock;
+                sum.oooo       += t.oooo;
+                sum.d2h        += t.d2h;
+                sum.n_iter      = std::max(sum.n_iter, t.n_iter);
+                mx.slice      = std::max(mx.slice,      t.slice);
+                mx.w_block    = std::max(mx.w_block,    t.w_block);
+                mx.r_contract = std::max(mx.r_contract, t.r_contract);
+                mx.inter_fock = std::max(mx.inter_fock, t.inter_fock);
+                mx.oooo       = std::max(mx.oooo,       t.oooo);
+                mx.d2h        = std::max(mx.d2h,        t.d2h);
+                mx.n_iter     = std::max(mx.n_iter,     t.n_iter);
+                ++n_active;
+                if (verbose >= 2) {
+                    const double t_total = t.slice + t.w_block + t.r_contract
+                                         + t.inter_fock + t.oooo + t.d2h;
+                    std::cout << "[DLPNO-RESID-GPU-PROF] " << round_tag
+                              << "  device=" << d
+                              << "  iters=" << t.n_iter
+                              << "  slice="      << std::fixed << std::setprecision(3) << t.slice
+                              << "  W_block="    << t.w_block
+                              << "  R_contract=" << t.r_contract
+                              << "  inter_Fock=" << t.inter_fock
+                              << "  oooo="       << t.oooo
+                              << "  D2H="        << t.d2h
+                              << "  pipe_sum="   << t_total
+                              << std::endl;
+                }
+                rgpus[d]->reset_stage_times();
+            }
+            if (n_active > 0) {
+                const double pipe_sum_mx = mx.slice + mx.w_block + mx.r_contract
+                                         + mx.inter_fock + mx.oooo + mx.d2h;
+                std::cout << "[DLPNO-RESID-GPU-PROF] " << round_tag
+                          << "  per-iter-max-across-GPUs"
+                          << "  iters=" << mx.n_iter
+                          << "  slice="      << std::fixed << std::setprecision(3) << mx.slice
+                          << "  W_block="    << mx.w_block
+                          << "  R_contract=" << mx.r_contract
+                          << "  inter_Fock=" << mx.inter_fock
+                          << "  oooo="       << mx.oooo
+                          << "  D2H="        << mx.d2h
+                          << "  pipe_sum="   << pipe_sum_mx
+                          << std::endl;
+            }
+        }
     }
     return st;
 }

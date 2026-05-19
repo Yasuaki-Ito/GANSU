@@ -320,7 +320,8 @@ DLPNOCCSD::DLPNOCCSD(RHF& rhf, const ERI& eri, DLPNOParams params)
       eri_(eri),
       params_(std::move(params)),
       nao_(rhf.get_num_basis()),
-      nocc_(rhf.get_num_electrons() / 2)
+      // Frozen-core aware (= total - num_frozen_core_; 0 if --frozen_core none).
+      nocc_(rhf.get_num_active_occ())
 {}
 
 real_t DLPNOCCSD::compute_energy()
@@ -595,7 +596,14 @@ real_t DLPNOCCSD::compute_energy()
     // Multi-GPU pair partition for CCSD T2 iteration. Picked up from the
     // distributed RI back-end if it has replicated B (each device can build
     // pi_cache / R_ph independently from its own B copy).
+    //
+    // Option C (2026-05-19): user_explicit_n_gpus tracks whether the user
+    // passed `--num_gpus N > 0` explicitly (vs. the default `-1` auto).
+    // When explicit, the auto-fallback threshold in iterate_dlpno_ccsd_t2
+    // is bypassed so the user intent is honoured (required for ResidGpu
+    // activation on cholesterol-class systems after S11 Phase 2).
     int t2_num_gpus = 1;
+    const bool user_explicit_n_gpus = (rhf_.get_num_gpus() != -1);
 #ifdef GANSU_MULTI_GPU
     if (auto* eri_dist = dynamic_cast<const ERI_RI_Distributed_RHF*>(&eri_)) {
         if (eri_dist->num_gpus() > 1) {
@@ -620,7 +628,7 @@ real_t DLPNOCCSD::compute_energy()
             nocc_, nao_, t2_max_iter, t2_conv,
             /*enable_dressing=*/true,
             params_.verbose, "CCSD T2 iteration",
-            &phase24, t2_num_gpus);
+            &phase24, t2_num_gpus, user_explicit_n_gpus);
     }
     const double dt_iter = std::chrono::duration<double>(
         prof_clock::now() - t_iter_0).count();
