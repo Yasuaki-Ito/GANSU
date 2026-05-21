@@ -120,8 +120,38 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"dlpno_sc_pno_iter", "1"},                        // int: extra rounds of self-consistent PNO refinement (0 = single-shot PNO selection from semi-canonical guess)
         {"dlpno_pno_os_only", "0"},                        // bool: PNO selection from opposite-spin amplitudes only (D = T^T T + T T^T). Default 0 = use full LMP2 density (Riplinger 2013, T̃^T T + T̃ T^T) which slightly outperforms the OS-only form for full closed-shell MP2 energy evaluation. Set to 1 only when pairing with SOS-MP2 (c_os scaling, SS dropped).
         {"dlpno_verbose", "1"},                            // int: 0=summary, 1=phase, 2=per-pair, 3=residual
+        {"dlpno_cpu_threads", "0"},                        // int: cap on OpenMP threads for DLPNO per-pair CPU loops (each calls Eigen->OpenBLAS; OpenBLAS has a 128 per-caller-thread buffer limit, so on >128-core machines the uncapped default crashes). 0 = auto = min(cores, 64). GPU-dispatch regions keep num_threads(num_gpus).
         {"dlpno_compute_density", "0"},                    // bool: build DLPNO Λ + 1-RDM after MP2/CCSD energy (Sub-phase 1+ of DLPNO-CCSD-Λ project). Default 0 = energy only (no extra cost). Set 1 for DMET / properties / dipole; print sanity block + dipole when combined with dlpno_verbose >= 1.
-        {"dlpno_lambda_full_dressing", "0"}                // bool: Sub-phase 2X.2c. Enable full F-eff dressing (phase24-based dF_ki + DF_per_pair) in the DLPNO-CCSD Λ iteration. Default 0 = LMP2-limit closed-form Λ_2 = 2 Y - Y^T (agrees with canonical CCSD oo/vv to ~1e-5). Set 1 to engage the full Path A dressing to close the 6.3% off-canonical dipole gap; iteration costs ~50% more than closed-form. See DLPNO_Lambda.md §12.
+        {"dlpno_lambda_full_dressing", "0"},               // bool: Sub-phase 2X.2c. Enable full F-eff dressing (phase24-based dF_ki + DF_per_pair) in the DLPNO-CCSD Λ iteration. Default 0 = LMP2-limit closed-form Λ_2 = 2 Y - Y^T (agrees with canonical CCSD oo/vv to ~1e-5). Set 1 to engage the full Path A dressing to close the 6.3% off-canonical dipole gap; iteration costs ~50% more than closed-form. See DLPNO_Lambda.md §12.
+        // ----- CIS NTO active space (bt-PNO-STEOM Phase P0) -----
+        {"cis_nto_n_root_cis",  "0"},                       // int: # CIS roots used to build state-averaged density. 0 = auto (n_excited_states + 4, STEOM.md §7.3)
+        {"cis_nto_o_thresh",    "1e-3"},                    // real_t: ORCA OThresh — NTO occupation cutoff for active occupied
+        {"cis_nto_v_thresh",    "1e-3"},                    // real_t: ORCA VThresh — NTO occupation cutoff for active virtual
+        {"cis_nto_weights",     "uniform"},                 // string: weighting scheme — uniform | first_n_only | <comma-list of w_n>
+        {"cis_nto_verbose",     "1"},                       // int: 0 silent, 1 summary, 2 full NTO spectrum
+        // ----- IP-EOM-CCSD (bt-PNO-STEOM Phase P1) -----
+        {"ip_eom_ip_thresh",      "0.80"},                  // real_t: %singles filter for IP roots (STEOM.md §14.2(b))
+        {"ip_eom_safety_margin",  "2"},                     // int: extra Davidson roots beyond n_act_occ
+        {"ip_eom_followcis",      "1"},                     // bool: enable FollowCIS overlap-based active-root selection
+        {"ip_eom_d_tol",          "1e-5"},                  // real_t: Davidson eigenvalue convergence (DTol, STEOM.md §14.2(c))
+        {"ip_eom_r_tol",          "1e-7"},                  // real_t: Davidson amplitude residual convergence (tighter than EE)
+        {"ip_eom_max_iter",       "500"},                   // int: Davidson max iterations
+        {"ip_eom_verbose",        "1"},                     // int: 0 silent, 1 summary, 2 per-iter + intermediate norms
+        // ----- EA-EOM-CCSD (bt-PNO-STEOM Phase P2) -----
+        {"ea_eom_ea_thresh",      "0.80"},                  // real_t: %singles filter for EA roots
+        {"ea_eom_safety_margin",  "2"},                     // int: extra Davidson roots beyond n_act_vir
+        {"ea_eom_followcis",      "1"},                     // bool: enable FollowCIS overlap-based active-root selection
+        {"ea_eom_d_tol",          "1e-5"},                  // real_t: Davidson eigenvalue convergence
+        {"ea_eom_r_tol",          "1e-7"},                  // real_t: Davidson amplitude residual convergence
+        {"ea_eom_max_iter",       "500"},                   // int: Davidson max iterations
+        {"ea_eom_verbose",        "1"},                     // int: 0 silent, 1 summary, 2 per-iter + intermediate norms
+        // ----- STEOM-CCSD (bt-PNO-STEOM Phase P3) -----
+        {"steom_n_root_cis",       "0"},                     // int: 0 = auto (n_excited_states + 4); else explicit CIS root count
+        {"steom_active_char_warn", "0.96"},                  // real_t: warn if % active character η < threshold
+        {"steom_d_tol",            "1e-5"},                  // real_t: Davidson eigenvalue convergence
+        {"steom_r_tol",            "1e-7"},                  // real_t: Davidson amplitude residual convergence
+        {"steom_max_iter",         "500"},                   // int: Davidson max iterations
+        {"steom_verbose",          "1"}                      // int: 0 silent, 1 summary, 2 per-iter + amplitude norms, 3 term-by-term
     };
 
 

@@ -38,6 +38,7 @@
 #include "utils.hpp"
 #include "profiler.hpp"
 #include "oscillator_strength.hpp"
+#include "cis_nto_active_space.hpp"
 
 namespace gansu {
 
@@ -46,7 +47,8 @@ void transform_ao_eri_to_mo_eri_full(
     const double* d_eri_ao, const double* d_C, int nao, double* d_eri_mo);
 
 
-static void compute_cis_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, real_t* d_eri_mo_precomputed = nullptr) {
+static void compute_cis_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, real_t* d_eri_mo_precomputed = nullptr,
+                             std::vector<real_t>* out_eigenvectors = nullptr) {
     PROFILE_FUNCTION();
 
     const int num_frozen = rhf.get_num_frozen_core();
@@ -224,6 +226,12 @@ static void compute_cis_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, rea
         // Still set excitation energies even if oscillator strengths fail
     }
 
+    // Hand the host-side CIS amplitudes back to the caller if requested
+    // (used by compute_cis_nto for state-averaged NTO active-space analysis).
+    if (out_eigenvectors) {
+        *out_eigenvectors = std::move(h_eigenvectors);
+    }
+
     // Cleanup
     if (free_eri_mo) tracked_cudaFree(d_eri_mo);
 }
@@ -232,7 +240,48 @@ void ERI_Stored_RHF::compute_cis(int n_states) {
     compute_cis_impl(rhf_, eri_matrix_.device_ptr(), n_states);
 }
 
+void ERI_Stored_RHF::compute_cis_nto(int n_states_cis) {
+    PROFILE_FUNCTION();
+
+    const int num_frozen  = rhf_.get_num_frozen_core();
+    const int full_occ    = rhf_.get_num_electrons() / 2;
+    const int nocc_active = full_occ - num_frozen;
+    const int nvir        = num_basis_ - full_occ;
+
+    if (nocc_active <= 0 || nvir <= 0) {
+        throw std::runtime_error(
+            "compute_cis_nto: invalid orbital partition (nocc_active or nvir <= 0)");
+    }
+
+    std::vector<real_t> cis_amplitudes;
+    compute_cis_impl(rhf_, eri_matrix_.device_ptr(), n_states_cis,
+                     /*d_eri_mo_precomputed=*/nullptr,
+                     /*out_eigenvectors=*/&cis_amplitudes);
+
+    // Build state-averaged NTO active space from the CIS amplitudes just produced.
+    CISNTOActiveSpace::Params p;
+    p.o_thresh = static_cast<real_t>(rhf_.get_cis_nto_o_thresh());
+    p.v_thresh = static_cast<real_t>(rhf_.get_cis_nto_v_thresh());
+    p.verbose  = rhf_.get_cis_nto_verbose();
+    // Day 1: weights default to uniform (parsed in Day 2 from rhf_.get_cis_nto_weights()).
+
+    CISNTOResult result = CISNTOActiveSpace::compute(
+        cis_amplitudes.data(), n_states_cis,
+        nocc_active, nvir, num_frozen, p);
+
+    std::cout << result.report;
+
+    // Persist into the RHF object so the final summary picks it up and so
+    // the next phase (P1 IP-EOM-CCSD) can consume the active space directly.
+    rhf_.append_excited_state_report(result.report);
+    rhf_.set_cis_nto_result(std::move(result));
+}
+
 void ERI_RI_RHF::compute_cis(int n_states) {
+    compute_cis_ri_impl(n_states, /*out_eigenvectors=*/nullptr);
+}
+
+void ERI_RI_RHF::compute_cis_ri_impl(int n_states, std::vector<real_t>* out_eigenvectors) {
     PROFILE_FUNCTION();
 
     const int nao = rhf_.get_num_basis();
@@ -242,13 +291,31 @@ void ERI_RI_RHF::compute_cis(int n_states) {
     const int cis_dim = nocc * nvir;
     const bool is_triplet = rhf_.is_triplet();
 
+    // Guard: the RI CIS path assumes the full B matrix is materialized on a
+    // single GPU.  In multi-GPU distributed mode (ERI_RI_Distributed_RHF) the
+    // base class instantiates intermediate_matrix_B_ via the lightweight
+    // constructor that *skips* allocation — so reading it here yields a null
+    // buffer and the resulting B_ov/B_oo/B_vv blocks are zero, which silently
+    // collapses CIS to the diagonal Hamiltonian (max|r| ≈ 1e-16 after a
+    // single Davidson iteration, with excitation energies equal to orbital
+    // energy differences).  Fail loudly instead.
+    if (intermediate_matrix_B_.rows() == 0 || intermediate_matrix_B_.cols() == 0 ||
+        intermediate_matrix_B_.device_ptr() == nullptr) {
+        throw std::runtime_error(
+            "ERI_RI_RHF::compute_cis: the full B matrix is not allocated on the "
+            "current device. This typically means GANSU is running with "
+            "--num_gpus > 1 (distributed RI). Multi-GPU RI CIS / CIS-NTO is "
+            "not yet implemented (bt-PNO-STEOM Phase P0 ships single-GPU only). "
+            "Rerun with --num_gpus 1.");
+    }
+
     // CPU fallback: CISOperator_RI uses cuBLAS-only kernels with no CPU
     // backend, so on CPU we route through the base CISOperator path by
     // building the full MO ERI tensor via build_mo_eri (which on CPU
     // reconstructs AO ERI from B and applies the O(N^5) quarter transform).
     if (!gpu::gpu_available()) {
         real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), nao);
-        compute_cis_impl(rhf_, nullptr, n_states, d_mo_eri);
+        compute_cis_impl(rhf_, nullptr, n_states, d_mo_eri, out_eigenvectors);
         tracked_cudaFree(d_mo_eri);
         return;
     }
@@ -445,10 +512,59 @@ void ERI_RI_RHF::compute_cis(int n_states) {
     rhf_.set_oscillator_strengths(es_result.oscillator_strengths);
     rhf_.set_excited_state_report(es_result.report);
 
+    // Hand the CIS amplitudes back to the caller if requested (used by
+    // ERI_RI_RHF::compute_cis_nto for state-averaged NTO analysis).
+    if (out_eigenvectors) {
+        *out_eigenvectors = std::move(h_eigenvectors);
+    }
+
     // Cleanup
     tracked_cudaFree(d_B_ov);
     tracked_cudaFree(d_B_oo);
     tracked_cudaFree(d_B_vv);
+}
+
+void ERI_RI_RHF::compute_cis_nto(int n_states_cis) {
+    PROFILE_FUNCTION();
+
+    const int num_frozen  = rhf_.get_num_frozen_core();
+    const int full_occ    = rhf_.get_num_electrons() / 2;
+    const int nocc_active = full_occ - num_frozen;
+    const int nvir        = rhf_.get_num_basis() - full_occ;
+
+    if (nocc_active <= 0 || nvir <= 0) {
+        throw std::runtime_error(
+            "compute_cis_nto (RI): invalid orbital partition (nocc_active or nvir <= 0)");
+    }
+
+    // Note: frozen_core is not yet plumbed into compute_cis_ri_impl on the RI
+    // path. The Stored CIS path subtracts num_frozen from nocc; the RI path
+    // currently does not. For P0 the CIS NTO call uses CIS amplitudes from
+    // the active-occupied block only when the Stored path runs. When P1 (RI
+    // IP-EOM) lands we will revisit RI frozen-core. For now, refuse the
+    // combination with a clear message.
+    if (num_frozen != 0) {
+        throw std::runtime_error(
+            "compute_cis_nto (RI): frozen_core is not yet supported on the RI CIS "
+            "path. Use --eri_method stored, or rerun without frozen_core.");
+    }
+
+    std::vector<real_t> cis_amplitudes;
+    compute_cis_ri_impl(n_states_cis, &cis_amplitudes);
+
+    // Build state-averaged NTO active space from the CIS amplitudes.
+    CISNTOActiveSpace::Params p;
+    p.o_thresh = static_cast<real_t>(rhf_.get_cis_nto_o_thresh());
+    p.v_thresh = static_cast<real_t>(rhf_.get_cis_nto_v_thresh());
+    p.verbose  = rhf_.get_cis_nto_verbose();
+
+    CISNTOResult result = CISNTOActiveSpace::compute(
+        cis_amplitudes.data(), n_states_cis,
+        nocc_active, nvir, num_frozen, p);
+
+    std::cout << result.report;
+    rhf_.append_excited_state_report(result.report);
+    rhf_.set_cis_nto_result(std::move(result));
 }
 
 // Forward declarations (defined in half_transform_mp3.cu)

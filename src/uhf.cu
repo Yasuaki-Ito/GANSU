@@ -578,6 +578,10 @@ std::vector<double> UHF::compute_Energy_Gradient() {
             case PostHFMethod::DLPNO_MP2:     method_name = "DLPNO-MP2 (unrestricted)"; break;
             case PostHFMethod::DLPNO_CCSD:    method_name = "DLPNO-CCSD (unrestricted)"; break;
             case PostHFMethod::DLPNO_CCSD_T:  method_name = "DLPNO-CCSD(T) (unrestricted)"; break;
+            case PostHFMethod::CIS_NTO:       method_name = "CIS NTO active space (RHF-only; not supported for UHF)"; break;
+            case PostHFMethod::IP_EOM_CCSD:   method_name = "IP-EOM-CCSD (RHF-only; not supported for UHF)"; break;
+            case PostHFMethod::EA_EOM_CCSD:   method_name = "EA-EOM-CCSD (RHF-only; not supported for UHF)"; break;
+            case PostHFMethod::STEOM_CCSD:    method_name = "STEOM-CCSD (RHF-only; not supported for UHF)"; break;
             case PostHFMethod::None:          method_name = "(none)"; break;
         }
         std::cout << "Post-HF method: " << method_name << std::endl;

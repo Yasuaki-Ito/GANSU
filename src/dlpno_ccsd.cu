@@ -889,6 +889,10 @@ real_t DLPNOCCSD::compute_energy()
 //  ERI wiring  —  RI is the only supported back-end for DLPNO.
 // ---------------------------------------------------------------------------
 real_t ERI_RI_RHF::compute_dlpno_ccsd() {
+    // Cap OpenMP threads for the per-pair CPU loops so the Eigen->OpenBLAS
+    // calls inside them stay under OpenBLAS's 128 per-caller-thread buffer
+    // limit on many-core machines (see OmpThreadCapGuard). Restored on return.
+    OmpThreadCapGuard omp_cap(rhf_.get_dlpno_cpu_threads());
     DLPNOParams p = resolve_dlpno_params(
         rhf_.get_dlpno_preset(),
         rhf_.get_dlpno_localizer(),
@@ -1448,6 +1452,11 @@ real_t run_phase33_triple_loop(const DLPNOLMP2Result& res,
 } // anonymous namespace
 
 real_t ERI_RI_RHF::compute_dlpno_ccsd_t() {
+    // Cap OpenMP threads across the whole (T) driver (the inner
+    // compute_dlpno_ccsd re-applies the same cap harmlessly). Keeps the
+    // per-triple TNOBuilder eigensolves' Eigen->OpenBLAS calls under the 128
+    // per-caller-thread buffer limit — this is exactly where the crash hit.
+    OmpThreadCapGuard omp_cap(rhf_.get_dlpno_cpu_threads());
     const real_t e_ccsd = compute_dlpno_ccsd();
 
     // Phase 3.1: rebuild the LMP2 pair state for TNO statistics.

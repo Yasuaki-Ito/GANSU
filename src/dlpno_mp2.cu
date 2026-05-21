@@ -925,6 +925,10 @@ real_t DLPNOMP2::compute_energy()
 //  ERI wiring — RI is the only supported back-end for DLPNO.
 // ---------------------------------------------------------------------------
 real_t ERI_RI_RHF::compute_dlpno_mp2() {
+    // Cap OpenMP threads for the per-pair CPU loops so the Eigen->OpenBLAS
+    // calls inside them stay under OpenBLAS's 128 per-caller-thread buffer
+    // limit on many-core machines (see OmpThreadCapGuard). Restored on return.
+    OmpThreadCapGuard omp_cap(rhf_.get_dlpno_cpu_threads());
     DLPNOParams p = resolve_dlpno_params(
         rhf_.get_dlpno_preset(),
         rhf_.get_dlpno_localizer(),

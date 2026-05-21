@@ -897,11 +897,15 @@ public:
     void compute_ccsd_density() override;
     real_t compute_fci_energy() override;
     void compute_cis(int n_states) override;
+    void compute_cis_nto(int n_states_cis) override;
     void compute_adc2(int n_states) override;
     void compute_adc2x(int n_states) override;
     void compute_eom_mp2(int n_states) override;
     void compute_eom_cc2(int n_states) override;
     void compute_eom_ccsd(int n_states) override;
+    void compute_ip_eom_ccsd(int n_states) override;
+    void compute_ea_eom_ccsd(int n_states) override;
+    void compute_steom_ccsd(int n_states) override;
     real_t compute_dmet_ccsd() override;
     real_t compute_dmet_ccsd_t() override;
 
@@ -971,6 +975,7 @@ private:
     real_t compute_ccsd_t_energy() override;
     real_t compute_fci_energy() override;
     void compute_cis(int n_states) override;
+    void compute_cis_nto(int n_states_cis) override;
     void compute_adc2(int n_states) override;
     void compute_sos_adc2(int n_states) override;
     void compute_sos_laplace_adc2(int n_states) override;
@@ -980,6 +985,12 @@ private:
     void compute_eom_ccsd(int n_states) override;
     real_t compute_dmet_ccsd() override;
     real_t compute_dmet_ccsd_t() override;
+
+    /// Internal RI CIS driver. Same numerical core as compute_cis(); accepts an
+    /// optional out-vector that receives the host-side CIS amplitudes (used by
+    /// compute_cis_nto). When out_eigenvectors is nullptr the behavior is
+    /// identical to the original compute_cis().
+    void compute_cis_ri_impl(int n_states, std::vector<real_t>* out_eigenvectors);
 
     void compute_thc_sos_adc2(int n_states) override;  // Phase 2.3: RI-Z path
 

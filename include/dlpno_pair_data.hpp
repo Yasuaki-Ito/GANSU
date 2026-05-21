@@ -10,9 +10,46 @@
 #pragma once
 
 #include <vector>
+#include <algorithm>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "types.hpp"
 
 namespace gansu {
+
+/**
+ * @brief Scoped cap on the OpenMP default thread count for the DLPNO CPU path.
+ *
+ * The per-pair `omp parallel for` loops in iterate_lmp2 /
+ * iterate_dlpno_ccsd_t2 / PNO selection have no num_threads() clause, so they
+ * default to one thread per logical core. On machines with > ~128 cores each
+ * such thread calls Eigen→OpenBLAS, and OpenBLAS allocates one buffer per
+ * distinct caller thread with a hard precompiled limit (128); exceeding it
+ * corrupts state and segfaults (observed in DLPNO-CCSD(T) (T) phase). Capping
+ * the OpenMP default keeps the OpenBLAS caller count bounded. The explicit
+ * `num_threads(num_gpus)` GPU-dispatch regions are unaffected (an explicit
+ * clause overrides the default). The previous value is restored on scope
+ * exit, so no process-wide thread-count state leaks beyond the DLPNO driver.
+ *
+ * @param requested user value (dlpno_cpu_threads); <= 0 means auto =
+ *        min(available cores, 64).
+ */
+struct OmpThreadCapGuard {
+#ifdef _OPENMP
+    int saved_;
+    explicit OmpThreadCapGuard(int requested) : saved_(omp_get_max_threads()) {
+        int cap = requested > 0 ? requested : std::min(saved_, 64);
+        if (cap < 1) cap = 1;
+        omp_set_num_threads(cap);
+    }
+    ~OmpThreadCapGuard() { omp_set_num_threads(saved_); }
+#else
+    explicit OmpThreadCapGuard(int /*requested*/) {}
+#endif
+    OmpThreadCapGuard(const OmpThreadCapGuard&) = delete;
+    OmpThreadCapGuard& operator=(const OmpThreadCapGuard&) = delete;
+};
 
 /**
  * @brief Per-pair invariants (independent of PNO selection).

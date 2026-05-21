@@ -132,6 +132,39 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     thc_max_rank_ = parameters.get<int>("thc_max_rank");
     thc_rsvd_power_iter_ = parameters.get<int>("thc_rsvd_power_iter");
 
+    // CIS NTO active space (bt-PNO-STEOM Phase P0)
+    cis_nto_n_root_cis_ = parameters.get<int>("cis_nto_n_root_cis");
+    cis_nto_o_thresh_   = parameters.get<double>("cis_nto_o_thresh");
+    cis_nto_v_thresh_   = parameters.get<double>("cis_nto_v_thresh");
+    cis_nto_weights_    = toLowerCase(parameters.get<std::string>("cis_nto_weights"));
+    cis_nto_verbose_    = parameters.get<int>("cis_nto_verbose");
+
+    // IP-EOM-CCSD (bt-PNO-STEOM Phase P1)
+    ip_eom_ip_thresh_     = parameters.get<double>("ip_eom_ip_thresh");
+    ip_eom_safety_margin_ = parameters.get<int>("ip_eom_safety_margin");
+    ip_eom_followcis_     = parameters.get<bool>("ip_eom_followcis");
+    ip_eom_d_tol_         = parameters.get<double>("ip_eom_d_tol");
+    ip_eom_r_tol_         = parameters.get<double>("ip_eom_r_tol");
+    ip_eom_max_iter_      = parameters.get<int>("ip_eom_max_iter");
+    ip_eom_verbose_       = parameters.get<int>("ip_eom_verbose");
+
+    // EA-EOM-CCSD (bt-PNO-STEOM Phase P2)
+    ea_eom_ea_thresh_     = parameters.get<double>("ea_eom_ea_thresh");
+    ea_eom_safety_margin_ = parameters.get<int>("ea_eom_safety_margin");
+    ea_eom_followcis_     = parameters.get<bool>("ea_eom_followcis");
+    ea_eom_d_tol_         = parameters.get<double>("ea_eom_d_tol");
+    ea_eom_r_tol_         = parameters.get<double>("ea_eom_r_tol");
+    ea_eom_max_iter_      = parameters.get<int>("ea_eom_max_iter");
+    ea_eom_verbose_       = parameters.get<int>("ea_eom_verbose");
+
+    // STEOM-CCSD (bt-PNO-STEOM Phase P3)
+    steom_n_root_cis_       = parameters.get<int>("steom_n_root_cis");
+    steom_active_char_warn_ = parameters.get<double>("steom_active_char_warn");
+    steom_d_tol_            = parameters.get<double>("steom_d_tol");
+    steom_r_tol_            = parameters.get<double>("steom_r_tol");
+    steom_max_iter_         = parameters.get<int>("steom_max_iter");
+    steom_verbose_          = parameters.get<int>("steom_verbose");
+
     // DLPNO parameters (raw user values; -1 sentinel resolved by dlpno_params.hpp)
     dlpno_preset_                = toLowerCase(parameters.get<std::string>("dlpno_preset"));
     dlpno_localizer_             = toLowerCase(parameters.get<std::string>("dlpno_localizer"));
@@ -151,6 +184,7 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     dlpno_sc_pno_iter_           = parameters.get<int>("dlpno_sc_pno_iter");
     dlpno_pno_os_only_           = parameters.get<bool>("dlpno_pno_os_only");
     dlpno_verbose_               = parameters.get<int>("dlpno_verbose");
+    dlpno_cpu_threads_           = parameters.get<int>("dlpno_cpu_threads");
     dlpno_compute_density_       = parameters.get<bool>("dlpno_compute_density");
     dlpno_lambda_full_dressing_  = parameters.get<bool>("dlpno_lambda_full_dressing");
 
@@ -261,6 +295,22 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
              || post_hf_method_str == "dlpno_ccsdt"){
         std::cout << "Message: Post-HF method is DLPNO-CCSD(T)." << std::endl;
         post_hf_method_ = PostHFMethod::DLPNO_CCSD_T;
+    }else if(post_hf_method_str == "cis_nto" || post_hf_method_str == "cis-nto"){
+        std::cout << "Message: Post-HF method is CIS NTO active space (bt-PNO-STEOM P0)." << std::endl;
+        post_hf_method_ = PostHFMethod::CIS_NTO;
+    }else if(post_hf_method_str == "ip_eom_ccsd" || post_hf_method_str == "ip-eom-ccsd"
+             || post_hf_method_str == "ipeom_ccsd" || post_hf_method_str == "ipeom-ccsd"){
+        std::cout << "Message: Post-HF method is IP-EOM-CCSD (bt-PNO-STEOM P1)." << std::endl;
+        post_hf_method_ = PostHFMethod::IP_EOM_CCSD;
+    }else if(post_hf_method_str == "ea_eom_ccsd" || post_hf_method_str == "ea-eom-ccsd"
+             || post_hf_method_str == "eaeom_ccsd" || post_hf_method_str == "eaeom-ccsd"){
+        std::cout << "Message: Post-HF method is EA-EOM-CCSD (bt-PNO-STEOM P2)." << std::endl;
+        post_hf_method_ = PostHFMethod::EA_EOM_CCSD;
+    }else if(post_hf_method_str == "steom_ccsd" || post_hf_method_str == "steom-ccsd"
+             || post_hf_method_str == "steomccsd"){
+        std::cout << "Message: Post-HF method is STEOM-CCSD (bt-PNO-STEOM P3). "
+                     "Auto-runs CIS-NTO + IP-EOM-CCSD + EA-EOM-CCSD as prerequisites." << std::endl;
+        post_hf_method_ = PostHFMethod::STEOM_CCSD;
     }else{
         throw std::runtime_error("Error: Unknown post-HF method: " + post_hf_method_str);
     }

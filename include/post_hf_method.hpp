@@ -45,7 +45,11 @@ enum class PostHFMethod {
     THC_SOS_ADC2, // THC + Laplace SOS-ADC(2) excited states (Phase 2.2a, MVP)
     DLPNO_MP2,    // Domain-based Local PNO MP2 (Phase 1)
     DLPNO_CCSD,   // Domain-based Local PNO CCSD (Phase 2)
-    DLPNO_CCSD_T  // Domain-based Local PNO CCSD(T) (Phase 3)
+    DLPNO_CCSD_T, // Domain-based Local PNO CCSD(T) (Phase 3)
+    CIS_NTO,      // State-averaged CIS natural-transition-orbital active space (bt-PNO-STEOM Phase P0)
+    IP_EOM_CCSD,  // Ionization-potential EOM-CCSD (bt-PNO-STEOM Phase P1, building block for ̂S^IP)
+    EA_EOM_CCSD,  // Electron-affinity EOM-CCSD (bt-PNO-STEOM Phase P2, building block for ̂S^EA)
+    STEOM_CCSD    // Similarity Transformed EOM-CCSD (bt-PNO-STEOM Phase P3; auto-runs CIS_NTO + IP-EOM + EA-EOM as prerequisites)
 };
 
 } // namespace gansu

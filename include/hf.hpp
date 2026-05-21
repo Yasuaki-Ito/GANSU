@@ -32,6 +32,10 @@
 #include "gpu_manager.hpp"
 #include "parameter_manager.hpp"
 #include "eri.hpp"
+#include "cis_nto_active_space.hpp"
+#include "ip_eom_result.hpp"
+#include "ea_eom_result.hpp"
+#include "steom_result.hpp"
 
 
 namespace gansu{
@@ -282,6 +286,7 @@ public:
     int    get_dlpno_sc_pno_iter()   const { return dlpno_sc_pno_iter_; }
     bool   get_dlpno_pno_os_only()   const { return dlpno_pno_os_only_; }
     int    get_dlpno_verbose() const { return dlpno_verbose_; }
+    int    get_dlpno_cpu_threads() const { return dlpno_cpu_threads_; }
     bool   get_dlpno_compute_density() const { return dlpno_compute_density_; }
     /// Sub-phase 2X.2c+: enable full F-eff dressing in the DLPNO-CCSD Λ
     /// iteration (phase24-based cross-pair dF_ki + per-pair DF). Default
@@ -294,6 +299,39 @@ public:
 
     /// Number of GPUs requested (-1 = auto-detect, 1 = single, > 1 = multi).
     int    get_num_gpus() const { return num_gpus_; }
+
+    /// CIS NTO (bt-PNO-STEOM Phase P0) parameters
+    int                get_cis_nto_n_root_cis() const { return cis_nto_n_root_cis_; }
+    double             get_cis_nto_o_thresh()   const { return cis_nto_o_thresh_;  }
+    double             get_cis_nto_v_thresh()   const { return cis_nto_v_thresh_;  }
+    const std::string& get_cis_nto_weights()    const { return cis_nto_weights_;   }
+    int                get_cis_nto_verbose()    const { return cis_nto_verbose_;   }
+
+    /// IP-EOM-CCSD (bt-PNO-STEOM Phase P1) parameters
+    double get_ip_eom_ip_thresh()      const { return ip_eom_ip_thresh_;      }
+    int    get_ip_eom_safety_margin()  const { return ip_eom_safety_margin_;  }
+    bool   get_ip_eom_followcis()      const { return ip_eom_followcis_;      }
+    double get_ip_eom_d_tol()          const { return ip_eom_d_tol_;          }
+    double get_ip_eom_r_tol()          const { return ip_eom_r_tol_;          }
+    int    get_ip_eom_max_iter()       const { return ip_eom_max_iter_;       }
+    int    get_ip_eom_verbose()        const { return ip_eom_verbose_;        }
+
+    /// EA-EOM-CCSD (bt-PNO-STEOM Phase P2) parameters
+    double get_ea_eom_ea_thresh()      const { return ea_eom_ea_thresh_;      }
+    int    get_ea_eom_safety_margin()  const { return ea_eom_safety_margin_;  }
+    bool   get_ea_eom_followcis()      const { return ea_eom_followcis_;      }
+    double get_ea_eom_d_tol()          const { return ea_eom_d_tol_;          }
+    double get_ea_eom_r_tol()          const { return ea_eom_r_tol_;          }
+    int    get_ea_eom_max_iter()       const { return ea_eom_max_iter_;       }
+    int    get_ea_eom_verbose()        const { return ea_eom_verbose_;        }
+
+    /// STEOM-CCSD (bt-PNO-STEOM Phase P3) parameters
+    int    get_steom_n_root_cis()      const { return steom_n_root_cis_;      }
+    double get_steom_active_char_warn() const { return steom_active_char_warn_; }
+    double get_steom_d_tol()           const { return steom_d_tol_;           }
+    double get_steom_r_tol()           const { return steom_r_tol_;           }
+    int    get_steom_max_iter()        const { return steom_max_iter_;        }
+    int    get_steom_verbose()         const { return steom_verbose_;         }
 
     /// Post-HF runtime statistics — populated by the post-HF driver as it
     /// runs so that the post-HF summary can report the actual problem size.
@@ -431,6 +469,54 @@ public:
      */
     const std::string& get_excited_state_report() const { return excited_state_report_; }
     void set_excited_state_report(const std::string& report) { excited_state_report_ = report; }
+    /// Append a chunk to the excited-state report. Used when multiple excited
+    /// post-HF stages (e.g. CIS + CIS-NTO) contribute to a single run's report.
+    void append_excited_state_report(const std::string& chunk) {
+        if (!chunk.empty()) {
+            if (!excited_state_report_.empty()) excited_state_report_ += "\n";
+            excited_state_report_ += chunk;
+        }
+    }
+
+    /**
+     * @brief CIS NTO active space result (bt-PNO-STEOM Phase P0).
+     *
+     * Populated by `ERI::compute_cis_nto`. Empty (`nocc_active==0`) if the
+     * post-HF method was not CIS_NTO. Read by P1 IP-EOM-CCSD (when it lands).
+     */
+    const CISNTOResult& get_cis_nto_result() const { return cis_nto_result_; }
+    CISNTOResult&       get_cis_nto_result()       { return cis_nto_result_; }
+    void set_cis_nto_result(CISNTOResult result) { cis_nto_result_ = std::move(result); }
+
+    /**
+     * @brief IP-EOM-CCSD result (bt-PNO-STEOM Phase P1).
+     *
+     * Populated by `ERI::compute_ip_eom_ccsd`. Empty (`n_active==0`) if the
+     * post-HF method was not IP_EOM_CCSD. Read by P3 STEOM (when it lands).
+     */
+    const IPEOMResult& get_ip_eom_result() const { return ip_eom_result_; }
+    IPEOMResult&       get_ip_eom_result()       { return ip_eom_result_; }
+    void set_ip_eom_result(IPEOMResult result) { ip_eom_result_ = std::move(result); }
+
+    /**
+     * @brief EA-EOM-CCSD result (bt-PNO-STEOM Phase P2).
+     *
+     * Populated by `ERI::compute_ea_eom_ccsd`. Empty (`n_active==0`) if the
+     * post-HF method was not EA_EOM_CCSD. Read by P3 STEOM (when it lands).
+     */
+    const EAEOMResult& get_ea_eom_result() const { return ea_eom_result_; }
+    EAEOMResult&       get_ea_eom_result()       { return ea_eom_result_; }
+    void set_ea_eom_result(EAEOMResult result) { ea_eom_result_ = std::move(result); }
+
+    /**
+     * @brief STEOM-CCSD result (bt-PNO-STEOM Phase P3).
+     *
+     * Populated by `ERI::compute_steom_ccsd`. Empty (`n_states==0`) if the
+     * post-HF method was not STEOM_CCSD.
+     */
+    const STEOMResult& get_steom_result() const { return steom_result_; }
+    STEOMResult&       get_steom_result()       { return steom_result_; }
+    void set_steom_result(STEOMResult result) { steom_result_ = std::move(result); }
 
     /**
      * @brief Get whether the coefficient matrix has been computed
@@ -519,11 +605,45 @@ protected:
     int    dlpno_sc_pno_iter_ = 1;
     bool   dlpno_pno_os_only_ = false;
     int    dlpno_verbose_ = 1;
+    int    dlpno_cpu_threads_ = 0;  ///< Cap on OpenMP threads for DLPNO per-pair CPU loops; 0 = auto min(cores,64). Bounds OpenBLAS per-caller-thread buffer use (128 limit) on many-core machines.
     bool   dlpno_compute_density_ = false;  ///< Sub-phase 1+: build Λ + 1-RDM after MP2/CCSD
     bool   dlpno_lambda_full_dressing_ = false;  ///< Sub-phase 2X.2c: full Λ F-eff dressing
 
     // Multi-GPU
     int    num_gpus_ = 1;
+
+    // CIS NTO active space (bt-PNO-STEOM Phase P0)
+    int         cis_nto_n_root_cis_ = 0;          ///< 0 = auto (n_excited_states + 4)
+    double      cis_nto_o_thresh_   = 1e-3;
+    double      cis_nto_v_thresh_   = 1e-3;
+    std::string cis_nto_weights_    = "uniform";
+    int         cis_nto_verbose_    = 1;
+
+    // IP-EOM-CCSD (bt-PNO-STEOM Phase P1)
+    double ip_eom_ip_thresh_     = 0.80;
+    int    ip_eom_safety_margin_ = 2;
+    bool   ip_eom_followcis_     = true;
+    double ip_eom_d_tol_         = 1e-5;
+    double ip_eom_r_tol_         = 1e-7;
+    int    ip_eom_max_iter_      = 500;
+    int    ip_eom_verbose_       = 1;
+
+    // EA-EOM-CCSD (bt-PNO-STEOM Phase P2)
+    double ea_eom_ea_thresh_     = 0.80;
+    int    ea_eom_safety_margin_ = 2;
+    bool   ea_eom_followcis_     = true;
+    double ea_eom_d_tol_         = 1e-5;
+    double ea_eom_r_tol_         = 1e-7;
+    int    ea_eom_max_iter_      = 500;
+    int    ea_eom_verbose_       = 1;
+
+    // STEOM-CCSD (bt-PNO-STEOM Phase P3)
+    int    steom_n_root_cis_      = 0;     // 0 = auto (n_excited_states + 4)
+    double steom_active_char_warn_ = 0.96; // warn if η < threshold
+    double steom_d_tol_           = 1e-5;
+    double steom_r_tol_           = 1e-7;
+    int    steom_max_iter_        = 500;
+    int    steom_verbose_         = 1;
 
     // Post-HF runtime statistics (set by drivers, read by post-HF summary).
     int    last_dmet_n_fragments_      = 0;
@@ -568,6 +688,10 @@ protected:
     std::vector<real_t> excitation_energies_; ///< Excitation energies (CIS/EOM)
     std::vector<real_t> oscillator_strengths_; ///< Oscillator strengths (CIS/EOM)
     std::string excited_state_report_; ///< Formatted excited state report for final summary
+    CISNTOResult cis_nto_result_;      ///< bt-PNO-STEOM Phase P0: state-averaged CIS NTO active space (empty unless post_hf_method=cis_nto)
+    IPEOMResult  ip_eom_result_;       ///< bt-PNO-STEOM Phase P1: IP-EOM-CCSD roots per active occupied NTO (empty unless post_hf_method=ip_eom_ccsd)
+    EAEOMResult  ea_eom_result_;       ///< bt-PNO-STEOM Phase P2: EA-EOM-CCSD roots per active virtual NTO (empty unless post_hf_method=ea_eom_ccsd)
+    STEOMResult  steom_result_;        ///< bt-PNO-STEOM Phase P3: STEOM-CCSD excited states (empty unless post_hf_method=steom_ccsd)
 
     // ECP data (from Molecular)
     bool has_ecp_ = false;

@@ -145,6 +145,15 @@ struct GansuResult {
     real_t post_hf_energy;   // correlation energy (0 if no post-HF)
     std::vector<real_t> excitation_energies;  // excitation energies (CIS/EOM)
     std::vector<real_t> oscillator_strengths;  // oscillator strengths (CIS/EOM)
+
+    // CIS NTO active-space result (populated only when post_hf == "cis_nto",
+    // bt-PNO-STEOM Phase P0). All fields are zero / empty otherwise.
+    int cis_nto_n_act_occ = 0;
+    int cis_nto_n_act_vir = 0;
+    real_t cis_nto_trace_occ = 0.0;
+    real_t cis_nto_trace_vir = 0.0;
+    std::vector<real_t> cis_nto_occ_occupations;
+    std::vector<real_t> cis_nto_vir_occupations;
 };
 
 static GansuResult run_gansu(const std::string& xyz,
@@ -198,6 +207,17 @@ static GansuResult run_gansu(const std::string& xyz,
     result.hf_total_energy = hf->get_total_energy();
     result.post_hf_energy = hf->get_post_hf_energy();
     result.excitation_energies = hf->get_excitation_energies();
+    result.oscillator_strengths = hf->get_oscillator_strengths();
+    // CIS NTO (bt-PNO-STEOM P0). Empty unless post_hf == "cis_nto".
+    {
+        const auto& nto = hf->get_cis_nto_result();
+        result.cis_nto_n_act_occ      = nto.n_act_occ;
+        result.cis_nto_n_act_vir      = nto.n_act_vir;
+        result.cis_nto_trace_occ      = nto.trace_occ;
+        result.cis_nto_trace_vir      = nto.trace_vir;
+        result.cis_nto_occ_occupations = nto.nto_occ_occupations;
+        result.cis_nto_vir_occupations = nto.nto_vir_occupations;
+    }
 
     std::cout << std::setprecision(10) << std::fixed
               << "  GANSU HF total = " << result.hf_total_energy;
@@ -951,6 +971,106 @@ static GansuResult run_gansu_cis(const std::string& xyz,
     std::cout << std::endl;
 
     return result;
+}
+
+// ============================================================
+//  CIS NTO active space (bt-PNO-STEOM Phase P0) — Day 4a gate
+// ============================================================
+static GansuResult run_gansu_cis_nto(const std::string& xyz,
+                                      const std::string& basis,
+                                      int n_states = 4,
+                                      const std::string& eri_method = "stored",
+                                      const std::string& auxiliary_basis = "")
+{
+    cudaDeviceSynchronize();
+    cudaGetLastError();
+
+    ParameterManager params;
+    params["xyzfilename"] = xyz;
+    params["gbsfilename"] = basis;
+    params["method"] = "rhf";
+    params["post_hf_method"] = "cis_nto";
+    params["n_excited_states"] = std::to_string(n_states);  // → N_root_CIS = n+4 (STEOM.md §7.3 default)
+    params["convergence_energy_threshold"] = "1e-10";
+    params["initial_guess"] = "core";
+    params["eri_method"] = eri_method;
+    // RI CIS / CIS-NTO is single-GPU-only in P0 (see compute_cis_ri_impl guard).
+    // Force num_gpus=1 so multi-GPU dev nodes don't trigger distributed RI.
+    params["num_gpus"] = "1";
+    if (!auxiliary_basis.empty()) {
+        params["auxiliary_gbsfilename"] = auxiliary_basis;
+    }
+
+    std::streambuf* orig_buf = std::cout.rdbuf();
+    std::ostringstream null_stream;
+    std::cout.rdbuf(null_stream.rdbuf());
+
+    auto hf = HFBuilder::buildHF(params);
+    hf->solve();
+
+    std::cout.rdbuf(orig_buf);
+
+    GansuResult result;
+    result.hf_total_energy = hf->get_total_energy();
+    result.post_hf_energy = hf->get_post_hf_energy();
+    result.excitation_energies = hf->get_excitation_energies();
+    result.oscillator_strengths = hf->get_oscillator_strengths();
+    const auto& nto = hf->get_cis_nto_result();
+    result.cis_nto_n_act_occ       = nto.n_act_occ;
+    result.cis_nto_n_act_vir       = nto.n_act_vir;
+    result.cis_nto_trace_occ       = nto.trace_occ;
+    result.cis_nto_trace_vir       = nto.trace_vir;
+    result.cis_nto_occ_occupations = nto.nto_occ_occupations;
+    result.cis_nto_vir_occupations = nto.nto_vir_occupations;
+
+    std::cout << std::setprecision(10) << std::fixed
+              << "  GANSU HF total = " << result.hf_total_energy
+              << "  n_act_occ=" << result.cis_nto_n_act_occ
+              << "  n_act_vir=" << result.cis_nto_n_act_vir;
+    if (!result.cis_nto_occ_occupations.empty()) {
+        std::cout << "  occ[0]=" << result.cis_nto_occ_occupations[0];
+    }
+    std::cout << std::endl;
+    return result;
+}
+
+// STEOM.md §16 named P0 gate: pyridine n→π* gives an active space that
+// matches PySCF cart=True (cc-pVDZ, 8 CIS roots). The nitrogen lone pair
+// is one of the dominant occupied NTOs (top-3 occupation > 0.2).
+TEST(ValidationCIS_NTO, Pyridine_ccpVDZ) {
+    auto r = run_gansu_cis_nto(XYZ + "pyridine.xyz", BASIS + "cc-pvdz.gbs", 4);
+    // PySCF reference (cart=True, 8 roots, ORCA OThresh/VThresh=1e-3):
+    //   n_act_occ=10/21, n_act_vir=12/94, top occ NTOs = 0.3889/0.3471/0.2385
+    EXPECT_EQ(r.cis_nto_n_act_occ, 10);
+    EXPECT_EQ(r.cis_nto_n_act_vir, 12);
+    EXPECT_NEAR(r.cis_nto_trace_occ, 1.0, 1e-6);
+    EXPECT_NEAR(r.cis_nto_trace_vir, 1.0, 1e-6);
+    ASSERT_GE(r.cis_nto_occ_occupations.size(), 3u);
+    // Top-3 NTO occupations dominate (n + 2 π NTOs).  Tolerance 0.02 is loose
+    // enough to absorb Davidson convergence noise (~1e-5 at conv 1e-6) and
+    // basis-set rounding, but tight enough to fail on any major regression.
+    EXPECT_NEAR(r.cis_nto_occ_occupations[0], 0.3889, 0.02);
+    EXPECT_NEAR(r.cis_nto_occ_occupations[1], 0.3471, 0.02);
+    EXPECT_NEAR(r.cis_nto_occ_occupations[2], 0.2385, 0.02);
+}
+
+// Day 4b: RI CIS NTO path on pyridine. The RI approximation introduces
+// small (~1e-3) numerical noise in CIS amplitudes but must preserve the
+// active-space partition exactly so P1 RI-IP-EOM consumes the same set.
+TEST(ValidationCIS_NTO, Pyridine_ccpVDZ_RI) {
+    auto r = run_gansu_cis_nto(XYZ + "pyridine.xyz", BASIS + "cc-pvdz.gbs", 4,
+                                "ri", AUX_BASIS + "cc-pvdz-rifit.gbs");
+    // RI must agree with stored on active partition (this is the P1 contract:
+    // both paths produce the same active orbital set).
+    EXPECT_EQ(r.cis_nto_n_act_occ, 10);
+    EXPECT_EQ(r.cis_nto_n_act_vir, 12);
+    EXPECT_NEAR(r.cis_nto_trace_occ, 1.0, 1e-6);
+    EXPECT_NEAR(r.cis_nto_trace_vir, 1.0, 1e-6);
+    ASSERT_GE(r.cis_nto_occ_occupations.size(), 3u);
+    // Loose tolerance 0.03 absorbs the RI fitting error on top of Davidson noise.
+    EXPECT_NEAR(r.cis_nto_occ_occupations[0], 0.3889, 0.03);
+    EXPECT_NEAR(r.cis_nto_occ_occupations[1], 0.3471, 0.03);
+    EXPECT_NEAR(r.cis_nto_occ_occupations[2], 0.2385, 0.03);
 }
 
 TEST(ValidationCIS, H2_STO3G) {

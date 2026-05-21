@@ -307,6 +307,16 @@ void RHF::post_process_after_scf() {
         post_hf_energy_ = eri_method_->compute_dlpno_ccsd();
     }else if(post_hf_method == PostHFMethod::DLPNO_CCSD_T){
         post_hf_energy_ = eri_method_->compute_dlpno_ccsd_t();
+    }else if(post_hf_method == PostHFMethod::CIS_NTO){
+        int n_cis = get_cis_nto_n_root_cis();
+        if (n_cis <= 0) n_cis = get_n_excited_states() + 4;  // STEOM.md §7.3 default
+        eri_method_->compute_cis_nto(n_cis);
+    }else if(post_hf_method == PostHFMethod::IP_EOM_CCSD){
+        eri_method_->compute_ip_eom_ccsd(get_n_excited_states());
+    }else if(post_hf_method == PostHFMethod::EA_EOM_CCSD){
+        eri_method_->compute_ea_eom_ccsd(get_n_excited_states());
+    }else if(post_hf_method == PostHFMethod::STEOM_CCSD){
+        eri_method_->compute_steom_ccsd(get_n_excited_states());
     }else{
         THROW_EXCEPTION("Invalid post-HF method.");
     }
@@ -1092,6 +1102,10 @@ void RHF::report() {
             case PostHFMethod::DLPNO_MP2:     method_name = "DLPNO-MP2"; break;
             case PostHFMethod::DLPNO_CCSD:    method_name = "DLPNO-CCSD"; break;
             case PostHFMethod::DLPNO_CCSD_T:  method_name = "DLPNO-CCSD(T)"; break;
+            case PostHFMethod::CIS_NTO:       method_name = "CIS NTO active space (bt-PNO-STEOM P0)"; break;
+            case PostHFMethod::IP_EOM_CCSD:   method_name = "IP-EOM-CCSD (bt-PNO-STEOM P1)"; break;
+            case PostHFMethod::EA_EOM_CCSD:   method_name = "EA-EOM-CCSD (bt-PNO-STEOM P2)"; break;
+            case PostHFMethod::STEOM_CCSD:    method_name = "STEOM-CCSD (bt-PNO-STEOM P3)"; break;
             case PostHFMethod::None:          method_name = "(none)"; break;
         }
         std::cout << "Post-HF method: " << method_name << std::endl;

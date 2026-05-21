@@ -313,6 +313,41 @@ public:
         THROW_EXCEPTION("EOM-CCSD computation is not supported for the selected ERI method.");
     }
 
+    /**
+     * @brief Compute state-averaged CIS NTO active space (bt-PNO-STEOM Phase P0)
+     * @param n_states_cis Number of CIS roots used to build the state-averaged density
+     */
+    virtual void compute_cis_nto(int /*n_states_cis*/){
+        THROW_EXCEPTION("CIS NTO active space is not supported for the selected ERI method.");
+    }
+
+    /**
+     * @brief Compute IP-EOM-CCSD (bt-PNO-STEOM Phase P1, building block for ̂S^IP)
+     * @param n_states Number of IP roots to extract from Davidson
+     */
+    virtual void compute_ip_eom_ccsd(int /*n_states*/){
+        THROW_EXCEPTION("IP-EOM-CCSD is not supported for the selected ERI method.");
+    }
+
+    /**
+     * @brief Compute EA-EOM-CCSD (bt-PNO-STEOM Phase P2, building block for ̂S^EA)
+     * @param n_states Number of EA roots to extract from Davidson
+     */
+    virtual void compute_ea_eom_ccsd(int /*n_states*/){
+        THROW_EXCEPTION("EA-EOM-CCSD is not supported for the selected ERI method.");
+    }
+
+    /**
+     * @brief Compute canonical STEOM-CCSD (bt-PNO-STEOM Phase P3)
+     * @param n_states Number of excited states to extract from Davidson
+     *
+     * The driver auto-runs CIS_NTO + IP-EOM + EA-EOM as prerequisites if the
+     * corresponding result fields on HF are empty.
+     */
+    virtual void compute_steom_ccsd(int /*n_states*/){
+        THROW_EXCEPTION("STEOM-CCSD is not supported for the selected ERI method.");
+    }
+
 };
 
 /**
@@ -365,6 +400,10 @@ public:
             || method == PostHFMethod::THC_MP2 // Tensor Hypercontraction MP2
             || method == PostHFMethod::THC_SOS_MP2 // THC + Laplace SOS-MP2
             || method == PostHFMethod::THC_SOS_ADC2 // THC SOS-ADC(2) excited states
+            || method == PostHFMethod::CIS_NTO // bt-PNO-STEOM P0: state-averaged CIS NTO active space
+            || method == PostHFMethod::IP_EOM_CCSD // bt-PNO-STEOM P1: IP-EOM-CCSD canonical
+            || method == PostHFMethod::EA_EOM_CCSD // bt-PNO-STEOM P2: EA-EOM-CCSD canonical
+            || method == PostHFMethod::STEOM_CCSD  // bt-PNO-STEOM P3: STEOM-CCSD (auto-runs P0/P1/P2)
           ){
             return true;
         }
@@ -489,6 +528,7 @@ public:
          || method == PostHFMethod::DLPNO_MP2
          || method == PostHFMethod::DLPNO_CCSD
          || method == PostHFMethod::DLPNO_CCSD_T
+         || method == PostHFMethod::CIS_NTO  // bt-PNO-STEOM P0 (RI-CIS path)
           ){
             return true;
         }

@@ -100,7 +100,15 @@ set(EIGEN_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(eigen)
 
-# BLAS (optional): Eigen uses it automatically for DGEMM etc. if available
+# BLAS (optional): Eigen uses it automatically for DGEMM etc. if available.
+# NOTE: large CPU-side dense GEMMs (e.g. the (T) B contraction) rely on a
+# multi-threaded BLAS here — disabling EIGEN_USE_BLAS makes Eigen fall back to
+# its (effectively unvectorized through nvcc) built-in GEMM and is far too
+# slow. Keep EIGEN_USE_BLAS ON. The OpenBLAS 128-thread per-caller buffer
+# crash seen in DLPNO-CCSD(T) on >128-core machines is handled in the code by
+# capping the DLPNO per-pair CPU loops to dlpno_cpu_threads (default
+# min(cores,64)) via OmpThreadCapGuard, keeping the OpenBLAS caller count
+# bounded — not by changing this define.
 find_package(BLAS QUIET)
 if(BLAS_FOUND)
     message(STATUS "BLAS found: ${BLAS_LIBRARIES}")
@@ -196,6 +204,15 @@ set(SOURCES
     src/cis_operator.cu
     src/cis_operator_ri.cu
     src/cis_operator_jk.cu
+    src/cis_nto_active_space.cu
+    src/ip_eom_ccsd_operator.cu
+    src/eri_stored_ip_eom_ccsd.cu
+    src/ip_eom_routing.cpp
+    src/ea_eom_ccsd_operator.cu
+    src/eri_stored_ea_eom_ccsd.cu
+    src/ea_eom_routing.cpp
+    src/steom_ccsd_operator.cu
+    src/eri_stored_steom_ccsd.cu
     src/hash_half_transform.cu
     src/half_transform_mp3.cu
     src/eri_ri_hash.cu

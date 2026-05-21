@@ -1,0 +1,222 @@
+/*
+ * GANSU: GPU Accelerated Numerical Simulation Utility
+ *
+ * Copyright (c) 2025-2026, Hiroshima University and Fujitsu Limited
+ * All rights reserved.
+ *
+ * This software is licensed under the BSD 3-Clause License.
+ * You may obtain a copy of the license in the LICENSE file
+ * located in the root directory of this source tree or at:
+ * https://opensource.org/licenses/BSD-3-Clause
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+/**
+ * @file steom_ccsd_operator.hpp
+ * @brief STEOM-CCSD effective Hamiltonian linear operator for Davidson
+ *        (bt-PNO-STEOM Phase P3).
+ *
+ * The G^{1h1p} matvec acts on a singles excitation vector R[i,a] with
+ *   total_dim = nocc_active * nvir
+ * (= ordinary CIS dimension).
+ *
+ * Sub-phase progression:
+ *   3.0+3.1: LinearOperator scaffolding + diagonal-only apply().
+ *   3.2:     bar-H rebuild (11 intermediates union of IP+EA).
+ *   3.3a:    Ŝ amplitude intermediate normalization (R2/(U·R1) single-divide).
+ *   3.4:     F^eff_oo dressing per CFOUR `gmi_steom_rhf` —
+ *              ・raw R2_IP / R2_EA + R1_IP / R1_EA + active MO indices on input
+ *              ・X(MI) matrix = inverse of active R1 (n_act_occ × n_act_occ)
+ *              ・U(M,I) = +2 Fov·R2 − Fov·R2 − 2 Wooov·R2 + Wooov·R2
+ *              ・F^eff_oo[M_active, I] = Loo[M_idx, I] − Σ_N U(N,I) · X(N,M)
+ *              ・inactive rows of F^eff_oo = bar Loo (no dressing)
+ *
+ * Full Ŝ-dressed bar-H build + G^{1h1p} matvec lands in sub-phases 3.5-3.7.
+ *
+ * IMPORTANT design note:
+ *   Starting sub-phase 3.4 the constructor takes the **RAW** R2 amplitudes
+ *   (NOT the single-divide-normalised Ŝ used in 3.3a). The X(MI) / X(EA)
+ *   matrix inverses are built internally and stored on device. Caller passes
+ *   R1, R2, and the active MO index map; ownership is by COPY into
+ *   device-owned storage (caller may free source vectors after construction).
+ */
+
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include "linear_operator.hpp"
+#include "types.hpp"
+
+namespace gansu {
+
+class STEOMCCSDOperator : public LinearOperator {
+public:
+    /**
+     * @brief Construct the STEOM-CCSD G^{1h1p} operator.
+     *
+     * @param d_eri_mo              Device pointer to active-space MO ERIs [nao_active^4]
+     *                              (chemist notation). May be nullptr — in that case
+     *                              bar-H intermediates / F^eff_oo are not built and apply()
+     *                              falls back to the sub-phase 3.0+3.1 diagonal-only stub
+     *                              (used by unit tests).
+     * @param d_orbital_energies    Device pointer to active-space orbital energies [nao_active].
+     * @param d_t1                  Device pointer to CCSD T1 [nocc_active * nvir]
+     *                              (ownership transferred). May be nullptr if d_eri_mo is nullptr.
+     * @param d_t2                  Device pointer to CCSD T2 [nocc_active² * nvir²]
+     *                              (ownership transferred). May be nullptr if d_eri_mo is nullptr.
+     * @param h_R2_IP_amplitudes    Host pointer to RAW R2_IP amplitudes (no Ŝ normalization)
+     *                              concatenated [n_act_occ * (nocc_active² * nvir)] with
+     *                              stride (((ã*nocc_active + i)*nocc_active + j)*nvir + a).
+     *                              Caller retains ownership.
+     * @param h_R2_EA_amplitudes    Host pointer to RAW R2_EA amplitudes
+     *                              [n_act_vir * (nocc_active * nvir²)] with stride
+     *                              (((ẽ*nocc_active + j)*nvir + a)*nvir + b).
+     * @param h_R1_IP_amplitudes    Host pointer to R1_IP amplitudes [n_act_occ * nocc_active]
+     *                              with stride (ã*nocc_active + i). Used to build X(MI).
+     *                              May be nullptr only if d_eri_mo is nullptr.
+     * @param h_R1_EA_amplitudes    Host pointer to R1_EA amplitudes [n_act_vir * nvir]
+     *                              with stride (ẽ*nvir + a). Used to build X(EA).
+     * @param h_active_occ_idx      Host pointer to active occupied MO indices [n_act_occ]
+     *                              (each entry is in [0, nocc_active)). Identifies which
+     *                              MO each active NTO maps to. May be nullptr if d_eri_mo
+     *                              is nullptr.
+     * @param h_active_vir_idx      Host pointer to active virtual MO indices [n_act_vir]
+     *                              (each entry is in [0, nvir)). May be nullptr if d_eri_mo
+     *                              is nullptr.
+     * @param nocc_active           Active-occupied count (= full_occ - num_frozen).
+     * @param nvir                  Virtual count.
+     * @param nao_active            Active-basis count (= nocc_active + nvir).
+     * @param n_act_occ             Number of active occupied NTOs (== number of IP roots used).
+     * @param n_act_vir             Number of active virtual NTOs (== number of EA roots used).
+     */
+    STEOMCCSDOperator(const real_t* d_eri_mo,
+                      const real_t* d_orbital_energies,
+                      real_t* d_t1, real_t* d_t2,
+                      const real_t* h_R2_IP_amplitudes,
+                      const real_t* h_R2_EA_amplitudes,
+                      const real_t* h_R1_IP_amplitudes,
+                      const real_t* h_R1_EA_amplitudes,
+                      const int* h_active_occ_idx,
+                      const int* h_active_vir_idx,
+                      int nocc_active, int nvir, int nao_active,
+                      int n_act_occ, int n_act_vir);
+
+    ~STEOMCCSDOperator();
+
+    STEOMCCSDOperator(const STEOMCCSDOperator&) = delete;
+    STEOMCCSDOperator& operator=(const STEOMCCSDOperator&) = delete;
+
+    // --- LinearOperator interface ---
+    void apply(const real_t* d_input, real_t* d_output) const override;
+    void apply_preconditioner(const real_t* d_input, real_t* d_output) const override;
+    const real_t* get_diagonal_device() const override { return d_diagonal_; }
+    int dimension() const override { return total_dim_; }
+    std::string name() const override { return "STEOMCCSDOperator"; }
+
+    // --- Accessors ---
+    int get_nocc_active() const { return nocc_active_; }
+    int get_nvir()        const { return nvir_; }
+    int get_n_act_occ()   const { return n_act_occ_; }
+    int get_n_act_vir()   const { return n_act_vir_; }
+    int get_dim()         const { return total_dim_; }  // = nocc_active * nvir
+
+    /// Print Ŝ amplitude Frobenius norms (sub-phase 3.0+3.1 smoke check).
+    void print_amplitude_norms(std::ostream& os) const;
+
+private:
+    int nocc_active_;
+    int nvir_;
+    int nao_active_;
+    int n_act_occ_;
+    int n_act_vir_;
+    int total_dim_;
+
+    // === Active NTO ↔ MO index maps (host-side, copied in constructor) ===
+    std::vector<int> active_occ_idx_;   // [n_act_occ]   (each ∈ [0, nocc_active))
+    std::vector<int> active_vir_idx_;   // [n_act_vir]   (each ∈ [0, nvir))
+
+    // === Raw R1 / R2 amplitudes (device-owned, copied from host inputs) ===
+    // Sub-phase 3.4: store RAW R2 (no single-divide Ŝ normalization). The
+    // X(MI) / X(EA) matrices built below provide the matrix-inverse form
+    // of the active-NTO normalization, matching CFOUR's `renormalize`.
+    real_t* d_R2_IP_ = nullptr;   // [n_act_occ · nocc_active² · nvir]
+    real_t* d_R2_EA_ = nullptr;   // [n_act_vir · nocc_active · nvir²]
+    real_t* d_R1_IP_ = nullptr;   // [n_act_occ · nocc_active]
+    real_t* d_R1_EA_ = nullptr;   // [n_act_vir · nvir]
+
+    // === X matrices = active R1 inverse (n_act_* × n_act_*) ============
+    // CFOUR `renormalize`: X_IP = inverse of R1_active[m_NTO, n_root] where
+    // R1_active[m_NTO, n_root] = R1_IP^(n_root)[active_occ_idx[m_NTO]].
+    real_t* d_X_IP_ = nullptr;    // [n_act_occ × n_act_occ] (row-major)
+    real_t* d_X_EA_ = nullptr;    // [n_act_vir × n_act_vir] (row-major)
+
+    // === F^eff_oo / F^eff_vv (full nvir²/nocc² with active rows dressed) ===
+    real_t* d_F_eff_oo_ = nullptr;   // [nocc_active × nocc_active]
+    real_t* d_U_MI_     = nullptr;   // [n_act_occ × nocc_active]  (IP intermediate)
+    real_t* d_F_eff_vv_ = nullptr;   // [nvir × nvir]
+    real_t* d_U_EA_     = nullptr;   // [n_act_vir × nvir]         (EA intermediate)
+
+    // === CCSD amplitudes (owned — freed in destructor) ===
+    real_t* d_t1_ = nullptr;   // [nocc_active * nvir]
+    real_t* d_t2_ = nullptr;   // [nocc_active² * nvir²]
+
+    // === MO ERI blocks (union of IP + EA needs: 7 blocks) ===
+    // Built by sub-phase 3.2 `extract_eri_blocks`.
+    real_t* d_eri_oooo_ = nullptr;
+    real_t* d_eri_ooov_ = nullptr;
+    real_t* d_eri_oovv_ = nullptr;
+    real_t* d_eri_ovov_ = nullptr;
+    real_t* d_eri_ovvo_ = nullptr;
+    real_t* d_eri_ovvv_ = nullptr;
+    real_t* d_eri_vvvv_ = nullptr;
+
+    // === Dressed bar-H intermediates (union of IP + EA, PySCF rintermediates.py
+    //  definitions; 11 distinct quantities). Built in 3.2; used by 3.3-3.7
+    //  Ŝ-dressing + G^{1h1p} matvec.
+    real_t* d_Loo_    = nullptr;
+    real_t* d_Lvv_    = nullptr;
+    real_t* d_Fov_    = nullptr;
+    // IP-side intermediates (also used by STEOM bar-H, even if EA matvec didn't need them)
+    real_t* d_Woooo_  = nullptr;
+    real_t* d_Wooov_  = nullptr;
+    real_t* d_Wovov_  = nullptr;
+    real_t* d_Wovvo_  = nullptr;
+    real_t* d_Wovoo_  = nullptr;
+    // EA-side intermediates
+    real_t* d_Wvovv_  = nullptr;
+    real_t* d_Wvvvv_  = nullptr;
+    real_t* d_Wvvvo_  = nullptr;
+
+    // === Fock diagonals (for bar-H build) ===
+    real_t* d_f_oo_  = nullptr;  // [nocc_active]
+    real_t* d_f_vv_  = nullptr;  // [nvir]
+
+    // === Diagonal (stub for sub-phase 3.0+3.1, replaced in 3.7) ===
+    real_t* d_diagonal_ = nullptr;  // [total_dim]
+    real_t* d_eps_occ_  = nullptr;  // [nocc_active]
+    real_t* d_eps_vir_  = nullptr;  // [nvir]
+
+    void build_diagonal(const real_t* d_orbital_energies);
+    void extract_eri_blocks(const real_t* d_eri_mo);
+    void build_dressed_intermediates();
+
+    /// Sub-phase 3.4: build X(MI) and X(EA) on host then upload to device.
+    /// Done with hand-rolled Gauss-Jordan since n_act_* is tiny (≤ ~20).
+    void build_x_matrices(const real_t* h_R1_IP_amplitudes,
+                          const real_t* h_R1_EA_amplitudes);
+
+    /// Sub-phase 3.4: build U(M,I) and F^eff_oo per CFOUR `gmi_steom_rhf`.
+    /// Requires bar-H intermediates + R2_IP + X(MI) already built.
+    void build_F_eff_oo();
+
+    /// Sub-phase 3.4 (extended): build U(E,A) and F^eff_vv per CFOUR
+    /// `gea_steom_rhf`. Symmetric to F^eff_oo with PySCF EA-EOM σ1[a] form:
+    ///   U(E,A) = +2 Fov·R2 − Fov·R2 + 2 Wvovv·R2 − Wvovv·R2
+    ///   F^eff_vv[A_idx, A] = Lvv[A_idx, A] + Σ_F U(F,A) · X(F,E_NTO)
+    void build_F_eff_vv();
+};
+
+} // namespace gansu
