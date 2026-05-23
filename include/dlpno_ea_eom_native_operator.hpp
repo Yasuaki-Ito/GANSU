@@ -141,18 +141,61 @@ private:
     // d_r2c_all_ vs device 0, ≤1e-11) under GANSU_DLPNO_NATIVE_GPU_MULTI_VALIDATE.
     // The slab σ2 split + peer gather land in Stage 5c. Mirrors the IP operator.
     bool use_gpu_multi_ = false;       ///< broadcast + per-device lift wired (num_gpus_>1)
-    bool multi_selfcheck_ = false;     ///< per-device d_r2c_all_ vs device 0 diff each matvec
+    bool multi_selfcheck_ = false;     ///< gathered σ vs full device-0 host reference (first matvecs)
+    // Cap the 5c self-check at the first few matvecs (the per-matvec host recompute is
+    // ruinous at scale — it's exactly the host path multi-GPU avoids). Keeps
+    // GANSU_DLPNO_NATIVE_GPU_MULTI_VALIDATE usable for large-system timing. Mirrors IP.
+    mutable int multi_check_done_ = 0;
+    static constexpr int kMultiCheckMax = 3;
+    // Stage 5c: each device d holds a FULL replica of every σ2 device buffer (constants
+    // peer-copied from device 0, scratch freshly allocated) + a cublas handle, so the
+    // validated σ2 helper chain runs unchanged on device d after bind_device(d). ws_[0]
+    // aliases the device-0 members so bind_device(0) is an exact restore. Mirrors IP.
     struct DeviceWorkspace {
-        int     device    = -1;        ///< CUDA device id (ws_[0].device stays -1; device 0 uses members)
-        real_t* d_input   = nullptr;   ///< [total_dim] broadcast copy of the matvec input
-        real_t* d_U_pack  = nullptr;   ///< [u_pno_off_.back()] replica of d_U_pack_
-        real_t* d_lift_T  = nullptr;   ///< [nvir·max_n_pno] replica of d_lift_T_ (chained-GEMM scratch)
-        real_t* d_r2c_all = nullptr;   ///< [nocc·nvir²] per-device lifted source r2c
+        int     device    = -1;        ///< CUDA device id (ws_[0].device = 0, aliases members)
+        void*   cublas     = nullptr;  ///< cublasHandle_t for this device (device 0 = cublas_)
+        real_t* d_input    = nullptr;  ///< [total_dim] broadcast copy of the matvec input (d>0)
+        real_t* d_r2c_all  = nullptr;  ///< [nocc·nvir²] per-device lifted source r2c
+        real_t* d_lift_T   = nullptr;  ///< [nvir·max_n_pno] lift chained-GEMM scratch
+        real_t* d_acc_all  = nullptr;  ///< [nocc·nvir²] acc stack scratch
+        real_t* d_sig_pack = nullptr;  ///< [total_dim-nvir] σ2 output scratch
+        real_t* d_T1       = nullptr;  ///< [nvir·max_n_pno] projection chained-GEMM scratch
+        real_t* d_r2c_sym_re = nullptr;///< [nvir·nocc·nvir] T_tmp scratch
+        real_t* d_tmp      = nullptr;  ///< [nocc] T_tmp scratch
+        real_t* d_U_pack   = nullptr;
+        real_t* d_Wvvvv_pno_pack = nullptr;
+        size_t  wvvvv_shift = 0;       ///< 5e: subtract from wvvvv_pno_off_[j] for slab-only pack (0 = full)
+        real_t* d_Loo_xpair = nullptr;
+        real_t* d_Wovov_lmo = nullptr;
+        real_t* d_Wovvo_re = nullptr;
+        real_t* d_ovov_Llmo = nullptr;
+        real_t* d_t2_Jlmo  = nullptr;
+        real_t* d_Lvv      = nullptr;
+        real_t* d_Wvvvo_r1 = nullptr;
     };
-    std::vector<DeviceWorkspace> ws_;  ///< size = #devices used (entries d>0 hold replicas)
-    /// Stage 5b: broadcast d_input to every d>0, lift each device's own d_r2c_all_,
-    /// and (under multi_selfcheck_) compare it against device 0. The device-0 matvec
-    /// output is unaffected — this only proves the broadcast + per-device residency.
+    std::vector<DeviceWorkspace> ws_;  ///< size = #devices used (ws_[0] aliases device 0)
+    std::vector<int> occ_begin_;       ///< [#dev] output-occ slab start per device
+    std::vector<int> occ_end_;         ///< [#dev] output-occ slab end (exclusive) per device
+    // Stage 5c-step2 (compute split): when use_gpu_multi_slab_, each device computes σ2
+    // ONLY for its output-occ slab. slab_active_ + cur_occ_* are set per device in
+    // apply_resident; the σ2 helpers read them (full [0,nocc_) when slab_active_ is
+    // false → single-GPU + step1 byte-unchanged). The global T_tmp stage-1 tmp[K]
+    // reduction stays full. The T_Loo stacked GEMM and T_tmp stage-2 GEMV (which write
+    // the whole acc in one call) restrict their output-occ column range to the slab.
+    // Default ON for multi; GANSU_DLPNO_NATIVE_GPU_MULTI_NOSLAB=1 forces step1.
+    bool use_gpu_multi_slab_ = false;
+    mutable bool slab_active_ = false;
+    mutable int  cur_occ_begin_ = 0;
+    mutable int  cur_occ_end_   = 0;
+    // 5e: output-indexed Wvvvv pack slab-only. d>0 in slab mode hold only their occ
+    // slab's n_pno⁴ packs; project_acc_stack reads d_Wvvvv_pno_pack_[wvvvv_pno_off_[j] -
+    // wvvvv_pack_shift_]. 0 on device 0 / full / single-GPU. Set per device in bind_device.
+    mutable size_t wvvvv_pack_shift_ = 0;
+    /// Stage 5c: point the (const_cast) σ2 members at device d's workspace buffers +
+    /// cublas handle (NULL stream); bind_device(0) restores the device-0 members.
+    void bind_device(int d) const;
+    /// Stage 5b legacy (kept for the num_gpus=1 byte path / standalone validation;
+    /// superseded by the 5c gathered-σ self-check).
     void lift_r2c_multi_validate(const real_t* d_input) const;
 
     // Borrowed canonical intermediates (host copies; bit-identical to ea_op).

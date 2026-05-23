@@ -162,7 +162,13 @@ private:
     // 0, ≤1e-11) under GANSU_DLPNO_NATIVE_GPU_MULTI_VALIDATE. The slab σ2 split +
     // peer gather land in Stage 5c. Mirrors the EA operator.
     bool use_gpu_multi_ = false;       ///< multi-GPU σ2 (broadcast + per-device build + gather)
-    bool multi_selfcheck_ = false;     ///< gathered σ vs full device-0 host reference each matvec
+    bool multi_selfcheck_ = false;     ///< gathered σ vs full device-0 host reference (first matvecs)
+    // The 5c self-check recomputes the full host σ each matvec — fine to prove the path,
+    // but ruinous as a per-matvec cost (the host path is exactly what multi-GPU avoids at
+    // scale). Cap it at the first few matvecs so GANSU_DLPNO_NATIVE_GPU_MULTI_VALIDATE
+    // stays usable for timing on large systems.
+    mutable int multi_check_done_ = 0;
+    static constexpr int kMultiCheckMax = 3;
     // Stage 5c: each device d holds a FULL replica of every σ2 device buffer (constants
     // peer-copied from device 0, scratch freshly allocated) plus a cublas handle, so the
     // validated σ2 helper chain can run unchanged on device d after bind_device(d) points
@@ -192,10 +198,27 @@ private:
         real_t* d_RP_oim   = nullptr;  ///< [nocc·max_n_pno] ph-ladder scratch
         real_t* d_RP_moi   = nullptr;
         real_t* d_RP_moj   = nullptr;
+        size_t  lvv_shift  = 0;        ///< 5e: subtract from lvv_pno_off_[idx] for slab-only Lvv pack (0=full)
+        size_t  wovvo_shift= 0;        ///< 5e: subtract from wovvo_off_[idx] for slab-only ph-ladder packs (0=full)
     };
     std::vector<DeviceWorkspace> ws_;  ///< size = #devices used (ws_[0] aliases device 0)
     std::vector<int> slot_begin_;      ///< [#dev] orientation-slot slab start per device
     std::vector<int> slot_end_;        ///< [#dev] orientation-slot slab end (exclusive) per device
+    // Stage 5c-step2 (compute split): when use_gpu_multi_slab_, each device computes σ2
+    // ONLY for its orientation-slot slab (no redundant full build). slab_active_ +
+    // cur_slot_* are set per device in apply_resident; the σ2 helpers read them (full
+    // [0,n_orient_) when slab_active_ is false → single-GPU + step1 byte-unchanged). The
+    // global T8a tmp_c reduction stays full on every device. Default ON for the multi
+    // path; GANSU_DLPNO_NATIVE_GPU_MULTI_NOSLAB=1 forces the step1 redundant build.
+    bool use_gpu_multi_slab_ = false;
+    mutable bool slab_active_ = false;
+    mutable int  cur_slot_begin_ = 0;
+    mutable int  cur_slot_end_   = 0;
+    // 5e: output-indexed pack slab-only. d>0 in slab mode hold only their slab's pairs'
+    // Lvv_pno (lvv_pno_off_) + ph-ladder (wovvo_off_) packs; the helpers index them as
+    // d_..._ + (off[idx] - shift). 0 on device 0 / full / single-GPU. Set in bind_device.
+    mutable size_t lvv_pack_shift_   = 0;
+    mutable size_t wovvo_pack_shift_ = 0;
     /// Stage 5c: point the (const_cast) σ2 members at device d's workspace buffers +
     /// cublas handle (NULL stream) so the validated helper chain runs on device d.
     /// bind_device(0) restores the device-0 members. resident_/d_r2_src_/d_r1_src_ are

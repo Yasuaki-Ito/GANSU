@@ -974,8 +974,11 @@ private:
     real_t compute_ccsd_energy() override;
     real_t compute_ccsd_t_energy() override;
     real_t compute_fci_energy() override;
+
+protected:  // CIS core reused (with full-B gather) by ERI_RI_Distributed_RHF.
     void compute_cis(int n_states) override;
     void compute_cis_nto(int n_states_cis) override;
+private:
     void compute_ip_eom_ccsd(int n_states) override;   // bt-PNO-STEOM P4 (RI path)
     void compute_ea_eom_ccsd(int n_states) override;   // bt-PNO-STEOM P4 (RI path)
     void compute_steom_ccsd(int n_states) override;    // bt-PNO-STEOM P4 (RI path, auto-runs P0/P1/P2)
@@ -1059,6 +1062,10 @@ private:
 
 protected:
     RHF& rhf_; ///< RHF
+    /// CIS multi-GPU hook: when non-null, compute_cis_ri_impl reads the full B from
+    /// here (gathered on device 0 by ERI_RI_Distributed_RHF::compute_cis[_nto]) instead
+    /// of intermediate_matrix_B_, and skips the single-GPU "full B not allocated" guard.
+    const real_t* cis_B_override_ = nullptr;
 };
 
 #ifdef GANSU_MULTI_GPU
@@ -1191,7 +1198,16 @@ public:
     const std::vector<int>& get_naux_local() const { return naux_local_; }
     const std::vector<real_t*>& get_d_B_local() const { return d_B_local_; }
 
+    /// Multi-GPU RI CIS / CIS-NTO: gather the aux-partitioned d_B_local_ slabs into a
+    /// full B[naux × nao²] on device 0, point cis_B_override_ at it, run the base
+    /// single-GPU CIS core, then free. Unblocks bt-PNO-STEOM stage 2 under --num_gpus>1.
+    void compute_cis(int n_states) override;
+    void compute_cis_nto(int n_states_cis) override;
+
 private:
+    /// Allocate full B[naux × nao²] on device 0 and peer-gather every d_B_local_ slab
+    /// into its aux range (contiguous ascending partition). Caller frees the result.
+    real_t* gather_full_B_device0() const;
     int num_gpus_;
     std::vector<int> naux_local_;
     std::vector<size_t> P_start_;

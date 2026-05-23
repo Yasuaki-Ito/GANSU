@@ -299,8 +299,11 @@ void ERI_RI_RHF::compute_cis_ri_impl(int n_states, std::vector<real_t>* out_eige
     // collapses CIS to the diagonal Hamiltonian (max|r| ≈ 1e-16 after a
     // single Davidson iteration, with excitation energies equal to orbital
     // energy differences).  Fail loudly instead.
-    if (intermediate_matrix_B_.rows() == 0 || intermediate_matrix_B_.cols() == 0 ||
-        intermediate_matrix_B_.device_ptr() == nullptr) {
+    // cis_B_override_ (set by ERI_RI_Distributed_RHF::compute_cis[_nto]) supplies the
+    // full B gathered on device 0; the guard then no longer applies.
+    if (cis_B_override_ == nullptr &&
+        (intermediate_matrix_B_.rows() == 0 || intermediate_matrix_B_.cols() == 0 ||
+         intermediate_matrix_B_.device_ptr() == nullptr)) {
         throw std::runtime_error(
             "ERI_RI_RHF::compute_cis: the full B matrix is not allocated on the "
             "current device. This typically means GANSU is running with "
@@ -330,8 +333,9 @@ void ERI_RI_RHF::compute_cis_ri_impl(int n_states, std::vector<real_t>* out_eige
         n_states = cis_dim;
     }
 
-    // Step 1: Build B_ov(Q,ia), B_oo(Q,ij), B_vv(Q,ab) from intermediate_matrix_B_
-    const real_t* d_B = intermediate_matrix_B_.device_ptr();  // (naux, nao*nao)
+    // Step 1: Build B_ov(Q,ia), B_oo(Q,ij), B_vv(Q,ab) from the full B. In distributed
+    // mode cis_B_override_ points at the device-0 gather; else the single-GPU member.
+    const real_t* d_B = cis_B_override_ ? cis_B_override_ : intermediate_matrix_B_.device_ptr();  // (naux, nao*nao)
     const real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
 
     // Transform B(Q,μν) → MO blocks via DGEMM

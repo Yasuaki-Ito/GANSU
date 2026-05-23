@@ -185,6 +185,9 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
         use_gpu_multi_ = use_gpu_resident_ && num_gpus_ > 1 && (env_multi && env_multi[0] == '1');
         const char* env_mv = std::getenv("GANSU_DLPNO_NATIVE_GPU_MULTI_VALIDATE");
         multi_selfcheck_ = use_gpu_multi_ && (env_mv && env_mv[0] == '1');
+        // Stage 5c-step2: actual compute split (default ON for multi); NOSLAB forces step1.
+        const char* env_noslab = std::getenv("GANSU_DLPNO_NATIVE_GPU_MULTI_NOSLAB");
+        use_gpu_multi_slab_ = use_gpu_multi_ && !(env_noslab && env_noslab[0] == '1');
 #ifdef GANSU_CPU_ONLY
         use_gpu_ = false; gpu_selfcheck_ = false; use_gpu_proj_ = false;
         use_gpu_lift_ = false; use_gpu_xpair_ = false;
@@ -192,7 +195,7 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
         use_gpu_tmp_ = false; use_gpu_tlvv_ = false; use_gpu_tr1_ = false;
         use_gpu_s1lvv_ = false; use_gpu_s1fov_ = false; use_gpu_s1wvovv_ = false;
         use_gpu_resident_ = false;
-        use_gpu_multi_ = false; multi_selfcheck_ = false;
+        use_gpu_multi_ = false; multi_selfcheck_ = false; use_gpu_multi_slab_ = false;
 #endif
     }
 
@@ -652,41 +655,110 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
         // per-device-lift validation in apply_resident. tracked_cudaMalloc allocates
         // on the current (DeviceGuard) device; cudaMemcpyPeer mirrors d_U_pack_ from
         // device 0. The allocation itself proves the per-device residency footprint fits.
+        // Stage 5c: full per-device σ2 workspace (mirror of IP). Each d>0 gets a
+        // complete replica of every σ2 device buffer (constants peer-copied, scratch
+        // allocated) + a cublas handle, so the validated σ2 helper chain runs unchanged
+        // on device d after bind_device(d). ws_[0] aliases the device-0 members. The
+        // output-occ slab partition (weight n_pno_ii²) assigns each device its gather
+        // range. Production (num_gpus=1) byte-unchanged.
         if (use_gpu_multi_) {
             auto& mgr = MultiGpuManager::instance();
             mgr.initialize(num_gpus_);
             const int nuse = std::min(num_gpus_, mgr.num_devices());
             if (nuse < 2) {
-                use_gpu_multi_ = false; multi_selfcheck_ = false;
+                use_gpu_multi_ = false; multi_selfcheck_ = false; use_gpu_multi_slab_ = false;
             } else {
                 ws_.resize(nuse);
-                const size_t r2c_len = static_cast<size_t>(nocc_) * nvir_ * nvir_;
-                const size_t utot = u_pno_off_.empty() ? 0 : u_pno_off_.back();
+                const size_t r2c_len  = static_cast<size_t>(nocc_) * nvir_ * nvir_;
                 const size_t lift_len = static_cast<size_t>(nvir_) * max_n_pno_;
+                const size_t plen     = static_cast<size_t>(total_dim_ - nvir_);
+                const size_t sym_len  = static_cast<size_t>(nvir_) * nocc_ * nvir_;
+                const size_t no2      = static_cast<size_t>(nocc_) * nocc_;
+                const size_t nv2      = static_cast<size_t>(nvir_) * nvir_;
+                const size_t ovov_len = static_cast<size_t>(nocc_) * nvir_ * nocc_ * nvir_;
+                const size_t oovv_len = no2 * nv2;
+                const size_t wvvvo_len= static_cast<size_t>(nocc_) * nvir_ * nvir_ * nvir_;
+                const size_t utot     = u_pno_off_.empty()     ? 0 : u_pno_off_.back();
+                const size_t wvvvv_tot= wvvvv_pno_off_.empty() ? 0 : wvvvv_pno_off_.back();
+                // Output-occ slab partition (contiguous, weight n_pno_ii²) — computed
+                // before the alloc loop so the 5e slab-only Wvvvv pack can size its range.
+                std::vector<double> wcum(nocc_ + 1, 0.0);
+                for (int j = 0; j < nocc_; ++j) {
+                    const double n = packing_.n_pno_ii[j];
+                    wcum[j + 1] = wcum[j] + n * n;
+                }
+                const double total = wcum[nocc_];
+                occ_begin_.assign(nuse, 0); occ_end_.assign(nuse, 0);
+                { int jb = 0;
+                  for (int d = 0; d < nuse; ++d) {
+                      occ_begin_[d] = jb;
+                      if (d == nuse - 1) jb = nocc_;
+                      else { const double tgt = total * (d + 1) / nuse;
+                             while (jb < nocc_ && wcum[jb + 1] < tgt) ++jb; }
+                      occ_end_[d] = jb;
+                  } }
+                // ws_[0] aliases the device-0 members.
+                ws_[0].device = 0;            ws_[0].cublas = cublas_;
+                ws_[0].d_input = nullptr;     ws_[0].d_r2c_all = d_r2c_all_;
+                ws_[0].d_lift_T = d_lift_T_;  ws_[0].d_acc_all = d_acc_all_;
+                ws_[0].d_sig_pack = d_sig_pack_; ws_[0].d_T1 = d_T1_;
+                ws_[0].d_r2c_sym_re = d_r2c_sym_re_; ws_[0].d_tmp = d_tmp_;
+                ws_[0].d_U_pack = d_U_pack_;  ws_[0].d_Wvvvv_pno_pack = d_Wvvvv_pno_pack_;
+                ws_[0].d_Loo_xpair = d_Loo_xpair_; ws_[0].d_Wovov_lmo = d_Wovov_lmo_;
+                ws_[0].d_Wovvo_re = d_Wovvo_re_;   ws_[0].d_ovov_Llmo = d_ovov_Llmo_;
+                ws_[0].d_t2_Jlmo = d_t2_Jlmo_;     ws_[0].d_Lvv = d_Lvv_;
+                ws_[0].d_Wvvvo_r1 = d_Wvvvo_r1_;
+                ws_[0].wvvvv_shift = 0;   // device 0 holds the full Wvvvv pack
+                // d>0 replicas.
                 for (int d = 1; d < nuse; ++d) {
                     MultiGpuManager::DeviceGuard guard(d);
-                    ws_[d].device = d;
-                    tracked_cudaMalloc(&ws_[d].d_input,
-                                       static_cast<size_t>(total_dim_) * sizeof(real_t));
-                    tracked_cudaMalloc(&ws_[d].d_r2c_all, r2c_len * sizeof(real_t));
-                    if (lift_len > 0)
-                        tracked_cudaMalloc(&ws_[d].d_lift_T, lift_len * sizeof(real_t));
-                    if (utot > 0) {
-                        tracked_cudaMalloc(&ws_[d].d_U_pack, utot * sizeof(real_t));
-                        cudaMemcpyPeer(ws_[d].d_U_pack, d, d_U_pack_, 0, utot * sizeof(real_t));
+                    DeviceWorkspace& w = ws_[d];
+                    w.device = d;  w.cublas = mgr.cublas(d);
+                    cublasSetStream(mgr.cublas(d), 0);  // NULL stream → match device-0 ordering
+                    auto scr = [&](real_t** p, size_t n) {
+                        if (n) tracked_cudaMalloc(p, n * sizeof(real_t)); };
+                    auto cpy = [&](real_t** p, const real_t* src, size_t n) {
+                        if (n && src) { tracked_cudaMalloc(p, n * sizeof(real_t));
+                                        cudaMemcpyPeer(*p, d, src, 0, n * sizeof(real_t)); } };
+                    scr(&w.d_input, static_cast<size_t>(total_dim_));
+                    scr(&w.d_r2c_all, r2c_len);  scr(&w.d_lift_T, lift_len);
+                    scr(&w.d_acc_all, r2c_len);  scr(&w.d_sig_pack, plen);
+                    scr(&w.d_T1, lift_len);      scr(&w.d_r2c_sym_re, sym_len);
+                    scr(&w.d_tmp, static_cast<size_t>(nocc_));
+                    cpy(&w.d_U_pack, d_U_pack_, utot);
+                    // 5e: Wvvvv pack slab-only in slab mode (occ-contiguous subrange);
+                    // else full replica. project_acc_stack uses w.wvvvv_shift to index it.
+                    if (use_gpu_multi_slab_ && wvvvv_tot > 0) {
+                        const size_t lo = wvvvv_pno_off_[occ_begin_[d]];
+                        const size_t hi = wvvvv_pno_off_[occ_end_[d]];
+                        w.wvvvv_shift = lo;
+                        if (hi > lo) {
+                            tracked_cudaMalloc(&w.d_Wvvvv_pno_pack, (hi - lo) * sizeof(real_t));
+                            cudaMemcpyPeer(w.d_Wvvvv_pno_pack, d, d_Wvvvv_pno_pack_ + lo, 0,
+                                           (hi - lo) * sizeof(real_t));
+                        }
+                    } else {
+                        w.wvvvv_shift = 0;
+                        cpy(&w.d_Wvvvv_pno_pack, d_Wvvvv_pno_pack_, wvvvv_tot);
                     }
+                    cpy(&w.d_Loo_xpair, d_Loo_xpair_, no2);
+                    cpy(&w.d_Wovov_lmo, d_Wovov_lmo_, ovov_len);
+                    cpy(&w.d_Wovvo_re, d_Wovvo_re_, ovov_len);
+                    cpy(&w.d_ovov_Llmo, d_ovov_Llmo_, ovov_len);
+                    cpy(&w.d_t2_Jlmo, d_t2_Jlmo_, oovv_len);
+                    cpy(&w.d_Lvv, d_Lvv_, nv2);
+                    cpy(&w.d_Wvvvo_r1, d_Wvvvo_r1_, wvvvo_len);
                 }
             }
         }
         if (num_gpus_ > 1)
             std::cout << "[bt-PNO Stage 5] DLPNOEAEOMNativeOperator: num_gpus=" << num_gpus_
                       << (use_gpu_multi_
-                            ? " (Stage 5b: broadcast d_input + per-device lift active; "
-                              "σ1/σ2 + output still on device 0 — slab σ2 split + peer "
-                              "gather land in 5c; GANSU_DLPNO_NATIVE_GPU_MULTI=1)"
+                            ? " (Stage 5c: per-device σ2 build (full replica) + disjoint "
+                              "peer gather; σ1 on device 0; GANSU_DLPNO_NATIVE_GPU_MULTI=1)"
                             : " (multi-GPU scaffolding; matvec single-device — set "
                               "GANSU_DLPNO_NATIVE_GPU_MULTI=1 with full residency to "
-                              "exercise Stage 5b)")
+                              "exercise Stage 5c)")
                       << std::endl;
     } else {
         use_gpu_ = false; gpu_selfcheck_ = false; use_gpu_proj_ = false;
@@ -725,14 +797,16 @@ DLPNOEAEOMNativeOperator::~DLPNOEAEOMNativeOperator() {
     if (d_Wvovv_)          tracked_cudaFree(d_Wvovv_);
     if (d_sigma1_)         tracked_cudaFree(d_sigma1_);
     if (d_r2c_sym_lcd_)    tracked_cudaFree(d_r2c_sym_lcd_);
-    // Stage 5b: free the per-device lift workspace (each on its own device).
+    // Stage 5c: free the per-device σ2 replicas (d>0 only; ws_[0] aliases the device-0
+    // members freed above, so skip it to avoid a double free).
     for (auto& w : ws_) {
-        if (w.device < 0) continue;
+        if (w.device <= 0) continue;
         MultiGpuManager::DeviceGuard guard(w.device);
-        if (w.d_input)   tracked_cudaFree(w.d_input);
-        if (w.d_U_pack)  tracked_cudaFree(w.d_U_pack);
-        if (w.d_lift_T)  tracked_cudaFree(w.d_lift_T);
-        if (w.d_r2c_all) tracked_cudaFree(w.d_r2c_all);
+        for (real_t* p : {w.d_input, w.d_r2c_all, w.d_lift_T, w.d_acc_all, w.d_sig_pack,
+                          w.d_T1, w.d_r2c_sym_re, w.d_tmp, w.d_U_pack, w.d_Wvvvv_pno_pack,
+                          w.d_Loo_xpair, w.d_Wovov_lmo, w.d_Wovvo_re, w.d_ovov_Llmo,
+                          w.d_t2_Jlmo, w.d_Lvv, w.d_Wvvvo_r1})
+            if (p) tracked_cudaFree(p);
     }
     if (cublas_) cublasDestroy(reinterpret_cast<cublasHandle_t>(cublas_));
 #endif
@@ -1155,7 +1229,9 @@ void DLPNOEAEOMNativeOperator::project_acc_stack_gpu(
     cudaMemset(d_sig_pack_, 0, plen * sizeof(real_t));
     const real_t one = 1.0, zero = 0.0;
     const int nv = nvir_;
-    for (int j = 0; j < nocc_; ++j) {
+    const int j_lo = slab_active_ ? cur_occ_begin_ : 0;        // Stage 5c-step2 slab
+    const int j_hi = slab_active_ ? cur_occ_end_   : nocc_;
+    for (int j = j_lo; j < j_hi; ++j) {
         const int n = packing_.n_pno_ii[j];
         if (n == 0) continue;
         const size_t off = static_cast<size_t>(packing_.off_i[j]) - nvir_;
@@ -1167,10 +1243,12 @@ void DLPNOEAEOMNativeOperator::project_acc_stack_gpu(
         // GEMM2: s2[n×n] = Uᵀ·T1 (β=0) → packed σ2 block.
         cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T, n, n, nv, &one,
                     d_T1_, n, U, n, &zero, d_sig_pack_ + off, n);
-        // T_vvvv (validated Stage 1): s2 += Wvvvv^(jj)·r2p (β=1).
+        // T_vvvv (validated Stage 1): s2 += Wvvvv^(jj)·r2p (β=1). 5e: subtract
+        // wvvvv_pack_shift_ so the slab-only per-device pack is indexed correctly
+        // (shift = 0 for device 0 / full / single-GPU → unchanged).
         const int M = n * n;
         cublasDgemv(cublas, CUBLAS_OP_T, M, M, &one,
-                    d_Wvvvv_pno_pack_ + wvvvv_pno_off_[j], M,
+                    d_Wvvvv_pno_pack_ + (wvvvv_pno_off_[j] - wvvvv_pack_shift_), M,
                     r2src + off, 1, &one,
                     d_sig_pack_ + off, 1);
     }
@@ -1204,10 +1282,16 @@ void DLPNOEAEOMNativeOperator::apply_xpair_projection_gpu(
     else
         cudaMemcpy(d_acc_all_, acc_all.data(), acclen * sizeof(real_t), cudaMemcpyHostToDevice);
     // T_Loo stacked GEMM: ACC[nocc × nvir²] += M_Loo[nocc×nocc] · R_stack[nocc × nvir²].
+    // Stage 5c-step2: restrict the output-occ columns [j_lo,j_hi) to the active slab
+    // (R_stack/k=nocc stays full — cross-pair reads all l). Off → all nocc columns.
     const real_t one = 1.0;
     const int nv2 = nvir_ * nvir_;
-    cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, nv2, nocc_, nocc_, &one,
-                d_r2c_all_, nv2, d_Loo_xpair_, nocc_, &one, d_acc_all_, nv2);
+    const int j_lo = slab_active_ ? cur_occ_begin_ : 0;
+    const int j_hi = slab_active_ ? cur_occ_end_   : nocc_;
+    if (j_hi > j_lo)
+        cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, nv2, j_hi - j_lo, nocc_, &one,
+                    d_r2c_all_, nv2, d_Loo_xpair_ + static_cast<size_t>(j_lo) * nocc_, nocc_,
+                    &one, d_acc_all_ + static_cast<size_t>(j_lo) * nv2, nv2);
     if (use_gpu_tlvv_) add_tlvv_gpu();
     if (use_gpu_tr1_)  add_tr1_gpu(r1);
     if (use_gpu_ph2_) add_tph2_gpu();
@@ -1230,7 +1314,9 @@ void DLPNOEAEOMNativeOperator::add_tph2_gpu() const {
     cublasHandle_t cublas = reinterpret_cast<cublasHandle_t>(cublas_);
     const real_t neg_one = -1.0, one = 1.0;
     const int nv = nvir_;
-    for (int j = 0; j < nocc_; ++j) {
+    const int j_lo = slab_active_ ? cur_occ_begin_ : 0;        // Stage 5c-step2 slab
+    const int j_hi = slab_active_ ? cur_occ_end_   : nocc_;
+    for (int j = j_lo; j < j_hi; ++j) {
         if (packing_.n_pno_ii[j] == 0) continue;
         real_t* C = d_acc_all_ + static_cast<size_t>(j) * nv * nv;
         for (int l = 0; l < nocc_; ++l) {
@@ -1255,7 +1341,9 @@ void DLPNOEAEOMNativeOperator::add_tph3_gpu() const {
     cublasHandle_t cublas = reinterpret_cast<cublasHandle_t>(cublas_);
     const real_t neg_one = -1.0, one = 1.0;
     const int nv = nvir_;
-    for (int j = 0; j < nocc_; ++j) {
+    const int j_lo = slab_active_ ? cur_occ_begin_ : 0;        // Stage 5c-step2 slab
+    const int j_hi = slab_active_ ? cur_occ_end_   : nocc_;
+    for (int j = j_lo; j < j_hi; ++j) {
         if (packing_.n_pno_ii[j] == 0) continue;
         real_t* C = d_acc_all_ + static_cast<size_t>(j) * nv * nv;
         for (int l = 0; l < nocc_; ++l) {
@@ -1280,7 +1368,9 @@ void DLPNOEAEOMNativeOperator::add_tph1_gpu() const {
     cublasHandle_t cublas = reinterpret_cast<cublasHandle_t>(cublas_);
     const real_t two = 2.0, neg_one = -1.0, one = 1.0;
     const int nv = nvir_;
-    for (int j = 0; j < nocc_; ++j) {
+    const int j_lo = slab_active_ ? cur_occ_begin_ : 0;        // Stage 5c-step2 slab
+    const int j_hi = slab_active_ ? cur_occ_end_   : nocc_;
+    for (int j = j_lo; j < j_hi; ++j) {
         if (packing_.n_pno_ii[j] == 0) continue;
         real_t* C = d_acc_all_ + static_cast<size_t>(j) * nv * nv;
         for (int l = 0; l < nocc_; ++l) {
@@ -1318,11 +1408,17 @@ void DLPNOEAEOMNativeOperator::add_ttmp_gpu() const {
     dlpno_ea_native_r2c_sym_re_kernel<<<blocks, threads>>>(d_r2c_all_, d_r2c_sym_re_, nocc_, nv);
     cublasDgemv(cublas, CUBLAS_OP_T, M, nocc_, &one,
                 d_ovov_Llmo_, M, d_r2c_sym_re_, 1, &zero, d_tmp_, 1);
-    // Stage 2: acc_all -= t2_Jlmo_mat·tmp (whole acc stack; t2_Jlmo row-major
-    // [nocc_K × nocc·nvir²] → col-major [nocc·nvir² × nocc_K], lda = nocc·nvir²).
+    // Stage 2: acc_all -= t2_Jlmo_mat·tmp (t2_Jlmo row-major [nocc_K × (j,a,b)] →
+    // col-major [(j,a,b) × nocc_K], lda = nocc·nvir²). Stage 5c-step2: restrict the
+    // output (j,a,b) rows to the active occ slab [j_lo·nv², j_hi·nv²) (k=nocc full).
     const int m2 = nocc_ * nv * nv;
-    cublasDgemv(cublas, CUBLAS_OP_N, m2, nocc_, &neg_one,
-                d_t2_Jlmo_, m2, d_tmp_, 1, &one, d_acc_all_, 1);
+    const int j_lo = slab_active_ ? cur_occ_begin_ : 0;
+    const int j_hi = slab_active_ ? cur_occ_end_   : nocc_;
+    const int m_sub = (j_hi - j_lo) * nv * nv;
+    if (m_sub > 0)
+        cublasDgemv(cublas, CUBLAS_OP_N, m_sub, nocc_, &neg_one,
+                    d_t2_Jlmo_ + static_cast<size_t>(j_lo) * nv * nv, m2,
+                    d_tmp_, 1, &one, d_acc_all_ + static_cast<size_t>(j_lo) * nv * nv, 1);
 #endif
 }
 
@@ -1335,7 +1431,9 @@ void DLPNOEAEOMNativeOperator::add_tlvv_gpu() const {
     cublasHandle_t cublas = reinterpret_cast<cublasHandle_t>(cublas_);
     const real_t one = 1.0;
     const int nv = nvir_;
-    for (int j = 0; j < nocc_; ++j) {
+    const int j_lo = slab_active_ ? cur_occ_begin_ : 0;        // Stage 5c-step2 slab
+    const int j_hi = slab_active_ ? cur_occ_end_   : nocc_;
+    for (int j = j_lo; j < j_hi; ++j) {
         if (packing_.n_pno_ii[j] == 0) continue;
         real_t* C = d_acc_all_ + static_cast<size_t>(j) * nv * nv;
         const real_t* R = d_r2c_all_ + static_cast<size_t>(j) * nv * nv;  // r2c[j] [nv×nv]
@@ -1360,7 +1458,9 @@ void DLPNOEAEOMNativeOperator::add_tr1_gpu(const std::vector<real_t>& r1) const 
     const real_t* r1src = resident_ ? d_r1_src_ : d_r1_;   // r1 device source
     const real_t one = 1.0;
     const int nv = nvir_;
-    for (int j = 0; j < nocc_; ++j) {
+    const int j_lo = slab_active_ ? cur_occ_begin_ : 0;        // Stage 5c-step2 slab
+    const int j_hi = slab_active_ ? cur_occ_end_   : nocc_;
+    for (int j = j_lo; j < j_hi; ++j) {
         if (packing_.n_pno_ii[j] == 0) continue;
         // M_j row-major [nvir²×nvir] → col-major [nvir×nvir²] lda=nvir; op_T → M_j·r1.
         cublasDgemv(cublas, CUBLAS_OP_T, nv, nv * nv, &one,
@@ -1426,6 +1526,37 @@ void DLPNOEAEOMNativeOperator::add_sigma1_gpu(
 #endif
 }
 
+// Stage 5c: point the σ2 members at device d's workspace (+ its cublas handle, NULL
+// stream). bind_device(0) restores the device-0 members (ws_[0] aliases them). σ1
+// buffers (d_sigma1_/d_Fov_/d_Wvovv_/d_r2c_sym_lcd_) stay on device 0 and are untouched.
+void DLPNOEAEOMNativeOperator::bind_device(int d) const {
+#ifndef GANSU_CPU_ONLY
+    auto* s = const_cast<DLPNOEAEOMNativeOperator*>(this);
+    const DeviceWorkspace& w = ws_[d];
+    if (d != 0 && w.cublas) cublasSetStream(reinterpret_cast<cublasHandle_t>(w.cublas), 0);
+    s->cublas_           = w.cublas;
+    s->d_r2c_all_        = w.d_r2c_all;
+    s->d_lift_T_         = w.d_lift_T;
+    s->d_acc_all_        = w.d_acc_all;
+    s->d_sig_pack_       = w.d_sig_pack;
+    s->d_T1_             = w.d_T1;
+    s->d_r2c_sym_re_     = w.d_r2c_sym_re;
+    s->d_tmp_            = w.d_tmp;
+    s->d_U_pack_         = w.d_U_pack;
+    s->d_Wvvvv_pno_pack_ = w.d_Wvvvv_pno_pack;
+    wvvvv_pack_shift_    = w.wvvvv_shift;        // 5e: slab-only Wvvvv pack offset
+    s->d_Loo_xpair_      = w.d_Loo_xpair;
+    s->d_Wovov_lmo_      = w.d_Wovov_lmo;
+    s->d_Wovvo_re_       = w.d_Wovvo_re;
+    s->d_ovov_Llmo_      = w.d_ovov_Llmo;
+    s->d_t2_Jlmo_        = w.d_t2_Jlmo;
+    s->d_Lvv_            = w.d_Lvv;
+    s->d_Wvvvo_r1_       = w.d_Wvvvo_r1;
+#else
+    (void)d;
+#endif
+}
+
 // B-a.6a Stage 4 full residency: device-only matvec. r1 = d_input[0:nvir],
 // packed_r2 = d_input[nvir:] are read straight from device (no input D2H/H2D, no
 // d_r2_pack_ copy). The lift fills d_r2c_all_ (resident); add_sigma1_gpu leaves the
@@ -1433,9 +1564,94 @@ void DLPNOEAEOMNativeOperator::add_sigma1_gpu(
 // adds every cross-pair/T_Lvv/T_r1 term, and projects into d_sig_pack_. The output
 // is assembled with two D2D copies. NUMERICS-PRESERVING — identical math to the
 // validated host-assisted path (the self-check below confirms it bit-for-bit).
+//
+// Stage 5c (use_gpu_multi_): each device builds the FULL σ2 into its own d_sig_pack
+// (step1 = redundant compute; the slab split lands as step2); σ1 on device 0; device 0
+// gathers each device's output-occ slab into d_output.
 void DLPNOEAEOMNativeOperator::apply_resident(const real_t* d_input, real_t* d_output) const {
 #ifndef GANSU_CPU_ONLY
     const size_t plen = static_cast<size_t>(total_dim_ - nvir_);
+
+    // Stage 5c multi-GPU: per-device σ2 build + disjoint output-occ gather. step2
+    // (use_gpu_multi_slab_): each device computes ONLY its occ slab (lift stays full).
+    // step1 (NOSLAB): each device builds the full σ2 redundantly. Both gather the same
+    // disjoint slabs.
+    if (use_gpu_multi_ && ws_.size() >= 2) {
+        auto& mgr = MultiGpuManager::instance();
+        resident_ = true;
+        std::vector<real_t> unused;
+        // Device 0: σ1 (device-0 only, full) + σ2 (slab when step2) into d_sig_pack_.
+        {
+            MultiGpuManager::DeviceGuard guard(0);
+            bind_device(0);
+            if (use_gpu_multi_slab_) { slab_active_ = true;
+                cur_occ_begin_ = occ_begin_[0]; cur_occ_end_ = occ_end_[0]; }
+            d_r1_src_ = d_input; d_r2_src_ = d_input + nvir_;
+            lift_r2c_gpu(unused, unused);
+            add_sigma1_gpu(unused, unused);          // σ1 ignores slab_active_ (full)
+            apply_xpair_projection_gpu(unused, unused, unused, unused);
+        }
+        // Devices d>0: broadcast input, lift (full), then σ2 (slab when step2). Async
+        // broadcast on device d's null stream (ordered before the lift on stream 0) so
+        // the host doesn't block and the per-device pipelines overlap (sync_all below).
+        for (int d = 1; d < static_cast<int>(ws_.size()); ++d) {
+            MultiGpuManager::DeviceGuard guard(d);
+            bind_device(d);
+            if (use_gpu_multi_slab_) { slab_active_ = true;
+                cur_occ_begin_ = occ_begin_[d]; cur_occ_end_ = occ_end_[d]; }
+            cudaMemcpyPeerAsync(ws_[d].d_input, d, d_input, 0,
+                                static_cast<size_t>(total_dim_) * sizeof(real_t), 0);
+            d_r1_src_ = ws_[d].d_input; d_r2_src_ = ws_[d].d_input + nvir_;
+            lift_r2c_gpu(unused, unused);
+            apply_xpair_projection_gpu(unused, unused, unused, unused);
+        }
+        slab_active_ = false;      // back to full for any later non-multi use
+        bind_device(0);            // restore members to device 0
+        mgr.sync_all();
+        // Assemble: σ1 from device 0; gather each device's output-occ slab into σ2.
+        {
+            MultiGpuManager::DeviceGuard guard(0);
+            cudaMemcpy(d_output, d_sigma1_, static_cast<size_t>(nvir_) * sizeof(real_t),
+                       cudaMemcpyDeviceToDevice);
+            for (int d = 0; d < static_cast<int>(ws_.size()); ++d)
+                for (int j = occ_begin_[d]; j < occ_end_[d]; ++j) {
+                    const int n = packing_.n_pno_ii[j];
+                    if (n == 0) continue;
+                    const size_t off = static_cast<size_t>(packing_.off_i[j]) - nvir_;
+                    const size_t len = static_cast<size_t>(n) * n;
+                    real_t* dst = d_output + nvir_ + off;
+                    if (d == 0)
+                        cudaMemcpy(dst, ws_[0].d_sig_pack + off, len * sizeof(real_t),
+                                   cudaMemcpyDeviceToDevice);
+                    else
+                        cudaMemcpyPeer(dst, 0, ws_[d].d_sig_pack + off, d, len * sizeof(real_t));
+                }
+        }
+        resident_ = false; d_r1_src_ = nullptr; d_r2_src_ = nullptr;
+
+        if (multi_selfcheck_ && multi_check_done_ < kMultiCheckMax) {
+            ++multi_check_done_;
+            std::vector<real_t> h_in(static_cast<size_t>(total_dim_));
+            cudaMemcpy(h_in.data(), d_input,
+                       static_cast<size_t>(total_dim_) * sizeof(real_t), cudaMemcpyDeviceToHost);
+            std::vector<real_t> r1(h_in.begin(), h_in.begin() + nvir_);
+            std::vector<real_t> packed_r2(h_in.begin() + nvir_, h_in.end());
+            std::vector<real_t> ref1, ref2;
+            compute_sigma1(r1, packed_r2, ref1);
+            compute_sigma2(r1, packed_r2, ref2, /*skip_tvvvv=*/false);
+            std::vector<real_t> got(static_cast<size_t>(total_dim_));
+            cudaMemcpy(got.data(), d_output,
+                       static_cast<size_t>(total_dim_) * sizeof(real_t), cudaMemcpyDeviceToHost);
+            real_t d1 = 0.0, d2 = 0.0;
+            for (int a = 0; a < nvir_; ++a) d1 = std::max(d1, std::fabs(got[a] - ref1[a]));
+            for (size_t k = 0; k < plen; ++k) d2 = std::max(d2, std::fabs(got[nvir_ + k] - ref2[k]));
+            std::cout << "[bt-PNO Stage 5c self-check] gathered σ vs full host: max|σ1| = "
+                      << std::scientific << d1 << ", max|σ2| = " << d2
+                      << "  (expect ≤1e-11 = multi-GPU gather == single-device)" << std::endl;
+        }
+        return;
+    }
+
     resident_ = true;
     d_r1_src_ = d_input;             // r1     = d_input[0:nvir]
     d_r2_src_ = d_input + nvir_;     // packed_r2 = d_input[nvir:]  (d_r2_src_ + off = d_input + off_i[j])
@@ -1454,9 +1670,6 @@ void DLPNOEAEOMNativeOperator::apply_resident(const real_t* d_input, real_t* d_o
 
     resident_ = false;
     d_r1_src_ = nullptr; d_r2_src_ = nullptr;
-
-    // Stage 5b: validate the broadcast + per-device lift (output unaffected).
-    if (use_gpu_multi_) lift_r2c_multi_validate(d_input);
 
     if (gpu_selfcheck_) {
         // Gate: pull r1/packed_r2 to host, run the full host path, compare against

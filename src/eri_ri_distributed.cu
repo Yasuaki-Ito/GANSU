@@ -2565,6 +2565,52 @@ real_t ERI_RI_Distributed_RHF::compute_dmet_ccsd_t() {
     return dmet.compute_energy(/*with_triples=*/true);
 }
 
+// ============================================================
+//  Multi-GPU RI CIS / CIS-NTO (bt-PNO-STEOM stage 2 unblock)
+// ============================================================
+// In distributed mode B is aux-partitioned (d_B_local_[d] = [naux_local × nbas²]),
+// and intermediate_matrix_B_ is null, so the single-GPU CIS core fails its guard.
+// We gather the slabs into a full B on device 0, point cis_B_override_ at it, run
+// the validated single-GPU CIS core, then free. The aux partition is contiguous and
+// ascending (device 0 = lowest aux), so the slabs concatenate directly.
+
+real_t* ERI_RI_Distributed_RHF::gather_full_B_device0() const {
+    const size_t nbas2 = static_cast<size_t>(num_basis_) * num_basis_;
+    real_t* d_B_full = nullptr;
+    {
+        MultiGpuManager::DeviceGuard guard(0);
+        tracked_cudaMalloc(&d_B_full,
+                           static_cast<size_t>(num_auxiliary_basis_) * nbas2 * sizeof(real_t));
+    }
+    size_t aux_off = 0;
+    for (int d = 0; d < num_gpus_; ++d) {
+        const size_t n = static_cast<size_t>(naux_local_[d]) * nbas2;
+        if (n > 0)
+            cudaMemcpyPeer(d_B_full + aux_off * nbas2, 0, d_B_local_[d], d, n * sizeof(real_t));
+        aux_off += static_cast<size_t>(naux_local_[d]);
+    }
+    cudaDeviceSynchronize();
+    return d_B_full;
+}
+
+void ERI_RI_Distributed_RHF::compute_cis(int n_states) {
+    MultiGpuManager::DeviceGuard guard(0);
+    real_t* d_B_full = gather_full_B_device0();
+    cis_B_override_ = d_B_full;
+    ERI_RI_RHF::compute_cis(n_states);
+    cis_B_override_ = nullptr;
+    tracked_cudaFree(d_B_full);
+}
+
+void ERI_RI_Distributed_RHF::compute_cis_nto(int n_states_cis) {
+    MultiGpuManager::DeviceGuard guard(0);
+    real_t* d_B_full = gather_full_B_device0();
+    cis_B_override_ = d_B_full;
+    ERI_RI_RHF::compute_cis_nto(n_states_cis);
+    cis_B_override_ = nullptr;
+    tracked_cudaFree(d_B_full);
+}
+
 } // namespace gansu
 
 #endif // GANSU_MULTI_GPU
