@@ -46,6 +46,9 @@ set(GPU_TEST_SOURCES
     test_ip_eom_ccsd.cu
     test_ea_eom_ccsd.cu
     test_steom_ccsd.cu
+    test_bt_pno_backtransform.cu
+    test_dlpno_ip_packing.cu
+    test_dlpno_ea_packing.cu
 )
 
 # CPU backend test source files (separate executable to avoid GPU state pollution)

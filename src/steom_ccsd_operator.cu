@@ -102,6 +102,20 @@ __global__ void steom_precondition_kernel(
         y[idx] = (fabs(d) > 1e-12) ? (x[idx] / d) : real_t(0.0);
     }
 }
+
+// Dense (non-symmetric) matvec y = G x, G row-major [n×n] (row*n + col).
+__global__ void steom_dense_matvec_kernel(
+    const real_t* __restrict__ G, const real_t* __restrict__ x,
+    real_t* __restrict__ y, int n)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < n) {
+        real_t s = 0.0;
+        const real_t* Grow = G + (size_t)row * n;
+        for (int c = 0; c < n; ++c) s += Grow[c] * x[c];
+        y[row] = s;
+    }
+}
 #endif  // !GANSU_CPU_ONLY
 
 
@@ -220,10 +234,13 @@ STEOMCCSDOperator::STEOMCCSDOperator(
         build_x_matrices(h_R1_IP_amplitudes, h_R1_EA_amplitudes);
         build_F_eff_oo();
         build_F_eff_vv();
+        // Sub-phase 3.5-3.7: full W^eff dressing + dense G^{1h1p}.
+        build_W_eff_and_G();
     }
 }
 
 STEOMCCSDOperator::~STEOMCCSDOperator() {
+    if (d_G_)         tracked_cudaFree(d_G_);
     if (d_R2_IP_)     tracked_cudaFree(d_R2_IP_);
     if (d_R2_EA_)     tracked_cudaFree(d_R2_EA_);
     if (d_R1_IP_)     tracked_cudaFree(d_R1_IP_);
@@ -289,6 +306,25 @@ void STEOMCCSDOperator::build_diagonal(const real_t* d_orbital_energies) {
 //  apply / apply_preconditioner — diagonal-only stubs (sub-phase 3.0+3.1)
 // ==================================================================
 void STEOMCCSDOperator::apply(const real_t* d_input, real_t* d_output) const {
+    // Sub-phase 3.5-3.7: dense G^{1h1p} matvec when built; else diagonal stub.
+    if (d_G_ != nullptr) {
+        if (!gpu::gpu_available()) {
+            #pragma omp parallel for
+            for (int row = 0; row < total_dim_; ++row) {
+                real_t s = 0.0;
+                const real_t* Grow = d_G_ + (size_t)row * total_dim_;
+                for (int c = 0; c < total_dim_; ++c) s += Grow[c] * d_input[c];
+                d_output[row] = s;
+            }
+        } else {
+#ifndef GANSU_CPU_ONLY
+            const int threads = 256;
+            const int blocks  = (total_dim_ + threads - 1) / threads;
+            steom_dense_matvec_kernel<<<blocks, threads>>>(d_G_, d_input, d_output, total_dim_);
+#endif
+        }
+        return;
+    }
     if (!gpu::gpu_available()) {
         #pragma omp parallel for
         for (int idx = 0; idx < total_dim_; ++idx) {
@@ -1141,6 +1177,323 @@ void STEOMCCSDOperator::build_F_eff_vv() {
 
     std::cout << "  STEOM-CCSD F^eff_vv built (CFOUR `gea_steom_rhf` formula; "
               << "active rows dressed, inactive rows = bar Lvv)." << std::endl;
+}
+
+
+// ==================================================================
+//  build_W_eff_and_G — sub-phase 3.5-3.7: full W^eff dressing + dense
+//  G^{1h1p}. Direct host port of Python build_g_canonical_full
+//  (script/pyscf_steom_feff_reference.py, Nooijen-Bartlett 1997 Eq.34-63).
+//
+//  All tensors are tiny for valence basis sets; host loops mirror the
+//  Python einsums one-to-one. The hot loop (Davidson) reuses the dense
+//  d_G_ matvec, so no GPU kernel for the build itself.
+//
+//  Validation gate (H2O sto-3g, (3,2) active): lowest singlet eigenvalues
+//  of d_G_ == 0.392886 / 0.449061 (Python reference, accepted STEOM-level).
+// ==================================================================
+void STEOMCCSDOperator::build_W_eff_and_G() {
+    const int NO = nocc_active_;
+    const int NV = nvir_;
+    const int NMo = n_act_occ_;
+    const int NMv = n_act_vir_;
+
+    // ---- pull bar-H + R2 + X to host ----
+    auto pull = [&](real_t* dptr, size_t sz) {
+        std::vector<real_t> h(sz);
+#ifndef GANSU_CPU_ONLY
+        if (gpu::gpu_available())
+            cudaMemcpy(h.data(), dptr, sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+        else
+#endif
+            for (size_t i = 0; i < sz; ++i) h[i] = dptr[i];
+        return h;
+    };
+    std::vector<real_t> Fov   = pull(d_Fov_,   (size_t)NO*NV);
+    std::vector<real_t> Loo   = pull(d_Loo_,   (size_t)NO*NO);
+    std::vector<real_t> Lvv   = pull(d_Lvv_,   (size_t)NV*NV);
+    std::vector<real_t> Wooov = pull(d_Wooov_, (size_t)NO*NO*NO*NV);
+    std::vector<real_t> Wvovv = pull(d_Wvovv_, (size_t)NV*NO*NV*NV);
+    std::vector<real_t> Wovoo = pull(d_Wovoo_, (size_t)NO*NV*NO*NO);
+    std::vector<real_t> Wovov = pull(d_Wovov_, (size_t)NO*NV*NO*NV);
+    std::vector<real_t> Wovvo = pull(d_Wovvo_, (size_t)NO*NV*NV*NO);
+    std::vector<real_t> ERIov = pull(d_eri_ovov_, (size_t)NO*NV*NO*NV);
+    std::vector<real_t> R2IP  = pull(d_R2_IP_, (size_t)NMo*NO*NO*NV);
+    std::vector<real_t> R2EA  = pull(d_R2_EA_, (size_t)NMv*NO*NV*NV);
+    std::vector<real_t> XIP   = pull(d_X_IP_,  (size_t)NMo*NMo);
+    std::vector<real_t> XEA   = pull(d_X_EA_,  (size_t)NMv*NMv);
+
+    // ---- bar-H accessors (row-major natural order; see build_dressed_intermediates) ----
+    auto fov  = [&](int k,int c){ return Fov[(size_t)k*NV+c]; };
+    auto loo  = [&](int i,int j){ return Loo[(size_t)i*NO+j]; };
+    auto lvv  = [&](int a,int b){ return Lvv[(size_t)a*NV+b]; };
+    auto wooov= [&](int k,int l,int i,int d){ return Wooov[(((size_t)k*NO+l)*NO+i)*NV+d]; };
+    auto wvovv= [&](int a,int l,int c,int d){ return Wvovv[(((size_t)a*NO+l)*NV+c)*NV+d]; };
+    auto wovoo= [&](int k,int c,int l,int i){ return Wovoo[(((size_t)k*NV+c)*NO+l)*NO+i]; };
+    auto wovov= [&](int k,int b,int i,int d){ return Wovov[(((size_t)k*NV+b)*NO+i)*NV+d]; };
+    auto wovvo= [&](int k,int b,int c,int j){ return Wovvo[(((size_t)k*NV+b)*NV+c)*NO+j]; };
+    auto eriov= [&](int k,int b,int i,int d){ return ERIov[(((size_t)k*NV+b)*NO+i)*NV+d]; };
+    auto r2ip = [&](int m,int i,int j,int a){ return R2IP[(((size_t)m*NO+i)*NO+j)*NV+a]; };
+    auto r2ea = [&](int e,int i,int a,int b){ return R2EA[(((size_t)e*NO+i)*NV+a)*NV+b]; };
+
+    // ---- s_IP[m][i,j,a] = -Σ_λ R2_IP[λ][i,j,a]·X_IP[m,λ] ; s_EA[e][i,a,b] = +Σ_λ R2_EA[λ]·X_EA[e,λ]
+    //  (X_IP[m_NTO,λ] = rinv_IP[λ,m_NTO] from build_x_matrices, matching build_normalized_s.)
+    std::vector<real_t> sIP((size_t)NMo*NO*NO*NV, 0.0);
+    std::vector<real_t> sEA((size_t)NMv*NO*NV*NV, 0.0);
+    auto siP = [&](int m,int i,int j,int a)->real_t&{ return sIP[(((size_t)m*NO+i)*NO+j)*NV+a]; };
+    auto seA = [&](int e,int i,int a,int b)->real_t&{ return sEA[(((size_t)e*NO+i)*NV+a)*NV+b]; };
+    for (int m=0;m<NMo;++m)
+        for (int lam=0;lam<NMo;++lam){
+            const real_t x = XIP[(size_t)m*NMo+lam];
+            for (int i=0;i<NO;++i) for(int j=0;j<NO;++j) for(int a=0;a<NV;++a)
+                siP(m,i,j,a) -= r2ip(lam,i,j,a)*x;
+        }
+    for (int e=0;e<NMv;++e)
+        for (int lam=0;lam<NMv;++lam){
+            const real_t x = XEA[(size_t)e*NMv+lam];
+            for (int i=0;i<NO;++i) for(int a=0;a<NV;++a) for(int b=0;b<NV;++b)
+                seA(e,i,a,b) += r2ea(lam,i,a,b)*x;
+        }
+
+    // ---- F_eff_oo (Eq.34-35) + F_eff_vv (Eq.36-37) rebuilt with normalized s ----
+    std::vector<real_t> Foo = Loo;   // [NO×NO]
+    for (int m=0;m<NMo;++m){
+        const int mrow = active_occ_idx_[m];
+        for (int i=0;i<NO;++i){
+            real_t u=0.0;
+            for (int k=0;k<NO;++k) for(int c=0;c<NV;++c){
+                const real_t st = 2.0*siP(m,i,k,c)-siP(m,k,i,c);
+                u += fov(k,c)*st;
+            }
+            for (int k=0;k<NO;++k) for(int l=0;l<NO;++l) for(int d=0;d<NV;++d){
+                const real_t st = 2.0*siP(m,k,l,d)-siP(m,l,k,d);
+                u -= wooov(k,l,i,d)*st;
+            }
+            Foo[(size_t)mrow*NO+i] += u;
+        }
+    }
+    std::vector<real_t> Fvv = Lvv;   // [NV×NV]
+    for (int e=0;e<NMv;++e){
+        const int arow = active_vir_idx_[e];
+        for (int a=0;a<NV;++a){
+            real_t u=0.0;
+            for (int k=0;k<NO;++k) for(int c=0;c<NV;++c){
+                const real_t st = 2.0*seA(e,k,a,c)-seA(e,k,c,a);
+                u += fov(k,c)*st;
+            }
+            for (int l=0;l<NO;++l) for(int c=0;c<NV;++c) for(int d=0;d<NV;++d){
+                const real_t st = 2.0*seA(e,l,c,d)-seA(e,l,d,c);
+                u += wvovv(a,l,c,d)*st;
+            }
+            Fvv[(size_t)arow*NV+a] += u;
+        }
+    }
+
+    // ---- hp (Eq.38-39) ----
+    std::vector<real_t> u_ma((size_t)NMo*NV, 0.0);  // [m][a]
+    std::vector<real_t> u_ie((size_t)NO*NMv, 0.0);  // [i][e]
+    for (int m=0;m<NMo;++m)
+        for (int a=0;a<NV;++a){
+            real_t v=0.0;
+            for (int k=0;k<NO;++k) for(int l=0;l<NO;++l) for(int d=0;d<NV;++d){
+                const real_t st = 2.0*siP(m,k,l,d)-siP(m,l,k,d);
+                v -= wovvo(k,d,a,l)*st;
+            }
+            u_ma[(size_t)m*NV+a]=v;
+        }
+    for (int e=0;e<NMv;++e)
+        for (int i=0;i<NO;++i){
+            real_t v=0.0;
+            for (int l=0;l<NO;++l) for(int c=0;c<NV;++c) for(int d=0;d<NV;++d){
+                const real_t st = 2.0*seA(e,l,c,d)-seA(e,l,d,c);
+                v += wovvo(i,d,c,l)*st;
+            }
+            u_ie[(size_t)i*NMv+e]=v;
+        }
+
+    // ---- hhhp (Eq.42-44, bare v = eri_ovov) ----
+    std::vector<real_t> u_mlid((size_t)NMo*NO*NO*NV, 0.0); // [m][l,i,d]
+    std::vector<real_t> u_kmid((size_t)NO*NMo*NO*NV, 0.0); // [k][m][i,d]
+    std::vector<real_t> u_klie((size_t)NO*NO*NO*NMv, 0.0); // [k,l,i][e]
+    auto UMLID=[&](int m,int l,int i,int d)->real_t&{ return u_mlid[(((size_t)m*NO+l)*NO+i)*NV+d]; };
+    auto UKMID=[&](int k,int m,int i,int d)->real_t&{ return u_kmid[(((size_t)k*NMo+m)*NO+i)*NV+d]; };
+    auto UKLIE=[&](int k,int l,int i,int e)->real_t&{ return u_klie[(((size_t)k*NO+l)*NO+i)*NMv+e]; };
+    for (int m=0;m<NMo;++m)
+        for (int l=0;l<NO;++l) for(int i=0;i<NO;++i) for(int d=0;d<NV;++d){
+            real_t v=0.0;
+            for (int j=0;j<NO;++j) for(int b=0;b<NV;++b){
+                const real_t st = 2.0*siP(m,i,j,b)-siP(m,j,i,b);
+                v += eriov(j,b,l,d)*st - eriov(l,b,j,d)*siP(m,i,j,b);
+            }
+            UMLID(m,l,i,d)=v;
+        }
+    for (int m=0;m<NMo;++m)
+        for (int k=0;k<NO;++k) for(int i=0;i<NO;++i) for(int d=0;d<NV;++d){
+            real_t v=0.0;
+            for (int j=0;j<NO;++j) for(int b=0;b<NV;++b)
+                v -= eriov(j,d,k,b)*siP(m,j,i,b);
+            UKMID(k,m,i,d)=v;
+        }
+    for (int e=0;e<NMv;++e)
+        for (int k=0;k<NO;++k) for(int l=0;l<NO;++l) for(int i=0;i<NO;++i){
+            real_t v=0.0;
+            for (int a=0;a<NV;++a) for(int b=0;b<NV;++b)
+                v += eriov(k,a,l,b)*seA(e,i,a,b);
+            UKLIE(k,l,i,e)=v;
+        }
+
+    // ---- phph (Eq.56-58) ----
+    std::vector<real_t> u_amci((size_t)NV*NMo*NV*NO, 0.0); // [a][m][c][i]
+    std::vector<real_t> u_akei((size_t)NV*NO*NMv*NO, 0.0); // [a][k][e][i]
+    std::vector<real_t> u_amei((size_t)NV*NMo*NMv*NO, 0.0);// [a][m][e][i]
+    auto UAMCI=[&](int a,int m,int c,int i)->real_t&{ return u_amci[(((size_t)a*NMo+m)*NV+c)*NO+i]; };
+    auto UAKEI=[&](int a,int k,int e,int i)->real_t&{ return u_akei[(((size_t)a*NO+k)*NMv+e)*NO+i]; };
+    auto UAMEI=[&](int a,int m,int e,int i)->real_t&{ return u_amei[(((size_t)a*NMo+m)*NMv+e)*NO+i]; };
+    for (int m=0;m<NMo;++m)
+        for (int a=0;a<NV;++a) for(int c=0;c<NV;++c) for(int i=0;i<NO;++i){
+            real_t t=0.0;
+            for (int k=0;k<NO;++k) t -= fov(k,c)*siP(m,i,k,a);                    // T1
+            for (int l=0;l<NO;++l) for(int d=0;d<NV;++d){
+                const real_t st = 2.0*siP(m,i,l,d)-siP(m,l,i,d);
+                t += wvovv(a,l,c,d)*st;                                            // T2
+                t -= wvovv(a,l,d,c)*siP(m,i,l,d);                                  // T3
+            }
+            for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
+                t += wovoo(k,c,l,i)*siP(m,l,k,a);                                  // T4
+            UAMCI(a,m,c,i)=t;
+        }
+    for (int e=0;e<NMv;++e)
+        for (int a=0;a<NV;++a) for(int k=0;k<NO;++k) for(int i=0;i<NO;++i){
+            real_t t=0.0;
+            for (int c=0;c<NV;++c) t -= fov(k,c)*seA(e,i,a,c);                     // T1
+            for (int l=0;l<NO;++l) for(int d=0;d<NV;++d){
+                const real_t st = 2.0*seA(e,l,a,d)-seA(e,l,d,a);
+                t += wovoo(l,d,k,i)*st;                                            // T2
+                t -= wooov(l,k,i,d)*seA(e,l,a,d);                                  // T3
+            }
+            for (int c=0;c<NV;++c) for(int d=0;d<NV;++d)
+                t += wvovv(a,k,c,d)*seA(e,i,c,d);                                  // T4
+            UAKEI(a,k,e,i)=t;
+        }
+    for (int m=0;m<NMo;++m) for(int e=0;e<NMv;++e)
+        for (int a=0;a<NV;++a) for(int i=0;i<NO;++i){
+            real_t t=0.0;
+            for (int c=0;c<NV;++c) t += u_ma[(size_t)m*NV+c]*seA(e,i,a,c);         // T1
+            for (int k=0;k<NO;++k) t -= u_ie[(size_t)k*NMv+e]*siP(m,i,k,a);        // T2
+            for (int l=0;l<NO;++l) for(int d=0;d<NV;++d){
+                const real_t st = 2.0*seA(e,l,a,d)-seA(e,l,d,a);
+                t += UMLID(m,l,i,d)*st;                                            // T3
+                t -= UKMID(l,m,i,d)*seA(e,l,a,d);                                  // T4
+            }
+            for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
+                t += UKLIE(k,l,i,e)*siP(m,l,k,a);                                  // T5
+            UAMEI(a,m,e,i)=t;
+        }
+
+    // ---- phhp (Eq.60-62) ----
+    std::vector<real_t> u_bmjc((size_t)NV*NMo*NO*NV, 0.0); // [b][m][j][c]
+    std::vector<real_t> u_bkje((size_t)NV*NO*NO*NMv, 0.0); // [b][k][j][e]
+    std::vector<real_t> u_bmje((size_t)NV*NMo*NO*NMv, 0.0);// [b][m][j][e]
+    auto UBMJC=[&](int b,int m,int j,int c)->real_t&{ return u_bmjc[(((size_t)b*NMo+m)*NO+j)*NV+c]; };
+    auto UBKJE=[&](int b,int k,int j,int e)->real_t&{ return u_bkje[(((size_t)b*NO+k)*NO+j)*NMv+e]; };
+    auto UBMJE=[&](int b,int m,int j,int e)->real_t&{ return u_bmje[(((size_t)b*NMo+m)*NO+j)*NMv+e]; };
+    for (int m=0;m<NMo;++m)
+        for (int b=0;b<NV;++b) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c){
+            real_t t=0.0;
+            for (int k=0;k<NO;++k) t -= fov(k,c)*siP(m,k,j,b);                     // T1
+            for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
+                t += wovoo(k,c,l,j)*siP(m,k,l,b);                                  // T2
+            for (int k=0;k<NO;++k) for(int d=0;d<NV;++d)
+                t -= wvovv(b,k,d,c)*siP(m,k,j,d);                                  // T3
+            UBMJC(b,m,j,c)=t;
+        }
+    for (int e=0;e<NMv;++e)
+        for (int b=0;b<NV;++b) for(int k=0;k<NO;++k) for(int j=0;j<NO;++j){
+            real_t t=0.0;
+            for (int d=0;d<NV;++d) t += fov(k,d)*seA(e,j,d,b);                     // T1
+            for (int d=0;d<NV;++d) for(int c=0;c<NV;++c)
+                t += wvovv(b,k,d,c)*seA(e,j,c,d);                                  // T2
+            for (int l=0;l<NO;++l) for(int d=0;d<NV;++d)
+                t -= wooov(l,k,j,d)*seA(e,l,d,b);                                  // T3
+            UBKJE(b,k,j,e)=t;
+        }
+    for (int m=0;m<NMo;++m) for(int e=0;e<NMv;++e)
+        for (int b=0;b<NV;++b) for(int j=0;j<NO;++j){
+            real_t t=0.0;
+            for (int d=0;d<NV;++d) t += u_ma[(size_t)m*NV+d]*seA(e,j,d,b);         // T1
+            for (int k=0;k<NO;++k) t -= u_ie[(size_t)k*NMv+e]*siP(m,k,j,b);        // T2
+            for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
+                t += UKLIE(k,l,j,e)*siP(m,k,l,b);                                  // T3
+            for (int l=0;l<NO;++l) for(int d=0;d<NV;++d)
+                t -= UMLID(m,l,j,d)*seA(e,l,d,b);                                  // T4
+            UBMJE(b,m,j,e)=t;
+        }
+
+    // ---- assemble g_phph[a,k,c,i] (Eq.59) and g_phhp[b,k,j,c] (Eq.63) ----
+    std::vector<real_t> g_phph((size_t)NV*NO*NV*NO, 0.0);
+    std::vector<real_t> g_phhp((size_t)NV*NO*NO*NV, 0.0);
+    auto GPHPH=[&](int a,int k,int c,int i)->real_t&{ return g_phph[(((size_t)a*NO+k)*NV+c)*NO+i]; };
+    auto GPHHP=[&](int b,int k,int j,int c)->real_t&{ return g_phhp[(((size_t)b*NO+k)*NO+j)*NV+c]; };
+    for (int a=0;a<NV;++a) for(int k=0;k<NO;++k) for(int c=0;c<NV;++c) for(int i=0;i<NO;++i)
+        GPHPH(a,k,c,i)=wovov(k,a,i,c);
+    for (int m=0;m<NMo;++m){ const int kf=active_occ_idx_[m];
+        for(int a=0;a<NV;++a) for(int c=0;c<NV;++c) for(int i=0;i<NO;++i)
+            GPHPH(a,kf,c,i)+=UAMCI(a,m,c,i); }
+    for (int e=0;e<NMv;++e){ const int cf=active_vir_idx_[e];
+        for(int a=0;a<NV;++a) for(int k=0;k<NO;++k) for(int i=0;i<NO;++i)
+            GPHPH(a,k,cf,i)+=UAKEI(a,k,e,i); }
+    for (int m=0;m<NMo;++m) for(int e=0;e<NMv;++e){ const int kf=active_occ_idx_[m], cf=active_vir_idx_[e];
+        for(int a=0;a<NV;++a) for(int i=0;i<NO;++i)
+            GPHPH(a,kf,cf,i)+=UAMEI(a,m,e,i); }
+    for (int b=0;b<NV;++b) for(int k=0;k<NO;++k) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c)
+        GPHHP(b,k,j,c)=wovvo(k,b,c,j);
+    for (int m=0;m<NMo;++m){ const int kf=active_occ_idx_[m];
+        for(int b=0;b<NV;++b) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c)
+            GPHHP(b,kf,j,c)+=UBMJC(b,m,j,c); }
+    for (int e=0;e<NMv;++e){ const int cf=active_vir_idx_[e];
+        for(int b=0;b<NV;++b) for(int k=0;k<NO;++k) for(int j=0;j<NO;++j)
+            GPHHP(b,k,j,cf)+=UBKJE(b,k,j,e); }
+    for (int m=0;m<NMo;++m) for(int e=0;e<NMv;++e){ const int kf=active_occ_idx_[m], cf=active_vir_idx_[e];
+        for(int b=0;b<NV;++b) for(int j=0;j<NO;++j)
+            GPHHP(b,kf,j,cf)+=UBMJE(b,m,j,e); }
+
+    // ---- G^{1h1p} singlet: row=i*NV+a, col=j*NV+b ----
+    //  G = F_eff_vv δ_ij − F_eff_oo δ_ab + 2 g_phhp[b,j,i,a] − g_phph[a,j,b,i]
+    std::vector<real_t> Gmat((size_t)total_dim_*total_dim_, 0.0);
+    for (int i=0;i<NO;++i) for(int a=0;a<NV;++a){
+        const int row=i*NV+a;
+        for (int j=0;j<NO;++j) for(int b=0;b<NV;++b){
+            const int col=j*NV+b;
+            real_t v = 2.0*GPHHP(b,j,i,a) - GPHPH(a,j,b,i);
+            if (i==j) v += Fvv[(size_t)a*NV+b];
+            if (a==b) v -= Foo[(size_t)i*NO+j];
+            Gmat[(size_t)row*total_dim_+col]=v;
+        }
+    }
+
+    // ---- upload dense G + refresh diagonal ----
+    tracked_cudaMalloc(&d_G_, (size_t)total_dim_*total_dim_*sizeof(real_t));
+    std::vector<real_t> h_diag(total_dim_);
+    for (int r=0;r<total_dim_;++r) h_diag[r]=Gmat[(size_t)r*total_dim_+r];
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()){
+        cudaMemcpy(d_G_, Gmat.data(), Gmat.size()*sizeof(real_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_diagonal_, h_diag.data(), h_diag.size()*sizeof(real_t), cudaMemcpyHostToDevice);
+    } else
+#endif
+    {
+        for (size_t i=0;i<Gmat.size();++i) d_G_[i]=Gmat[i];
+        for (int r=0;r<total_dim_;++r) d_diagonal_[r]=h_diag[r];
+    }
+    // Verification aid: HOMO->LUMO diagonal element (= eigenvalue for the
+    // pure HOMO->LUMO state). H2O sto-3g (3,2) reference: 0.392886.
+    {
+        const int hl = (NO - 1) * NV + 0;
+        std::cout << "  STEOM-CCSD G^{1h1p} built (W^eff dressing Eq.34-63, dense "
+                  << total_dim_ << "×" << total_dim_ << "); G[HOMO->LUMO diag] = "
+                  << Gmat[(size_t)hl * total_dim_ + hl]
+                  << "  (H2O sto-3g ref 0.392886)." << std::endl;
+    }
 }
 
 #undef H_OVOV

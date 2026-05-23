@@ -57,6 +57,15 @@ struct Phase24ExtractLayout {
     std::size_t off_W_oovv_lambda      = 0;
     std::size_t off_W_ovoo_lambda      = 0;
     std::size_t off_W_ovoo_lambda_alt  = 0;
+    /// B-a.6c IP dense-free bare ph-ladder blocks (native DLPNO-IP-EOM σ).
+    /// ovvo_bare[m,a',d'](I) = (m d'|a' I) = eri[m,n_lmo+d',n_lmo+a',I];
+    /// oovv_bare[m,a',d'](I) = (m I|a' d') = eri[m,I,n_lmo+a',n_lmo+d'].
+    /// Each is the dense-free bare seed of Wovvo_pno / Wovov_pno (occ-role i/j),
+    /// layout (m·n_pno + a')·n_pno + d', size n_lmo · n_pno² (= sz_W_ovov).
+    std::size_t off_W_ovvo_bare_i      = 0;
+    std::size_t off_W_ovvo_bare_j      = 0;
+    std::size_t off_W_oovv_bare_i      = 0;
+    std::size_t off_W_oovv_bare_j      = 0;
 
     std::size_t sz_T_pair       = 0;  ///< n_lmo² · n_pno²
     std::size_t sz_W_pair       = 0;  ///< n_pno⁴

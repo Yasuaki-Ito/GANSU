@@ -311,6 +311,12 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
         std::cout << "Message: Post-HF method is STEOM-CCSD (bt-PNO-STEOM P3). "
                      "Auto-runs CIS-NTO + IP-EOM-CCSD + EA-EOM-CCSD as prerequisites." << std::endl;
         post_hf_method_ = PostHFMethod::STEOM_CCSD;
+    }else if(post_hf_method_str == "dlpno_steom_ccsd" || post_hf_method_str == "dlpno-steom-ccsd"
+             || post_hf_method_str == "dlpno_steom" || post_hf_method_str == "dlpnosteom"){
+        std::cout << "Message: Post-HF method is DLPNO-STEOM-CCSD (hybrid bt-PNO-STEOM P5b). "
+                     "DLPNO-CCSD ground state back-transformed to canonical, fed to canonical "
+                     "CIS-NTO + IP-EOM + EA-EOM + STEOM." << std::endl;
+        post_hf_method_ = PostHFMethod::DLPNO_STEOM_CCSD;
     }else{
         throw std::runtime_error("Error: Unknown post-HF method: " + post_hf_method_str);
     }

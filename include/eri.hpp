@@ -348,6 +348,17 @@ public:
         THROW_EXCEPTION("STEOM-CCSD is not supported for the selected ERI method.");
     }
 
+    /**
+     * @brief Hybrid DLPNO-STEOM-CCSD (bt-PNO-STEOM Phase P5b)
+     * @param n_states Number of excited states
+     *
+     * DLPNO-CCSD ground state back-transformed to canonical MO, fed to the
+     * canonical CIS-NTO + IP-EOM + EA-EOM + STEOM machinery. RI-only.
+     */
+    virtual void compute_dlpno_steom_ccsd(int /*n_states*/){
+        THROW_EXCEPTION("DLPNO-STEOM-CCSD is not supported for the selected ERI method (RI required).");
+    }
+
 };
 
 /**
@@ -529,6 +540,10 @@ public:
          || method == PostHFMethod::DLPNO_CCSD
          || method == PostHFMethod::DLPNO_CCSD_T
          || method == PostHFMethod::CIS_NTO  // bt-PNO-STEOM P0 (RI-CIS path)
+         || method == PostHFMethod::IP_EOM_CCSD  // bt-PNO-STEOM P4 (RI path)
+         || method == PostHFMethod::EA_EOM_CCSD  // bt-PNO-STEOM P4 (RI path)
+         || method == PostHFMethod::STEOM_CCSD   // bt-PNO-STEOM P4 (RI path, auto-runs P0/P1/P2)
+         || method == PostHFMethod::DLPNO_STEOM_CCSD  // hybrid bt-PNO-STEOM P5b (RI required)
           ){
             return true;
         }

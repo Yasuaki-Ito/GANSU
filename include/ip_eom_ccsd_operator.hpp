@@ -86,6 +86,24 @@ public:
     int get_h_dim()   const { return h_dim_; }    // 1h sector dim   = nocc
     int get_h2p_dim() const { return h2p_dim_; }  // 2h1p sector dim = nocc² · nvir (FULL layout)
 
+    // --- Dressed-intermediate device pointers (const, read-only) ---
+    // Borrowed by the native per-pair DLPNO-IP-EOM σ (bt-PNO-STEOM stage B (a))
+    // so the occupied-heavy intermediates are bit-identical to this validated
+    // operator (no re-derivation). Valid after construction with d_eri_mo !=
+    // nullptr (build_dressed_intermediates ran); nullptr otherwise.
+    const real_t* get_Loo_device()   const { return d_Loo_; }    // [nocc²]
+    const real_t* get_Lvv_device()   const { return d_Lvv_; }    // [nvir²]
+    const real_t* get_Fov_device()   const { return d_Fov_; }    // [nocc·nvir]
+    const real_t* get_Woooo_device() const { return d_Woooo_; }  // [nocc⁴]
+    const real_t* get_Wooov_device() const { return d_Wooov_; }  // [nocc²·nocc·nvir]
+    const real_t* get_Wovov_device() const { return d_Wovov_; }  // [nocc·nvir·nocc·nvir]
+    const real_t* get_Wovvo_device() const { return d_Wovvo_; }  // [nocc·nvir·nvir·nocc]
+    const real_t* get_Wovoo_device() const { return d_Wovoo_; }  // [nocc·nvir·nocc²]
+    const real_t* get_eri_oovv_device() const { return d_eri_oovv_; }  // [nocc²·nvir²] = Woovv
+    const real_t* get_eri_ovov_device() const { return d_eri_ovov_; }  // [nocc·nvir·nocc·nvir] (ov|ov), raw ERI
+    const real_t* get_eri_ovvo_device() const { return d_eri_ovvo_; }  // [nocc·nvir·nvir·nocc] (ov|vo), raw ERI
+    const real_t* get_t2_device()     const { return d_t2_; }    // [nocc²·nvir²]
+
     /// Print intermediate Frobenius norms (used by ip_eom_verbose ≥ 2 for
     /// PySCF cross-validation in sub-phases 1.3-1.6). Sub-phase 1.0+1.1
     /// returns the identity-stub annotation only.

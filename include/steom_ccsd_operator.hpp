@@ -159,6 +159,13 @@ private:
     real_t* d_F_eff_vv_ = nullptr;   // [nvir × nvir]
     real_t* d_U_EA_     = nullptr;   // [n_act_vir × nvir]         (EA intermediate)
 
+    // === Sub-phase 3.5-3.7: explicit dense G^{1h1p} singlet matrix ===
+    // [total_dim × total_dim] row-major (row = i*nvir+a, col = j*nvir+b),
+    // non-Hermitian. Built by build_W_eff_and_G() (port of Python
+    // build_g_canonical_full, Nooijen Eq.34-63 with normalized s). When
+    // present, apply() performs the dense matvec; the diagonal stub is bypassed.
+    real_t* d_G_ = nullptr;          // [total_dim × total_dim]
+
     // === CCSD amplitudes (owned — freed in destructor) ===
     real_t* d_t1_ = nullptr;   // [nocc_active * nvir]
     real_t* d_t2_ = nullptr;   // [nocc_active² * nvir²]
@@ -217,6 +224,14 @@ private:
     ///   U(E,A) = +2 Fov·R2 − Fov·R2 + 2 Wvovv·R2 − Wvovv·R2
     ///   F^eff_vv[A_idx, A] = Lvv[A_idx, A] + Σ_F U(F,A) · X(F,E_NTO)
     void build_F_eff_vv();
+
+    /// Sub-phase 3.5-3.7: build the full W^eff dressing (hp/hhhp/phph/phhp
+    /// intermediates + cross), assemble g_phph/g_phhp, rebuild F^eff_oo/vv
+    /// with normalized s for consistency, and form the dense G^{1h1p} singlet
+    /// matrix d_G_. Direct host port of Python build_g_canonical_full
+    /// (Nooijen Eq.34-63). Validation gate (H2O sto-3g): lowest singlet
+    /// eigenvalues of d_G_ == 0.392886 / 0.449061 (Python reference).
+    void build_W_eff_and_G();
 };
 
 } // namespace gansu

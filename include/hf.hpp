@@ -36,6 +36,7 @@
 #include "ip_eom_result.hpp"
 #include "ea_eom_result.hpp"
 #include "steom_result.hpp"
+#include "bt_pno_backtransform.hpp"  // BTAmplitudes (hybrid DLPNO-STEOM P5b)
 
 
 namespace gansu{
@@ -519,6 +520,48 @@ public:
     void set_steom_result(STEOMResult result) { steom_result_ = std::move(result); }
 
     /**
+     * @brief DLPNO-CCSD T1/T2 back-transformed to canonical MO (hybrid bt-PNO-STEOM P5b).
+     *
+     * When `use_dlpno_amplitudes()` is true the IP-EOM / EA-EOM / STEOM impls
+     * consume these canonical amplitudes (one device copy each) instead of
+     * solving a fresh canonical CCSD ground state. Set by
+     * `ERI_RI_RHF::compute_dlpno_steom_ccsd`; cleared after that driver returns.
+     */
+    const BTAmplitudes& get_dlpno_bt_amplitudes() const { return dlpno_bt_amplitudes_; }
+    void set_dlpno_bt_amplitudes(BTAmplitudes a) { dlpno_bt_amplitudes_ = std::move(a); use_dlpno_amplitudes_ = true; }
+    bool use_dlpno_amplitudes() const { return use_dlpno_amplitudes_; }
+    void clear_dlpno_amplitudes() { use_dlpno_amplitudes_ = false; dlpno_bt_amplitudes_ = BTAmplitudes{}; }
+
+    /// When set, DLPNOCCSD::compute_energy back-transforms its converged
+    /// amplitudes to canonical MO and stores them via set_dlpno_bt_amplitudes
+    /// (used by the hybrid DLPNO-STEOM driver). Default false → plain
+    /// DLPNO-CCSD runs pay no back-transform cost. When set it ALSO stows the
+    /// converged DLPNOLMP2Result (set_dlpno_res) so the projected DLPNO-IP/EA
+    /// path (stage B) can reach the per-pair PNOs / barS.
+    void set_collect_dlpno_bt(bool b) { collect_dlpno_bt_ = b; }
+    bool collect_dlpno_bt() const { return collect_dlpno_bt_; }
+
+    /// Converged DLPNO-CCSD pair state (per-pair bar_Q/Lambda/setups/U_loc),
+    /// stowed when collect_dlpno_bt is set. Consumed by the projected
+    /// DLPNO-IP-EOM / DLPNO-EA-EOM operators (bt-PNO-STEOM stage B).
+    void set_dlpno_res(DLPNOLMP2Result r) { dlpno_res_ = std::move(r); }
+    const DLPNOLMP2Result& get_dlpno_res() const { return dlpno_res_; }
+
+    /// When set, the IP-EOM / EA-EOM impls run the Galerkin-projected DLPNO
+    /// operator (per-pair PNO 2h1p/2p1h space) instead of the full canonical
+    /// Davidson. Requires get_dlpno_res() to be populated. Set by the
+    /// DLPNO-STEOM driver; cleared afterwards. Default false.
+    void set_use_dlpno_projected_eom(bool b) { use_dlpno_projected_eom_ = b; }
+    bool use_dlpno_projected_eom() const { return use_dlpno_projected_eom_; }
+
+    /// stage B (a): IP impl runs the NATIVE per-pair DLPNO-IP-EOM σ operator
+    /// (DLPNOIPEOMNativeOperator) instead of the project-up reference. Set
+    /// alongside use_dlpno_projected_eom_ (EA stays projected until native EA
+    /// lands). Default false → projected/hybrid/canonical paths unchanged.
+    void set_use_dlpno_native_eom(bool b) { use_dlpno_native_eom_ = b; }
+    bool use_dlpno_native_eom() const { return use_dlpno_native_eom_; }
+
+    /**
      * @brief Get whether the coefficient matrix has been computed
      */
     bool get_hasMatrixC() const { return hasMatrixC_; }
@@ -692,6 +735,12 @@ protected:
     IPEOMResult  ip_eom_result_;       ///< bt-PNO-STEOM Phase P1: IP-EOM-CCSD roots per active occupied NTO (empty unless post_hf_method=ip_eom_ccsd)
     EAEOMResult  ea_eom_result_;       ///< bt-PNO-STEOM Phase P2: EA-EOM-CCSD roots per active virtual NTO (empty unless post_hf_method=ea_eom_ccsd)
     STEOMResult  steom_result_;        ///< bt-PNO-STEOM Phase P3: STEOM-CCSD excited states (empty unless post_hf_method=steom_ccsd)
+    BTAmplitudes dlpno_bt_amplitudes_; ///< hybrid bt-PNO-STEOM P5b: DLPNO-CCSD T1/T2 in canonical MO (set during dlpno_steom_ccsd)
+    bool         use_dlpno_amplitudes_ = false; ///< when true, IP/EA/STEOM impls consume dlpno_bt_amplitudes_ instead of canonical CCSD
+    bool         collect_dlpno_bt_ = false;      ///< when true, DLPNOCCSD::compute_energy stores back-transformed canonical amplitudes
+    DLPNOLMP2Result dlpno_res_;                  ///< stage B: converged DLPNO pair state (set when collect_dlpno_bt_)
+    bool         use_dlpno_projected_eom_ = false; ///< stage B: IP/EA impls run the projected DLPNO operator
+    bool         use_dlpno_native_eom_ = false; ///< stage B (a): IP impl runs the native per-pair DLPNO-IP-EOM σ
 
     // ECP data (from Molecular)
     bool has_ecp_ = false;

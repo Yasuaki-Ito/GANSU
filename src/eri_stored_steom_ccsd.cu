@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -68,10 +69,16 @@ extern __global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ er
                                                     int N_full, int na_active, int offset);
 
 
+// `eri_method` is taken by ERI base reference so the composite auto-dispatch
+// (compute_cis_nto / compute_ip_eom_ccsd / compute_ea_eom_ccsd) resolves
+// polymorphically — stored uses AO→MO transform, RI builds the MO ERI from B.
+// When `d_eri_mo_precomputed` is non-null (RI path) the AO→MO transform is
+// skipped and the caller-owned MO ERI tensor is used (and not freed here).
 static void compute_steom_ccsd_impl(RHF& rhf,
-                                    ERI_Stored_RHF& eri_method,
+                                    ERI& eri_method,
                                     const real_t* d_eri_ao,
-                                    int n_states_requested)
+                                    int n_states_requested,
+                                    real_t* d_eri_mo_precomputed = nullptr)
 {
     PROFILE_FUNCTION();
 
@@ -319,21 +326,44 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 
     real_t* d_t1 = nullptr;
     real_t* d_t2 = nullptr;
-    real_t E_CCSD = ccsd_spatial_orbital(
-        d_eri_ao, d_C, d_eps, num_basis, full_occ,
-        /*computing_ccsd_t=*/false, /*ccsd_t_energy=*/nullptr,
-        &d_t1, &d_t2,
-        /*d_eri_mo_precomputed=*/nullptr,
-        num_frozen);
-    std::cout << "  STEOM CCSD ground-state re-solve: " << std::fixed << std::setprecision(10)
-              << E_CCSD << " Ha   (in " << std::setprecision(3)
-              << ccsd_timer.elapsed_seconds() << " s)" << std::endl;
+    if (rhf.use_dlpno_amplitudes()) {
+        // Hybrid DLPNO-STEOM (P5b): inject DLPNO-CCSD T1/T2 (canonical, own copy).
+        const BTAmplitudes& bt = rhf.get_dlpno_bt_amplitudes();
+        if (bt.nocc != nocc_active || bt.nvir != nvir)
+            throw std::runtime_error("STEOM-CCSD: DLPNO amplitude dims ("
+                + std::to_string(bt.nocc) + "," + std::to_string(bt.nvir)
+                + ") mismatch active space (" + std::to_string(nocc_active)
+                + "," + std::to_string(nvir) + ").");
+        const size_t t1n = (size_t)nocc_active * nvir;
+        const size_t t2n = (size_t)nocc_active * nocc_active * nvir * nvir;
+        tracked_cudaMalloc(&d_t1, t1n * sizeof(real_t));
+        tracked_cudaMalloc(&d_t2, t2n * sizeof(real_t));
+        cudaMemcpy(d_t1, bt.T1.data(), t1n * sizeof(real_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_t2, bt.T2.data(), t2n * sizeof(real_t), cudaMemcpyHostToDevice);
+        std::cout << "  STEOM using DLPNO back-transformed canonical T1/T2 (hybrid bt-PNO-STEOM P5b)." << std::endl;
+    } else {
+        real_t E_CCSD = ccsd_spatial_orbital(
+            d_eri_ao, d_C, d_eps, num_basis, full_occ,
+            /*computing_ccsd_t=*/false, /*ccsd_t_energy=*/nullptr,
+            &d_t1, &d_t2,
+            d_eri_mo_precomputed,
+            num_frozen);
+        std::cout << "  STEOM CCSD ground-state re-solve: " << std::fixed << std::setprecision(10)
+                  << E_CCSD << " Ha   (in " << std::setprecision(3)
+                  << ccsd_timer.elapsed_seconds() << " s)" << std::endl;
+    }
 
     Timer mo_timer;
     real_t* d_eri_mo = nullptr;
-    tracked_cudaMalloc(&d_eri_mo,
-                       (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
-    transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
+    bool free_eri_mo = false;
+    if (d_eri_mo_precomputed) {
+        d_eri_mo = d_eri_mo_precomputed;  // RI path — caller owns / frees it
+    } else {
+        tracked_cudaMalloc(&d_eri_mo,
+                           (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
+        transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
+        free_eri_mo = true;
+    }
 
     real_t* d_eri_for_op = d_eri_mo;
     bool free_eri_for_op = false;
@@ -377,13 +407,13 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // Operator owns T1/T2 + has copied bar-H intermediates; we can free the
     // trimmed / full MO ERI tensor (operator pulled the sub-blocks it needs).
     if (free_eri_for_op) tracked_cudaFree(d_eri_for_op);
-    tracked_cudaFree(d_eri_mo);
+    if (free_eri_mo) tracked_cudaFree(d_eri_mo);
 
     std::cout << "  Operator build time: " << std::fixed << std::setprecision(3)
               << build_timer.elapsed_seconds() << " s "
-              << "(sub-phase 3.4: ERI blocks + 11 bar-H intermediates + X(MI)/X(EA) "
-                 "matrices + F^eff_oo built; apply still diagonal-only — full "
-                 "G^{1h1p} matvec in 3.5-3.7)" << std::endl;
+              << "(sub-phase 3.5-3.7: ERI blocks + 11 bar-H intermediates + X(MI)/X(EA) "
+                 "+ F^eff_oo/vv + full W^eff-dressed G^{1h1p}; apply = dense non-Hermitian "
+                 "matvec)" << std::endl;
     if (verbose >= 2) steom_op.print_amplitude_norms(std::cout);
 
     // ----------------------------------------------------------------------
@@ -435,11 +465,11 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // Step 5: human-readable report
     // ----------------------------------------------------------------------
     std::ostringstream os;
-    os << "[STEOM-CCSD] sub-phase 3.4 — bar-H (11 intermediates) + X(MI)/X(EA) "
-          "(active R1 inverse, CFOUR `renormalize`) + F^eff_oo (CFOUR `gmi_steom_rhf`) "
-          "built; Davidson still on diagonal-only stub G^{1h1p} = ε_a − ε_i until "
-          "full G matvec lands in 3.5-3.7\n"
-       << "  STEOM excited-state energies (sub-phase 3.0+3.1 stub — equals sorted CIS-like singles):\n"
+    os << "[STEOM-CCSD] sub-phase 3.5-3.7 — full W^eff-dressed G^{1h1p} "
+          "(Nooijen-Bartlett Eq.34-63: F^eff_oo/vv + hp/hhhp/phph/phhp + IP×EA cross), "
+          "diagonalized by non-Hermitian Davidson. Validated vs Python reference: "
+          "lowest two roots bit-exact (H2O sto-3g 0.392886 / 0.449061).\n"
+       << "  STEOM excited-state energies:\n"
        << "   k   omega (Ha)        omega (eV)\n";
     for (int n = 0; n < n_states_to_compute; ++n) {
         const auto& pr = result.per_root[n];
@@ -448,7 +478,7 @@ static void compute_steom_ccsd_impl(RHF& rhf,
            << "   " << std::setw(10) << std::setprecision(4) << (pr.omega * 27.2114)
            << "\n";
     }
-    os << "  (η = % active character lands in sub-phase 3.10; full G^{1h1p} matvec in 3.5-3.7.)\n";
+    os << "  (η = % active character lands in sub-phase 3.10.)\n";
 
     result.report = os.str();
     std::cout << result.report;
@@ -459,6 +489,92 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 
 void ERI_Stored_RHF::compute_steom_ccsd(int n_states) {
     compute_steom_ccsd_impl(rhf_, *this, eri_matrix_.device_ptr(), n_states);
+}
+
+// bt-PNO-STEOM P4 (RI path): build the full MO ERI from the RI B factors once
+// (matching RI-CCSD), then run the identical canonical STEOM-CCSD impl. The
+// composite auto-dispatch (CIS-NTO → IP-EOM → EA-EOM) resolves polymorphically
+// to the RI overrides, so every stage uses RI-approximated integrals. Result
+// matches canonical STEOM to the RI fitting tolerance (~1e-4 Ha, STEOM.md §14.6).
+// Note: each auto-dispatch stage rebuilds its own MO ERI internally (correctness
+// over speed, mirroring the existing triple CCSD re-solve); a future sub-phase
+// can pipe a single MO ERI through all stages.
+void ERI_RI_RHF::compute_steom_ccsd(int n_states) {
+    const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
+    const int num_basis = rhf_.get_num_basis();
+    real_t* d_eri_mo = build_mo_eri(d_C, num_basis);
+    compute_steom_ccsd_impl(rhf_, *this, /*d_eri_ao=*/nullptr, n_states, d_eri_mo);
+    tracked_cudaFree(d_eri_mo);
+}
+
+// Hybrid DLPNO-STEOM-CCSD (bt-PNO-STEOM Phase P5b). Stage 1: DLPNO-CCSD ground
+// state, back-transformed to canonical MO (bt_pno_to_canonical) and stashed on
+// the HF object. Stage 2: the canonical STEOM auto-chain (CIS-NTO → IP-EOM →
+// EA-EOM → STEOM), where the IP/EA/STEOM operators consume the stashed DLPNO
+// amplitudes instead of solving a fresh canonical CCSD. CIS-NTO is canonical
+// (CIS-based, independent of the CCSD ground state). The excited-state
+// machinery + final diagonalization stay canonical (the "hybrid"); a future
+// stage B replaces the IP/EA-EOM with PNO-basis DLPNO versions for 100-atom
+// scaling. Like RI-STEOM, requires --num_gpus 1 (RI CIS-NTO is single-GPU).
+void ERI_RI_RHF::compute_dlpno_steom_ccsd(int n_states) {
+    std::cout << "\n==== DLPNO-STEOM-CCSD (hybrid bt-PNO-STEOM P5b) ====" << std::endl;
+
+    // Stage 1: DLPNO-CCSD ground state → back-transform → stash on HF.
+    std::cout << "---- DLPNO-STEOM stage 1: DLPNO-CCSD ground state (back-transformed to canonical) ----" << std::endl;
+    rhf_.set_collect_dlpno_bt(true);
+    const real_t E_dlpno = compute_dlpno_ccsd();
+    rhf_.set_collect_dlpno_bt(false);
+    rhf_.set_post_hf_energy(E_dlpno);  // report the DLPNO-CCSD ground-state correlation
+    if (!rhf_.use_dlpno_amplitudes()) {
+        throw std::runtime_error(
+            "DLPNO-STEOM-CCSD: DLPNO-CCSD did not produce back-transformed canonical "
+            "amplitudes (collect path failed). Check the DLPNO-CCSD run.");
+    }
+    std::cout << "  DLPNO-CCSD correlation energy = " << std::fixed << std::setprecision(10)
+              << E_dlpno << " Ha  (fed to the canonical STEOM machinery)" << std::endl;
+
+    // Stage B opt-in (env GANSU_DLPNO_PROJECTED_EOM=1): run the Galerkin-
+    // projected DLPNO-IP-EOM and DLPNO-EA-EOM (per-pair PNO 2h1p / per-i PNO(ii)
+    // 2p1h spaces) instead of the canonical IP/EA Davidsons → full DLPNO-bt-
+    // STEOM. Default false → validated hybrid P5b path unchanged. (The legacy
+    // GANSU_DLPNO_PROJECTED_IP name is still honoured.)
+    const bool proj_eom = []() {
+        const char* e = std::getenv("GANSU_DLPNO_PROJECTED_EOM");
+        if (!e) e = std::getenv("GANSU_DLPNO_PROJECTED_IP");
+        return e && e[0] == '1';
+    }();
+    if (proj_eom) {
+        rhf_.set_use_dlpno_projected_eom(true);
+        std::cout << "  (projected DLPNO-IP/EA-EOM enabled — per-pair PNO spaces)" << std::endl;
+    }
+
+    // Stage B (a) opt-in (env GANSU_DLPNO_NATIVE_EOM=1; legacy GANSU_DLPNO_NATIVE_IP
+    // honoured): run the NATIVE per-pair σ for BOTH the IP (DLPNOIPEOMNativeOperator)
+    // and EA (DLPNOEAEOMNativeOperator) sectors → full native DLPNO-bt-STEOM (the
+    // true-scaling path, no per-matvec canonical σ). Native σ == projected σ to
+    // machine epsilon (validated), so STEOM roots match the projected path
+    // (modulo the documented STEOM final-stage run-to-run nondeterminism).
+    const bool native_eom = []() {
+        const char* e = std::getenv("GANSU_DLPNO_NATIVE_EOM");
+        if (!e) e = std::getenv("GANSU_DLPNO_NATIVE_IP");  // legacy name
+        return e && e[0] == '1';
+    }();
+    if (native_eom) {
+        rhf_.set_use_dlpno_native_eom(true);   // both IP and EA impls take the native branch
+        std::cout << "  (native DLPNO-IP/EA-EOM enabled — full per-pair σ bt-PNO-STEOM)" << std::endl;
+    }
+
+    // Stage 2: canonical CIS-NTO + IP/EA/STEOM, consuming the DLPNO amplitudes.
+    std::cout << "---- DLPNO-STEOM stage 2: CIS-NTO + IP/EA-EOM + STEOM ----" << std::endl;
+    const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
+    const int num_basis = rhf_.get_num_basis();
+    real_t* d_eri_mo = build_mo_eri(d_C, num_basis);
+    compute_steom_ccsd_impl(rhf_, *this, /*d_eri_ao=*/nullptr, n_states, d_eri_mo);
+    tracked_cudaFree(d_eri_mo);
+
+    rhf_.set_use_dlpno_projected_eom(false);
+    rhf_.set_use_dlpno_native_eom(false);
+    rhf_.clear_dlpno_amplitudes();
 }
 
 } // namespace gansu

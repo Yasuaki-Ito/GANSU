@@ -270,6 +270,17 @@ set(SOURCES
     src/dlpno_mp2.cu
     src/dlpno_ccsd.cu
     src/dlpno_mp2_lambda.cu
+    src/bt_pno_backtransform.cu
+    src/dlpno_ip_packing.cu
+    src/dlpno_ip_eom_operator.cu
+    src/dlpno_ip_eom_transform.cu
+    src/dlpno_ip_eom_projected_operator.cu
+    src/dlpno_ip_eom_native_operator.cu
+    src/dlpno_ea_packing.cu
+    src/dlpno_ea_eom_transform.cu
+    src/dlpno_ea_eom_projected_operator.cu
+    src/dlpno_ea_eom_native_operator.cu
+    src/dlpno_eom_dressed_pno.cu
 )
 
 if(NOT ENABLE_GPU)

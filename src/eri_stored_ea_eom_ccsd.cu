@@ -35,6 +35,11 @@
 #include <vector>
 
 #include "rhf.hpp"
+#include "dlpno_ea_packing.hpp"                // bt-PNO-STEOM stage B: EA packed layout
+#include "dlpno_ea_eom_projected_operator.hpp" // stage B: projected DLPNO-EA operator
+#include "dlpno_ea_eom_native_operator.hpp"    // stage B (a): native per-pair DLPNO-EA σ operator
+#include "dlpno_ea_eom_transform.hpp"          // stage B: packed↔canonical EA R2 transform
+#include <memory>
 #include "ea_eom_ccsd_operator.hpp"
 #include "ea_eom_result.hpp"
 #include "davidson_solver.hpp"
@@ -142,17 +147,36 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
 
     real_t* d_t1 = nullptr;
     real_t* d_t2 = nullptr;
-    real_t E_CCSD = ccsd_spatial_orbital(
-        d_eri_ao, d_C, d_eps, num_basis, full_occ,
-        /*computing_ccsd_t=*/false, /*ccsd_t_energy=*/nullptr,
-        &d_t1, &d_t2,
-        d_eri_mo_precomputed,
-        num_frozen);
+    real_t E_CCSD = 0.0;
+    if (rhf.use_dlpno_amplitudes()) {
+        // Hybrid DLPNO-STEOM (P5b): inject DLPNO-CCSD T1/T2 (canonical, own copy).
+        const BTAmplitudes& bt = rhf.get_dlpno_bt_amplitudes();
+        if (bt.nocc != nocc_active || bt.nvir != nvir)
+            throw std::runtime_error("EA-EOM-CCSD: DLPNO amplitude dims ("
+                + std::to_string(bt.nocc) + "," + std::to_string(bt.nvir)
+                + ") mismatch active space (" + std::to_string(nocc_active)
+                + "," + std::to_string(nvir) + ").");
+        const size_t t1n = (size_t)nocc_active * nvir;
+        const size_t t2n = (size_t)nocc_active * nocc_active * nvir * nvir;
+        tracked_cudaMalloc(&d_t1, t1n * sizeof(real_t));
+        tracked_cudaMalloc(&d_t2, t2n * sizeof(real_t));
+        cudaMemcpy(d_t1, bt.T1.data(), t1n * sizeof(real_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_t2, bt.T2.data(), t2n * sizeof(real_t), cudaMemcpyHostToDevice);
+        E_CCSD = rhf.get_post_hf_energy();  // DLPNO-CCSD energy (set by stage 1)
+        std::cout << "  Using DLPNO back-transformed canonical T1/T2 (hybrid bt-PNO-STEOM P5b)." << std::endl;
+    } else {
+        E_CCSD = ccsd_spatial_orbital(
+            d_eri_ao, d_C, d_eps, num_basis, full_occ,
+            /*computing_ccsd_t=*/false, /*ccsd_t_energy=*/nullptr,
+            &d_t1, &d_t2,
+            d_eri_mo_precomputed,
+            num_frozen);
 
-    std::cout << "  CCSD correlation energy: " << std::fixed << std::setprecision(10)
-              << E_CCSD << " Ha   (in " << std::setprecision(3)
-              << ccsd_timer.elapsed_seconds() << " s)" << std::endl;
-    rhf.set_post_hf_energy(E_CCSD);
+        std::cout << "  CCSD correlation energy: " << std::fixed << std::setprecision(10)
+                  << E_CCSD << " Ha   (in " << std::setprecision(3)
+                  << ccsd_timer.elapsed_seconds() << " s)" << std::endl;
+        rhf.set_post_hf_energy(E_CCSD);
+    }
 
     // Step 2: Build MO ERI (matches EE-EOM pattern) and trim for frozen core.
     Timer mo_timer;
@@ -225,15 +249,77 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
     config.min_eigenvalue        = 0.0;
     config.verbose               = (verbose >= 2) ? 2 : (verbose >= 1 ? 1 : 0);
 
-    DavidsonSolver solver(ea_op, config);
-    bool converged = solver.solve();
+    std::vector<real_t> eigenvalues;
+    std::vector<real_t> h_eigenvectors((size_t)n_roots_to_compute * total_dim, 0.0);
+    bool converged = false;
+
+    if (rhf.use_dlpno_projected_eom() || rhf.use_dlpno_native_eom()) {
+        // bt-PNO-STEOM stage B: DLPNO-EA-EOM in the per-i PNO(i,i) 2p1h space,
+        // via the project-up reference (B1b) or the NATIVE per-pair σ operator
+        // (B-EA, env GANSU_DLPNO_NATIVE_EOM). Both wrap ea_op and produce packed
+        // roots, back-transformed to canonical (downstream selection unchanged).
+        // Native σ == projected σ to machine epsilon (GANSU_DLPNO_EA_NATIVE_VALIDATE).
+        const bool native = rhf.use_dlpno_native_eom();
+        if (num_frozen != 0)
+            throw std::runtime_error("DLPNO EA-EOM (projected/native) currently requires --frozen_core none.");
+        const DLPNOLMP2Result& dres = rhf.get_dlpno_res();
+        if (dres.pairs.empty())
+            throw std::runtime_error("DLPNO EA-EOM: DLPNO pair state not stowed (set_dlpno_res).");
+
+        DeviceHostMatrix<real_t>& Cmat = rhf.get_coefficient_matrix();
+        Cmat.toHost();
+        const real_t* C_full = Cmat.host_ptr();
+        std::vector<real_t> C_vir((size_t)num_basis * nvir, 0.0);
+        for (int mu = 0; mu < num_basis; ++mu)
+            for (int a = 0; a < nvir; ++a)
+                C_vir[(size_t)mu * nvir + a] = C_full[(size_t)mu * num_basis + (nocc_active + a)];
+        rhf.get_overlap_matrix().toHost();
+        const real_t* h_S = rhf.get_overlap_matrix().host_ptr();
+        orbital_energies.toHost();
+        const real_t* h_eps = orbital_energies.host_ptr();
+        std::vector<real_t> eps_v(nvir);
+        for (int a = 0; a < nvir; ++a) eps_v[a] = h_eps[nocc_active + a];
+
+        const DLPNOEAPacking pack = build_ea_packing(dres);
+        std::unique_ptr<LinearOperator> dlpno_op;
+        if (native)
+            dlpno_op = std::make_unique<DLPNOEAEOMNativeOperator>(
+                ea_op, dres, pack, dres.U_loc, C_vir, h_S, num_basis, nvir, eps_v,
+                rhf.get_num_gpus());
+        else
+            dlpno_op = std::make_unique<DLPNOEAEOMProjectedOperator>(
+                ea_op, dres, pack, dres.U_loc, C_vir, h_S, num_basis, eps_v);
+        LinearOperator& dop = *dlpno_op;
+
+        DavidsonConfig pcfg = config;
+        pcfg.max_subspace_size = std::min(dop.dimension(), std::max(80, 20 * n_roots_to_compute));
+        DavidsonSolver solver(dop, pcfg);
+        converged = solver.solve();
+        eigenvalues = solver.get_eigenvalues();
+
+        const int pdim = dop.dimension();
+        std::vector<real_t> packed_evec((size_t)n_roots_to_compute * pdim);
+        solver.copy_eigenvectors_to_host(packed_evec.data());
+        for (int k = 0; k < n_roots_to_compute; ++k) {
+            const real_t* ev = packed_evec.data() + (size_t)k * pdim;
+            std::copy(ev, ev + p_dim, h_eigenvectors.begin() + (size_t)k * total_dim);  // R1
+            std::vector<real_t> packed_r2(ev + p_dim, ev + pdim);
+            std::vector<real_t> R2_canon = ea_packed_r2_to_canonical(
+                dres, pack, dres.U_loc, C_vir, h_S, num_basis, packed_r2);
+            std::copy(R2_canon.begin(), R2_canon.end(),
+                      h_eigenvectors.begin() + (size_t)k * total_dim + p_dim);
+        }
+        std::cout << "  DLPNO-" << (native ? "native" : "projected") << " EA-EOM (packed_dim=" << pdim
+                  << ", canon_dim=" << total_dim << ")." << std::endl;
+    } else {
+        DavidsonSolver solver(ea_op, config);
+        converged = solver.solve();
+        eigenvalues = solver.get_eigenvalues();
+        solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+    }
     if (!converged) {
         std::cout << "Warning: EA-EOM-CCSD Davidson did not converge for all roots." << std::endl;
     }
-
-    const auto& eigenvalues = solver.get_eigenvalues();
-    std::vector<real_t> h_eigenvectors((size_t)n_roots_to_compute * total_dim);
-    solver.copy_eigenvectors_to_host(h_eigenvectors.data());
 
     std::cout << "  EA-EOM-CCSD solve time: " << std::fixed << std::setprecision(3)
               << solve_timer.elapsed_seconds() << " s" << std::endl;
@@ -354,6 +440,17 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
 
 void ERI_Stored_RHF::compute_ea_eom_ccsd(int n_states) {
     compute_ea_eom_ccsd_impl(rhf_, eri_matrix_.device_ptr(), n_states);
+}
+
+// bt-PNO-STEOM P4 (RI path): build the full MO ERI from the RI B factors
+// (matching RI-CCSD), then run the identical canonical EA-EOM-CCSD impl. EA
+// roots match canonical EA-EOM to the RI fitting tolerance (~1e-4 Ha).
+void ERI_RI_RHF::compute_ea_eom_ccsd(int n_states) {
+    const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
+    const int num_basis = rhf_.get_num_basis();
+    real_t* d_eri_mo = build_mo_eri(d_C, num_basis);
+    compute_ea_eom_ccsd_impl(rhf_, /*d_eri_ao=*/nullptr, n_states, d_eri_mo);
+    tracked_cudaFree(d_eri_mo);
 }
 
 } // namespace gansu

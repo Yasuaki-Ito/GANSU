@@ -86,6 +86,20 @@ public:
     int get_p_dim()   const { return p_dim_; }    // 1p sector dim   = nvir
     int get_p2h_dim() const { return p2h_dim_; }  // 2p1h sector dim = nocc · nvir² (FULL layout)
 
+    // --- Dressed-intermediate device pointers (const, read-only) ---
+    // Borrowed by the native per-pair DLPNO-EA-EOM σ (bt-PNO-STEOM stage B (a)).
+    // Valid after construction with d_eri_mo != nullptr; nullptr otherwise.
+    const real_t* get_Loo_device()   const { return d_Loo_; }    // [nocc²]
+    const real_t* get_Lvv_device()   const { return d_Lvv_; }    // [nvir²]
+    const real_t* get_Fov_device()   const { return d_Fov_; }    // [nocc·nvir]
+    const real_t* get_Wovov_device() const { return d_Wovov_; }  // [nocc·nvir·nocc·nvir]
+    const real_t* get_Wovvo_device() const { return d_Wovvo_; }  // [nocc·nvir·nvir·nocc]
+    const real_t* get_Wvovv_device() const { return d_Wvovv_; }  // [nvir·nocc·nvir·nvir]
+    const real_t* get_Wvvvv_device() const { return d_Wvvvv_; }  // [nvir⁴]
+    const real_t* get_Wvvvo_device() const { return d_Wvvvo_; }  // [nvir·nvir·nvir·nocc]
+    const real_t* get_eri_ovov_device() const { return d_eri_ovov_; }  // [nocc·nvir·nocc·nvir] (kc|ld) → tmp_k
+    const real_t* get_t2_device()     const { return d_t2_; }    // [nocc²·nvir²]
+
     /// Print intermediate Frobenius norms (used by ea_eom_verbose ≥ 2 for
     /// PySCF cross-validation in sub-phases 2.3-2.6). Sub-phase 2.0+2.1
     /// returns the identity-stub annotation only.

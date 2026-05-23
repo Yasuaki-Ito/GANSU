@@ -38,15 +38,21 @@ X(MI)[M_act, I_full] and X(EA)[E_act, A_full]: nonzero only on active columns
 (= active R1 inverse mapped through the selection matrix). Built here as full
 (act × full) matrices with the active-orbital columns filled.
 
-KNOWN-INCONSISTENT STATE (2026-05-22): smbij is set to the DIRECT layout
-r2_ip[M][I,J,b], which is VERIFIED correct for the F^eff_oo dressing (umi → −IP
-eigenvalues exactly). However the umabi/umaei contraction LABELS in this file
-were originally derived assuming the TRANSPOSED smbij, so with the now-correct
-direct smbij the S^IP-route W^eff over-shoots (state0 W^eff ≈ +217 mHa vs the
-needed +62; transposed smbij gave +20). The CFOUR contract-label slot reading
-for the umabi/umaei S^IP route must be re-derived consistently with the direct
-smbij (umi reads free-occ from smbij slot0; umabi reads it from slot1 — that
-asymmetry is the remaining bug). EA-route (ujaei, F^eff_vv) is verified correct.
+RESOLVED (2026-05-22): smbij uses the TRANSPOSE layout r2_ip[M][J,I,b], which is
+the verbatim CFOUR convention (`trans "JIB"→"IJB"` ⇒ sijb[I,J,b]=r2[J,I,b]). With
+it the faithful W^eff AGREES with the independent Nooijen build_g_canonical_full
+(H2O sto-3g: 0.38864/0.45311/0.58108 vs 0.39289/0.44906/0.57869, ‖umaei‖=0.0035).
+The earlier "umi(slot0) vs umabi(slot1) inconsistency" was a FALSE coupling: the
+umi diagnostic reproduces -IP only with DIRECT smbij, but umi is NOT the production
+F^eff route (F^eff comes from build_g_singlet, PySCF σ1-style, independent of this
+smbij). The faithful smbij is consumed ONLY by umabi/umaei → transpose is correct.
+DIRECT was the regression (over-shoots W^eff by ~+150 mHa: 0.586/0.679/0.701).
+
+★ The slot question is NOT the physics gap. Both correct, independent W^eff impls
+(this CFOUR port + Nooijen Eq.56-63) land at ~0.39, ~38 mHa below EOM-EE-CCSD and
+~43 below ORCA STEOM (0.4354). The residual gap is COMMON to both → the next
+suspect is active-space mismatch with ORCA (CIS-NTO vs argmax/Hungarian), not the
+S^IP route. EA-route (ujaei, F^eff_vv) and bare-W are verified correct.
 
 Usage:
     wsl python3 script/steom_weff_cfour_faithful.py xyz/H2O.xyz sto-3g 3 2 3
@@ -78,12 +84,24 @@ def build_cfour_tensors(bar_h, r2_ip_list, r2_ea_list, nocc, nvir,
     wamef = np.einsum("amef->efam", Wvovv).copy()       # [E,f,A,m]=Wvovv[A,m,E,f]
     wmnef = np.einsum("iajb->abij", eri_ovov).copy()    # [A,B,I,J]=eri_ovov[I,A,J,B]
 
-    # smbij[I,J,M,b] = r2_ip[M][I,J,b] (DIRECT, NOT transposed). Verified: the
-    # transposed r2[J,I,b] gives a WRONG F^eff_oo (umi diag ≠ −IP eigval); the
-    # direct form reproduces −e_ip exactly. This was the S^IP-route bug.
-    smbij = np.zeros((nocc, nocc, n_act_occ, nvir))     # [I,J,M,b]=r2_ip[M][I,J,b]
+    # smbij[I,J,M,b] = r2_ip[M][J,I,b] (TRANSPOSE, verbatim CFOUR). The CFOUR
+    # driver builds S(Ij,Mb) via `trans(1.0, r2, "JIB", 0.0, sijb, "IJB")`, i.e.
+    # sijb[I,J,b] = r2_cfour[J,I,b]. This (transpose) orientation is the one the
+    # umabi/umaei contractions are written against; it makes the faithful W^eff
+    # AGREE with the independent Nooijen build_g_canonical_full (~0.389 vs 0.393
+    # on H2O sto-3g, ‖umaei‖=0.0035). The DIRECT orientation r2[I,J,b] was tried
+    # because the faithful-umi diagnostic reproduces -IP eigenvalues with it, but
+    # that path is NOT the production F^eff route (F^eff comes from build_g_singlet,
+    # PySCF σ1-style, independent of this smbij) — direct over-shoots W^eff by
+    # ~+150 mHa. Override with SMBIJ_TRANSPOSE=0 only for the umi diagnostic.
+    import os as _os
+    smbij = np.zeros((nocc, nocc, n_act_occ, nvir))     # [I,J,M,b]
+    _SMBIJ_TRANSPOSE = _os.environ.get("SMBIJ_TRANSPOSE", "1") == "1"
     for m in range(n_act_occ):
-        smbij[:, :, m, :] = r2_ip_list[m]
+        if _SMBIJ_TRANSPOSE:
+            smbij[:, :, m, :] = np.swapaxes(r2_ip_list[m], 0, 1)   # r2[J,I,b] (CFOUR)
+        else:
+            smbij[:, :, m, :] = r2_ip_list[m]                      # r2[I,J,b] direct (umi diag only)
     sabej = np.zeros((nvir, nvir, n_act_vir, nocc))     # [A,B,E,j]=r2_ea[E][j,A,B]
     for e in range(n_act_vir):
         sabej[:, :, e, :] = np.einsum("jab->abj", r2_ea_list[e])

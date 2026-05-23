@@ -165,6 +165,51 @@ __global__ void extract_ovov_ovvo_kernel(
     d_out[tid] = d_eri_mo[e];
 }
 
+/// B-a.6c IP dense-free bare ph-ladder block, occupied I = si or sj fixed.
+///   mode 0 (OVVO): ovvo_bare[m,a,d] = (m d | a I) = eri[m, n_lmo+d, n_lmo+a, I]
+///   mode 1 (OOVV): oovv_bare[m,a,d] = (m I | a d) = eri[m, I, n_lmo+a, n_lmo+d]
+/// Output layout: (m · n_pno + a) · n_pno + d  (size n_lmo · n_pno²).
+/// These are the bare seeds of the per-pair PNO Wovvo_pno/Wovov_pno (occ=I);
+/// the PNO ERI equals the canonical congruence U^(ij)ᵀ⊗2 (bare) bit-for-bit,
+/// so the dense nocc²·nvir² Wovvo/Wovov is never materialised (true scaling).
+__global__ void extract_ip_bare_kernel(
+    const real_t* __restrict__ d_eri_mo,
+    real_t*       __restrict__ d_out,
+    int n_emb, int n_lmo, int n_pno,
+    int I,
+    int mode)
+{
+    const std::size_t total =
+        static_cast<std::size_t>(n_lmo) * n_pno * n_pno;
+    const std::size_t tid =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+
+    const std::size_t n_emb2 = static_cast<std::size_t>(n_emb) * n_emb;
+    const std::size_t n_emb3 = n_emb2 * n_emb;
+
+    const int d = static_cast<int>(tid % n_pno);
+    const std::size_t t1 = tid / n_pno;
+    const int a = static_cast<int>(t1 % n_pno);
+    const int m = static_cast<int>(t1 / n_pno);
+
+    std::size_t e;
+    if (mode == 0) {
+        // OVVO: eri_mo[m, n_lmo+d, n_lmo+a, I]
+        e = static_cast<std::size_t>(m) * n_emb3 +
+            static_cast<std::size_t>(n_lmo + d) * n_emb2 +
+            static_cast<std::size_t>(n_lmo + a) * n_emb +
+            static_cast<std::size_t>(I);
+    } else {
+        // OOVV: eri_mo[m, I, n_lmo+a, n_lmo+d]
+        e = static_cast<std::size_t>(m) * n_emb3 +
+            static_cast<std::size_t>(I) * n_emb2 +
+            static_cast<std::size_t>(n_lmo + a) * n_emb +
+            static_cast<std::size_t>(n_lmo + d);
+    }
+    d_out[tid] = d_eri_mo[e];
+}
+
 /// V_ovov_pair^{(ij)}[l, k, d, c] = (l, n_lmo+d | k, n_lmo+c).
 /// Output layout: ((l · n_lmo + k) · n_pno + d) · n_pno + c.
 __global__ void extract_V_ovov_kernel(
@@ -341,6 +386,11 @@ Phase24ExtractLayout compute_phase24_extract_layout(
     L.off_W_oovv_lambda      = off; off += L.sz_pno2;
     L.off_W_ovoo_lambda      = off; off += L.sz_ovoo;
     L.off_W_ovoo_lambda_alt  = off; off += L.sz_ovoo;
+    // B-a.6c IP dense-free bare ph-ladder blocks (size n_lmo·n_pno² = sz_W_ovov).
+    L.off_W_ovvo_bare_i      = off; off += L.sz_W_ovov;
+    L.off_W_ovvo_bare_j      = off; off += L.sz_W_ovov;
+    L.off_W_oovv_bare_i      = off; off += L.sz_W_ovov;
+    L.off_W_oovv_bare_j      = off; off += L.sz_W_ovov;
     L.total = off;
     return L;
 }
@@ -443,6 +493,25 @@ void launch_phase24_extract(
                 d_packed_out + layout.off_W_ovoo_lambda,
                 d_packed_out + layout.off_W_ovoo_lambda_alt,
                 n_emb, n_lmo, n_pno, si, sj);
+        }
+    }
+    // B-a.6c IP dense-free bare ph-ladder (ovvo/oovv, i/j roles); each
+    // n_lmo·n_pno² = sz_W_ovov.
+    {
+        const std::size_t n = layout.sz_W_ovov;
+        if (n > 0) {
+            extract_ip_bare_kernel<<<grid_for(n), kBlock, 0, stream>>>(
+                d_eri_mo, d_packed_out + layout.off_W_ovvo_bare_i,
+                n_emb, n_lmo, n_pno, si, /*mode=*/0);
+            extract_ip_bare_kernel<<<grid_for(n), kBlock, 0, stream>>>(
+                d_eri_mo, d_packed_out + layout.off_W_ovvo_bare_j,
+                n_emb, n_lmo, n_pno, sj, /*mode=*/0);
+            extract_ip_bare_kernel<<<grid_for(n), kBlock, 0, stream>>>(
+                d_eri_mo, d_packed_out + layout.off_W_oovv_bare_i,
+                n_emb, n_lmo, n_pno, si, /*mode=*/1);
+            extract_ip_bare_kernel<<<grid_for(n), kBlock, 0, stream>>>(
+                d_eri_mo, d_packed_out + layout.off_W_oovv_bare_j,
+                n_emb, n_lmo, n_pno, sj, /*mode=*/1);
         }
     }
 }

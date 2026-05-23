@@ -259,6 +259,19 @@ struct Phase24Integrals {
     /// is ~150 MB.
     std::vector<std::vector<real_t>> W_ovoo_lambda;     ///< [n_pairs] of [n_pno·nocc]
     std::vector<std::vector<real_t>> W_ovoo_lambda_alt; ///< [n_pairs] of [n_pno·nocc]
+
+    /// B-a.6c IP dense-free bare ph-ladder blocks, per pair (i,j), occ-role I=i/j.
+    /// These are the dense-free seeds of the native DLPNO-IP-EOM per-pair PNO
+    /// Wovvo_pno/Wovov_pno (ip_eom_ccsd_operator.cu:688/:663 bare terms), so the
+    /// dense nocc²·nvir² Wovvo/Wovov is never materialised at 100 atoms:
+    ///   W_ovvo_bare_i[idx][m,a',d'] = (m d'|a' s.i) = eri[m,n_lmo+d',n_lmo+a',s.i]
+    ///   W_oovv_bare_i[idx][m,a',d'] = (m s.i|a' d') = eri[m,s.i,n_lmo+a',n_lmo+d']
+    /// (the _j variants use s.j). Layout (m·n_pno + a')·n_pno + d', m an LMO,
+    /// a',d' in pair (i,j)'s PNO. Size n_pno · nocc · n_pno (= W_ovov shape).
+    std::vector<std::vector<real_t>> W_ovvo_bare_i;     ///< [n_pairs] of [nocc · n_pno²]
+    std::vector<std::vector<real_t>> W_ovvo_bare_j;
+    std::vector<std::vector<real_t>> W_oovv_bare_i;     ///< [n_pairs] of [nocc · n_pno²]
+    std::vector<std::vector<real_t>> W_oovv_bare_j;
 };
 
 /**

@@ -1,0 +1,17 @@
+# H2O / STO-3G  STEOM-CCSD  (FROZEN-CORE = ORCA default; for comparison)
+# Same geometry; only difference vs *_allelec.inp is FrozenCore on.
+# Run:  orca orca_h2o_sto3g_steom_fc.inp > fc.out
+! STEOM-CCSD STO-3G TightSCF FrozenCore
+%mdci
+  NRoots 3
+  DoSTEOM   true
+  OThresh   1e-3
+  VThresh   1e-3
+  PrintLevel 3
+end
+%maxcore 4000
+*xyz 0 1
+  O          0.000        0.000       0.127
+  H          0.000        0.758      -0.509
+  H          0.000      -0.758      -0.509
+*

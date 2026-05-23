@@ -32,6 +32,14 @@ struct DLPNOLMP2Result {
     std::vector<int>       pair_lookup;   ///< pair_lookup[i*nocc+j] = pair index (i,j ↔ j,i)
     std::vector<real_t>    F_LMO;         ///< [nocc × nocc] LMO Fock matrix
     std::vector<real_t>    C_LMO;         ///< [nao  × nocc] LMO coefficients in AO basis (used by CCSD T1 residual)
+    std::vector<real_t>    U_loc;         ///< [nocc × nocc] localization rotation, C_LMO = C_occ · U_loc, element (I_can,i_lmo) at U_loc[I*nocc+i] (bt-PNO-STEOM P5a back-transform). Identity when localizer == "none".
+    /// Per-pair PNO two-electron integral blocks (W_ovov/W_ovvo/W_oooo/T_pair/…)
+    /// required by the native per-pair DLPNO-IP/EA-EOM σ (bt-PNO-STEOM stage B
+    /// (a), see STEOM.md §21.11). Built once during DLPNO-CCSD by
+    /// precompute_phase24_integrals() and normally discarded; copied here only
+    /// on the DLPNO-bt-STEOM collect path (rhf.collect_dlpno_bt()), so plain
+    /// DLPNO-CCSD / non-DLPNO runs leave it default-empty at zero cost.
+    Phase24Integrals       phase24;
     real_t E_pao_total = 0.0;             ///< pre-PNO MP2 (diagnostic)
     real_t E_pno_total = 0.0;             ///< post-PNO converged LMP2
     int    nao = 0;

@@ -1,0 +1,19 @@
+# H2O / STO-3G  STEOM-CCSD  (ALL-ELECTRON, to match the PySCF reference)
+# Geometry = GANSU xyz/H2O.xyz (exact, Angstrom).
+# Goal: extract (1) the STEOM ACTIVE-SPACE orbital list, (2) STEOM energies,
+#       (3) the IP/EA-EOM eigenvalues ORCA used.
+# Run:  orca orca_h2o_sto3g_steom_allelec.inp > allelec.out
+! STEOM-CCSD STO-3G TightSCF NoFrozenCore
+%mdci
+  NRoots 3
+  DoSTEOM   true
+  OThresh   1e-3
+  VThresh   1e-3
+  PrintLevel 4
+end
+%maxcore 4000
+*xyz 0 1
+  O          0.000        0.000       0.127
+  H          0.000        0.758      -0.509
+  H          0.000      -0.758      -0.509
+*

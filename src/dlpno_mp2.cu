@@ -202,6 +202,10 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     // Stash a copy of C_LMO so downstream solvers (CCSD T1 residual) can
     // build occ–vir Fock blocks without re-running the localiser.
     result.C_LMO = loc.C_LMO;
+    // Stash the localization rotation U_loc (C_LMO = C_occ · U_loc) for the
+    // bt-PNO-STEOM P5a back-transform (occupied LMO → canonical step). With
+    // localizer == "none" the localiser returns U = identity.
+    result.U_loc = loc.U;
 
     // F_LMO = U_loc^T · diag(eps_occ) · U_loc.
     std::vector<real_t>& F_LMO = result.F_LMO;

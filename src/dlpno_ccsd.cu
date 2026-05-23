@@ -16,6 +16,7 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <random>
 #include <vector>
 
 #include <chrono>
@@ -23,6 +24,18 @@
 #include <omp.h>
 #endif
 
+#include "bt_pno_backtransform.hpp"  // bt-PNO-STEOM P5a: PNO→canonical back-transform + validation
+#include "ip_eom_ccsd_operator.hpp"   // bt-PNO-STEOM stage B B1b: canonical IP-EOM operator (gate)
+#include "davidson_solver.hpp"        // bt-PNO-STEOM stage B B1b: Davidson (gate)
+#include "dlpno_ip_packing.hpp"       // bt-PNO-STEOM stage B: packed-vector layout
+#include "dlpno_ip_eom_projected_operator.hpp"  // bt-PNO-STEOM stage B B1b: projected operator
+#include "dlpno_ip_eom_native_operator.hpp"      // bt-PNO-STEOM stage B (a) B-a.1: native σ operator
+#include "dlpno_ip_eom_transform.hpp"            // bt-PNO-STEOM stage B (a): in-gate σ2 reference (lift/project)
+#include "ea_eom_ccsd_operator.hpp"              // bt-PNO-STEOM stage B (a): canonical EA-EOM operator (gate)
+#include "dlpno_ea_packing.hpp"                  // bt-PNO-STEOM stage B (a): EA packed-vector layout
+#include "dlpno_ea_eom_projected_operator.hpp"   // bt-PNO-STEOM stage B (a): projected EA operator (gate ref)
+#include "dlpno_ea_eom_native_operator.hpp"      // bt-PNO-STEOM stage B (a): native EA σ operator
+#include "dlpno_ea_eom_transform.hpp"            // bt-PNO-STEOM stage B (a): EA packed↔canonical transform
 #include "ccsd_lambda.hpp"        // transform_density_mo_to_ao_cpu (Sub-phase 3B properties)
 #include "device_host_memory.hpp"
 #include "dlpno_density.hpp"      // build_dlpno_ccsd_1rdm_mo_closedform (Sub-phase 2)
@@ -39,8 +52,21 @@
 #include "rhf.hpp"
 
 #include <cstring> // memcpy
+#include <cstdlib> // std::getenv (bt-PNO P5a.2 validation gate)
 
 namespace gansu {
+
+// Canonical spatial-orbital CCSD (defined in eri_stored.cu) — used by the
+// bt-PNO-STEOM P5a.2 back-transform validation gate as the reference T1/T2.
+real_t ccsd_spatial_orbital(const real_t* d_eri_ao,
+                            const real_t* d_coefficient_matrix,
+                            const real_t* d_orbital_energies,
+                            const int num_basis, const int num_occ,
+                            const bool computing_ccsd_t, real_t* ccsd_t_energy,
+                            real_t** d_t1_out, real_t** d_t2_out,
+                            real_t* d_eri_mo_precomputed,
+                            int num_frozen,
+                            const real_t* h_fov_active);
 
 namespace {
 using RowMatXd = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -140,6 +166,12 @@ inline Phase24Integrals precompute_phase24_integrals(
     // Two orientations needed.
     out.W_ovoo_lambda.assign(n_pairs, {});
     out.W_ovoo_lambda_alt.assign(n_pairs, {});
+    // B-a.6c IP dense-free bare ph-ladder blocks (ovvo/oovv, i/j roles) for the
+    // native DLPNO-IP-EOM σ. Filled below per pair alongside the ovov/ovvo W.
+    out.W_ovvo_bare_i.assign(n_pairs, {});
+    out.W_ovvo_bare_j.assign(n_pairs, {});
+    out.W_oovv_bare_i.assign(n_pairs, {});
+    out.W_oovv_bare_j.assign(n_pairs, {});
 
     // Phase B — multi-GPU pair-parallel integral build.
     //   Detect distributed RI back-end with replicated B; if available,
@@ -299,6 +331,11 @@ inline Phase24Integrals precompute_phase24_integrals(
         copy_block(out.W_oovv_lambda[idx],     layout.off_W_oovv_lambda,     layout.sz_pno2);
         copy_block(out.W_ovoo_lambda[idx],     layout.off_W_ovoo_lambda,     layout.sz_ovoo);
         copy_block(out.W_ovoo_lambda_alt[idx], layout.off_W_ovoo_lambda_alt, layout.sz_ovoo);
+        // B-a.6c IP dense-free bare ph-ladder (size n_lmo·n_pno² = sz_W_ovov).
+        copy_block(out.W_ovvo_bare_i[idx], layout.off_W_ovvo_bare_i, layout.sz_W_ovov);
+        copy_block(out.W_ovvo_bare_j[idx], layout.off_W_ovvo_bare_j, layout.sz_W_ovov);
+        copy_block(out.W_oovv_bare_i[idx], layout.off_W_oovv_bare_i, layout.sz_W_ovov);
+        copy_block(out.W_oovv_bare_j[idx], layout.off_W_oovv_bare_j, layout.sz_W_ovov);
 
         (void)s;  // s used above; suppress -Wunused if conditional.
     }
@@ -690,6 +727,663 @@ real_t DLPNOCCSD::compute_energy()
                   << "\n[DLPNO-CCSD]   E(T1 contribution)  = " << E_T1
                   << "\n[DLPNO-CCSD]   E(total CCSD corr)  = " << E_total
                   << std::endl;
+    }
+
+    // ----------------------------------------------------------------
+    // bt-PNO-STEOM P5a.2 validation gate (env GANSU_DLPNO_BT_VALIDATE=1).
+    // Back-transform the converged DLPNO-CCSD T2/T1 (per-pair PNO basis) to
+    // canonical MO basis and compare element-wise to a canonical CCSD run on
+    // the same RHF reference. At no truncation (full domains, t_cut_pno→0,
+    // t_cut_pairs→0) DLPNO is just a rotation of the canonical space, so the
+    // back-transformed amplitudes must match canonical CCSD to ~1e-6. Off by
+    // default → zero production cost. See STEOM.md §21.4.
+    // ----------------------------------------------------------------
+    const bool bt_validate = [](){ const char* e = std::getenv("GANSU_DLPNO_BT_VALIDATE");
+                                    return e && e[0] == '1'; }();
+    if (bt_validate || rhf_.collect_dlpno_bt()) {
+        {
+            const int num_fc        = rhf_.get_num_frozen_core();
+            const int num_occ_total = nocc_ + num_fc;
+            const int nvir          = nao_ - num_occ_total;
+
+            // Canonical virtual block from the full C [nao × nao] (columns
+            // [num_occ_total, nao) — accounts for frozen core).
+            rhf_.get_coefficient_matrix().toHost();
+            const real_t* C_full = rhf_.get_coefficient_matrix().host_ptr();
+            std::vector<real_t> C_vir(static_cast<size_t>(nao_) * nvir, 0.0);
+            for (int mu = 0; mu < nao_; ++mu)
+                for (int a = 0; a < nvir; ++a)
+                    C_vir[static_cast<size_t>(mu) * nvir + a] =
+                        C_full[static_cast<size_t>(mu) * nao_ + (num_occ_total + a)];
+
+            // PNO → canonical back-transform (T1 from the per-LMO PAO vector).
+            BTAmplitudes bt = bt_pno_to_canonical(
+                res, res.U_loc, C_vir, h_S, nao_, nvir, T1, /*include_t1=*/true);
+
+            // Hybrid DLPNO-STEOM (P5b): hand the canonical amplitudes to the
+            // STEOM driver via the RHF object. (Sets use_dlpno_amplitudes_.)
+            if (rhf_.collect_dlpno_bt()) {
+                rhf_.set_dlpno_bt_amplitudes(bt);
+                // stage B (a): the native per-pair σ reads the converged per-pair
+                // PNO integral blocks. phase24 is still needed below (line ~929,
+                // Λ dressing when compute_density is on), so copy rather than
+                // move. set_dlpno_res copies res by value, so phase24 must be in
+                // place first. Cost is incurred only on the collect path.
+                res.phase24 = phase24;
+                rhf_.set_dlpno_res(res);  // stage B: projected DLPNO-IP/EA needs per-pair PNOs
+            }
+
+            // Canonical-CCSD element-wise comparison (validation only; the
+            // collect path above does not need it). Runs a full canonical CCSD,
+            // so it is skipped unless GANSU_DLPNO_BT_VALIDATE=1.
+            if (bt_validate) {
+            // Canonical CCSD reference on the same RHF (MO ERI from RI B).
+            const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
+            const real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+            real_t* d_mo_eri = eri_.build_mo_eri(d_C, nao_);
+            real_t* d_t1c = nullptr;
+            real_t* d_t2c = nullptr;
+            const real_t E_can = ccsd_spatial_orbital(
+                /*d_eri_ao=*/nullptr, d_C, d_eps, nao_, num_occ_total,
+                /*computing_ccsd_t=*/false, /*ccsd_t_energy=*/nullptr,
+                &d_t1c, &d_t2c, d_mo_eri, num_fc, /*h_fov_active=*/nullptr);
+
+            const size_t t2n = static_cast<size_t>(nocc_) * nocc_ * nvir * nvir;
+            const size_t t1n = static_cast<size_t>(nocc_) * nvir;
+            std::vector<real_t> t2c(t2n), t1c(t1n);
+            cudaMemcpy(t2c.data(), d_t2c, t2n * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(t1c.data(), d_t1c, t1n * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+            real_t max_dt2 = 0.0, nrm_d = 0.0, nrm_ref = 0.0, max_dt1 = 0.0;
+            for (size_t k = 0; k < t2n; ++k) {
+                const real_t d = bt.T2[k] - t2c[k];
+                max_dt2  = std::max(max_dt2, std::fabs(d));
+                nrm_d   += d * d;
+                nrm_ref += t2c[k] * t2c[k];
+            }
+            for (size_t k = 0; k < t1n; ++k)
+                max_dt1 = std::max(max_dt1, std::fabs(bt.T1[k] - t1c[k]));
+            const real_t rel_f =
+                (nrm_ref > 0.0) ? std::sqrt(nrm_d / nrm_ref) : std::sqrt(nrm_d);
+
+            std::cout << "[bt-PNO P5a.2] back-transform vs canonical CCSD  (nocc="
+                      << nocc_ << ", nvir=" << nvir << ", frozen=" << num_fc << ")\n"
+                      << "  E(DLPNO corr)     = " << std::fixed << std::setprecision(10)
+                      << E_total << " Ha\n"
+                      << "  E(canonical CCSD) = " << E_can << " Ha   (ΔE = "
+                      << std::scientific << std::setprecision(3) << (E_total - E_can) << ")\n"
+                      << "  max|ΔT2| = " << max_dt2
+                      << "   ||ΔT2||_F/||T2||_F = " << rel_f
+                      << "   max|ΔT1| = " << max_dt1 << std::endl;
+
+            tracked_cudaFree(d_t1c);
+            tracked_cudaFree(d_t2c);
+            tracked_cudaFree(d_mo_eri);
+            }  // if (bt_validate)
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // bt-PNO-STEOM stage B B1b validation gate (env GANSU_DLPNO_IP_VALIDATE=1).
+    // Build the canonical IP-EOM operator from DLPNO back-transformed T1/T2, run
+    // (i) the canonical IP-EOM Davidson (= P1 reference) and (ii) the Galerkin-
+    // projected DLPNO-IP-EOM Davidson (DLPNOIPEOMProjectedOperator wrapping the
+    // same canonical σ). At no truncation (n_pno=nvir) the projection is a
+    // bijection → the lowest IP roots must match the canonical reference.
+    // Requires --frozen_core none. Off by default → zero production cost.
+    // ----------------------------------------------------------------
+    {
+        const char* ip_env = std::getenv("GANSU_DLPNO_IP_VALIDATE");
+        const bool ip_validate = (ip_env && ip_env[0] == '1');
+        const int num_fc = rhf_.get_num_frozen_core();
+        if (ip_validate && num_fc != 0) {
+            std::cout << "[bt-PNO B1b] IP validate gate requires --frozen_core none; skipping."
+                      << std::endl;
+        } else if (ip_validate) {
+            const int nvir = nao_ - nocc_;
+
+            // Canonical virtual block + back-transformed canonical T1/T2.
+            rhf_.get_coefficient_matrix().toHost();
+            const real_t* C_full = rhf_.get_coefficient_matrix().host_ptr();
+            std::vector<real_t> C_vir(static_cast<size_t>(nao_) * nvir, 0.0);
+            for (int mu = 0; mu < nao_; ++mu)
+                for (int a = 0; a < nvir; ++a)
+                    C_vir[static_cast<size_t>(mu) * nvir + a] =
+                        C_full[static_cast<size_t>(mu) * nao_ + (nocc_ + a)];
+            BTAmplitudes bt = bt_pno_to_canonical(
+                res, res.U_loc, C_vir, h_S, nao_, nvir, T1, /*include_t1=*/true);
+
+            const size_t t1n = static_cast<size_t>(nocc_) * nvir;
+            const size_t t2n = static_cast<size_t>(nocc_) * nocc_ * nvir * nvir;
+            real_t* d_t1 = nullptr;
+            real_t* d_t2 = nullptr;
+            tracked_cudaMalloc(&d_t1, t1n * sizeof(real_t));
+            tracked_cudaMalloc(&d_t2, t2n * sizeof(real_t));
+            cudaMemcpy(d_t1, bt.T1.data(), t1n * sizeof(real_t), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_t2, bt.T2.data(), t2n * sizeof(real_t), cudaMemcpyHostToDevice);
+
+            const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
+            const real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+            real_t* d_mo_eri = eri_.build_mo_eri(d_C, nao_);
+
+            // Canonical IP-EOM operator (takes ownership of d_t1/d_t2).
+            IPEOMCCSDOperator ip_op(d_mo_eri, d_eps, d_t1, d_t2, nocc_, nvir, nao_);
+            tracked_cudaFree(d_mo_eri);
+
+            const int k = std::min(3, ip_op.dimension());
+            DavidsonConfig cfg;
+            cfg.num_eigenvalues       = k;
+            cfg.convergence_threshold = 1e-7;
+            cfg.max_iterations        = 200;
+            cfg.use_preconditioner    = true;
+            cfg.symmetric             = false;
+            cfg.min_eigenvalue        = 0.0;
+            cfg.verbose               = 0;
+
+            // (i) canonical reference roots.
+            cfg.max_subspace_size = std::min(ip_op.dimension(), std::max(80, 20 * k));
+            DavidsonSolver s_can(ip_op, cfg);
+            s_can.solve();
+            std::vector<real_t> eig_can = s_can.get_eigenvalues();
+
+            // (ii) projected DLPNO-IP-EOM roots.
+            rhf_.get_orbital_energies().toHost();
+            const real_t* h_eps = rhf_.get_orbital_energies().host_ptr();
+            std::vector<real_t> eps_o(nocc_);
+            for (int i = 0; i < nocc_; ++i) eps_o[i] = h_eps[i];
+            const DLPNOIPPacking pack = build_ip_packing(res);
+            DLPNOIPEOMProjectedOperator proj_op(
+                ip_op, res, pack, res.U_loc, C_vir, h_S, nao_, nvir, eps_o);
+            DavidsonConfig cfg2 = cfg;
+            cfg2.max_subspace_size = std::min(proj_op.dimension(), std::max(80, 20 * k));
+            DavidsonSolver s_proj(proj_op, cfg2);
+            s_proj.solve();
+            std::vector<real_t> eig_proj = s_proj.get_eigenvalues();
+
+            std::cout << "[bt-PNO B1b] DLPNO-IP-EOM (projected) vs canonical IP-EOM  (nocc="
+                      << nocc_ << ", nvir=" << nvir
+                      << ", packed_dim=" << proj_op.dimension()
+                      << ", canon_dim=" << ip_op.dimension() << ")\n";
+            real_t max_d = 0.0;
+            for (int r = 0; r < k; ++r) {
+                const real_t d = eig_proj[r] - eig_can[r];
+                max_d = std::max(max_d, std::fabs(d));
+                std::cout << "   root " << r << "   canon=" << std::fixed << std::setprecision(8)
+                          << eig_can[r] << "   dlpno=" << eig_proj[r]
+                          << "   Δ=" << std::scientific << std::setprecision(3) << d << "\n";
+            }
+            std::cout << "   max|Δω| = " << std::scientific << std::setprecision(3) << max_d
+                      << "  (no truncation → expect ~Davidson tol; truncation → DLPNO error)"
+                      << std::endl;
+            // ip_op destructor frees d_t1/d_t2.
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // bt-PNO-STEOM stage B (a) B-a.1 native-σ validation gate
+    // (env GANSU_DLPNO_IP_NATIVE_VALIDATE=1). Compares the σ1 (1h) rows of the
+    // native per-pair operator (DLPNOIPEOMNativeOperator) against the validated
+    // project-up reference (DLPNOIPEOMProjectedOperator) on random packed
+    // vectors. At no truncation the two must agree to ~1e-10 on the σ1 block.
+    // (σ2 is diagonal-only in the native operator at B-a.1, so σ2 rows are NOT
+    // compared here — the native σ2 terms and their gates land in B-a.2+.)
+    // Self-contained (rebuilds ip_op/pack); leaves the IP_VALIDATE block above
+    // untouched. Requires --frozen_core none. Off by default → zero prod cost.
+    // ----------------------------------------------------------------
+    {
+        const char* nat_env = std::getenv("GANSU_DLPNO_IP_NATIVE_VALIDATE");
+        const bool nat_validate = (nat_env && nat_env[0] == '1');
+        const int num_fc = rhf_.get_num_frozen_core();
+        if (nat_validate && num_fc != 0) {
+            std::cout << "[bt-PNO B-a.1] native-σ gate requires --frozen_core none; skipping."
+                      << std::endl;
+        } else if (nat_validate) {
+            const int nvir = nao_ - nocc_;
+
+            rhf_.get_coefficient_matrix().toHost();
+            const real_t* C_full = rhf_.get_coefficient_matrix().host_ptr();
+            std::vector<real_t> C_vir(static_cast<size_t>(nao_) * nvir, 0.0);
+            for (int mu = 0; mu < nao_; ++mu)
+                for (int a = 0; a < nvir; ++a)
+                    C_vir[static_cast<size_t>(mu) * nvir + a] =
+                        C_full[static_cast<size_t>(mu) * nao_ + (nocc_ + a)];
+            BTAmplitudes bt = bt_pno_to_canonical(
+                res, res.U_loc, C_vir, h_S, nao_, nvir, T1, /*include_t1=*/true);
+
+            const size_t t1n = static_cast<size_t>(nocc_) * nvir;
+            const size_t t2n = static_cast<size_t>(nocc_) * nocc_ * nvir * nvir;
+            real_t* d_t1 = nullptr;
+            real_t* d_t2 = nullptr;
+            tracked_cudaMalloc(&d_t1, t1n * sizeof(real_t));
+            tracked_cudaMalloc(&d_t2, t2n * sizeof(real_t));
+            cudaMemcpy(d_t1, bt.T1.data(), t1n * sizeof(real_t), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_t2, bt.T2.data(), t2n * sizeof(real_t), cudaMemcpyHostToDevice);
+
+            const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
+            const real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+            real_t* d_mo_eri = eri_.build_mo_eri(d_C, nao_);
+            IPEOMCCSDOperator ip_op(d_mo_eri, d_eps, d_t1, d_t2, nocc_, nvir, nao_);
+            tracked_cudaFree(d_mo_eri);
+
+            // Borrow Lvv (T2) + Wovoo (T1) + Loo (T3/T4) + Woooo (T5) + eri_oovv/t2 (T8)
+            // for the in-gate σ2 reference.
+            std::vector<real_t> h_Lvv(static_cast<size_t>(nvir) * nvir);
+            std::vector<real_t> h_Wovoo(static_cast<size_t>(nocc_) * nvir * nocc_ * nocc_);
+            std::vector<real_t> h_Loo(static_cast<size_t>(nocc_) * nocc_);
+            std::vector<real_t> h_Woooo(static_cast<size_t>(nocc_) * nocc_ * nocc_ * nocc_);
+            std::vector<real_t> h_oovv(static_cast<size_t>(nocc_) * nocc_ * nvir * nvir);
+            std::vector<real_t> h_t2(static_cast<size_t>(nocc_) * nocc_ * nvir * nvir);
+            std::vector<real_t> h_Wovvo(static_cast<size_t>(nocc_) * nvir * nvir * nocc_);
+            std::vector<real_t> h_Wovov(static_cast<size_t>(nocc_) * nvir * nocc_ * nvir);
+            cudaMemcpy(h_Lvv.data(),   ip_op.get_Lvv_device(),   h_Lvv.size()   * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_Wovoo.data(), ip_op.get_Wovoo_device(), h_Wovoo.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_Loo.data(),   ip_op.get_Loo_device(),   h_Loo.size()   * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_Woooo.data(), ip_op.get_Woooo_device(), h_Woooo.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_oovv.data(),  ip_op.get_eri_oovv_device(), h_oovv.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_t2.data(),    ip_op.get_t2_device(),       h_t2.size()   * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_Wovvo.data(), ip_op.get_Wovvo_device(), h_Wovvo.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_Wovov.data(), ip_op.get_Wovov_device(), h_Wovov.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+            rhf_.get_orbital_energies().toHost();
+            const real_t* h_eps = rhf_.get_orbital_energies().host_ptr();
+            std::vector<real_t> eps_o(nocc_);
+            for (int i = 0; i < nocc_; ++i) eps_o[i] = h_eps[i];
+
+            const DLPNOIPPacking pack = build_ip_packing(res);
+            DLPNOIPEOMProjectedOperator proj_op(
+                ip_op, res, pack, res.U_loc, C_vir, h_S, nao_, nvir, eps_o);
+            // Stage 5 multi-GPU: thread the device count into the validation-gate
+            // operator too (the production site eri_stored_ip_eom_ccsd.cu wires it
+            // for stage 2, but this in-process B-a.4 gate is where the multi-GPU
+            // path is actually exercised — stage 2 STEOM needs --num_gpus 1 for
+            // CIS-NTO). Default 1 unless the GPU residency + MULTI env are on.
+            DLPNOIPEOMNativeOperator native_op(
+                ip_op, res, pack, res.U_loc, C_vir, h_S, nao_, nvir, eps_o,
+                rhf_.get_num_gpus());
+
+            const int pdim = pack.total_dim;
+            real_t* d_x  = nullptr;
+            real_t* d_yn = nullptr;
+            real_t* d_yp = nullptr;
+            tracked_cudaMalloc(&d_x,  static_cast<size_t>(pdim) * sizeof(real_t));
+            tracked_cudaMalloc(&d_yn, static_cast<size_t>(pdim) * sizeof(real_t));
+            tracked_cudaMalloc(&d_yp, static_cast<size_t>(pdim) * sizeof(real_t));
+
+            std::mt19937_64 rng(20260522ULL);
+            std::normal_distribution<real_t> gauss(0.0, 1.0);
+            const int n_probe = 3;
+            const size_t vstride = static_cast<size_t>(nvir);
+            real_t max_d1 = 0.0, max_d2 = 0.0, max_dfull = 0.0;
+            std::vector<real_t> x(pdim), yn(pdim), yp(pdim);
+
+            // B-a.6c dressed-path reference: the native dressed ph-ladder works in
+            // PNO space, which inserts the projector P_ij = U^(ij) U^(ij)ᵀ on the
+            // T6/T7 SOURCE amplitude's virtual index (one-sided barS). Full PNO
+            // (P=I) is unreachable — PNOs truncate to the pair-density rank, so U
+            // is never square — so "dressed == (b) at full PNO" is a dead gate.
+            // Instead, when GANSU_DLPNO_NATIVE_DRESSED=1, project the in-gate σ2
+            // reference's T6/T7 sources by P_ij too → native == reference bit-exact
+            // at ANY truncation (validates the PNO restructure + one-sided barS +
+            // occ-role mapping). T2 (own-orientation, exact) and T1/T3/T4/T5/T8
+            // (still dense in the native) need no projection. Note: vfull (native
+            // vs (b) projected) will NOT be ~0 in the dressed case — that is the
+            // genuine truncation difference; the σ2-ref Δ (v2) is the gate.
+            const char* dr_env = std::getenv("GANSU_DLPNO_NATIVE_DRESSED");
+            const bool dressed_ref = (dr_env && dr_env[0] == '1');
+            std::vector<std::vector<real_t>> Ppair;  // [n_pairs] of [nvir²] (P_ij), empty if screened
+            if (dressed_ref) {
+                Eigen::Map<const RowMatXd> Cv(C_vir.data(), nao_, nvir);
+                Eigen::Map<const RowMatXd> Sm(h_S, nao_, nao_);
+                const RowMatXd CvtS = Cv.transpose() * Sm;        // [nvir × nao]
+                const int n_pairs = static_cast<int>(res.pairs.size());
+                Ppair.assign(n_pairs, {});
+                for (int idx = 0; idx < n_pairs; ++idx) {
+                    const int n = pack.n_pno[idx];
+                    if (n == 0) continue;
+                    Eigen::Map<const RowMatXd> barQ(res.pairs[idx].bar_Q.data(), nao_, n);
+                    const RowMatXd U = CvtS * barQ;               // [nvir × n]
+                    const RowMatXd P = U * U.transpose();         // [nvir × nvir]
+                    Ppair[idx].assign(static_cast<size_t>(nvir) * nvir, 0.0);
+                    for (int a = 0; a < nvir; ++a)
+                        for (int b = 0; b < nvir; ++b)
+                            Ppair[idx][static_cast<size_t>(a) * nvir + b] = P(a, b);
+                }
+            }
+
+            for (int t = 0; t < n_probe; ++t) {
+                for (int p = 0; p < pdim; ++p) x[p] = gauss(rng);
+                cudaMemcpy(d_x, x.data(), static_cast<size_t>(pdim) * sizeof(real_t), cudaMemcpyHostToDevice);
+                native_op.apply(d_x, d_yn);
+                proj_op.apply(d_x, d_yp);
+                cudaMemcpy(yn.data(), d_yn, static_cast<size_t>(pdim) * sizeof(real_t), cudaMemcpyDeviceToHost);
+                cudaMemcpy(yp.data(), d_yp, static_cast<size_t>(pdim) * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+                // σ1 (1h): native vs (b) reference (both = canonical σ1 on lifted r2).
+                real_t v1 = 0.0;
+                for (int i = 0; i < nocc_; ++i) v1 = std::max(v1, std::fabs(yn[i] - yp[i]));
+                max_d1 = std::max(max_d1, v1);
+
+                // FULL native σ vs (b) projected reference (all rows). Now that
+                // every σ2 term is implemented, the two operators must agree on
+                // the entire packed vector — the decisive end-to-end gate.
+                real_t vfull = 0.0;
+                for (int p = 0; p < pdim; ++p) vfull = std::max(vfull, std::fabs(yn[p] - yp[p]));
+                max_dfull = std::max(max_dfull, vfull);
+
+                // σ2 terms T1+T2: native vs in-gate reference = project_down of the
+                // canonical (T1+T2) on the lifted r2. Both sides use the same
+                // U^(ij)/Lvv/Wovoo so this is bit-exact even with residual PNO
+                // truncation (validates the native per-pair machinery, the occ
+                // U_loc rotation of Wovoo, offsets, and both orientations).
+                //   T2:  sig2c[I,J,a] += Σ_d Lvv[a,d] r2c[I,J,d]
+                //   T1:  sig2c[I,J,a] += -Σ_k Wovoo[k,a,I,J] r1[k]
+                //   T3:  sig2c[I,J,a] += -Σ_K Loo[K,I] r2c[K,J,a]
+                //   T4:  sig2c[I,J,a] += -Σ_L Loo[L,J] r2c[I,L,a]
+                //   T5:  sig2c[I,J,a] += +Σ_KL Woooo[K,L,I,J] r2c[K,L,a]
+                //   T8:  tmp_c[c]      =  Σ_KLD (2 oovv[L,K,D,c]-oovv[K,L,D,c]) r2c[K,L,D]
+                //        sig2c[I,J,a] += -Σ_c tmp_c[c] t2[I,J,c,a]
+                const real_t* r1 = x.data();   // canonical 1h block
+                std::vector<real_t> packed_r2(x.begin() + nocc_, x.end());
+                std::vector<real_t> r2c = ip_packed_r2_to_canonical(
+                    res, pack, res.U_loc, C_vir, h_S, nao_, nvir, packed_r2);
+                std::vector<real_t> tmp_c(nvir, 0.0);
+                for (int K = 0; K < nocc_; ++K)
+                    for (int L = 0; L < nocc_; ++L)
+                        for (int D = 0; D < nvir; ++D) {
+                            const real_t r = r2c[(static_cast<size_t>(K) * nocc_ + L) * vstride + D];
+                            for (int c = 0; c < nvir; ++c)
+                                tmp_c[c] += (2.0 * h_oovv[((static_cast<size_t>(L) * nocc_ + K) * nvir + D) * nvir + c]
+                                                 - h_oovv[((static_cast<size_t>(K) * nocc_ + L) * nvir + D) * nvir + c]) * r;
+                        }
+                std::vector<real_t> sig2c(r2c.size(), 0.0);
+                #pragma omp parallel for
+                for (int IJ = 0; IJ < nocc_ * nocc_; ++IJ) {
+                    const int I = IJ / nocc_, J = IJ % nocc_;
+                    // Dressed: project the ph-ladder T6/T7 sources by P_ij (see
+                    // the Ppair note above) so the reference matches the native
+                    // PNO-space ph-ladder bit-exact at any truncation.
+                    const int idx_t = dressed_ref
+                        ? res.pair_lookup[static_cast<size_t>(I) * nocc_ + J] : -1;
+                    const bool proj = (idx_t >= 0 && !Ppair[idx_t].empty());
+                    std::vector<real_t> Pr_Im, Pr_mI, Pr_mJ;  // [nocc·nvir], filled iff proj
+                    if (proj) {
+                        const real_t* P = Ppair[idx_t].data();
+                        Pr_Im.assign(static_cast<size_t>(nocc_) * nvir, 0.0);
+                        Pr_mI.assign(static_cast<size_t>(nocc_) * nvir, 0.0);
+                        Pr_mJ.assign(static_cast<size_t>(nocc_) * nvir, 0.0);
+                        for (int m = 0; m < nocc_; ++m)
+                            for (int d = 0; d < nvir; ++d) {
+                                real_t sIm = 0.0, smI = 0.0, smJ = 0.0;
+                                for (int e = 0; e < nvir; ++e) {
+                                    const real_t p = P[static_cast<size_t>(d) * nvir + e];
+                                    sIm += p * r2c[(static_cast<size_t>(I) * nocc_ + m) * vstride + e];
+                                    smI += p * r2c[(static_cast<size_t>(m) * nocc_ + I) * vstride + e];
+                                    smJ += p * r2c[(static_cast<size_t>(m) * nocc_ + J) * vstride + e];
+                                }
+                                Pr_Im[static_cast<size_t>(m) * nvir + d] = sIm;
+                                Pr_mI[static_cast<size_t>(m) * nvir + d] = smI;
+                                Pr_mJ[static_cast<size_t>(m) * nvir + d] = smJ;
+                            }
+                    }
+                    for (int a = 0; a < nvir; ++a) {
+                        real_t s = 0.0;
+                        for (int d = 0; d < nvir; ++d)            // T2
+                            s += h_Lvv[static_cast<size_t>(a) * nvir + d]
+                                 * r2c[static_cast<size_t>(IJ) * vstride + d];
+                        for (int k = 0; k < nocc_; ++k)           // T1
+                            s -= h_Wovoo[(static_cast<size_t>(k) * nvir + a) * nocc_ * nocc_
+                                         + static_cast<size_t>(I) * nocc_ + J] * r1[k];
+                        for (int K = 0; K < nocc_; ++K)           // T3
+                            s -= h_Loo[static_cast<size_t>(K) * nocc_ + I]
+                                 * r2c[(static_cast<size_t>(K) * nocc_ + J) * vstride + a];
+                        for (int L = 0; L < nocc_; ++L)           // T4
+                            s -= h_Loo[static_cast<size_t>(L) * nocc_ + J]
+                                 * r2c[(static_cast<size_t>(I) * nocc_ + L) * vstride + a];
+                        for (int K = 0; K < nocc_; ++K)           // T5
+                            for (int L = 0; L < nocc_; ++L)
+                                s += h_Woooo[((static_cast<size_t>(K) * nocc_ + L) * nocc_
+                                             + I) * nocc_ + J]
+                                     * r2c[(static_cast<size_t>(K) * nocc_ + L) * vstride + a];
+                        for (int c = 0; c < nvir; ++c)            // T8b
+                            s -= tmp_c[c] * h_t2[((static_cast<size_t>(I) * nocc_ + J) * nvir + c) * nvir + a];
+                        for (int m = 0; m < nocc_; ++m)           // T6/T7 (ph-ladder)
+                            for (int d = 0; d < nvir; ++d) {
+                                const real_t r_Im = proj ? Pr_Im[static_cast<size_t>(m) * nvir + d]
+                                    : r2c[(static_cast<size_t>(I) * nocc_ + m) * vstride + d];
+                                const real_t r_mI = proj ? Pr_mI[static_cast<size_t>(m) * nvir + d]
+                                    : r2c[(static_cast<size_t>(m) * nocc_ + I) * vstride + d];
+                                const real_t r_mJ = proj ? Pr_mJ[static_cast<size_t>(m) * nvir + d]
+                                    : r2c[(static_cast<size_t>(m) * nocc_ + J) * vstride + d];
+                                s += h_Wovvo[((static_cast<size_t>(m) * nvir + a) * nvir + d) * nocc_ + J]
+                                     * (2.0 * r_Im - r_mI);                         // T6
+                                s -= h_Wovov[((static_cast<size_t>(m) * nvir + a) * nocc_ + J) * nvir + d] * r_Im;  // T7 first
+                                s -= h_Wovov[((static_cast<size_t>(m) * nvir + a) * nocc_ + I) * nvir + d] * r_mJ;  // T7 second
+                            }
+                        sig2c[static_cast<size_t>(IJ) * vstride + a] = s;
+                    }
+                }
+                std::vector<real_t> ref_packed = ip_canonical_r2_to_packed(
+                    res, pack, res.U_loc, C_vir, h_S, nao_, nvir, sig2c);
+                real_t v2 = 0.0;
+                for (int p = 0; p < pdim - nocc_; ++p)
+                    v2 = std::max(v2, std::fabs(yn[nocc_ + p] - ref_packed[p]));
+                max_d2 = std::max(max_d2, v2);
+
+                std::cout << "[bt-PNO B-a.4]   probe " << t
+                          << "  max|Δσ_full(native vs projected)| = "
+                          << std::scientific << std::setprecision(3) << vfull
+                          << "  (σ2 in-gate ref Δ = " << v2 << ")\n";
+            }
+            std::cout << "[bt-PNO B-a.4] FULL native-σ vs (b) projected reference  (nocc=" << nocc_
+                      << ", nvir=" << nvir << ", packed_dim=" << pdim
+                      << ")  max|Δσ_full| = " << std::scientific << std::setprecision(3) << max_dfull
+                      << "  (σ1 Δ=" << max_d1 << ", σ2-ref Δ=" << max_d2 << ")" << std::endl;
+            if (dressed_ref)
+                std::cout << "[bt-PNO B-a.6c] DRESSED gate (localizer none): the bit-exact metric is "
+                             "σ2-ref Δ = " << std::scientific << std::setprecision(3) << max_d2
+                          << " (in-gate ref P-projects the T6/T7 sources by P_ij; expect ~1e-13). "
+                             "max|Δσ_full| vs (b) = " << max_dfull << " is the GENUINE PNO truncation "
+                             "difference (P≠I), NOT a gate." << std::endl;
+            else
+                std::cout << "  (all σ1+σ2 terms; expect ~1e-12)" << std::endl;
+
+            tracked_cudaFree(d_x);
+            tracked_cudaFree(d_yn);
+            tracked_cudaFree(d_yp);
+            // ip_op destructor frees d_t1/d_t2.
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // bt-PNO-STEOM stage B (a) B-EA.1 native-σ validation gate
+    // (env GANSU_DLPNO_EA_NATIVE_VALIDATE=1). Compares the σ1 (1p) rows of the
+    // native per-pair EA operator (DLPNOEAEOMNativeOperator) against the
+    // projected reference on random packed vectors. (σ2 is diagonal-only at
+    // B-EA.1, not compared.) Self-contained; requires --frozen_core none.
+    // ----------------------------------------------------------------
+    {
+        const char* nat_env = std::getenv("GANSU_DLPNO_EA_NATIVE_VALIDATE");
+        const bool nat_validate = (nat_env && nat_env[0] == '1');
+        const int num_fc = rhf_.get_num_frozen_core();
+        if (nat_validate && num_fc != 0) {
+            std::cout << "[bt-PNO B-EA.1] native-σ gate requires --frozen_core none; skipping."
+                      << std::endl;
+        } else if (nat_validate) {
+            const int nvir = nao_ - nocc_;
+
+            rhf_.get_coefficient_matrix().toHost();
+            const real_t* C_full = rhf_.get_coefficient_matrix().host_ptr();
+            std::vector<real_t> C_vir(static_cast<size_t>(nao_) * nvir, 0.0);
+            for (int mu = 0; mu < nao_; ++mu)
+                for (int a = 0; a < nvir; ++a)
+                    C_vir[static_cast<size_t>(mu) * nvir + a] =
+                        C_full[static_cast<size_t>(mu) * nao_ + (nocc_ + a)];
+            BTAmplitudes bt = bt_pno_to_canonical(
+                res, res.U_loc, C_vir, h_S, nao_, nvir, T1, /*include_t1=*/true);
+
+            const size_t t1n = static_cast<size_t>(nocc_) * nvir;
+            const size_t t2n = static_cast<size_t>(nocc_) * nocc_ * nvir * nvir;
+            real_t* d_t1 = nullptr;
+            real_t* d_t2 = nullptr;
+            tracked_cudaMalloc(&d_t1, t1n * sizeof(real_t));
+            tracked_cudaMalloc(&d_t2, t2n * sizeof(real_t));
+            cudaMemcpy(d_t1, bt.T1.data(), t1n * sizeof(real_t), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_t2, bt.T2.data(), t2n * sizeof(real_t), cudaMemcpyHostToDevice);
+
+            const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
+            const real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+            real_t* d_mo_eri = eri_.build_mo_eri(d_C, nao_);
+            EAEOMCCSDOperator ea_op(d_mo_eri, d_eps, d_t1, d_t2, nocc_, nvir, nao_);
+            tracked_cudaFree(d_mo_eri);
+
+            // Borrow Lvv (T_Lvv) + Wvvvo (T_r1) + Loo/Wovvo/Wovov (cross-pair) for
+            // the in-gate σ2 reference.
+            std::vector<real_t> h_Lvv(static_cast<size_t>(nvir) * nvir);
+            std::vector<real_t> h_Wvvvo(static_cast<size_t>(nvir) * nvir * nvir * nocc_);
+            std::vector<real_t> h_Loo(static_cast<size_t>(nocc_) * nocc_);
+            std::vector<real_t> h_Wovvo(static_cast<size_t>(nocc_) * nvir * nvir * nocc_);
+            std::vector<real_t> h_Wovov(static_cast<size_t>(nocc_) * nvir * nocc_ * nvir);
+            cudaMemcpy(h_Lvv.data(),   ea_op.get_Lvv_device(),   h_Lvv.size()   * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_Wvvvo.data(), ea_op.get_Wvvvo_device(), h_Wvvvo.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+            std::vector<real_t> h_ovov(static_cast<size_t>(nocc_) * nvir * nocc_ * nvir);
+            std::vector<real_t> h_t2(static_cast<size_t>(nocc_) * nocc_ * nvir * nvir);
+            std::vector<real_t> h_Wvvvv(static_cast<size_t>(nvir) * nvir * nvir * nvir);
+            cudaMemcpy(h_Loo.data(),   ea_op.get_Loo_device(),   h_Loo.size()   * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_Wovvo.data(), ea_op.get_Wovvo_device(), h_Wovvo.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_Wovov.data(), ea_op.get_Wovov_device(), h_Wovov.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_ovov.data(),  ea_op.get_eri_ovov_device(), h_ovov.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_t2.data(),    ea_op.get_t2_device(),       h_t2.size()   * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_Wvvvv.data(), ea_op.get_Wvvvv_device(),    h_Wvvvv.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+            rhf_.get_orbital_energies().toHost();
+            const real_t* h_eps = rhf_.get_orbital_energies().host_ptr();
+            std::vector<real_t> eps_v(nvir);
+            for (int a = 0; a < nvir; ++a) eps_v[a] = h_eps[nocc_ + a];
+
+            const DLPNOEAPacking pack = build_ea_packing(res);
+            DLPNOEAEOMProjectedOperator proj_op(
+                ea_op, res, pack, res.U_loc, C_vir, h_S, nao_, eps_v);
+            // Stage 5 multi-GPU: thread the device count into the validation-gate
+            // operator too (mirror of the IP B-a.4 gate above; the production site
+            // eri_stored_ea_eom_ccsd.cu wires stage 2, but this in-process B-EA.4
+            // gate is where the multi-GPU path is actually exercised).
+            DLPNOEAEOMNativeOperator native_op(
+                ea_op, res, pack, res.U_loc, C_vir, h_S, nao_, nvir, eps_v,
+                rhf_.get_num_gpus());
+
+            const int pdim = pack.total_dim;
+            real_t* d_x  = nullptr;
+            real_t* d_yn = nullptr;
+            real_t* d_yp = nullptr;
+            tracked_cudaMalloc(&d_x,  static_cast<size_t>(pdim) * sizeof(real_t));
+            tracked_cudaMalloc(&d_yn, static_cast<size_t>(pdim) * sizeof(real_t));
+            tracked_cudaMalloc(&d_yp, static_cast<size_t>(pdim) * sizeof(real_t));
+
+            std::mt19937_64 rng(20260522ULL);
+            std::normal_distribution<real_t> gauss(0.0, 1.0);
+            const int n_probe = 3;
+            const size_t vstride = static_cast<size_t>(nvir);
+            real_t max_d1 = 0.0, max_d2 = 0.0, max_dfull = 0.0;
+            std::vector<real_t> x(pdim), yn(pdim), yp(pdim);
+            for (int t = 0; t < n_probe; ++t) {
+                for (int p = 0; p < pdim; ++p) x[p] = gauss(rng);
+                cudaMemcpy(d_x, x.data(), static_cast<size_t>(pdim) * sizeof(real_t), cudaMemcpyHostToDevice);
+                native_op.apply(d_x, d_yn);
+                proj_op.apply(d_x, d_yp);
+                cudaMemcpy(yn.data(), d_yn, static_cast<size_t>(pdim) * sizeof(real_t), cudaMemcpyDeviceToHost);
+                cudaMemcpy(yp.data(), d_yp, static_cast<size_t>(pdim) * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+                // σ1 (1p): native vs (b) reference.
+                real_t v1 = 0.0;
+                for (int a = 0; a < nvir; ++a) v1 = std::max(v1, std::fabs(yn[a] - yp[a]));
+                max_d1 = std::max(max_d1, v1);
+
+                // FULL native σ vs (b) projected reference (all rows) — native σ
+                // is now complete (σ1 + all σ2 terms), so the two must agree.
+                real_t vfull = 0.0;
+                for (int p = 0; p < pdim; ++p) vfull = std::max(vfull, std::fabs(yn[p] - yp[p]));
+                max_dfull = std::max(max_dfull, vfull);
+
+                // σ2 terms T_Lvv + T_r1: native vs in-gate reference = project_down of
+                // the canonical (T_Lvv + T_r1) on the lifted r2. Same U^(ii)/Lvv/Wvvvo
+                // ⇒ bit-exact even with PNO truncation. r2c layout (J*nvir+a)*nvir+b.
+                //   T_Lvv_a: sig2c[J,a,b] += Σ_c Lvv[a,c] r2c[J,c,b]
+                //   T_Lvv_b: sig2c[J,a,b] += Σ_d Lvv[b,d] r2c[J,a,d]
+                //   T_r1   : sig2c[J,a,b] += Σ_c Wvvvo[a,b,c,J] r1[c]
+                const real_t* r1 = x.data();   // canonical 1p block
+                std::vector<real_t> packed_r2(x.begin() + nvir, x.end());
+                std::vector<real_t> r2c = ea_packed_r2_to_canonical(
+                    res, pack, res.U_loc, C_vir, h_S, nao_, packed_r2);
+                // T_tmp pre-stage: tmp[K] = Σ_{l,C,D}(2 ovov[K,C,l,D]-ovov[K,D,l,C]) r2c[l,C,D]
+                std::vector<real_t> tmp(nocc_, 0.0);
+                for (int K = 0; K < nocc_; ++K) {
+                    real_t s = 0.0;
+                    for (int l = 0; l < nocc_; ++l)
+                        for (int c = 0; c < nvir; ++c)
+                            for (int d = 0; d < nvir; ++d)
+                                s += (2.0 * h_ovov[((static_cast<size_t>(K) * nvir + c) * nocc_ + l) * nvir + d]
+                                          - h_ovov[((static_cast<size_t>(K) * nvir + d) * nocc_ + l) * nvir + c])
+                                     * r2c[(static_cast<size_t>(l) * nvir + c) * vstride + d];
+                    tmp[K] = s;
+                }
+                std::vector<real_t> sig2c(r2c.size(), 0.0);
+                #pragma omp parallel for
+                for (int J = 0; J < nocc_; ++J)
+                    for (int a = 0; a < nvir; ++a)
+                        for (int b = 0; b < nvir; ++b) {
+                            real_t s = 0.0;
+                            for (int c = 0; c < nvir; ++c)            // T_Lvv_a + T_Lvv_b
+                                s += h_Lvv[static_cast<size_t>(a) * nvir + c]
+                                     * r2c[(static_cast<size_t>(J) * nvir + c) * vstride + b]
+                                   + h_Lvv[static_cast<size_t>(b) * nvir + c]
+                                     * r2c[(static_cast<size_t>(J) * nvir + a) * vstride + c];
+                            for (int c = 0; c < nvir; ++c)            // T_r1
+                                s += h_Wvvvo[((static_cast<size_t>(a) * nvir + b) * nvir + c) * nocc_ + J] * r1[c];
+                            for (int l = 0; l < nocc_; ++l) {        // cross-pair (Loo + ph-ladder)
+                                s -= h_Loo[static_cast<size_t>(l) * nocc_ + J]
+                                     * r2c[(static_cast<size_t>(l) * nvir + a) * vstride + b];   // T_Loo
+                                for (int d = 0; d < nvir; ++d)        // T_ph1
+                                    s += (2.0 * h_Wovvo[((static_cast<size_t>(l) * nvir + b) * nvir + d) * nocc_ + J]
+                                              - h_Wovov[((static_cast<size_t>(l) * nvir + b) * nocc_ + J) * nvir + d])
+                                         * r2c[(static_cast<size_t>(l) * nvir + a) * vstride + d];
+                                for (int c = 0; c < nvir; ++c)        // T_ph2
+                                    s -= h_Wovov[((static_cast<size_t>(l) * nvir + a) * nocc_ + J) * nvir + c]
+                                         * r2c[(static_cast<size_t>(l) * nvir + c) * vstride + b];
+                                for (int c = 0; c < nvir; ++c)        // T_ph3
+                                    s -= h_Wovvo[((static_cast<size_t>(l) * nvir + b) * nvir + c) * nocc_ + J]
+                                         * r2c[(static_cast<size_t>(l) * nvir + c) * vstride + a];
+                            }
+                            for (int K = 0; K < nocc_; ++K)          // T_tmp
+                                s -= tmp[K] * h_t2[((static_cast<size_t>(K) * nocc_ + J) * nvir + a) * nvir + b];
+                            for (int c = 0; c < nvir; ++c)           // T_vvvv
+                                for (int d = 0; d < nvir; ++d)
+                                    s += h_Wvvvv[((static_cast<size_t>(a) * nvir + b) * nvir + c) * nvir + d]
+                                         * r2c[(static_cast<size_t>(J) * nvir + c) * vstride + d];
+                            sig2c[(static_cast<size_t>(J) * nvir + a) * vstride + b] = s;
+                        }
+                std::vector<real_t> ref_packed = ea_canonical_r2_to_packed(
+                    res, pack, res.U_loc, C_vir, h_S, nao_, sig2c);
+                real_t v2 = 0.0;
+                for (int p = 0; p < pdim - nvir; ++p)
+                    v2 = std::max(v2, std::fabs(yn[nvir + p] - ref_packed[p]));
+                max_d2 = std::max(max_d2, v2);
+
+                std::cout << "[bt-PNO B-EA.4]   probe " << t
+                          << "  max|Δσ_full(native vs projected)| = "
+                          << std::scientific << std::setprecision(3) << vfull
+                          << "  (σ2 in-gate ref Δ = " << v2 << ")\n";
+            }
+            std::cout << "[bt-PNO B-EA.4] FULL native-σ vs (b) projected reference  (nocc=" << nocc_
+                      << ", nvir=" << nvir << ", packed_dim=" << pdim
+                      << ")  max|Δσ_full| = " << std::scientific << std::setprecision(3) << max_dfull
+                      << "  (σ1 Δ=" << max_d1 << ", σ2-ref Δ=" << max_d2
+                      << ")  (all σ1+σ2 terms; expect ~1e-12)" << std::endl;
+
+            tracked_cudaFree(d_x);
+            tracked_cudaFree(d_yn);
+            tracked_cudaFree(d_yp);
+            // ea_op destructor frees d_t1/d_t2.
+        }
     }
 
     // ----------------------------------------------------------------

@@ -317,6 +317,8 @@ void RHF::post_process_after_scf() {
         eri_method_->compute_ea_eom_ccsd(get_n_excited_states());
     }else if(post_hf_method == PostHFMethod::STEOM_CCSD){
         eri_method_->compute_steom_ccsd(get_n_excited_states());
+    }else if(post_hf_method == PostHFMethod::DLPNO_STEOM_CCSD){
+        eri_method_->compute_dlpno_steom_ccsd(get_n_excited_states());
     }else{
         THROW_EXCEPTION("Invalid post-HF method.");
     }
@@ -1106,6 +1108,7 @@ void RHF::report() {
             case PostHFMethod::IP_EOM_CCSD:   method_name = "IP-EOM-CCSD (bt-PNO-STEOM P1)"; break;
             case PostHFMethod::EA_EOM_CCSD:   method_name = "EA-EOM-CCSD (bt-PNO-STEOM P2)"; break;
             case PostHFMethod::STEOM_CCSD:    method_name = "STEOM-CCSD (bt-PNO-STEOM P3)"; break;
+            case PostHFMethod::DLPNO_STEOM_CCSD: method_name = "DLPNO-STEOM-CCSD (hybrid bt-PNO-STEOM P5b)"; break;
             case PostHFMethod::None:          method_name = "(none)"; break;
         }
         std::cout << "Post-HF method: " << method_name << std::endl;

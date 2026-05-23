@@ -49,7 +49,8 @@ enum class PostHFMethod {
     CIS_NTO,      // State-averaged CIS natural-transition-orbital active space (bt-PNO-STEOM Phase P0)
     IP_EOM_CCSD,  // Ionization-potential EOM-CCSD (bt-PNO-STEOM Phase P1, building block for ̂S^IP)
     EA_EOM_CCSD,  // Electron-affinity EOM-CCSD (bt-PNO-STEOM Phase P2, building block for ̂S^EA)
-    STEOM_CCSD    // Similarity Transformed EOM-CCSD (bt-PNO-STEOM Phase P3; auto-runs CIS_NTO + IP-EOM + EA-EOM as prerequisites)
+    STEOM_CCSD,   // Similarity Transformed EOM-CCSD (bt-PNO-STEOM Phase P3; auto-runs CIS_NTO + IP-EOM + EA-EOM as prerequisites)
+    DLPNO_STEOM_CCSD // Hybrid bt-PNO-STEOM (Phase P5b): DLPNO-CCSD ground state back-transformed to canonical, fed to canonical IP/EA/STEOM
 };
 
 } // namespace gansu
