@@ -34,6 +34,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
 #include <numeric>
 #include <Eigen/Dense>
 
@@ -563,6 +564,37 @@ inline void launch_eri_ri_transpose_b_tmp(
     eri_ri_transpose_b_tmp_per_aux_kernel<<<grid, block, 0, stream>>>(
         d_in, d_out, naux, nmo, nao);
 }
+
+// Phase 0 — gather one (P,Q) sub-block of B_mo (naux, nmo, nmo) row-major into a
+// contiguous half-matrix d_half (naux, pn, qn) row-major:
+//   d_half[aux, pl, ql] = B_mo[aux, p0+pl, q0+ql]
+// d_half is the (naux × pn*qn) operand for the per-block B_mo^T·B_mo DGEMM.
+__global__ void eri_ri_gather_bmo_block_kernel(
+    const real_t* __restrict__ d_B_mo,
+    real_t*       __restrict__ d_half,
+    int naux, int nmo, int p0, int pn, int q0, int qn)
+{
+    const int aux = blockIdx.z;
+    const int pl  = blockIdx.y * blockDim.y + threadIdx.y;
+    const int ql  = blockIdx.x * blockDim.x + threadIdx.x;
+    if (aux >= naux || pl >= pn || ql >= qn) return;
+    const size_t in_off  = ((size_t)aux * nmo + (p0 + pl)) * (size_t)nmo + (q0 + ql);
+    const size_t out_off = ((size_t)aux * pn + pl) * (size_t)qn + ql;
+    d_half[out_off] = d_B_mo[in_off];
+}
+inline void launch_eri_ri_gather_bmo_block(
+    const real_t* d_B_mo, real_t* d_half, int naux, int nmo,
+    int p0, int pn, int q0, int qn, cudaStream_t stream)
+{
+    constexpr int TILE_X = 32;
+    constexpr int TILE_Y = 8;
+    dim3 block(TILE_X, TILE_Y, 1);
+    dim3 grid((qn + TILE_X - 1) / TILE_X,
+              (pn + TILE_Y - 1) / TILE_Y,
+              naux);
+    eri_ri_gather_bmo_block_kernel<<<grid, block, 0, stream>>>(
+        d_B_mo, d_half, naux, nmo, p0, pn, q0, qn);
+}
 } // anonymous namespace
 #endif // !GANSU_CPU_ONLY
 
@@ -751,6 +783,209 @@ void ERI_RI::build_mo_eri_into(const real_t* d_C, int nmo,
                   << (nmo2 * nmo2 * sizeof(real_t)) / (1024*1024) << " MB"
                   << " (skipped nao^4 = " << ((size_t)nao*nao*nao*nao*sizeof(real_t))/(1024*1024) << " MB)" << std::endl;
     }
+
+    // Phase 0 self-check (env GANSU_MO_ERI_BLOCK_VALIDATE): confirm the on-the-fly
+    // block builder (build_B_mo + mo_eri_block_into) reproduces an arbitrary
+    // sub-block of this full tensor bit-exactly, before any operator is rewired.
+#ifndef GANSU_CPU_ONLY
+    if (std::getenv("GANSU_MO_ERI_BLOCK_VALIDATE")) {
+        auto ext = [&](int off, int want){ return std::max(0, std::min(want, nmo - off)); };
+        const int p0 = 0,                 q0 = (nmo > 2 ? 1 : 0);
+        const int r0 = (nmo > 3 ? 2 : 0),  s0 = (nmo > 4 ? 3 : 0);
+        const int pn = ext(p0, 5), qn = ext(q0, 4), rn = ext(r0, 3), sn = ext(s0, 6);
+        if (pn && qn && rn && sn) {
+            const size_t blk = (size_t)pn * qn * rn * sn;
+            real_t* d_blk = nullptr;
+            tracked_cudaMalloc(&d_blk, blk * sizeof(real_t));
+            const real_t* d_B_mo2 = build_B_mo(d_C, nmo);   // thread-local cached
+            mo_eri_block_into(d_B_mo2, nmo, p0, pn, q0, qn, r0, rn, s0, sn, d_blk);
+            std::vector<real_t> h_blk(blk), h_full(nmo2 * nmo2);
+            cudaMemcpy(h_blk.data(),  d_blk,     blk * sizeof(real_t),         cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_full.data(), d_eri_out, nmo2 * nmo2 * sizeof(real_t), cudaMemcpyDeviceToHost);
+            double maxdiff = 0.0;
+            for (int p = 0; p < pn; ++p)
+            for (int q = 0; q < qn; ++q)
+            for (int r = 0; r < rn; ++r)
+            for (int s = 0; s < sn; ++s) {
+                const size_t bi = (((size_t)p * qn + q) * rn + r) * sn + s;
+                const size_t fi = (((size_t)(p0+p) * nmo + (q0+q)) * nmo + (r0+r)) * (size_t)nmo + (s0+s);
+                maxdiff = std::max(maxdiff, std::fabs((double)h_blk[bi] - (double)h_full[fi]));
+            }
+            std::cout << "[Phase0 MO-ERI block self-check] block(" << pn << "x" << qn
+                      << "|" << rn << "x" << sn << ") off(" << p0 << "," << q0 << ","
+                      << r0 << "," << s0 << ") max|Δ| vs full = " << maxdiff
+                      << "  (expect 0)" << std::endl;
+            tracked_cudaFree(d_blk);
+        }
+    }
+#endif
+}
+
+// Phase 0 — build only the half-transformed B_mo (naux × nmo², the intermediate
+// of build_mo_eri_into) and return a thread-local cached device pointer. Steps
+// 1-2 are intentionally duplicated from build_mo_eri_into (rather than refactored
+// in place) so the validated full-tensor path stays byte-for-byte unchanged.
+const real_t* ERI_RI::build_B_mo(const real_t* d_C, int nmo) const {
+#ifdef GANSU_CPU_ONLY
+    (void)d_C; (void)nmo;
+    return nullptr;
+#else
+    if (!gpu::gpu_available()) return nullptr;
+    // P4b: delegate to the explicit-source helper, passing the replicated full
+    // B for non-distributed RI (intermediate_matrix_B_ on the current device).
+    return build_B_mo_impl(intermediate_matrix_B_.device_ptr(), d_C, nmo);
+#endif
+}
+
+// P4b — workhorse: build B_mo from a caller-supplied AO-basis B pointer. Used
+// by ERI_RI::build_B_mo with intermediate_matrix_B_, and by the distributed
+// override with d_B_full_per_gpu_[curr_dev] (after replicate_B_to_all_gpus()).
+const real_t* ERI_RI::build_B_mo_impl(const real_t* d_B_ao_src,
+                                      const real_t* d_C, int nmo) const {
+#ifdef GANSU_CPU_ONLY
+    (void)d_B_ao_src; (void)d_C; (void)nmo;
+    return nullptr;
+#else
+    if (!gpu::gpu_available() || !d_B_ao_src) return nullptr;
+
+    const int nao  = num_basis_;
+    const int naux = num_auxiliary_basis_;
+    const size_t nmo2 = (size_t)nmo * nmo;
+
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    const double alpha = 1.0, beta = 0.0;
+
+    static thread_local real_t* ws_B_tmp       = nullptr;
+    static thread_local real_t* ws_B_tmp2      = nullptr;
+    static thread_local real_t* ws_B_mo        = nullptr;
+    static thread_local size_t  ws_B_tmp_bytes = 0;
+    static thread_local size_t  ws_B_mo_bytes  = 0;
+    static thread_local int     ws_device      = -1;
+
+    int curr_dev = 0;
+    cudaGetDevice(&curr_dev);
+    const size_t need_B_tmp_bytes = (size_t)naux * nao * nmo * sizeof(real_t);
+    const size_t need_B_mo_bytes  = (size_t)naux * nmo2 * sizeof(real_t);
+
+    if (curr_dev != ws_device) {
+        if (ws_device >= 0 && (ws_B_tmp || ws_B_tmp2 || ws_B_mo)) {
+            const int saved = curr_dev;
+            cudaSetDevice(ws_device);
+            if (ws_B_tmp)  { tracked_cudaFree(ws_B_tmp);  ws_B_tmp  = nullptr; }
+            if (ws_B_tmp2) { tracked_cudaFree(ws_B_tmp2); ws_B_tmp2 = nullptr; }
+            if (ws_B_mo)   { tracked_cudaFree(ws_B_mo);   ws_B_mo   = nullptr; }
+            ws_B_tmp_bytes = 0;
+            ws_B_mo_bytes  = 0;
+            cudaSetDevice(saved);
+        }
+        ws_device = curr_dev;
+    }
+    if (need_B_tmp_bytes > ws_B_tmp_bytes) {
+        if (ws_B_tmp)  { tracked_cudaFree(ws_B_tmp);  ws_B_tmp  = nullptr; }
+        if (ws_B_tmp2) { tracked_cudaFree(ws_B_tmp2); ws_B_tmp2 = nullptr; }
+        tracked_cudaMalloc(&ws_B_tmp,  need_B_tmp_bytes);
+        tracked_cudaMalloc(&ws_B_tmp2, need_B_tmp_bytes);
+        ws_B_tmp_bytes = need_B_tmp_bytes;
+    }
+    if (need_B_mo_bytes > ws_B_mo_bytes) {
+        if (ws_B_mo) { tracked_cudaFree(ws_B_mo); ws_B_mo = nullptr; }
+        tracked_cudaMalloc(&ws_B_mo, need_B_mo_bytes);
+        ws_B_mo_bytes = need_B_mo_bytes;
+    }
+
+    real_t* d_B_tmp  = ws_B_tmp;
+    real_t* d_B_tmp2 = ws_B_tmp2;
+    real_t* d_B_mo   = ws_B_mo;
+
+    // Step 1: B_tmp(Q,μ,q) = Σ_ν B(Q,μ,ν)·C(ν,q)   (B source = d_B_ao_src)
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        nmo, (long long)naux * nao, nao, &alpha,
+        d_C, nmo,
+        d_B_ao_src, nao,
+        &beta, d_B_tmp, nmo);
+
+    // Step 2a: per-aux transpose B_tmp(Q,μ,q) → B_tmp2(Q,q,μ)
+    {
+        cudaStream_t stream = nullptr;
+        cublasGetStream(handle, &stream);
+        launch_eri_ri_transpose_b_tmp(d_B_tmp, d_B_tmp2, naux, nmo, nao, stream);
+    }
+
+    // Step 2b: B_mo(Q,p,q) = Σ_μ C(μ,p)·B_tmp2(Q,q,μ)
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        nmo, (long long)naux * nmo, nao, &alpha,
+        d_C, nmo,
+        d_B_tmp2, nao,
+        &beta, d_B_mo, nmo);
+
+    cudaDeviceSynchronize();
+    return d_B_mo;
+#endif
+}
+
+// Phase 0 — form one MO-ERI sub-block from B_mo (built by build_B_mo) as
+// block[(p,q),(r,s)] row-major ((pn*qn)×(rn*sn)) = (p q | r s), via two strided
+// gathers + a single Bra^T·Ket DGEMM over the aux axis. Never materializes nmo⁴.
+void ERI_RI::mo_eri_block_into(const real_t* d_B_mo, int nmo,
+                               int p0, int pn, int q0, int qn,
+                               int r0, int rn, int s0, int sn,
+                               real_t* d_out) const {
+#ifndef GANSU_CPU_ONLY
+    const int naux = num_auxiliary_basis_;
+    const size_t nPQ = (size_t)pn * qn;
+    const size_t nRS = (size_t)rn * sn;
+
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    const double alpha = 1.0, beta = 0.0;
+    cudaStream_t stream = nullptr;
+    cublasGetStream(handle, &stream);
+
+    static thread_local real_t* ws_bra       = nullptr;
+    static thread_local real_t* ws_ket       = nullptr;
+    static thread_local size_t  ws_bra_bytes = 0;
+    static thread_local size_t  ws_ket_bytes = 0;
+    static thread_local int     ws_dev       = -1;
+
+    int curr_dev = 0;
+    cudaGetDevice(&curr_dev);
+    if (curr_dev != ws_dev) {
+        if (ws_dev >= 0 && (ws_bra || ws_ket)) {
+            const int saved = curr_dev;
+            cudaSetDevice(ws_dev);
+            if (ws_bra) { tracked_cudaFree(ws_bra); ws_bra = nullptr; }
+            if (ws_ket) { tracked_cudaFree(ws_ket); ws_ket = nullptr; }
+            ws_bra_bytes = 0; ws_ket_bytes = 0;
+            cudaSetDevice(saved);
+        }
+        ws_dev = curr_dev;
+    }
+    const size_t need_bra = (size_t)naux * nPQ * sizeof(real_t);
+    const size_t need_ket = (size_t)naux * nRS * sizeof(real_t);
+    if (need_bra > ws_bra_bytes) {
+        if (ws_bra) tracked_cudaFree(ws_bra);
+        tracked_cudaMalloc(&ws_bra, need_bra); ws_bra_bytes = need_bra;
+    }
+    if (need_ket > ws_ket_bytes) {
+        if (ws_ket) tracked_cudaFree(ws_ket);
+        tracked_cudaMalloc(&ws_ket, need_ket); ws_ket_bytes = need_ket;
+    }
+
+    launch_eri_ri_gather_bmo_block(d_B_mo, ws_bra, naux, nmo, p0, pn, q0, qn, stream);
+    launch_eri_ri_gather_bmo_block(d_B_mo, ws_ket, naux, nmo, r0, rn, s0, sn, stream);
+
+    // ws_bra row-major (naux,nPQ) = col-major (nPQ,naux) ld=nPQ; same for ket.
+    // C(nRS×nPQ) col-major = Ket·Braᵀ → C[ket,bra] at ket+bra*nRS = block
+    // row-major (nPQ×nRS) with bra outer, ket inner.
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+        (int)nRS, (int)nPQ, naux, &alpha,
+        ws_ket, (int)nRS,
+        ws_bra, (int)nPQ,
+        &beta, d_out, (int)nRS);
+    cudaDeviceSynchronize();
+#else
+    (void)d_B_mo; (void)nmo; (void)p0; (void)pn; (void)q0; (void)qn;
+    (void)r0; (void)rn; (void)s0; (void)sn; (void)d_out;
+#endif
 }
 
 void ERI_RI::precompute_schwarz_and_shell_pairs() {

@@ -41,11 +41,14 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "linear_operator.hpp"
 #include "types.hpp"
 
 namespace gansu {
+
+class ERI_RI;  // Phase 0: on-the-fly MO-ERI block source (build_B_mo / mo_eri_block_into)
 
 class IPEOMCCSDOperator : public LinearOperator {
 public:
@@ -66,7 +69,11 @@ public:
     IPEOMCCSDOperator(const real_t* d_eri_mo,
                       const real_t* d_orbital_energies,
                       real_t* d_t1, real_t* d_t2,
-                      int nocc, int nvir, int nao);
+                      int nocc, int nvir, int nao,
+                      const ERI_RI* eri_block_src = nullptr,
+                      const real_t* d_B_mo_blocks = nullptr,
+                      int nmo_full = 0,
+                      int num_gpus = 1);   // multi-GPU σ (Stage IP-5; 1 = legacy single-GPU)
 
     ~IPEOMCCSDOperator();
 
@@ -149,10 +156,49 @@ private:
     real_t* d_f_oo_  = nullptr;  // [nocc] diagonal Fock-occ
     real_t* d_f_vv_  = nullptr;  // [nvir] diagonal Fock-vir
 
+    // Phase 0: optional on-the-fly MO-ERI block source (single-GPU RI,
+    // num_frozen==0). When set, extract_eri_blocks builds the 6 blocks from
+    // d_B_mo_blocks_ via eri_block_src_->mo_eri_block_into, never the full nmo⁴.
+    const ERI_RI* eri_block_src_ = nullptr;
+    const real_t* d_B_mo_blocks_ = nullptr;
+    int nmo_full_ = 0;
     void extract_eri_blocks(const real_t* d_eri_mo);
     void compute_denominators_and_fock(const real_t* d_orbital_energies);
     void build_diagonal();
     void build_dressed_intermediates();   // duplicated inline from EE-EOM (design Q2 = duplicate)
+
+    // === Multi-GPU σ (Stage IP-5) — mirrors the validated EA-EOM 5a-5d ===
+    // GANSU_STEOM_EOM_GPUS=N>1 (decoupled from the RI/CIS-NTO --num_gpus, forced
+    // to 1) splits the σ2 sector [i,j,a] (nocc²·nvir) over the outer-occ i across
+    // N physical GPUs: each d>0 holds a full replica of every intermediate apply()
+    // reads (all small — no nvir⁴; Woooo is only nocc⁴), computes its i-slab of σ2,
+    // and disjoint-gathers to device 0.  IP apply() is 3 kernels (σ1, tmp_c, σ2),
+    // no GEMM → no cuBLAS handle needed.  num_gpus_==1 → ws_ empty, legacy path
+    // (byte-identical).
+    int num_gpus_ = 1;
+    bool use_gpu_multi_ = false;
+    mutable int multi_check_count_ = 0;
+    struct DeviceWorkspace {
+        int     device  = -1;
+        real_t* d_input = nullptr;   // [total_dim]   broadcast matvec input
+        real_t* d_s1    = nullptr;   // [h_dim]       σ1 scratch
+        real_t* d_s2    = nullptr;   // [h2p_dim]     σ2 (only this device's i-slab authoritative)
+        real_t* d_tmp_c = nullptr;   // [nvir]        tmp[c] scratch (full reduction)
+        real_t* d_Loo = nullptr;   real_t* d_Lvv = nullptr;   real_t* d_Fov = nullptr;
+        real_t* d_Woooo = nullptr; real_t* d_Wooov = nullptr; real_t* d_Wovov = nullptr;
+        real_t* d_Wovvo = nullptr; real_t* d_Wovoo = nullptr; real_t* d_eri_oovv = nullptr;
+        real_t* d_t2 = nullptr;
+        int     i_begin = 0, i_end = 0;
+    };
+    std::vector<DeviceWorkspace> ws_;
+    void setup_multi_gpu();   // Stage IP-5: per-device replicas (no-op when num_gpus_==1)
+    void apply_sigma_gpu(const real_t* d_r1, const real_t* d_r2, real_t* d_s1, real_t* d_s2,
+                         const real_t* Loo, const real_t* Lvv, const real_t* Fov,
+                         const real_t* Woooo, const real_t* Wooov, const real_t* Wovov,
+                         const real_t* Wovvo, const real_t* Wovoo, const real_t* eri_oovv,
+                         const real_t* t2, int i_begin, int i_end, bool do_sigma1,
+                         real_t* scr_tmp_c = nullptr) const;
+    void apply_multi(const real_t* d_input, real_t* d_output) const;
 };
 
 } // namespace gansu

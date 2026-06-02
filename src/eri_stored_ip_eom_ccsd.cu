@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -79,7 +80,9 @@ extern __global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ er
 static void compute_ip_eom_ccsd_impl(RHF& rhf,
                                      const real_t* d_eri_ao,
                                      int n_roots_requested,
-                                     real_t* d_eri_mo_precomputed = nullptr)
+                                     real_t* d_eri_mo_precomputed = nullptr,
+                                     const ERI_RI* eri_block_src = nullptr,
+                                     const real_t* d_B_mo_blocks = nullptr)
 {
     PROFILE_FUNCTION();
 
@@ -189,16 +192,20 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
     }
 
     // Step 2: Build MO ERI (matches EE-EOM pattern) and trim for frozen core.
+    // Phase 0: eri_block_src (single-GPU RI DLPNO) builds the operator's blocks
+    // on the fly from B_mo — skip the full nmo⁴ tensor entirely.
     Timer mo_timer;
     real_t* d_eri_mo = nullptr;
     bool free_eri_mo = false;
-    if (d_eri_mo_precomputed) {
-        d_eri_mo = d_eri_mo_precomputed;
-    } else {
-        tracked_cudaMalloc(&d_eri_mo,
-                           (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
-        transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
-        free_eri_mo = true;
+    if (!eri_block_src) {
+        if (d_eri_mo_precomputed) {
+            d_eri_mo = d_eri_mo_precomputed;
+        } else {
+            tracked_cudaMalloc(&d_eri_mo,
+                               (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
+            transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
+            free_eri_mo = true;
+        }
     }
     std::cout << "  MO transform time: " << std::fixed << std::setprecision(3)
               << mo_timer.elapsed_seconds() << " s" << std::endl;
@@ -235,9 +242,15 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
     // intermediates ARE now built in the constructor; apply() still uses the
     // diagonal-only matvec until sub-phases 1.3-1.6 wire in the full sigma.
     Timer build_timer;
+    // Stage IP-5: multi-GPU IP σ opt-in via GANSU_STEOM_EOM_GPUS=N>1 (shared with EA),
+    // decoupled from the RI/CIS-NTO --num_gpus (forced to 1). Default unset → single-GPU.
+    int eom_gpus = 1;
+    if (const char* e = std::getenv("GANSU_STEOM_EOM_GPUS"))
+        if (e[0]) eom_gpus = std::max(1, std::atoi(e));
     IPEOMCCSDOperator ip_op(d_eri_for_op, d_eps_for_op,
                             d_t1, d_t2,
-                            nocc_active, nvir, nao_active);
+                            nocc_active, nvir, nao_active,
+                            eri_block_src, d_B_mo_blocks, num_basis, eom_gpus);
 
     // The intermediates have been built; we no longer need the trimmed /
     // full MO ERI tensor (the operator owns the extracted sub-blocks).
@@ -260,7 +273,10 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
     // IP eigenvalues are physical IPs (positive Ha) — NO spurious near-zero
     // root to filter out, so leave min_eigenvalue at default 0.
     config.min_eigenvalue        = 0.0;
-    config.verbose               = (verbose >= 2) ? 2 : (verbose >= 1 ? 1 : 0);
+    // Davidson per-iter progress is always printed (one line/iter) so the
+    // user sees eigenvalue stabilisation + residual + ETA during the long
+    // native-operator silent stretch (anthracene-scale: 10-30 min/solve).
+    config.verbose               = (verbose >= 2) ? 2 : 1;
 
     std::vector<real_t> eigenvalues;
     std::vector<real_t> h_eigenvectors((size_t)n_roots_to_compute * total_dim, 0.0);
@@ -471,9 +487,19 @@ void ERI_Stored_RHF::compute_ip_eom_ccsd(int n_states) {
 void ERI_RI_RHF::compute_ip_eom_ccsd(int n_states) {
     const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
     const int num_basis = rhf_.get_num_basis();
-    real_t* d_eri_mo = build_mo_eri(d_C, num_basis);
-    compute_ip_eom_ccsd_impl(rhf_, /*d_eri_ao=*/nullptr, n_states, d_eri_mo);
-    tracked_cudaFree(d_eri_mo);
+    // P4b: RI DLPNO builds the operator's MO-ERI blocks on the fly from B_mo
+    // (no full nmo⁴). Single-GPU uses intermediate_matrix_B_; distributed-RI's
+    // build_B_mo lazily replicates B to each GPU (~580 MB at anthracene scale).
+    // build_B_mo returns nullptr when budget exceeded → fallback to full tensor.
+    const bool want_block = rhf_.use_dlpno_amplitudes()
+                            && rhf_.get_num_frozen_core() == 0
+                            && gpu::gpu_available();
+    const real_t* d_B_mo = want_block ? build_B_mo(d_C, num_basis) : nullptr;
+    const bool block     = want_block && d_B_mo != nullptr;
+    real_t* d_eri_mo     = block ? nullptr : build_mo_eri(d_C, num_basis);
+    compute_ip_eom_ccsd_impl(rhf_, /*d_eri_ao=*/nullptr, n_states, d_eri_mo,
+                             block ? this : nullptr, d_B_mo);
+    if (d_eri_mo) tracked_cudaFree(d_eri_mo);
 }
 
 } // namespace gansu

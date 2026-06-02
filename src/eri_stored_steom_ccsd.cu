@@ -38,6 +38,9 @@
 #include <iostream>
 #include <sstream>
 #include <vector>
+#include <limits>
+#include <cmath>
+#include <cstring>
 
 #include "rhf.hpp"
 #include "steom_ccsd_operator.hpp"
@@ -68,6 +71,43 @@ extern __global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ er
                                                     real_t* __restrict__ eri_trimmed,
                                                     int N_full, int na_active, int offset);
 
+
+// Collision-free greedy assignment of EOM roots to DISTINCT canonical MOs for
+// the STEOM active NTO↔MO matching. Process roots in descending max|R1|; each
+// takes its largest-|R1| still-unused orbital. This equals the per-root
+// argmax|R1| EXACTLY when that is already collision-free (so non-degenerate
+// cases — H2O, naphthalene — are bit-identical to the validated path), and only
+// (near-)degenerate roots sharing an argmax MO get disambiguated (the stronger
+// |R1| keeps argmax, the weaker takes its 2nd-best). Result: distinct columns →
+// non-singular active R1, without the global-Hungarian's complexity. (Matches
+// Python assign_active_1to1's intent; differs only in the tie/collision break.)
+static std::vector<int> steom_assign_distinct(
+        const std::vector<const std::vector<real_t>*>& r1_list, int n_orb) {
+    const int n = static_cast<int>(r1_list.size());
+    std::vector<int>    assign(n, -1);
+    std::vector<int>    order(n);
+    std::vector<double> rmax(n, 0.0);
+    for (int r = 0; r < n; ++r) {
+        order[r] = r;
+        double mx = -1.0;
+        for (int i = 0; i < n_orb; ++i) mx = std::max(mx, std::fabs((double)(*r1_list[r])[i]));
+        rmax[r] = mx;
+    }
+    std::sort(order.begin(), order.end(), [&](int a, int b){ return rmax[a] > rmax[b]; });
+    std::vector<char> used(n_orb, 0);
+    for (int oi = 0; oi < n; ++oi) {
+        const int r = order[oi];
+        int best = -1; double best_abs = -1.0;
+        for (int i = 0; i < n_orb; ++i) {
+            if (used[i]) continue;
+            const double v = std::fabs((double)(*r1_list[r])[i]);
+            if (v > best_abs) { best_abs = v; best = i; }
+        }
+        assign[r] = best;
+        if (best >= 0) used[best] = 1;
+    }
+    return assign;
+}
 
 // `eri_method` is taken by ERI base reference so the composite auto-dispatch
 // (compute_cis_nto / compute_ip_eom_ccsd / compute_ea_eom_ccsd) resolves
@@ -236,70 +276,81 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     std::vector<int>    h_active_occ_idx(n_act_occ_eff, -1);
     std::vector<int>    h_active_vir_idx(n_act_vir_eff, -1);
 
-    // For active_occ_idx we use the canonical MO index of the dominant R1
-    // component (argmax |R1|), NOT `pr.canonical_occ_label` — the latter is
-    // tied to the CIS-NTO basis, which may be hybrid/degenerate (e.g. H2O
-    // sto-3g produces 4-fold degenerate NTOs with eigenvalue 0.2222), and
-    // can collide across different IP roots, making R1_active singular.
-    // The dominant-canonical-MO label, by contrast, is uniquely defined for
-    // each non-degenerate IP root and matches the convention of the Python
-    // reference (`script/pyscf_steom_feff_reference.py`).
-    auto dominant_idx = [](const std::vector<real_t>& r1) {
-        int best = 0;
-        real_t best_abs = -1.0;
-        for (int i = 0; i < (int)r1.size(); ++i) {
-            const real_t v = std::fabs(r1[i]);
-            if (v > best_abs) { best_abs = v; best = i; }
-        }
-        return best;
-    };
-
+    // Copy the filtered active R2/R1 amplitudes and gather each filtered root's
+    // R1 for the active NTO↔canonical-MO assignment below. (canonical_occ_label
+    // / canonical_vir_label < 0 means the NTO was not routed to an EOM root and
+    // does not enter Ŝ — skip it.)
+    std::vector<const std::vector<real_t>*> ip_r1_filtered, ea_r1_filtered;
     int m_eff = 0;
     for (int m = 0; m < n_act_occ; ++m) {
         const auto& pr = ip_result.per_active[m];
         if (pr.canonical_occ_label < 0) continue;
-        h_active_occ_idx[m_eff] = dominant_idx(pr.R1);
         std::memcpy(h_R2_IP.data() + (size_t)m_eff * r2_ip_per_root,
                     pr.R2.data(), r2_ip_per_root * sizeof(real_t));
         std::memcpy(h_R1_IP.data() + (size_t)m_eff * nocc_active,
                     pr.R1.data(), nocc_active * sizeof(real_t));
+        ip_r1_filtered.push_back(&pr.R1);
         ++m_eff;
     }
     int e_eff = 0;
     for (int e = 0; e < n_act_vir; ++e) {
         const auto& pr = ea_result.per_active[e];
         if (pr.canonical_vir_label < 0) continue;
-        h_active_vir_idx[e_eff] = dominant_idx(pr.R1);
         std::memcpy(h_R2_EA.data() + (size_t)e_eff * r2_ea_per_root,
                     pr.R2.data(), r2_ea_per_root * sizeof(real_t));
         std::memcpy(h_R1_EA.data() + (size_t)e_eff * nvir,
                     pr.R1.data(), nvir * sizeof(real_t));
+        ea_r1_filtered.push_back(&pr.R1);
         ++e_eff;
     }
 
-    // Detect duplicate dominant indices — these would make R1_active singular.
+    // Primary assignment = per-root argmax|R1| (the validated path; bit-identical
+    // to 0b/0c for non-degenerate cases). Only if argmax collides (two roots →
+    // same MO → singular active R1) do we fall back to the collision-free greedy
+    // (steom_assign_distinct), and announce it. This preserves the validated
+    // result exactly when there is no collision, and replaces the old hard throw
+    // with a usable disambiguation when there is.
+    auto argmax_abs = [](const std::vector<real_t>& r1) {
+        int best = 0; double b = -1.0;
+        for (int i = 0; i < (int)r1.size(); ++i) {
+            const double v = std::fabs((double)r1[i]);
+            if (v > b) { b = v; best = i; }
+        }
+        return best;
+    };
+    auto has_dup = [](const std::vector<int>& v, int n) {
+        std::vector<int> s(v.begin(), v.begin() + n);
+        std::sort(s.begin(), s.end());
+        for (int i = 1; i < n; ++i) if (s[i] == s[i-1]) return true;
+        return false;
+    };
+    for (int r = 0; r < m_eff; ++r) h_active_occ_idx[r] = argmax_abs(*ip_r1_filtered[r]);
+    for (int r = 0; r < e_eff; ++r) h_active_vir_idx[r] = argmax_abs(*ea_r1_filtered[r]);
+    if (m_eff > 0 && has_dup(h_active_occ_idx, m_eff)) {
+        const std::vector<int> a = steom_assign_distinct(ip_r1_filtered, nocc_active);
+        for (int r = 0; r < m_eff; ++r) h_active_occ_idx[r] = a[r];
+        std::cout << "  [STEOM] active-occ argmax|R1| collision → greedy distinct-MO assignment "
+                     "(near-degenerate roots)" << std::endl;
+    }
+    if (e_eff > 0 && has_dup(h_active_vir_idx, e_eff)) {
+        const std::vector<int> a = steom_assign_distinct(ea_r1_filtered, nvir);
+        for (int r = 0; r < e_eff; ++r) h_active_vir_idx[r] = a[r];
+        std::cout << "  [STEOM] active-vir argmax|R1| collision → greedy distinct-MO assignment "
+                     "(near-degenerate roots)" << std::endl;
+    }
+    // Hungarian yields a permutation (distinct columns) by construction; assert
+    // no collision remains as a defensive guard (must never fire).
     {
-        std::vector<int> sorted_occ = h_active_occ_idx;
-        std::sort(sorted_occ.begin(), sorted_occ.end());
-        for (int i = 1; i < (int)sorted_occ.size(); ++i) {
-            if (sorted_occ[i] == sorted_occ[i-1]) {
-                throw std::runtime_error(
-                    "STEOM-CCSD: two filtered IP roots share dominant canonical "
-                    "MO index " + std::to_string(sorted_occ[i])
-                    + ". This would make the active R1 matrix singular. Likely "
-                      "the IP-EOM Davidson assigned multiple roots to the same "
-                      "canonical orbital — check %singles and FollowCIS thresholds.");
-            }
-        }
-        std::vector<int> sorted_vir = h_active_vir_idx;
-        std::sort(sorted_vir.begin(), sorted_vir.end());
-        for (int i = 1; i < (int)sorted_vir.size(); ++i) {
-            if (sorted_vir[i] == sorted_vir[i-1]) {
-                throw std::runtime_error(
-                    "STEOM-CCSD: two filtered EA roots share dominant canonical "
-                    "MO index " + std::to_string(sorted_vir[i]) + ".");
-            }
-        }
+        std::vector<int> s = h_active_occ_idx; std::sort(s.begin(), s.end());
+        for (int i = 1; i < (int)s.size(); ++i)
+            if (s[i] == s[i-1])
+                throw std::runtime_error("STEOM-CCSD: active occ MO assignment collision (MO "
+                    + std::to_string(s[i]) + ") after Hungarian — internal error.");
+        std::vector<int> t = h_active_vir_idx; std::sort(t.begin(), t.end());
+        for (int i = 1; i < (int)t.size(); ++i)
+            if (t[i] == t[i-1])
+                throw std::runtime_error("STEOM-CCSD: active vir MO assignment collision (MO "
+                    + std::to_string(t[i]) + ") after Hungarian — internal error.");
     }
 
     // Suppress unused-variable warning when CIS-NTO data is not consulted
@@ -353,16 +404,33 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                   << ccsd_timer.elapsed_seconds() << " s)" << std::endl;
     }
 
+    // P4b: RI DLPNO path builds MO-ERI sub-blocks on the fly from B_mo
+    // (naux×nmo²) inside the STEOM operator, never the full nmo⁴ tensor.
+    // Single-GPU uses intermediate_matrix_B_; distributed-RI's build_B_mo
+    // lazily replicates B to each GPU and returns nullptr only if the
+    // replication budget would fail. Requires DLPNO amplitudes + num_frozen==0.
+    const ERI_RI* eri_ri_block = nullptr;
+    const real_t* d_B_mo_blocks = nullptr;
+    if (rhf.use_dlpno_amplitudes() && num_frozen == 0 && gpu::gpu_available()) {
+        eri_ri_block = dynamic_cast<const ERI_RI*>(&eri_method);
+        if (eri_ri_block) {
+            d_B_mo_blocks = eri_ri_block->build_B_mo(d_C, num_basis);
+            if (!d_B_mo_blocks) eri_ri_block = nullptr;  // CPU / budget fail
+        }
+    }
+
     Timer mo_timer;
     real_t* d_eri_mo = nullptr;
     bool free_eri_mo = false;
-    if (d_eri_mo_precomputed) {
-        d_eri_mo = d_eri_mo_precomputed;  // RI path — caller owns / frees it
-    } else {
-        tracked_cudaMalloc(&d_eri_mo,
-                           (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
-        transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
-        free_eri_mo = true;
+    if (!eri_ri_block) {
+        if (d_eri_mo_precomputed) {
+            d_eri_mo = d_eri_mo_precomputed;  // RI path — caller owns / frees it
+        } else {
+            tracked_cudaMalloc(&d_eri_mo,
+                               (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
+            transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
+            free_eri_mo = true;
+        }
     }
 
     real_t* d_eri_for_op = d_eri_mo;
@@ -395,6 +463,173 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     std::cout << "  MO transform + frozen-core trim time: " << std::fixed << std::setprecision(3)
               << mo_timer.elapsed_seconds() << " s" << std::endl;
 
+    // Ship 11 — STEOM operator device-redirect (mirror of EA impl). The STEOM
+    // operator construction allocates d_eri_vvvv_ (nvir⁴·8B), wvvvo_w_t1
+    // (nvir³·nocc·8B) and the dense G^{1h1p} matrix on the current device.
+    // For Pentacene-class workloads (NV=327), nvir⁴·8B ≈ 91 GB exceeds the
+    // free memory on GPU 0 (biased by persistent DLPNO ground state slab),
+    // while peer GPUs sit ~131 GB free. With GANSU_STEOM_OPERATOR_DEVICE_BALANCING=1
+    // we pick the device with maximum driver-free memory and redirect all
+    // subsequent operator allocs there. Restored at impl exit.
+    bool steom_dev_balance_active = false;
+    int  steom_dev_balance_restore = 0;
+    int  steom_dev_balance_target  = 0;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        const size_t tracked_global = GlobalGpuMemoryTracker::get_current();
+        const size_t tracked_peak   = GlobalGpuMemoryTracker::get_peak();
+        const size_t nvir_sz = (size_t)nvir * nvir * nvir * nvir * sizeof(real_t);
+        const double need_vvvv_gb = nvir_sz / (1024.0*1024.0*1024.0);
+        std::cout << "  [STEOM device audit] tracked sum-of-GPUs current = "
+                  << std::fixed << std::setprecision(2)
+                  << (tracked_global / (1024.0*1024.0*1024.0)) << " GB"
+                  << "   peak = " << (tracked_peak / (1024.0*1024.0*1024.0)) << " GB"
+                  << "   (operator will alloc d_eri_vvvv_ = " << need_vvvv_gb << " GB next)"
+                  << std::defaultfloat << std::endl;
+        int n_dev = 0;
+        cudaGetDeviceCount(&n_dev);
+        int saved_dev = 0;
+        cudaGetDevice(&saved_dev);
+        steom_dev_balance_restore = saved_dev;
+        std::vector<size_t> per_dev_free(n_dev, 0);
+        for (int d = 0; d < n_dev; ++d) {
+            cudaSetDevice(d);
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+                per_dev_free[d] = free_b;
+                const double used_gb  = (total_b - free_b) / (1024.0*1024.0*1024.0);
+                const double free_gb  = free_b / (1024.0*1024.0*1024.0);
+                const double total_gb = total_b / (1024.0*1024.0*1024.0);
+                std::cout << "    GPU " << d << " driver:   used="
+                          << std::fixed << std::setprecision(2) << used_gb << " GB"
+                          << "  free=" << free_gb << " GB"
+                          << "  total=" << total_gb << " GB"
+                          << "  d_eri_vvvv_ alloc "
+                          << (free_b >= nvir_sz ? "fits" : "WILL OOM")
+                          << std::defaultfloat << std::endl;
+            }
+        }
+        const char* env_balance = std::getenv("GANSU_STEOM_OPERATOR_DEVICE_BALANCING");
+        if (env_balance && env_balance[0] == '1' && n_dev > 1) {
+            int best_dev = saved_dev;
+            size_t best_free = (saved_dev >= 0 && saved_dev < n_dev) ? per_dev_free[saved_dev] : 0;
+            for (int d = 0; d < n_dev; ++d) {
+                if (per_dev_free[d] > best_free) {
+                    best_free = per_dev_free[d];
+                    best_dev  = d;
+                }
+            }
+            if (best_dev != saved_dev) {
+                cudaSetDevice(best_dev);
+                // Rebuild thread_local GPUHandle (cuBLAS + cuSOLVER) on the
+                // new device — otherwise STEOM operator's many DGEMMs run
+                // with a handle bound to the original device while pointers
+                // live on the new one (CUBLAS_STATUS_EXECUTION_FAILED).
+                gpu::GPUHandle::reset();
+                steom_dev_balance_active = true;
+                steom_dev_balance_target = best_dev;
+                std::cout << "  [STEOM device-balance] redirecting operator to GPU "
+                          << best_dev
+                          << " (free=" << std::fixed << std::setprecision(2)
+                          << (best_free / (1024.0*1024.0*1024.0)) << " GB"
+                          << ", was on GPU " << saved_dev
+                          << " with free=" << (per_dev_free[saved_dev] / (1024.0*1024.0*1024.0))
+                          << " GB; GPUHandle rebuilt for new device)"
+                          << std::defaultfloat << std::endl;
+            } else {
+                cudaSetDevice(saved_dev);
+                std::cout << "  [STEOM device-balance] GPU " << saved_dev
+                          << " already has max free memory; no redirect."
+                          << std::endl;
+            }
+        } else {
+            cudaSetDevice(saved_dev);
+        }
+    }
+#endif
+
+    // Ship 14: vvvv n-slab distribution (mirror of EA Ship 12 for STEOM).
+    // When GANSU_EA_VVVV_NSLAB=N is set and we have the P4b on-the-fly path,
+    // allocate + extract per-device d_eri_vvvv slabs immediately so the STEOM
+    // operator's canonical-skip Term A GEMM can run per-device against its
+    // own slab.  For Pentacene (NV=327) this avoids the single-device
+    // bottleneck after Ship 11's redirect: GPU 3 alone can't hold d_eri_vvvv
+    // (91 GB) + Term A scratch d_inter (20 GB) + other state.  Slab ownership
+    // transfers to the operator ctor below.
+    std::vector<real_t*> steom_d_eri_vvvv_slabs;
+#ifndef GANSU_CPU_ONLY
+    if (eri_ri_block && gpu::gpu_available()) {
+        const char* env_nslab = std::getenv("GANSU_EA_VVVV_NSLAB");
+        if (env_nslab && env_nslab[0]) {
+            const int Nreq = std::atoi(env_nslab);
+            int n_dev = 0;
+            cudaGetDeviceCount(&n_dev);
+            const int N = std::min(Nreq, n_dev);
+            if (N >= 2) {
+                int saved = 0;
+                cudaGetDevice(&saved);
+                steom_d_eri_vvvv_slabs.assign(N, nullptr);
+                bool all_ok = true;
+                for (int d = 0; d < N; ++d) {
+                    cudaSetDevice(d);
+                    const real_t* B_d = eri_ri_block->build_B_mo(d_C, num_basis);
+                    if (!B_d) {
+                        all_ok = false;
+                        std::cout << "  [STEOM Ship 14] WARNING: build_B_mo returned null "
+                                     "for device " << d << "; disabling slab mode." << std::endl;
+                        break;
+                    }
+                    const int a_start = (int)((int64_t)d * nvir / N);
+                    const int a_end   = (int)((int64_t)(d + 1) * nvir / N);
+                    const int an      = a_end - a_start;
+                    const size_t slab_sz = (size_t)an * nvir * nvir * nvir;
+                    tracked_cudaMalloc(&steom_d_eri_vvvv_slabs[d], slab_sz * sizeof(real_t));
+                    eri_ri_block->mo_eri_block_into(B_d, num_basis,
+                        nocc_active + a_start, an,   // a range (slab)
+                        nocc_active, nvir,           // b range
+                        nocc_active, nvir,           // c range
+                        nocc_active, nvir,           // d range
+                        steom_d_eri_vvvv_slabs[d]);
+                    cudaDeviceSynchronize();
+                    std::cout << "  [STEOM Ship 14] slab d=" << d
+                              << " allocated " << std::fixed << std::setprecision(2)
+                              << (slab_sz * sizeof(real_t) / (1024.0*1024.0*1024.0))
+                              << " GB on GPU " << d
+                              << " (a∈[" << a_start << "," << a_end << "))"
+                              << std::defaultfloat << std::endl;
+                }
+                cudaSetDevice(saved);
+                if (!all_ok) {
+                    for (int d = 0; d < N; ++d) {
+                        if (steom_d_eri_vvvv_slabs[d]) {
+                            cudaSetDevice(d);
+                            tracked_cudaFree(steom_d_eri_vvvv_slabs[d]);
+                            steom_d_eri_vvvv_slabs[d] = nullptr;
+                        }
+                    }
+                    cudaSetDevice(saved);
+                    steom_d_eri_vvvv_slabs.clear();
+                } else {
+                    // Refresh build_B_mo on the saved (Ship 11 target) device so
+                    // the operator's stored d_B_mo_blocks is valid for the other
+                    // 6 d_eri_* extractions in extract_eri_blocks.
+                    d_B_mo_blocks = eri_ri_block->build_B_mo(d_C, num_basis);
+                    if (!d_B_mo_blocks) {
+                        std::cout << "  [STEOM Ship 14] WARNING: post-loop "
+                                     "build_B_mo refresh on saved device returned null; "
+                                     "operator extract_eri_blocks will likely fail."
+                                  << std::endl;
+                    }
+                }
+            } else {
+                std::cout << "  [STEOM Ship 14] GANSU_EA_VVVV_NSLAB=" << Nreq
+                          << " but only " << n_dev << " GPUs visible; needs ≥2 to slab"
+                          << std::endl;
+            }
+        }
+    }
+#endif
+
     Timer build_timer;
     STEOMCCSDOperator steom_op(d_eri_for_op, d_eps_active,
                                d_t1, d_t2,
@@ -402,7 +637,10 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                                h_R1_IP.data(), h_R1_EA.data(),
                                h_active_occ_idx.data(), h_active_vir_idx.data(),
                                nocc_active, nvir, nao_active,
-                               n_act_occ_eff, n_act_vir_eff);
+                               n_act_occ_eff, n_act_vir_eff,
+                               eri_ri_block, d_B_mo_blocks, num_basis,
+                               steom_d_eri_vvvv_slabs.empty()
+                                   ? nullptr : &steom_d_eri_vvvv_slabs);
 
     // Operator owns T1/T2 + has copied bar-H intermediates; we can free the
     // trimmed / full MO ERI tensor (operator pulled the sub-blocks it needs).
@@ -417,31 +655,134 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     if (verbose >= 2) steom_op.print_amplitude_norms(std::cout);
 
     // ----------------------------------------------------------------------
-    // Step 3: Non-Hermitian Davidson on G^{1h1p} (stub matvec = diagonal D · x)
+    // Step 3: diagonalize G^{1h1p}.
+    //
+    // DEFAULT for small/mid G = full dense non-Hermitian diagonalization
+    // (eigenDecompositionNonSymmetric: Eigen CPU / cusolverDnXgeev GPU). It is
+    // deterministic and returns ALL eigenvalues sorted ascending by real part;
+    // we then select the lowest n_states real roots ≥ min_eigenvalue. This was
+    // promoted to the default after the non-Hermitian Davidson was shown to be
+    // unreliable on (near-)degenerate G: it both MISSES roots and fails to
+    // reach the true lowest root (naphthalene Davidson 3.4527/…/5.8994 eV vs
+    // dense 3.4402/…/5.5770 — Davidson dropped the 5.4313 eV root and overshot
+    // k0 by +0.0125 eV; its "reproducible" answer was a reproducible error).
+    //
+    // Dense memory ~ 5·total_dim² doubles + geev workspace and cost ~ total_dim³,
+    // so for LARGE G we fall back to the iterative non-Hermitian Davidson.
+    // Overrides: GANSU_STEOM_DENSE_DIAG=1 forces dense regardless of size;
+    // GANSU_STEOM_DAVIDSON=1 forces Davidson regardless.
     // ----------------------------------------------------------------------
     Timer solve_timer;
-    DavidsonConfig config;
-    config.num_eigenvalues       = n_states_to_compute;
-    config.convergence_threshold = rhf.get_steom_d_tol();
-    config.max_subspace_size     = std::min(total_dim, std::max(80, 20 * n_states_to_compute));
-    config.max_iterations        = rhf.get_steom_max_iter();
-    config.use_preconditioner    = true;
-    config.symmetric             = false;
-    config.min_eigenvalue        = 0.0;
-    config.verbose               = (verbose >= 2) ? 2 : (verbose >= 1 ? 1 : 0);
+    const int  dense_auto_max = 12000;  // total_dim threshold for auto dense (~5.8 GB at 12000)
+    const bool force_dense    = (std::getenv("GANSU_STEOM_DENSE_DIAG") != nullptr);
+    const bool force_davidson = (std::getenv("GANSU_STEOM_DAVIDSON")  != nullptr);
+    const bool dense_diag = (steom_op.get_G_device() != nullptr)
+                            && !force_davidson
+                            && (force_dense || total_dim <= dense_auto_max);
 
-    DavidsonSolver solver(steom_op, config);
-    bool converged = solver.solve();
-    if (!converged) {
-        std::cout << "Warning: STEOM-CCSD Davidson did not converge for all roots." << std::endl;
-    }
-
-    const auto& eigenvalues = solver.get_eigenvalues();
+    std::vector<real_t> eigenvalues;
     std::vector<real_t> h_eigenvectors((size_t)n_states_to_compute * total_dim);
-    solver.copy_eigenvectors_to_host(h_eigenvectors.data());
 
-    std::cout << "  STEOM-CCSD solve time: " << std::fixed << std::setprecision(3)
-              << solve_timer.elapsed_seconds() << " s" << std::endl;
+    if (dense_diag) {
+        const real_t min_eigenvalue = 0.0;  // STEOM excitation energies are positive
+        // eigenDecompositionNonSymmetric expects column-major input. d_G_ is
+        // row-major [total_dim × total_dim]; its linear buffer is exactly the
+        // column-major storage of Gᵀ. eig(Gᵀ) == eig(G), so passing the buffer
+        // directly yields the correct eigenvalues; to also recover the RIGHT
+        // eigenvectors of G we transpose the copy into true column-major G.
+        real_t* d_G_cm = nullptr;
+        tracked_cudaMalloc(&d_G_cm, (size_t)total_dim * total_dim * sizeof(real_t));
+        cudaMemcpy(d_G_cm, steom_op.get_G_device(),
+                   (size_t)total_dim * total_dim * sizeof(real_t),
+                   cudaMemcpyDeviceToDevice);
+        gpu::transposeMatrixInPlace(d_G_cm, total_dim);  // row-major G → column-major G
+
+        real_t* d_all_evals = nullptr;
+        real_t* d_all_evecs = nullptr;
+        tracked_cudaMalloc(&d_all_evals, (size_t)total_dim * sizeof(real_t));
+        tracked_cudaMalloc(&d_all_evecs, (size_t)total_dim * total_dim * sizeof(real_t));
+
+        int info = gpu::eigenDecompositionNonSymmetric(d_G_cm, d_all_evals, d_all_evecs, total_dim);
+        if (info != 0) {
+            std::cout << "Warning: STEOM dense diagonalization (geev) returned info="
+                      << info << "." << std::endl;
+        }
+
+        // eigenvalues are sorted ascending by real part; complex/missing slots
+        // were filled with 1e30 at the tail. Eigenvectors are in transposed
+        // layout (eigenvector i = row i, stride = total_dim).
+        std::vector<real_t> h_all_evals(total_dim);
+        cudaMemcpy(h_all_evals.data(), d_all_evals,
+                   (size_t)total_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+        // Select the lowest n_states real roots ≥ min_eigenvalue.
+        std::vector<int> sel;
+        sel.reserve(n_states_to_compute);
+        for (int i = 0; i < total_dim && (int)sel.size() < n_states_to_compute; ++i) {
+            if (h_all_evals[i] >= min_eigenvalue && h_all_evals[i] < 1e29)
+                sel.push_back(i);
+        }
+        if ((int)sel.size() < n_states_to_compute) {
+            std::cout << "Warning: STEOM dense diagonalization found only " << sel.size()
+                      << " real roots ≥ " << min_eigenvalue << " (requested "
+                      << n_states_to_compute << ")." << std::endl;
+        }
+
+        eigenvalues.assign(n_states_to_compute, 1e30);
+        for (int n = 0; n < (int)sel.size(); ++n)
+            eigenvalues[n] = h_all_evals[sel[n]];
+        // Strided D2H copy of the selected eigenvectors (transposed layout:
+        // element j of eigenvector idx is at d_all_evecs[idx + j*total_dim]).
+        {
+            std::vector<real_t> h_all_evecs((size_t)total_dim * total_dim);
+            cudaMemcpy(h_all_evecs.data(), d_all_evecs,
+                       (size_t)total_dim * total_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
+            for (int n = 0; n < (int)sel.size(); ++n) {
+                int idx = sel[n];
+                for (int j = 0; j < total_dim; ++j)
+                    h_eigenvectors[(size_t)n * total_dim + j] = h_all_evecs[(size_t)idx + (size_t)j * total_dim];
+            }
+        }
+
+        tracked_cudaFree(d_G_cm);
+        tracked_cudaFree(d_all_evals);
+        tracked_cudaFree(d_all_evecs);
+
+        std::cout << "  STEOM-CCSD solve time: " << std::fixed << std::setprecision(3)
+                  << solve_timer.elapsed_seconds() << " s "
+                  << "(dense non-Hermitian geev, deterministic; "
+                  << (force_dense ? "forced via GANSU_STEOM_DENSE_DIAG"
+                                  : "auto: total_dim=" + std::to_string(total_dim)
+                                    + " ≤ " + std::to_string(dense_auto_max))
+                  << ")" << std::endl;
+    } else {
+        if (steom_op.get_G_device() != nullptr && !force_davidson)
+            std::cout << "  STEOM-CCSD: total_dim=" << total_dim << " > " << dense_auto_max
+                      << " → iterative non-Hermitian Davidson (dense geev too large; "
+                      << "note Davidson may miss/over-shoot roots — force dense with "
+                      << "GANSU_STEOM_DENSE_DIAG=1 if affordable)." << std::endl;
+        DavidsonConfig config;
+        config.num_eigenvalues       = n_states_to_compute;
+        config.convergence_threshold = rhf.get_steom_d_tol();
+        config.max_subspace_size     = std::min(total_dim, std::max(80, 20 * n_states_to_compute));
+        config.max_iterations        = rhf.get_steom_max_iter();
+        config.use_preconditioner    = true;
+        config.symmetric             = false;
+        config.min_eigenvalue        = 0.0;
+        config.verbose               = (verbose >= 2) ? 2 : (verbose >= 1 ? 1 : 0);
+
+        DavidsonSolver solver(steom_op, config);
+        bool converged = solver.solve();
+        if (!converged) {
+            std::cout << "Warning: STEOM-CCSD Davidson did not converge for all roots." << std::endl;
+        }
+
+        eigenvalues = solver.get_eigenvalues();
+        solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+
+        std::cout << "  STEOM-CCSD solve time: " << std::fixed << std::setprecision(3)
+                  << solve_timer.elapsed_seconds() << " s" << std::endl;
+    }
 
     // ----------------------------------------------------------------------
     // Step 4: Build STEOMResult
@@ -467,7 +808,10 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     std::ostringstream os;
     os << "[STEOM-CCSD] sub-phase 3.5-3.7 — full W^eff-dressed G^{1h1p} "
           "(Nooijen-Bartlett Eq.34-63: F^eff_oo/vv + hp/hhhp/phph/phhp + IP×EA cross), "
-          "diagonalized by non-Hermitian Davidson. Validated vs Python reference: "
+          "diagonalized by "
+       << (dense_diag ? "dense non-Hermitian geev (deterministic)"
+                      : "non-Hermitian Davidson")
+       << ". Validated vs Python reference: "
           "lowest two roots bit-exact (H2O sto-3g 0.392886 / 0.449061).\n"
        << "  STEOM excited-state energies:\n"
        << "   k   omega (Ha)        omega (eV)\n";
@@ -485,6 +829,19 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 
     rhf.append_excited_state_report(result.report);
     rhf.set_steom_result(std::move(result));
+
+    // Ship 11 — restore caller's device after STEOM operator + Davidson are
+    // both destructed (RAII), so downstream output / API code sees the same
+    // device it set before calling STEOM.
+#ifndef GANSU_CPU_ONLY
+    if (steom_dev_balance_active) {
+        cudaSetDevice(steom_dev_balance_restore);
+        gpu::GPUHandle::reset();
+        std::cout << "  [STEOM device-balance] restored to GPU " << steom_dev_balance_restore
+                  << " (operator ran on GPU " << steom_dev_balance_target
+                  << "; GPUHandle rebuilt for restored device)" << std::endl;
+    }
+#endif
 }
 
 void ERI_Stored_RHF::compute_steom_ccsd(int n_states) {
@@ -568,9 +925,18 @@ void ERI_RI_RHF::compute_dlpno_steom_ccsd(int n_states) {
     std::cout << "---- DLPNO-STEOM stage 2: CIS-NTO + IP/EA-EOM + STEOM ----" << std::endl;
     const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
     const int num_basis = rhf_.get_num_basis();
-    real_t* d_eri_mo = build_mo_eri(d_C, num_basis);
+    // P4b: STEOM operator's MO-ERI sub-blocks built on the fly inside
+    // compute_steom_ccsd_impl from B_mo (no full nmo⁴), single-GPU and
+    // distributed (lazy replicate). Probe build_B_mo here; if it returns
+    // nullptr (CPU / budget refused) we must pre-build the full nmo⁴ tensor
+    // because compute_steom_ccsd_impl has no d_eri_ao to AO→MO transform from.
+    const bool want_block = rhf_.use_dlpno_amplitudes()
+                            && rhf_.get_num_frozen_core() == 0
+                            && gpu::gpu_available();
+    const real_t* probe = want_block ? build_B_mo(d_C, num_basis) : nullptr;
+    real_t* d_eri_mo = (probe != nullptr) ? nullptr : build_mo_eri(d_C, num_basis);
     compute_steom_ccsd_impl(rhf_, *this, /*d_eri_ao=*/nullptr, n_states, d_eri_mo);
-    tracked_cudaFree(d_eri_mo);
+    if (d_eri_mo) tracked_cudaFree(d_eri_mo);
 
     rhf_.set_use_dlpno_projected_eom(false);
     rhf_.set_use_dlpno_native_eom(false);

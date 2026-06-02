@@ -260,6 +260,18 @@ DressedPnoEA build_dressed_pno_ea_vvvv(const std::vector<real_t>& h_Wvvvv,
                                        int nvir);
 
 /**
+ * @brief Host 4-index congruence W_pno[a'b'c'd'] = Σ_{abcd} U[a,a']U[b,b']U[c,c']U[d,d']
+ *        W[abcd] for one occ (four sequential single-index transforms). The reference for
+ *        the GPU port (DLPNOEAEOMNativeOperator::build_dressed_vvvv_gpu) — exposed so the
+ *        ctor gpu_selfcheck_ gate can compare one occ block.
+ * @param W     dense canonical Wvvvv [nvir⁴], row-major ((a·nv+b)·nv+c)·nv+d.
+ * @param Uflat U^(jj) flat row-major [nv × n].
+ * @param out   filled with [n⁴], row-major ((a'·n+b')·n+c')·n+d'.
+ */
+void congruence4(const std::vector<real_t>& W, const std::vector<real_t>& Uflat,
+                 int nv, int n, std::vector<real_t>& out);
+
+/**
  * @brief B-EA.6e dense-free seed: set Wvvvv^(jj) to the bare PNO 4-virtual ERI
  *        block straight from Phase24 (W_pair^{(jj)}[a,b,c,d] = (ac|bd) in PNO),
  *        WITHOUT ever materialising the dense nvir⁴ Wvvvv.

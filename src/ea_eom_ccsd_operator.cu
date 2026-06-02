@@ -39,8 +39,11 @@
 
 #include "ea_eom_ccsd_operator.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <iomanip>
+#include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <ostream>
 #include <stdexcept>
@@ -48,9 +51,12 @@
 
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
+#include "eri.hpp"   // Phase 0: ERI_RI::mo_eri_block_into (on-the-fly MO-ERI blocks)
+#include "multi_gpu_manager.hpp"   // Stage EA-5: multi-GPU σ (MultiGpuManager/DeviceGuard)
 
 #ifndef GANSU_CPU_ONLY
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #endif
 
 namespace gansu {
@@ -211,15 +217,16 @@ __global__ void ea_eom_sigma2_full_kernel(
     const real_t* __restrict__ r1,         // [nvir]
     const real_t* __restrict__ r2,         // [nocc · nvir²]
     real_t* __restrict__ sigma2,           // [nocc · nvir²]
-    int nocc, int nvir)
+    int nocc, int nvir, int include_wvvvv, int include_ring,
+    int j_begin, int j_end)                // Stage EA-5c: compute only this output-occ slab
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = nocc * nvir * nvir;
-    if (idx >= total) return;
-    int b = idx % nvir;
-    int t = idx / nvir;
+    int lidx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int slabtot = (j_end - j_begin) * nvir * nvir;
+    if (lidx >= slabtot) return;
+    int b = lidx % nvir;
+    int t = lidx / nvir;
     int a = t % nvir;
-    int j = t / nvir;
+    int j = j_begin + t / nvir;            // global output-occ index
 
     real_t s = 0.0;
 
@@ -242,43 +249,113 @@ __global__ void ea_eom_sigma2_full_kernel(
         s -= Loo[l * nocc + j] * r2[((size_t)l * nvir + a) * nvir + b];
     }
 
-    // +Σ_{l,d} (2 Wovvo[l,b,d,j] - Wovov[l,b,j,d]) r2[l,a,d]
-    //   Wovvo[l,b,d,j] layout: ((l*nvir+b)*nvir+d)*nocc + j
-    //   Wovov[l,b,j,d] layout: ((l*nvir+b)*nocc+j)*nvir + d
-    for (int l = 0; l < nocc; ++l)
-        for (int d = 0; d < nvir; ++d) {
-            real_t wovvo = Wovvo[(((size_t)l * nvir + b) * nvir + d) * nocc + j];
-            real_t wovov = Wovov[(((size_t)l * nvir + b) * nocc + j) * nvir + d];
-            s += (2.0 * wovvo - wovov) * r2[((size_t)l * nvir + a) * nvir + d];
-        }
+    // Ring terms (skipped here when include_ring==0; handled by 3 cuBLAS GEMMs
+    // over precomputed reorganized M matrices in apply()).
+    if (include_ring) {
+        // +Σ_{l,d} (2 Wovvo[l,b,d,j] - Wovov[l,b,j,d]) r2[l,a,d]     (R_A)
+        //   Wovvo[l,b,d,j] layout: ((l*nvir+b)*nvir+d)*nocc + j
+        //   Wovov[l,b,j,d] layout: ((l*nvir+b)*nocc+j)*nvir + d
+        for (int l = 0; l < nocc; ++l)
+            for (int d = 0; d < nvir; ++d) {
+                real_t wovvo = Wovvo[(((size_t)l * nvir + b) * nvir + d) * nocc + j];
+                real_t wovov = Wovov[(((size_t)l * nvir + b) * nocc + j) * nvir + d];
+                s += (2.0 * wovvo - wovov) * r2[((size_t)l * nvir + a) * nvir + d];
+            }
 
-    // -Σ_{l,c} Wovov[l,a,j,c] r2[l,c,b]
-    for (int l = 0; l < nocc; ++l)
-        for (int c = 0; c < nvir; ++c) {
-            real_t w = Wovov[(((size_t)l * nvir + a) * nocc + j) * nvir + c];
-            s -= w * r2[((size_t)l * nvir + c) * nvir + b];
-        }
+        // -Σ_{l,c} Wovov[l,a,j,c] r2[l,c,b]                          (R_B)
+        for (int l = 0; l < nocc; ++l)
+            for (int c = 0; c < nvir; ++c) {
+                real_t w = Wovov[(((size_t)l * nvir + a) * nocc + j) * nvir + c];
+                s -= w * r2[((size_t)l * nvir + c) * nvir + b];
+            }
 
-    // -Σ_{l,c} Wovvo[l,b,c,j] r2[l,c,a]
-    for (int l = 0; l < nocc; ++l)
-        for (int c = 0; c < nvir; ++c) {
-            real_t w = Wovvo[(((size_t)l * nvir + b) * nvir + c) * nocc + j];
-            s -= w * r2[((size_t)l * nvir + c) * nvir + a];
-        }
+        // -Σ_{l,c} Wovvo[l,b,c,j] r2[l,c,a]                          (R_C)
+        for (int l = 0; l < nocc; ++l)
+            for (int c = 0; c < nvir; ++c) {
+                real_t w = Wovvo[(((size_t)l * nvir + b) * nvir + c) * nocc + j];
+                s -= w * r2[((size_t)l * nvir + c) * nvir + a];
+            }
+    }
 
     // +Σ_{c,d} Wvvvv[a,b,c,d] r2[j,c,d]    layout: ((a*nvir+b)*nvir+c)*nvir + d
-    for (int c = 0; c < nvir; ++c)
-        for (int d = 0; d < nvir; ++d) {
-            s += Wvvvv[(((size_t)a * nvir + b) * nvir + c) * nvir + d]
-                 * r2[((size_t)j * nvir + c) * nvir + d];
-        }
+    // (skipped here when include_wvvvv==0; handled by a single cuBLAS GEMM in apply())
+    if (include_wvvvv)
+        for (int c = 0; c < nvir; ++c)
+            for (int d = 0; d < nvir; ++d) {
+                s += Wvvvv[(((size_t)a * nvir + b) * nvir + c) * nvir + d]
+                     * r2[((size_t)j * nvir + c) * nvir + d];
+            }
 
     // -Σ_k tmp[k] · t2[k,j,a,b]    t2 layout: ((k*nocc+j)*nvir + a)*nvir + b
     for (int k = 0; k < nocc; ++k) {
         s -= d_tmp_k[k] * t2[(((size_t)k * nocc + j) * nvir + a) * nvir + b];
     }
 
-    sigma2[idx] = s;
+    sigma2[((size_t)j * nvir + a) * nvir + b] = s;   // global index (slab writes its rows)
+}
+
+// ------------------------------------------------------------------
+//  Ring-term GEMM acceleration helpers
+// ------------------------------------------------------------------
+// Build the 3 reorganized W matrices used by the σ2 ring GEMMs.  All three
+// share the output linear index ((i1·nvir+v1)·nocc+i2)·nvir+v2 with
+// out=(i1,v1), con=(i2,v2):
+//   M_A[(j,b),(l,d)] = 2 Wovvo[l,b,d,j] - Wovov[l,b,j,d]
+//   M_B[(j,a),(l,c)] = Wovov[l,a,j,c]
+//   M_C[(j,b),(l,c)] = Wovvo[l,b,c,j]
+__global__ void ea_build_ring_M_kernel(
+    const real_t* __restrict__ Wovov,   // ((l*nvir+b)*nocc+j)*nvir + d
+    const real_t* __restrict__ Wovvo,   // ((l*nvir+b)*nvir+d)*nocc + j
+    real_t* __restrict__ M_A,
+    real_t* __restrict__ M_B,
+    real_t* __restrict__ M_C,
+    int nocc, int nvir)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t total = (size_t)nocc * nvir * nocc * nvir;
+    if (idx >= total) return;
+    int v2 = idx % nvir;
+    size_t t = idx / nvir;
+    int i2 = t % nocc;
+    t /= nocc;
+    int v1 = t % nvir;
+    int i1 = t / nvir;
+    real_t wovvo = Wovvo[(((size_t)i2 * nvir + v1) * nvir + v2) * nocc + i1];
+    real_t wovov = Wovov[(((size_t)i2 * nvir + v1) * nocc + i1) * nvir + v2];
+    M_A[idx] = 2.0 * wovvo - wovov;
+    M_B[idx] = wovov;
+    M_C[idx] = wovvo;
+}
+
+// r2T[(l,d),a] = r2[l,a,d]  (swap the two virtual indices, per occupied l)
+__global__ void ea_r2_swap_vir_kernel(
+    const real_t* __restrict__ r2, real_t* __restrict__ r2T, int nocc, int nvir)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;  // r2 layout (l,a,d)
+    const size_t total = (size_t)nocc * nvir * nvir;
+    if (idx >= total) return;
+    int d = idx % nvir;
+    size_t t = idx / nvir;
+    int a = t % nvir;
+    int l = t / nvir;
+    r2T[((size_t)l * nvir + d) * nvir + a] = r2[idx];
+}
+
+// σ2[j,a,b] += tmp[(j,b),a]   (scatter the [(jb),a]-shaped R_A+R_C accumulator)
+// Stage EA-5c: only the output-occ slab [j_begin, j_end) is scattered.
+__global__ void ea_ring_scatter_kernel(
+    const real_t* __restrict__ tmp, real_t* __restrict__ sigma2, int nocc, int nvir,
+    int j_begin, int j_end)
+{
+    size_t lidx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;  // slab-local
+    const size_t slabtot = (size_t)(j_end - j_begin) * nvir * nvir;
+    if (lidx >= slabtot) return;
+    int b = lidx % nvir;
+    size_t t = lidx / nvir;
+    int a = t % nvir;
+    int j = j_begin + (int)(t / nvir);
+    const size_t g = ((size_t)j * nvir + a) * nvir + b;
+    sigma2[g] += tmp[((size_t)j * nvir + b) * nvir + a];
 }
 #endif  // !GANSU_CPU_ONLY
 
@@ -291,13 +368,46 @@ EAEOMCCSDOperator::EAEOMCCSDOperator(
     const real_t* d_eri_mo,
     const real_t* d_orbital_energies,
     real_t* d_t1, real_t* d_t2,
-    int nocc, int nvir, int nao)
+    int nocc, int nvir, int nao,
+    const ERI_RI* eri_block_src,
+    const real_t* d_B_mo_blocks,
+    int nmo_full,
+    int num_gpus,
+    std::vector<real_t*>* d_eri_vvvv_slabs_input)
     : nocc_(nocc), nvir_(nvir), nao_(nao),
       p_dim_(nvir),
       p2h_dim_(nocc * nvir * nvir),
       total_dim_(nvir + nocc * nvir * nvir),
-      d_t1_(d_t1), d_t2_(d_t2)
+      d_t1_(d_t1), d_t2_(d_t2),
+      eri_block_src_(eri_block_src), d_B_mo_blocks_(d_B_mo_blocks), nmo_full_(nmo_full)
 {
+    // Ship 12 — take ownership of per-device d_eri_vvvv slabs allocated +
+    // extracted by the driver (compute_ea_eom_ccsd_impl).  Slab boundaries
+    // are uniform along the outermost a-axis; the consumer GEMM
+    // (canonical-skip Term A) runs independently on each device against its
+    // own slab + a broadcast t1.
+    if (d_eri_vvvv_slabs_input && (int)d_eri_vvvv_slabs_input->size() >= 2) {
+        const int N = (int)d_eri_vvvv_slabs_input->size();
+        eri_vvvv_nslab_ = N;
+        d_eri_vvvv_slabs_ = std::move(*d_eri_vvvv_slabs_input);
+        a_starts_.assign(N, 0);
+        a_ends_.assign(N, 0);
+        for (int d = 0; d < N; ++d) {
+            a_starts_[d] = (int)((int64_t)d * nvir / N);
+            a_ends_[d]   = (int)((int64_t)(d + 1) * nvir / N);
+        }
+        std::cout << "  [EA-EOM Ship 12] d_eri_vvvv slab mode ON: N="
+                  << N << " devices, a-axis split [";
+        for (int d = 0; d < N; ++d)
+            std::cout << a_starts_[d] << "-" << a_ends_[d]
+                      << (d + 1 < N ? "," : "]");
+        const double per_dev_gb = (double)(a_ends_[0] - a_starts_[0])
+                                  * nvir * nvir * nvir * sizeof(real_t)
+                                  / (1024.0 * 1024.0 * 1024.0);
+        std::cout << ", slab[0] ≈ " << std::fixed << std::setprecision(2)
+                  << per_dev_gb << " GB per device" << std::defaultfloat
+                  << std::endl;
+    }
     if (nocc <= 0 || nvir <= 0 || nao != nocc + nvir) {
         throw std::invalid_argument(
             "EAEOMCCSDOperator: invalid (nocc, nvir, nao) — require nao == nocc + nvir, both positive");
@@ -305,12 +415,61 @@ EAEOMCCSDOperator::EAEOMCCSDOperator(
 
     compute_denominators_and_fock(d_orbital_energies);
     build_diagonal();
+    // P5 canonical-skip (env-gated, all 3 required so the flag is only active when
+    // the native per-pair σ takes over both σ2 and the dressed-W reads). Default off
+    // → bit-exact full build.
+    {
+        const char* env_skip   = std::getenv("GANSU_DLPNO_CANONICAL_SKIP");
+        const char* env_native = std::getenv("GANSU_DLPNO_NATIVE_EOM");
+        const char* env_bare   = std::getenv("GANSU_DLPNO_NATIVE_BARE");
+        canonical_skip_wvvvv_ = (env_skip   && env_skip[0]   == '1') &&
+                                (env_native && env_native[0] == '1') &&
+                                (env_bare   && env_bare[0]   == '1');
+        if (canonical_skip_wvvvv_)
+            std::cout << "  [EA-EOM canonical-skip] dressed Wvvvv build SKIPPED "
+                         "(nvir⁴ host+device elided; Wvvvo·t1 refactored)" << std::endl;
+    }
+    // Ship 12: vvvv slab mode requires canonical-skip ON.  The legacy
+    // non-skip code path D2H's d_eri_vvvv_ (nullptr in slab mode) and reads
+    // h_vvvv (empty in slab mode); both would crash without skip.  Force the
+    // flag and warn if the env disagrees so the user notices.
+    if (eri_vvvv_nslab_ > 1 && !canonical_skip_wvvvv_) {
+        canonical_skip_wvvvv_ = true;
+        std::cout << "  [EA-EOM Ship 12] forcing canonical_skip_wvvvv_=true "
+                     "(slab mode requires skip path; set GANSU_DLPNO_CANONICAL_SKIP=1 "
+                     "to silence this notice)" << std::endl;
+    }
     // Sub-phase 2.2: when d_eri_mo is provided, extract the EA-needed MO ERI
     // blocks and build PySCF-equivalent dressed intermediates.
     // (Unit tests pass d_eri_mo == nullptr and exercise only the diagonal.)
-    if (d_eri_mo != nullptr) {
-        extract_eri_blocks(d_eri_mo);
-        build_dressed_intermediates();
+    if (d_eri_mo != nullptr || eri_block_src_ != nullptr) {  // Phase 0: block source
+        // Per-phase build profiling.  Default ON so each phase prints START
+        // and END markers — the canonical EA-EOM operator build is a long
+        // silent stretch otherwise (anthracene ~160 s, tetracene ~236 s, no
+        // Davidson activity to fall back on).  Set GANSU_EOM_BUILD_PROF=0
+        // to silence both markers.
+        const char* env_prof = std::getenv("GANSU_EOM_BUILD_PROF");
+        const bool prof = !env_prof || env_prof[0] != '0';
+        auto tphase = [&](const char* name, auto&& fn) {
+            if (!prof) { fn(); return; }
+            std::cout << "  [EA-EOM build-PROF] " << name << " ..." << std::endl;
+#ifndef GANSU_CPU_ONLY
+            if (gpu::gpu_available()) cudaDeviceSynchronize();
+#endif
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            fn();
+#ifndef GANSU_CPU_ONLY
+            if (gpu::gpu_available()) cudaDeviceSynchronize();
+#endif
+            const double s = std::chrono::duration<double>(
+                                 std::chrono::high_resolution_clock::now() - t0).count();
+            std::cout << "  [EA-EOM build-PROF] " << name << " = " << std::fixed
+                      << std::setprecision(3) << s << " s" << std::defaultfloat << std::endl;
+        };
+        tphase("extract_eri_blocks",          [&]{ extract_eri_blocks(d_eri_mo); });
+        tphase("build_dressed_intermediates", [&]{ build_dressed_intermediates(); });
+        num_gpus_ = (num_gpus > 1 ? num_gpus : 1);
+        setup_multi_gpu();   // Stage EA-5a: per-device replicas (no-op when num_gpus_==1)
     }
 }
 
@@ -329,6 +488,22 @@ EAEOMCCSDOperator::~EAEOMCCSDOperator() {
     if (d_eri_ovvo_)  tracked_cudaFree(d_eri_ovvo_);
     if (d_eri_ovvv_)  tracked_cudaFree(d_eri_ovvv_);
     if (d_eri_vvvv_)  tracked_cudaFree(d_eri_vvvv_);
+    // Ship 12: free per-device vvvv slabs (current device may not match the
+    // alloc device, so wrap each free in cudaSetDevice).
+#ifndef GANSU_CPU_ONLY
+    if (!d_eri_vvvv_slabs_.empty()) {
+        int saved = 0;
+        cudaGetDevice(&saved);
+        for (size_t d = 0; d < d_eri_vvvv_slabs_.size(); ++d) {
+            if (d_eri_vvvv_slabs_[d]) {
+                cudaSetDevice((int)d);
+                tracked_cudaFree(d_eri_vvvv_slabs_[d]);
+                d_eri_vvvv_slabs_[d] = nullptr;
+            }
+        }
+        cudaSetDevice(saved);
+    }
+#endif
     if (d_Loo_)       tracked_cudaFree(d_Loo_);
     if (d_Lvv_)       tracked_cudaFree(d_Lvv_);
     if (d_Fov_)       tracked_cudaFree(d_Fov_);
@@ -337,6 +512,133 @@ EAEOMCCSDOperator::~EAEOMCCSDOperator() {
     if (d_Wvovv_)     tracked_cudaFree(d_Wvovv_);
     if (d_Wvvvv_)     tracked_cudaFree(d_Wvvvv_);
     if (d_Wvvvo_)     tracked_cudaFree(d_Wvvvo_);
+    if (d_M_ringA_)   tracked_cudaFree(d_M_ringA_);
+    if (d_M_ringB_)   tracked_cudaFree(d_M_ringB_);
+    if (d_M_ringC_)   tracked_cudaFree(d_M_ringC_);
+#ifndef GANSU_CPU_ONLY
+    // Stage EA-5: free per-device replicas (skip ws_[0], which aliases the
+    // device-0 members freed above).
+    for (size_t d = 1; d < ws_.size(); ++d) {
+        DeviceWorkspace& w = ws_[d];
+        MultiGpuManager::DeviceGuard guard(w.device);
+        for (real_t* p : {w.d_input, w.d_s1, w.d_s2, w.d_tmp_k, w.d_r2T, w.d_ring_tmp,
+                          w.d_Lvv, w.d_Loo, w.d_Fov, w.d_Wovov, w.d_Wovvo, w.d_Wvovv,
+                          w.d_Wvvvo, w.d_Wvvvv, w.d_t2, w.d_eri_ovov,
+                          w.d_M_ringA, w.d_M_ringB, w.d_M_ringC})
+            if (p) tracked_cudaFree(p);
+        if (w.cublas) cublasDestroy((cublasHandle_t)w.cublas);
+    }
+    // ws_[0] only owns its σ scratch (other pointers alias the device-0 members
+    // freed above); free just the scratch on device 0.
+    if (!ws_.empty()) {
+        MultiGpuManager::DeviceGuard guard(0);
+        if (ws_[0].d_tmp_k)    tracked_cudaFree(ws_[0].d_tmp_k);
+        if (ws_[0].d_r2T)      tracked_cudaFree(ws_[0].d_r2T);
+        if (ws_[0].d_ring_tmp) tracked_cudaFree(ws_[0].d_ring_tmp);
+    }
+#endif
+}
+
+// ==================================================================
+//  Stage EA-5a: multi-GPU scaffolding — per-device replicas of all
+//  σ-build intermediates (peer-copied from device 0).  Gated by
+//  GANSU_STEOM_EOM_GPUS=N>1 (decoupled from RI/CIS-NTO --num_gpus).
+//  Pure setup: apply() is unchanged this stage (slab σ2 + gather land
+//  in EA-5b/5c).  num_gpus_==1 → no-op (byte-identical legacy path).
+// ==================================================================
+void EAEOMCCSDOperator::setup_multi_gpu() {
+#ifndef GANSU_CPU_ONLY
+    if (!gpu::gpu_available() || num_gpus_ <= 1) return;
+    const char* e = std::getenv("GANSU_STEOM_EOM_GPUS");
+    const int env_gpus = (e && e[0]) ? std::atoi(e) : 0;
+    if (env_gpus <= 1) return;   // decoupled opt-in; default = legacy single-GPU
+
+    // Decouple the EA σ device count from the RI/CIS-NTO MultiGpuManager singleton,
+    // which is already initialized to 1 device by the --num_gpus 1 HF/RI path
+    // (initialize() is a no-op after the first call).  Use the physical device count
+    // directly and create our own per-device cuBLAS handles (the singleton only holds
+    // a device-0 handle).  MultiGpuManager::DeviceGuard is a pure cudaSetDevice RAII
+    // (no singleton state) and is safe to reuse.
+    int phys = 0;
+    cudaGetDeviceCount(&phys);
+    const int nuse = std::min({num_gpus_, env_gpus, phys});
+    if (nuse <= 1) return;
+    use_gpu_multi_ = true;
+
+    const size_t NO = nocc_, NV = nvir_;
+    const size_t loo_sz = NO*NO, lvv_sz = NV*NV, fov_sz = NO*NV;
+    const size_t ovov_sz = NO*NV*NO*NV;          // == ovvo, M_ring, eri_ovov size
+    const size_t wvovv_sz = NV*NO*NV*NV;
+    const size_t vvvv_sz = NV*NV*NV*NV;
+    const size_t wvvvo_sz = NV*NV*NV*NO;
+    const size_t t2_sz = NO*NO*NV*NV;
+    const size_t p2h = (size_t)p2h_dim_, total = (size_t)total_dim_;
+
+    ws_.resize(nuse);
+    // ws_[0] aliases the device-0 members (exact restore; no alloc/copy).
+    {
+        DeviceWorkspace& w = ws_[0];
+        w.device = 0; w.cublas = nullptr;
+        w.d_Lvv=d_Lvv_; w.d_Loo=d_Loo_; w.d_Fov=d_Fov_; w.d_Wovov=d_Wovov_;
+        w.d_Wovvo=d_Wovvo_; w.d_Wvovv=d_Wvovv_; w.d_Wvvvo=d_Wvvvo_; w.d_Wvvvv=d_Wvvvv_;
+        w.d_t2=d_t2_; w.d_eri_ovov=d_eri_ovov_;
+        w.d_M_ringA=d_M_ringA_; w.d_M_ringB=d_M_ringB_; w.d_M_ringC=d_M_ringC_;
+        auto p0 = aux_partition(NO, nuse, 0);
+        w.j_begin = (int)p0.first; w.j_end = (int)p0.second;
+        // EA-5d: device-0 persistent σ scratch (avoid per-matvec cudaMalloc).
+        tracked_cudaMalloc(&w.d_tmp_k,    NO * sizeof(real_t));
+        tracked_cudaMalloc(&w.d_r2T,      p2h * sizeof(real_t));
+        tracked_cudaMalloc(&w.d_ring_tmp, p2h * sizeof(real_t));
+    }
+    size_t bytes_per_dev = 0;
+    for (int d = 1; d < nuse; ++d) {
+        DeviceWorkspace& w = ws_[d];
+        w.device = d;
+        MultiGpuManager::DeviceGuard guard(d);
+        cublasHandle_t h = nullptr;
+        cublasCreate(&h);          // our own per-device handle (destroyed in dtor)
+        w.cublas = (void*)h;
+        auto pd = aux_partition(NO, nuse, d);
+        w.j_begin = (int)pd.first; w.j_end = (int)pd.second;
+        // alloc a device-d buffer, peer-copy from the device-0 source.
+        auto repl = [&](real_t** dst, const real_t* src0, size_t n) {
+            tracked_cudaMalloc(dst, n * sizeof(real_t));
+            cudaMemcpyPeer(*dst, d, src0, 0, n * sizeof(real_t));
+            bytes_per_dev += n * sizeof(real_t);
+        };
+        repl(&w.d_Lvv,   d_Lvv_,   lvv_sz);
+        repl(&w.d_Loo,   d_Loo_,   loo_sz);
+        repl(&w.d_Fov,   d_Fov_,   fov_sz);
+        repl(&w.d_Wovov, d_Wovov_, ovov_sz);
+        repl(&w.d_Wovvo, d_Wovvo_, ovov_sz);
+        repl(&w.d_Wvovv, d_Wvovv_, wvovv_sz);
+        repl(&w.d_Wvvvo, d_Wvvvo_, wvvvo_sz);
+        if (d_Wvvvv_)
+            repl(&w.d_Wvvvv, d_Wvvvv_, vvvv_sz);
+        // else: canonical-skip → canonical σ2 not invoked, replica unused
+        repl(&w.d_t2,    d_t2_,    t2_sz);
+        repl(&w.d_eri_ovov, d_eri_ovov_, ovov_sz);
+        repl(&w.d_M_ringA, d_M_ringA_, ovov_sz);
+        repl(&w.d_M_ringB, d_M_ringB_, ovov_sz);
+        repl(&w.d_M_ringC, d_M_ringC_, ovov_sz);
+        // per-device scratch (uninitialized; used by EA-5b/5c apply_multi).
+        tracked_cudaMalloc(&w.d_input,    total * sizeof(real_t));
+        tracked_cudaMalloc(&w.d_s1,       (size_t)p_dim_ * sizeof(real_t));
+        tracked_cudaMalloc(&w.d_s2,       p2h * sizeof(real_t));
+        tracked_cudaMalloc(&w.d_tmp_k,    NO * sizeof(real_t));
+        tracked_cudaMalloc(&w.d_r2T,      p2h * sizeof(real_t));
+        tracked_cudaMalloc(&w.d_ring_tmp, p2h * sizeof(real_t));
+        bytes_per_dev += (total + p_dim_ + 3*p2h + NO) * sizeof(real_t);
+    }
+    MultiGpuManager::DeviceGuard guard0(0);  // restore device 0
+    const double gb_per_dev = (nuse > 1)
+        ? (double)bytes_per_dev / (double)(nuse - 1) / (1024.0*1024.0*1024.0) : 0.0;
+    std::cout << "[EA-EOM Stage 5c] multi-GPU σ: nuse=" << nuse
+              << "  j-slab over nocc=" << NO
+              << "  per-device replicas ≈ " << std::fixed << std::setprecision(2)
+              << gb_per_dev << " GB"
+              << std::defaultfloat << " (each device computes its σ2 j-slab → disjoint gather)" << std::endl;
+#endif
 }
 
 void EAEOMCCSDOperator::compute_denominators_and_fock(const real_t* d_orbital_energies) {
@@ -409,7 +711,35 @@ void EAEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
     tracked_cudaMalloc(&d_eri_oovv_, oovv_sz * sizeof(real_t));
     tracked_cudaMalloc(&d_eri_ovvo_, ovvo_sz * sizeof(real_t));
     tracked_cudaMalloc(&d_eri_ovvv_, ovvv_sz * sizeof(real_t));
-    tracked_cudaMalloc(&d_eri_vvvv_, vvvv_sz * sizeof(real_t));
+    // Ship 12: in slab mode d_eri_vvvv_ stays null; each device owns its
+    // slab via d_eri_vvvv_slabs_[d] allocated below in the P4b branch.
+    if (eri_vvvv_nslab_ <= 1) {
+        tracked_cudaMalloc(&d_eri_vvvv_, vvvv_sz * sizeof(real_t));
+    }
+
+#ifndef GANSU_CPU_ONLY
+    // Phase 0: build the 7 blocks on the fly from B_mo (naux×nmo²), never the
+    // full nmo⁴. o=[0,nocc), v=[nocc,nmo). Layouts match the gather kernels below.
+    if (eri_block_src_ != nullptr) {
+        const int M = nmo_full_;
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,0,nocc,      0,nocc,0,nocc,      d_eri_oooo_); // (ij|kl)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,0,nocc,      0,nocc,nocc,nvir,   d_eri_ooov_); // (ji|kb)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,nocc,nvir,   0,nocc,nocc,nvir,   d_eri_ovov_); // (ia|jb)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,0,nocc,      nocc,nvir,nocc,nvir,d_eri_oovv_); // (ij|ab)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,nocc,nvir,   nocc,nvir,0,nocc,   d_eri_ovvo_); // (ia|bj)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,nocc,nvir,   nocc,nvir,nocc,nvir,d_eri_ovvv_); // (ia|bc)
+
+        // Ship 12: in slab mode the d_eri_vvvv slabs are already allocated
+        // and populated by the driver (compute_ea_eom_ccsd_impl) before this
+        // ctor was reached — operator just owns them. Skip the legacy
+        // single-device vvvv extract here.
+        if (eri_vvvv_nslab_ <= 1) {
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, nocc,nvir,nocc,nvir,nocc,nvir,nocc,nvir,d_eri_vvvv_); // (ab|cd)
+        }
+        cudaDeviceSynchronize();
+        return;
+    }
+#endif
 
     if (!gpu::gpu_available()) {
         // CPU fallback — explicit nested loops, mirroring src/ip_eom_ccsd_operator.cu.
@@ -536,7 +866,15 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
 
     std::vector<real_t> h_t1(t1_sz), h_t2(t2_sz);
     std::vector<real_t> h_ovov(ovov_sz), h_ooov(ooov_sz), h_oovv(oovv_sz);
-    std::vector<real_t> h_ovvo(ovvo_sz), h_ovvv(ovvv_sz), h_vvvv(vvvv_sz);
+    std::vector<real_t> h_ovvo(ovvo_sz), h_ovvv(ovvv_sz);
+    // Ship 12: in slab mode the bare vvvv tensor lives in per-device device
+    // buffers (d_eri_vvvv_slabs_); the only consumer that needs h_vvvv (host)
+    // is the canonical-skip OFF Wvvvv build + validate sample + CPU fallback.
+    // Slab mode enforces canonical_skip_wvvvv_=true and uses the Term A slab
+    // GEMM directly off device, so h_vvvv stays empty.  Saves NV⁴·8B host RAM
+    // (Pentacene: 91 GB host alloc avoided).
+    std::vector<real_t> h_vvvv;
+    if (eri_vvvv_nslab_ <= 1) h_vvvv.assign(vvvv_sz, 0.0);
 
     cudaMemcpy(h_t1.data(),   d_t1_,        t1_sz   * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_t2.data(),   d_t2_,        t2_sz   * sizeof(real_t), cudaMemcpyDeviceToHost);
@@ -545,7 +883,8 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     cudaMemcpy(h_oovv.data(), d_eri_oovv_,  oovv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_ovvo.data(), d_eri_ovvo_,  ovvo_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_ovvv.data(), d_eri_ovvv_,  ovvv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_vvvv.data(), d_eri_vvvv_,  vvvv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    if (eri_vvvv_nslab_ <= 1)
+        cudaMemcpy(h_vvvv.data(), d_eri_vvvv_,  vvvv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
 
     std::vector<real_t> h_f_oo(NO), h_f_vv(NV);
     cudaMemcpy(h_f_oo.data(), d_f_oo_, NO * sizeof(real_t), cudaMemcpyDeviceToHost);
@@ -555,6 +894,7 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     //  cc_Fov[k,c] = fov + 2 ovov[k,c,l,d] t1[l,d] - ovov[k,d,l,c] t1[l,d]
     // ============================================================
     std::vector<real_t> h_Fov(t1_sz, 0.0);
+    #pragma omp parallel for collapse(2)
     for (int k = 0; k < NO; ++k)
         for (int c = 0; c < NV; ++c) {
             real_t v = 0.0;
@@ -570,6 +910,7 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     //  cc_Foo / cc_Fvv (internal helpers for Loo / Lvv)
     // ============================================================
     std::vector<real_t> h_ccFoo(NO * NO, 0.0);
+    #pragma omp parallel for collapse(2)
     for (int k = 0; k < NO; ++k)
         for (int i = 0; i < NO; ++i) {
             real_t v = (k == i ? h_f_oo[k] : 0.0);
@@ -585,6 +926,7 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         }
 
     std::vector<real_t> h_ccFvv(NV * NV, 0.0);
+    #pragma omp parallel for collapse(2)
     for (int a = 0; a < NV; ++a)
         for (int c = 0; c < NV; ++c) {
             real_t v = (a == c ? h_f_vv[a] : 0.0);
@@ -604,6 +946,7 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     //  Lvv[a,c] = cc_Fvv - Fov·t1 + 2 ovvv·t1 - ovvv·t1 (PySCF Lvv)
     // ============================================================
     std::vector<real_t> h_Loo(NO * NO, 0.0);
+    #pragma omp parallel for collapse(2)
     for (int k = 0; k < NO; ++k)
         for (int i = 0; i < NO; ++i) {
             real_t v = h_ccFoo[k*NO + i];
@@ -618,6 +961,7 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         }
 
     std::vector<real_t> h_Lvv(NV * NV, 0.0);
+    #pragma omp parallel for collapse(2)
     for (int a = 0; a < NV; ++a)
         for (int c = 0; c < NV; ++c) {
             real_t v = h_ccFvv[a*NV + c];
@@ -639,6 +983,7 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     // Where Wooov[k,l,i,d] = ooov[k,i,l,d] + Σ_c t1[i,c] ovov[k,c,l,d]
     // ============================================================
     std::vector<real_t> h_Wooov(ooov_sz, 0.0);
+    #pragma omp parallel for collapse(2)
     for (int k = 0; k < NO; ++k)
         for (int l = 0; l < NO; ++l)
             for (int i = 0; i < NO; ++i)
@@ -650,20 +995,116 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                 }
     #define H_WOOOV(k,l,i,d) h_Wooov[(((size_t)(k) * NO + (l)) * NO + (i)) * NV + (d)]
 
+    // GPU GEMM port of the two O(NO³·NV³) contraction hotspots (mirrors the
+    // validated IP/STEOM build_dressed ports). Each is computed ONCE on the GPU
+    // and reused by the W1ovov / W1ovvo standalone loops below.
+    //   ct_ovov[(k,d),(i,b)] = Σ_{c,l} ovov[k,c,l,d]·t2[i,l,c,b]
+    //   ct_ovvo[(k,c),(j,b)] = Σ_{l,d}[(2·ovov[k,c,l,d]−ovov[k,d,l,c])·t2[j,l,b,d]
+    //                                  − ovov[k,c,l,d]·t2[l,j,b,d]]
+    const int EA_MO_kd = NO*NV, EA_NO_ib = NO*NV, EA_KO_cl = NV*NO;   // ct_ovov
+    const int EA_M_kc = NO*NV, EA_N_jb = NO*NV, EA_K_ld = NO*NV;      // ct_ovvo
+    std::vector<real_t> ct_ovov, ct_ovvo;
+    bool ea_ct_gpu = false;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+        const real_t one = 1.0, negone = -1.0, zero = 0.0;
+        {   // ct_ovov
+            std::vector<real_t> hA((size_t)EA_MO_kd*EA_KO_cl), hB((size_t)EA_KO_cl*EA_NO_ib);
+            #pragma omp parallel for collapse(2)
+            for (int k=0;k<NO;++k) for (int d=0;d<NV;++d)
+                for (int c=0;c<NV;++c) for (int l=0;l<NO;++l)
+                    hA[(size_t)(k*NV+d)*EA_KO_cl+(c*NO+l)] = H_OVOV(k,c,l,d);
+            #pragma omp parallel for collapse(2)
+            for (int c=0;c<NV;++c) for (int l=0;l<NO;++l)
+                for (int i=0;i<NO;++i) for (int b=0;b<NV;++b)
+                    hB[(size_t)(c*NO+l)*EA_NO_ib+(i*NV+b)] = H_T2(i,l,c,b);
+            real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
+            tracked_cudaMalloc(&dA,(size_t)EA_MO_kd*EA_KO_cl*sizeof(real_t));
+            tracked_cudaMalloc(&dB,(size_t)EA_KO_cl*EA_NO_ib*sizeof(real_t));
+            tracked_cudaMalloc(&dC,(size_t)EA_MO_kd*EA_NO_ib*sizeof(real_t));
+            cudaMemcpy(dA,hA.data(),(size_t)EA_MO_kd*EA_KO_cl*sizeof(real_t),cudaMemcpyHostToDevice);
+            cudaMemcpy(dB,hB.data(),(size_t)EA_KO_cl*EA_NO_ib*sizeof(real_t),cudaMemcpyHostToDevice);
+            cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,EA_NO_ib,EA_MO_kd,EA_KO_cl,&one,
+                        dB,EA_NO_ib,dA,EA_KO_cl,&zero,dC,EA_NO_ib);
+            ct_ovov.assign((size_t)EA_MO_kd*EA_NO_ib,0.0);
+            cudaMemcpy(ct_ovov.data(),dC,(size_t)EA_MO_kd*EA_NO_ib*sizeof(real_t),cudaMemcpyDeviceToHost);
+            tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
+        }
+        {   // ct_ovvo
+            std::vector<real_t> hA1((size_t)EA_M_kc*EA_K_ld), hB1((size_t)EA_K_ld*EA_N_jb),
+                                hA2((size_t)EA_M_kc*EA_K_ld), hB2((size_t)EA_K_ld*EA_N_jb);
+            #pragma omp parallel for collapse(2)
+            for (int k=0;k<NO;++k) for (int c=0;c<NV;++c)
+                for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) {
+                    const size_t o=(size_t)(k*NV+c)*EA_K_ld+(l*NV+d);
+                    hA1[o]=2.0*H_OVOV(k,c,l,d)-H_OVOV(k,d,l,c); hA2[o]=H_OVOV(k,c,l,d);
+                }
+            #pragma omp parallel for collapse(2)
+            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
+                for (int j=0;j<NO;++j) for (int b=0;b<NV;++b) {
+                    const size_t o=(size_t)(l*NV+d)*EA_N_jb+(j*NV+b);
+                    hB1[o]=H_T2(j,l,b,d); hB2[o]=H_T2(l,j,b,d);
+                }
+            real_t *dA1=nullptr,*dB1=nullptr,*dA2=nullptr,*dB2=nullptr,*dC=nullptr;
+            tracked_cudaMalloc(&dA1,(size_t)EA_M_kc*EA_K_ld*sizeof(real_t));
+            tracked_cudaMalloc(&dB1,(size_t)EA_K_ld*EA_N_jb*sizeof(real_t));
+            tracked_cudaMalloc(&dA2,(size_t)EA_M_kc*EA_K_ld*sizeof(real_t));
+            tracked_cudaMalloc(&dB2,(size_t)EA_K_ld*EA_N_jb*sizeof(real_t));
+            tracked_cudaMalloc(&dC, (size_t)EA_M_kc*EA_N_jb*sizeof(real_t));
+            cudaMemcpy(dA1,hA1.data(),(size_t)EA_M_kc*EA_K_ld*sizeof(real_t),cudaMemcpyHostToDevice);
+            cudaMemcpy(dB1,hB1.data(),(size_t)EA_K_ld*EA_N_jb*sizeof(real_t),cudaMemcpyHostToDevice);
+            cudaMemcpy(dA2,hA2.data(),(size_t)EA_M_kc*EA_K_ld*sizeof(real_t),cudaMemcpyHostToDevice);
+            cudaMemcpy(dB2,hB2.data(),(size_t)EA_K_ld*EA_N_jb*sizeof(real_t),cudaMemcpyHostToDevice);
+            cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,EA_N_jb,EA_M_kc,EA_K_ld,&one,
+                        dB1,EA_N_jb,dA1,EA_K_ld,&zero,dC,EA_N_jb);
+            cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,EA_N_jb,EA_M_kc,EA_K_ld,&negone,
+                        dB2,EA_N_jb,dA2,EA_K_ld,&one,dC,EA_N_jb);
+            ct_ovvo.assign((size_t)EA_M_kc*EA_N_jb,0.0);
+            cudaMemcpy(ct_ovvo.data(),dC,(size_t)EA_M_kc*EA_N_jb*sizeof(real_t),cudaMemcpyDeviceToHost);
+            tracked_cudaFree(dA1);tracked_cudaFree(dB1);tracked_cudaFree(dA2);tracked_cudaFree(dB2);tracked_cudaFree(dC);
+        }
+        ea_ct_gpu = true;
+        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+            real_t d1=0.0,d2=0.0;
+            for (int k=0;k<NO;k+=(NO/2>0?NO/2:1)) for (int d=0;d<NV;d+=(NV/2>0?NV/2:1))
+                for (int i=0;i<NO;++i) for (int b=0;b<NV;++b) {
+                    real_t v=0.0; for (int c=0;c<NV;++c) for (int l=0;l<NO;++l) v+=H_OVOV(k,c,l,d)*H_T2(i,l,c,b);
+                    d1=std::max(d1,std::fabs(v-ct_ovov[(size_t)(k*NV+d)*EA_NO_ib+(i*NV+b)]));
+                }
+            for (int k=0;k<NO;k+=(NO/2>0?NO/2:1)) for (int b=0;b<NV;b+=(NV/2>0?NV/2:1))
+                for (int c=0;c<NV;++c) for (int j=0;j<NO;++j) {
+                    real_t v=0.0; for (int l=0;l<NO;++l) for (int dd=0;dd<NV;++dd){
+                        real_t kcld=H_OVOV(k,c,l,dd);
+                        v+=2.0*kcld*H_T2(j,l,b,dd)-kcld*H_T2(l,j,b,dd)-H_OVOV(k,dd,l,c)*H_T2(j,l,b,dd);}
+                    d2=std::max(d2,std::fabs(v-ct_ovvo[(size_t)(k*NV+c)*EA_N_jb+(j*NV+b)]));
+                }
+            std::cout << "[EA-EOM build self-check] ct_ovov max|Δ| = " << std::scientific << d1
+                      << ", ct_ovvo max|Δ| = " << d2 << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+        }
+    }
+#endif
+
     std::vector<real_t> h_W1ovov(ovov_sz, 0.0);
+    #pragma omp parallel for collapse(2)
     for (int k = 0; k < NO; ++k)
         for (int b = 0; b < NV; ++b)
             for (int i = 0; i < NO; ++i)
                 for (int d = 0; d < NV; ++d) {
                     real_t v = H_OOVV(k,i,b,d);
-                    for (int c = 0; c < NV; ++c)
-                        for (int l = 0; l < NO; ++l)
-                            v -= H_OVOV(k,c,l,d) * H_T2(i,l,c,b);
+                    if (ea_ct_gpu) {
+                        v -= ct_ovov[(size_t)(k*NV+d)*EA_NO_ib + (i*NV+b)];
+                    } else {
+                        for (int c = 0; c < NV; ++c)
+                            for (int l = 0; l < NO; ++l)
+                                v -= H_OVOV(k,c,l,d) * H_T2(i,l,c,b);
+                    }
                     h_W1ovov[(((size_t)k * NV + b) * NO + i) * NV + d] = v;
                 }
     #define H_W1OVOV(k,b,i,d) h_W1ovov[(((size_t)(k) * NV + (b)) * NO + (i)) * NV + (d)]
 
     std::vector<real_t> h_Wovov(ovov_sz, 0.0);
+    #pragma omp parallel for collapse(2)
     for (int k = 0; k < NO; ++k)
         for (int b = 0; b < NV; ++b)
             for (int i = 0; i < NO; ++i)
@@ -686,23 +1127,29 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     //  Wovvo = W1ovvo + W2ovvo                      (PySCF Wovvo)
     // ============================================================
     std::vector<real_t> h_W1ovvo(ovvo_sz, 0.0);
+    #pragma omp parallel for collapse(2)
     for (int k = 0; k < NO; ++k)
         for (int b = 0; b < NV; ++b)
             for (int c = 0; c < NV; ++c)
                 for (int j = 0; j < NO; ++j) {
                     real_t v = H_OVVO(k,c,b,j);
-                    for (int l = 0; l < NO; ++l)
-                        for (int d = 0; d < NV; ++d) {
-                            real_t kcld = H_OVOV(k,c,l,d);
-                            v += 2.0 * kcld * H_T2(j,l,b,d);
-                            v -=       kcld * H_T2(l,j,b,d);
-                            v -= H_OVOV(k,d,l,c) * H_T2(j,l,b,d);
-                        }
+                    if (ea_ct_gpu) {
+                        v += ct_ovvo[(size_t)(k*NV+c)*EA_N_jb + (j*NV+b)];
+                    } else {
+                        for (int l = 0; l < NO; ++l)
+                            for (int d = 0; d < NV; ++d) {
+                                real_t kcld = H_OVOV(k,c,l,d);
+                                v += 2.0 * kcld * H_T2(j,l,b,d);
+                                v -=       kcld * H_T2(l,j,b,d);
+                                v -= H_OVOV(k,d,l,c) * H_T2(j,l,b,d);
+                            }
+                    }
                     h_W1ovvo[(((size_t)k * NV + b) * NV + c) * NO + j] = v;
                 }
     #define H_W1OVVO(k,b,c,j) h_W1ovvo[(((size_t)(k) * NV + (b)) * NV + (c)) * NO + (j)]
 
     std::vector<real_t> h_Wovvo(ovvo_sz, 0.0);
+    #pragma omp parallel for collapse(2)
     for (int k = 0; k < NO; ++k)
         for (int b = 0; b < NV; ++b)
             for (int c = 0; c < NV; ++c)
@@ -722,6 +1169,7 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     // ============================================================
     const size_t wvovv_sz = (size_t)NV * NO * NV * NV;
     std::vector<real_t> h_Wvovv(wvovv_sz, 0.0);
+    #pragma omp parallel for collapse(2)
     for (int a = 0; a < NV; ++a)
         for (int l = 0; l < NO; ++l)
             for (int c = 0; c < NV; ++c)
@@ -740,24 +1188,508 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     //                 - Σ_k ovvv[k,c,b,d] t1[k,a]
     //  layout: [a, b, c, d]  index = ((a*NV + b)*NV + c)*NV + d
     // ============================================================
-    std::vector<real_t> h_Wvvvv(vvvv_sz, 0.0);
-    for (int a = 0; a < NV; ++a)
-        for (int b = 0; b < NV; ++b)
-            for (int c = 0; c < NV; ++c)
-                for (int d = 0; d < NV; ++d) {
-                    real_t v = H_VVVV(a,c,b,d);  // (ac|bd) chemist → Wabcd physicist
-                    for (int k = 0; k < NO; ++k)
-                        v -= H_OVVV(k,c,b,d) * H_T1(k,a);
+    // Wvvvv dominant term3 (Σ_kl ovov[k,c,l,d]·τ[k,l,a,b], τ=t2+t1t1) via a single GEMM —
+    // the EA-EOM build hotspot (mirrors the STEOM build). result[(ab),(cd)] = Σ_(kl)
+    // τ[(kl),(ab)]·ovov2[(kl),(cd)] with ovov2 = ovov repacked to [k,l,c,d]; cublasDgemm(N,T)
+    // → C col-major [cd×ab] = result row-major [ab][cd] = Wvvvv layout. Host fallback keeps
+    // the k,l sum. Self-check (GANSU_STEOM_BUILD_VALIDATE) below.
+    const int NV2 = NV * NV, NO2 = NO * NO;
+    std::vector<real_t> wvvvv_t3;
+    bool wvvvv_t3_gpu = false;
+    std::vector<real_t> h_Wvvvv;
+    if (!canonical_skip_wvvvv_) {
+#ifndef GANSU_CPU_ONLY
+        if (gpu::gpu_available()) {
+            cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+            std::vector<real_t> h_tau(t2_sz), h_ovov2(ovov_sz);
+            #pragma omp parallel for collapse(2)
+            for (int k = 0; k < NO; ++k)
+                for (int l = 0; l < NO; ++l)
+                    for (int a = 0; a < NV; ++a)
+                        for (int b = 0; b < NV; ++b)
+                            h_tau[(((size_t)k*NO+l)*NV+a)*NV+b] = H_T2(k,l,a,b) + H_T1(k,a)*H_T1(l,b);
+            #pragma omp parallel for collapse(2)
+            for (int k = 0; k < NO; ++k)
+                for (int c = 0; c < NV; ++c)
                     for (int l = 0; l < NO; ++l)
-                        v -= H_OVVV(l,d,a,c) * H_T1(l,b);
-                    for (int k = 0; k < NO; ++k)
-                        for (int l = 0; l < NO; ++l) {
-                            real_t kcld = H_OVOV(k,c,l,d);
-                            v += kcld * (H_T2(k,l,a,b) + H_T1(k,a) * H_T1(l,b));
+                        for (int d = 0; d < NV; ++d)
+                            h_ovov2[(((size_t)k*NO+l)*NV+c)*NV+d] = H_OVOV(k,c,l,d);
+            real_t *d_tau = nullptr, *d_ovov2 = nullptr, *d_t3 = nullptr;
+            tracked_cudaMalloc(&d_tau,   t2_sz   * sizeof(real_t));
+            tracked_cudaMalloc(&d_ovov2, ovov_sz * sizeof(real_t));
+            tracked_cudaMalloc(&d_t3,    (size_t)NV2 * NV2 * sizeof(real_t));
+            cudaMemcpy(d_tau,   h_tau.data(),   t2_sz   * sizeof(real_t), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_ovov2, h_ovov2.data(), ovov_sz * sizeof(real_t), cudaMemcpyHostToDevice);
+            const real_t one = 1.0, zero = 0.0;
+            cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T, NV2, NV2, NO2, &one,
+                        d_ovov2, NV2, d_tau, NV2, &zero, d_t3, NV2);
+            wvvvv_t3.assign((size_t)NV2 * NV2, 0.0);
+            cudaMemcpy(wvvvv_t3.data(), d_t3, (size_t)NV2 * NV2 * sizeof(real_t), cudaMemcpyDeviceToHost);
+            tracked_cudaFree(d_tau); tracked_cudaFree(d_ovov2); tracked_cudaFree(d_t3);
+            wvvvv_t3_gpu = true;
+            if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+                real_t dmax = 0.0;
+                const int asamp[2] = {0, NV - 1};
+                for (int ai = 0; ai < 2; ++ai) { const int a = asamp[ai];
+                    for (int b = 0; b < NV; b += (NV/2>0?NV/2:1))
+                        for (int c = 0; c < NV; ++c) for (int d = 0; d < NV; ++d) {
+                            real_t v = 0.0;
+                            for (int k = 0; k < NO; ++k) for (int l = 0; l < NO; ++l)
+                                v += H_OVOV(k,c,l,d) * (H_T2(k,l,a,b) + H_T1(k,a)*H_T1(l,b));
+                            dmax = std::max(dmax, std::fabs(v - wvvvv_t3[((size_t)(a*NV+b))*NV2 + (c*NV+d)]));
                         }
-                    h_Wvvvv[(((size_t)a * NV + b) * NV + c) * NV + d] = v;
                 }
+                std::cout << "[EA-EOM build self-check] Wvvvv term3 GEMM vs host: max|Δ| = "
+                          << std::scientific << dmax << " (expect ≤1e-11)"
+                          << std::defaultfloat << std::endl;
+            }
+        }
+#endif
+
+        h_Wvvvv.assign(vvvv_sz, 0.0);
+        #pragma omp parallel for collapse(2)
+        for (int a = 0; a < NV; ++a)
+            for (int b = 0; b < NV; ++b)
+                for (int c = 0; c < NV; ++c)
+                    for (int d = 0; d < NV; ++d) {
+                        real_t v = H_VVVV(a,c,b,d);  // (ac|bd) chemist → Wabcd physicist
+                        for (int k = 0; k < NO; ++k)
+                            v -= H_OVVV(k,c,b,d) * H_T1(k,a);
+                        for (int l = 0; l < NO; ++l)
+                            v -= H_OVVV(l,d,a,c) * H_T1(l,b);
+                        if (wvvvv_t3_gpu) {
+                            v += wvvvv_t3[((size_t)(a * NV + b)) * NV2 + (c * NV + d)];
+                        } else {
+                            for (int k = 0; k < NO; ++k)
+                                for (int l = 0; l < NO; ++l) {
+                                    real_t kcld = H_OVOV(k,c,l,d);
+                                    v += kcld * (H_T2(k,l,a,b) + H_T1(k,a) * H_T1(l,b));
+                                }
+                        }
+                        h_Wvvvv[(((size_t)a * NV + b) * NV + c) * NV + d] = v;
+                    }
+    }  // close canonical_skip guard
     #define H_WVVVV(a,b,c,d) h_Wvvvv[(((size_t)(a) * NV + (b)) * NV + (c)) * NV + (d)]
+
+    // P5 canonical-skip: when h_Wvvvv is not materialized, the only consumer
+    // (Σ_d Wvvvv[a,b,c,d]·t1[j,d] in the Wvvvo build below) is recomputed via
+    // 4 fused contractions without ever forming a nvir⁴ intermediate. Each term
+    // uses an O(nocc³·nvir) or O(nocc·nvir²) scratch and runs at O(nvir⁵·nocc)
+    // or less — same complexity class as the original d-loop, no extra work.
+    std::vector<real_t> wvvvo_w_t1;
+    if (canonical_skip_wvvvv_) {
+        const size_t wvvvo_sz_local = (size_t)NV * NV * NV * NO;
+        wvvvo_w_t1.assign(wvvvo_sz_local, 0.0);
+
+        // Term A: + Σ_d (ac|bd)·t1[j,d] = Σ_d H_VVVV(a,c,b,d)·t1[j,d]
+        // GPU: 1 cuBLAS GEMM uses d_eri_vvvv_ already on device (no upload).
+        //   intermediate[a,b,c,j] = Σ_d h_vvvv[a,b,c,d]·t1[j,d] (natural layout)
+        //   then wvvvo_w_t1[a,b,c,j] += intermediate[a,c,b,j] (b↔c swap on host).
+        // STEOM mirror.  anthracene -25 to -30 s contribution to EA build.
+        {
+            bool termA_gpu = false;
+#ifndef GANSU_CPU_ONLY
+            if (gpu::gpu_available()) {
+                const size_t inter_sz = (size_t)NV * NV * NV * NO;
+                std::vector<real_t> h_inter(inter_sz, 0.0);
+                if (eri_vvvv_nslab_ > 1) {
+                    // Ship 12: per-device slab GEMM.  Each slab's GEMM output
+                    // [a_local, b, c, j] (col k = a_local*NV² + b*NV + c) lines
+                    // up directly with the global [a, b, c, j] layout, so each
+                    // D2H writes contiguously into h_inter at byte offset
+                    // a_starts_[d_dev] * NV²·NO·8.  The host swap loop below
+                    // is unchanged (b↔c on read, see line ~1345).
+                    const real_t one = 1.0, zero = 0.0;
+                    const int N = eri_vvvv_nslab_;
+                    std::vector<cublasHandle_t> hdl(N, nullptr);
+                    std::vector<real_t*>        d_t1_per(N, nullptr), d_inter_per(N, nullptr);
+                    int saved = 0; cudaGetDevice(&saved);
+                    for (int d_dev = 0; d_dev < N; ++d_dev) {
+                        const int an = a_ends_[d_dev] - a_starts_[d_dev];
+                        if (an <= 0) continue;
+                        cudaSetDevice(d_dev);
+                        cublasCreate(&hdl[d_dev]);
+                        cudaMalloc(&d_t1_per[d_dev], (size_t)NO * NV * sizeof(real_t));
+                        cudaMemcpyAsync(d_t1_per[d_dev], h_t1.data(),
+                                        (size_t)NO * NV * sizeof(real_t),
+                                        cudaMemcpyHostToDevice, 0);
+                        const size_t slab_inter_sz = (size_t)an * NV * NV * NO;
+                        cudaMalloc(&d_inter_per[d_dev], slab_inter_sz * sizeof(real_t));
+                        cublasDgemm(hdl[d_dev], CUBLAS_OP_T, CUBLAS_OP_N,
+                                    NO, an * NV * NV, NV, &one,
+                                    d_t1_per[d_dev],          NV,
+                                    d_eri_vvvv_slabs_[d_dev], NV,
+                                    &zero,
+                                    d_inter_per[d_dev],       NO);
+                        // D2H into the slab's contiguous portion of h_inter.
+                        cudaMemcpyAsync(h_inter.data()
+                                            + (size_t)a_starts_[d_dev] * NV * NV * NO,
+                                        d_inter_per[d_dev],
+                                        slab_inter_sz * sizeof(real_t),
+                                        cudaMemcpyDeviceToHost, 0);
+                    }
+                    // Sync + free per device.
+                    for (int d_dev = 0; d_dev < N; ++d_dev) {
+                        const int an = a_ends_[d_dev] - a_starts_[d_dev];
+                        if (an <= 0) continue;
+                        cudaSetDevice(d_dev);
+                        cudaDeviceSynchronize();
+                        cudaFree(d_t1_per[d_dev]);
+                        cudaFree(d_inter_per[d_dev]);
+                        cublasDestroy(hdl[d_dev]);
+                    }
+                    cudaSetDevice(saved);
+                    termA_gpu = true;
+                } else {
+                    cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+                    real_t *d_t1_dev = nullptr, *d_inter = nullptr;
+                    tracked_cudaMalloc(&d_t1_dev, (size_t)NO * NV * sizeof(real_t));
+                    tracked_cudaMalloc(&d_inter,  inter_sz   * sizeof(real_t));
+                    cudaMemcpy(d_t1_dev, h_t1.data(), (size_t)NO * NV * sizeof(real_t), cudaMemcpyHostToDevice);
+                    const real_t one = 1.0, zero = 0.0;
+                    cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                NO, NV*NV*NV, NV, &one,
+                                d_t1_dev,    NV,
+                                d_eri_vvvv_, NV,
+                                &zero,
+                                d_inter,     NO);
+                    cudaMemcpy(h_inter.data(), d_inter, inter_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+                    tracked_cudaFree(d_t1_dev); tracked_cudaFree(d_inter);
+                    termA_gpu = true;
+                }
+                // Ship 12: self-check reads H_VVVV (= h_vvvv), unavailable in
+                // slab mode → silently skip. Single-GPU validate path keeps
+                // its existing GANSU_STEOM_BUILD_VALIDATE gate.
+                if (std::getenv("GANSU_STEOM_BUILD_VALIDATE") && eri_vvvv_nslab_ <= 1) {
+                    real_t dmax = 0.0;
+                    const int asamp[2] = {0, NV - 1};
+                    for (int ai = 0; ai < 2; ++ai) { const int a = asamp[ai];
+                        for (int b = 0; b < NV; b += (NV/2>0?NV/2:1))
+                            for (int c = 0; c < NV; c += (NV/2>0?NV/2:1))
+                                for (int j = 0; j < NO; j += (NO/2>0?NO/2:1)) {
+                                    real_t v = 0.0;
+                                    for (int d = 0; d < NV; ++d)
+                                        v += H_VVVV(a,c,b,d) * H_T1(j,d);
+                                    const real_t got = h_inter[(((size_t)a*NV+c)*NV+b)*NO+j];
+                                    dmax = std::max(dmax, std::fabs(v - got));
+                                }
+                    }
+                    std::cout << "[EA build self-check] Term A GEMM vs host: max|Δ| = "
+                              << std::scientific << dmax << " (expect ≤1e-11)"
+                              << std::defaultfloat << std::endl;
+                }
+                #pragma omp parallel for collapse(2)
+                for (int a = 0; a < NV; ++a)
+                    for (int b = 0; b < NV; ++b)
+                        for (int c = 0; c < NV; ++c) {
+                            const size_t src_base = ((size_t)a*NV + c)*NV*NO + (size_t)b*NO;
+                            const size_t dst_base = ((size_t)a*NV + b)*NV*NO + (size_t)c*NO;
+                            for (int j = 0; j < NO; ++j)
+                                wvvvo_w_t1[dst_base + j] += h_inter[src_base + j];
+                        }
+            }
+#endif
+            if (!termA_gpu) {
+                #pragma omp parallel for collapse(2)
+                for (int a = 0; a < NV; ++a)
+                    for (int b = 0; b < NV; ++b)
+                        for (int c = 0; c < NV; ++c)
+                            for (int j = 0; j < NO; ++j) {
+                                real_t s = 0.0;
+                                for (int d = 0; d < NV; ++d) s += H_VVVV(a,c,b,d) * H_T1(j,d);
+                                wvvvo_w_t1[(((size_t)a*NV+b)*NV+c)*NO+j] += s;
+                            }
+            }
+        }
+
+        // Term B: - Σ_dk ovvv[k,c,b,d]·t1[k,a]·t1[j,d]
+        //   Stage 1: inter1[(k,c,b),j] = Σ_d ovvv[(k,c,b),d]·t1[j,d]  (natural ovvv layout)
+        //   Stage 2: result[a,(c,b,j)] = Σ_k t1[k,a]·inter1[k,(c,b,j)]
+        //   wvvvo_w_t1[a,b,c,j] -= result[a,c,b,j]  (b↔c swap on host)
+        // STEOM mirror; uses d_eri_ovvv_ on device.
+        {
+            const size_t inter1_sz = (size_t)NO * NV * NV * NO;
+            const size_t result_sz = (size_t)NV * NV * NV * NO;
+            bool termB_gpu = false;
+#ifndef GANSU_CPU_ONLY
+            if (gpu::gpu_available()) {
+                cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+                real_t *d_t1_dev = nullptr, *d_inter1 = nullptr, *d_result = nullptr;
+                tracked_cudaMalloc(&d_t1_dev, (size_t)NO * NV * sizeof(real_t));
+                tracked_cudaMalloc(&d_inter1, inter1_sz   * sizeof(real_t));
+                tracked_cudaMalloc(&d_result, result_sz   * sizeof(real_t));
+                cudaMemcpy(d_t1_dev, h_t1.data(), (size_t)NO * NV * sizeof(real_t), cudaMemcpyHostToDevice);
+                const real_t one = 1.0, zero = 0.0;
+                // Stage 1
+                cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                            NO, NO*NV*NV, NV, &one,
+                            d_t1_dev,    NV,
+                            d_eri_ovvv_, NV,
+                            &zero,
+                            d_inter1,    NO);
+                // Stage 2
+                cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                            NV*NV*NO, NV, NO, &one,
+                            d_inter1,  NV*NV*NO,
+                            d_t1_dev,  NV,
+                            &zero,
+                            d_result,  NV*NV*NO);
+                std::vector<real_t> h_result(result_sz, 0.0);
+                cudaMemcpy(h_result.data(), d_result, result_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+                tracked_cudaFree(d_t1_dev); tracked_cudaFree(d_inter1); tracked_cudaFree(d_result);
+                termB_gpu = true;
+                if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+                    real_t dmax = 0.0;
+                    const int asamp[2] = {0, NV - 1};
+                    for (int ai = 0; ai < 2; ++ai) { const int a = asamp[ai];
+                        for (int b = 0; b < NV; b += (NV/2>0?NV/2:1))
+                            for (int c = 0; c < NV; c += (NV/2>0?NV/2:1))
+                                for (int j = 0; j < NO; j += (NO/2>0?NO/2:1)) {
+                                    real_t v = 0.0;
+                                    for (int k = 0; k < NO; ++k) {
+                                        real_t s = 0.0;
+                                        for (int d = 0; d < NV; ++d) s += H_OVVV(k,c,b,d) * H_T1(j,d);
+                                        v += H_T1(k,a) * s;
+                                    }
+                                    const real_t got = h_result[(((size_t)a*NV+c)*NV+b)*NO+j];
+                                    dmax = std::max(dmax, std::fabs(v - got));
+                                }
+                    }
+                    std::cout << "[EA build self-check] Term B 2-GEMM vs host: max|Δ| = "
+                              << std::scientific << dmax << " (expect ≤1e-11)"
+                              << std::defaultfloat << std::endl;
+                }
+                #pragma omp parallel for collapse(2)
+                for (int a = 0; a < NV; ++a)
+                    for (int b = 0; b < NV; ++b)
+                        for (int c = 0; c < NV; ++c) {
+                            const size_t src_base = ((size_t)a*NV + c)*NV*NO + (size_t)b*NO;
+                            const size_t dst_base = ((size_t)a*NV + b)*NV*NO + (size_t)c*NO;
+                            for (int j = 0; j < NO; ++j)
+                                wvvvo_w_t1[dst_base + j] -= h_result[src_base + j];
+                        }
+            }
+#endif
+            if (!termB_gpu) {
+                std::vector<real_t> hkbcj((size_t)NO*NV*NV*NO, 0.0);
+                #pragma omp parallel for collapse(2)
+                for (int k = 0; k < NO; ++k)
+                    for (int b = 0; b < NV; ++b)
+                        for (int c = 0; c < NV; ++c)
+                            for (int j = 0; j < NO; ++j) {
+                                real_t s = 0.0;
+                                for (int d = 0; d < NV; ++d) s += H_OVVV(k,c,b,d) * H_T1(j,d);
+                                hkbcj[(((size_t)k*NV+b)*NV+c)*NO+j] = s;
+                            }
+                #pragma omp parallel for collapse(2)
+                for (int a = 0; a < NV; ++a)
+                    for (int b = 0; b < NV; ++b)
+                        for (int c = 0; c < NV; ++c)
+                            for (int j = 0; j < NO; ++j) {
+                                real_t s = 0.0;
+                                for (int k = 0; k < NO; ++k)
+                                    s += H_T1(k,a) * hkbcj[(((size_t)k*NV+b)*NV+c)*NO+j];
+                                wvvvo_w_t1[(((size_t)a*NV+b)*NV+c)*NO+j] -= s;
+                            }
+            }
+        }
+
+        // Term C: - Σ_dl ovvv[l,d,a,c]·t1[l,b]·t1[j,d]
+        //   Stage 1 batched: u_C[l,(a,c),j] = Σ_d slab_l[(a,c),d]·t1[j,d]  (per-l batch)
+        //                     contracts h_ovvv axis_1 = d (non-trailing)
+        //   Stage 2: result_C[b,(a,c,j)] = Σ_l t1[l,b]·u_C[l,(a,c,j)]
+        //   wvvvo_w_t1[a,b,c,j] -= result_C[b,a,c,j]  (a↔b swap on host)
+        // STEOM mirror.
+        {
+            const size_t u_C_sz    = (size_t)NO * NV * NV * NO;
+            const size_t result_sz = (size_t)NV * NV * NV * NO;
+            bool termC_gpu = false;
+#ifndef GANSU_CPU_ONLY
+            if (gpu::gpu_available()) {
+                cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+                real_t *d_t1_dev = nullptr, *d_u_C = nullptr, *d_result = nullptr;
+                tracked_cudaMalloc(&d_t1_dev, (size_t)NO * NV * sizeof(real_t));
+                tracked_cudaMalloc(&d_u_C,    u_C_sz       * sizeof(real_t));
+                tracked_cudaMalloc(&d_result, result_sz    * sizeof(real_t));
+                cudaMemcpy(d_t1_dev, h_t1.data(), (size_t)NO * NV * sizeof(real_t), cudaMemcpyHostToDevice);
+                const real_t one = 1.0, zero = 0.0;
+                cublasDgemmStridedBatched(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_T,
+                    NO, NV*NV, NV,
+                    &one,
+                    d_t1_dev, NV, /*strideA=*/0,
+                    d_eri_ovvv_, NV*NV, /*strideB=*/(long long)NV*NV*NV,
+                    &zero,
+                    d_u_C, NO, /*strideC=*/(long long)NV*NV*NO,
+                    NO);
+                cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                            NV*NV*NO, NV, NO, &one,
+                            d_u_C,    NV*NV*NO,
+                            d_t1_dev, NV,
+                            &zero,
+                            d_result, NV*NV*NO);
+                std::vector<real_t> h_result(result_sz, 0.0);
+                cudaMemcpy(h_result.data(), d_result, result_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+                tracked_cudaFree(d_t1_dev); tracked_cudaFree(d_u_C); tracked_cudaFree(d_result);
+                termC_gpu = true;
+                if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+                    real_t dmax = 0.0;
+                    const int asamp[2] = {0, NV - 1};
+                    for (int ai = 0; ai < 2; ++ai) { const int a = asamp[ai];
+                        for (int b = 0; b < NV; b += (NV/2>0?NV/2:1))
+                            for (int c = 0; c < NV; c += (NV/2>0?NV/2:1))
+                                for (int j = 0; j < NO; j += (NO/2>0?NO/2:1)) {
+                                    real_t v = 0.0;
+                                    for (int l = 0; l < NO; ++l) {
+                                        real_t s = 0.0;
+                                        for (int d = 0; d < NV; ++d) s += H_OVVV(l,d,a,c) * H_T1(j,d);
+                                        v += H_T1(l,b) * s;
+                                    }
+                                    const real_t got = h_result[(((size_t)b*NV+a)*NV+c)*NO+j];
+                                    dmax = std::max(dmax, std::fabs(v - got));
+                                }
+                    }
+                    std::cout << "[EA build self-check] Term C 2-GEMM vs host: max|Δ| = "
+                              << std::scientific << dmax << " (expect ≤1e-11)"
+                              << std::defaultfloat << std::endl;
+                }
+                #pragma omp parallel for collapse(2)
+                for (int a = 0; a < NV; ++a)
+                    for (int b = 0; b < NV; ++b)
+                        for (int c = 0; c < NV; ++c) {
+                            const size_t src_base = ((size_t)b*NV + a)*NV*NO + (size_t)c*NO;
+                            const size_t dst_base = ((size_t)a*NV + b)*NV*NO + (size_t)c*NO;
+                            for (int j = 0; j < NO; ++j)
+                                wvvvo_w_t1[dst_base + j] -= h_result[src_base + j];
+                        }
+            }
+#endif
+            if (!termC_gpu) {
+                std::vector<real_t> hlacj((size_t)NO*NV*NV*NO, 0.0);
+                #pragma omp parallel for collapse(2)
+                for (int l = 0; l < NO; ++l)
+                    for (int a = 0; a < NV; ++a)
+                        for (int c = 0; c < NV; ++c)
+                            for (int j = 0; j < NO; ++j) {
+                                real_t s = 0.0;
+                                for (int d = 0; d < NV; ++d) s += H_OVVV(l,d,a,c) * H_T1(j,d);
+                                hlacj[(((size_t)l*NV+a)*NV+c)*NO+j] = s;
+                            }
+                #pragma omp parallel for collapse(2)
+                for (int a = 0; a < NV; ++a)
+                    for (int b = 0; b < NV; ++b)
+                        for (int c = 0; c < NV; ++c)
+                            for (int j = 0; j < NO; ++j) {
+                                real_t s = 0.0;
+                                for (int l = 0; l < NO; ++l)
+                                    s += H_T1(l,b) * hlacj[(((size_t)l*NV+a)*NV+c)*NO+j];
+                                wvvvo_w_t1[(((size_t)a*NV+b)*NV+c)*NO+j] -= s;
+                            }
+            }
+        }
+
+        // Term D: + Σ_dkl ovov[k,c,l,d]·τ[k,l,a,b]·t1[j,d]   (τ = t2 + t1·t1)
+        // GPU path: single GEMM of shape (m=NV·NO, n=NV², k=NO²) with
+        //   row-major C[(a,b),(c,j)] = Σ_{(k,l)} τ[(k,l),(a,b)] · u'[(k,l),(c,j)]
+        // mirrors the STEOM build_dressed_intermediates Term D ship; output
+        // h_termD layout = wvvvo_w_t1 (no scatter), omp += accumulate.
+        // anthracene canonical-skip ON regression = +300 s here (host loop
+        // O(NV³·NO³) cache-unfriendly H_T2(k,l,...) stride).  Single-GPU path
+        // only — multi_gpu_gemm_nslab helper is in steom_ccsd_operator.cu
+        // translation unit and not visible here; A100 single-device GEMM
+        // = ~0.1 s flop + ~0.5 s PCIe at anthracene.
+        {
+            const size_t u_klcj_sz   = (size_t)NO*NO*NV*NO;
+            const size_t tau_klab_sz = (size_t)NO*NO*NV*NV;
+            const size_t termD_sz    = (size_t)NV*NV*NV*NO;
+            bool termD_gpu = false;
+#ifndef GANSU_CPU_ONLY
+            if (gpu::gpu_available()) {
+                std::vector<real_t> h_u_klcj(u_klcj_sz, 0.0);
+                #pragma omp parallel for collapse(2)
+                for (int k = 0; k < NO; ++k)
+                    for (int l = 0; l < NO; ++l)
+                        for (int c = 0; c < NV; ++c)
+                            for (int j = 0; j < NO; ++j) {
+                                real_t s = 0.0;
+                                for (int d = 0; d < NV; ++d) s += H_OVOV(k,c,l,d) * H_T1(j,d);
+                                h_u_klcj[(((size_t)k*NO+l)*NV+c)*NO+j] = s;
+                            }
+                std::vector<real_t> h_tau_klab(tau_klab_sz, 0.0);
+                #pragma omp parallel for collapse(2)
+                for (int k = 0; k < NO; ++k)
+                    for (int l = 0; l < NO; ++l)
+                        for (int a = 0; a < NV; ++a)
+                            for (int b = 0; b < NV; ++b)
+                                h_tau_klab[(((size_t)k*NO+l)*NV+a)*NV+b] =
+                                    H_T2(k,l,a,b) + H_T1(k,a)*H_T1(l,b);
+                std::vector<real_t> h_termD(termD_sz, 0.0);
+                cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+                real_t *d_u = nullptr, *d_tau = nullptr, *d_C = nullptr;
+                tracked_cudaMalloc(&d_u,   u_klcj_sz   * sizeof(real_t));
+                tracked_cudaMalloc(&d_tau, tau_klab_sz * sizeof(real_t));
+                tracked_cudaMalloc(&d_C,   termD_sz    * sizeof(real_t));
+                cudaMemcpy(d_u,   h_u_klcj.data(),   u_klcj_sz   * sizeof(real_t), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_tau, h_tau_klab.data(), tau_klab_sz * sizeof(real_t), cudaMemcpyHostToDevice);
+                const real_t one = 1.0, zero = 0.0;
+                cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                            NV*NO, NV*NV, NO*NO, &one,
+                            d_u, NV*NO, d_tau, NV*NV, &zero, d_C, NV*NO);
+                cudaMemcpy(h_termD.data(), d_C, termD_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+                tracked_cudaFree(d_u); tracked_cudaFree(d_tau); tracked_cudaFree(d_C);
+                termD_gpu = true;
+                if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+                    real_t dmax = 0.0;
+                    const int asamp[2] = {0, NV - 1};
+                    for (int ai = 0; ai < 2; ++ai) { const int a = asamp[ai];
+                        for (int b = 0; b < NV; b += (NV/2>0?NV/2:1))
+                            for (int c = 0; c < NV; c += (NV/2>0?NV/2:1))
+                                for (int j = 0; j < NO; j += (NO/2>0?NO/2:1)) {
+                                    real_t v = 0.0;
+                                    for (int k = 0; k < NO; ++k) for (int l = 0; l < NO; ++l) {
+                                        real_t s = 0.0;
+                                        for (int d = 0; d < NV; ++d) s += H_OVOV(k,c,l,d) * H_T1(j,d);
+                                        v += s * (H_T2(k,l,a,b) + H_T1(k,a)*H_T1(l,b));
+                                    }
+                                    const real_t got = h_termD[(((size_t)a*NV+b)*NV+c)*NO+j];
+                                    dmax = std::max(dmax, std::fabs(v - got));
+                                }
+                    }
+                    std::cout << "[EA build self-check] Term D GEMM vs host: max|Δ| = "
+                              << std::scientific << dmax << " (expect ≤1e-11)"
+                              << std::defaultfloat << std::endl;
+                }
+                #pragma omp parallel for
+                for (size_t i = 0; i < termD_sz; ++i) wvvvo_w_t1[i] += h_termD[i];
+            }
+#endif
+            if (!termD_gpu) {
+                std::vector<real_t> u((size_t)NO*NV*NO*NO, 0.0);
+                #pragma omp parallel for collapse(2)
+                for (int k = 0; k < NO; ++k)
+                    for (int c = 0; c < NV; ++c)
+                        for (int l = 0; l < NO; ++l)
+                            for (int j = 0; j < NO; ++j) {
+                                real_t s = 0.0;
+                                for (int d = 0; d < NV; ++d) s += H_OVOV(k,c,l,d) * H_T1(j,d);
+                                u[(((size_t)k*NV+c)*NO+l)*NO+j] = s;
+                            }
+                #pragma omp parallel for collapse(2)
+                for (int a = 0; a < NV; ++a)
+                    for (int b = 0; b < NV; ++b)
+                        for (int c = 0; c < NV; ++c)
+                            for (int j = 0; j < NO; ++j) {
+                                real_t s = 0.0;
+                                for (int k = 0; k < NO; ++k)
+                                    for (int l = 0; l < NO; ++l) {
+                                        const real_t tau_klab = H_T2(k,l,a,b) + H_T1(k,a)*H_T1(l,b);
+                                        s += u[(((size_t)k*NV+c)*NO+l)*NO+j] * tau_klab;
+                                    }
+                                wvvvo_w_t1[(((size_t)a*NV+b)*NV+c)*NO+j] += s;
+                            }
+            }
+        }
+    }
 
     // ============================================================
     //  Wvvvo[a,b,c,j]  (PySCF Wvvvo, 11 terms)
@@ -774,36 +1706,328 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     //   + Σ_d Wvvvv[a,b,c,d] t1[j,d]                   # only if t1 != 0
     //  layout: [a, b, c, j]  index = ((a*NV + b)*NV + c)*NO + j
     // ============================================================
+    // Wvvvo big terms (term3 + term4) via 3 GEMMs (mirrors the STEOM build):
+    //   term3 = Σ_ld [2 ovvv[l,d,a,c] t2[l,j,d,b] − ovvv[l,d,a,c] t2[l,j,b,d] − ovvv[l,c,a,d] t2[l,j,d,b]]
+    //   term4 = −Σ_kd ovvv[k,c,b,d] t2[j,k,d,a].
+    // Each M[NV²×KV] = A[NV²×KV]·B[KV×KV] (KV=NO·NV) over repacked ovvv/t2; scattered into
+    // Wvvvo[a,b,c,j]. 3a+3c fused (shared B=t2[l,j,d,b]). Cheap terms stay in the host loop.
+    const int KV = NO * NV;
+    std::vector<real_t> wvvvo_big;
+    bool wvvvo_big_gpu = false;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+        const size_t Asz = (size_t)NV2 * KV, Bsz = (size_t)KV * KV, Msz = (size_t)NV2 * KV;
+        std::vector<real_t> hA(Asz), hAc2(Asz), hAcomb(Asz), hB(Bsz), hBp(Bsz), hA4(Asz), hB4(Bsz);
+        #pragma omp parallel for collapse(2)
+        for (int a = 0; a < NV; ++a)
+            for (int c = 0; c < NV; ++c)
+                for (int l = 0; l < NO; ++l)
+                    for (int d = 0; d < NV; ++d) {
+                        const size_t o = (size_t)(a*NV+c)*KV + (l*NV+d);
+                        hA[o]     = H_OVVV(l,d,a,c);
+                        hAc2[o]   = H_OVVV(l,c,a,d);
+                        hAcomb[o] = 2.0*hA[o] - hAc2[o];
+                    }
+        #pragma omp parallel for collapse(2)
+        for (int l = 0; l < NO; ++l)
+            for (int d = 0; d < NV; ++d)
+                for (int j = 0; j < NO; ++j)
+                    for (int b = 0; b < NV; ++b) {
+                        const size_t o = (size_t)(l*NV+d)*KV + (j*NV+b);
+                        hB[o]  = H_T2(l,j,d,b);
+                        hBp[o] = H_T2(l,j,b,d);
+                    }
+        #pragma omp parallel for collapse(2)
+        for (int b = 0; b < NV; ++b)
+            for (int c = 0; c < NV; ++c)
+                for (int k = 0; k < NO; ++k)
+                    for (int d = 0; d < NV; ++d)
+                        hA4[(size_t)(b*NV+c)*KV + (k*NV+d)] = H_OVVV(k,c,b,d);
+        #pragma omp parallel for collapse(2)
+        for (int k = 0; k < NO; ++k)
+            for (int d = 0; d < NV; ++d)
+                for (int j = 0; j < NO; ++j)
+                    for (int a = 0; a < NV; ++a)
+                        hB4[(size_t)(k*NV+d)*KV + (j*NV+a)] = H_T2(j,k,d,a);
+        real_t *dA = nullptr, *dB = nullptr, *dM = nullptr;
+        tracked_cudaMalloc(&dA, Asz * sizeof(real_t));
+        tracked_cudaMalloc(&dB, Bsz * sizeof(real_t));
+        tracked_cudaMalloc(&dM, Msz * sizeof(real_t));
+        const real_t one = 1.0, zero = 0.0;
+        wvvvo_big.assign((size_t)NV*NV*NV*NO, 0.0);
+        auto gemm_scatter = [&](const std::vector<real_t>& hAt, const std::vector<real_t>& hBt,
+                                real_t coeff, bool free_bc) {
+            cudaMemcpy(dA, hAt.data(), Asz * sizeof(real_t), cudaMemcpyHostToDevice);
+            cudaMemcpy(dB, hBt.data(), Bsz * sizeof(real_t), cudaMemcpyHostToDevice);
+            cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, KV, NV2, KV, &one,
+                        dB, KV, dA, KV, &zero, dM, KV);
+            std::vector<real_t> hM(Msz);
+            cudaMemcpy(hM.data(), dM, Msz * sizeof(real_t), cudaMemcpyDeviceToHost);
+            #pragma omp parallel for collapse(2)
+            for (int a = 0; a < NV; ++a)
+                for (int b = 0; b < NV; ++b)
+                    for (int c = 0; c < NV; ++c)
+                        for (int j = 0; j < NO; ++j) {
+                            const size_t mo = free_bc
+                                ? (size_t)(b*NV+c)*KV + (j*NV+a)
+                                : (size_t)(a*NV+c)*KV + (j*NV+b);
+                            wvvvo_big[(((size_t)a*NV+b)*NV+c)*NO+j] += coeff * hM[mo];
+                        }
+        };
+        gemm_scatter(hAcomb, hB,  1.0, false);
+        gemm_scatter(hA,     hBp, -1.0, false);
+        gemm_scatter(hA4,    hB4, -1.0, true);
+        tracked_cudaFree(dA); tracked_cudaFree(dB); tracked_cudaFree(dM);
+        wvvvo_big_gpu = true;
+        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+            real_t dmax = 0.0;
+            const int as[2] = {0, NV - 1};
+            for (int ai = 0; ai < 2; ++ai) { const int a = as[ai];
+                for (int b = 0; b < NV; b += (NV/2>0?NV/2:1))
+                    for (int c = 0; c < NV; ++c) for (int j = 0; j < NO; ++j) {
+                        real_t v = 0.0;
+                        for (int l = 0; l < NO; ++l) for (int d = 0; d < NV; ++d) {
+                            v += 2.0 * H_OVVV(l,d,a,c) * H_T2(l,j,d,b);
+                            v -=       H_OVVV(l,d,a,c) * H_T2(l,j,b,d);
+                            v -=       H_OVVV(l,c,a,d) * H_T2(l,j,d,b);
+                        }
+                        for (int k = 0; k < NO; ++k) for (int d = 0; d < NV; ++d)
+                            v -= H_OVVV(k,c,b,d) * H_T2(j,k,d,a);
+                        dmax = std::max(dmax, std::fabs(v - wvvvo_big[(((size_t)a*NV+b)*NV+c)*NO+j]));
+                    }
+            }
+            std::cout << "[EA-EOM build self-check] Wvvvo term3+4 GEMM vs host: max|Δ| = "
+                      << std::scientific << dmax << " (expect ≤1e-11)"
+                      << std::defaultfloat << std::endl;
+        }
+    }
+#endif
+
+    // GPU GEMM port of Wvvvo term5 (the EA build_dressed hotspot, O(NV³·NO³)
+    // strided/memory-bound — mirrors the validated STEOM port):
+    //   ct[a,b,c,j] = Σ_{k,l} ooov(l,j,k,c)·(t2(l,k,b,a) + t1(l,b)·t1(k,a))
+    // C[(j,c),(b,a)] = A·B, A[(j,c),(k,l)]=ooov(l,j,k,c), B[(k,l),(b,a)]=tau2(l,k,b,a).
+    const int JC_M5 = NO*NV, BA_N5 = NV*NV, KL_K5 = NO*NO;
+    std::vector<real_t> wvvvo_t5;
+    bool wvvvo_t5_gpu = false;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+        std::vector<real_t> hA((size_t)JC_M5*KL_K5), hB((size_t)KL_K5*BA_N5);
+        #pragma omp parallel for collapse(2)
+        for (int j=0;j<NO;++j) for (int c=0;c<NV;++c)
+            for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
+                hA[(size_t)(j*NV+c)*KL_K5+(k*NO+l)] = H_OOOV(l,j,k,c);
+        #pragma omp parallel for collapse(2)
+        for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
+            for (int b=0;b<NV;++b) for (int a=0;a<NV;++a)
+                hB[(size_t)(k*NO+l)*BA_N5+(b*NV+a)] = H_T2(l,k,b,a) + H_T1(l,b)*H_T1(k,a);
+        real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
+        tracked_cudaMalloc(&dA,(size_t)JC_M5*KL_K5*sizeof(real_t));
+        tracked_cudaMalloc(&dB,(size_t)KL_K5*BA_N5*sizeof(real_t));
+        tracked_cudaMalloc(&dC,(size_t)JC_M5*BA_N5*sizeof(real_t));
+        cudaMemcpy(dA,hA.data(),(size_t)JC_M5*KL_K5*sizeof(real_t),cudaMemcpyHostToDevice);
+        cudaMemcpy(dB,hB.data(),(size_t)KL_K5*BA_N5*sizeof(real_t),cudaMemcpyHostToDevice);
+        const real_t one=1.0,zero=0.0;
+        cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,BA_N5,JC_M5,KL_K5,&one,dB,BA_N5,dA,KL_K5,&zero,dC,BA_N5);
+        wvvvo_t5.assign((size_t)JC_M5*BA_N5,0.0);
+        cudaMemcpy(wvvvo_t5.data(),dC,(size_t)JC_M5*BA_N5*sizeof(real_t),cudaMemcpyDeviceToHost);
+        tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
+        wvvvo_t5_gpu = true;
+        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+            real_t dmax=0.0;
+            const int as[2]={0,NV-1};
+            for (int ai=0;ai<2;++ai){ const int a=as[ai];
+                for (int b=0;b<NV;b+=(NV/2>0?NV/2:1))
+                    for (int c=0;c<NV;c+=(NV/2>0?NV/2:1)) for (int j=0;j<NO;++j) {
+                        real_t v=0.0;
+                        for (int k=0;k<NO;++k) for (int l=0;l<NO;++l) {
+                            real_t klc=H_OOOV(l,j,k,c);
+                            v += klc*H_T2(l,k,b,a) + klc*H_T1(l,b)*H_T1(k,a);
+                        }
+                        dmax=std::max(dmax,std::fabs(v-wvvvo_t5[(size_t)(j*NV+c)*BA_N5+(b*NV+a)]));
+                    }
+            }
+            std::cout << "[EA-EOM build self-check] Wvvvo term5 (ooov·tau2) GEMM vs host: max|Δ| = "
+                      << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+        }
+    }
+#endif
+
+    // GPU GEMM port of three remaining Wvvvo inner-sum hotspots (canonical_skip_wvvvv_
+    // on, anthracene profile = each ~21 G ops/scatter, STEOM build mirror).
+    //   Item 1: ct1[b, (a,j,c)] = Σ_l T1(l,b) · W1OVOV(l, a, j, c)
+    //   Item 2: ct2[a, (b,c,j)] = Σ_k T1(k,a) · W1OVVO(k, b, c, j)
+    //   Item 5: ct5[c, (j,a,b)] = Σ_k Fov(k,c) · T2(k, j, a, b)
+    // B-side direct (no repack: h_W1ovov / h_W1ovvo / h_t2 leading dim = N),
+    // A-side small repack (NO×NV doubles). Sign applied at scatter site
+    // (`v -= ct_wvvvo_N[...]`).
+    const int M_w1 = NV, N_w1 = NV*NO*NV, K_w1 = NO;
+    const int M_w2 = NV, N_w2 = NV*NV*NO, K_w2 = NO;
+    const int M_w5 = NV, N_w5 = NO*NV*NV, K_w5 = NO;
+    std::vector<real_t> ct_wvvvo_1, ct_wvvvo_2, ct_wvvvo_5;
+    bool wvvvo_1_gpu = false, wvvvo_2_gpu = false, wvvvo_5_gpu = false;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+        const real_t one = 1.0, zero = 0.0;
+        // --- Item 1: A[b,l] = T1(l,b); B = h_W1ovov direct (stride l = N_w1) ---
+        {
+            std::vector<real_t> hA((size_t)M_w1*K_w1);
+            #pragma omp parallel for
+            for (int b = 0; b < NV; ++b)
+                for (int l = 0; l < NO; ++l) hA[(size_t)b*K_w1 + l] = h_t1[l*NV + b];
+            ct_wvvvo_1.assign((size_t)M_w1*N_w1, 0.0);
+            real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
+            tracked_cudaMalloc(&dA,(size_t)M_w1*K_w1*sizeof(real_t));
+            tracked_cudaMalloc(&dB,(size_t)K_w1*N_w1*sizeof(real_t));
+            tracked_cudaMalloc(&dC,(size_t)M_w1*N_w1*sizeof(real_t));
+            cudaMemcpy(dA,hA.data(),(size_t)M_w1*K_w1*sizeof(real_t),cudaMemcpyHostToDevice);
+            cudaMemcpy(dB,h_W1ovov.data(),(size_t)K_w1*N_w1*sizeof(real_t),cudaMemcpyHostToDevice);
+            cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,N_w1,M_w1,K_w1,&one,dB,N_w1,dA,K_w1,&zero,dC,N_w1);
+            cudaMemcpy(ct_wvvvo_1.data(),dC,(size_t)M_w1*N_w1*sizeof(real_t),cudaMemcpyDeviceToHost);
+            tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
+            wvvvo_1_gpu = true;
+            if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+                real_t dmax = 0.0;
+                for (int a=0;a<NV;a+=(NV/4>0?NV/4:1))
+                    for (int b=0;b<NV;b+=(NV/4>0?NV/4:1))
+                        for (int c=0;c<NV;c+=(NV/4>0?NV/4:1))
+                            for (int j=0;j<NO;++j) {
+                                real_t t = 0.0;
+                                for (int l=0;l<NO;++l) t += H_W1OVOV(l,a,j,c)*H_T1(l,b);
+                                dmax = std::max(dmax, std::fabs(t -
+                                    ct_wvvvo_1[(size_t)b*N_w1 + ((size_t)a*NO*NV + j*NV + c)]));
+                            }
+                std::cout << "[EA-EOM build self-check] Wvvvo item 1 (W1ovov·t1): max|Δ| = "
+                          << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+            }
+        }
+        // --- Item 2: A[a,k] = T1(k,a); B = h_W1ovvo direct (stride k = N_w2) ---
+        {
+            std::vector<real_t> hA((size_t)M_w2*K_w2);
+            #pragma omp parallel for
+            for (int a = 0; a < NV; ++a)
+                for (int k = 0; k < NO; ++k) hA[(size_t)a*K_w2 + k] = h_t1[k*NV + a];
+            ct_wvvvo_2.assign((size_t)M_w2*N_w2, 0.0);
+            real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
+            tracked_cudaMalloc(&dA,(size_t)M_w2*K_w2*sizeof(real_t));
+            tracked_cudaMalloc(&dB,(size_t)K_w2*N_w2*sizeof(real_t));
+            tracked_cudaMalloc(&dC,(size_t)M_w2*N_w2*sizeof(real_t));
+            cudaMemcpy(dA,hA.data(),(size_t)M_w2*K_w2*sizeof(real_t),cudaMemcpyHostToDevice);
+            cudaMemcpy(dB,h_W1ovvo.data(),(size_t)K_w2*N_w2*sizeof(real_t),cudaMemcpyHostToDevice);
+            cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,N_w2,M_w2,K_w2,&one,dB,N_w2,dA,K_w2,&zero,dC,N_w2);
+            cudaMemcpy(ct_wvvvo_2.data(),dC,(size_t)M_w2*N_w2*sizeof(real_t),cudaMemcpyDeviceToHost);
+            tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
+            wvvvo_2_gpu = true;
+            if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+                real_t dmax = 0.0;
+                for (int a=0;a<NV;a+=(NV/4>0?NV/4:1))
+                    for (int b=0;b<NV;b+=(NV/4>0?NV/4:1))
+                        for (int c=0;c<NV;c+=(NV/4>0?NV/4:1))
+                            for (int j=0;j<NO;++j) {
+                                real_t t = 0.0;
+                                for (int k=0;k<NO;++k) t += H_W1OVVO(k,b,c,j)*H_T1(k,a);
+                                dmax = std::max(dmax, std::fabs(t -
+                                    ct_wvvvo_2[(size_t)a*N_w2 + ((size_t)b*NV*NO + c*NO + j)]));
+                            }
+                std::cout << "[EA-EOM build self-check] Wvvvo item 2 (W1ovvo·t1): max|Δ| = "
+                          << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+            }
+        }
+        // --- Item 5: A[c,k] = Fov(k,c); B = h_t2 direct (stride k = N_w5) ---
+        {
+            std::vector<real_t> hA((size_t)M_w5*K_w5);
+            #pragma omp parallel for
+            for (int c = 0; c < NV; ++c)
+                for (int k = 0; k < NO; ++k) hA[(size_t)c*K_w5 + k] = h_Fov[k*NV + c];
+            ct_wvvvo_5.assign((size_t)M_w5*N_w5, 0.0);
+            real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
+            tracked_cudaMalloc(&dA,(size_t)M_w5*K_w5*sizeof(real_t));
+            tracked_cudaMalloc(&dB,(size_t)K_w5*N_w5*sizeof(real_t));
+            tracked_cudaMalloc(&dC,(size_t)M_w5*N_w5*sizeof(real_t));
+            cudaMemcpy(dA,hA.data(),(size_t)M_w5*K_w5*sizeof(real_t),cudaMemcpyHostToDevice);
+            cudaMemcpy(dB,h_t2.data(),(size_t)K_w5*N_w5*sizeof(real_t),cudaMemcpyHostToDevice);
+            cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,N_w5,M_w5,K_w5,&one,dB,N_w5,dA,K_w5,&zero,dC,N_w5);
+            cudaMemcpy(ct_wvvvo_5.data(),dC,(size_t)M_w5*N_w5*sizeof(real_t),cudaMemcpyDeviceToHost);
+            tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
+            wvvvo_5_gpu = true;
+            if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+                real_t dmax = 0.0;
+                for (int a=0;a<NV;a+=(NV/4>0?NV/4:1))
+                    for (int b=0;b<NV;b+=(NV/4>0?NV/4:1))
+                        for (int c=0;c<NV;c+=(NV/4>0?NV/4:1))
+                            for (int j=0;j<NO;++j) {
+                                real_t t = 0.0;
+                                for (int k=0;k<NO;++k) t += h_Fov[k*NV + c]*H_T2(k,j,a,b);
+                                dmax = std::max(dmax, std::fabs(t -
+                                    ct_wvvvo_5[(size_t)c*N_w5 + ((size_t)j*NV*NV + a*NV + b)]));
+                            }
+                std::cout << "[EA-EOM build self-check] Wvvvo item 5 (Fov·t2): max|Δ| = "
+                          << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+            }
+        }
+    }
+#endif
+
     const size_t wvvvo_sz = (size_t)NV * NV * NV * NO;
     std::vector<real_t> h_Wvvvo(wvvvo_sz, 0.0);
+    #pragma omp parallel for collapse(2)
     for (int a = 0; a < NV; ++a)
         for (int b = 0; b < NV; ++b)
             for (int c = 0; c < NV; ++c)
                 for (int j = 0; j < NO; ++j) {
                     real_t v = H_OVVV(j,b,c,a);  // bare: ovvv[j,b,c,a] = (jb|ca) chemist
-                    for (int l = 0; l < NO; ++l)
-                        v -= H_W1OVOV(l,a,j,c) * H_T1(l,b);
-                    for (int k = 0; k < NO; ++k)
-                        v -= H_W1OVVO(k,b,c,j) * H_T1(k,a);
-                    for (int l = 0; l < NO; ++l)
-                        for (int d = 0; d < NV; ++d) {
-                            v += 2.0 * H_OVVV(l,d,a,c) * H_T2(l,j,d,b);
-                            v -=       H_OVVV(l,d,a,c) * H_T2(l,j,b,d);
-                            v -=       H_OVVV(l,c,a,d) * H_T2(l,j,d,b);
-                        }
-                    for (int k = 0; k < NO; ++k)
+                    if (wvvvo_1_gpu) {
+                        v -= ct_wvvvo_1[(size_t)b*N_w1 + ((size_t)a*NO*NV + j*NV + c)];
+                    } else {
+                        for (int l = 0; l < NO; ++l)
+                            v -= H_W1OVOV(l,a,j,c) * H_T1(l,b);
+                    }
+                    if (wvvvo_2_gpu) {
+                        v -= ct_wvvvo_2[(size_t)a*N_w2 + ((size_t)b*NV*NO + c*NO + j)];
+                    } else {
+                        for (int k = 0; k < NO; ++k)
+                            v -= H_W1OVVO(k,b,c,j) * H_T1(k,a);
+                    }
+                    if (wvvvo_big_gpu) {
+                        v += wvvvo_big[(((size_t)a*NV+b)*NV+c)*NO+j];   // term3 + term4 (GEMM)
+                    } else {
+                        for (int l = 0; l < NO; ++l)
+                            for (int d = 0; d < NV; ++d) {
+                                v += 2.0 * H_OVVV(l,d,a,c) * H_T2(l,j,d,b);
+                                v -=       H_OVVV(l,d,a,c) * H_T2(l,j,b,d);
+                                v -=       H_OVVV(l,c,a,d) * H_T2(l,j,d,b);
+                            }
+                        for (int k = 0; k < NO; ++k)
+                            for (int d = 0; d < NV; ++d)
+                                v -= H_OVVV(k,c,b,d) * H_T2(j,k,d,a);
+                    }
+                    if (wvvvo_t5_gpu) {
+                        v += wvvvo_t5[(size_t)(j*NV+c)*BA_N5 + (b*NV+a)];   // term5 (GEMM)
+                    } else {
+                        for (int k = 0; k < NO; ++k)
+                            for (int l = 0; l < NO; ++l) {
+                                real_t klc_lj = H_OOOV(l,j,k,c);  // ovoo[k,c,l,j] = ooov[l,j,k,c]
+                                v += klc_lj * H_T2(l,k,b,a);
+                                v += klc_lj * H_T1(l,b) * H_T1(k,a);
+                            }
+                    }
+                    if (wvvvo_5_gpu) {
+                        v -= ct_wvvvo_5[(size_t)c*N_w5 + ((size_t)j*NV*NV + a*NV + b)];
+                    } else {
+                        for (int k = 0; k < NO; ++k)
+                            v -= h_Fov[k*NV + c] * H_T2(k,j,a,b);
+                    }
+                    if (canonical_skip_wvvvv_) {
+                        // P5 canonical-skip: Σ_d Wvvvv[a,b,c,d]·t1[j,d] precomputed
+                        // term-by-term above without materializing nvir⁴ Wvvvv.
+                        v += wvvvo_w_t1[(((size_t)a*NV+b)*NV+c)*NO+j];
+                    } else {
                         for (int d = 0; d < NV; ++d)
-                            v -= H_OVVV(k,c,b,d) * H_T2(j,k,d,a);
-                    for (int k = 0; k < NO; ++k)
-                        for (int l = 0; l < NO; ++l) {
-                            real_t klc_lj = H_OOOV(l,j,k,c);  // ovoo[k,c,l,j] = ooov[l,j,k,c]
-                            v += klc_lj * H_T2(l,k,b,a);
-                            v += klc_lj * H_T1(l,b) * H_T1(k,a);
-                        }
-                    for (int k = 0; k < NO; ++k)
-                        v -= h_Fov[k*NV + c] * H_T2(k,j,a,b);
-                    for (int d = 0; d < NV; ++d)
-                        v += H_WVVVV(a,b,c,d) * H_T1(j,d);
+                            v += H_WVVVV(a,b,c,d) * H_T1(j,d);
+                    }
                     h_Wvvvo[(((size_t)a * NV + b) * NV + c) * NO + j] = v;
                 }
 
@@ -826,10 +2050,29 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     cudaMemcpy(d_Wovvo_, h_Wovvo.data(), ovvo_sz  * sizeof(real_t), cudaMemcpyHostToDevice);
     tracked_cudaMalloc(&d_Wvovv_, wvovv_sz * sizeof(real_t));
     cudaMemcpy(d_Wvovv_, h_Wvovv.data(), wvovv_sz * sizeof(real_t), cudaMemcpyHostToDevice);
-    tracked_cudaMalloc(&d_Wvvvv_, vvvv_sz  * sizeof(real_t));
-    cudaMemcpy(d_Wvvvv_, h_Wvvvv.data(), vvvv_sz  * sizeof(real_t), cudaMemcpyHostToDevice);
+    if (!canonical_skip_wvvvv_) {
+        tracked_cudaMalloc(&d_Wvvvv_, vvvv_sz  * sizeof(real_t));
+        cudaMemcpy(d_Wvvvv_, h_Wvvvv.data(), vvvv_sz  * sizeof(real_t), cudaMemcpyHostToDevice);
+    }  // canonical_skip: d_Wvvvv_ stays nullptr (native operator handles σ2 via per-pair PNO)
     tracked_cudaMalloc(&d_Wvvvo_, wvvvo_sz * sizeof(real_t));
     cudaMemcpy(d_Wvvvo_, h_Wvvvo.data(), wvvvo_sz * sizeof(real_t), cudaMemcpyHostToDevice);
+
+#ifndef GANSU_CPU_ONLY
+    // Precompute the 3 reorganized ring matrices (M_A/M_B/M_C, each [NO·NV × NO·NV])
+    // used to GEMM-ify the σ2 ring contractions in apply().  GPU only; on the CPU
+    // path the per-thread loops in apply() handle the ring terms directly.
+    if (gpu::gpu_available()) {
+        const size_t M_sz = (size_t)NO * NV * NO * NV;
+        tracked_cudaMalloc(&d_M_ringA_, M_sz * sizeof(real_t));
+        tracked_cudaMalloc(&d_M_ringB_, M_sz * sizeof(real_t));
+        tracked_cudaMalloc(&d_M_ringC_, M_sz * sizeof(real_t));
+        const int thr = 256;
+        const int blk = (int)((M_sz + thr - 1) / thr);
+        ea_build_ring_M_kernel<<<blk, thr>>>(d_Wovov_, d_Wovvo_,
+                                             d_M_ringA_, d_M_ringB_, d_M_ringC_, NO, NV);
+        cudaDeviceSynchronize();
+    }
+#endif
 
     std::cout << "  EA-EOM-CCSD dressed intermediates built (PySCF EA definitions)." << std::endl;
 
@@ -856,6 +2099,15 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
 //  (d_Lvv_ != nullptr). When d_eri_mo was passed as nullptr (unit-test path)
 //  the operator falls back to a diagonal-only matvec.
 void EAEOMCCSDOperator::apply(const real_t* d_input, real_t* d_output) const {
+    // P5 canonical-skip contract: when the dressed Wvvvv was elided (native per-pair
+    // σ takes over), canonical apply() must not be called — the σ2 kernels would
+    // segfault on nullptr d_Wvvvv_. The Davidson driver wraps this in dlpno_op when
+    // native EOM is active, so this is unreachable in practice; defensive assert.
+    if (canonical_skip_wvvvv_ && d_Wvvvv_ == nullptr) {
+        throw std::runtime_error(
+            "EAEOMCCSDOperator::apply called with canonical-skip Wvvvv elided — "
+            "this operator's σ should be wrapped by the native DLPNO-EA-EOM operator.");
+    }
     // (a) Stub path: intermediates not built → diagonal-only matvec.
     if (d_Lvv_ == nullptr) {
         if (!gpu::gpu_available()) {
@@ -960,30 +2212,202 @@ void EAEOMCCSDOperator::apply(const real_t* d_input, real_t* d_output) const {
         }
     } else {
 #ifndef GANSU_CPU_ONLY
-        const int threads = 256;
-
-        // σ1
-        const int blocks_1 = (p_dim_ + threads - 1) / threads;
-        ea_eom_sigma1_full_kernel<<<blocks_1, threads>>>(
-            d_Lvv_, d_Fov_, d_Wvovv_, d_r1, d_r2, d_s1, nocc_, nvir_);
-
-        // Pre-stage: tmp[k]
-        real_t* d_tmp_k = nullptr;
-        tracked_cudaMalloc(&d_tmp_k, (size_t)nocc_ * sizeof(real_t));
-        const int blocks_tmp = (nocc_ + threads - 1) / threads;
-        ea_eom_sigma2_tmp_k_kernel<<<blocks_tmp, threads>>>(
-            d_eri_ovov_, d_r2, d_tmp_k, nocc_, nvir_);
-
-        // σ2
-        const int blocks_2 = (p2h_dim_ + threads - 1) / threads;
-        ea_eom_sigma2_full_kernel<<<blocks_2, threads>>>(
-            d_Lvv_, d_Loo_, d_Wovov_, d_Wovvo_, d_Wvvvv_, d_Wvvvo_,
-            d_tmp_k, d_t2_, d_r1, d_r2, d_s2, nocc_, nvir_);
-
-        tracked_cudaFree(d_tmp_k);
+        if (use_gpu_multi_) {
+            apply_multi(d_input, d_output);   // Stage EA-5b/5c
+        } else {
+            apply_sigma_gpu(d_r1, d_r2, d_s1, d_s2,
+                            d_Lvv_, d_Loo_, d_Fov_, d_Wovov_, d_Wovvo_, d_Wvovv_,
+                            d_Wvvvo_, d_Wvvvv_, d_t2_, d_eri_ovov_,
+                            d_M_ringA_, d_M_ringB_, d_M_ringC_,
+                            (void*)gansu::gpu::GPUHandle::cublas(),
+                            /*j_begin=*/0, /*j_end=*/nocc_, /*do_sigma1=*/true);
+        }
 #endif
     }
 }
+
+#ifndef GANSU_CPU_ONLY
+// ==================================================================
+//  Device-parametric GPU σ (Stage EA-5b).  Identical numerics to the
+//  legacy single-GPU body, but every intermediate + the cuBLAS handle
+//  are explicit arguments, so it runs unchanged on any device after a
+//  cudaSetDevice (DeviceGuard) by the caller.  Scratch is allocated on
+//  the current device.
+// ==================================================================
+void EAEOMCCSDOperator::apply_sigma_gpu(
+    const real_t* d_r1, const real_t* d_r2, real_t* d_s1, real_t* d_s2,
+    const real_t* Lvv, const real_t* Loo, const real_t* Fov,
+    const real_t* Wovov, const real_t* Wovvo, const real_t* Wvovv,
+    const real_t* Wvvvo, const real_t* Wvvvv, const real_t* t2,
+    const real_t* eri_ovov, const real_t* M_ringA, const real_t* M_ringB,
+    const real_t* M_ringC, void* cublas_v,
+    int j_begin, int j_end, bool do_sigma1,
+    real_t* scr_tmp_k, real_t* scr_r2T, real_t* scr_tmp) const
+{
+    cublasHandle_t cublas = (cublasHandle_t)cublas_v;
+    const int threads = 256;
+    const int jslab = j_end - j_begin;
+    if (jslab <= 0 && !do_sigma1) return;
+
+    // σ1 (full p sector; only on the owning device — device 0)
+    if (do_sigma1) {
+        const int blocks_1 = (p_dim_ + threads - 1) / threads;
+        ea_eom_sigma1_full_kernel<<<blocks_1, threads>>>(
+            Lvv, Fov, Wvovv, d_r1, d_r2, d_s1, nocc_, nvir_);
+    }
+    if (jslab <= 0) return;
+
+    // Pre-stage: tmp[k] (full reduction; needed by the σ2 tmp·t2 term for every k).
+    // EA-5d: use persistent scratch when provided (multi path) to avoid per-matvec malloc.
+    real_t* d_tmp_k = scr_tmp_k;
+    if (!d_tmp_k) tracked_cudaMalloc(&d_tmp_k, (size_t)nocc_ * sizeof(real_t));
+    const int blocks_tmp = (nocc_ + threads - 1) / threads;
+    ea_eom_sigma2_tmp_k_kernel<<<blocks_tmp, threads>>>(
+        eri_ovov, d_r2, d_tmp_k, nocc_, nvir_);
+
+    // Wvvvv·r2 and ring terms via GEMM (env-gated, same as legacy).
+    static const bool wvvvv_gemm = [] {
+        const char* e = std::getenv("GANSU_EA_WVVVV_GEMM");
+        return !(e && e[0] == '0');
+    }();
+    static const bool ring_gemm_env = [] {
+        const char* e = std::getenv("GANSU_EA_RING_GEMM");
+        return !(e && e[0] == '0');
+    }();
+    const bool ring_gemm = ring_gemm_env && (M_ringA != nullptr);
+
+    const int nvir2 = nvir_ * nvir_;
+    const size_t joff = (size_t)j_begin * nvir2;   // σ2/r2 row offset for this slab
+
+    // σ2 kernel over the slab [j_begin, j_end); writes its rows of the full d_s2.
+    const int blocks_2 = (jslab * nvir2 + threads - 1) / threads;
+    ea_eom_sigma2_full_kernel<<<blocks_2, threads>>>(
+        Lvv, Loo, Wovov, Wovvo, Wvvvv, Wvvvo,
+        d_tmp_k, t2, d_r1, d_r2, d_s2, nocc_, nvir_,
+        wvvvv_gemm ? 0 : 1, ring_gemm ? 0 : 1, j_begin, j_end);
+
+    const real_t one = 1.0;
+    if (wvvvv_gemm) {
+        // slab columns only: σ2[j∈slab,(ab)] += Wvvvv·r2[j∈slab,(cd)]  (N = jslab)
+        cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                    nvir2, jslab, nvir2, &one,
+                    Wvvvv, nvir2, d_r2 + joff, nvir2, &one, d_s2 + joff, nvir2);
+    }
+    if (ring_gemm) {
+        const real_t zero = 0.0, neg = -1.0;
+        const int NK = nocc_ * nvir_;
+        const int mrows = jslab * nvir_;                 // slab output rows (jb)/(ja)
+        const size_t moff = (size_t)j_begin * nvir_ * NK; // M_ring row offset
+        // R_B: σ2[(ja),b] -= M_B[slab rows]·r2[(lc),b]
+        cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                    nvir_, mrows, NK, &neg, d_r2, nvir_, M_ringB + moff, NK,
+                    &one, d_s2 + joff, nvir_);
+        // R_A + R_C → tmp[(jb),a] slab → scatter
+        real_t* d_r2T = scr_r2T;
+        real_t* d_tmp = scr_tmp;
+        if (!d_r2T) tracked_cudaMalloc(&d_r2T, (size_t)p2h_dim_ * sizeof(real_t));
+        if (!d_tmp) tracked_cudaMalloc(&d_tmp, (size_t)p2h_dim_ * sizeof(real_t));
+        const int blocks_r2 = (p2h_dim_ + threads - 1) / threads;
+        ea_r2_swap_vir_kernel<<<blocks_r2, threads>>>(d_r2, d_r2T, nocc_, nvir_);  // full (input)
+        cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                    nvir_, mrows, NK, &one, d_r2T, nvir_, M_ringA + moff, NK,
+                    &zero, d_tmp + joff, nvir_);
+        cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                    nvir_, mrows, NK, &neg, d_r2, nvir_, M_ringC + moff, NK,
+                    &one, d_tmp + joff, nvir_);
+        const int blocks_sc = (jslab * nvir2 + threads - 1) / threads;
+        ea_ring_scatter_kernel<<<blocks_sc, threads>>>(d_tmp, d_s2, nocc_, nvir_, j_begin, j_end);
+        if (!scr_r2T) tracked_cudaFree(d_r2T);   // free only if locally allocated
+        if (!scr_tmp) tracked_cudaFree(d_tmp);
+    }
+    if (!scr_tmp_k) tracked_cudaFree(d_tmp_k);
+}
+
+// ==================================================================
+//  Stage EA-5c: j-slab multi-GPU σ.  σ1 (full) + device 0's σ2 slab are
+//  computed on device 0 into d_output; each device d>0 computes ONLY its
+//  output-occ σ2 slab into its replica workspace, then the slabs are
+//  disjoint-gathered (cudaMemcpyPeer) into d_output.  No redundant work →
+//  real speedup.  Result is identical to single-GPU (disjoint slabs cover
+//  [0,nocc); GANSU_STEOM_EOM_MULTI_VALIDATE=1 cross-checks the gathered σ2
+//  against a full device-0 reference on the first matvecs).
+// ==================================================================
+void EAEOMCCSDOperator::apply_multi(const real_t* d_input, real_t* d_output) const {
+    const int nuse = (int)ws_.size();
+    const int nvir2 = nvir_ * nvir_;
+
+    // EA-5d: broadcast the input to every d>0 FIRST (device 0's stream is still idle),
+    // so the peer copies do not serialize behind device 0's σ kernels.  Then launch all
+    // devices' σ asynchronously (real overlap), then sync + gather.
+    for (int d = 1; d < nuse; ++d) {
+        const DeviceWorkspace& w = ws_[d];
+        MultiGpuManager::DeviceGuard guard(d);
+        cudaMemcpyPeerAsync(w.d_input, d, d_input, 0,
+                            (size_t)total_dim_ * sizeof(real_t), 0);
+    }
+
+    // device 0: σ1 (full) + its own σ2 slab [0, j_end0) into d_output (async).
+    apply_sigma_gpu(d_input, d_input + p_dim_, d_output, d_output + p_dim_,
+                    d_Lvv_, d_Loo_, d_Fov_, d_Wovov_, d_Wovvo_, d_Wvovv_,
+                    d_Wvvvo_, d_Wvvvv_, d_t2_, d_eri_ovov_,
+                    d_M_ringA_, d_M_ringB_, d_M_ringC_,
+                    (void*)gansu::gpu::GPUHandle::cublas(),
+                    ws_[0].j_begin, ws_[0].j_end, /*do_sigma1=*/true,
+                    ws_[0].d_tmp_k, ws_[0].d_r2T, ws_[0].d_ring_tmp);
+
+    // d>0: compute σ2 slab into ws_[d].d_s2 (async on device d, persistent scratch).
+    for (int d = 1; d < nuse; ++d) {
+        const DeviceWorkspace& w = ws_[d];
+        MultiGpuManager::DeviceGuard guard(d);
+        apply_sigma_gpu(w.d_input, w.d_input + p_dim_, w.d_s1, w.d_s2,
+                        w.d_Lvv, w.d_Loo, w.d_Fov, w.d_Wovov, w.d_Wovvo, w.d_Wvovv,
+                        w.d_Wvvvo, w.d_Wvvvv, w.d_t2, w.d_eri_ovov,
+                        w.d_M_ringA, w.d_M_ringB, w.d_M_ringC, w.cublas,
+                        w.j_begin, w.j_end, /*do_sigma1=*/false,
+                        w.d_tmp_k, w.d_r2T, w.d_ring_tmp);
+    }
+    // gather: sync each d>0 and copy its σ2 slab rows into d_output (disjoint).
+    for (int d = 1; d < nuse; ++d) {
+        const DeviceWorkspace& w = ws_[d];
+        MultiGpuManager::DeviceGuard guard(d);
+        cudaDeviceSynchronize();
+        const size_t off = (size_t)w.j_begin * nvir2;
+        const size_t cnt = (size_t)(w.j_end - w.j_begin) * nvir2;
+        if (cnt > 0)
+            cudaMemcpyPeer(d_output + p_dim_ + off, 0, w.d_s2 + off, d, cnt * sizeof(real_t));
+    }
+    { MultiGpuManager::DeviceGuard g0(0); cudaDeviceSynchronize(); }  // device 0 slab + σ1 done
+
+    // Optional capped cross-check: full device-0 σ2 reference vs the gathered result.
+    static const bool do_validate = [] {
+        const char* e = std::getenv("GANSU_STEOM_EOM_MULTI_VALIDATE");
+        return e && e[0] == '1';
+    }();
+    if (do_validate && multi_check_count_ < 3) {
+        real_t* d_ref = nullptr;
+        tracked_cudaMalloc(&d_ref, (size_t)p2h_dim_ * sizeof(real_t));
+        real_t* d_s1tmp = nullptr;
+        tracked_cudaMalloc(&d_s1tmp, (size_t)p_dim_ * sizeof(real_t));
+        apply_sigma_gpu(d_input, d_input + p_dim_, d_s1tmp, d_ref,
+                        d_Lvv_, d_Loo_, d_Fov_, d_Wovov_, d_Wovvo_, d_Wvovv_,
+                        d_Wvvvo_, d_Wvvvv_, d_t2_, d_eri_ovov_,
+                        d_M_ringA_, d_M_ringB_, d_M_ringC_,
+                        (void*)gansu::gpu::GPUHandle::cublas(),
+                        0, nocc_, /*do_sigma1=*/false,
+                        ws_[0].d_tmp_k, ws_[0].d_r2T, ws_[0].d_ring_tmp);
+        cudaDeviceSynchronize();
+        std::vector<real_t> h_ref(p2h_dim_), h_out(p2h_dim_);
+        cudaMemcpy(h_ref.data(), d_ref, (size_t)p2h_dim_ * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_out.data(), d_output + p_dim_, (size_t)p2h_dim_ * sizeof(real_t), cudaMemcpyDeviceToHost);
+        real_t dmax = 0.0;
+        for (int i = 0; i < p2h_dim_; ++i) dmax = std::max(dmax, std::fabs(h_ref[i] - h_out[i]));
+        std::cout << "[EA-EOM Stage 5c self-check] gathered σ2 vs full device-0 ref: max|Δ| = "
+                  << std::scientific << dmax << std::defaultfloat << " (expect ≤1e-11)" << std::endl;
+        tracked_cudaFree(d_ref); tracked_cudaFree(d_s1tmp);
+        ++multi_check_count_;
+    }
+}
+#endif
 
 void EAEOMCCSDOperator::apply_preconditioner(const real_t* d_input, real_t* d_output) const {
     if (!gpu::gpu_available()) {
@@ -1041,7 +2465,9 @@ void EAEOMCCSDOperator::print_intermediate_norms(std::ostream& os) const {
        << "    ‖Wovov‖     = " << frobenius_norm_device(d_Wovov_, ovov_sz)  << "\n"
        << "    ‖Wovvo‖     = " << frobenius_norm_device(d_Wovvo_, ovvo_sz)  << "\n"
        << "    ‖Wvovv‖     = " << frobenius_norm_device(d_Wvovv_, wvovv_sz) << "\n"
-       << "    ‖Wvvvv‖     = " << frobenius_norm_device(d_Wvvvv_, wvvvv_sz) << "\n"
+       << "    ‖Wvvvv‖     = "
+       << (d_Wvvvv_ ? frobenius_norm_device(d_Wvvvv_, wvvvv_sz) : 0.0)
+       << (d_Wvvvv_ ? "" : "  (canonical-skip)") << "\n"
        << "    ‖Wvvvo‖     = " << frobenius_norm_device(d_Wvvvo_, wvvvo_sz) << "\n";
 }
 

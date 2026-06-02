@@ -239,6 +239,19 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
 
     bool converged = false;
 
+    // Per-phase timing (printed at solve end when verbose>0). One sync per phase/iter;
+    // negligible vs the phases themselves. Reveals where a large-dim EOM solve spends
+    // time outside the operator apply (orthogonalization / subspace ops / restart).
+    double t_sigma = 0, t_build = 0, t_eig = 0, t_ritz = 0, t_corr = 0, t_restart = 0;
+    auto phase = [](double& acc, auto&& fn) {
+        cudaDeviceSynchronize();
+        const auto p0 = std::chrono::high_resolution_clock::now();
+        fn();
+        cudaDeviceSynchronize();
+        acc += std::chrono::duration<double>(
+                   std::chrono::high_resolution_clock::now() - p0).count();
+    };
+
     for (int iter = 0; iter < config_.max_iterations; ++iter) {
         num_iterations_ = iter + 1;
 
@@ -256,9 +269,10 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
             }
             sigma_computed_ = subspace_dim_;
             cudaDeviceSynchronize();
+            double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::high_resolution_clock::now() - t_start).count();
+            t_sigma += ms / 1000.0;
             if (config_.verbose > 1 && n_new > 0) {
-                auto t_end = std::chrono::high_resolution_clock::now();
-                double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
                 std::cout << "  sigma: " << n_new << " vecs, "
                           << std::fixed << std::setprecision(0) << ms << "ms ("
                           << std::setprecision(0) << ms / n_new << "ms/vec)" << std::endl;
@@ -266,14 +280,14 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
         }
 
         // Build subspace matrix (incremental: only new columns)
-        build_subspace_matrix_incremental(subspace_matrix_built_);
+        phase(t_build, [&] { build_subspace_matrix_incremental(subspace_matrix_built_); });
         subspace_matrix_built_ = subspace_dim_;
 
         // Solve subspace eigenvalue problem
-        solve_subspace_eigenproblem();
+        phase(t_eig, [&] { solve_subspace_eigenproblem(); });
 
         // Compute Ritz vectors and residuals
-        compute_ritz_vectors_and_residuals();
+        phase(t_ritz, [&] { compute_ritz_vectors_and_residuals(); });
 
         // Check convergence (residual-based)
         converged = check_convergence();
@@ -367,7 +381,7 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
             if (config_.verbose > 2) {
                 std::cout << "  Davidson: restarting subspace" << std::endl;
             }
-            restart_subspace();
+            phase(t_restart, [&] { restart_subspace(); });
             sigma_computed_ = 0;  // Ritz vectors replaced old basis — recompute sigma
             subspace_matrix_built_ = 0;  // Subspace matrix must be rebuilt after restart
 
@@ -404,13 +418,24 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
             }
         }
 
-        // Add correction vectors
-        add_correction_vectors();
+        // Add correction vectors (Jacobi precondition + Gram-Schmidt orthogonalize)
+        phase(t_corr, [&] { add_correction_vectors(); });
     }
 
     if (!converged && config_.verbose > 0) {
         std::cout << "  Warning: Davidson did not converge in "
                  << config_.max_iterations << " iterations" << std::endl;
+    }
+
+    if (config_.verbose > 0) {
+        const double tot = t_sigma + t_build + t_eig + t_ritz + t_corr + t_restart;
+        std::cout << std::fixed << std::setprecision(3)
+                  << "  [Davidson-PROF] dim=" << dim_ << " nev=" << config_.num_eigenvalues
+                  << " iters=" << num_iterations_ << " phase-total=" << tot << "s\n"
+                  << "    sigma(apply)=" << t_sigma << "s  build_subspace=" << t_build
+                  << "s  subspace_eig=" << t_eig << "s\n"
+                  << "    ritz+resid=" << t_ritz << "s  add_correction(orth)=" << t_corr
+                  << "s  restart=" << t_restart << "s" << std::defaultfloat << std::endl;
     }
 
     return converged;

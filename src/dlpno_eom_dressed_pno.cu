@@ -17,18 +17,171 @@
 #include "dlpno_eom_dressed_pno.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <iomanip>
 #include <iostream>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+namespace {
+// OpenBLAS allocates per-caller-thread state and was compiled with a hard
+// cap of 128 threads.  When this file's OMP parallel-fors (IP ring builder,
+// EA Wvvvv ring builder) launch from a machine with >128 cores (H200 NVL,
+// EPYC Zen 4 192-core), Eigen GEMM inside each OMP worker reaches OpenBLAS
+// which trips the per-thread metadata array and aborts the process.
+// Cap each outer parallel-for to 64 threads — same heuristic CLAUDE.md
+// documents for `--dlpno_cpu_threads` (DLPNO ground-state OMP cap).
+// Mirrored here because the EOM ring builders are a separate code path
+// outside dlpno_ccsd.cu's cap.
+inline int dlpno_eom_ring_omp_cap() {
+#ifdef _OPENMP
+    const int hw = omp_get_max_threads();
+    return hw > 64 ? 64 : hw;
+#else
+    return 1;
+#endif
+}
+}  // anonymous namespace
+
+#ifndef GANSU_CPU_ONLY
+#include <cuda_runtime.h>
+#endif
 
 #include <Eigen/Dense>
 
 #include "dlpno_mp2.hpp"        // DLPNOLMP2Result (setups / pairs / pair_lookup / phase24)
 #include "dlpno_pair_data.hpp" // PairSetup / PairData / Phase24Integrals
+#include "device_host_memory.hpp" // tracked_cudaMalloc / tracked_cudaFree (matches IP/EA op pattern)
 
 namespace gansu {
 
 namespace {
 using RowMatXd = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+
+#ifndef GANSU_CPU_ONLY
+// B-a.6f Stage F2b: single-kernel V·T contraction for one (idx, I) of the IP
+// ring builder. 1 thread per (m, ap, dp) output element; the kernel sums over
+// (l, e) internally and writes the 4 terms (A,B,C,D) into nat_vvo / nat_vov.
+// Bypasses cuBLAS launch overhead — the per-(idx, I) work is < n³·nocc² flops,
+// far below the 10 µs cuBLAS launch budget per call. At 100 atoms 1 kernel
+// launch replaces ~4·nocc² = 90k host-Eigen GEMMs.
+//
+// Layout (matches host F2a):
+//   d_V[m,l,dp,e] = V[((m·nocc + l)·n + dp)·n + e]
+//   d_T[l,ap,e]   = T_l[ap, e]   (rows = ap, cols = e per l-slab)
+//   nat_vvo[m,ap,dp], nat_vov[m,ap,dp] indexed ((m·n + ap)·n + dp)
+__global__ void ip_ring_vt_contract_kernel(
+    const real_t* __restrict__ d_V,        // [nocc · nocc · n · n]
+    const real_t* __restrict__ d_T,        // [nocc · n · n]
+    real_t* __restrict__ d_nat_vvo,        // [nocc · n · n]  (output)
+    real_t* __restrict__ d_nat_vov,        // [nocc · n · n]  (output)
+    int nocc, int n)
+{
+    const int m  = blockIdx.x;
+    const int ap = blockIdx.y;
+    const int dp = threadIdx.x;
+    if (dp >= n) return;
+    const size_t nn = static_cast<size_t>(n) * n;
+    real_t s_vvo = 0.0;
+    real_t s_vov = 0.0;
+    for (int l = 0; l < nocc; ++l) {
+        const real_t* Tl  = d_T + static_cast<size_t>(l) * nn;
+        const real_t* Mml = d_V + (static_cast<size_t>(m) * nocc + l) * nn;
+        for (int e = 0; e < n; ++e) {
+            const real_t V1   = Mml[static_cast<size_t>(dp) * n + e];   // M[dp, e]
+            const real_t V3   = Mml[static_cast<size_t>(e)  * n + dp];  // M[e, dp]
+            const real_t Tape = Tl [static_cast<size_t>(ap) * n + e];   // T[ap, e]
+            const real_t Teap = Tl [static_cast<size_t>(e)  * n + ap];  // T[e, ap]
+            s_vvo += 2.0 * V1 * Tape - V1 * Teap - V3 * Tape;
+            s_vov += -V3 * Teap;
+        }
+    }
+    const size_t off = (static_cast<size_t>(m) * n + ap) * n + dp;
+    d_nat_vvo[off] = s_vvo;
+    d_nat_vov[off] = s_vov;
+}
+
+// Per-(idx, I) wrapper around the V·T kernel. Allocates scratch buffers,
+// uploads V[idx] and the t2Il stack, launches the kernel, and copies the
+// nat_vvo / nat_vov results back to host. Returns false on any CUDA error
+// (the caller can fall back to the host F2a path).
+//
+// Note: this allocates and frees device buffers per (idx, I). At a thousand
+// pairs that adds 1000+ malloc/free pairs; if profiling shows this overhead
+// is significant we will hoist the allocation to a per-thread scratch pool.
+bool ip_ring_vt_contract_gpu(const std::vector<real_t>& V_host,         // [nocc² · n²]
+                             const std::vector<RowMatXd>& t2Il,         // size nocc, each [n × n]
+                             int nocc, int n,
+                             std::vector<real_t>& nat_vvo_host,         // [nocc · n²] out
+                             std::vector<real_t>& nat_vov_host)         // [nocc · n²] out
+{
+    const size_t v_sz = static_cast<size_t>(nocc) * nocc * n * n;
+    const size_t t_sz = static_cast<size_t>(nocc) * n * n;
+    const size_t out_sz = static_cast<size_t>(nocc) * n * n;
+    nat_vvo_host.assign(out_sz, 0.0);
+    nat_vov_host.assign(out_sz, 0.0);
+
+    real_t* d_V = nullptr;
+    real_t* d_T = nullptr;
+    real_t* d_nat_vvo = nullptr;
+    real_t* d_nat_vov = nullptr;
+    cudaError_t err = cudaSuccess;
+
+    err = cudaMalloc(&d_V, v_sz * sizeof(real_t));
+    if (err != cudaSuccess) goto cleanup;
+    err = cudaMalloc(&d_T, t_sz * sizeof(real_t));
+    if (err != cudaSuccess) goto cleanup;
+    err = cudaMalloc(&d_nat_vvo, out_sz * sizeof(real_t));
+    if (err != cudaSuccess) goto cleanup;
+    err = cudaMalloc(&d_nat_vov, out_sz * sizeof(real_t));
+    if (err != cudaSuccess) goto cleanup;
+
+    err = cudaMemcpy(d_V, V_host.data(), v_sz * sizeof(real_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) goto cleanup;
+    {
+        // Stage t2Il (vector of Eigen matrices) into a contiguous host buffer
+        // before H2D — a single async memcpy per t2Il slab would also work but
+        // adds complexity for marginal benefit at this scale.
+        std::vector<real_t> T_packed(t_sz, 0.0);
+        for (int l = 0; l < nocc; ++l) {
+            const size_t off = static_cast<size_t>(l) * n * n;
+            // t2Il[l] is RowMatXd row-major n × n.
+            std::memcpy(T_packed.data() + off, t2Il[l].data(),
+                        static_cast<size_t>(n) * n * sizeof(real_t));
+        }
+        err = cudaMemcpy(d_T, T_packed.data(), t_sz * sizeof(real_t), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) goto cleanup;
+    }
+
+    {
+        dim3 grid(static_cast<unsigned>(nocc), static_cast<unsigned>(n), 1);
+        dim3 block(static_cast<unsigned>(n), 1, 1);
+        ip_ring_vt_contract_kernel<<<grid, block>>>(d_V, d_T, d_nat_vvo, d_nat_vov, nocc, n);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto cleanup;
+    }
+
+    err = cudaMemcpy(nat_vvo_host.data(), d_nat_vvo,
+                     out_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) goto cleanup;
+    err = cudaMemcpy(nat_vov_host.data(), d_nat_vov,
+                     out_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) goto cleanup;
+
+cleanup:
+    if (d_V)        cudaFree(d_V);
+    if (d_T)        cudaFree(d_T);
+    if (d_nat_vvo)  cudaFree(d_nat_vvo);
+    if (d_nat_vov)  cudaFree(d_nat_vov);
+    return err == cudaSuccess;
+}
+#endif  // !GANSU_CPU_ONLY
 }  // namespace
 
 DressedPnoIP build_dressed_pno_ip(const std::vector<real_t>& h_Lvv,
@@ -216,13 +369,52 @@ void build_dressed_pno_ip_ring(DressedPnoIP& io,
 
     Eigen::Map<const RowMatXd> S(h_S.data(), nao, nao);
 
-    // Apply the (native_ring − congruence(dense_ring)) update for one occ role.
-    //   dst[idx][(m·n+ap)·n+dp]   ap = result PNO, dp = contracted PNO.
+    // B-a.6f Stage F0: per-phase ctor-build chrono. Split between (i) the
+    // per-(idx,I,l) t2_proj = barS·Y·barSᵀ build [t2_proj_ms] and (ii) the
+    // inner (m, ap, dp, e) V·T contraction [vt_ms]. At 100 atoms one of
+    // these is the multi-hour host hotspot — printed at the end when
+    // subtract_dense=false (the BARE / dense-free production path).
+    // Under OMP the per-thread sums are reduced; the printed split is the
+    // sum of useful work across threads (≈ wall × num_threads for an
+    // OMP-bound section).
+    double t2_proj_ms = 0.0, vt_ms = 0.0;
+
+    // B-a.6f Stage F2b: env-gated CUDA kernel for the V·T contraction. Only
+    // active for the production (subtract_dense=false) BARE path. When ON,
+    // each (idx, I) launches a single kernel covering the entire (m, ap, dp)
+    // output, summing over (l, e) internally — sidesteps the cuBLAS launch
+    // overhead that dominates per-(m, l) GEMMs for small n_pno. F2a Eigen
+    // remains the fallback (and is the validation reference).
+    const char* env_gpu_ring  = std::getenv("GANSU_DLPNO_NATIVE_BARE_GPU_RING");
+    const bool  use_gpu_ring  = (!subtract_dense) &&
+                                (env_gpu_ring && env_gpu_ring[0] == '1');
+    const char* env_gpu_ringv = std::getenv("GANSU_DLPNO_NATIVE_BARE_GPU_RING_VALIDATE");
+    const bool  gpu_ring_validate = use_gpu_ring &&
+                                    (env_gpu_ringv && env_gpu_ringv[0] == '1');
+    // First-pair self-check counter; only the first pair-role to take the
+    // GPU path runs both paths and prints max|nat(GPU) - nat(F2a)|.
+    // Atomic flag → at most one self-check print across OMP threads.
+    int selfcheck_done = 0;
+
+    // B-a.6f Stage F2a: per (idx, I) builder. Refactored from the scalar
+    // (m, ap, dp, e) quad-loop into four Eigen GEMMs per (l, m) plus an
+    // outer OMP-over-idx parallelisation. Per-call local max/time outputs
+    // so the lambda is thread-safe (the outer loop uses OMP reductions to
+    // fold them into max_delta / max_ring / t2_proj_ms / vt_ms).
+    //
+    // Math (M := V[m,l,:,:] of shape n×n in (rows=dp, cols=e) layout;
+    //       T_l := t2_proj[I,l] of shape n×n in (rows=ap, cols=e)):
+    //   Term A  nat_vvo += +2 · T_l · M^T            (Wovvo, V1 · T(ap,e))
+    //   Term B  nat_vvo += -1 · T_l^T · M^T          (Wovvo, V1 · T(e,ap))
+    //   Term C  nat_vvo += -1 · T_l · M              (Wovvo, V3 · T(ap,e))
+    //   Term D  nat_vov += -1 · T_l^T · M            (Wovov, V3 · T(e,ap))
     auto apply_role = [&](int idx, int I, int n,
                           const Eigen::Map<const RowMatXd>& U,
                           const RowMatXd& Bij,            // bar_Q_ijᵀ · S  [n × nao]
                           std::vector<std::vector<real_t>>& dst_vvo,
-                          std::vector<std::vector<real_t>>& dst_vov) {
+                          std::vector<std::vector<real_t>>& dst_vov,
+                          real_t& out_max_delta, real_t& out_max_ring,
+                          double& out_t2_ms, double& out_vt_ms) {
         // V[A,B,P,Q]=(AP|BQ), layout ((A·nocc+B)·n+P)·n+Q. No Phase24 ovov for this
         // pair → leave the b1 congruence seed (incl. its dense ring) intact rather
         // than dropping the ring entirely.
@@ -233,6 +425,7 @@ void build_dressed_pno_ip_ring(DressedPnoIP& io,
         const std::vector<real_t>& V = ph.V_ovov_pair[idx];
 
         // t2_proj[I,l] in target PNO [n×n] for every l (t2_proj[l,I] = transpose).
+        const auto t0_t2 = std::chrono::high_resolution_clock::now();
         std::vector<RowMatXd> t2Il(nocc, RowMatXd::Zero(n, n));
         for (int l = 0; l < nocc; ++l) {
             const int src = res.pair_lookup[static_cast<size_t>(I) * nocc + l];
@@ -247,43 +440,134 @@ void build_dressed_pno_ip_ring(DressedPnoIP& io,
             if (res.setups[src].i == I) t2Il[l] = M;                     // occ order (I,l) == storage
             else                        t2Il[l] = M.transpose();          // (l,I) → transpose
         }
+        out_t2_ms += std::chrono::duration<double, std::milli>(
+                         std::chrono::high_resolution_clock::now() - t0_t2).count();
+
+        const auto t0_vt = std::chrono::high_resolution_clock::now();
+
+        // B-a.6f Stage F2b: GPU kernel path for the production (dense-free)
+        // branch. One kernel launch per (idx, I) computes nat_vvo / nat_vov
+        // for all (m, ap, dp); the host-Eigen F2a loop below remains the
+        // fallback. Self-check (gpu_ring_validate) recomputes the F2a result
+        // for the first pair-role and prints max|GPU − F2a|.
+#ifndef GANSU_CPU_ONLY
+        if (use_gpu_ring && !subtract_dense) {
+            std::vector<real_t> nat_vvo_gpu_flat, nat_vov_gpu_flat;
+            const bool gpu_ok = ip_ring_vt_contract_gpu(V, t2Il, nocc, n,
+                                                       nat_vvo_gpu_flat,
+                                                       nat_vov_gpu_flat);
+            if (gpu_ok) {
+                if (gpu_ring_validate) {
+                    // Optional self-check: run F2a Eigen for the same (idx, I)
+                    // and compare. One-shot — first thread to reach this here
+                    // takes the print, the rest skip.
+                    bool take_check = false;
+#ifdef _OPENMP
+                    #pragma omp critical (ip_ring_f2b_selfcheck)
+                    {
+                        if (selfcheck_done == 0) { selfcheck_done = 1; take_check = true; }
+                    }
+#else
+                    if (selfcheck_done == 0) { selfcheck_done = 1; take_check = true; }
+#endif
+                    if (take_check) {
+                        RowMatXd nat_vvo_ref(n, n), nat_vov_ref(n, n);
+                        real_t dmax = 0.0, refmax = 0.0;
+                        for (int m = 0; m < nocc; ++m) {
+                            nat_vvo_ref.setZero();
+                            nat_vov_ref.setZero();
+                            const size_t mV = static_cast<size_t>(m) * NO;
+                            for (int l = 0; l < nocc; ++l) {
+                                const RowMatXd& T = t2Il[l];
+                                const size_t vbase = (mV + l) * static_cast<size_t>(n) * n;
+                                Eigen::Map<const RowMatXd> M(V.data() + vbase, n, n);
+                                nat_vvo_ref.noalias() += 2.0 * T * M.transpose();
+                                nat_vvo_ref.noalias() -= T.transpose() * M.transpose();
+                                nat_vvo_ref.noalias() -= T * M;
+                                nat_vov_ref.noalias() -= T.transpose() * M;
+                            }
+                            const size_t base = static_cast<size_t>(m) * n * n;
+                            for (int ap = 0; ap < n; ++ap)
+                                for (int dp = 0; dp < n; ++dp) {
+                                    const size_t off = static_cast<size_t>(ap) * n + dp;
+                                    const real_t gvvo = nat_vvo_gpu_flat[base + off];
+                                    const real_t gvov = nat_vov_gpu_flat[base + off];
+                                    const real_t rvvo = nat_vvo_ref(ap, dp);
+                                    const real_t rvov = nat_vov_ref(ap, dp);
+                                    dmax  = std::max(dmax,  std::max(std::fabs(gvvo - rvvo),
+                                                                     std::fabs(gvov - rvov)));
+                                    refmax = std::max(refmax, std::max(std::fabs(rvvo),
+                                                                        std::fabs(rvov)));
+                                }
+                        }
+                        std::cout << "[bt-PNO B-a.6f F2b self-check] idx=" << idx
+                                  << " I=" << I << " n=" << n
+                                  << "  max|nat(GPU) - nat(F2a)| = "
+                                  << std::scientific << dmax
+                                  << "   max|nat(F2a)| = " << refmax
+                                  << "   (expect ≤1e-12 = kernel math matches Eigen)"
+                                  << std::defaultfloat << std::endl;
+                    }
+                }
+                // Write GPU result into dst_vvo / dst_vov + update max_ring.
+                real_t local_max_ring = 0.0;
+                real_t* dvvo_base = dst_vvo[idx].data();
+                real_t* dvov_base = dst_vov[idx].data();
+                for (size_t k = 0; k < nat_vvo_gpu_flat.size(); ++k) {
+                    const real_t vvo = nat_vvo_gpu_flat[k];
+                    const real_t vov = nat_vov_gpu_flat[k];
+                    dvvo_base[k] += vvo;
+                    dvov_base[k] += vov;
+                    local_max_ring = std::max(local_max_ring,
+                                              std::max(std::fabs(vvo), std::fabs(vov)));
+                }
+                out_max_ring = std::max(out_max_ring, local_max_ring);
+                out_vt_ms += std::chrono::duration<double, std::milli>(
+                                 std::chrono::high_resolution_clock::now() - t0_vt).count();
+                return;
+            }
+            // GPU failed (rare; usually OOM at extreme scale). Fall through
+            // silently to the host F2a path so the build still completes.
+        }
+#endif
 
         RowMatXd nat_vvo(n, n), nat_vov(n, n);
         for (int m = 0; m < nocc; ++m) {
-            // native ring (PNO space) for this (idx,I,m).
+            // native ring (PNO space) for this (idx,I,m): four Eigen noalias GEMMs
+            // per l, accumulated. Each GEMM is n × n × n.
             nat_vvo.setZero();
             nat_vov.setZero();
-            {
-                const size_t mV = static_cast<size_t>(m) * NO;        // (m·nocc + l) row base
-                for (int l = 0; l < nocc; ++l) {
-                    const RowMatXd& T = t2Il[l];                       // T(ap,e) = t2_proj[I,l]
-                    const size_t vbase = (mV + l) * static_cast<size_t>(n) * n;  // V[m,l,·,·]
-                    for (int ap = 0; ap < n; ++ap)
-                        for (int dp = 0; dp < n; ++dp) {
-                            real_t svvo = 0.0, svov = 0.0;
-                            for (int e = 0; e < n; ++e) {
-                                const real_t V1 = V[vbase + static_cast<size_t>(dp) * n + e]; // (m dp|l e)
-                                const real_t V3 = V[vbase + static_cast<size_t>(e) * n + dp]; // (m e|l dp)
-                                svvo += 2.0 * V1 * T(ap, e) - V1 * T(e, ap) - V3 * T(ap, e);
-                                // Wovov: -Σ_{c'} (m c'|l dp)·t2_proj[I,l](c',ap), c'≡e → (m e|l dp)=V3.
-                                svov += -V3 * T(e, ap);
-                            }
-                            nat_vvo(ap, dp) += svvo;   // accumulate over l (zeroed per m)
-                            nat_vov(ap, dp) += svov;
-                        }
-                }
+            const size_t mV = static_cast<size_t>(m) * NO;             // (m·nocc + l) row base
+            for (int l = 0; l < nocc; ++l) {
+                const RowMatXd& T = t2Il[l];                            // [n × n] rows=ap, cols=e
+                const size_t vbase = (mV + l) * static_cast<size_t>(n) * n;  // V[m,l,·,·] base
+                Eigen::Map<const RowMatXd> M(V.data() + vbase, n, n);   // rows=dp, cols=e
+                // Term A: +2 · T · M^T  (Wovvo Wick-pair coefficient).
+                nat_vvo.noalias() += 2.0 * T * M.transpose();
+                // Term B: -1 · T^T · M^T  (Wovvo exchanged-occ).
+                nat_vvo.noalias() -= T.transpose() * M.transpose();
+                // Term C: -1 · T · M      (Wovvo cross V3 coefficient).
+                nat_vvo.noalias() -= T * M;
+                // Term D: -1 · T^T · M    (Wovov; one term only).
+                nat_vov.noalias() -= T.transpose() * M;
             }
             const size_t base = static_cast<size_t>(m) * n * n;
             if (!subtract_dense) {
                 // IP dense-free: add native ring alone on top of the Phase24 bare
                 // seed (no dense DR built / no congruence subtraction).
+                real_t* dvvo_ptr = dst_vvo[idx].data() + base;
+                real_t* dvov_ptr = dst_vov[idx].data() + base;
+                real_t local_max_ring = 0.0;
                 for (int ap = 0; ap < n; ++ap)
                     for (int dp = 0; dp < n; ++dp) {
+                        const size_t off = static_cast<size_t>(ap) * n + dp;
                         const real_t vvo = nat_vvo(ap, dp), vov = nat_vov(ap, dp);
-                        dst_vvo[idx][base + static_cast<size_t>(ap) * n + dp] += vvo;
-                        dst_vov[idx][base + static_cast<size_t>(ap) * n + dp] += vov;
-                        max_ring = std::max(max_ring, std::max(std::fabs(vvo), std::fabs(vov)));
+                        dvvo_ptr[off] += vvo;
+                        dvov_ptr[off] += vov;
+                        local_max_ring = std::max(local_max_ring,
+                                                  std::max(std::fabs(vvo), std::fabs(vov)));
                     }
+                out_max_ring = std::max(out_max_ring, local_max_ring);
                 continue;
             }
             // B-a.6c(b2) validate: Wovvo_pno += native_ring − congruence(dense_ring).
@@ -293,29 +577,113 @@ void build_dressed_pno_ip_ring(DressedPnoIP& io,
             const RowMatXd cong_vvo = U.transpose() * DRvm * U;        // [n×n]
             const RowMatXd cong_vov = U.transpose() * DRom * U;
 
+            real_t local_max_delta = 0.0, local_max_ring = 0.0;
             for (int ap = 0; ap < n; ++ap)
                 for (int dp = 0; dp < n; ++dp) {
                     const real_t dvvo = nat_vvo(ap, dp) - cong_vvo(ap, dp);
                     const real_t dvov = nat_vov(ap, dp) - cong_vov(ap, dp);
                     dst_vvo[idx][base + static_cast<size_t>(ap) * n + dp] += dvvo;
                     dst_vov[idx][base + static_cast<size_t>(ap) * n + dp] += dvov;
-                    max_delta = std::max(max_delta, std::max(std::fabs(dvvo), std::fabs(dvov)));
-                    max_ring  = std::max(max_ring,  std::max(std::fabs(cong_vvo(ap, dp)),
-                                                             std::fabs(cong_vov(ap, dp))));
+                    local_max_delta = std::max(local_max_delta,
+                                               std::max(std::fabs(dvvo), std::fabs(dvov)));
+                    local_max_ring  = std::max(local_max_ring,
+                                               std::max(std::fabs(cong_vvo(ap, dp)),
+                                                        std::fabs(cong_vov(ap, dp))));
                 }
+            out_max_delta = std::max(out_max_delta, local_max_delta);
+            out_max_ring  = std::max(out_max_ring,  local_max_ring);
         }
+        out_vt_ms += std::chrono::duration<double, std::milli>(
+                         std::chrono::high_resolution_clock::now() - t0_vt).count();
     };
 
+    // Eigen does internally launch threads via OpenMP / EIGEN_DONT_PARALLELIZE
+    // can mix poorly with our outer #pragma omp parallel for. Set Eigen to a
+    // single thread per OMP worker; the outer loop provides the parallelism.
+#ifdef _OPENMP
+    Eigen::setNbThreads(1);
+#endif
+    const auto t0_total = std::chrono::high_resolution_clock::now();
+    // Periodic progress signal — anthracene/tetracene-scale ring builder is
+    // a 2-6 min host-Eigen silent stretch with no Davidson activity to fall
+    // back on (operator is still under construction).  Print at ~10% deciles
+    // using an atomic pair counter so the OMP-parallel pairs land in order
+    // of completion, not idx.  Default ON (~10 lines / ring builder run);
+    // set GANSU_DLPNO_NATIVE_PROF=0 to silence both this and the F0 phase
+    // split summary.
+    const char* env_prog_phase = std::getenv("GANSU_DLPNO_NATIVE_PROF");
+    const bool  print_phase_progress = !env_prog_phase || env_prog_phase[0] != '0';
+    std::atomic<int> done_pairs{0};
+    std::atomic<int> next_decile{1};
+#ifdef _OPENMP
+    // When the GPU kernel path is on, all OMP threads would serialise on the
+    // same CUDA default-stream → keep the OMP parallel construct (for the
+    // F2a fallback case the reductions are correct sequentially too) but
+    // gate parallelism via the `if` clause.
+    #pragma omp declare reduction(maxr : real_t : omp_out = std::max(omp_out, omp_in)) initializer(omp_priv = 0.0)
+    const int _ip_ring_threads = dlpno_eom_ring_omp_cap();
+    #pragma omp parallel for schedule(dynamic) if (!use_gpu_ring) \
+            num_threads(_ip_ring_threads) \
+            reduction(maxr : max_delta) reduction(maxr : max_ring) \
+            reduction(+   : t2_proj_ms) reduction(+   : vt_ms)
+#endif
     for (int idx = 0; idx < n_pairs; ++idx) {
         const int n = n_pno[idx];
-        if (n == 0) continue;
-        Eigen::Map<const RowMatXd> U(Uall[idx].data(), nvir, n);
-        Eigen::Map<const RowMatXd> barQ_ij(res.pairs[idx].bar_Q.data(), nao, n);
-        const RowMatXd Bij = barQ_ij.transpose() * S;                 // [n × nao]
-        const int i = res.setups[idx].i;
-        const int j = res.setups[idx].j;
-        apply_role(idx, i, n, U, Bij, io.Wovvo_pno_occi, io.Wovov_pno_occi);
-        apply_role(idx, j, n, U, Bij, io.Wovvo_pno_occj, io.Wovov_pno_occj);
+        if (n != 0) {
+            Eigen::Map<const RowMatXd> U(Uall[idx].data(), nvir, n);
+            Eigen::Map<const RowMatXd> barQ_ij(res.pairs[idx].bar_Q.data(), nao, n);
+            const RowMatXd Bij = barQ_ij.transpose() * S;                 // [n × nao]
+            const int i = res.setups[idx].i;
+            const int j = res.setups[idx].j;
+            apply_role(idx, i, n, U, Bij, io.Wovvo_pno_occi, io.Wovov_pno_occi,
+                       max_delta, max_ring, t2_proj_ms, vt_ms);
+            apply_role(idx, j, n, U, Bij, io.Wovvo_pno_occj, io.Wovov_pno_occj,
+                       max_delta, max_ring, t2_proj_ms, vt_ms);
+        }
+        if (print_phase_progress && !subtract_dense) {
+            const int done = done_pairs.fetch_add(1) + 1;
+            int expected = next_decile.load();
+            while (expected <= 10 && done * 10 >= n_pairs * expected) {
+                if (next_decile.compare_exchange_strong(expected, expected + 1)) {
+                    const double elapsed_s = std::chrono::duration<double>(
+                        std::chrono::high_resolution_clock::now() - t0_total).count();
+                    const double eta_s = (expected > 0)
+                        ? elapsed_s * (10.0 - expected) / expected
+                        : 0.0;
+                    #pragma omp critical(eom_ring_progress)
+                    std::cout << "  [bt-PNO IP ring builder] " << (expected * 10)
+                              << "% (" << done << "/" << n_pairs << " pairs, "
+                              << std::fixed << std::setprecision(1) << elapsed_s
+                              << "s elapsed, ETA " << eta_s << "s)"
+                              << std::defaultfloat << std::endl;
+                    break;
+                }
+                // CAS failed → expected was updated to current next_decile;
+                // re-check whether we still need to print this decile.
+            }
+        }
+    }
+    const double total_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::high_resolution_clock::now() - t0_total).count();
+    // B-a.6f Stage F0 phase split (BARE / dense-free path only — i.e., the
+    // path that runs at production scale; the b2 validate path is gate-only).
+    // F2a: under OMP the t2_proj/vt sums are across threads (≈ wall × #threads);
+    // total_ms is wall. Speed-up ≈ (t2_proj + vt) / total.
+    // F2b: when the GPU kernel path is on, OMP is disabled (sequential pair
+    // iteration) → t2_proj/vt sums ≈ wall. Same fields, different ratio.
+    if (!subtract_dense) {
+#ifdef _OPENMP
+        const int nthr = use_gpu_ring ? 1 : omp_get_max_threads();
+#else
+        const int nthr = 1;
+#endif
+        std::cout << "[bt-PNO B-a.6f IP ring split]  wall = " << std::fixed
+                  << std::setprecision(1) << total_ms << " ms"
+                  << "   t2_proj (barS·Y·barSᵀ work) = " << t2_proj_ms << " ms"
+                  << "   V·T contraction (work) = " << vt_ms << " ms"
+                  << "   nthreads = " << nthr
+                  << "   path = " << (use_gpu_ring ? "GPU (F2b)" : "host F2a (Eigen+OMP)")
+                  << std::defaultfloat << std::endl;
     }
 }
 
@@ -323,10 +691,10 @@ void build_dressed_pno_ip_ring(DressedPnoIP& io,
 //  EA mirror (B-EA.6d): per-pair PNO Wvvvv.
 // ===========================================================================
 
-namespace {
 // 4-index congruence W_pno[a'b'c'd'] = Σ_{abcd} U[a,a']U[b,b']U[c,c']U[d,d'] W[abcd],
 // as four sequential single-index transforms. Uflat is row-major [nv × n];
-// W and out are row-major (((·)*…)). Runs once in the ctor — gate scale.
+// W and out are row-major (((·)*…)). Host reference (the GPU port lives in the EA
+// native operator; this is the gpu_selfcheck_ comparison target).
 void congruence4(const std::vector<real_t>& W,
                  const std::vector<real_t>& Uflat, int nv, int n,
                  std::vector<real_t>& out) {
@@ -381,7 +749,6 @@ void congruence4(const std::vector<real_t>& W,
                     out[(((static_cast<size_t>(ap) * n + bp) * n + cp) * n + dp)] = s;
                 }
 }
-}  // namespace
 
 DressedPnoEA build_dressed_pno_ea_vvvv(const std::vector<real_t>& h_Wvvvv,
                                        const std::vector<std::vector<real_t>>& Uocc,
@@ -472,6 +839,19 @@ void build_dressed_pno_ea_vvvv_ring(DressedPnoEA& io,
 
     Eigen::Map<const RowMatXd> S(h_S.data(), nao, nao);
 
+    // B-a.6f Stage F0: per-phase ctor-build chrono (EA mirror of IP). Split
+    // between (i) the t2kl = barS·Y·barSᵀ build over all (k,l) and (ii) the
+    // V·T 4-index contraction. Printed at end when subtract_dense=false.
+    double t2_proj_ms = 0.0, vt_ms = 0.0;
+    const auto t0_total = std::chrono::high_resolution_clock::now();
+    // Periodic progress signal — anthracene-scale EA Wvvvv ring builder is
+    // a 10-30 s host-Eigen silent stretch (Tetracene scale: 2-5 min) with
+    // no Davidson activity to fall back on.  Outer loop runs serially over
+    // active occupied indices j (nocc iterations); print at deciles.
+    const char* env_prog_phase = std::getenv("GANSU_DLPNO_NATIVE_PROF");
+    const bool  print_phase_progress = !env_prog_phase || env_prog_phase[0] != '0';
+    int ea_done_j = 0, ea_next_decile = 1;
+
     for (int j = 0; j < nocc; ++j) {
         const int n = n_pno_ii[j];
         if (n == 0) continue;
@@ -489,6 +869,7 @@ void build_dressed_pno_ea_vvvv_ring(DressedPnoEA& io,
         const RowMatXd Bjj = barQ_jj.transpose() * S;        // [n × nao]
 
         // t2_proj^(jj←kl)[a',b'] = oriented(barS Y_src barSᵀ) [n×n] for every (k,l).
+        const auto t0_t2 = std::chrono::high_resolution_clock::now();
         std::vector<RowMatXd> t2kl(static_cast<size_t>(nocc) * nocc, RowMatXd::Zero(n, n));
         for (int k = 0; k < nocc; ++k)
             for (int l = 0; l < nocc; ++l) {
@@ -504,14 +885,17 @@ void build_dressed_pno_ea_vvvv_ring(DressedPnoEA& io,
                 t2kl[static_cast<size_t>(k) * nocc + l] =
                     (res.setups[src].i == k) ? M : RowMatXd(M.transpose());   // (k,l) order
             }
+        t2_proj_ms += std::chrono::duration<double, std::milli>(
+                          std::chrono::high_resolution_clock::now() - t0_t2).count();
 
         // native_ring[a',b',c',d'] = Σ_{k,l} V[k,l,c',d'] · t2_proj[k,l][a',b'].
+        const auto t0_vt = std::chrono::high_resolution_clock::now();
         std::vector<real_t> nat(static_cast<size_t>(n) * n * n * n, 0.0);
         for (int k = 0; k < nocc; ++k)
             for (int l = 0; l < nocc; ++l) {
                 const RowMatXd& T = t2kl[static_cast<size_t>(k) * nocc + l];
                 const size_t vbase = (static_cast<size_t>(k) * nocc + l) * n * n;  // V[k,l,·,·]
-                #pragma omp parallel for
+                #pragma omp parallel for num_threads(dlpno_eom_ring_omp_cap())
                 for (int ap = 0; ap < n; ++ap)
                     for (int bp = 0; bp < n; ++bp) {
                         const real_t Tab = T(ap, bp);
@@ -523,6 +907,8 @@ void build_dressed_pno_ea_vvvv_ring(DressedPnoEA& io,
                                     Tab * V[vbase + static_cast<size_t>(cp) * n + dp];
                     }
             }
+        vt_ms += std::chrono::duration<double, std::milli>(
+                     std::chrono::high_resolution_clock::now() - t0_vt).count();
 
         std::vector<real_t>& W = io.Wvvvv_pno[j];
         const size_t n4 = static_cast<size_t>(n) * n * n * n;
@@ -543,6 +929,34 @@ void build_dressed_pno_ea_vvvv_ring(DressedPnoEA& io,
                 max_ring = std::max(max_ring, std::fabs(nat[e]));
             }
         }
+        // Decile progress (single-threaded outer loop → no atomics needed).
+        if (print_phase_progress && !subtract_dense) {
+            ++ea_done_j;
+            while (ea_next_decile <= 10 && ea_done_j * 10 >= nocc * ea_next_decile) {
+                const double elapsed_s = std::chrono::duration<double>(
+                    std::chrono::high_resolution_clock::now() - t0_total).count();
+                const double eta_s = (ea_next_decile > 0)
+                    ? elapsed_s * (10.0 - ea_next_decile) / ea_next_decile
+                    : 0.0;
+                std::cout << "  [bt-PNO EA Wvvvv ring builder] " << (ea_next_decile * 10)
+                          << "% (" << ea_done_j << "/" << nocc << " occ, "
+                          << std::fixed << std::setprecision(1) << elapsed_s
+                          << "s elapsed, ETA " << eta_s << "s)"
+                          << std::defaultfloat << std::endl;
+                ++ea_next_decile;
+            }
+        }
+    }
+
+    // B-a.6f Stage F0 phase split (BARE / dense-free path only).
+    if (!subtract_dense) {
+        const double total_ms = std::chrono::duration<double, std::milli>(
+                                    std::chrono::high_resolution_clock::now() - t0_total).count();
+        std::cout << "[bt-PNO B-a.6f EA ring split]  total = " << std::fixed
+                  << std::setprecision(1) << total_ms << " ms"
+                  << "   t2kl (barS·Y·barSᵀ) = " << t2_proj_ms << " ms"
+                  << "   V·T contraction = " << vt_ms << " ms"
+                  << std::defaultfloat << std::endl;
     }
 }
 

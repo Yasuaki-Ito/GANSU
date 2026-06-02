@@ -472,6 +472,32 @@ public:
     void build_mo_eri_into(const real_t* d_C, int nmo,
                            real_t* d_eri_out) const override;
 
+    /// Phase 0 (memory decoupling): build only the half-transformed B_mo
+    /// (naux × nmo² row-major) — the intermediate of build_mo_eri_into — WITHOUT
+    /// the nao⁴ Step-3 product. Returns a thread-local cached device pointer
+    /// (valid until the next build_B_mo / build_mo_eri_into on this thread; do
+    /// not free). GPU-only (returns nullptr on CPU). Lets callers form
+    /// individual MO-ERI sub-blocks on the fly and never materialize nmo⁴.
+    /// Virtual so distributed RI can override the source-B lookup (P4b).
+    virtual const real_t* build_B_mo(const real_t* d_C, int nmo) const;
+
+    /// Phase P4b — workhorse for build_B_mo: takes the AO-basis source B
+    /// pointer explicitly so distributed RI (where intermediate_matrix_B_ is
+    /// empty) can hand in its replicated d_B_full_per_gpu_[curr_dev]. The
+    /// device-residency / thread-local workspace lifecycle matches build_B_mo.
+    const real_t* build_B_mo_impl(const real_t* d_B_ao_src,
+                                  const real_t* d_C, int nmo) const;
+
+    /// Phase 0: form one MO-ERI sub-block directly from a B_mo built by
+    /// build_B_mo, written as block[(p,q),(r,s)] row-major
+    /// ((pn*qn) × (rn*sn)) = (p q | r s) with p∈[p0,p0+pn) etc. Peak extra =
+    /// two naux×(block-pair) gather buffers (≤ naux·nmo², thread-local cached),
+    /// never nmo⁴. d_out must hold pn*qn*rn*sn reals.
+    void mo_eri_block_into(const real_t* d_B_mo, int nmo,
+                           int p0, int pn, int q0, int qn,
+                           int r0, int rn, int s0, int sn,
+                           real_t* d_out) const;
+
     /// Compute G(D) using RI B-matrix based J/K build (no AO ERI reconstruction needed).
     void compute_jk_response(const real_t* d_D, real_t* d_G, int nao) const override;
 

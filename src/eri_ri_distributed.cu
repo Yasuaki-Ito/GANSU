@@ -2404,6 +2404,66 @@ real_t* ERI_RI_Distributed_RHF::build_mo_eri(const real_t* d_C, int nmo) const {
     return d_eri_mo;
 }
 
+// P4b — half-transformed B_mo for distributed RI. The base ERI_RI::build_B_mo
+// reads intermediate_matrix_B_ which is empty in the distributed class (we
+// store B as per-GPU slices d_B_local_[g]). Lazily call replicate_B_to_all_gpus()
+// so each GPU has the full naux×nao² B (≈ 580 MB at anthracene cc-pVDZ scale),
+// then delegate to the base build_B_mo_impl using the current-device copy.
+// Used by IP/EA/STEOM operator block-mode (P4b) so no nmo⁴ MO ERI is built.
+const real_t* ERI_RI_Distributed_RHF::build_B_mo(const real_t* d_C, int nmo) const {
+#ifdef GANSU_CPU_ONLY
+    (void)d_C; (void)nmo;
+    return nullptr;
+#else
+    if (!gpu::gpu_available()) return nullptr;
+    if (!b_replicated_) {
+        // const_cast is acceptable: replicate_B_to_all_gpus mutates only the
+        // lazy-replication cache (d_B_full_per_gpu_, b_replicated_), not the
+        // logical state of the operator. Memory check inside; returns false
+        // if replication would blow the per-GPU budget.
+        const bool ok = const_cast<ERI_RI_Distributed_RHF*>(this)->
+                        replicate_B_to_all_gpus();
+        if (!ok) {
+            std::cout << "  [P4b] build_B_mo: replicate_B_to_all_gpus refused "
+                         "(budget); falling back to full nmo⁴ MO ERI tensor."
+                      << std::endl;
+            return nullptr;   // caller falls back to build_mo_eri (legacy)
+        }
+    }
+    int curr_dev = 0;
+    cudaGetDevice(&curr_dev);
+    // Device-0 fallback: if the calling context left the current device set to
+    // something outside [0, num_gpus_) (e.g., CIS-NTO finalize), or to a device
+    // that doesn't hold a replica (only seen with non-uniform multi-GPU layouts),
+    // gracefully fall back to device 0 where the canonical replica always lives
+    // after replicate_B_to_all_gpus().  Without this guard, build_B_mo silently
+    // returns nullptr and the caller allocates a full nmo⁴ MO ERI buffer
+    // (~88 GB at tetracene cc-pVDZ, OOM on a single H200 141 GB after DLPNO
+    // ground state residency).  Print diagnostics for the nullptr paths so the
+    // failure mode is visible if device 0 itself ever lacks a replica.
+    const bool curr_dev_bad   = (curr_dev < 0 || curr_dev >= num_gpus_);
+    const bool curr_dev_empty = (!curr_dev_bad) && !d_B_full_per_gpu_[curr_dev];
+    if (curr_dev_bad || curr_dev_empty) {
+        if (num_gpus_ > 0 && (int)d_B_full_per_gpu_.size() > 0 && d_B_full_per_gpu_[0]) {
+            std::cout << "  [P4b] build_B_mo: curr_dev=" << curr_dev
+                      << " "
+                      << (curr_dev_bad ? "out of range" : "has no replica")
+                      << "; using device-0 replica" << std::endl;
+            cudaSetDevice(0);
+            return build_B_mo_impl(d_B_full_per_gpu_[0], d_C, nmo);
+        }
+        std::cout << "  [P4b] build_B_mo: nullptr (curr_dev=" << curr_dev
+                  << ", num_gpus_=" << num_gpus_
+                  << ", replica vec size=" << d_B_full_per_gpu_.size()
+                  << ", device-0 replica="
+                  << (d_B_full_per_gpu_.empty() ? "n/a" : (d_B_full_per_gpu_[0] ? "ok" : "null"))
+                  << ") — caller will fall back to nmo⁴ MO ERI" << std::endl;
+        return nullptr;
+    }
+    return build_B_mo_impl(d_B_full_per_gpu_[curr_dev], d_C, nmo);
+#endif
+}
+
 // Step 6.3c — workspace variant for the replicated-B path. Writes the MO ERI
 // directly into the caller-supplied d_eri_out buffer (must be ≥ nmo⁴ doubles).
 // For the multi-GPU NCCL distributed path the caller-provided buffer can't

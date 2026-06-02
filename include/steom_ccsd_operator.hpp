@@ -52,6 +52,8 @@
 
 namespace gansu {
 
+class ERI_RI;  // Phase 0: on-the-fly MO-ERI block source (build_B_mo / mo_eri_block_into)
+
 class STEOMCCSDOperator : public LinearOperator {
 public:
     /**
@@ -102,7 +104,15 @@ public:
                       const int* h_active_occ_idx,
                       const int* h_active_vir_idx,
                       int nocc_active, int nvir, int nao_active,
-                      int n_act_occ, int n_act_vir);
+                      int n_act_occ, int n_act_vir,
+                      const ERI_RI* eri_block_src = nullptr,
+                      const real_t* d_B_mo_blocks = nullptr,
+                      int nmo_full = 0,
+                      // Ship 14: per-device d_eri_vvvv slabs (driver allocates
+                      // + extracts; operator takes ownership and uses them in
+                      // canonical-skip Term A GEMM). Non-null + size ≥ 2
+                      // enables slab mode (forces canonical_skip_wvvvv_=true).
+                      std::vector<real_t*>* d_eri_vvvv_slabs_input = nullptr);
 
     ~STEOMCCSDOperator();
 
@@ -123,6 +133,13 @@ public:
     int get_n_act_vir()   const { return n_act_vir_; }
     int get_dim()         const { return total_dim_; }  // = nocc_active * nvir
 
+    /// Dense non-symmetric G^{1h1p} matrix [total_dim × total_dim] row-major,
+    /// or nullptr if build_W_eff_and_G() has not run. Used by the optional
+    /// dense-diagonalization path (GANSU_STEOM_DENSE_DIAG) to deterministically
+    /// extract all eigenvalues via eigenDecompositionNonSymmetric, bypassing
+    /// the run-to-run nondeterminism of the non-Hermitian Davidson.
+    const real_t* get_G_device() const { return d_G_; }
+
     /// Print Ŝ amplitude Frobenius norms (sub-phase 3.0+3.1 smoke check).
     void print_amplitude_norms(std::ostream& os) const;
 
@@ -133,6 +150,22 @@ private:
     int n_act_occ_;
     int n_act_vir_;
     int total_dim_;
+
+    // Build-phase multi-GPU device count (env GANSU_STEOM_BUILD_GPUS=N>1).
+    // Decoupled from the solve-phase GANSU_STEOM_EOM_GPUS and from --num_gpus
+    // (the MultiGpuManager singleton is pinned to 1 device by the CIS-NTO
+    // --num_gpus 1 path). 1 = legacy single-GPU build (byte-identical).
+    int build_gpus_ = 1;
+
+    // P5 canonical-skip: skip the dressed nvir⁴ Wvvvv build (host + device) when
+    // (GANSU_DLPNO_NATIVE_EOM=1 AND GANSU_DLPNO_NATIVE_BARE=1 AND GANSU_DLPNO_CANONICAL_SKIP=1).
+    // STEOM's d_Wvvvv_ is only read by print_intermediate_norms (verbose); the
+    // dense G^{1h1p} matvec does not consume it. The Wvvvo·t1 contribution
+    // (Σ_d Wvvvv[a,b,c,d]·t1[j,d]) is recomputed via a 4-term Wick refactor
+    // (mirror of the EA canonical-skip) without ever materialising the nvir⁴
+    // dressed intermediate. Saves ~nvir⁴·8B host + ~nvir⁴·8B device = ~16.5 GB
+    // each at anthracene, decisive at 100 atoms. Default off → bit-exact.
+    bool canonical_skip_wvvvv_ = false;
 
     // === Active NTO ↔ MO index maps (host-side, copied in constructor) ===
     std::vector<int> active_occ_idx_;   // [n_act_occ]   (each ∈ [0, nocc_active))
@@ -180,6 +213,21 @@ private:
     real_t* d_eri_ovvv_ = nullptr;
     real_t* d_eri_vvvv_ = nullptr;
 
+    // === Ship 14: d_eri_vvvv n-slab distribution (mirror of EA Ship 12) =====
+    // For Pentacene-class workloads (NV=327) the bare ERI vvvv tensor +
+    // canonical-skip Term A scratch d_inter (NV³·NO·8B ≈ 20 GB) exceed the
+    // single-device budget after d_eri_vvvv (91 GB) is also resident.  When
+    // GANSU_STEOM_EA_VVVV_NSLAB=N (or GANSU_EA_VVVV_NSLAB=N — shared env)
+    // is set, we split d_eri_vvvv along the outermost a-axis: slab d holds
+    // [a_starts_[d] .. a_ends_[d]) × NV³ doubles on device d.  Only consumer
+    // with multi-GPU support is canonical-skip Term A; non-skip paths (h_vvvv
+    // host alloc, d_Wvvvv_ device upload) are gated by canonical_skip_wvvvv_
+    // = true when slab mode is active.  Slab ownership transfers from driver.
+    int eri_vvvv_nslab_ = 1;                  // N>1 = slab mode
+    std::vector<real_t*> d_eri_vvvv_slabs_;   // per-device slab device pointers
+    std::vector<int> a_starts_;               // slab boundary a_starts_[d]
+    std::vector<int> a_ends_;                 // slab boundary a_ends_[d]
+
     // === Dressed bar-H intermediates (union of IP + EA, PySCF rintermediates.py
     //  definitions; 11 distinct quantities). Built in 3.2; used by 3.3-3.7
     //  Ŝ-dressing + G^{1h1p} matvec.
@@ -207,6 +255,14 @@ private:
     real_t* d_eps_vir_  = nullptr;  // [nvir]
 
     void build_diagonal(const real_t* d_orbital_energies);
+    // Phase 0: optional on-the-fly block source (single-GPU RI, num_frozen==0).
+    // When eri_block_src_ != nullptr, extract_eri_blocks forms each ERI sub-block
+    // from d_B_mo_blocks_ (the naux×nmo² half-transform) via
+    // eri_block_src_->mo_eri_block_into, never allocating the full nmo⁴ tensor.
+    // nullptr => legacy gather from a caller-supplied full d_eri_mo.
+    const ERI_RI* eri_block_src_ = nullptr;
+    const real_t* d_B_mo_blocks_ = nullptr;
+    int nmo_full_ = 0;
     void extract_eri_blocks(const real_t* d_eri_mo);
     void build_dressed_intermediates();
 

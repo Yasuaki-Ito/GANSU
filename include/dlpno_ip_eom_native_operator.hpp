@@ -186,9 +186,9 @@ private:
         real_t* d_Lvv_pno_pack = nullptr;
         real_t* d_Loo_lmo  = nullptr;
         real_t* d_Woooo_lmo= nullptr;
-        real_t* d_Wovoo_re = nullptr;
+        real_t* d_Wovoo_slot = nullptr; ///< 5g: slot-packed Wovoo_re (slab subrange in slab mode)
         real_t* d_Woovv_lmo= nullptr;
-        real_t* d_t2_lmo   = nullptr;
+        real_t* d_t2_slot  = nullptr;  ///< 5f: slot-packed t2 (slab subrange in slab mode)
         real_t* d_S        = nullptr;  ///< [nocc²·nvir] T8a scratch
         real_t* d_tmp_c    = nullptr;  ///< [nvir] T8 scratch
         real_t* d_Wovvo_occi = nullptr;
@@ -200,6 +200,8 @@ private:
         real_t* d_RP_moj   = nullptr;
         size_t  lvv_shift  = 0;        ///< 5e: subtract from lvv_pno_off_[idx] for slab-only Lvv pack (0=full)
         size_t  wovvo_shift= 0;        ///< 5e: subtract from wovvo_off_[idx] for slab-only ph-ladder packs (0=full)
+        size_t  t2_shift   = 0;        ///< 5f: subtract from slot·nvir² for slab-only slot-packed t2 (0=full)
+        size_t  wovoo_t1_shift = 0;    ///< 5g: subtract from slot·nvir·nocc for slab-only slot-packed Wovoo (0=full)
     };
     std::vector<DeviceWorkspace> ws_;  ///< size = #devices used (ws_[0] aliases device 0)
     std::vector<int> slot_begin_;      ///< [#dev] orientation-slot slab start per device
@@ -219,6 +221,16 @@ private:
     // d_..._ + (off[idx] - shift). 0 on device 0 / full / single-GPU. Set in bind_device.
     mutable size_t lvv_pack_shift_   = 0;
     mutable size_t wovvo_pack_shift_ = 0;
+    // 5f: cross-pair t2 stored slot-packed (one nvir² block per orientation slot, in slot
+    // order) instead of the full occ-pair nocc²·nvir² dense tensor. add_t8_gpu indexes it
+    // by slot; d>0 slab replicas hold only their contiguous slot subrange and subtract this
+    // shift (= slot_begin·nvir²). 0 on device 0 / full / single-GPU. Set in bind_device.
+    mutable size_t t2_slot_shift_    = 0;
+    // 5g: cross-pair Wovoo_re stored slot-packed (one nvir·nocc block per orientation slot,
+    // in slot order) instead of the full occ-pair nocc²·nvir·nocc dense tensor. add_t1_gpu
+    // indexes it by slot; d>0 slab replicas keep only their contiguous slot subrange and
+    // subtract this shift (= slot_begin·nvir·nocc). 0 on device 0 / full / single-GPU.
+    mutable size_t wovoo_slot_shift_ = 0;
     /// Stage 5c: point the (const_cast) σ2 members at device d's workspace buffers +
     /// cublas handle (NULL stream) so the validated helper chain runs on device d.
     /// bind_device(0) restores the device-0 members. resident_/d_r2_src_/d_r1_src_ are
@@ -323,7 +335,7 @@ private:
     // (oi,oj) innermost (stride nocc²), so the ctor pre-transposes it to Wovoo_re[oi,oj,a,k]
     // (contiguous [nvir×nocc] per slot) → per-slot GEMV OP_T over r1.
     bool use_gpu_t1_ = false;
-    real_t* d_Wovoo_re_ = nullptr;      ///< [nocc²·nvir·nocc] Wovoo_re[oi,oj,a,k]=Wovoo_lmo[k,a,oi,oj]
+    real_t* d_Wovoo_slot_ = nullptr;    ///< [n_orient·nvir·nocc] Wovoo_re slot-packed (T1; 5g)
     real_t* d_r1_ = nullptr;            ///< [nocc] r1 upload scratch
 
     // B-a.6a GPU port — Stage 3b T8 (env GANSU_DLPNO_NATIVE_GPU_T8=1; ⊂ use_gpu_xpair_).
@@ -332,7 +344,7 @@ private:
     // T8b: acc[s][a] -= Σ_c tmp_c[c] t2_lmo[oi,oj,c,a]  (per-slot GEMV, t2 block contiguous).
     bool use_gpu_t8_ = false;
     real_t* d_Woovv_lmo_ = nullptr;     ///< [nocc²·nvir²] Woovv_lmo (T8a)
-    real_t* d_t2_lmo_    = nullptr;     ///< [nocc²·nvir²] CCSD T2 (T8b)
+    real_t* d_t2_slot_   = nullptr;     ///< [n_orient·nvir²] CCSD T2 slot-packed (T8b; 5f)
     real_t* d_S_         = nullptr;     ///< [nocc²·nvir] symmetrized r2c scratch (T8a)
     real_t* d_tmp_c_     = nullptr;     ///< [nvir] tmp_c scratch (T8)
 

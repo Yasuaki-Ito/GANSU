@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -72,7 +73,9 @@ extern __global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ er
 static void compute_ea_eom_ccsd_impl(RHF& rhf,
                                      const real_t* d_eri_ao,
                                      int n_roots_requested,
-                                     real_t* d_eri_mo_precomputed = nullptr)
+                                     real_t* d_eri_mo_precomputed = nullptr,
+                                     const ERI_RI* eri_block_src = nullptr,
+                                     const real_t* d_B_mo_blocks = nullptr)
 {
     PROFILE_FUNCTION();
 
@@ -129,6 +132,114 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
               << (active_mode ? "  (active mode)" : "  (passive mode)")
               << std::endl;
 
+    // Device buffer audit (diagnostic for Pentacene-class OOM at d_eri_vvvv_
+    // alloc: prior IP-EOM operator destructor SHOULD have released its
+    // d_eri_vvvv_ + native operator state, but the persistent DLPNO state
+    // (T2 amplitudes + bt-PNO PI cache + B replica) survives across all 3
+    // (IP/EA/STEOM) consumers.  This audit prints per-device free/used
+    // memory + the global tracked-malloc counter, so the gap between what
+    // we EXPECT to be freed and what's actually still alive is visible
+    // before we attempt the NV⁴·8B = 91 GB d_eri_vvvv_ alloc at NV=327.
+    // Always-on (1 short paragraph per run, low log noise).
+    //
+    // Ship 11 — operator device-redirect: if GANSU_STEOM_OPERATOR_DEVICE_BALANCING=1
+    // is set, after the audit pick the device with maximum driver-free memory and
+    // cudaSetDevice to it BEFORE we proceed to CCSD/MO transform/operator ctor.
+    // This addresses the Pentacene GPU-0 bias (DLPNO ground state's heaviest T2
+    // slab persists on device 0 while devices 1-3 sit ~131 GB free). Operator
+    // tracked allocs land on the chosen device; restored at impl exit.
+    bool dev_balance_active = false;
+    int dev_balance_restore = 0;
+    int dev_balance_target  = 0;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        // Global tracker snapshot (sum across all devices, via the GANSU memory tracker).
+        const size_t tracked_global = GlobalGpuMemoryTracker::get_current();
+        const size_t tracked_peak = GlobalGpuMemoryTracker::get_peak();
+        const size_t nvir_sz = (size_t)nvir * nvir * nvir * nvir * sizeof(real_t);
+        const double need_vvvv_gb = nvir_sz / (1024.0*1024.0*1024.0);
+        std::cout << "  [EA-EOM device audit] tracked sum-of-GPUs current = "
+                  << std::fixed << std::setprecision(2)
+                  << (tracked_global / (1024.0*1024.0*1024.0)) << " GB"
+                  << "   peak = " << (tracked_peak / (1024.0*1024.0*1024.0)) << " GB"
+                  << "   (will alloc d_eri_vvvv_ = " << need_vvvv_gb << " GB next)"
+                  << std::defaultfloat << std::endl;
+        // Per-device breakdown from tracker (only devices that saw a tracked alloc).
+        const auto per_dev = GlobalGpuMemoryTracker::get_per_device_snapshot();
+        for (const auto& kv : per_dev) {
+            const int dev = kv.first;
+            const auto& s = kv.second;  // {current, total, peak}
+            std::cout << "    GPU " << dev << " tracker:  current="
+                      << std::fixed << std::setprecision(2)
+                      << (s[0] / (1024.0*1024.0*1024.0)) << " GB"
+                      << "  peak=" << (s[2] / (1024.0*1024.0*1024.0)) << " GB"
+                      << std::defaultfloat << std::endl;
+        }
+        // Live cudaMemGetInfo per device (= ground truth from driver).
+        int n_dev = 0;
+        cudaGetDeviceCount(&n_dev);
+        int saved_dev = 0;
+        cudaGetDevice(&saved_dev);
+        dev_balance_restore = saved_dev;
+        std::vector<size_t> per_dev_free(n_dev, 0);
+        for (int d = 0; d < n_dev; ++d) {
+            cudaSetDevice(d);
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+                per_dev_free[d] = free_b;
+                const double used_gb = (total_b - free_b) / (1024.0*1024.0*1024.0);
+                const double free_gb = free_b / (1024.0*1024.0*1024.0);
+                const double total_gb = total_b / (1024.0*1024.0*1024.0);
+                std::cout << "    GPU " << d << " driver:   used="
+                          << std::fixed << std::setprecision(2) << used_gb << " GB"
+                          << "  free=" << free_gb << " GB"
+                          << "  total=" << total_gb << " GB"
+                          << "  d_eri_vvvv_ alloc "
+                          << (free_b >= nvir_sz ? "fits" : "WILL OOM")
+                          << std::defaultfloat << std::endl;
+            }
+        }
+        // Ship 11: optional device-redirect based on max driver-free memory.
+        const char* env_balance = std::getenv("GANSU_STEOM_OPERATOR_DEVICE_BALANCING");
+        if (env_balance && env_balance[0] == '1' && n_dev > 1) {
+            int best_dev = saved_dev;
+            size_t best_free = (saved_dev >= 0 && saved_dev < n_dev) ? per_dev_free[saved_dev] : 0;
+            for (int d = 0; d < n_dev; ++d) {
+                if (per_dev_free[d] > best_free) {
+                    best_free = per_dev_free[d];
+                    best_dev  = d;
+                }
+            }
+            if (best_dev != saved_dev) {
+                cudaSetDevice(best_dev);
+                // Rebuild thread_local GPUHandle (cuBLAS + cuSOLVER) on the
+                // new device — otherwise build_dressed_intermediates DGEMMs
+                // run with a handle bound to the original device while
+                // pointers live on the new one, which fails with
+                // CUBLAS_STATUS_EXECUTION_FAILED (status=13).
+                gpu::GPUHandle::reset();
+                dev_balance_active = true;
+                dev_balance_target = best_dev;
+                std::cout << "  [EA-EOM device-balance] redirecting operator to GPU "
+                          << best_dev
+                          << " (free=" << std::fixed << std::setprecision(2)
+                          << (best_free / (1024.0*1024.0*1024.0)) << " GB"
+                          << ", was on GPU " << saved_dev
+                          << " with free=" << (per_dev_free[saved_dev] / (1024.0*1024.0*1024.0))
+                          << " GB; GPUHandle rebuilt for new device)"
+                          << std::defaultfloat << std::endl;
+            } else {
+                cudaSetDevice(saved_dev);
+                std::cout << "  [EA-EOM device-balance] GPU " << saved_dev
+                          << " already has max free memory; no redirect."
+                          << std::endl;
+            }
+        } else {
+            cudaSetDevice(saved_dev);
+        }
+    }
+#endif
+
     if (active_mode && cis_nto.nvir != nvir) {
         throw std::runtime_error(
             "EA-EOM-CCSD: CISNTOResult.nvir ("
@@ -180,15 +291,19 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
 
     // Step 2: Build MO ERI (matches EE-EOM pattern) and trim for frozen core.
     Timer mo_timer;
+    // Phase 0: eri_block_src (single-GPU RI DLPNO) builds the operator's blocks
+    // on the fly from B_mo — skip the full nmo⁴ tensor entirely.
     real_t* d_eri_mo = nullptr;
     bool free_eri_mo = false;
-    if (d_eri_mo_precomputed) {
-        d_eri_mo = d_eri_mo_precomputed;
-    } else {
-        tracked_cudaMalloc(&d_eri_mo,
-                           (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
-        transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
-        free_eri_mo = true;
+    if (!eri_block_src) {
+        if (d_eri_mo_precomputed) {
+            d_eri_mo = d_eri_mo_precomputed;
+        } else {
+            tracked_cudaMalloc(&d_eri_mo,
+                               (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
+            transform_ao_eri_to_mo_eri_full(d_eri_ao, d_C, num_basis, d_eri_mo);
+            free_eri_mo = true;
+        }
     }
     std::cout << "  MO transform time: " << std::fixed << std::setprecision(3)
               << mo_timer.elapsed_seconds() << " s" << std::endl;
@@ -226,9 +341,102 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
     // uses the diagonal-only matvec until sub-phases 2.3-2.6 wire in the
     // full sigma.
     Timer build_timer;
+    // Stage EA-5: multi-GPU EA σ is opt-in via GANSU_STEOM_EOM_GPUS=N>1, decoupled
+    // from the RI/CIS-NTO --num_gpus (forced to 1). Default unset → single-GPU.
+    int eom_gpus = 1;
+    if (const char* e = std::getenv("GANSU_STEOM_EOM_GPUS"))
+        if (e[0]) eom_gpus = std::max(1, std::atoi(e));
+
+    // Ship 12: vvvv n-slab distribution.  When GANSU_EA_VVVV_NSLAB=N is set
+    // and we have the P4b on-the-fly path, allocate + extract per-device
+    // d_eri_vvvv slabs immediately (build_B_mo has thread-local workspace,
+    // so we must extract each slab before moving to the next device).  This
+    // avoids the single-device 91 GB ceiling for Pentacene (NV=327): each
+    // slab ≈ NV⁴/N · 8B fits comfortably on each H200 (140 GB).  Slab
+    // ownership transfers to the operator ctor below.
+    std::vector<real_t*> d_eri_vvvv_slabs;
+#ifndef GANSU_CPU_ONLY
+    if (eri_block_src && gpu::gpu_available()) {
+        const char* env_nslab = std::getenv("GANSU_EA_VVVV_NSLAB");
+        if (env_nslab && env_nslab[0]) {
+            const int Nreq = std::atoi(env_nslab);
+            int n_dev = 0;
+            cudaGetDeviceCount(&n_dev);
+            const int N = std::min(Nreq, n_dev);
+            if (N >= 2) {
+                int saved = 0;
+                cudaGetDevice(&saved);
+                d_eri_vvvv_slabs.assign(N, nullptr);
+                bool all_ok = true;
+                for (int d = 0; d < N; ++d) {
+                    cudaSetDevice(d);
+                    const real_t* B_d = eri_block_src->build_B_mo(d_C, num_basis);
+                    if (!B_d) {
+                        all_ok = false;
+                        std::cout << "  [EA-EOM Ship 12] WARNING: build_B_mo returned null "
+                                     "for device " << d << "; disabling slab mode." << std::endl;
+                        break;
+                    }
+                    const int a_start = (int)((int64_t)d * nvir / N);
+                    const int a_end   = (int)((int64_t)(d + 1) * nvir / N);
+                    const int an      = a_end - a_start;
+                    const size_t slab_sz = (size_t)an * nvir * nvir * nvir;
+                    tracked_cudaMalloc(&d_eri_vvvv_slabs[d], slab_sz * sizeof(real_t));
+                    eri_block_src->mo_eri_block_into(B_d, num_basis,
+                        nocc_active + a_start, an,   // a range (slab)
+                        nocc_active, nvir,           // b range
+                        nocc_active, nvir,           // c range
+                        nocc_active, nvir,           // d range
+                        d_eri_vvvv_slabs[d]);
+                    cudaDeviceSynchronize();
+                    std::cout << "  [EA-EOM Ship 12] slab d=" << d
+                              << " allocated " << std::fixed << std::setprecision(2)
+                              << (slab_sz * sizeof(real_t) / (1024.0*1024.0*1024.0))
+                              << " GB on GPU " << d
+                              << " (a∈[" << a_start << "," << a_end << "))"
+                              << std::defaultfloat << std::endl;
+                }
+                cudaSetDevice(saved);
+                if (!all_ok) {
+                    // Free any partially-allocated slabs.
+                    for (int d = 0; d < N; ++d) {
+                        if (d_eri_vvvv_slabs[d]) {
+                            cudaSetDevice(d);
+                            tracked_cudaFree(d_eri_vvvv_slabs[d]);
+                            d_eri_vvvv_slabs[d] = nullptr;
+                        }
+                    }
+                    cudaSetDevice(saved);
+                    d_eri_vvvv_slabs.clear();
+                } else {
+                    // Ship 12: the build_B_mo thread-local workspace cache is
+                    // single-device — our per-device loop above invalidated the
+                    // GPU-0 (or whichever was original) ws_B_mo and now points
+                    // at the LAST device's data.  Refresh on `saved` (the Ship 11
+                    // redirect target, or original device) so the operator's
+                    // stored d_B_mo_blocks is valid for the other 6 d_eri_*
+                    // extractions in extract_eri_blocks.
+                    d_B_mo_blocks = eri_block_src->build_B_mo(d_C, num_basis);
+                    if (!d_B_mo_blocks) {
+                        std::cout << "  [EA-EOM Ship 12] WARNING: post-loop "
+                                     "build_B_mo refresh on saved device returned null; "
+                                     "operator extract_eri_blocks will likely fail."
+                                  << std::endl;
+                    }
+                }
+            } else {
+                std::cout << "  [EA-EOM Ship 12] GANSU_EA_VVVV_NSLAB=" << Nreq
+                          << " but only " << n_dev << " GPUs visible; needs ≥2 to slab"
+                          << std::endl;
+            }
+        }
+    }
+#endif
     EAEOMCCSDOperator ea_op(d_eri_for_op, d_eps_for_op,
                             d_t1, d_t2,
-                            nocc_active, nvir, nao_active);
+                            nocc_active, nvir, nao_active,
+                            eri_block_src, d_B_mo_blocks, num_basis, eom_gpus,
+                            d_eri_vvvv_slabs.empty() ? nullptr : &d_eri_vvvv_slabs);
 
     if (free_eri_for_op) tracked_cudaFree(d_eri_for_op);
     if (free_eri_mo)     tracked_cudaFree(d_eri_mo);
@@ -247,7 +455,10 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
     config.use_preconditioner    = true;
     config.symmetric             = false;
     config.min_eigenvalue        = 0.0;
-    config.verbose               = (verbose >= 2) ? 2 : (verbose >= 1 ? 1 : 0);
+    // Davidson per-iter progress is always printed (one line/iter) so the
+    // user sees eigenvalue stabilisation + residual + ETA during the long
+    // native-operator silent stretch (anthracene-scale: 10-30 min/solve).
+    config.verbose               = (verbose >= 2) ? 2 : 1;
 
     std::vector<real_t> eigenvalues;
     std::vector<real_t> h_eigenvectors((size_t)n_roots_to_compute * total_dim, 0.0);
@@ -282,6 +493,77 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
 
         const DLPNOEAPacking pack = build_ea_packing(dres);
         std::unique_ptr<LinearOperator> dlpno_op;
+
+        // Ship 13 — secondary device-balance for the DLPNO native operator +
+        // Davidson workspace.  The canonical EA operator (ea_op) holds ~120 GB
+        // of persistent state on the Ship 11 target device; the DLPNO native
+        // operator's d_Wvvvv_pno_pack_ (Σ_j n_pno(jj)⁴·8B, ~5 GB at Pentacene)
+        // plus Davidson subspace+sigma (packed_dim·max_sub·8B·2, ~9 GB at
+        // Pentacene EA scale) would push that single device over the 139.8 GB
+        // ceiling.  By picking a different device with maximum free memory
+        // for the native operator+Davidson, we let peer-access NVLink read
+        // ea_op's persistent state cross-device.  Gate by same env as Ship 11.
+        bool ea_native_dev_balance_active = false;
+        int  ea_native_dev_balance_restore = 0;
+        int  ea_native_dev_balance_target  = 0;
+#ifndef GANSU_CPU_ONLY
+        if (gpu::gpu_available()) {
+            const char* env_bal = std::getenv("GANSU_STEOM_OPERATOR_DEVICE_BALANCING");
+            if (env_bal && env_bal[0] == '1') {
+                int n_dev = 0;
+                cudaGetDeviceCount(&n_dev);
+                if (n_dev > 1) {
+                    int saved = 0;
+                    cudaGetDevice(&saved);
+                    ea_native_dev_balance_restore = saved;
+                    std::vector<size_t> per_dev_free(n_dev, 0);
+                    for (int d = 0; d < n_dev; ++d) {
+                        cudaSetDevice(d);
+                        size_t free_b = 0, total_b = 0;
+                        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
+                            per_dev_free[d] = free_b;
+                    }
+                    int best_dev = saved;
+                    size_t best_free = per_dev_free[saved];
+                    for (int d = 0; d < n_dev; ++d) {
+                        if (per_dev_free[d] > best_free) {
+                            best_free = per_dev_free[d];
+                            best_dev  = d;
+                        }
+                    }
+                    if (best_dev != saved) {
+                        cudaSetDevice(best_dev);
+                        // Ship 13 critical: GPUHandle is thread_local cuBLAS +
+                        // cuSOLVER bound to the device current at first call
+                        // (likely GPU 0).  After our cudaSetDevice the handle
+                        // is still bound to the wrong device → Davidson
+                        // build_subspace_matrix cublasDgemm fails with
+                        // CUBLAS_STATUS_EXECUTION_FAILED (status=13).  reset()
+                        // recreates the handles on the new current device.
+                        // Note: it nullifies (does not cublasDestroy) the old
+                        // handles — acceptable one-shot leak for a long-lived
+                        // EOM solve.  EA native operator owns its own cuBLAS
+                        // handle internally, so unaffected.
+                        gpu::GPUHandle::reset();
+                        ea_native_dev_balance_active = true;
+                        ea_native_dev_balance_target = best_dev;
+                        std::cout << "  [EA-EOM Ship 13 native-balance] redirecting "
+                                     "DLPNO native operator + Davidson workspace to GPU "
+                                  << best_dev << " (free=" << std::fixed
+                                  << std::setprecision(2)
+                                  << (best_free / (1024.0*1024.0*1024.0)) << " GB"
+                                  << ", canonical ea_op stays on GPU " << saved
+                                  << " with free=" << (per_dev_free[saved] / (1024.0*1024.0*1024.0))
+                                  << " GB; GPUHandle rebuilt for new device)"
+                                  << std::defaultfloat << std::endl;
+                    } else {
+                        cudaSetDevice(saved);
+                    }
+                }
+            }
+        }
+#endif
+
         if (native)
             dlpno_op = std::make_unique<DLPNOEAEOMNativeOperator>(
                 ea_op, dres, pack, dres.U_loc, C_vir, h_S, num_basis, nvir, eps_v,
@@ -436,6 +718,23 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
 
     rhf.append_excited_state_report(result.report);
     rhf.set_ea_eom_result(std::move(result));
+
+    // Ship 11 — operator device-redirect: restore caller's device so that
+    // any downstream code (STEOM dispatch, output, gansu_api) sees the same
+    // device it set before calling EA-EOM. Operator + DLPNO native state are
+    // already destructed (RAII via ea_op / dlpno_op scope), so this is a
+    // pure context switch with no straggler allocs.
+#ifndef GANSU_CPU_ONLY
+    if (dev_balance_active) {
+        cudaSetDevice(dev_balance_restore);
+        // Rebuild thread_local GPUHandle for the restored device so STEOM
+        // dispatch / downstream code sees handles on the correct device.
+        gpu::GPUHandle::reset();
+        std::cout << "  [EA-EOM device-balance] restored to GPU " << dev_balance_restore
+                  << " (operator ran on GPU " << dev_balance_target
+                  << "; GPUHandle rebuilt for restored device)" << std::endl;
+    }
+#endif
 }
 
 void ERI_Stored_RHF::compute_ea_eom_ccsd(int n_states) {
@@ -448,9 +747,19 @@ void ERI_Stored_RHF::compute_ea_eom_ccsd(int n_states) {
 void ERI_RI_RHF::compute_ea_eom_ccsd(int n_states) {
     const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
     const int num_basis = rhf_.get_num_basis();
-    real_t* d_eri_mo = build_mo_eri(d_C, num_basis);
-    compute_ea_eom_ccsd_impl(rhf_, /*d_eri_ao=*/nullptr, n_states, d_eri_mo);
-    tracked_cudaFree(d_eri_mo);
+    // P4b: RI DLPNO builds the operator's MO-ERI blocks on the fly from B_mo
+    // (no full nmo⁴). Single-GPU uses intermediate_matrix_B_; distributed-RI's
+    // build_B_mo lazily replicates B to each GPU (~580 MB at anthracene scale).
+    // build_B_mo returns nullptr when budget exceeded → fallback to full tensor.
+    const bool want_block = rhf_.use_dlpno_amplitudes()
+                            && rhf_.get_num_frozen_core() == 0
+                            && gpu::gpu_available();
+    const real_t* d_B_mo = want_block ? build_B_mo(d_C, num_basis) : nullptr;
+    const bool block     = want_block && d_B_mo != nullptr;
+    real_t* d_eri_mo     = block ? nullptr : build_mo_eri(d_C, num_basis);
+    compute_ea_eom_ccsd_impl(rhf_, /*d_eri_ao=*/nullptr, n_states, d_eri_mo,
+                             block ? this : nullptr, d_B_mo);
+    if (d_eri_mo) tracked_cudaFree(d_eri_mo);
 }
 
 } // namespace gansu

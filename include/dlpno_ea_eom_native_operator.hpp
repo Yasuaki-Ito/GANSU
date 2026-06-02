@@ -172,6 +172,12 @@ private:
         real_t* d_t2_Jlmo  = nullptr;
         real_t* d_Lvv      = nullptr;
         real_t* d_Wvvvo_r1 = nullptr;
+        int     wovvo_re_j_extent = 0; ///< 5h: j-dim extent of the d_Wovvo_re slice (nocc full, occ_end-occ_begin slab)
+        int     wovvo_re_j_base   = 0; ///< 5h: j-dim base of the d_Wovvo_re slice (0 full, occ_begin slab)
+        int     t2_jlmo_j_extent  = 0; ///< 5i: j-dim extent of the d_t2_Jlmo slice (nocc full, slab) → GEMV lda = extent·nvir²
+        int     t2_jlmo_j_base    = 0; ///< 5i: j-dim base of the d_t2_Jlmo slice (0 full, occ_begin slab)
+        int     wovov_j_extent    = 0; ///< 5j: j-dim extent of the d_Wovov_lmo slice (nocc full, slab) → GEMM ldB = extent·nvir
+        int     wovov_j_base      = 0; ///< 5j: j-dim base of the d_Wovov_lmo slice (0 full, occ_begin slab)
     };
     std::vector<DeviceWorkspace> ws_;  ///< size = #devices used (ws_[0] aliases device 0)
     std::vector<int> occ_begin_;       ///< [#dev] output-occ slab start per device
@@ -191,6 +197,29 @@ private:
     // slab's n_pno⁴ packs; project_acc_stack reads d_Wvvvv_pno_pack_[wvvvv_pno_off_[j] -
     // wvvvv_pack_shift_]. 0 on device 0 / full / single-GPU. Set per device in bind_device.
     mutable size_t wvvvv_pack_shift_ = 0;
+    // 5h: d_Wovvo_re is sliced on d>0 in slab mode — the j (2nd) axis is restricted to the
+    // device's output-occ slab, ALL l (outermost) kept. The readers (add_tph3 / add_tph1)
+    // index it as (l·wovvo_re_j_extent_ + (j - wovvo_re_j_base_))·nvir². extent = nocc /
+    // base = 0 on device 0 / full / single-GPU (→ the original (l·nocc + j)·nvir²). Set in
+    // the ctor (single-GPU default) and per device in bind_device.
+    mutable int wovvo_re_j_extent_ = 0;
+    mutable int wovvo_re_j_base_   = 0;
+    // 5i: d_t2_Jlmo is sliced on d>0 in slab mode — the j (2nd) axis restricted to the
+    // device's output-occ slab, ALL K (outermost) kept. The add_ttmp stage-2 GEMV reads it
+    // col-major with lda = t2_jlmo_j_extent_·nvir² (the K-axis stride; the FIRST cuBLAS-lda
+    // change of the domain-sparse work) and A_ptr offset (j_lo - t2_jlmo_j_base_)·nvir² (= 0
+    // on the slab device, j_lo·nvir² on full). extent = nocc / base = 0 on device 0 / full /
+    // single-GPU (→ lda = nocc·nvir², the original m2). Set in the ctor + per device in bind_device.
+    mutable int t2_jlmo_j_extent_ = 0;
+    mutable int t2_jlmo_j_base_   = 0;
+    // 5j: d_Wovov_lmo is sliced on d>0 in slab mode — the j (3rd) axis (layout [l,a,j,d],
+    // j stride nvir) restricted to the device's output-occ slab. Because j is deep (not the
+    // 2nd axis), the slice is a HOST repack from h_Wovov_lmo_ + H2D (a device peer copy would
+    // be nocc·nvir tiny strided copies). The readers (add_tph2 / add_tph1 term B) use the
+    // a-axis row-stride ldB = wovov_j_extent_·nvir and base (l·nvir·extent + (j - base))·nvir.
+    // extent = nocc / base = 0 on device 0 / full / single-GPU (→ ldB = nocc·nvir, original).
+    mutable int wovov_j_extent_ = 0;
+    mutable int wovov_j_base_   = 0;
     /// Stage 5c: point the (const_cast) σ2 members at device d's workspace buffers +
     /// cublas handle (NULL stream); bind_device(0) restores the device-0 members.
     void bind_device(int d) const;
@@ -228,6 +257,30 @@ private:
     // GPU-vs-host σ2 diff each matvec (probe-independent gate, ≤1e-11).
     bool use_gpu_ = false;
     bool gpu_selfcheck_ = false;
+    // Per-term apply profiling (env GANSU_DLPNO_NATIVE_PROF=1). Off by default →
+    // zero overhead (no cudaDeviceSynchronize). Run with --num_gpus 1 for a clean
+    // per-matvec breakdown (prof_calls_ = matvec count); printed in the destructor.
+    mutable bool   prof_ = false;
+    mutable long   prof_calls_ = 0;
+    mutable double prof_t_lift_ = 0, prof_t_s1_ = 0, prof_t_loo_ = 0, prof_t_tlvv_ = 0,
+                   prof_t_tr1_ = 0, prof_t_ph2_ = 0, prof_t_ph3_ = 0, prof_t_ph1_ = 0,
+                   prof_t_tmp_ = 0, prof_t_proj_ = 0;
+    void print_profile() const;          ///< dump the accumulated per-term timings (if prof_)
+    /// GPU 4-index congruence: fills dressed_.Wvvvv_pno[j] = U^(jj)ᵀ⊗4 · Wvvvv for every
+    /// occ j, reading the dense Wvvvv straight off the device (4 cublasDgemm[StridedBatched]
+    /// per occ). Replaces the host congruence4 quad-loop (the EA operator-build hotspot).
+    void build_dressed_vvvv_gpu(const real_t* d_Wvvvv);
+    /// Stage F5b on-device ph-ladder rotation: build d_Wovov_lmo_ + d_Wovvo_re_ directly
+    /// from ea_op.get_W{ovov,ovvo}_device() WITHOUT ever materialising the persistent host
+    /// members h_Wovov_lmo_/h_Wovvo_lmo_ or the transient h_Wovvo/h_Wovov pulls /
+    /// h_Wovvo_re transpose. Eliminates the EA-ctor's ~6.4 GB transient host peak at
+    /// anthracene / ~1.4 TB at 100 atoms (F5 only released the persistent footprint after
+    /// ctor; F5b also avoids the transient peak). Chunked over the virtual `a` axis so
+    /// the device intermediate stays ≤ ~16 GB. Identity uloc skips the GEMMs.
+    /// Active ONLY when use_native_bare_ && use_gpu_resident_ && !gpu_selfcheck_
+    /// && num_gpus_ == 1; otherwise the F5 (host-rotation + late-free) path runs.
+    void borrow_ph_to_device_f5b(const real_t* d_Wovvo_canon,
+                                 const real_t* d_Wovov_canon);
     void* cublas_ = nullptr;             ///< cublasHandle_t (opaque; keeps cublas out of this header)
     real_t* d_Wvvvv_pno_pack_ = nullptr; ///< packed per-occ Wvvvv^(jj), n_pno(jj)⁴ back-to-back
     std::vector<size_t> wvvvv_pno_off_;  ///< [nocc+1] prefix offsets (n⁴) into d_Wvvvv_pno_pack_

@@ -17,6 +17,7 @@
 #include "dlpno_ip_eom_native_operator.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -418,8 +419,15 @@ DLPNOIPEOMNativeOperator::DLPNOIPEOMNativeOperator(
         // Wovvo_pno/Wovov_pno come straight from Phase24 (W_ovvo_bare/W_oovv_bare),
         // NO dense nocc²·nvir² Wovvo/Wovov. Otherwise (b1): congruence of the dense
         // already-dressed Wovvo/Wovov borrowed above.
+        // B-a.6f Stage F0: time the BARE ctor builders. The ring builder
+        // (subtract_dense=false) is the suspected ~hours-at-100-atoms host
+        // hotspot; the bare seed is small. Reported by the audit print below.
+        double f0_ms_bare = 0.0, f0_ms_ring = 0.0;
         if (use_native_bare_) {
+            const auto t0_bare = std::chrono::high_resolution_clock::now();
             build_dressed_pno_ip_bare(dressed_, res_, packing_.n_pno, nocc_);
+            f0_ms_bare = std::chrono::duration<double, std::milli>(
+                             std::chrono::high_resolution_clock::now() - t0_bare).count();
             std::cout << "[bt-PNO B-a.6c] DLPNOIPEOMNativeOperator: dense-free ph-ladder "
                          "Wovvo/Wovov^(ij) path ON (Phase24 bare seed + native-only ring, "
                          "NO dense nocc²·nvir²; GANSU_DLPNO_NATIVE_BARE=1)" << std::endl;
@@ -526,10 +534,13 @@ DLPNOIPEOMNativeOperator::DLPNOIPEOMNativeOperator(
                 }
             }
             real_t ring_max_delta = 0.0, ring_max_ref = 0.0;
+            const auto t0_ring = std::chrono::high_resolution_clock::now();
             build_dressed_pno_ip_ring(dressed_, res_, h_ovov_lmo_, h_t2_lmo_, Uall_,
                                       h_S_, packing_.n_pno, nao_, nocc_, nvir_,
                                       ring_max_delta, ring_max_ref,
                                       /*subtract_dense=*/!use_native_bare_);
+            f0_ms_ring = std::chrono::duration<double, std::milli>(
+                             std::chrono::high_resolution_clock::now() - t0_ring).count();
             if (use_native_bare_)
                 std::cout << "[bt-PNO B-a.6c] native ph-ladder ring added (Phase24 "
                              "V_ovov_pair + two-sided barS, NO dense DR): max|native_ring| = "
@@ -543,6 +554,44 @@ DLPNOIPEOMNativeOperator::DLPNOIPEOMNativeOperator(
                           << std::scientific << ring_max_delta
                           << "  (|cong(dense_ring)|_max = " << ring_max_ref
                           << "; →0 at full PNO, else = truncation correction)" << std::endl;
+        }
+
+        // B-a.6f Stage F0 audit: when BARE is on, surface (i) whether the
+        // per-matvec is on the resident GPU fast-path (silent-host detector —
+        // missing sub-flags listed verbatim so they can be copy-pasted), and
+        // (ii) ctor builder wall-clock so the hours-at-100-atoms cost is
+        // observable at small scale before scaling up. Diagnostic-only,
+        // does not change any compute path; default ON when BARE is set.
+        if (use_native_bare_) {
+            std::cout << "[bt-PNO B-a.6f IP BARE-AUDIT]"
+                      << "  use_native_bare_=" << (use_native_bare_ ? 1 : 0)
+                      << "  use_gpu_resident_=" << (use_gpu_resident_ ? 1 : 0)
+                      << std::endl;
+            if (!use_gpu_resident_) {
+                std::cout << "  [WARN] residency OFF → matvec drops to host-Eigen "
+                             "compute_sigma2 (the 60 s/matvec failure mode)." << std::endl;
+                std::cout << "  Missing sub-flags (require =1 with NATIVE_BARE):";
+                if (!use_gpu_)         std::cout << " GANSU_DLPNO_NATIVE_GPU";
+                if (!use_gpu_proj_)    std::cout << " GANSU_DLPNO_NATIVE_GPU_PROJ";
+                if (!use_gpu_lift_)    std::cout << " GANSU_DLPNO_NATIVE_GPU_LIFT";
+                if (!use_gpu_xpair_)   std::cout << " GANSU_DLPNO_NATIVE_GPU_XPAIR";
+                if (!use_gpu_t1_)      std::cout << " GANSU_DLPNO_NATIVE_GPU_T1";
+                if (!use_gpu_t8_)      std::cout << " GANSU_DLPNO_NATIVE_GPU_T8";
+                if (!use_gpu_phl_)     std::cout << " GANSU_DLPNO_NATIVE_GPU_PHL";
+                if (!use_gpu_s1loo_)   std::cout << " GANSU_DLPNO_NATIVE_GPU_S1LOO";
+                if (!use_gpu_s1fov_)   std::cout << " GANSU_DLPNO_NATIVE_GPU_S1FOV";
+                if (!use_gpu_s1wooov_) std::cout << " GANSU_DLPNO_NATIVE_GPU_S1WOOOV";
+                {
+                    const char* e = std::getenv("GANSU_DLPNO_NATIVE_GPU_RESIDENT");
+                    if (!e || e[0] != '1') std::cout << " GANSU_DLPNO_NATIVE_GPU_RESIDENT";
+                }
+                std::cout << std::endl;
+            }
+            std::cout << "  ctor builder wall:  bare seed = " << std::fixed
+                      << std::setprecision(1) << f0_ms_bare << " ms"
+                      << "  ring builder = " << f0_ms_ring << " ms"
+                      << " (subtract_dense=" << (!use_native_bare_ ? "true" : "false") << ")"
+                      << std::defaultfloat << std::endl;
         }
     }
 
@@ -631,23 +680,31 @@ DLPNOIPEOMNativeOperator::DLPNOIPEOMNativeOperator(
                 tracked_cudaMalloc(&d_Woooo_lmo_, no4 * sizeof(real_t));
                 cudaMemcpy(d_Woooo_lmo_, h_Woooo_lmo_.data(), no4 * sizeof(real_t), cudaMemcpyHostToDevice);
             }
-            // Stage 3b T1: pre-transpose Wovoo_lmo[k,a,oi,oj] → Wovoo_re[oi,oj,a,k]
-            // (contiguous [nvir×nocc] per slot (oi,oj)) + the r1 upload scratch.
+            // Stage 3b T1: pre-transpose Wovoo_lmo[k,a,oi,oj] → Wovoo_re[a,k] per slot.
+            // 5g: store it SLOT-PACKED (one nvir·nocc block per orientation slot, in slot
+            // order) instead of the full occ-pair nocc²·nvir·nocc dense tensor. add_t1_gpu
+            // reads it by slot index; the slab-only multi-GPU replicas (d>0) keep just their
+            // contiguous slot subrange. h_Wovoo_lmo_ (occ-pair) stays the build source — the
+            // host T1 path (compute_sigma2) still indexes it directly. Slot s reads occ-pair
+            // (orient_oi_[s], orient_oj_[s]), distinct across slots → no aliasing; mirrors 5f.
             if (use_gpu_t1_) {
                 const int no = nocc_, nv = nvir_;
                 const size_t no2 = static_cast<size_t>(no) * no;
-                const size_t wsz = no2 * nv * no;
+                const size_t blk = static_cast<size_t>(nv) * no;        // per-slot block [a,k]
+                const size_t wsz = static_cast<size_t>(n_orient_) * blk; // slot-packed
                 std::vector<real_t> h_Wovoo_re(wsz, 0.0);
                 #pragma omp parallel for
-                for (int oi = 0; oi < no; ++oi)
-                    for (int oj = 0; oj < no; ++oj)
-                        for (int a = 0; a < nv; ++a)
-                            for (int k = 0; k < no; ++k)
-                                h_Wovoo_re[((static_cast<size_t>(oi) * no + oj) * nv + a) * no + k] =
-                                    h_Wovoo_lmo_[(static_cast<size_t>(k) * nv + a) * no2
-                                                 + static_cast<size_t>(oi) * no + oj];
-                tracked_cudaMalloc(&d_Wovoo_re_, wsz * sizeof(real_t));
-                cudaMemcpy(d_Wovoo_re_, h_Wovoo_re.data(), wsz * sizeof(real_t), cudaMemcpyHostToDevice);
+                for (int s = 0; s < n_orient_; ++s) {
+                    const int oi = orient_oi_[s], oj = orient_oj_[s];
+                    real_t* dst = h_Wovoo_re.data() + static_cast<size_t>(s) * blk;
+                    for (int a = 0; a < nv; ++a)
+                        for (int k = 0; k < no; ++k)
+                            dst[static_cast<size_t>(a) * no + k] =
+                                h_Wovoo_lmo_[(static_cast<size_t>(k) * nv + a) * no2
+                                             + static_cast<size_t>(oi) * no + oj];
+                }
+                tracked_cudaMalloc(&d_Wovoo_slot_, wsz * sizeof(real_t));
+                cudaMemcpy(d_Wovoo_slot_, h_Wovoo_re.data(), wsz * sizeof(real_t), cudaMemcpyHostToDevice);
                 tracked_cudaMalloc(&d_r1_, static_cast<size_t>(no) * sizeof(real_t));
             }
             // Stage 3b T8: Woovv_lmo + t2_lmo to device + the S/tmp_c scratch.
@@ -655,8 +712,28 @@ DLPNOIPEOMNativeOperator::DLPNOIPEOMNativeOperator(
                 const size_t sz = static_cast<size_t>(nocc_) * nocc_ * nvir_ * nvir_;
                 tracked_cudaMalloc(&d_Woovv_lmo_, sz * sizeof(real_t));
                 cudaMemcpy(d_Woovv_lmo_, h_Woovv_lmo_.data(), sz * sizeof(real_t), cudaMemcpyHostToDevice);
-                tracked_cudaMalloc(&d_t2_lmo_, sz * sizeof(real_t));
-                cudaMemcpy(d_t2_lmo_, h_t2_lmo_.data(), sz * sizeof(real_t), cudaMemcpyHostToDevice);
+                // 5f: store t2 SLOT-PACKED (one nvir² block per orientation slot, in slot
+                // order) instead of the full occ-pair nocc²·nvir² dense tensor. add_t8_gpu
+                // reads it by slot index; the slab-only multi-GPU replicas (d>0) keep just
+                // their contiguous slot subrange. h_t2_lmo_ (occ-pair) stays the build source
+                // — the host T8b path (compute_sigma2) still indexes it directly. Slot s
+                // reads occ-pair (orient_oi_[s], orient_oj_[s]), distinct across slots, so
+                // the gather has no aliasing; n_orient·nvir² ≤ nocc²·nvir² (= the reduction).
+                {
+                    const size_t nv2 = static_cast<size_t>(nvir_) * nvir_;
+                    const size_t t2_slot_len = static_cast<size_t>(n_orient_) * nv2;
+                    std::vector<real_t> h_t2_slot(t2_slot_len);
+                    #pragma omp parallel for
+                    for (int s = 0; s < n_orient_; ++s) {
+                        const size_t src =
+                            (static_cast<size_t>(orient_oi_[s]) * nocc_ + orient_oj_[s]) * nv2;
+                        std::copy(h_t2_lmo_.begin() + src, h_t2_lmo_.begin() + src + nv2,
+                                  h_t2_slot.begin() + static_cast<size_t>(s) * nv2);
+                    }
+                    tracked_cudaMalloc(&d_t2_slot_, t2_slot_len * sizeof(real_t));
+                    cudaMemcpy(d_t2_slot_, h_t2_slot.data(),
+                               t2_slot_len * sizeof(real_t), cudaMemcpyHostToDevice);
+                }
                 tracked_cudaMalloc(&d_S_, static_cast<size_t>(nocc_) * nocc_ * nvir_ * sizeof(real_t));
                 tracked_cudaMalloc(&d_tmp_c_, static_cast<size_t>(nvir_) * sizeof(real_t));
             }
@@ -669,12 +746,26 @@ DLPNOIPEOMNativeOperator::DLPNOIPEOMNativeOperator(
                     wovvo_off_[idx + 1] = wovvo_off_[idx] + static_cast<size_t>(nocc_) * n * n;
                 }
                 const size_t wtot = wovvo_off_[n_pairs];
+                // Pre-transpose each m-block [a][d] → [d][a] so the per-pair block becomes
+                // the col-major matrix Wre[a, (m·n+d)] ([n × nocc·n]). add_phl_gpu then
+                // contracts the whole (m,d) index in ONE GEMV per term (drops the per-m
+                // tiny n×n GEMV loop = ~nocc× fewer launches; this is the IP-solve hotspot).
+                // Mirrors the S1WOOOV Wooov_re repack below.
                 auto pack_W = [&](real_t** dptr, const std::vector<std::vector<real_t>>& src) {
                     tracked_cudaMalloc(dptr, wtot * sizeof(real_t));
                     for (int idx = 0; idx < n_pairs; ++idx) {
                         const size_t sz = wovvo_off_[idx + 1] - wovvo_off_[idx];
                         if (sz == 0) continue;
-                        cudaMemcpy(*dptr + wovvo_off_[idx], src[idx].data(), sz * sizeof(real_t),
+                        const int n = packing_.n_pno[idx];
+                        std::vector<real_t> h_re(sz);
+                        const real_t* s = src[idx].data();   // [m][a][d], offset m·n²+a·n+d
+                        #pragma omp parallel for
+                        for (int m = 0; m < nocc_; ++m)
+                            for (int a = 0; a < n; ++a)
+                                for (int d = 0; d < n; ++d)
+                                    h_re[(static_cast<size_t>(m) * n + d) * n + a] =
+                                        s[(static_cast<size_t>(m) * n + a) * n + d];
+                        cudaMemcpy(*dptr + wovvo_off_[idx], h_re.data(), sz * sizeof(real_t),
                                    cudaMemcpyHostToDevice);
                     }
                 };
@@ -773,8 +864,9 @@ DLPNOIPEOMNativeOperator::DLPNOIPEOMNativeOperator(
                 const size_t s_len    = static_cast<size_t>(nocc_) * nocc_ * nvir_;
                 const size_t no2      = static_cast<size_t>(nocc_) * nocc_;
                 const size_t no4      = no2 * no2;
-                const size_t wovoo_len= no2 * nvir_ * nocc_;
                 const size_t oovv_len = no2 * static_cast<size_t>(nvir_) * nvir_;
+                const size_t t2_slot_len = static_cast<size_t>(n_orient_) * nvir_ * nvir_;  // 5f
+                const size_t wovoo_slot_len = static_cast<size_t>(n_orient_) * nvir_ * nocc_;  // 5g
                 const size_t rpsz     = static_cast<size_t>(nocc_) * max_n_pno_;
                 const size_t utot     = u_pno_off_.empty()   ? 0 : u_pno_off_.back();
                 const size_t lvv_tot  = lvv_pno_off_.empty() ? 0 : lvv_pno_off_.back();
@@ -802,8 +894,10 @@ DLPNOIPEOMNativeOperator::DLPNOIPEOMNativeOperator(
                 ws_[0].d_acc_all = d_acc_all_;  ws_[0].d_sig_pack = d_sig_pack_;
                 ws_[0].d_U_pack = d_U_pack_;    ws_[0].d_Lvv_pno_pack = d_Lvv_pno_pack_;
                 ws_[0].d_Loo_lmo = d_Loo_lmo_;  ws_[0].d_Woooo_lmo = d_Woooo_lmo_;
-                ws_[0].d_Wovoo_re = d_Wovoo_re_; ws_[0].d_Woovv_lmo = d_Woovv_lmo_;
-                ws_[0].d_t2_lmo = d_t2_lmo_;    ws_[0].d_S = d_S_;  ws_[0].d_tmp_c = d_tmp_c_;
+                ws_[0].d_Wovoo_slot = d_Wovoo_slot_; ws_[0].d_Woovv_lmo = d_Woovv_lmo_;
+                ws_[0].d_t2_slot = d_t2_slot_;  ws_[0].d_S = d_S_;  ws_[0].d_tmp_c = d_tmp_c_;
+                ws_[0].t2_shift = 0;            // device 0 holds the full slot-packed t2
+                ws_[0].wovoo_t1_shift = 0;      // device 0 holds the full slot-packed Wovoo
                 ws_[0].d_Wovvo_occi = d_Wovvo_occi_; ws_[0].d_Wovvo_occj = d_Wovvo_occj_;
                 ws_[0].d_Wovov_occi = d_Wovov_occi_; ws_[0].d_Wovov_occj = d_Wovov_occj_;
                 ws_[0].d_RP_oim = d_RP_oim_;    ws_[0].d_RP_moi = d_RP_moi_; ws_[0].d_RP_moj = d_RP_moj_;
@@ -832,9 +926,38 @@ DLPNOIPEOMNativeOperator::DLPNOIPEOMNativeOperator(
                     cpy(&w.d_U_pack, d_U_pack_, utot);
                     cpy(&w.d_Loo_lmo, d_Loo_lmo_, no2);
                     cpy(&w.d_Woooo_lmo, d_Woooo_lmo_, no4);
-                    cpy(&w.d_Wovoo_re, d_Wovoo_re_, wovoo_len);
-                    cpy(&w.d_Woovv_lmo, d_Woovv_lmo_, oovv_len);
-                    cpy(&w.d_t2_lmo, d_t2_lmo_, oovv_len);
+                    // 5g: slot-packed Wovoo — slab-only subrange in slab mode (uniform
+                    // nvir·nocc stride; contiguous slot range → contiguous byte subrange),
+                    // else full replica. add_t1_gpu subtracts wovoo_slot_shift_. Mirrors 5f.
+                    if (use_gpu_multi_slab_ && slot_end_[d] > slot_begin_[d]) {
+                        const size_t wblk = static_cast<size_t>(nvir_) * nocc_;
+                        const size_t wlo = static_cast<size_t>(slot_begin_[d]) * wblk;
+                        const size_t whi = static_cast<size_t>(slot_end_[d])   * wblk;
+                        w.wovoo_t1_shift = wlo;
+                        cpy_slab(&w.d_Wovoo_slot, d_Wovoo_slot_, wlo, whi);
+                    } else {
+                        w.wovoo_t1_shift = 0;
+                        cpy(&w.d_Wovoo_slot, d_Wovoo_slot_, wovoo_slot_len);
+                    }
+                    // 5k: Woovv_lmo (nocc²·nvir²) is NOT replicated on d>0. It only feeds the
+                    // GLOBAL tmp_c reduction (add_t8 T8a), which is output-slab-independent;
+                    // device 0 computes the full tmp_c and broadcasts it (peer copy) before the
+                    // d>0 projections. Leaving w.d_Woovv_lmo null makes add_t8 skip its stage1.
+                    // (largest remaining per-d>0 array dropped → the (B) memory win.)
+                    // 5f: slot-packed t2 — slab-only subrange in slab mode (uniform nvir²
+                    // stride; the slab's slots [slot_begin,slot_end) are a contiguous slot
+                    // range, so [slot_begin·nv², slot_end·nv²) is a contiguous subrange of
+                    // the full slot-pack), else full replica. add_t8_gpu subtracts t2_shift.
+                    if (use_gpu_multi_slab_ && slot_end_[d] > slot_begin_[d]) {
+                        const size_t nv2 = static_cast<size_t>(nvir_) * nvir_;
+                        const size_t t2lo = static_cast<size_t>(slot_begin_[d]) * nv2;
+                        const size_t t2hi = static_cast<size_t>(slot_end_[d])   * nv2;
+                        w.t2_shift = t2lo;
+                        cpy_slab(&w.d_t2_slot, d_t2_slot_, t2lo, t2hi);
+                    } else {
+                        w.t2_shift = 0;
+                        cpy(&w.d_t2_slot, d_t2_slot_, t2_slot_len);
+                    }
                     // 5e: Lvv_pno + ph-ladder packs slab-only in slab mode. The slab's
                     // pairs form a contiguous idx range [orient_idx_[slot_begin],
                     // orient_idx_[slot_end-1]] (orient slots are in idx order), so the
@@ -891,10 +1014,10 @@ DLPNOIPEOMNativeOperator::~DLPNOIPEOMNativeOperator() {
     if (d_r2c_all_)      tracked_cudaFree(d_r2c_all_);
     if (d_Loo_lmo_)      tracked_cudaFree(d_Loo_lmo_);
     if (d_Woooo_lmo_)    tracked_cudaFree(d_Woooo_lmo_);
-    if (d_Wovoo_re_)     tracked_cudaFree(d_Wovoo_re_);
+    if (d_Wovoo_slot_)   tracked_cudaFree(d_Wovoo_slot_);
     if (d_r1_)           tracked_cudaFree(d_r1_);
     if (d_Woovv_lmo_)    tracked_cudaFree(d_Woovv_lmo_);
-    if (d_t2_lmo_)       tracked_cudaFree(d_t2_lmo_);
+    if (d_t2_slot_)      tracked_cudaFree(d_t2_slot_);
     if (d_S_)            tracked_cudaFree(d_S_);
     if (d_tmp_c_)        tracked_cudaFree(d_tmp_c_);
     if (d_Wovvo_occi_)   tracked_cudaFree(d_Wovvo_occi_);
@@ -915,8 +1038,8 @@ DLPNOIPEOMNativeOperator::~DLPNOIPEOMNativeOperator() {
         if (w.device <= 0) continue;
         MultiGpuManager::DeviceGuard guard(w.device);
         for (real_t* p : {w.d_input, w.d_r2c_all, w.d_acc_all, w.d_sig_pack, w.d_U_pack,
-                          w.d_Lvv_pno_pack, w.d_Loo_lmo, w.d_Woooo_lmo, w.d_Wovoo_re,
-                          w.d_Woovv_lmo, w.d_t2_lmo, w.d_S, w.d_tmp_c,
+                          w.d_Lvv_pno_pack, w.d_Loo_lmo, w.d_Woooo_lmo, w.d_Wovoo_slot,
+                          w.d_Woovv_lmo, w.d_t2_slot, w.d_S, w.d_tmp_c,
                           w.d_Wovvo_occi, w.d_Wovvo_occj, w.d_Wovov_occi, w.d_Wovov_occj,
                           w.d_RP_oim, w.d_RP_moi, w.d_RP_moj})
             if (p) tracked_cudaFree(p);
@@ -1465,12 +1588,13 @@ void DLPNOIPEOMNativeOperator::add_t1_gpu(const std::vector<real_t>& r1) const {
     const real_t* r1src = resident_ ? d_r1_src_ : d_r1_;   // r1 device source
     const real_t neg_one = -1.0, one = 1.0;
     const int nv = nvir_, no = nocc_;
+    // 5g: Wovoo is slot-packed (block s at s·nv·no); the slab replica subtracts
+    // wovoo_slot_shift_ (= slot_begin·nv·no; 0 on device 0 / full / single-GPU).
     const int s_lo = slab_active_ ? cur_slot_begin_ : 0;        // Stage 5c-step2 slab
     const int s_hi = slab_active_ ? cur_slot_end_   : n_orient_;
     for (int s = s_lo; s < s_hi; ++s) {
-        const int oi = orient_oi_[s], oj = orient_oj_[s];
         cublasDgemv(cublas, CUBLAS_OP_T, no, nv, &neg_one,
-                    d_Wovoo_re_ + (static_cast<size_t>(oi) * no + oj) * nv * no, no,
+                    d_Wovoo_slot_ + (static_cast<size_t>(s) * nv * no - wovoo_slot_shift_), no,
                     r1src, 1, &one, d_acc_all_ + static_cast<size_t>(s) * nv, 1);
     }
 #endif
@@ -1484,20 +1608,27 @@ void DLPNOIPEOMNativeOperator::add_t8_gpu() const {
     cublasHandle_t cublas = reinterpret_cast<cublasHandle_t>(cublas_);
     const real_t one = 1.0, zero = 0.0, neg_one = -1.0;
     const int nv = nvir_, no = nocc_;
-    // T8a stage 1: S kernel.
-    const int M = no * no * nv;
-    const int threads = 256, blocks = (M + threads - 1) / threads;
-    dlpno_ip_native_r2c_sym_kernel<<<blocks, threads>>>(d_r2c_all_, d_S_, no, nv);
-    // T8a stage 2: tmp_c[c] = Σ_m Woovv[m,c] S[m]  (Woovv row-major [M×nvir] → col-major [nvir×M]).
-    cublasDgemv(cublas, CUBLAS_OP_N, nv, M, &one, d_Woovv_lmo_, nv, d_S_, 1, &zero, d_tmp_c_, 1);
-    // T8b: per slot acc -= Σ_c tmp_c[c] t2_lmo[oi,oj,c,a]  (t2 block [c,a] row-major, OP_N → a).
+    // T8a (global tmp_c reduction): computed only where Woovv_lmo is resident — device 0 /
+    // single-GPU. 5k: on the multi d>0 devices Woovv_lmo (nocc²·nvir²) is NOT replicated;
+    // d_tmp_c_ already holds device 0's broadcast global tmp_c (peer-copied in apply_resident
+    // before the d>0 projections). The broadcast is bit-identical (device 0's r2c_all matches
+    // every device's), so this stays bit-exact — no reduction reorder.
+    if (d_Woovv_lmo_ != nullptr) {
+        const int M = no * no * nv;
+        const int threads = 256, blocks = (M + threads - 1) / threads;
+        dlpno_ip_native_r2c_sym_kernel<<<blocks, threads>>>(d_r2c_all_, d_S_, no, nv);
+        // tmp_c[c] = Σ_m Woovv[m,c] S[m]  (Woovv row-major [M×nvir] → col-major [nvir×M]).
+        cublasDgemv(cublas, CUBLAS_OP_N, nv, M, &one, d_Woovv_lmo_, nv, d_S_, 1, &zero, d_tmp_c_, 1);
+    }
+    // T8b: per slot acc -= Σ_c tmp_c[c] t2_slot[s][c,a]  (t2 block [c,a] row-major, OP_N → a).
     // (T8a tmp_c above is a global reduction → stays full on every device.)
+    // 5f: t2 is slot-packed (block s at s·nv²); the slab replica subtracts t2_slot_shift_
+    // (= slot_begin·nv²; 0 on device 0 / full / single-GPU).
     const int s_lo = slab_active_ ? cur_slot_begin_ : 0;        // Stage 5c-step2 slab
     const int s_hi = slab_active_ ? cur_slot_end_   : n_orient_;
     for (int s = s_lo; s < s_hi; ++s) {
-        const int oi = orient_oi_[s], oj = orient_oj_[s];
         cublasDgemv(cublas, CUBLAS_OP_N, nv, nv, &neg_one,
-                    d_t2_lmo_ + (static_cast<size_t>(oi) * no + oj) * nv * nv, nv,
+                    d_t2_slot_ + (static_cast<size_t>(s) * nv * nv - t2_slot_shift_), nv,
                     d_tmp_c_, 1, &one, d_acc_all_ + static_cast<size_t>(s) * nv, 1);
     }
 #endif
@@ -1507,9 +1638,13 @@ void DLPNOIPEOMNativeOperator::add_t8_gpu() const {
 // (after the projection writes proj+T2). Per orientation slot (oi,oj) with (i,j)=
 // setups[idx] and PNO dim n: the one-sided barS projections RP_*[nocc×n] = R_*·U^(ij)
 // are formed by 3 GEMMs (row-major C trick: C[nocc×n]=R[nocc×nvir]·U[nvir×n]; R_oi
-// contiguous ld=nvir, R_moi/R_moj strided ld=nocc·nvir), then per m four GEMVs (W·rp,
-// OP_T) accumulate into σ2:  +2·W6·rp_oim  -W6·rp_moi  -W7oj·rp_oim  -W7oi·rp_moj.
-// W role select W6/W7oj on (oj==j), W7oi on (oi==j). Verified by index trace vs host.
+// contiguous ld=nvir, R_moi/R_moj strided ld=nocc·nvir), then FOUR GEMVs (one per term,
+// each contracting the whole flattened (m,d) index of length nocc·n) accumulate into σ2:
+//   +2·W6·rp_oim  -W6·rp_moi  -W7oj·rp_oim  -W7oi·rp_moj.
+// The per-m tiny n×n GEMV loop is gone — the W blocks are pre-transposed to col-major
+// [n × nocc·n] in pack_W so the m-sum folds into the single GEMV (the IP-solve hotspot:
+// 4·nocc·n_orient → 4·n_orient launches). W role select W6/W7oj on (oj==j), W7oi on
+// (oi==j). Verified by index trace vs host + the ≤1e-11 ph-ladder GPU self-check.
 void DLPNOIPEOMNativeOperator::add_phl_gpu() const {
 #ifndef GANSU_CPU_ONLY
     cublasHandle_t cublas = reinterpret_cast<cublasHandle_t>(cublas_);
@@ -1535,19 +1670,16 @@ void DLPNOIPEOMNativeOperator::add_phl_gpu() const {
         cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, no, nv, &one,
                     U, n, d_r2c_all_ + static_cast<size_t>(oj) * nv, no * nv, &zero, d_RP_moj_, n);
         real_t* sig = d_sig_pack_ + orient_off_[s];
-        for (int m = 0; m < no; ++m) {
-            const real_t* Wm6   = W6   + static_cast<size_t>(m) * n * n;
-            const real_t* Wm7oj = W7oj + static_cast<size_t>(m) * n * n;
-            const real_t* Wm7oi = W7oi + static_cast<size_t>(m) * n * n;
-            const real_t* rp_oim = d_RP_oim_ + static_cast<size_t>(m) * n;
-            const real_t* rp_moi = d_RP_moi_ + static_cast<size_t>(m) * n;
-            const real_t* rp_moj = d_RP_moj_ + static_cast<size_t>(m) * n;
-            // W·rp via OP_T (W row-major [ap×dp] → col-major [dp×ap]; OP_T → Σ_dp W[ap,dp] rp[dp]).
-            cublasDgemv(cublas, CUBLAS_OP_T, n, n, &two,     Wm6,   n, rp_oim, 1, &one, sig, 1);  // +2 W6·rp_oim
-            cublasDgemv(cublas, CUBLAS_OP_T, n, n, &neg_one, Wm6,   n, rp_moi, 1, &one, sig, 1);  // -W6·rp_moi
-            cublasDgemv(cublas, CUBLAS_OP_T, n, n, &neg_one, Wm7oj, n, rp_oim, 1, &one, sig, 1);  // -W7oj·rp_oim
-            cublasDgemv(cublas, CUBLAS_OP_T, n, n, &neg_one, Wm7oi, n, rp_moj, 1, &one, sig, 1);  // -W7oi·rp_moj
-        }
+        // The W blocks are pre-transposed in pack_W to col-major [n × (nocc·n)] (column
+        // c = m·n+d). d_RP_*_ is col-major [n × nocc] = the flat (m,d) vector with the
+        // SAME index m·n+d, so each term is ONE GEMV over the whole (m,d) index (OP_N →
+        // sig[a] += Σ_{m,d} W[a, m·n+d] rp[m·n+d] = Σ_{m,d} W6[m,a,d] rp[m,d], the old
+        // per-m sum). Replaces 4·nocc tiny n×n GEMVs/slot with 4 GEMVs/slot.
+        const int mn = no * n;   // flattened (m,d) length for this slot's PNO dim n
+        cublasDgemv(cublas, CUBLAS_OP_N, n, mn, &two,     W6,   n, d_RP_oim_, 1, &one, sig, 1);  // +2 W6·rp_oim
+        cublasDgemv(cublas, CUBLAS_OP_N, n, mn, &neg_one, W6,   n, d_RP_moi_, 1, &one, sig, 1);  // -W6·rp_moi
+        cublasDgemv(cublas, CUBLAS_OP_N, n, mn, &neg_one, W7oj, n, d_RP_oim_, 1, &one, sig, 1);  // -W7oj·rp_oim
+        cublasDgemv(cublas, CUBLAS_OP_N, n, mn, &neg_one, W7oi, n, d_RP_moj_, 1, &one, sig, 1);  // -W7oi·rp_moj
     }
 #endif
 }
@@ -1616,9 +1748,9 @@ void DLPNOIPEOMNativeOperator::bind_device(int d) const {
     s->d_Lvv_pno_pack_ = w.d_Lvv_pno_pack;
     s->d_Loo_lmo_      = w.d_Loo_lmo;
     s->d_Woooo_lmo_    = w.d_Woooo_lmo;
-    s->d_Wovoo_re_     = w.d_Wovoo_re;
+    s->d_Wovoo_slot_   = w.d_Wovoo_slot;
     s->d_Woovv_lmo_    = w.d_Woovv_lmo;
-    s->d_t2_lmo_       = w.d_t2_lmo;
+    s->d_t2_slot_      = w.d_t2_slot;
     s->d_S_            = w.d_S;
     s->d_tmp_c_        = w.d_tmp_c;
     s->d_Wovvo_occi_   = w.d_Wovvo_occi;
@@ -1630,6 +1762,8 @@ void DLPNOIPEOMNativeOperator::bind_device(int d) const {
     s->d_RP_moj_       = w.d_RP_moj;
     lvv_pack_shift_    = w.lvv_shift;        // 5e: slab-only Lvv_pno / ph-ladder pack offsets
     wovvo_pack_shift_  = w.wovvo_shift;
+    t2_slot_shift_     = w.t2_shift;         // 5f: slab-only slot-packed t2 offset
+    wovoo_slot_shift_  = w.wovoo_t1_shift;   // 5g: slab-only slot-packed Wovoo offset
 #else
     (void)d;
 #endif
@@ -1667,6 +1801,17 @@ void DLPNOIPEOMNativeOperator::apply_resident(const real_t* d_input, real_t* d_o
             lift_r2c_gpu(unused, unused);
             add_sigma1_gpu(unused, unused);          // σ1 ignores slab_active_ (full)
             apply_projection_gpu(unused, unused, unused, unused);
+        }
+        // 5k: device 0 (which holds the full Woovv_lmo) just computed the GLOBAL tmp_c in its
+        // add_t8 T8a; broadcast it to every d>0 (which keep NO Woovv_lmo and skip that stage).
+        // Sync device 0 first so tmp_c is materialized; tmp_c is tiny ([nvir]). Bit-identical
+        // across devices (same broadcast input + U) → the gathered σ stays bit-exact.
+        { MultiGpuManager::DeviceGuard guard(0); cudaDeviceSynchronize(); }
+        for (int d = 1; d < static_cast<int>(ws_.size()); ++d) {
+            if (ws_[d].d_Woovv_lmo) continue;        // d>0 has its own (non-5k) — no broadcast
+            MultiGpuManager::DeviceGuard guard(d);
+            cudaMemcpyPeer(ws_[d].d_tmp_c, d, ws_[0].d_tmp_c, 0,
+                           static_cast<size_t>(nvir_) * sizeof(real_t));
         }
         // Devices d>0: broadcast input, lift (full), then σ2 (slab when step2). The
         // broadcast is async on device d's null stream (ordered before the lift, which
@@ -1773,9 +1918,31 @@ void DLPNOIPEOMNativeOperator::apply_resident(const real_t* d_input, real_t* d_o
 }
 
 void DLPNOIPEOMNativeOperator::apply(const real_t* d_input, real_t* d_output) const {
+    // Progress logging — opt-in.  Davidson already prints per-iteration
+    // eigenvalues + max|r| which is the convergence signal users want; the
+    // per-matvec line is debugging-only (~300 lines/run) and noise-floor for
+    // the production view.  Default OFF; set GANSU_EOM_PROGRESS=1 to enable.
+    static thread_local int  ip_call_count = 0;
+    static thread_local double ip_total_s = 0.0;
+    const char* env_eom_prog = std::getenv("GANSU_EOM_PROGRESS");
+    const bool ip_progress = env_eom_prog && env_eom_prog[0] == '1';
+    const auto ip_t0 = std::chrono::high_resolution_clock::now();
+
     // B-a.6a Stage 4: full-residency device-only path (no host round-trip) when the
     // complete GPU term set is on. The host-assisted paths below are byte-unchanged.
-    if (use_gpu_resident_) { apply_resident(d_input, d_output); return; }
+    if (use_gpu_resident_) {
+        apply_resident(d_input, d_output);
+        if (ip_progress) {
+            ++ip_call_count;
+            const double dt = std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - ip_t0).count();
+            ip_total_s += dt;
+            std::cout << "  [IP-EOM native matvec #" << ip_call_count
+                      << "] last=" << std::fixed << std::setprecision(2) << dt
+                      << "s  total=" << ip_total_s << "s  (resident)" << std::endl;
+        }
+        return;
+    }
 
     // D2H packed input → [r1 (canonical, nocc) | packed_r2].
     std::vector<real_t> h_in(static_cast<size_t>(total_dim_));
@@ -1883,6 +2050,16 @@ void DLPNOIPEOMNativeOperator::apply(const real_t* d_input, real_t* d_output) co
                 packed_sigma2.size() * sizeof(real_t));
     cudaMemcpy(d_output, h_out.data(),
                static_cast<size_t>(total_dim_) * sizeof(real_t), cudaMemcpyHostToDevice);
+
+    if (ip_progress) {
+        ++ip_call_count;
+        const double dt = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - ip_t0).count();
+        ip_total_s += dt;
+        std::cout << "  [IP-EOM native matvec #" << ip_call_count
+                  << "] last=" << std::fixed << std::setprecision(2) << dt
+                  << "s  total=" << ip_total_s << "s  (host)" << std::endl;
+    }
 }
 
 void DLPNOIPEOMNativeOperator::apply_preconditioner(const real_t* d_input, real_t* d_output) const {
