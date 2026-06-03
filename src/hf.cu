@@ -446,11 +446,9 @@ void HF::compute_core_hamiltonian_matrix() {
         // after.  Internal cart temp buffers are sized to num_basis_cart_, then
         // spherical_transform.hpp reduces them to num_basis (= sph count) and we
         // copy the result into overlap_matrix / core_hamiltonian_matrix which
-        // were allocated at sph size in the constructor.
-        if (has_ecp_) {
-            THROW_EXCEPTION("Phase 1 spherical basis does not yet support ECP "
-                            "(set use_spherical=0 or remove --ecp_filename).");
-        }
+        // were allocated at sph size in the constructor.  The ECP contribution
+        // (also Cartesian) is added to H in the Cartesian basis before the
+        // Cart→Sph transform (see below).
         const int nbf_cart = num_basis_cart_;
         const int nbf_sph  = num_basis;
 
@@ -467,6 +465,25 @@ void HF::compute_core_hamiltonian_matrix() {
 
         S_cart_tmp.toHost();
         H_cart_tmp.toHost();
+
+        // Add the ECP contribution in the Cartesian basis (V_ECP is built from
+        // the Cartesian primitive shells, sized nbf_cart), then the Cart→Sph
+        // transform below carries it into the spherical core Hamiltonian.
+        if (has_ecp_) {
+            primitive_shells.toHost();
+            cgto_normalization_factors.toHost();
+            atoms.toHost();
+            std::vector<double> V_ecp((size_t)nbf_cart * nbf_cart, 0.0);
+            ecp_integral::compute_ecp_matrix(
+                primitive_shells.host_ptr(), primitive_shells.size(),
+                cgto_normalization_factors.host_ptr(),
+                nbf_cart,
+                atoms.host_ptr(), atoms.size(),
+                ecp_data_,
+                V_ecp.data());
+            for (size_t i = 0; i < (size_t)nbf_cart * nbf_cart; i++)
+                H_cart_tmp.host_ptr()[i] += V_ecp[i];
+        }
 
         std::vector<real_t> S_sph_host((size_t)nbf_sph * nbf_sph);
         std::vector<real_t> H_sph_host((size_t)nbf_sph * nbf_sph);

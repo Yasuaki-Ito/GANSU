@@ -383,11 +383,8 @@ void RHF::guess_initial_fock_matrix(const real_t* density_matrix_a, const real_t
         // Cartesian and transforms it Cart→Sph (Phase 3c, see guess()).
         initial_guess = std::make_unique<InitialGuess_RHF_SAD>(*this);
     }else if(initial_guess_method_ == "minao"){ // MINAO (Minimal ANO) projection
-        // MINAO projects a minimal ANO basis (Cartesian) onto the AO basis; the
-        // spherical Cart→Sph of that projection is not yet implemented — guard.
-        if(get_use_spherical())
-            THROW_EXCEPTION("MINAO initial guess does not yet support spherical basis "
-                "(--use_spherical 1). Use --initial_guess sad or core (default).");
+        // MINAO projects a minimal ANO basis onto the AO basis; under spherical
+        // basis the cross-overlap's calc axis is transformed Cart→Sph in guess().
         initial_guess = std::make_unique<InitialGuess_RHF_MINAO>(*this);
     }else{
         throw std::runtime_error("Invalid initial guess method: " + initial_guess_method_);
@@ -540,12 +537,13 @@ void RHF::export_density_matrix(real_t* density_matrix_a, real_t* density_martix
 std::vector<double> RHF::compute_Energy_Hessian() {
     PROFILE_FUNCTION();
 
-    // Spherical basis: the skeleton-Hessian AO second-derivative integrals are
-    // built in Cartesian and contracted with Spherical density/coefficients
-    // (no Cart→Sph transform). Fail loudly (Phase 3 follow-up).
-    if (get_use_spherical())
-        THROW_EXCEPTION("Analytical Hessian does not yet support spherical basis "
-            "(--use_spherical 1). Run in Cartesian (omit --use_spherical).");
+    // Spherical basis: the analytical skeleton Hessian below differentiates the
+    // Cartesian Gaussian integrals, so it must contract the Cartesian-expressed
+    // D / C / ε (back-transform, exactly like the stored gradient). The CPHF
+    // response part is computed from the spherical Fock/overlap derivatives
+    // (finite difference through the spherical SCF) and spherical MO ERIs, so it
+    // runs natively in the spherical active basis without any back-transform.
+    const bool hess_sph = get_use_spherical();
 
     int num_atoms_val = static_cast<int>(atoms.size());
     int ndim = 3 * num_atoms_val;
@@ -560,21 +558,66 @@ std::vector<double> RHF::compute_Energy_Hessian() {
 
     // --- Skeleton Hessian ---
     if (verbose) std::cout << "  Computing skeleton Hessian..." << std::endl;
-    auto skel_hessian = gpu::computeSkeletonHessian_RHF(
-        shell_type_infos,
-        shell_pair_type_infos,
-        atoms.device_ptr(),
-        density_matrix.device_ptr(),
-        coefficient_matrix.device_ptr(),
-        orbital_energies.device_ptr(),
-        primitive_shells.device_ptr(),
-        boys_grid.device_ptr(),
-        cgto_normalization_factors.device_ptr(),
-        static_cast<int>(atoms.size()),
-        num_basis,
-        num_electrons,
-        verbose
-    );
+    std::vector<double> skel_hessian;
+    if (hess_sph) {
+        // === Spherical skeleton Hessian via Cartesian back-transform ===
+        const int nc = get_num_basis_cart();
+        const int ns = num_basis;
+        const size_t nc2 = (size_t)nc * nc;
+        const auto& sht  = get_shell_types();
+        const auto& offc = get_shell_offsets_cart();
+        const auto& offs = get_shell_offsets_sph();
+
+        real_t *d_D_cart=nullptr, *d_C_pack=nullptr, *d_C_cart=nullptr, *d_eps_cart=nullptr;
+        gansu::tracked_cudaMalloc(&d_D_cart,  nc2 * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_C_pack,  (size_t)nc * ns * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_C_cart,  nc2 * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_eps_cart, (size_t)nc * sizeof(real_t));
+
+        // D_cart = Uᵀ D_sph U ;  C_pack[nc × ns] = Uᵀ C_sph
+        spherical::transform_matrix_sph_to_cart_device(
+            density_matrix.device_ptr(), d_D_cart, sht, offc, offs);
+        spherical::transform_coeff_sph_to_cart_device(
+            coefficient_matrix.device_ptr(), d_C_pack, ns, sht, offc, offs);
+
+        // Pad C to [nc × nc] (extra MO columns 0) and ε to [nc] (extra 0). Only
+        // occupied MOs (< ns) enter the skeleton Hessian, so padding is inert.
+        cudaMemset(d_C_cart, 0, nc2 * sizeof(real_t));
+        cudaMemcpy2D(d_C_cart, (size_t)nc * sizeof(real_t),
+                     d_C_pack, (size_t)ns * sizeof(real_t),
+                     (size_t)ns * sizeof(real_t), (size_t)nc, cudaMemcpyDeviceToDevice);
+        cudaMemset(d_eps_cart, 0, (size_t)nc * sizeof(real_t));
+        cudaMemcpy(d_eps_cart, orbital_energies.device_ptr(),
+                   (size_t)ns * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+        skel_hessian = gpu::computeSkeletonHessian_RHF(
+            shell_type_infos, shell_pair_type_infos, atoms.device_ptr(),
+            d_D_cart, d_C_cart, d_eps_cart,
+            primitive_shells.device_ptr(), boys_grid.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
+            static_cast<int>(atoms.size()), nc, num_electrons, verbose);
+
+        gansu::tracked_cudaFree(d_D_cart);
+        gansu::tracked_cudaFree(d_C_pack);
+        gansu::tracked_cudaFree(d_C_cart);
+        gansu::tracked_cudaFree(d_eps_cart);
+    } else {
+        skel_hessian = gpu::computeSkeletonHessian_RHF(
+            shell_type_infos,
+            shell_pair_type_infos,
+            atoms.device_ptr(),
+            density_matrix.device_ptr(),
+            coefficient_matrix.device_ptr(),
+            orbital_energies.device_ptr(),
+            primitive_shells.device_ptr(),
+            boys_grid.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
+            static_cast<int>(atoms.size()),
+            num_basis,
+            num_electrons,
+            verbose
+        );
+    }
 
     // --- CPHF Response Hessian ---
     if (verbose) std::cout << "  Computing CPHF response Hessian..." << std::endl;
@@ -1060,14 +1103,32 @@ std::vector<double> RHF::compute_Energy_Gradient() {
         cgto_normalization_factors.toHost();
         atoms.toHost();
 
-        ecp_integral::compute_ecp_gradient(
-            primitive_shells.host_ptr(), primitive_shells.size(),
-            cgto_normalization_factors.host_ptr(),
-            num_basis,
-            atoms.host_ptr(), atoms.size(),
-            ecp_data_,
-            density_matrix.host_ptr(),
-            gradient.data());
+        if (get_use_spherical()) {
+            // ECP integral derivatives are built in the Cartesian primitive
+            // basis, so contract them with the Cartesian density D_cart = Uᵀ D_sph U.
+            const int nc = get_num_basis_cart();
+            std::vector<real_t> D_cart((size_t)nc * nc);
+            spherical::transform_matrix_sph_to_cart(
+                density_matrix.host_ptr(), D_cart.data(),
+                get_shell_types(), get_shell_offsets_cart(), get_shell_offsets_sph());
+            ecp_integral::compute_ecp_gradient(
+                primitive_shells.host_ptr(), primitive_shells.size(),
+                cgto_normalization_factors.host_ptr(),
+                nc,
+                atoms.host_ptr(), atoms.size(),
+                ecp_data_,
+                D_cart.data(),
+                gradient.data());
+        } else {
+            ecp_integral::compute_ecp_gradient(
+                primitive_shells.host_ptr(), primitive_shells.size(),
+                cgto_normalization_factors.host_ptr(),
+                num_basis,
+                atoms.host_ptr(), atoms.size(),
+                ecp_data_,
+                density_matrix.host_ptr(),
+                gradient.data());
+        }
     }
 
     return gradient;
@@ -1955,8 +2016,37 @@ void InitialGuess_RHF_MINAO::guess() {
     std::cout << " [MINAO] n_calc=" << nb << " n_minao=" << n_minao
               << " n_electrons(occ)=" << std::accumulate(occ.begin(), occ.end(), 0.0) << std::endl;
 
-    // Compute cross overlap S_cross (n_calc × n_minao)
+    // Compute cross overlap S_cross (n_calc_CART × n_minao) — compute_cross_overlap
+    // always works in the Cartesian calc basis.
     auto S_cross = compute_cross_overlap(atoms_host, calc_basis, minao_basis);
+
+    // Under spherical basis, S_calc and X (from the HF object) are spherical
+    // (nb = nbf_sph), but S_cross is [nbf_cart × n_minao]. Transform the calc
+    // (Cartesian) axis to spherical: S_cross_sph[m,j] = Σ_p U[m,p] S_cross[p,j]
+    // with the block-diagonal Cart→Sph matrix U. The MINAO occupation axis j is
+    // untouched. The minao axis itself stays in its own (Cartesian) basis — only
+    // the projection onto the calc basis matters and is now consistent.
+    if (hf_.get_use_spherical()) {
+        const auto& sht  = hf_.get_shell_types();
+        const auto& offc = hf_.get_shell_offsets_cart();
+        const auto& offs = hf_.get_shell_offsets_sph();
+        std::vector<double> S_cross_sph((size_t)nb * n_minao, 0.0);
+        for (size_t ish = 0; ish < sht.size(); ish++) {
+            const auto U = spherical::get_cart_to_sph_matrix(sht[ish]);  // [n_sph_i × n_cart_i]
+            const int ns_i = (int)U.size();
+            const int nc_i = (int)U[0].size();
+            const int so = offs[ish], co = offc[ish];
+            for (int a = 0; a < ns_i; a++)
+                for (int b = 0; b < nc_i; b++) {
+                    const double u = U[a][b];
+                    if (u == 0.0) continue;
+                    for (int j = 0; j < n_minao; j++)
+                        S_cross_sph[(size_t)(so + a) * n_minao + j] +=
+                            u * S_cross[(size_t)(co + b) * n_minao + j];
+                }
+        }
+        S_cross = std::move(S_cross_sph);
+    }
 
     // Compute S_calc overlap on host (reuse from HF object)
     hf_.get_overlap_matrix().toHost();

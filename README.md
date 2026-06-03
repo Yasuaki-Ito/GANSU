@@ -85,19 +85,19 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
     * Cartesian Gaussians (6D / 10F / 15G) — default
     * Pure spherical harmonics (5D / 7F / 9G, Molden m-ordering; d / f / g shells) — integrals computed in Cartesian and transformed to the spherical basis
     * Reproduces ORCA / PySCF / NWChem spherical-basis energies (e.g. cc-pVDZ benzene RHF matches ORCA to ≤ 1e-9 Ha)
-    * Supported with spherical basis: RHF / UHF / ROHF energy (stored, RI, multi-GPU distributed RI), RI post-HF (MP2 / CCSD / CIS / EOM / ADC(2) / DLPNO / STEOM), THC, SAD initial guess (RHF), analytical gradient and geometry optimization (stored and RI, single- and multi-GPU), Molden export, Mulliken / dipole analysis
-    * Cartesian-only (guarded with a clear message under `--use_spherical`): ECP, Direct-SCF / Hash ERI, MINAO and UHF/ROHF SAD initial guesses, analytical Hessian, MP2 gradient
+    * Supported with spherical basis: RHF / UHF / ROHF energy (stored, RI, multi-GPU distributed RI), RI post-HF (MP2 / CCSD / CIS / EOM / ADC(2) / DLPNO / STEOM), THC, all initial guesses (core / gwh / sad / minao for RHF; core / gwh / sad for UHF/ROHF), ECP, analytical gradient and geometry optimization (stored and RI, single- and multi-GPU), analytical Hessian and vibrational frequencies, Molden export, Mulliken / dipole analysis
+    * Cartesian-only (guarded with a clear message under `--use_spherical`): Direct-SCF / Hash ERI, and the (experimental) MP2 gradient
 * Charge analysis
     * Mulliken population analysis (RHF, UHF, ROHF)
 * Bond order analysis
     * Mayer bond order (RHF, UHF, ROHF)
     * Wiberg bond order (RHF, UHF, ROHF)
 * Energy Gradient
-    * Analytical energy gradient (RHF, UHF) — stored, Direct, and RI (density-fitting) ERIs
-    * RI-native analytical gradient (3-center/2-center integral derivatives, RHF) — single- and multi-GPU (NCCL distributed)
-    * Spherical-basis gradient and geometry optimization (`--use_spherical`; stored and RI, single- and multi-GPU)
+    * Analytical energy gradient (RHF, UHF) — four-center skeleton path (works with any ERI method)
+    * RI-native analytical gradient (3-center/2-center integral derivatives) — RHF only, single- and multi-GPU (NCCL distributed)
+    * Spherical-basis gradient and geometry optimization (`--use_spherical`) — RHF (four-center and RI-native, single- and multi-GPU) and UHF (four-center)
 * Energy Hessian
-    * Analytical Hessian (RHF) — skeleton (1e/2e/Vnn) + CPHF response
+    * Analytical Hessian (RHF) — skeleton (1e/2e/Vnn) + CPHF response; Cartesian and spherical (`--use_spherical`)
     * Vibrational frequency analysis (harmonic, with translation/rotation projection)
 * Geometry Optimization
     * Quasi-Newton methods: BFGS, DFP, SR1
@@ -114,8 +114,9 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
       *Resulting molecular orbital of Benzene by MOrbVis*
     * Export Pipek-Mezey localized occupied orbitals (LMOs) in Molden format (`--export_lmo_molden`, RHF / UHF / ROHF)
 * Effective Core Potentials (ECP)
-    * LANL2DZ, cc-pVnZ-PP basis sets for heavy elements
+    * LANL2DZ, def2 / cc-pVnZ-PP basis sets for heavy elements (ECP definitions embedded in the basis-set file)
     * GPU-accelerated ECP integral computation
+    * Cartesian and spherical (`--use_spherical`) — energy and gradient
 * Multi-GPU (`--num_gpus`)
     * Distributed RI-HF with NCCL AllReduce
     * Per-GPU independent B-matrix construction (chunked 3-center ERI + L⁻¹ DGEMM)
@@ -141,8 +142,8 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
 * Excited State Methods
   * Time-Dependent Hartree-Fock (TDHF)
 * Energy Gradient
-  * Post-HF energy gradient (MP2, CCSD, DLPNO, etc.) — MP2 gradient (Cartesian) is experimental / unvalidated
-  * Spherical-basis MP2 / RI multi-GPU gradient edge cases (analytical RI gradient itself is supported)
+  * Post-HF energy gradient (MP2, CCSD, DLPNO, etc.) — MP2 gradient (Cartesian) is experimental / unvalidated; spherical MP2 gradient awaits the Cartesian one being validated first
+  * RI-native gradient for UHF (UHF gradient currently uses the four-center path only)
 * DLPNO methods
   * UHF / ROHF DLPNO (currently RHF closed-shell only)
   * Non-RI DLPNO (currently requires RI)

@@ -180,11 +180,8 @@ void UHF::post_process_after_scf() {
         if(gbsfilename_.empty()){
             THROW_EXCEPTION("The basis set file is not specified for SAD initial guess method. Please specify the basis set file name by -gbsfilename option.");
         }
-        // SAD places Cartesian per-atom density blocks into the Spherical-dim
-        // molecular density — guard until per-atom Cart→Sph transform is added.
-        if(get_use_spherical())
-            THROW_EXCEPTION("SAD initial guess does not yet support spherical basis "
-                "(--use_spherical 1). Use --initial_guess core (default) or gwh.");
+        // SAD assembles Cartesian per-atom density blocks then transforms the
+        // whole matrix Cart→Sph under --use_spherical (handled in the guess()).
         initial_guess = std::make_unique<InitialGuess_UHF_SAD>(*this);
     }else{
         THROW_EXCEPTION("Invalid initial guess method: " + initial_guess_method_);
@@ -400,30 +397,85 @@ void UHF::export_density_matrix(real_t* density_matrix_a, real_t* density_matrix
 std::vector<double> UHF::compute_Energy_Gradient() {
     PROFILE_FUNCTION();
 
-    // Gradient AO derivative integrals are Cartesian; no Cart→Sph transform yet.
-    if (get_use_spherical())
-        THROW_EXCEPTION("Energy gradient does not yet support spherical basis "
-            "(--use_spherical 1). Run gradients in Cartesian (omit --use_spherical).");
+    const bool grad_sph = get_use_spherical();
 
-    auto gradient = gpu::computeEnergyGradient_UHF(
-        shell_type_infos,
-        shell_pair_type_infos,
-        atoms.device_ptr(),
-        density_matrix_a.device_ptr(),
-        density_matrix_b.device_ptr(),
-        coefficient_matrix_a.device_ptr(),
-        coefficient_matrix_b.device_ptr(),
-        orbital_energies_a.device_ptr(),
-        orbital_energies_b.device_ptr(),
-        primitive_shells.device_ptr(),
-        boys_grid.device_ptr(),
-        cgto_normalization_factors.device_ptr(),
-        static_cast<int>(atoms.size()),
-        num_basis,
-        num_alpha_spins,
-        num_beta_spins,
-        verbose
-    );
+    std::vector<double> gradient;
+    if (grad_sph) {
+        // === Spherical UHF gradient via Cartesian back-transform ===
+        // The four-center AO derivative integrals are Cartesian, so contract them
+        // with the Cartesian-expressed α/β densities/coefficients (exact: U is
+        // geometry-independent). Mirrors the RHF stored gradient, applied to both
+        // spin channels.
+        const int nc = get_num_basis_cart();
+        const int ns = num_basis;                  // spherical AO count (= #MOs)
+        const size_t nc2 = (size_t)nc * nc;
+        const auto& sht  = get_shell_types();
+        const auto& offc = get_shell_offsets_cart();
+        const auto& offs = get_shell_offsets_sph();
+
+        real_t *d_Da=nullptr, *d_Db=nullptr;
+        real_t *d_Ca_pack=nullptr, *d_Ca=nullptr, *d_Cb_pack=nullptr, *d_Cb=nullptr;
+        real_t *d_epsa=nullptr, *d_epsb=nullptr;
+        gansu::tracked_cudaMalloc(&d_Da, nc2 * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_Db, nc2 * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_Ca_pack, (size_t)nc * ns * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_Cb_pack, (size_t)nc * ns * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_Ca, nc2 * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_Cb, nc2 * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_epsa, (size_t)nc * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_epsb, (size_t)nc * sizeof(real_t));
+
+        // D_cart = Uᵀ D_sph U ;  C_pack[nc × ns] = Uᵀ C_sph  (per spin)
+        spherical::transform_matrix_sph_to_cart_device(density_matrix_a.device_ptr(), d_Da, sht, offc, offs);
+        spherical::transform_matrix_sph_to_cart_device(density_matrix_b.device_ptr(), d_Db, sht, offc, offs);
+        spherical::transform_coeff_sph_to_cart_device(coefficient_matrix_a.device_ptr(), d_Ca_pack, ns, sht, offc, offs);
+        spherical::transform_coeff_sph_to_cart_device(coefficient_matrix_b.device_ptr(), d_Cb_pack, ns, sht, offc, offs);
+
+        // Pad C to [nc × nc] and ε to [nc] (extra MO columns / entries 0; only
+        // occupied MOs < ns enter the gradient, so the padding is inert).
+        cudaMemset(d_Ca, 0, nc2 * sizeof(real_t));
+        cudaMemset(d_Cb, 0, nc2 * sizeof(real_t));
+        cudaMemcpy2D(d_Ca, (size_t)nc * sizeof(real_t), d_Ca_pack, (size_t)ns * sizeof(real_t),
+                     (size_t)ns * sizeof(real_t), (size_t)nc, cudaMemcpyDeviceToDevice);
+        cudaMemcpy2D(d_Cb, (size_t)nc * sizeof(real_t), d_Cb_pack, (size_t)ns * sizeof(real_t),
+                     (size_t)ns * sizeof(real_t), (size_t)nc, cudaMemcpyDeviceToDevice);
+        cudaMemset(d_epsa, 0, (size_t)nc * sizeof(real_t));
+        cudaMemset(d_epsb, 0, (size_t)nc * sizeof(real_t));
+        cudaMemcpy(d_epsa, orbital_energies_a.device_ptr(), (size_t)ns * sizeof(real_t), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(d_epsb, orbital_energies_b.device_ptr(), (size_t)ns * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+        gradient = gpu::computeEnergyGradient_UHF(
+            shell_type_infos, shell_pair_type_infos, atoms.device_ptr(),
+            d_Da, d_Db, d_Ca, d_Cb, d_epsa, d_epsb,
+            primitive_shells.device_ptr(), boys_grid.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
+            static_cast<int>(atoms.size()), nc, num_alpha_spins, num_beta_spins, verbose);
+
+        gansu::tracked_cudaFree(d_Da);   gansu::tracked_cudaFree(d_Db);
+        gansu::tracked_cudaFree(d_Ca_pack); gansu::tracked_cudaFree(d_Cb_pack);
+        gansu::tracked_cudaFree(d_Ca);   gansu::tracked_cudaFree(d_Cb);
+        gansu::tracked_cudaFree(d_epsa); gansu::tracked_cudaFree(d_epsb);
+    } else {
+        gradient = gpu::computeEnergyGradient_UHF(
+            shell_type_infos,
+            shell_pair_type_infos,
+            atoms.device_ptr(),
+            density_matrix_a.device_ptr(),
+            density_matrix_b.device_ptr(),
+            coefficient_matrix_a.device_ptr(),
+            coefficient_matrix_b.device_ptr(),
+            orbital_energies_a.device_ptr(),
+            orbital_energies_b.device_ptr(),
+            primitive_shells.device_ptr(),
+            boys_grid.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
+            static_cast<int>(atoms.size()),
+            num_basis,
+            num_alpha_spins,
+            num_beta_spins,
+            verbose
+        );
+    }
 
     // Add ECP gradient contribution if present
     if (has_ecp_) {
@@ -434,18 +486,40 @@ std::vector<double> UHF::compute_Energy_Gradient() {
         cgto_normalization_factors.toHost();
         atoms.toHost();
 
-        std::vector<double> D_total((size_t)num_basis * num_basis);
-        for (size_t i = 0; i < D_total.size(); i++)
-            D_total[i] = density_matrix_a.host_ptr()[i] + density_matrix_b.host_ptr()[i];
+        if (grad_sph) {
+            // ECP integral derivatives are Cartesian → contract with the
+            // Cartesian total density D_total_cart = Uᵀ (D_a_sph + D_b_sph) U.
+            const int nc = get_num_basis_cart();
+            std::vector<real_t> Da_cart((size_t)nc * nc), Db_cart((size_t)nc * nc);
+            spherical::transform_matrix_sph_to_cart(density_matrix_a.host_ptr(), Da_cart.data(),
+                get_shell_types(), get_shell_offsets_cart(), get_shell_offsets_sph());
+            spherical::transform_matrix_sph_to_cart(density_matrix_b.host_ptr(), Db_cart.data(),
+                get_shell_types(), get_shell_offsets_cart(), get_shell_offsets_sph());
+            std::vector<double> D_total((size_t)nc * nc);
+            for (size_t i = 0; i < D_total.size(); i++)
+                D_total[i] = Da_cart[i] + Db_cart[i];
+            ecp_integral::compute_ecp_gradient(
+                primitive_shells.host_ptr(), primitive_shells.size(),
+                cgto_normalization_factors.host_ptr(),
+                nc,
+                atoms.host_ptr(), atoms.size(),
+                ecp_data_,
+                D_total.data(),
+                gradient.data());
+        } else {
+            std::vector<double> D_total((size_t)num_basis * num_basis);
+            for (size_t i = 0; i < D_total.size(); i++)
+                D_total[i] = density_matrix_a.host_ptr()[i] + density_matrix_b.host_ptr()[i];
 
-        ecp_integral::compute_ecp_gradient(
-            primitive_shells.host_ptr(), primitive_shells.size(),
-            cgto_normalization_factors.host_ptr(),
-            num_basis,
-            atoms.host_ptr(), atoms.size(),
-            ecp_data_,
-            D_total.data(),
-            gradient.data());
+            ecp_integral::compute_ecp_gradient(
+                primitive_shells.host_ptr(), primitive_shells.size(),
+                cgto_normalization_factors.host_ptr(),
+                num_basis,
+                atoms.host_ptr(), atoms.size(),
+                ecp_data_,
+                D_total.data(),
+                gradient.data());
+        }
     }
 
     return gradient;

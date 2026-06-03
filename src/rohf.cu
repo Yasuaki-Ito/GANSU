@@ -163,11 +163,8 @@ void ROHF::guess_initial_fock_matrix(const real_t* density_matrix_a, const real_
         if(gbsfilename_.empty()){
             THROW_EXCEPTION("The basis set file is not specified for SAD initial guess method. Please specify the basis set file name by -gbsfilename option.");
         }
-        // SAD places Cartesian per-atom density blocks into the Spherical-dim
-        // molecular density — guard until per-atom Cart→Sph transform is added.
-        if(get_use_spherical())
-            THROW_EXCEPTION("SAD initial guess does not yet support spherical basis "
-                "(--use_spherical 1). Use --initial_guess core (default) or gwh.");
+        // SAD assembles Cartesian per-atom density blocks then transforms the
+        // whole matrix Cart→Sph under --use_spherical (handled in the guess()).
         initial_guess = std::make_unique<InitialGuess_ROHF_SAD>(*this);
     }else{
         THROW_EXCEPTION("Invalid initial guess method: " + initial_guess_method_);

@@ -191,10 +191,11 @@ ORCA / PySCF / NWChem convention for cc-pVnZ and similar basis sets.
 ```
 
 Spherical basis is supported for RHF/UHF/ROHF energy (stored, RI, multi-GPU
-distributed RI), RI post-HF (MP2/CCSD/CIS/EOM/ADC(2)/DLPNO/STEOM), THC, the SAD
-initial guess (RHF), analytical gradient and geometry optimization, and Molden
-export. ECP, Direct-SCF/Hash ERIs, MINAO/UHF/ROHF SAD, analytical Hessian, and
-the MP2 gradient remain Cartesian-only and raise a clear error under
+distributed RI), RI post-HF (MP2/CCSD/CIS/EOM/ADC(2)/DLPNO/STEOM), THC, all
+initial guesses (core/gwh/sad/minao for RHF; core/gwh/sad for UHF/ROHF), ECP,
+analytical gradient and geometry optimization, analytical Hessian and
+vibrational frequencies, and Molden export. Direct-SCF/Hash ERIs and the
+(experimental) MP2 gradient remain Cartesian-only and raise a clear error under
 `--use_spherical 1`.
 
 ### 3. Post-HF Correlation Energy

@@ -23,6 +23,7 @@
 #pragma once
 
 #include "hf.hpp"
+#include "spherical_transform.hpp"   // Cart→Sph density transform (SAD spherical guess)
 #include <memory> // std::unique_ptr
 
 #include "profiler.hpp"
@@ -573,12 +574,17 @@ public:
 
 
     void guess() override {
-        // allocate and initialize the density matrices of alpha and beta spins
-        std::unique_ptr<real_t[]> density_matrix_closed(new real_t[hf_.get_num_basis() * hf_.get_num_basis()]);
-        std::unique_ptr<real_t[]> density_matrix_open(new real_t[hf_.get_num_basis() * hf_.get_num_basis()]);
-        memset(density_matrix_closed.get(), 0, hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t));
-        memset(density_matrix_open.get(), 0, hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t));
+        // The per-atom .sad density blocks are Cartesian; under spherical basis
+        // assemble closed/open in Cartesian (placing each block at the atom's
+        // Cartesian range) and transform Cart→Sph (D_sph = U·D_cart·Uᵀ). The
+        // converged SCF is independent of the initial guess (mirrors RHF/UHF SAD).
+        const bool sph = hf_.get_use_spherical();
+        const size_t nsph  = hf_.get_num_basis();                       // active (sph) count
+        const size_t nwork = sph ? hf_.get_num_basis_cart() : nsph;     // build in Cartesian when sph
+        const auto& ranges = sph ? hf_.get_atom_to_basis_range_cart() : hf_.get_atom_to_basis_range();
 
+        std::vector<real_t> dwork_closed(nwork * nwork, 0.0);
+        std::vector<real_t> dwork_open(nwork * nwork, 0.0);
 
         // solve ROHF for each atom to get the density matrix
         for(int i=0; i<hf_.get_atoms().size(); i++){
@@ -598,19 +604,32 @@ public:
             int atom_num_basis;
             auto [atom_density_matrix_alpha, atom_density_matrix_beta] = read_density_from_sad(element_name, hf_.get_gbsfilename(), atom_num_basis);
 
-            // copy the density matrix of the atom to the density matrix of the molecule in the corresponding diagonal block
+            // copy the (Cartesian) atomic density blocks into the molecular diagonal block
             for(size_t p=0; p < atom_num_basis; p++){
                 for(size_t q = 0; q < atom_num_basis; q++){
-                    size_t p_molecule = hf_.get_atom_to_basis_range()[i].start_index + p;
-                    size_t q_molecule = hf_.get_atom_to_basis_range()[i].start_index + q;
-                    density_matrix_closed[p_molecule * hf_.get_num_basis() + q_molecule] = 2.0 * atom_density_matrix_beta [p * atom_num_basis + q];
-                    density_matrix_open[p_molecule * hf_.get_num_basis() + q_molecule]  = atom_density_matrix_alpha[p * atom_num_basis + q] - atom_density_matrix_beta [p * atom_num_basis + q];
+                    size_t p_molecule = ranges[i].start_index + p;
+                    size_t q_molecule = ranges[i].start_index + q;
+                    dwork_closed[p_molecule * nwork + q_molecule] = 2.0 * atom_density_matrix_beta [p * atom_num_basis + q];
+                    dwork_open  [p_molecule * nwork + q_molecule] = atom_density_matrix_alpha[p * atom_num_basis + q] - atom_density_matrix_beta [p * atom_num_basis + q];
                 }
             }
         }
-        cudaMemcpy(hf_.get_density_matrix_closed().device_ptr(), density_matrix_closed.get(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyHostToDevice);
-        cudaMemcpy(hf_.get_density_matrix_open().device_ptr(), density_matrix_open.get(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t), cudaMemcpyHostToDevice);
-        
+
+        std::unique_ptr<real_t[]> density_matrix_closed(new real_t[nsph * nsph]);
+        std::unique_ptr<real_t[]> density_matrix_open(new real_t[nsph * nsph]);
+        if (sph) {
+            spherical::transform_matrix_cart_to_sph(dwork_closed.data(), density_matrix_closed.get(),
+                hf_.get_shell_types(), hf_.get_shell_offsets_cart(), hf_.get_shell_offsets_sph());
+            spherical::transform_matrix_cart_to_sph(dwork_open.data(), density_matrix_open.get(),
+                hf_.get_shell_types(), hf_.get_shell_offsets_cart(), hf_.get_shell_offsets_sph());
+        } else {
+            std::copy(dwork_closed.begin(), dwork_closed.end(), density_matrix_closed.get());
+            std::copy(dwork_open.begin(), dwork_open.end(), density_matrix_open.get());
+        }
+
+        cudaMemcpy(hf_.get_density_matrix_closed().device_ptr(), density_matrix_closed.get(), nsph * nsph * sizeof(real_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(hf_.get_density_matrix_open().device_ptr(), density_matrix_open.get(), nsph * nsph * sizeof(real_t), cudaMemcpyHostToDevice);
+
         hf_.compute_fock_matrix(); // compute the Fock matrix from the density matrix
 
         // Since the above Fock matrix is not correct (the density matrix is not correct), the coefficient matrix is computed from the Fock matrix

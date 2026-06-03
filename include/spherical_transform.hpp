@@ -244,6 +244,22 @@ void transform_matrix_cart_to_sph(
     const std::vector<int>& shell_offsets_sph);
 
 /**
+ * @brief Host "reverse" 2-index transform for a DENSITY-like (contravariant)
+ *        matrix:  M_cart = Uᵀ · M_sph · U  ([nbf_sph × nbf_sph] → [nc × nc]).
+ *
+ * Host (Eigen) counterpart of transform_matrix_sph_to_cart_device. Used by the
+ * ECP gradient under spherical basis: the ECP integral derivatives are built in
+ * the Cartesian primitive basis, so they must contract a Cartesian density
+ * D_cart = Uᵀ D_sph U.
+ */
+void transform_matrix_sph_to_cart(
+    const real_t* M_sph,
+    real_t* M_cart,
+    const std::vector<int>& shell_types,
+    const std::vector<int>& shell_offsets_cart,
+    const std::vector<int>& shell_offsets_sph);
+
+/**
  * @brief Apply Cartesian → Spherical transformation to a 4-index ERI tensor.
  *
  * Input  : ERI_cart[nbf⁴_cart]  (row-major (p,q,r,s) chemist notation)

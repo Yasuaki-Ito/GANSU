@@ -211,8 +211,8 @@ If any of the following conditions are met, an exception is thrown:
 * `false` — Cartesian Gaussians: 6 d-functions, 10 f-functions, 15 g-functions (GANSU's native representation).
 * `true` — pure spherical harmonics: 5 d-functions, 7 f-functions, 9 g-functions, in Molden m-ordering (e.g. d: 0, +1, −1, +2, −2). Use this to reproduce standard cc-pVnZ results from ORCA / PySCF / NWChem, which default to spherical functions for d and higher shells. For example, cc-pVDZ benzene RHF matches the ORCA spherical-d reference to ≤ 1e-9 Ha.
 * Integrals are always computed in the Cartesian basis and then transformed to the spherical basis, so s and p shells are unchanged.
-* **Supported with `--use_spherical 1`:** RHF / UHF / ROHF energy (stored, RI, multi-GPU distributed RI, Direct-RI / Semi-Direct-RI); RI post-HF (MP2, SCS/SOS-MP2, CCSD, CIS, EOM, ADC(2), DLPNO, STEOM); THC; SAD initial guess (RHF); analytical energy gradient and geometry optimization (stored and RI, single- and multi-GPU); Molden export; Mulliken / dipole analysis.
-* **Cartesian-only (a clear error is raised under `--use_spherical 1`):** ECP, Direct-SCF and Hash ERIs, MINAO and UHF/ROHF SAD initial guesses, analytical Hessian, and the MP2 gradient. Run these in Cartesian (omit `--use_spherical`).
+* **Supported with `--use_spherical 1`:** RHF / UHF / ROHF energy (stored, RI, multi-GPU distributed RI, Direct-RI / Semi-Direct-RI); RI post-HF (MP2, SCS/SOS-MP2, CCSD, CIS, EOM, ADC(2), DLPNO, STEOM); THC; all initial guesses (core / gwh / sad / minao for RHF; core / gwh / sad for UHF/ROHF); ECP; analytical energy gradient and geometry optimization (stored and RI, single- and multi-GPU); analytical Hessian and vibrational frequencies; Molden export; Mulliken / dipole analysis.
+* **Cartesian-only (a clear error is raised under `--use_spherical 1`):** Direct-SCF and Hash ERIs, and the (experimental, Cartesian-unvalidated) MP2 gradient. Run these in Cartesian (omit `--use_spherical`).
 
 #### post_hf_method - Post-Hartree-Fock method to use
 * default: none
@@ -802,11 +802,18 @@ A100 80 GB fits Coulomb-only at `thc_n_radial 20–25 / lebedev 194` and Coulomb
 
 #### ecp_filename - Effective Core Potential file
 
-* default: (empty — all-electron calculation)
-* When set, the specified ECP replaces the core electrons of the listed elements with a parameterized potential. Useful for heavy elements where relativistic / large-core effects matter
-* File format follows the Gaussian-style ECP block convention (matches the entries on Basis Set Exchange)
+* default: (empty)
+* **Most basis-set files already embed their ECP** — if the `.gbs` passed to `-g` contains `XX-ECP` blocks (e.g. `lanl2dz.gbs` has Cl/Br/I, `def2-svp.gbs` has I/Ir/Pt), the ECP is loaded and applied automatically; no `--ecp_filename` is needed. Which elements get an ECP is basis-dependent (e.g. def2 uses ECPs only for Z ≥ 37, so Br stays all-electron in def2-SVP but I uses a 28-electron-core ECP).
+* `--ecp_filename` is the alternate route: load an ECP from a separate file (Gaussian-style ECP block convention, matching Basis Set Exchange). Useful when the basis `.gbs` has only orbital exponents.
+* When an ECP is active, the listed elements' core electrons are replaced by a parameterized potential (`[ECP] N core electrons replaced ...` is printed) and the effective nuclear charge / electron count are reduced accordingly. Useful for heavy elements where relativistic / large-core effects matter.
+* Works with both Cartesian and spherical (`--use_spherical`) bases, for energy and gradient.
 
 ```bash
+# ECP embedded in the basis (no --ecp_filename needed)
+./gansu -x ../xyz/HI.xyz -g def2-svp                    # I: 28-core ECP, all-electron H
+./gansu -x ../xyz/HI.xyz -g def2-svp --use_spherical 1  # same, spherical basis
+
+# ECP from a separate file
 ./gansu -x ../xyz/heavy_atom.xyz -g cc-pvdz --ecp_filename ../basis/cc-pvdz-pp.ecp
 ```
 

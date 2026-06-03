@@ -101,6 +101,33 @@ void transform_matrix_cart_to_sph(
 }
 
 
+void transform_matrix_sph_to_cart(
+    const real_t* M_sph,
+    real_t* M_cart,
+    const std::vector<int>& shell_types,
+    const std::vector<int>& shell_offsets_cart,
+    const std::vector<int>& shell_offsets_sph)
+{
+    const int n_shells = (int)shell_types.size();
+    if ((int)shell_offsets_cart.size() != n_shells + 1 ||
+        (int)shell_offsets_sph.size() != n_shells + 1) {
+        throw std::runtime_error(
+            "transform_matrix_sph_to_cart: offset arrays must have size n_shells+1");
+    }
+    const int nbf_cart = shell_offsets_cart[n_shells];
+    const int nbf_sph  = shell_offsets_sph[n_shells];
+
+    const RowMatrix U_full = build_U_full(shell_types, shell_offsets_cart,
+                                          shell_offsets_sph);
+
+    // M_cart = U_full^T · M_sph · U_full  (contravariant back-transform; the
+    // adjoint of the covariant cart→sph operator transform).
+    Eigen::Map<const RowMatrix> M_sph_mat (M_sph,  nbf_sph,  nbf_sph);
+    Eigen::Map<RowMatrix>       M_cart_mat(M_cart, nbf_cart, nbf_cart);
+    M_cart_mat.noalias() = U_full.transpose() * M_sph_mat * U_full;
+}
+
+
 void transform_eri_cart_to_sph(
     const real_t* ERI_cart,
     real_t* ERI_sph,
