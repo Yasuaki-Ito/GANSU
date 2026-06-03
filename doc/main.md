@@ -15,6 +15,9 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
     * Restricted Hartree-Fock (RHF)
     * Unrestricted Hartree-Fock (UHF)
     * Restricted Open-Shell Hartree-Fock (ROHF)
+* Basis function representation (`--use_spherical`)
+    * Cartesian Gaussians (6D / 10F / 15G) — default
+    * Pure spherical harmonics (5D / 7F / 9G, Molden ordering) — reproduces ORCA / PySCF / NWChem spherical-basis results (e.g. cc-pVDZ)
 * Initial Guess
     * Core Hamiltonian (RHF, UHF, ROHF)
     * Generalized Wolfsberg-Helmholz (GWH) @cite Wolfsberg1952 (RHF, UHF, ROHF)

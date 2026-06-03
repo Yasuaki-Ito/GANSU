@@ -11,6 +11,7 @@
 | xyzfilename | XYZ file | string | |
 | gbsfilename | Gaussian basis set file | string | |
 | auxiliary_gbsfilename | Path to auxiliary Gaussian basis set file for RI approximation (auto-generated if omitted) | string | |
+| use_spherical | Use pure spherical-harmonic basis functions (5D/7F/9G, Molden ordering) instead of Cartesian Gaussians (6D/10F/15G) | bool | false |
 | verbose | Verbose mode | bool | false |
 | method | Method to use (RHF, UHF, ROHF) | string | RHF |
 | charge | Charge of the molecule | int | 0 |
@@ -204,6 +205,14 @@ If any of the following conditions are met, an exception is thrown:
   3. Remove near-duplicate exponents (keep only if consecutive exponents differ by a factor of $\ge 2$)
   4. Create uncontracted auxiliary functions (coefficient = 1.0) for angular momenta $L = 0, 1, \ldots, 2L_{\max}$, where $L_{\max}$ is the maximum angular momentum in the primary basis
 * The auto-generated auxiliary basis provides a quick approximation but is less accurate than purpose-built auxiliary basis sets (e.g., cc-pVDZ-RIFIT). Use explicit auxiliary basis files for production calculations.
+
+#### use_spherical - Cartesian vs spherical-harmonic basis functions
+* default: false (Cartesian)
+* `false` — Cartesian Gaussians: 6 d-functions, 10 f-functions, 15 g-functions (GANSU's native representation).
+* `true` — pure spherical harmonics: 5 d-functions, 7 f-functions, 9 g-functions, in Molden m-ordering (e.g. d: 0, +1, −1, +2, −2). Use this to reproduce standard cc-pVnZ results from ORCA / PySCF / NWChem, which default to spherical functions for d and higher shells. For example, cc-pVDZ benzene RHF matches the ORCA spherical-d reference to ≤ 1e-9 Ha.
+* Integrals are always computed in the Cartesian basis and then transformed to the spherical basis, so s and p shells are unchanged.
+* **Supported with `--use_spherical 1`:** RHF / UHF / ROHF energy (stored, RI, multi-GPU distributed RI, Direct-RI / Semi-Direct-RI); RI post-HF (MP2, SCS/SOS-MP2, CCSD, CIS, EOM, ADC(2), DLPNO, STEOM); THC; SAD initial guess (RHF); analytical energy gradient and geometry optimization (stored and RI, single- and multi-GPU); Molden export; Mulliken / dipole analysis.
+* **Cartesian-only (a clear error is raised under `--use_spherical 1`):** ECP, Direct-SCF and Hash ERIs, MINAO and UHF/ROHF SAD initial guesses, analytical Hessian, and the MP2 gradient. Run these in Cartesian (omit `--use_spherical`).
 
 #### post_hf_method - Post-Hartree-Fock method to use
 * default: none

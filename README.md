@@ -13,6 +13,7 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
 * Multi-GPU support: Distributed RI-HF across multiple GPUs via NCCL, with per-GPU B-matrix construction and AllReduce-based Fock build.
 * CPU backend: Full CPU-only execution via `--cpu` flag (Eigen + OpenMP), supporting all HF methods, post-HF, gradient, Hessian, and geometry optimization.
 * ECP support: Effective Core Potentials for heavy elements (LANL2DZ, cc-pVnZ-PP basis sets).
+* Cartesian & spherical basis: Cartesian Gaussians (6D/10F/15G, default) or pure spherical harmonics (5D/7F/9G, Molden ordering) via `--use_spherical`, reproducing ORCA / PySCF / NWChem spherical-basis references (e.g. cc-pVDZ).
 * Python API: Call GANSU from Python via `import gansu` with automatic basis set resolution.
 * C API: Stable ABI for external bindings (`libgansu.so`).
 * Flexible Input Options: Supports standard file formats such as XYZ and Gaussian basis set files.
@@ -80,13 +81,21 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
       * McMurchie-Davidson algorithm (s-, p-, d-, f-, and g-orbitals)
       * Head-Gordon-Pople algorithm (s-, p-, and d-orbitals for basis functions, s-, p-, d-, f-, and g-orbitals for auxiliary basis functions)
     * Boys function
+* Basis function representation (`--use_spherical`)
+    * Cartesian Gaussians (6D / 10F / 15G) — default
+    * Pure spherical harmonics (5D / 7F / 9G, Molden m-ordering; d / f / g shells) — integrals computed in Cartesian and transformed to the spherical basis
+    * Reproduces ORCA / PySCF / NWChem spherical-basis energies (e.g. cc-pVDZ benzene RHF matches ORCA to ≤ 1e-9 Ha)
+    * Supported with spherical basis: RHF / UHF / ROHF energy (stored, RI, multi-GPU distributed RI), RI post-HF (MP2 / CCSD / CIS / EOM / ADC(2) / DLPNO / STEOM), THC, SAD initial guess (RHF), analytical gradient and geometry optimization (stored and RI, single- and multi-GPU), Molden export, Mulliken / dipole analysis
+    * Cartesian-only (guarded with a clear message under `--use_spherical`): ECP, Direct-SCF / Hash ERI, MINAO and UHF/ROHF SAD initial guesses, analytical Hessian, MP2 gradient
 * Charge analysis
     * Mulliken population analysis (RHF, UHF, ROHF)
 * Bond order analysis
     * Mayer bond order (RHF, UHF, ROHF)
     * Wiberg bond order (RHF, UHF, ROHF)
 * Energy Gradient
-    * Analytical energy gradient (RHF, UHF)
+    * Analytical energy gradient (RHF, UHF) — stored, Direct, and RI (density-fitting) ERIs
+    * RI-native analytical gradient (3-center/2-center integral derivatives, RHF) — single- and multi-GPU (NCCL distributed)
+    * Spherical-basis gradient and geometry optimization (`--use_spherical`; stored and RI, single- and multi-GPU)
 * Energy Hessian
     * Analytical Hessian (RHF) — skeleton (1e/2e/Vnn) + CPHF response
     * Vibrational frequency analysis (harmonic, with translation/rotation projection)
@@ -132,8 +141,8 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
 * Excited State Methods
   * Time-Dependent Hartree-Fock (TDHF)
 * Energy Gradient
-  * RI-native gradient (3-center integral derivatives)
-  * Post-HF energy gradient (MP2, CCSD, DLPNO, etc.)
+  * Post-HF energy gradient (MP2, CCSD, DLPNO, etc.) — MP2 gradient (Cartesian) is experimental / unvalidated
+  * Spherical-basis MP2 / RI multi-GPU gradient edge cases (analytical RI gradient itself is supported)
 * DLPNO methods
   * UHF / ROHF DLPNO (currently RHF closed-shell only)
   * Non-RI DLPNO (currently requires RI)
@@ -334,6 +343,12 @@ make
 # DLPNO-CCSD / DLPNO-CCSD(T) — local correlation, scales to ~100 atoms with RI
 ./gansu -x ../xyz/large_molecular/water_hexamer.xyz -g cc-pvdz --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method dlpno_ccsd --dlpno_preset normal
 ./gansu -x ../xyz/large_molecular/water_hexamer.xyz -g cc-pvdz --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method dlpno_ccsd_t --dlpno_preset normal
+
+# Spherical-harmonic basis (5D/7F/9G) — match ORCA/PySCF cc-pVDZ references
+./gansu -x ../xyz/Benzene.xyz -g cc-pvdz --use_spherical 1
+
+# Spherical-basis RI gradient / geometry optimization (single- or multi-GPU)
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs -r optimize --use_spherical 1 --num_gpus 4
 
 # Export Pipek-Mezey localized orbitals for visualization (Avogadro/Jmol/VMD)
 ./gansu -x ../xyz/Benzene.xyz -g cc-pvdz --export_lmo_molden 1

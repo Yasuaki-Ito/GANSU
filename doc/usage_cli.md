@@ -87,6 +87,8 @@ Basis sets are specified by name. GANSU automatically resolves the path.
 | `cc-pvtz` | Correlation-consistent TZ | High-accuracy post-HF |
 | `cc-pvqz` | Correlation-consistent QZ | Benchmark calculations |
 
+By default GANSU uses **Cartesian** Gaussians (6 d-functions, 10 f, 15 g). To match the **spherical-harmonic** convention used by ORCA / PySCF / NWChem for cc-pVnZ and similar basis sets (5 d, 7 f, 9 g), add `--use_spherical 1`. See [Example 2b](#2b-spherical-harmonic-basis).
+
 ---
 
 ## Basic Usage
@@ -111,6 +113,8 @@ Basis sets are specified by name. GANSU automatically resolves the path.
 | `--convergence_method` | SCF convergence: `DIIS`, `SOSCF`, etc. | `DIIS` |
 | `--initial_guess` | Initial guess: `core`, `gwh`, `sad`, `minao` | `core` |
 | `--optimizer` | Geometry optimizer (see below) | `bfgs` |
+| `--use_spherical` | Spherical-harmonic basis (5D/7F/9G) instead of Cartesian (6D/10F/15G) | `0` |
+| `--num_gpus` | Number of GPUs for multi-GPU RI (-1 = auto-detect all) | `-1` |
 | `--cpu` | Force CPU-only execution | (off) |
 | `--list-basis` | List available basis sets and exit | |
 | `-p` | Parameter recipe file | (none) |
@@ -168,6 +172,30 @@ EOF
 ./gansu -x h2o.xyz -g cc-pvdz       # Double-zeta
 ./gansu -x h2o.xyz -g cc-pvtz       # Triple-zeta
 ```
+
+### 2b. Spherical-Harmonic Basis
+
+By default GANSU uses Cartesian Gaussians (6D/10F/15G). Add `--use_spherical 1`
+to use pure spherical harmonics (5D/7F/9G, Molden ordering), matching the
+ORCA / PySCF / NWChem convention for cc-pVnZ and similar basis sets.
+
+```bash
+# Cartesian (default) vs spherical RHF energy
+./gansu -x h2o.xyz -g cc-pvdz                       # Cartesian (25 basis functions)
+./gansu -x h2o.xyz -g cc-pvdz --use_spherical 1     # Spherical (24 basis functions)
+
+# Works across stored / RI / multi-GPU and gradients + optimization
+./gansu -x benzene.xyz -g cc-pvdz --use_spherical 1
+./gansu -x h2o.xyz -g cc-pvdz --eri_method ri -ag cc-pvdz-rifit.gbs \
+        -r optimize --use_spherical 1 --num_gpus 4
+```
+
+Spherical basis is supported for RHF/UHF/ROHF energy (stored, RI, multi-GPU
+distributed RI), RI post-HF (MP2/CCSD/CIS/EOM/ADC(2)/DLPNO/STEOM), THC, the SAD
+initial guess (RHF), analytical gradient and geometry optimization, and Molden
+export. ECP, Direct-SCF/Hash ERIs, MINAO/UHF/ROHF SAD, analytical Hessian, and
+the MP2 gradient remain Cartesian-only and raise a clear error under
+`--use_spherical 1`.
 
 ### 3. Post-HF Correlation Energy
 
@@ -282,8 +310,20 @@ For ROHF, doubly-occupied and singly-occupied subspaces are localized separately
 ### 5. Energy Gradient
 
 ```bash
+# Stored-ERI analytical gradient
 ./gansu -x h2o.xyz -g cc-pvdz -r gradient
+
+# RI-native analytical gradient (3c/2c integral derivatives), single- or multi-GPU
+./gansu -x h2o.xyz -g cc-pvdz --eri_method ri -ag cc-pvdz-rifit.gbs -r gradient
+./gansu -x h2o.xyz -g cc-pvdz --eri_method ri -ag cc-pvdz-rifit.gbs -r gradient --num_gpus 4
+
+# Spherical-basis gradient
+./gansu -x h2o.xyz -g cc-pvdz --eri_method ri -ag cc-pvdz-rifit.gbs -r gradient --use_spherical 1
 ```
+
+Analytical gradients are available for RHF/UHF (stored, Direct) and RHF (RI,
+single- and multi-GPU), in both Cartesian and spherical bases. Post-HF gradients
+(MP2/CCSD/...) are not yet supported.
 
 ### 6. Geometry Optimization
 
