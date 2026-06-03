@@ -95,6 +95,19 @@ public:
         
         Molecular molecular(xyzfilename, gbsfilename, charge, beta_to_alpha);
 
+        // Phase 1 spherical-harmonic basis: toggle on Molecular BEFORE HF
+        // constructs matrices — get_num_basis() then returns Spherical count
+        // (= Σ 2L+1 per shell) and HF allocates all matrices at that size.
+        if (parameters.contains("use_spherical")) {
+            const int us = parameters.get<int>("use_spherical");
+            if (us != 0) {
+                molecular.set_use_spherical(true);
+                std::cout << "[Phase 1 Spherical basis] nbf_cart = " << molecular.get_num_basis_cart()
+                          << " → nbf_sph = " << molecular.get_num_basis_sph()
+                          << "  (Molden ordering: 5D / 7F / 9G)" << std::endl;
+            }
+        }
+
         // Select and build the HF class
         const std::string method = parameters.get<std::string>("method");
         if(method == "rhf"){

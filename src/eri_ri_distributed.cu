@@ -30,6 +30,7 @@
 #include "nccl_comm.hpp"
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
+#include "spherical_transform.hpp"
 #include "ri_adc2_schur_distributed_operator.hpp"
 #include "sos_laplace_adc2_distributed_operator.hpp"
 #include "davidson_solver.hpp"
@@ -184,6 +185,11 @@ ERI_RI_Distributed_RHF::~ERI_RI_Distributed_RHF() {
         tracked_cudaFree(d_cached_L_inv_);
         d_cached_L_inv_ = nullptr;
     }
+    if (d_cached_M_) {
+        MultiGpuManager::DeviceGuard guard(0);
+        tracked_cudaFree(d_cached_M_);
+        d_cached_M_ = nullptr;
+    }
 }
 
 void ERI_RI_Distributed_RHF::allocate_chunked_workspace() {
@@ -283,6 +289,13 @@ void ERI_RI_Distributed_RHF::replicate_data_to_gpus() {
     const size_t nbas2 = (size_t)num_basis_ * num_basis_;
     per_gpu_data_.resize(num_gpus_);
 
+    // Phase 2b spherical-distributed-RI extra per-device buffers.
+    const bool use_spherical = hf_.get_use_spherical();
+    const int  nc_orb = use_spherical ? hf_.get_num_basis_cart()    : num_basis_;
+    const int  ns_orb = num_basis_;                  // = nc_orb in Cart mode
+    const int  nc_aux = use_spherical ? num_auxiliary_basis_cart_   : num_auxiliary_basis_;
+    const size_t nc_orb2 = (size_t)nc_orb * nc_orb;
+
     const size_t n_pshells = hf_.get_primitive_shells().size();
     const size_t n_aux_pshells = auxiliary_primitive_shells_.size();
     const size_t n_cgto = hf_.get_cgto_normalization_factors().size();
@@ -294,6 +307,7 @@ void ERI_RI_Distributed_RHF::replicate_data_to_gpus() {
         auto& g = per_gpu_data_[d];
         if (d == 0) {
             g.d_L_inv = d_cached_L_inv_;
+            g.d_M = d_cached_M_;   // borrowed (nullptr in Cart mode)
             g.d_pshells = const_cast<PrimitiveShell*>(hf_.get_primitive_shells().device_ptr());
             g.d_cgto_norms = const_cast<real_t*>(hf_.get_cgto_normalization_factors().device_ptr());
             g.d_aux_pshells = auxiliary_primitive_shells_.device_ptr();
@@ -303,8 +317,14 @@ void ERI_RI_Distributed_RHF::replicate_data_to_gpus() {
             g.d_aux_schwarz = auxiliary_schwarz_upper_bound_factors.device_ptr();
             g.d_boys = const_cast<real_t*>(hf_.get_boys_grid().device_ptr());
         } else {
-            cudaMalloc(&g.d_L_inv, (size_t)naux * naux * sizeof(real_t));
-            cudaMemcpy(g.d_L_inv, d_cached_L_inv_, (size_t)naux * naux * sizeof(real_t), cudaMemcpyDefault);
+            if (use_spherical) {
+                // Spherical: replicate M = L_sph⁻¹·U_aux [ns_aux × nc_aux]; L⁻¹ unused.
+                cudaMalloc(&g.d_M, (size_t)naux * nc_aux * sizeof(real_t));
+                cudaMemcpy(g.d_M, d_cached_M_, (size_t)naux * nc_aux * sizeof(real_t), cudaMemcpyDefault);
+            } else {
+                cudaMalloc(&g.d_L_inv, (size_t)naux * naux * sizeof(real_t));
+                cudaMemcpy(g.d_L_inv, d_cached_L_inv_, (size_t)naux * naux * sizeof(real_t), cudaMemcpyDefault);
+            }
             cudaMalloc(&g.d_pshells, n_pshells * sizeof(PrimitiveShell));
             cudaMemcpy(g.d_pshells, hf_.get_primitive_shells().device_ptr(), n_pshells * sizeof(PrimitiveShell), cudaMemcpyDefault);
             cudaMalloc(&g.d_cgto_norms, n_cgto * sizeof(real_t));
@@ -322,8 +342,20 @@ void ERI_RI_Distributed_RHF::replicate_data_to_gpus() {
             cudaMalloc(&g.d_boys, n_boys * sizeof(real_t));
             cudaMemcpy(g.d_boys, hf_.get_boys_grid().device_ptr(), n_boys * sizeof(real_t), cudaMemcpyDefault);
         }
-        // Pre-allocate chunk buffer (max aux type size) on every GPU
+        // Pre-allocate chunk buffer (max aux type size) on every GPU.
+        // In spherical mode this holds the Sph-transformed chunk [max_nfunc × ns_orb²].
         cudaMalloc(&g.d_chunk, (size_t)max_nfunc_chunk_ * nbas2 * sizeof(real_t));
+
+        if (use_spherical) {
+            // Cart 3c2e kernel output (pre-transform) + Stage-A orbital scratch +
+            // a per-device prebuilt orbital U.  Allocated on every GPU (scratch,
+            // not borrowed) so each device transforms its own chunks concurrently.
+            cudaMalloc(&g.d_chunk_cart, (size_t)max_nfunc_chunk_ * nc_orb2 * sizeof(real_t));
+            cudaMalloc(&g.d_T_orb,      (size_t)max_nfunc_chunk_ * (size_t)ns_orb * nc_orb * sizeof(real_t));
+            spherical::build_cart_to_sph_U_device(
+                hf_.get_shell_types(), hf_.get_shell_offsets_cart(), hf_.get_shell_offsets_sph(),
+                &g.d_U_orb);
+        }
     }
     MultiGpuManager::instance().sync_all();
     per_gpu_data_ready_ = true;
@@ -334,8 +366,13 @@ void ERI_RI_Distributed_RHF::free_per_gpu_data() {
         MultiGpuManager::DeviceGuard guard(d);
         auto& g = per_gpu_data_[d];
         if (g.d_chunk) { cudaFree(g.d_chunk); g.d_chunk = nullptr; }
+        // Spherical scratch is owned on every device (incl. GPU 0).
+        if (g.d_chunk_cart) { cudaFree(g.d_chunk_cart); g.d_chunk_cart = nullptr; }
+        if (g.d_T_orb)      { cudaFree(g.d_T_orb);      g.d_T_orb = nullptr; }
+        if (g.d_U_orb)      { cudaFree(g.d_U_orb);      g.d_U_orb = nullptr; }
         if (d == 0) continue;  // GPU 0 data is borrowed, not owned
         if (g.d_L_inv) cudaFree(g.d_L_inv);
+        if (g.d_M) cudaFree(g.d_M);
         if (g.d_pshells) cudaFree(g.d_pshells);
         if (g.d_cgto_norms) cudaFree(g.d_cgto_norms);
         if (g.d_aux_pshells) cudaFree(g.d_aux_pshells);
@@ -391,7 +428,17 @@ void ERI_RI_Distributed_RHF::compute_aux_type_ranges() {
     const size_t overhead_bytes = 2ULL * 1024 * 1024 * 1024;  // L⁻¹, J, K, W, X, safety margin
     const size_t used = B_local_bytes + overhead_bytes;
     const size_t available_for_chunk = (free_mem > used) ? free_mem - used : free_mem / 4;
-    const int max_batch_nfunc = std::max(1, (int)(available_for_chunk / (nbas2 * sizeof(real_t))));
+    // Per-aux-function chunk footprint.  In spherical mode each batch is held
+    // in THREE buffers before the M-DGEMM: the Cart kernel output (nc_orb²),
+    // the orbital Stage-A scratch (ns_orb·nc_orb) and the Sph output (ns_orb²).
+    // Budget against their sum so the batch limit stays within memory at scale.
+    size_t per_func_bytes = nbas2 * sizeof(real_t);
+    if (hf_.get_use_spherical()) {
+        const size_t nc_orb = (size_t)hf_.get_num_basis_cart();
+        const size_t ns_orb = (size_t)num_basis_;
+        per_func_bytes = (nc_orb * nc_orb + ns_orb * nc_orb + ns_orb * ns_orb) * sizeof(real_t);
+    }
+    const int max_batch_nfunc = std::max(1, (int)(available_for_chunk / per_func_bytes));
 
     // Sort auxiliary primitives by basis_index within each type (on host).
     // This ensures consecutive primitives have contiguous basis_index → efficient batching.
@@ -462,11 +509,32 @@ void ERI_RI_Distributed_RHF::compute_aux_type_ranges() {
 //  Then distributed B build (no full B on any single GPU)
 // ============================================================
 void ERI_RI_Distributed_RHF::precomputation() {
-    const int naux = num_auxiliary_basis_;
-    const int nbas = num_basis_;
+    const bool use_spherical = hf_.get_use_spherical();
+
+    // Spherical support: GPU_Resident (Phase 2b) + OnTheFly/OutOfCore (Phase 2c)
+    // all use the M = L_sph⁻¹·U_aux folding (Step 3 builds M; the per-chunk
+    // Cart→Sph orbital transform lives in distributed_build_B / chunked_fock_build
+    // / build_out_of_core_B).
+
+    const int naux = num_auxiliary_basis_;        // = ns_aux when use_spherical
+    const int nbas = num_basis_;                  // = ns_orb when use_spherical
 
     // Ensure GPU 0 is active (base class data lives on GPU 0)
     cudaSetDevice(0);
+
+    // Geometry may have changed since a previous precomputation (geometry
+    // optimization / gradient line search re-invokes precompute_eri_matrix per
+    // trial geometry). Drop the previously-built distributed state so B is
+    // rebuilt for the CURRENT geometry — otherwise distributed_build_B()
+    // early-returns on scattered_ and the SCF / gradient silently uses stale
+    // (previous-geometry) B (manifests as energies below the variational
+    // minimum + diverging optimization). d_B_local_ buffers are reused in place
+    // (re-zeroed + refilled), so only the cached metrics / replicated copy are
+    // freed here. At first construction these are all no-ops.
+    scattered_ = false;
+    free_replicated_B();
+    if (d_cached_M_)     { tracked_cudaFree(d_cached_M_);     d_cached_M_ = nullptr; }
+    if (d_cached_L_inv_) { tracked_cudaFree(d_cached_L_inv_); d_cached_L_inv_ = nullptr; }
 
     // Step 1: Schwarz + shell pairs + aux Schwarz (skip full B build)
     precompute_schwarz_and_shell_pairs();
@@ -477,33 +545,101 @@ void ERI_RI_Distributed_RHF::precomputation() {
     auxiliary_primitive_shells_.toHost();
     compute_aux_type_ranges();
 
-    // Step 3: Compute and cache L⁻¹ on GPU 0
+    // Step 3: Compute and cache the per-aux contraction matrix on GPU 0.
+    //  Cartesian : d_cached_L_inv_ = L⁻¹            [naux × naux],  L = chol(V_cart)
+    //  Spherical : d_cached_M_     = L_sph⁻¹·U_aux  [ns_aux × nc_aux]
+    //
+    //  The spherical fold is required because V_sph^{-1/2} ≠ U·V_cart^{-1/2}·U^T
+    //  (a matrix function does not commute with the Cart→Sph projection), so we
+    //  must form V_sph = U·V_cart·U^T first, factor it, and only then absorb the
+    //  remaining auxiliary Cart→Sph map U_aux into M.  With M precomputed, each
+    //  3c2e chunk contracts in Cart-aux space (folded) and needs only its two
+    //  orbital indices transformed — see distributed_build_B().
     {
         cudaSetDevice(0);
         const real_t schwarz_threshold = hf_.get_schwarz_screening_threshold();
 
-        real_t* d_two_center_eri;
-        tracked_cudaMalloc(&d_two_center_eri, (size_t)naux * naux * sizeof(real_t));
-        cudaMemset(d_two_center_eri, 0, (size_t)naux * naux * sizeof(real_t));
+        if (!use_spherical) {
+            real_t* d_two_center_eri;
+            tracked_cudaMalloc(&d_two_center_eri, (size_t)naux * naux * sizeof(real_t));
+            cudaMemset(d_two_center_eri, 0, (size_t)naux * naux * sizeof(real_t));
 
-        gpu::computeTwoCenterERIs(
-            auxiliary_shell_type_infos_,
-            auxiliary_primitive_shells_.device_ptr(),
-            auxiliary_cgto_normalization_factors_.device_ptr(),
-            d_two_center_eri, naux,
-            hf_.get_boys_grid().device_ptr(),
-            auxiliary_schwarz_upper_bound_factors.device_ptr(),
-            schwarz_threshold, false);
+            gpu::computeTwoCenterERIs(
+                auxiliary_shell_type_infos_,
+                auxiliary_primitive_shells_.device_ptr(),
+                auxiliary_cgto_normalization_factors_.device_ptr(),
+                d_two_center_eri, naux,
+                hf_.get_boys_grid().device_ptr(),
+                auxiliary_schwarz_upper_bound_factors.device_ptr(),
+                schwarz_threshold, false);
 
-        gpu::choleskyDecomposition(d_two_center_eri, naux);
+            gpu::choleskyDecomposition(d_two_center_eri, naux);
 
-        tracked_cudaMalloc(&d_cached_L_inv_, (size_t)naux * naux * sizeof(real_t));
-        gpu::computeInverseByDtrsm(d_two_center_eri, d_cached_L_inv_, naux);
+            tracked_cudaMalloc(&d_cached_L_inv_, (size_t)naux * naux * sizeof(real_t));
+            gpu::computeInverseByDtrsm(d_two_center_eri, d_cached_L_inv_, naux);
 
-        tracked_cudaFree(d_two_center_eri);
-        cudaDeviceSynchronize();
-        std::cout << "[RI-Dist] Cached L^-1 on GPU 0 ("
-                  << (size_t)naux * naux * sizeof(real_t) / (1024 * 1024) << " MB)" << std::flush << std::endl;
+            tracked_cudaFree(d_two_center_eri);
+            cudaDeviceSynchronize();
+            std::cout << "[RI-Dist] Cached L^-1 on GPU 0 ("
+                      << (size_t)naux * naux * sizeof(real_t) / (1024 * 1024) << " MB)" << std::flush << std::endl;
+        } else {
+            const int ns_aux = num_auxiliary_basis_;          // Sph aux count
+            const int nc_aux = num_auxiliary_basis_cart_;     // Cart aux count
+
+            // (P|Q) in Cart aux, on GPU 0
+            real_t* d_2c_cart = nullptr;
+            tracked_cudaMalloc(&d_2c_cart, (size_t)nc_aux * nc_aux * sizeof(real_t));
+            cudaMemset(d_2c_cart, 0, (size_t)nc_aux * nc_aux * sizeof(real_t));
+            gpu::computeTwoCenterERIs(
+                auxiliary_shell_type_infos_,
+                auxiliary_primitive_shells_.device_ptr(),
+                auxiliary_cgto_normalization_factors_.device_ptr(),
+                d_2c_cart, nc_aux,
+                hf_.get_boys_grid().device_ptr(),
+                auxiliary_schwarz_upper_bound_factors.device_ptr(),
+                schwarz_threshold, false);
+
+            // V_sph = U_aux · (P|Q)_cart · U_aux^T   [ns_aux × ns_aux]
+            real_t* d_V_sph = nullptr;
+            tracked_cudaMalloc(&d_V_sph, (size_t)ns_aux * ns_aux * sizeof(real_t));
+            spherical::transform_matrix_cart_to_sph_device(
+                d_2c_cart, d_V_sph,
+                aux_shell_types_, aux_shell_offsets_cart_, aux_shell_offsets_sph_);
+            tracked_cudaFree(d_2c_cart);
+
+            // L_sph = chol(V_sph);  L_sph⁻¹   [ns_aux × ns_aux]
+            gpu::choleskyDecomposition(d_V_sph, ns_aux);
+            real_t* d_Linv_sph = nullptr;
+            tracked_cudaMalloc(&d_Linv_sph, (size_t)ns_aux * ns_aux * sizeof(real_t));
+            gpu::computeInverseByDtrsm(d_V_sph, d_Linv_sph, ns_aux);
+            tracked_cudaFree(d_V_sph);
+
+            // U_aux  [ns_aux × nc_aux]  (block-diagonal Cart→Sph for the aux basis)
+            real_t* d_U_aux = nullptr;
+            spherical::build_cart_to_sph_U_device(
+                aux_shell_types_, aux_shell_offsets_cart_, aux_shell_offsets_sph_, &d_U_aux);
+
+            // M = L_sph⁻¹ · U_aux   [ns_aux × nc_aux]   (row-major C = A·B trick)
+            tracked_cudaMalloc(&d_cached_M_, (size_t)ns_aux * nc_aux * sizeof(real_t));
+            {
+                cublasHandle_t h = gpu::GPUHandle::cublas();
+                const double one = 1.0, zero = 0.0;
+                cublasDgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                    nc_aux, ns_aux, ns_aux,
+                    &one,
+                    d_U_aux,    nc_aux,    // B = U_aux [ns_aux × nc_aux], ldb = nc_aux
+                    d_Linv_sph, ns_aux,    // A = L⁻¹   [ns_aux × ns_aux], lda = ns_aux
+                    &zero,
+                    d_cached_M_, nc_aux);  // C = M     [ns_aux × nc_aux], ldc = nc_aux
+            }
+            cudaFree(d_U_aux);
+            tracked_cudaFree(d_Linv_sph);
+            cudaDeviceSynchronize();
+            std::cout << "[RI-Dist] Cached M = L_sph^-1 * U_aux on GPU 0 (ns_aux="
+                      << ns_aux << ", nc_aux=" << nc_aux << ", "
+                      << (size_t)ns_aux * nc_aux * sizeof(real_t) / (1024 * 1024)
+                      << " MB)" << std::flush << std::endl;
+        }
     }
 
     // Step 4: Build B based on storage mode
@@ -516,6 +652,7 @@ void ERI_RI_Distributed_RHF::precomputation() {
 
         const size_t overhead = 4ULL * 1024 * 1024 * 1024;  // L⁻¹ + workspace + chunk headroom
         if (B_local_bytes + overhead > free_check) {
+            // OutOfCore B build is Cart→Sph aware (Phase 2c, M-folding).
             std::cout << "[RI] Auto-switching to out-of-core (B_local=" << B_local_bytes / (1024*1024)
                       << " MB, GPU free=" << free_check / (1024*1024) << " MB)" << std::endl;
             storage_mode_ = StorageMode::OutOfCore;
@@ -552,8 +689,17 @@ void ERI_RI_Distributed_RHF::distributed_build_B() {
     const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
     const int n_aux_types = (int)auxiliary_shell_type_infos_.size();
 
+    // Phase 2b spherical: the 3c2e kernel and chunk indexing run in Cartesian
+    // (nc_orb, nc_aux); only the final B rows are Spherical (naux = ns_aux,
+    // nbas = ns_orb).  The aux Cart→Sph map is folded into M (= d_M).
+    const bool use_spherical = hf_.get_use_spherical();
+    const int  nc_orb = use_spherical ? hf_.get_num_basis_cart()  : nbas;
+    const int  nc_aux = use_spherical ? num_auxiliary_basis_cart_ : naux;
+    const size_t nc_orb2 = (size_t)nc_orb * nc_orb;
+
     // Batch sizing in compute_aux_type_ranges() ensures chunks fit alongside B_local.
-    std::cout << "[RI-Dist] Building B_local on " << num_gpus_ << " GPUs (chunked 3c2e + L^-1 DGEMM)..." << std::endl;
+    std::cout << "[RI-Dist] Building B_local on " << num_gpus_ << " GPUs (chunked 3c2e + "
+              << (use_spherical ? "orb-transform + M" : "L^-1") << " DGEMM)..." << std::endl;
 
     // ---- Step 1: Replicate data to all GPUs ----
     replicate_data_to_gpus();
@@ -580,30 +726,65 @@ void ERI_RI_Distributed_RHF::distributed_build_B() {
             cublasSetStream(handle, cs);
             auto& g = per_gpu_data_[d];
 
-            // Zero pre-allocated chunk buffer
-            cudaMemsetAsync(g.d_chunk, 0, (size_t)nfunc_c * nbas2 * sizeof(real_t), cs);
-
-            // Compute 3c2e for this batch (async)
-            gpu::computeThreeCenterERIs_for_aux_type(
-                shell_type_infos, shell_pair_type_infos,
-                g.d_pshells, g.d_cgto_norms,
-                batch.shell_info, batch.angular_momentum,
-                g.d_aux_pshells, g.d_aux_cgto_norms,
-                g.d_chunk, g.d_shell_pairs,
-                nbas, naux, g.d_boys,
-                g.d_schwarz, g.d_aux_schwarz,
-                schwarz_screening_threshold,
-                Q_c_start, nfunc_c, cs);
-
-            // DGEMM on the same stream: B_local += L⁻¹_rows × chunk
             const double one = 1.0;
-            cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                (int)nbas2, naux_local_[d], nfunc_c,
-                &one,
-                g.d_chunk, (int)nbas2,
-                &g.d_L_inv[P_start_[d] * naux + Q_c_start], naux,
-                &one,
-                d_B_local_[d], (int)nbas2);
+            if (!use_spherical) {
+                // Zero pre-allocated chunk buffer
+                cudaMemsetAsync(g.d_chunk, 0, (size_t)nfunc_c * nbas2 * sizeof(real_t), cs);
+
+                // Compute 3c2e for this batch (async)
+                gpu::computeThreeCenterERIs_for_aux_type(
+                    shell_type_infos, shell_pair_type_infos,
+                    g.d_pshells, g.d_cgto_norms,
+                    batch.shell_info, batch.angular_momentum,
+                    g.d_aux_pshells, g.d_aux_cgto_norms,
+                    g.d_chunk, g.d_shell_pairs,
+                    nbas, naux, g.d_boys,
+                    g.d_schwarz, g.d_aux_schwarz,
+                    schwarz_screening_threshold,
+                    Q_c_start, nfunc_c, cs);
+
+                // DGEMM on the same stream: B_local += L⁻¹_rows × chunk
+                cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                    (int)nbas2, naux_local_[d], nfunc_c,
+                    &one,
+                    g.d_chunk, (int)nbas2,
+                    &g.d_L_inv[P_start_[d] * naux + Q_c_start], naux,
+                    &one,
+                    d_B_local_[d], (int)nbas2);
+            } else {
+                // --- Spherical: Cart 3c2e → orbital Cart→Sph → fold-M DGEMM ---
+                // (1) Cart 3c2e chunk [nfunc_c × nc_orb²] (nfunc_c is Cart aux,
+                //     Q_c_start is a Cart aux offset; both come from aux_batches_).
+                cudaMemsetAsync(g.d_chunk_cart, 0, (size_t)nfunc_c * nc_orb2 * sizeof(real_t), cs);
+                gpu::computeThreeCenterERIs_for_aux_type(
+                    shell_type_infos, shell_pair_type_infos,
+                    g.d_pshells, g.d_cgto_norms,
+                    batch.shell_info, batch.angular_momentum,
+                    g.d_aux_pshells, g.d_aux_cgto_norms,
+                    g.d_chunk_cart, g.d_shell_pairs,
+                    nc_orb, nc_aux, g.d_boys,
+                    g.d_schwarz, g.d_aux_schwarz,
+                    schwarz_screening_threshold,
+                    Q_c_start, nfunc_c, cs);
+
+                // (2) Transform the two orbital indices: [nfunc_c × nc_orb²]
+                //     → g.d_chunk [nfunc_c × ns_orb²].  Aux axis (nfunc_c) untouched.
+                spherical::transform_orbital_pair_cart_to_sph_device(
+                    handle, g.d_chunk_cart, g.d_chunk, g.d_T_orb, g.d_U_orb,
+                    nfunc_c, nc_orb, nbas /* = ns_orb */);
+
+                // (3) B_local_sph += M[P_sph_rows, Q_cart_chunk] × chunk_sph.
+                //     M is [ns_aux × nc_aux] row-major; slice base/ld use nc_aux,
+                //     contraction dim is nfunc_c (Cart aux).  B rows are Sph aux,
+                //     already partitioned via P_start_/naux_local_ (over ns_aux).
+                cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                    (int)nbas2, naux_local_[d], nfunc_c,
+                    &one,
+                    g.d_chunk, (int)nbas2,
+                    &g.d_M[P_start_[d] * (size_t)nc_aux + Q_c_start], nc_aux,
+                    &one,
+                    d_B_local_[d], (int)nbas2);
+            }
         }
 
         // Sync all GPUs before next aux type (chunk reused)
@@ -611,7 +792,7 @@ void ERI_RI_Distributed_RHF::distributed_build_B() {
     }
 
     // ---- Step 4: Cleanup ----
-    // In stored mode, free replicated data + cached L⁻¹ (no longer needed).
+    // In stored mode, free replicated data + cached L⁻¹/M (no longer needed).
     // In direct mode, keep them for per-iteration rebuilds.
     if (storage_mode_ != StorageMode::OnTheFly) {
         free_per_gpu_data();
@@ -619,6 +800,11 @@ void ERI_RI_Distributed_RHF::distributed_build_B() {
             MultiGpuManager::DeviceGuard guard(0);
             tracked_cudaFree(d_cached_L_inv_);
             d_cached_L_inv_ = nullptr;
+        }
+        if (d_cached_M_) {
+            MultiGpuManager::DeviceGuard guard(0);
+            tracked_cudaFree(d_cached_M_);
+            d_cached_M_ = nullptr;
         }
     }
 
@@ -898,6 +1084,13 @@ void ERI_RI_Distributed_RHF::build_out_of_core_B() {
     const size_t nbas2 = (size_t)nbas * nbas;
     auto& mgr = MultiGpuManager::instance();
 
+    // Phase 2c spherical (mirrors distributed_build_B / chunked_fock_build):
+    // Cart 3c2e per chunk → orbital Cart→Sph → fold-M DGEMM → Sph B partitions.
+    const bool use_spherical = hf_.get_use_spherical();
+    const int  nc_orb = use_spherical ? hf_.get_num_basis_cart()  : nbas;
+    const int  nc_aux = use_spherical ? num_auxiliary_basis_cart_ : naux;
+    const size_t nc_orb2 = (size_t)nc_orb * nc_orb;
+
     const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
     const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
     const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
@@ -916,7 +1109,9 @@ void ERI_RI_Distributed_RHF::build_out_of_core_B() {
     // Check if full B fits on GPU (no out-of-core needed)
     const bool fits_on_gpu = ((size_t)naux * nbas2 * sizeof(real_t) + chunk_3c_bytes + reserved < free_mem);
 
-    if (fits_on_gpu) {
+    // The fused compute_RI_IntermediateMatrixB builder is Cartesian-only; for
+    // spherical, always take the chunked path below (M-folding per batch).
+    if (fits_on_gpu && !use_spherical) {
         // Full B fits on GPU — use optimized compute_RI_IntermediateMatrixB (parallel streams)
         std::cout << "[RI-Dist] Full B fits on GPU (" << naux * nbas2 * sizeof(real_t) / (1024*1024)
                   << " MB). Building with optimized path." << std::endl;
@@ -995,27 +1190,53 @@ void ERI_RI_Distributed_RHF::build_out_of_core_B() {
             cudaMemset(d_B_dest, 0, (size_t)P_count * nbas2 * sizeof(real_t));
 
         for (const auto& batch : aux_batches_) {
-            cudaMemset(d_3c_chunk, 0, (size_t)batch.nfunc * nbas2 * sizeof(real_t));
-
-            gpu::computeThreeCenterERIs_for_aux_type(
-                shell_type_infos, shell_pair_type_infos,
-                g.d_pshells, g.d_cgto_norms,
-                batch.shell_info, batch.angular_momentum,
-                g.d_aux_pshells, g.d_aux_cgto_norms,
-                d_3c_chunk, g.d_shell_pairs,
-                nbas, naux, g.d_boys,
-                g.d_schwarz, g.d_aux_schwarz,
-                schwarz_screening_threshold,
-                batch.basis_start, batch.nfunc, 0);
-
             const double one_val = 1.0;
-            cublasDgemm(h0, CUBLAS_OP_N, CUBLAS_OP_N,
-                (int)nbas2, P_count, batch.nfunc,
-                &one_val,
-                d_3c_chunk, (int)nbas2,
-                &g.d_L_inv[P_start * naux + batch.basis_start], naux,
-                &one_val,
-                d_B_dest, (int)nbas2);
+            if (!use_spherical) {
+                cudaMemset(d_3c_chunk, 0, (size_t)batch.nfunc * nbas2 * sizeof(real_t));
+                gpu::computeThreeCenterERIs_for_aux_type(
+                    shell_type_infos, shell_pair_type_infos,
+                    g.d_pshells, g.d_cgto_norms,
+                    batch.shell_info, batch.angular_momentum,
+                    g.d_aux_pshells, g.d_aux_cgto_norms,
+                    d_3c_chunk, g.d_shell_pairs,
+                    nbas, naux, g.d_boys,
+                    g.d_schwarz, g.d_aux_schwarz,
+                    schwarz_screening_threshold,
+                    batch.basis_start, batch.nfunc, 0);
+
+                cublasDgemm(h0, CUBLAS_OP_N, CUBLAS_OP_N,
+                    (int)nbas2, P_count, batch.nfunc,
+                    &one_val,
+                    d_3c_chunk, (int)nbas2,
+                    &g.d_L_inv[P_start * naux + batch.basis_start], naux,
+                    &one_val,
+                    d_B_dest, (int)nbas2);
+            } else {
+                // Spherical: Cart 3c2e → orbital Cart→Sph → fold-M DGEMM.
+                cudaMemset(g.d_chunk_cart, 0, (size_t)batch.nfunc * nc_orb2 * sizeof(real_t));
+                gpu::computeThreeCenterERIs_for_aux_type(
+                    shell_type_infos, shell_pair_type_infos,
+                    g.d_pshells, g.d_cgto_norms,
+                    batch.shell_info, batch.angular_momentum,
+                    g.d_aux_pshells, g.d_aux_cgto_norms,
+                    g.d_chunk_cart, g.d_shell_pairs,
+                    nc_orb, nc_aux, g.d_boys,
+                    g.d_schwarz, g.d_aux_schwarz,
+                    schwarz_screening_threshold,
+                    batch.basis_start, batch.nfunc, 0);
+
+                spherical::transform_orbital_pair_cart_to_sph_device(
+                    h0, g.d_chunk_cart, g.d_chunk, g.d_T_orb, g.d_U_orb,
+                    batch.nfunc, nc_orb, nbas);
+
+                cublasDgemm(h0, CUBLAS_OP_N, CUBLAS_OP_N,
+                    (int)nbas2, P_count, batch.nfunc,
+                    &one_val,
+                    g.d_chunk, (int)nbas2,
+                    &g.d_M[P_start * (size_t)nc_aux + batch.basis_start], nc_aux,
+                    &one_val,
+                    d_B_dest, (int)nbas2);
+            }
         }
 
         // Copy partition to host (unless GPU-resident)
@@ -1151,6 +1372,15 @@ void ERI_RI_Distributed_RHF::chunked_fock_build() {
     const int threads = 256;
     auto& mgr = MultiGpuManager::instance();
 
+    // Phase 2c spherical: the 3c2e kernel runs in Cartesian (nc_orb, nc_aux);
+    // each chunk's orbital pair is transformed Cart→Sph and the aux Cart→Sph
+    // mixing is folded into M (= d_M), so B_row rows come out Spherical.
+    // Mirrors distributed_build_B().  (Cart: nc_*==n* and the M branch is unused.)
+    const bool use_spherical = hf_.get_use_spherical();
+    const int  nc_orb = use_spherical ? hf_.get_num_basis_cart()  : nbas;
+    const int  nc_aux = use_spherical ? num_auxiliary_basis_cart_ : naux;
+    const size_t nc_orb2 = (size_t)nc_orb * nc_orb;
+
     const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
     const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
     const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
@@ -1221,27 +1451,53 @@ void ERI_RI_Distributed_RHF::chunked_fock_build() {
                 const size_t Q_c_start = batch.basis_start;
                 const int nfunc_c = batch.nfunc;
 
-                cudaMemsetAsync(w.d_3c_chunk, 0, (size_t)nfunc_c * nbas2 * sizeof(double), cs);
-
-                gpu::computeThreeCenterERIs_for_aux_type(
-                    shell_type_infos, shell_pair_type_infos,
-                    g.d_pshells, g.d_cgto_norms,
-                    batch.shell_info, batch.angular_momentum,
-                    g.d_aux_pshells, g.d_aux_cgto_norms,
-                    w.d_3c_chunk, g.d_shell_pairs,
-                    nbas, naux, g.d_boys,
-                    g.d_schwarz, g.d_aux_schwarz,
-                    schwarz_screening_threshold,
-                    Q_c_start, nfunc_c, cs);
-
                 const double one = 1.0;
-                cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                    (int)nbas2, P_count, nfunc_c,
-                    &one,
-                    w.d_3c_chunk, (int)nbas2,
-                    &g.d_L_inv[P_start_global * naux + Q_c_start], naux,
-                    &one,
-                    w.d_B_row, (int)nbas2);
+                if (!use_spherical) {
+                    cudaMemsetAsync(w.d_3c_chunk, 0, (size_t)nfunc_c * nbas2 * sizeof(double), cs);
+                    gpu::computeThreeCenterERIs_for_aux_type(
+                        shell_type_infos, shell_pair_type_infos,
+                        g.d_pshells, g.d_cgto_norms,
+                        batch.shell_info, batch.angular_momentum,
+                        g.d_aux_pshells, g.d_aux_cgto_norms,
+                        w.d_3c_chunk, g.d_shell_pairs,
+                        nbas, naux, g.d_boys,
+                        g.d_schwarz, g.d_aux_schwarz,
+                        schwarz_screening_threshold,
+                        Q_c_start, nfunc_c, cs);
+
+                    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                        (int)nbas2, P_count, nfunc_c,
+                        &one,
+                        w.d_3c_chunk, (int)nbas2,
+                        &g.d_L_inv[P_start_global * naux + Q_c_start], naux,
+                        &one,
+                        w.d_B_row, (int)nbas2);
+                } else {
+                    // Spherical: Cart 3c2e → orbital Cart→Sph → fold-M DGEMM.
+                    cudaMemsetAsync(g.d_chunk_cart, 0, (size_t)nfunc_c * nc_orb2 * sizeof(real_t), cs);
+                    gpu::computeThreeCenterERIs_for_aux_type(
+                        shell_type_infos, shell_pair_type_infos,
+                        g.d_pshells, g.d_cgto_norms,
+                        batch.shell_info, batch.angular_momentum,
+                        g.d_aux_pshells, g.d_aux_cgto_norms,
+                        g.d_chunk_cart, g.d_shell_pairs,
+                        nc_orb, nc_aux, g.d_boys,
+                        g.d_schwarz, g.d_aux_schwarz,
+                        schwarz_screening_threshold,
+                        Q_c_start, nfunc_c, cs);
+
+                    spherical::transform_orbital_pair_cart_to_sph_device(
+                        handle, g.d_chunk_cart, g.d_chunk, g.d_T_orb, g.d_U_orb,
+                        nfunc_c, nc_orb, nbas);
+
+                    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                        (int)nbas2, P_count, nfunc_c,
+                        &one,
+                        g.d_chunk, (int)nbas2,
+                        &g.d_M[P_start_global * (size_t)nc_aux + Q_c_start], nc_aux,
+                        &one,
+                        w.d_B_row, (int)nbas2);
+                }
             }
 
             // ---- J contribution ----

@@ -23,10 +23,12 @@
 #include <memory>
 #include <cassert>
 #include <algorithm> // std::sort
+#include <cstring>   // memcpy
 #include <cmath> // sqrt
 #include <iomanip> // std::setprecision
 
 #include "hf.hpp"
+#include "spherical_transform.hpp"
 #include "device_host_memory.hpp"
 #include "boys/boys_30720.h"
 #include "gpu_manager.hpp"
@@ -78,8 +80,13 @@ static double atomic_mass(int Z) {
  * @details This function constructs the HF class.
  * @details The molecular is given as an argument.
  */
-HF::HF(const Molecular& molecular, const ParameterManager& parameters) : 
-    num_basis(molecular.get_num_basis()), 
+HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
+    num_basis(molecular.get_num_basis()),
+    use_spherical_(molecular.get_use_spherical()),
+    num_basis_cart_(static_cast<int>(molecular.get_num_basis_cart())),
+    shell_types_(molecular.get_shell_types()),
+    shell_offsets_cart_(molecular.get_shell_offsets_cart()),
+    shell_offsets_sph_(molecular.get_shell_offsets_sph()),
     num_electrons(molecular.get_num_electrons()),
     num_alpha_spins(molecular.get_num_alpha_spins()),
     num_beta_spins(molecular.get_num_beta_spins()),
@@ -87,7 +94,8 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     primitive_shells(molecular.get_primitive_shells()), // construct the list directly from std::vector
     shell_type_infos(molecular.get_shell_type_infos()), // construct the list directly from std::vector
     shell_pair_type_infos(shell_type_infos.size()*(shell_type_infos.size()+1)/2),
-    atom_to_basis_range(molecular.get_atom_to_basis_range()), // construct the list directly from std::vector
+    atom_to_basis_range(molecular.get_atom_to_basis_range()), // active basis (sph when use_spherical)
+    atom_to_basis_range_cart(molecular.get_atom_to_basis_range_cart()), // always Cartesian (Molden [GTO])
     boys_grid(30720,true), // 30720 is the number of grid points for, true means that the host memory is allocated in advance
     cgto_normalization_factors(molecular.get_cgto_normalization_factors()), // construct the list directly from std::vector
     overlap_matrix(num_basis, num_basis), // host memory is not allocated in advance
@@ -432,6 +440,59 @@ void HF::compute_nuclear_repulsion_energy() {
 
 void HF::compute_core_hamiltonian_matrix() {
     PROFILE_FUNCTION();
+
+    if (use_spherical_) {
+        // Phase 1: integral engine computes in Cartesian; transform to Spherical
+        // after.  Internal cart temp buffers are sized to num_basis_cart_, then
+        // spherical_transform.hpp reduces them to num_basis (= sph count) and we
+        // copy the result into overlap_matrix / core_hamiltonian_matrix which
+        // were allocated at sph size in the constructor.
+        if (has_ecp_) {
+            THROW_EXCEPTION("Phase 1 spherical basis does not yet support ECP "
+                            "(set use_spherical=0 or remove --ecp_filename).");
+        }
+        const int nbf_cart = num_basis_cart_;
+        const int nbf_sph  = num_basis;
+
+        DeviceHostMatrix<real_t> S_cart_tmp(nbf_cart, nbf_cart);
+        DeviceHostMatrix<real_t> H_cart_tmp(nbf_cart, nbf_cart);
+        cudaMemset(S_cart_tmp.device_ptr(), 0, sizeof(real_t) * nbf_cart * nbf_cart);
+        cudaMemset(H_cart_tmp.device_ptr(), 0, sizeof(real_t) * nbf_cart * nbf_cart);
+
+        gpu::computeCoreHamiltonianMatrix(
+            shell_type_infos, atoms.device_ptr(), primitive_shells.device_ptr(),
+            boys_grid.device_ptr(), cgto_normalization_factors.device_ptr(),
+            S_cart_tmp.device_ptr(), H_cart_tmp.device_ptr(),
+            atoms.size(), nbf_cart, int1e_method, verbose);
+
+        S_cart_tmp.toHost();
+        H_cart_tmp.toHost();
+
+        std::vector<real_t> S_sph_host((size_t)nbf_sph * nbf_sph);
+        std::vector<real_t> H_sph_host((size_t)nbf_sph * nbf_sph);
+        spherical::transform_matrix_cart_to_sph(
+            S_cart_tmp.host_ptr(), S_sph_host.data(),
+            shell_types_, shell_offsets_cart_, shell_offsets_sph_);
+        spherical::transform_matrix_cart_to_sph(
+            H_cart_tmp.host_ptr(), H_sph_host.data(),
+            shell_types_, shell_offsets_cart_, shell_offsets_sph_);
+
+        // Copy sph result into the sph-sized device buffers.
+        overlap_matrix.toHost();
+        core_hamiltonian_matrix.toHost();
+        std::memcpy(overlap_matrix.host_ptr(), S_sph_host.data(),
+                    (size_t)nbf_sph * nbf_sph * sizeof(real_t));
+        std::memcpy(core_hamiltonian_matrix.host_ptr(), H_sph_host.data(),
+                    (size_t)nbf_sph * nbf_sph * sizeof(real_t));
+        overlap_matrix.toDevice();
+        core_hamiltonian_matrix.toDevice();
+
+        if (verbose) {
+            std::cout << "[Spherical] Cart→Sph transform applied to S (size "
+                      << nbf_cart << "→" << nbf_sph << ") and H_core" << std::endl;
+        }
+        return;  // skip the Cartesian-only ECP/print block below
+    }
 
     // compute the core Hamiltonian matrix (T + V_nuc with effective charges)
     gpu::computeCoreHamiltonianMatrix(shell_type_infos, atoms.device_ptr(), primitive_shells.device_ptr(), boys_grid.device_ptr(), cgto_normalization_factors.device_ptr(), overlap_matrix.device_ptr(), core_hamiltonian_matrix.device_ptr(),atoms.size(), num_basis, int1e_method, verbose);
@@ -1256,9 +1317,13 @@ void HF::update_geometry(const std::vector<Atom>& moved_atoms){
     }
     primitive_shells.toDevice(); // copy the list of primitive shells to the device memory
 
-    // update the primitive shells of the auxiliary basis set if RI is used in ERI calculation, which means that the auxiliary basis set is used
-    if(eri_method_->get_algorithm_name() == "RI"){
-        auto* ri_ptr = dynamic_cast<ERI_RI*>(eri_method_.get());
+    // update the primitive shells of the auxiliary basis set if RI is used in ERI calculation, which means that the auxiliary basis set is used.
+    // Match ANY RI variant (RI, RI-Distributed, RI-OutOfCore, RI-OnTheFly,
+    // direct_ri / semi_direct_ri) via dynamic_cast rather than the algorithm-name
+    // string — the distributed class reports "RI-Distributed", so the old
+    // == "RI" check skipped the aux-coordinate update and left the 2c2e/3c2e at
+    // the previous geometry's aux positions during optimization.
+    if(auto* ri_ptr = dynamic_cast<ERI_RI*>(eri_method_.get())){
         auto& auxiliary_primitive_shells = ri_ptr->get_auxiliary_primitive_shells(); // get the auxiliary basis set
         auxiliary_primitive_shells.toHost(); // copy the auxiliary primitive shells to the host memory
         for(size_t i=0; i<auxiliary_primitive_shells.size(); i++){

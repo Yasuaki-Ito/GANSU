@@ -107,6 +107,12 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
         const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename");
         BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);
         Molecular auxiliary_molecular(molecular.get_atoms(), aux_basis);
+        if (molecular.get_use_spherical()) {
+            auxiliary_molecular.set_use_spherical(true);
+            std::cout << "[RI Spherical aux] nbf_cart = "
+                      << auxiliary_molecular.get_num_basis_cart() << " → nbf_sph = "
+                      << auxiliary_molecular.get_num_basis_sph() << std::endl;
+        }
         std::cout << "[RI] Auxiliary basis: " << auxiliary_molecular.get_num_basis() << " functions" << std::endl;
 #ifdef GANSU_MULTI_GPU
         {
@@ -148,6 +154,12 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
         const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename");
         BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);
         Molecular auxiliary_molecular(molecular.get_atoms(), aux_basis);
+        if (molecular.get_use_spherical()) {
+            auxiliary_molecular.set_use_spherical(true);
+            std::cout << "[RI Spherical aux] nbf_cart = "
+                      << auxiliary_molecular.get_num_basis_cart() << " → nbf_sph = "
+                      << auxiliary_molecular.get_num_basis_sph() << std::endl;
+        }
         std::cout << "[RI] Auxiliary basis: " << auxiliary_molecular.get_num_basis() << " functions" << std::endl;
 #ifdef GANSU_MULTI_GPU
         {
@@ -168,6 +180,12 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
         const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename");
         BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);
         Molecular auxiliary_molecular(molecular.get_atoms(), aux_basis);
+        if (molecular.get_use_spherical()) {
+            auxiliary_molecular.set_use_spherical(true);
+            std::cout << "[RI Spherical aux] nbf_cart = "
+                      << auxiliary_molecular.get_num_basis_cart() << " → nbf_sph = "
+                      << auxiliary_molecular.get_num_basis_sph() << std::endl;
+        }
         std::cout << "[RI] Auxiliary basis: " << auxiliary_molecular.get_num_basis() << " functions" << std::endl;
 #ifdef GANSU_MULTI_GPU
         {
@@ -188,6 +206,12 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
         const std::string auxiliary_gbsfilename = parameters.get<std::string>("auxiliary_gbsfilename");
         BasisSet aux_basis = get_auxiliary_basis(molecular, auxiliary_gbsfilename);
         Molecular auxiliary_molecular(molecular.get_atoms(), aux_basis);
+        if (molecular.get_use_spherical()) {
+            auxiliary_molecular.set_use_spherical(true);
+            std::cout << "[RI Spherical aux] nbf_cart = "
+                      << auxiliary_molecular.get_num_basis_cart() << " → nbf_sph = "
+                      << auxiliary_molecular.get_num_basis_sph() << std::endl;
+        }
         std::cout << "[RI] Auxiliary basis: " << auxiliary_molecular.get_num_basis() << " functions" << std::endl;
         set_eri_method(std::make_unique<ERI_RI_Hash_RHF>(*this, auxiliary_molecular));
     }else{
@@ -355,8 +379,15 @@ void RHF::guess_initial_fock_matrix(const real_t* density_matrix_a, const real_t
         if(gbsfilename_.empty()){
             THROW_EXCEPTION("The basis set file is not specified for SAD initial guess method. Please specify the basis set file name by -gbsfilename option.");
         }
+        // SAD spherical support: the guess builds the molecular density in
+        // Cartesian and transforms it Cart→Sph (Phase 3c, see guess()).
         initial_guess = std::make_unique<InitialGuess_RHF_SAD>(*this);
     }else if(initial_guess_method_ == "minao"){ // MINAO (Minimal ANO) projection
+        // MINAO projects a minimal ANO basis (Cartesian) onto the AO basis; the
+        // spherical Cart→Sph of that projection is not yet implemented — guard.
+        if(get_use_spherical())
+            THROW_EXCEPTION("MINAO initial guess does not yet support spherical basis "
+                "(--use_spherical 1). Use --initial_guess sad or core (default).");
         initial_guess = std::make_unique<InitialGuess_RHF_MINAO>(*this);
     }else{
         throw std::runtime_error("Invalid initial guess method: " + initial_guess_method_);
@@ -508,6 +539,13 @@ void RHF::export_density_matrix(real_t* density_matrix_a, real_t* density_martix
  */
 std::vector<double> RHF::compute_Energy_Hessian() {
     PROFILE_FUNCTION();
+
+    // Spherical basis: the skeleton-Hessian AO second-derivative integrals are
+    // built in Cartesian and contracted with Spherical density/coefficients
+    // (no Cart→Sph transform). Fail loudly (Phase 3 follow-up).
+    if (get_use_spherical())
+        THROW_EXCEPTION("Analytical Hessian does not yet support spherical basis "
+            "(--use_spherical 1). Run in Cartesian (omit --use_spherical).");
 
     int num_atoms_val = static_cast<int>(atoms.size());
     int ndim = 3 * num_atoms_val;
@@ -882,7 +920,19 @@ std::vector<double> RHF::compute_Energy_Hessian() {
 std::vector<double> RHF::compute_Energy_Gradient() {
     PROFILE_FUNCTION();
 
+    // Spherical-basis gradient.  The stored/Direct HF gradient is handled
+    // exactly by a Cartesian back-transform (below): D_cart = Uᵀ D_sph U and
+    // C_cart = Uᵀ C_sph, then the existing Cartesian gradient kernels give dE/dR
+    // (U is geometry-independent and, for exact ERIs, E_sph = E_cart). The RI HF
+    // gradient is spherical via the Γ back-transform path (single- and multi-GPU,
+    // Phase 3d/3e). Only the MP2 gradient (nao⁴ 2-PDM) is still Cartesian-only —
+    // guard it (its Cartesian path is itself not yet validated).
+    const bool grad_sph = get_use_spherical();
+
     if (post_hf_method_ == PostHFMethod::MP2) {
+        if (grad_sph)
+            THROW_EXCEPTION("MP2 gradient does not yet support spherical basis "
+                "(--use_spherical 1). Run in Cartesian (omit --use_spherical).");
         // MP2 gradient uses computeEnergyGradient_general with:
         //   1-electron terms: P_relaxed (HF + MP2 unrelaxed + Z-vector)
         //   Overlap term: W_MP2
@@ -933,11 +983,58 @@ std::vector<double> RHF::compute_Energy_Gradient() {
     // exposes it (currently ERI_RI; ERI_RI_Distributed_RHF added in Phase 4).
     std::vector<double> gradient;
     if (eri_method_->supports_ri_gradient()) {
+        // Spherical RI gradient: compute_ri_gradient dispatches internally to
+        // the back-transform path (Γ assembled in the spherical metric, then
+        // back-transformed to Cartesian for the derivative kernels). Both the
+        // single-GPU (compute_ri_gradient_spherical) and multi-GPU distributed
+        // (compute_ri_gradient_spherical_distributed) paths support spherical.
         gradient = eri_method_->compute_ri_gradient(
             density_matrix.device_ptr(),
             coefficient_matrix.device_ptr(),
             orbital_energies.device_ptr(),
             num_electrons);
+    } else if (grad_sph) {
+        // === Spherical stored/Direct HF gradient via Cartesian back-transform ===
+        const int nc = get_num_basis_cart();
+        const int ns = num_basis;                 // spherical AO count (= #MOs)
+        const size_t nc2 = (size_t)nc * nc;
+        const auto& sht  = get_shell_types();
+        const auto& offc = get_shell_offsets_cart();
+        const auto& offs = get_shell_offsets_sph();
+
+        real_t *d_D_cart=nullptr, *d_C_pack=nullptr, *d_C_cart=nullptr, *d_eps_cart=nullptr;
+        gansu::tracked_cudaMalloc(&d_D_cart,  nc2 * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_C_pack,  (size_t)nc * ns * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_C_cart,  nc2 * sizeof(real_t));
+        gansu::tracked_cudaMalloc(&d_eps_cart, (size_t)nc * sizeof(real_t));
+
+        // D_cart = Uᵀ D_sph U ;  C_pack[nc × ns] = Uᵀ C_sph
+        spherical::transform_matrix_sph_to_cart_device(
+            density_matrix.device_ptr(), d_D_cart, sht, offc, offs);
+        spherical::transform_coeff_sph_to_cart_device(
+            coefficient_matrix.device_ptr(), d_C_pack, ns, sht, offc, offs);
+
+        // Pad C to [nc × nc] (extra MO columns 0) and eps to [nc] (extra 0).
+        // The gradient only uses occupied MOs (< ns), so padding is inert.
+        cudaMemset(d_C_cart, 0, nc2 * sizeof(real_t));
+        cudaMemcpy2D(d_C_cart, (size_t)nc * sizeof(real_t),
+                     d_C_pack, (size_t)ns * sizeof(real_t),
+                     (size_t)ns * sizeof(real_t), (size_t)nc, cudaMemcpyDeviceToDevice);
+        cudaMemset(d_eps_cart, 0, (size_t)nc * sizeof(real_t));
+        cudaMemcpy(d_eps_cart, orbital_energies.device_ptr(),
+                   (size_t)ns * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+        gradient = gpu::computeEnergyGradient_RHF(
+            shell_type_infos, shell_pair_type_infos, atoms.device_ptr(),
+            d_D_cart, d_C_cart, d_eps_cart,
+            primitive_shells.device_ptr(), boys_grid.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
+            static_cast<int>(atoms.size()), nc, num_electrons, verbose);
+
+        gansu::tracked_cudaFree(d_D_cart);
+        gansu::tracked_cudaFree(d_C_pack);
+        gansu::tracked_cudaFree(d_C_cart);
+        gansu::tracked_cudaFree(d_eps_cart);
     } else {
         gradient = gpu::computeEnergyGradient_RHF(
             shell_type_infos,
@@ -1190,8 +1287,12 @@ void RHF::export_molden_file(const std::string& filename) {
 
     ofs << "[GTO]" << std::endl;
     primitive_shells.toHost();
-    std::vector<int> num_primitives(num_basis, 0);
-    std::vector<int> shell_types(num_basis, 0);
+    // [GTO] writes Cart-indexed primitive shell info (primitive_shells.basis_index
+    // is the Cart basis function index 0..nbf_cart-1).  When use_spherical, num_basis
+    // = nbf_sph < nbf_cart, so sizing these arrays by num_basis triggers OOB writes.
+    const size_t nbf_for_gto = get_use_spherical() ? get_num_basis_cart() : num_basis;
+    std::vector<int> num_primitives(nbf_for_gto, 0);
+    std::vector<int> shell_types(nbf_for_gto, 0);
     for(size_t i=0; i<primitive_shells.size(); i++){
         num_primitives[primitive_shells[i].basis_index]++;
         shell_types[primitive_shells[i].basis_index] = primitive_shells[i].shell_type;
@@ -1199,7 +1300,7 @@ void RHF::export_molden_file(const std::string& filename) {
 
     for(size_t i=0; i<atoms.size(); i++){
         ofs << i+1 << " " << 0 << std::endl;
-        BasisRange basis_range = get_atom_to_basis_range()[i];
+        BasisRange basis_range = get_atom_to_basis_range_cart()[i];  // Molden [GTO]: Cartesian shell layout
         for(size_t j=basis_range.start_index; j<basis_range.end_index; j++){
             if(num_primitives[j] == 0){ // skip non-representative basis functions (e.g. py,pz, etc.)
                 continue;
@@ -1217,6 +1318,16 @@ void RHF::export_molden_file(const std::string& filename) {
     ofs << std::endl; // empty line
     
     // write the orbital energies
+    if (get_use_spherical()) {
+        // Molden spherical-basis markers (per Molden file format spec):
+        // [5D] = 5 D functions in spherical order, [7F] = 7 F, [9G] = 9 G.
+        // Coefficient ordering for spherical functions follows Molden's m-order
+        // (d_0, d_+1, d_-1, d_+2, d_-2 etc.), which matches what GANSU's
+        // Cart→Sph transform produces.
+        ofs << "[5D]" << std::endl;
+        ofs << "[7F]" << std::endl;
+        ofs << "[9G]" << std::endl;
+    }
     ofs << "[MO]" << std::endl;
     orbital_energies.toHost();
     coefficient_matrix.toHost();
@@ -1256,8 +1367,12 @@ void RHF::export_molden_file(const std::string& filename) {
 
     ofs << "[GTO]" << std::endl;
     primitive_shells.toHost();
-    std::vector<int> num_primitives(num_basis, 0);
-    std::vector<int> shell_types(num_basis, 0);
+    // [GTO] writes Cart-indexed primitive shell info (primitive_shells.basis_index
+    // is the Cart basis function index 0..nbf_cart-1).  When use_spherical, num_basis
+    // = nbf_sph < nbf_cart, so sizing these arrays by num_basis triggers OOB writes.
+    const size_t nbf_for_gto = get_use_spherical() ? get_num_basis_cart() : num_basis;
+    std::vector<int> num_primitives(nbf_for_gto, 0);
+    std::vector<int> shell_types(nbf_for_gto, 0);
     for(size_t i=0; i<primitive_shells.size(); i++){
         num_primitives[primitive_shells[i].basis_index]++;
         shell_types[primitive_shells[i].basis_index] = primitive_shells[i].shell_type;
@@ -1265,7 +1380,7 @@ void RHF::export_molden_file(const std::string& filename) {
 
     for(size_t i=0; i<atoms.size(); i++){
         ofs << i+1 << " " << 0 << std::endl;
-        BasisRange basis_range = get_atom_to_basis_range()[i];
+        BasisRange basis_range = get_atom_to_basis_range_cart()[i];  // Molden [GTO]: Cartesian shell layout
         for(size_t j=basis_range.start_index; j<basis_range.end_index; j++){
             if(num_primitives[j] == 0){ // skip non-representative basis functions (e.g. py,pz, etc.)
                 continue;
@@ -1283,6 +1398,16 @@ void RHF::export_molden_file(const std::string& filename) {
 //    ofs << std::endl; // empty line
 
     // write the orbital energies
+    if (get_use_spherical()) {
+        // Molden spherical-basis markers (per Molden file format spec):
+        // [5D] = 5 D functions in spherical order, [7F] = 7 F, [9G] = 9 G.
+        // Coefficient ordering for spherical functions follows Molden's m-order
+        // (d_0, d_+1, d_-1, d_+2, d_-2 etc.), which matches what GANSU's
+        // Cart→Sph transform produces.
+        ofs << "[5D]" << std::endl;
+        ofs << "[7F]" << std::endl;
+        ofs << "[9G]" << std::endl;
+    }
     ofs << "[MO]" << std::endl;
     orbital_energies.toHost();
     coefficient_matrix.toHost();
@@ -1331,15 +1456,19 @@ void RHF::export_lmo_molden_file(const std::string& filename) {
     }
     ofs << "[GTO]" << std::endl;
     primitive_shells.toHost();
-    std::vector<int> num_primitives(num_basis, 0);
-    std::vector<int> shell_types(num_basis, 0);
+    // [GTO] writes Cart-indexed primitive shell info (primitive_shells.basis_index
+    // is the Cart basis function index 0..nbf_cart-1).  When use_spherical, num_basis
+    // = nbf_sph < nbf_cart, so sizing these arrays by num_basis triggers OOB writes.
+    const size_t nbf_for_gto = get_use_spherical() ? get_num_basis_cart() : num_basis;
+    std::vector<int> num_primitives(nbf_for_gto, 0);
+    std::vector<int> shell_types(nbf_for_gto, 0);
     for(size_t i=0; i<primitive_shells.size(); i++){
         num_primitives[primitive_shells[i].basis_index]++;
         shell_types[primitive_shells[i].basis_index] = primitive_shells[i].shell_type;
     }
     for(size_t i=0; i<atoms.size(); i++){
         ofs << i+1 << " " << 0 << std::endl;
-        BasisRange basis_range = get_atom_to_basis_range()[i];
+        BasisRange basis_range = get_atom_to_basis_range_cart()[i];  // Molden [GTO]: Cartesian shell layout
         for(size_t j=basis_range.start_index; j<basis_range.end_index; j++){
             if(num_primitives[j] == 0) continue;
             ofs << " " << shell_type_to_shell_name(shell_types[j]) << " " << num_primitives[j] << " " << "1.00" << std::endl;
@@ -1396,6 +1525,16 @@ void RHF::export_lmo_molden_file(const std::string& filename) {
     }
 
     // --- [MO] block: LMOs (occupied) + canonical virtuals -----------------
+    if (get_use_spherical()) {
+        // Molden spherical-basis markers (per Molden file format spec):
+        // [5D] = 5 D functions in spherical order, [7F] = 7 F, [9G] = 9 G.
+        // Coefficient ordering for spherical functions follows Molden's m-order
+        // (d_0, d_+1, d_-1, d_+2, d_-2 etc.), which matches what GANSU's
+        // Cart→Sph transform produces.
+        ofs << "[5D]" << std::endl;
+        ofs << "[7F]" << std::endl;
+        ofs << "[9G]" << std::endl;
+    }
     ofs << "[MO]" << std::endl;
     // Occupied: write C_LMO column by column.
     for (int i = 0; i < nocc; ++i) {

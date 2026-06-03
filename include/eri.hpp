@@ -539,6 +539,48 @@ public:
         const size_t P_local_end,
         const bool include_one_electron);
 
+    /// Spherical-basis RI gradient (single-GPU).  The density / coefficient /
+    /// orbital-energy inputs and intermediate_matrix_B_ are all in the spherical
+    /// basis (ns_orb / ns_aux).  Assembles Γ^(3)_sph and Γ^(2)_sph with the
+    /// spherical J^{-1} metric (L_sph = Cholesky of U_aux·(P|Q)_cart·U_auxᵀ),
+    /// back-transforms them to the Cartesian basis (transform_3index_sph_to_cart
+    /// / transform_matrix_sph_to_cart), and contracts with the Cartesian 3c2e /
+    /// 2c2e derivative kernels.  The 1-electron / overlap / nuclear terms use the
+    /// Cartesian D_cart = Uᵀ D_sph U and W_cart = Uᵀ W_sph U.  Exact (up to the RI
+    /// approximation) since U is geometry-independent.
+    std::vector<double> compute_ri_gradient_spherical(
+        const real_t* d_density_matrix,
+        const real_t* d_coefficient_matrix,
+        const real_t* d_orbital_energies,
+        const int num_electron);
+
+    /// Build the FULL Cartesian RI-gradient intermediates Γ^(3)_cart
+    /// [nc_aux × nc_orb²] and Γ^(2)_cart [nc_aux × nc_aux] from the spherical
+    /// B (= L_sph⁻¹·(P|μν)_sph, [ns_aux × ns_orb²]) and spherical density
+    /// [ns_orb²], on the CURRENT CUDA device.  Factored out of
+    /// compute_ri_gradient_spherical so the multi-GPU distributed path can build
+    /// Γ_cart once on GPU 0 (single-device, avoiding the multi-GPU thread_local
+    /// cuBLAS-handle hazard) and replicate, then contract local Cartesian aux
+    /// P-slabs with kernel-only OpenMP.  Caller owns the two returned device
+    /// allocations (tracked_cudaFree).
+    void build_ri_gamma_cart_spherical(
+        const real_t* d_B_sph,
+        const real_t* d_density_sph,
+        real_t** d_gamma3_cart_out,
+        real_t** d_gamma2_cart_out);
+
+    /// Build the SPHERICAL RI-gradient intermediates Γ^(3)_sph [ns_aux × ns_orb²]
+    /// and Γ^(2)_sph [ns_aux × ns_aux] (steps 1–6, before the Cart back-transform)
+    /// from spherical B and D, on the current device. Caller owns the two returned
+    /// allocations (tracked_cudaFree). build_ri_gamma_cart_spherical is this +
+    /// the back-transform; the multi-GPU "chunked" gradient path keeps Γ_sph and
+    /// back-transforms only one aux P-slab at a time (peak relief on GPU 0).
+    void build_ri_gamma_spherical_sph(
+        const real_t* d_B_sph,
+        const real_t* d_density_sph,
+        real_t** d_gamma3_sph_out,
+        real_t** d_gamma2_sph_out);
+
     bool supports_post_hf_method(PostHFMethod method) const override {
         if( method == PostHFMethod::None
          || method == PostHFMethod::MP2
@@ -585,6 +627,16 @@ protected:
     const std::vector<ShellTypeInfo> auxiliary_shell_type_infos_; ///< Shell type info in the primitive shell list
     DeviceHostMemory<PrimitiveShell> auxiliary_primitive_shells_; ///< Primitive shells
     DeviceHostMemory<real_t> auxiliary_cgto_normalization_factors_; ///< Normalization factors of the contracted Gauss functions
+
+    /// Spherical-basis support (Phase 2): Cart count + shell offset arrays
+    /// for the auxiliary basis.  Equal to (num_auxiliary_basis_, {}, …)
+    /// when the orbital side is Cartesian.  When use_spherical is active,
+    /// num_auxiliary_basis_ holds the Sph count and these fields the Cart
+    /// metadata needed to run the Cart→Sph transform on (P|μν) and (P|Q).
+    const int num_auxiliary_basis_cart_;
+    const std::vector<int> aux_shell_types_;
+    const std::vector<int> aux_shell_offsets_cart_;
+    const std::vector<int> aux_shell_offsets_sph_;
 
     DeviceHostMatrix<real_t> intermediate_matrix_B_; ///< intermediate matrix B (num_auxiliary_basis_ x (num_basis_x num_basis_))
 

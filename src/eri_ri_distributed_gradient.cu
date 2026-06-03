@@ -30,7 +30,9 @@
 #include "grad_2c.hpp"
 #include "grad_3c.hpp"
 #include "int2e.hpp"  // comb_max(L)
+#include "spherical_transform.hpp"
 #include <algorithm>
+#include <cstdlib>   // std::getenv (GANSU_SPH_GRAD_GAMMA_CHUNKED)
 
 namespace gansu {
 
@@ -320,6 +322,14 @@ std::vector<double> ERI_RI_Distributed_RHF::compute_ri_gradient(
     const real_t* d_orbital_energies,
     const int num_electron)
 {
+    // Spherical distributed RI gradient: build Γ_cart once on GPU 0 (single-
+    // device, no multi-GPU cuBLAS-handle hazard), replicate, then contract local
+    // Cartesian aux P-slabs with kernel-only OpenMP. (See method below.)
+    if (hf_.get_use_spherical()) {
+        return compute_ri_gradient_spherical_distributed(
+            d_density_matrix, d_coefficient_matrix, d_orbital_energies, num_electron);
+    }
+
     const int nbas = num_basis_;
     const int naux = num_auxiliary_basis_;
     const size_t nbas2 = (size_t)nbas * (size_t)nbas;
@@ -885,6 +895,405 @@ std::vector<double> ERI_RI_Distributed_RHF::compute_ri_gradient(
     if (hf_.get_verbose()) {
         std::cout << "[RI-Distributed Gradient v4] Done." << std::endl;
     }
+    return gradient;
+}
+
+
+// ============================================================================
+// ERI_RI_Distributed_RHF::compute_ri_gradient_spherical_distributed
+//
+// Multi-GPU spherical RI gradient. The Γ assembly (spherical metric L_sph +
+// back-transform to Cartesian) uses many cuBLAS calls; doing it per-GPU under
+// OpenMP would hit the thread_local cuBLAS-handle device-binding hazard. So we
+// build the FULL Γ^(3)_cart [nc_aux × nc_orb²] and Γ^(2)_cart [nc_aux × nc_aux]
+// ONCE on GPU 0 (single device, main thread — reusing the validated single-GPU
+// ERI_RI::build_ri_gamma_cart_spherical), replicate them to every GPU, and then
+// each GPU contracts only its local Cartesian aux P-slab of the 3c2e/2c2e
+// derivative kernels in a kernel-ONLY OpenMP section (no cuBLAS → no hazard).
+// The 1-electron / overlap / nuclear terms (Cart D/W via back-transform) run on
+// GPU 0. NCCL AllReduce sums the per-GPU gradients.
+//
+// The parallelised work is the dominant 3c2e/2c2e kernel contraction; the GPU-0
+// Γ build (2c2e + Cholesky + a few DGEMMs + back-transform) is a small serial
+// fraction. Per-GPU memory: full B_sph (replicated, SCF cost) + full Γ^(3)_cart
+// (~nc_aux·nc_orb²·8 B, e.g. ~1.5 GB at Pentacene scale).
+// ============================================================================
+std::vector<double> ERI_RI_Distributed_RHF::compute_ri_gradient_spherical_distributed(
+    const real_t* d_density_matrix,      // D_sph [ns_orb²], on GPU 0
+    const real_t* d_coefficient_matrix,  // C_sph [ns_orb × ns_orb], on GPU 0
+    const real_t* d_orbital_energies,    // eps_sph [ns_orb], on GPU 0
+    const int num_electron)
+{
+    const int nc_orb = hf_.get_num_basis_cart();
+    const int nc_aux = num_auxiliary_basis_cart_;
+    const int ns_orb = num_basis_;
+    const int ns_aux = num_auxiliary_basis_;
+    const size_t nc_orb2 = (size_t)nc_orb * nc_orb;
+    const size_t ns_orb2 = (size_t)ns_orb * ns_orb;
+    const int num_atoms = (int)hf_.get_atoms().size();
+    const int n3 = 3 * num_atoms;
+
+    auto& mgr = MultiGpuManager::instance();
+
+    const auto& primitive_shells = hf_.get_primitive_shells();
+    const auto& cgto_norms       = hf_.get_cgto_normalization_factors();
+    const auto& atoms_dh         = hf_.get_atoms();
+    const auto& boys_grid        = hf_.get_boys_grid();
+    const auto& shell_type_infos = hf_.get_shell_type_infos();
+    const std::vector<gansu::ShellTypeInfo>& aux_shell_type_infos =
+        auxiliary_shell_type_infos_;
+    const auto& orb_sht  = hf_.get_shell_types();
+    const auto& orb_offc = hf_.get_shell_offsets_cart();
+    const auto& orb_offs = hf_.get_shell_offsets_sph();
+
+    if (hf_.get_verbose()) {
+        std::cout << "[RI-Distributed Gradient sph] num_gpus=" << num_gpus_
+                  << " nc_aux=" << nc_aux << " nc_orb=" << nc_orb
+                  << " (ns_aux=" << ns_aux << " ns_orb=" << ns_orb << ")" << std::endl;
+    }
+
+    const bool replicated = replicate_B_to_all_gpus();
+
+    cudaSetDevice(0);
+    cudaDeviceSetLimit(cudaLimitStackSize, 64 * 1024);
+
+    // ---- Full B_sph [ns_aux × ns_orb²] on GPU 0 ----
+    real_t* d_B_sph_g0 = nullptr;
+    bool b_owned = false;
+    if (replicated) {
+        d_B_sph_g0 = d_B_full_per_gpu_[0];
+    } else {
+        tracked_cudaMalloc(&d_B_sph_g0, (size_t)ns_aux * ns_orb2 * sizeof(real_t));
+        b_owned = true;
+        std::vector<size_t> offsets(num_gpus_, 0);
+        for (int g = 1; g < num_gpus_; g++)
+            offsets[g] = offsets[g - 1] + (size_t)naux_local_[g - 1] * ns_orb2;
+        for (int src = 0; src < num_gpus_; src++) {
+            const size_t bytes_src = (size_t)naux_local_[src] * ns_orb2 * sizeof(real_t);
+            if (bytes_src == 0) continue;
+            if (src == 0)
+                cudaMemcpy(d_B_sph_g0 + offsets[src], d_B_local_[src], bytes_src,
+                           cudaMemcpyDeviceToDevice);
+            else
+                cudaMemcpyPeer(d_B_sph_g0 + offsets[src], 0, d_B_local_[src], src, bytes_src);
+        }
+        cudaDeviceSynchronize();
+    }
+
+    // ---- Build Γ on GPU 0. Default (Stage 1): full Γ_cart, sliced into per-GPU
+    //      slabs below. Opt-in GANSU_SPH_GRAD_GAMMA_CHUNKED (multi-GPU only,
+    //      Stage 2): defer to a chunked build that back-transforms one aux P-slab
+    //      of Γ³ at a time and scatters it directly — the full Γ³_cart
+    //      (nc_aux·nc_orb², ~17 GB at cholesterol) is never materialized on
+    //      GPU 0, relieving its build-transient peak for cholesterol-and-beyond.
+    const bool want_chunked =
+        replicated && (std::getenv("GANSU_SPH_GRAD_GAMMA_CHUNKED") != nullptr);
+    real_t *d_g3 = nullptr, *d_g2 = nullptr;
+    if (!want_chunked) {
+        build_ri_gamma_cart_spherical(d_B_sph_g0, d_density_matrix, &d_g3, &d_g2);
+        if (b_owned) { tracked_cudaFree(d_B_sph_g0); d_B_sph_g0 = nullptr; }
+    }
+    // else: d_B_sph_g0 stays alive for the chunked build in the replicated branch.
+
+    // ---- Per-GPU gradient buffers ----
+    std::vector<double*> d_grad_per_gpu(num_gpus_, nullptr);
+    for (int g = 0; g < num_gpus_; g++) {
+        cudaSetDevice(g);
+        tracked_cudaMalloc(&d_grad_per_gpu[g], n3 * sizeof(double));
+        cudaMemset(d_grad_per_gpu[g], 0, n3 * sizeof(double));
+    }
+
+    // ---- 1-electron + S + N gradient on GPU 0 (Cartesian D/W back-transform) ----
+    cudaSetDevice(0);
+    {
+        real_t *d_D_cart=nullptr, *d_W_sph=nullptr, *d_W_cart=nullptr;
+        tracked_cudaMalloc(&d_D_cart, nc_orb2 * sizeof(real_t));
+        tracked_cudaMalloc(&d_W_sph,  ns_orb2 * sizeof(real_t));
+        tracked_cudaMalloc(&d_W_cart, nc_orb2 * sizeof(real_t));
+        cudaMemset(d_W_sph, 0, ns_orb2 * sizeof(real_t));
+        spherical::transform_matrix_sph_to_cart_device(
+            d_density_matrix, d_D_cart, orb_sht, orb_offc, orb_offs);
+        gpu::compute_W(d_W_sph, d_coefficient_matrix, d_orbital_energies, ns_orb, num_electron);
+        spherical::transform_matrix_sph_to_cart_device(
+            d_W_sph, d_W_cart, orb_sht, orb_offc, orb_offs);
+        tracked_cudaFree(d_W_sph);
+
+        const int shell_type_count = (int)shell_type_infos.size();
+        const int threads_per_block = 128;
+        for (int s0 = shell_type_count - 1; s0 >= 0; s0--) {
+            for (int s1 = shell_type_count - 1; s1 >= s0; s1--) {
+                const auto info0 = shell_type_infos[s0];
+                const auto info1 = shell_type_infos[s1];
+                const size_t n_pairs = (s0 == s1) ? (size_t)info0.count*(info0.count+1)/2
+                                                  : (size_t)info0.count*info1.count;
+                if (n_pairs == 0) continue;
+                const size_t blocks = (n_pairs + threads_per_block - 1) / threads_per_block;
+                gpu::compute_gradients_overlap<<<(unsigned int)blocks, threads_per_block>>>(
+                    d_grad_per_gpu[0], d_W_cart, primitive_shells.device_ptr(), cgto_norms.device_ptr(),
+                    nc_orb, info0, info1, n_pairs);
+                gpu::compute_gradients_kinetic<<<(unsigned int)blocks, threads_per_block>>>(
+                    d_grad_per_gpu[0], d_D_cart, primitive_shells.device_ptr(), cgto_norms.device_ptr(),
+                    nc_orb, info0, info1, n_pairs);
+                gpu::compute_gradients_nuclear<<<(unsigned int)blocks, threads_per_block>>>(
+                    d_grad_per_gpu[0], d_D_cart, primitive_shells.device_ptr(), cgto_norms.device_ptr(),
+                    atoms_dh.device_ptr(), num_atoms, nc_orb, info0, info1, n_pairs,
+                    boys_grid.device_ptr());
+            }
+        }
+        const size_t nr_threads = (size_t)num_atoms * (size_t)num_atoms;
+        const size_t nr_blocks  = (nr_threads + threads_per_block - 1) / threads_per_block;
+        gpu::compute_nuclear_repulsion_gradient_kernel<<<(unsigned int)nr_blocks, threads_per_block>>>(
+            d_grad_per_gpu[0], atoms_dh.device_ptr(), num_atoms);
+        cudaDeviceSynchronize();
+
+        tracked_cudaFree(d_D_cart);
+        tracked_cudaFree(d_W_cart);
+    }
+
+    // ---- Cartesian aux cshell-aligned partition (mirror of the Cart v4 path) ----
+    const PrimitiveShell* h_aux_prim = auxiliary_primitive_shells_.host_ptr();
+    if (h_aux_prim == nullptr)
+        throw std::runtime_error("[RI-Distributed Gradient sph] aux host_ptr is null");
+    const size_t n_prim_aux = auxiliary_primitive_shells_.size();
+
+    struct CShell { size_t basis_idx; int L; };
+    std::vector<CShell> cshells;
+    cshells.reserve(n_prim_aux);
+    for (size_t i = 0; i < n_prim_aux; i++) {
+        if (i == 0 || h_aux_prim[i].basis_index != h_aux_prim[i-1].basis_index)
+            cshells.push_back({(size_t)h_aux_prim[i].basis_index, h_aux_prim[i].shell_type});
+    }
+    std::sort(cshells.begin(), cshells.end(),
+              [](const CShell& a, const CShell& b){ return a.basis_idx < b.basis_idx; });
+    const size_t n_cshells = cshells.size();
+
+    std::vector<size_t> basis_start(num_gpus_), basis_end(num_gpus_);
+    std::vector<int>    nl_basis(num_gpus_, 0);
+    for (int g = 0; g < num_gpus_; g++) {
+        auto [cs, ce] = aux_partition(n_cshells, num_gpus_, g);
+        if (cs >= ce) { basis_start[g] = nc_aux; basis_end[g] = nc_aux; nl_basis[g] = 0; continue; }
+        basis_start[g] = cshells[cs].basis_idx;
+        basis_end[g]   = cshells[ce-1].basis_idx + (size_t)gpu::comb_max(cshells[ce-1].L);
+        nl_basis[g]    = (int)(basis_end[g] - basis_start[g]);
+    }
+
+    if (replicated) {
+        // ---- Replicate small SCF buffers; SCATTER Γ_cart per-GPU slab; then
+        //      kernel-only OpenMP contraction of each local slab ----
+        auto d_prim_pg     = replicate_to_all_gpus<gansu::PrimitiveShell>(
+            primitive_shells.device_ptr(), primitive_shells.size(), num_gpus_);
+        auto d_cgto_pg     = replicate_to_all_gpus<real_t>(
+            cgto_norms.device_ptr(), cgto_norms.size(), num_gpus_);
+        auto d_boys_pg     = replicate_to_all_gpus<real_t>(
+            boys_grid.device_ptr(), boys_grid.size(), num_gpus_);
+        auto d_aux_prim_pg = replicate_to_all_gpus<gansu::PrimitiveShell>(
+            auxiliary_primitive_shells_.device_ptr(), n_prim_aux, num_gpus_);
+        auto d_aux_cgto_pg = replicate_to_all_gpus<real_t>(
+            auxiliary_cgto_normalization_factors_.device_ptr(),
+            auxiliary_cgto_normalization_factors_.size(), num_gpus_);
+        // Each GPU g ends up holding ONLY its local aux P-slab of Γ_cart
+        // (rows [basis_start[g], basis_end[g])). The local slab's row 0 maps to
+        // global aux basis row basis_start[g]; launch_*_grad_local's phantom
+        // pointer (− basis_P_start·stride) handles the global P indexing, so we
+        // pass the slab base directly.
+        std::vector<real_t*> d_g3_slab(num_gpus_, nullptr);
+        std::vector<real_t*> d_g2_slab(num_gpus_, nullptr);
+
+        if (!want_chunked) {
+            // ---- Stage 1: SLICE the full GPU-0 Γ_cart into per-GPU slabs ----
+            // Full Γ^(3)_cart (nc_aux·nc_orb²) was built on GPU 0; copy each GPU's
+            // row range and free the full copy. Bit-identical (same data, sliced).
+            for (int g = 0; g < num_gpus_; g++) {
+                if (nl_basis[g] == 0) continue;
+                const size_t g3_bytes = (size_t)nl_basis[g] * nc_orb2 * sizeof(real_t);
+                const size_t g2_bytes = (size_t)nl_basis[g] * (size_t)nc_aux * sizeof(real_t);
+                cudaSetDevice(g);
+                tracked_cudaMalloc(&d_g3_slab[g], g3_bytes);
+                tracked_cudaMalloc(&d_g2_slab[g], g2_bytes);
+                const real_t* g3_src = d_g3 + basis_start[g] * nc_orb2;          // GPU 0
+                const real_t* g2_src = d_g2 + basis_start[g] * (size_t)nc_aux;   // GPU 0
+                if (g == 0) {
+                    cudaMemcpy(d_g3_slab[g], g3_src, g3_bytes, cudaMemcpyDeviceToDevice);
+                    cudaMemcpy(d_g2_slab[g], g2_src, g2_bytes, cudaMemcpyDeviceToDevice);
+                } else {
+                    cudaMemcpyPeer(d_g3_slab[g], g, g3_src, 0, g3_bytes);
+                    cudaMemcpyPeer(d_g2_slab[g], g, g2_src, 0, g2_bytes);
+                }
+            }
+            for (int g = 0; g < num_gpus_; g++) { cudaSetDevice(g); cudaDeviceSynchronize(); }
+            cudaSetDevice(0);
+            tracked_cudaFree(d_g3); d_g3 = nullptr;
+            tracked_cudaFree(d_g2); d_g2 = nullptr;
+        } else {
+            // ---- Stage 2: CHUNKED build — never materialize full Γ³_cart ----
+            // Build Γ_sph on GPU 0, back-transform Γ² in full (tiny, nc_aux²) and
+            // scatter its row-slices, then for each GPU g back-transform ONLY its
+            // aux P-slab of Γ³ (sph rows [bs_start,bs_end) → cart rows
+            // [basis_start[g],basis_end[g))) using the aux U block restricted to
+            // that chunk's shells, and scatter directly. GPU-0 peak drops from
+            // (full B + full Γ³_sph + full Γ³_cart) to (full B + Γ³_sph + 1 chunk).
+            cudaSetDevice(0);
+            real_t *d_g3_sph=nullptr, *d_g2_sph=nullptr;
+            build_ri_gamma_spherical_sph(d_B_sph_g0, d_density_matrix, &d_g3_sph, &d_g2_sph);
+            if (b_owned) { tracked_cudaFree(d_B_sph_g0); d_B_sph_g0 = nullptr; }
+
+            // Full Γ²_cart on GPU 0 (small) — sliced per GPU like Stage 1.
+            real_t* d_g2_cart_full = nullptr;
+            tracked_cudaMalloc(&d_g2_cart_full, (size_t)nc_aux * nc_aux * sizeof(real_t));
+            spherical::transform_matrix_sph_to_cart_device(
+                d_g2_sph, d_g2_cart_full,
+                aux_shell_types_, aux_shell_offsets_cart_, aux_shell_offsets_sph_);
+            tracked_cudaFree(d_g2_sph);
+
+            const int n_aux_shells = (int)aux_shell_types_.size();
+            for (int g = 0; g < num_gpus_; g++) {
+                if (nl_basis[g] == 0) continue;
+                const size_t bc_start = basis_start[g];
+                const size_t bc_end   = basis_end[g];
+                // Aux shells covering the chunk's Cartesian basis range (offsets
+                // are monotonic; the partition is shell-aligned).
+                int sh_lo = -1, sh_hi = -1;
+                for (int i = 0; i < n_aux_shells; i++) {
+                    const size_t off = (size_t)aux_shell_offsets_cart_[i];
+                    if (off >= bc_start && off < bc_end) { if (sh_lo < 0) sh_lo = i; sh_hi = i + 1; }
+                }
+                if (sh_lo < 0 || (size_t)aux_shell_offsets_cart_[sh_hi] != bc_end) {
+                    throw std::runtime_error("[RI-Dist sph chunked] aux chunk not "
+                        "shell-aligned (partition boundary inside a shell)");
+                }
+                const int bs_start = aux_shell_offsets_sph_[sh_lo];
+                std::vector<int> ch_types, ch_offc, ch_offs;
+                for (int i = sh_lo; i < sh_hi; i++) {
+                    ch_types.push_back(aux_shell_types_[i]);
+                    ch_offc.push_back(aux_shell_offsets_cart_[i] - (int)bc_start);
+                    ch_offs.push_back(aux_shell_offsets_sph_[i]  - bs_start);
+                }
+                ch_offc.push_back((int)(bc_end - bc_start));                       // nl_cart
+                ch_offs.push_back(aux_shell_offsets_sph_[sh_hi] - bs_start);       // nl_sph
+                const int nl_cart = nl_basis[g];
+
+                // Γ³_cart_chunk [nl_cart × nc_orb²] on GPU 0: back-transform the
+                // chunk's sph rows with the chunk-local aux U block + full orb U.
+                cudaSetDevice(0);
+                real_t* d_g3c_chunk = nullptr;
+                tracked_cudaMalloc(&d_g3c_chunk, (size_t)nl_cart * nc_orb2 * sizeof(real_t));
+                spherical::transform_3index_sph_to_cart_device(
+                    d_g3_sph + (size_t)bs_start * ns_orb2, d_g3c_chunk,
+                    ch_types, ch_offc, ch_offs,
+                    orb_sht, orb_offc, orb_offs);
+
+                // Scatter Γ³ chunk + Γ² row-slice to GPU g.
+                const size_t g3_bytes = (size_t)nl_cart * nc_orb2 * sizeof(real_t);
+                const size_t g2_bytes = (size_t)nl_cart * (size_t)nc_aux * sizeof(real_t);
+                const real_t* g2_src = d_g2_cart_full + bc_start * (size_t)nc_aux;
+                cudaSetDevice(g);
+                tracked_cudaMalloc(&d_g3_slab[g], g3_bytes);
+                tracked_cudaMalloc(&d_g2_slab[g], g2_bytes);
+                if (g == 0) {
+                    cudaMemcpy(d_g3_slab[g], d_g3c_chunk, g3_bytes, cudaMemcpyDeviceToDevice);
+                    cudaMemcpy(d_g2_slab[g], g2_src,      g2_bytes, cudaMemcpyDeviceToDevice);
+                } else {
+                    cudaMemcpyPeer(d_g3_slab[g], g, d_g3c_chunk, 0, g3_bytes);
+                    cudaMemcpyPeer(d_g2_slab[g], g, g2_src,      0, g2_bytes);
+                }
+                cudaSetDevice(0);
+                tracked_cudaFree(d_g3c_chunk);
+            }
+            tracked_cudaFree(d_g3_sph);
+            tracked_cudaFree(d_g2_cart_full);
+            for (int g = 0; g < num_gpus_; g++) { cudaSetDevice(g); cudaDeviceSynchronize(); }
+            cudaSetDevice(0);
+        }
+
+        #pragma omp parallel num_threads(num_gpus_)
+        {
+            const int d = omp_get_thread_num();
+            cudaSetDevice(d);
+            cudaDeviceSetLimit(cudaLimitStackSize, 64 * 1024);
+            if (nl_basis[d] > 0) {
+                const size_t P_start = basis_start[d];
+                const size_t P_end   = basis_end[d];
+                launch_3c2e_grad_local(
+                    d_grad_per_gpu[d], d_g3_slab[d],   // row 0 = global P_start
+                    shell_type_infos, aux_shell_type_infos,
+                    d_prim_pg[d], d_aux_prim_pg[d],
+                    d_cgto_pg[d], d_aux_cgto_pg[d],
+                    nc_orb, nc_aux, d_boys_pg[d],
+                    h_aux_prim, P_start, P_end);
+                cudaDeviceSynchronize();
+                launch_2c2e_grad_local(
+                    d_grad_per_gpu[d], d_g2_slab[d],   // row 0 = global P_start
+                    aux_shell_type_infos,
+                    d_aux_prim_pg[d], d_aux_cgto_pg[d],
+                    nc_aux, d_boys_pg[d],
+                    h_aux_prim, P_start, P_end);
+                cudaDeviceSynchronize();
+            }
+        }
+
+        for (int g = 0; g < num_gpus_; g++) {
+            cudaSetDevice(g);
+            if (d_g3_slab[g]) tracked_cudaFree(d_g3_slab[g]);
+            if (d_g2_slab[g]) tracked_cudaFree(d_g2_slab[g]);
+        }
+        cudaSetDevice(0);
+
+        free_per_gpu_replicas(d_aux_cgto_pg);
+        free_per_gpu_replicas(d_aux_prim_pg);
+        free_per_gpu_replicas(d_boys_pg);
+        free_per_gpu_replicas(d_cgto_pg);
+        free_per_gpu_replicas(d_prim_pg);
+
+        // ---- NCCL AllReduce per-GPU gradients ----
+        nccl::group_start();
+        for (int d = 0; d < num_gpus_; d++) {
+            cudaSetDevice(d);
+            nccl::all_reduce(d_grad_per_gpu[d], d_grad_per_gpu[d],
+                             (size_t)n3, ncclSum, d, mgr.comm_stream(d));
+        }
+        nccl::group_end();
+        for (int d = 0; d < num_gpus_; d++) {
+            cudaSetDevice(d);
+            cudaStreamSynchronize(mgr.comm_stream(d));
+        }
+    } else {
+        // ---- Fallback: GPU 0 contracts the full Cartesian aux range ----
+        cudaSetDevice(0);
+        launch_3c2e_grad_local(
+            d_grad_per_gpu[0], d_g3,
+            shell_type_infos, aux_shell_type_infos,
+            primitive_shells.device_ptr(), auxiliary_primitive_shells_.device_ptr(),
+            cgto_norms.device_ptr(), auxiliary_cgto_normalization_factors_.device_ptr(),
+            nc_orb, nc_aux, boys_grid.device_ptr(),
+            h_aux_prim, 0, (size_t)nc_aux);
+        cudaDeviceSynchronize();
+        launch_2c2e_grad_local(
+            d_grad_per_gpu[0], d_g2,
+            aux_shell_type_infos,
+            auxiliary_primitive_shells_.device_ptr(), auxiliary_cgto_normalization_factors_.device_ptr(),
+            nc_aux, boys_grid.device_ptr(),
+            h_aux_prim, 0, (size_t)nc_aux);
+        cudaDeviceSynchronize();
+    }
+
+    // ---- Result from GPU 0, cleanup ----
+    cudaSetDevice(0);
+    std::vector<double> gradient(n3);
+    cudaMemcpy(gradient.data(), d_grad_per_gpu[0], n3 * sizeof(double),
+               cudaMemcpyDeviceToHost);
+
+    // d_g3/d_g2 are already freed + nulled in the replicated (scatter) branch;
+    // the fallback branch leaves them live for GPU-0 contraction. Guard the free.
+    if (d_g3) tracked_cudaFree(d_g3);
+    if (d_g2) tracked_cudaFree(d_g2);
+    for (int g = 0; g < num_gpus_; g++) {
+        cudaSetDevice(g);
+        if (d_grad_per_gpu[g]) tracked_cudaFree(d_grad_per_gpu[g]);
+    }
+    cudaSetDevice(0);
+
+    if (hf_.get_verbose())
+        std::cout << "[RI-Distributed Gradient sph] Done." << std::endl;
     return gradient;
 }
 

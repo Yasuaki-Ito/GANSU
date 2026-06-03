@@ -242,6 +242,8 @@ set(SOURCES
     src/test_operators.cu
     src/utils.cpp
     src/ecp_integrals.cpp
+    src/spherical_transform.cpp
+    src/spherical_transform_gpu.cu
     src/ecp_integrals_gpu.cu
     src/sos_laplace_adc2_operator.cu
     src/ri_adc2_schur_operator.cu

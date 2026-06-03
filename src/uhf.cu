@@ -180,6 +180,11 @@ void UHF::post_process_after_scf() {
         if(gbsfilename_.empty()){
             THROW_EXCEPTION("The basis set file is not specified for SAD initial guess method. Please specify the basis set file name by -gbsfilename option.");
         }
+        // SAD places Cartesian per-atom density blocks into the Spherical-dim
+        // molecular density — guard until per-atom Cart→Sph transform is added.
+        if(get_use_spherical())
+            THROW_EXCEPTION("SAD initial guess does not yet support spherical basis "
+                "(--use_spherical 1). Use --initial_guess core (default) or gwh.");
         initial_guess = std::make_unique<InitialGuess_UHF_SAD>(*this);
     }else{
         THROW_EXCEPTION("Invalid initial guess method: " + initial_guess_method_);
@@ -394,6 +399,11 @@ void UHF::export_density_matrix(real_t* density_matrix_a, real_t* density_matrix
  */
 std::vector<double> UHF::compute_Energy_Gradient() {
     PROFILE_FUNCTION();
+
+    // Gradient AO derivative integrals are Cartesian; no Cart→Sph transform yet.
+    if (get_use_spherical())
+        THROW_EXCEPTION("Energy gradient does not yet support spherical basis "
+            "(--use_spherical 1). Run gradients in Cartesian (omit --use_spherical).");
 
     auto gradient = gpu::computeEnergyGradient_UHF(
         shell_type_infos,
@@ -651,8 +661,11 @@ void UHF::export_molden_file(const std::string& filename) {
     }
     ofs << "[GTO]" << std::endl;
     primitive_shells.toHost();
-    std::vector<int> num_primitives(num_basis, 0);
-    std::vector<int> shell_types(num_basis, 0);
+    // [GTO] writes Cart-indexed primitive shell info; when use_spherical we must
+    // size by Cart count to avoid OOB writes via primitive_shells[i].basis_index.
+    const size_t nbf_for_gto = get_use_spherical() ? get_num_basis_cart() : num_basis;
+    std::vector<int> num_primitives(nbf_for_gto, 0);
+    std::vector<int> shell_types(nbf_for_gto, 0);
     for(size_t i=0; i<primitive_shells.size(); i++){
         num_primitives[primitive_shells[i].basis_index]++;
         shell_types[primitive_shells[i].basis_index] = primitive_shells[i].shell_type;
@@ -660,7 +673,7 @@ void UHF::export_molden_file(const std::string& filename) {
 
     for(size_t i=0; i<atoms.size(); i++){
         ofs << i+1 << " " << 0 << std::endl;
-        BasisRange basis_range = get_atom_to_basis_range()[i];
+        BasisRange basis_range = get_atom_to_basis_range_cart()[i];  // Molden [GTO]: Cartesian shell layout
         for(size_t j=basis_range.start_index; j<basis_range.end_index; j++){
             if(num_primitives[j] == 0){ // skip non-representative basis functions (e.g. py,pz, etc.)
                 continue;
@@ -683,6 +696,13 @@ void UHF::export_molden_file(const std::string& filename) {
     coefficient_matrix_a.toHost();
     coefficient_matrix_b.toHost();
 
+    if (get_use_spherical()) {
+        // Molden spherical-basis markers (per Molden file format spec):
+        // [5D] = 5 D functions in spherical order, [7F] = 7 F, [9G] = 9 G.
+        ofs << "[5D]" << std::endl;
+        ofs << "[7F]" << std::endl;
+        ofs << "[9G]" << std::endl;
+    }
     ofs << "[MO]" << std::endl;
     for(size_t i=0; i<num_basis; i++){  // alpha spin
         ofs << "Sym= A" << std::endl;
@@ -732,15 +752,18 @@ void UHF::export_lmo_molden_file(const std::string& filename) {
     }
     ofs << "[GTO]" << std::endl;
     primitive_shells.toHost();
-    std::vector<int> num_primitives(num_basis, 0);
-    std::vector<int> shell_types(num_basis, 0);
+    // [GTO] writes Cart-indexed primitive shell info; when use_spherical we must
+    // size by Cart count to avoid OOB writes via primitive_shells[i].basis_index.
+    const size_t nbf_for_gto = get_use_spherical() ? get_num_basis_cart() : num_basis;
+    std::vector<int> num_primitives(nbf_for_gto, 0);
+    std::vector<int> shell_types(nbf_for_gto, 0);
     for(size_t i=0; i<primitive_shells.size(); i++){
         num_primitives[primitive_shells[i].basis_index]++;
         shell_types[primitive_shells[i].basis_index] = primitive_shells[i].shell_type;
     }
     for(size_t i=0; i<atoms.size(); i++){
         ofs << i+1 << " " << 0 << std::endl;
-        BasisRange basis_range = get_atom_to_basis_range()[i];
+        BasisRange basis_range = get_atom_to_basis_range_cart()[i];  // Molden [GTO]: Cartesian shell layout
         for(size_t j=basis_range.start_index; j<basis_range.end_index; j++){
             if(num_primitives[j] == 0) continue;
             ofs << " " << shell_type_to_shell_name(shell_types[j]) << " " << num_primitives[j] << " " << "1.00" << std::endl;
@@ -827,6 +850,13 @@ void UHF::export_lmo_molden_file(const std::string& filename) {
                   << std::endl;
     };
 
+    if (get_use_spherical()) {
+        // Molden spherical-basis markers (per Molden file format spec):
+        // [5D] = 5 D functions in spherical order, [7F] = 7 F, [9G] = 9 G.
+        ofs << "[5D]" << std::endl;
+        ofs << "[7F]" << std::endl;
+        ofs << "[9G]" << std::endl;
+    }
     ofs << "[MO]" << std::endl;
     write_spin_block(static_cast<int>(num_alpha_spins), coefficient_matrix_a, orbital_energies_a, "Alpha");
     write_spin_block(static_cast<int>(num_beta_spins),  coefficient_matrix_b, orbital_energies_b, "Beta");

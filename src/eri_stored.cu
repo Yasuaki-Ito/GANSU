@@ -1707,6 +1707,7 @@ real_t ERI_Stored_RHF::compute_thc_mp2_energy() {
 #ifdef GANSU_CPU_ONLY
     THROW_EXCEPTION("THC-MP2 requires GPU build (CPU-only path not yet implemented).");
 #else
+    // Spherical handled inside compute_X_ao_gpu (Cart build + Cart→Sph AO axis).
     const int N_bas = rhf_.get_num_basis();
     const int n_occ = rhf_.get_num_electrons() / 2;
 
@@ -1793,6 +1794,7 @@ real_t ERI_Stored_RHF::compute_thc_sos_mp2_energy() {
 #ifdef GANSU_CPU_ONLY
     THROW_EXCEPTION("THC-SOS-MP2 requires GPU build (CPU-only path not yet implemented).");
 #else
+    // Spherical handled inside compute_X_ao_gpu (Cart build + Cart→Sph AO axis).
     const int N_bas = rhf_.get_num_basis();
     const int n_occ = rhf_.get_num_electrons() / 2;
 
@@ -1876,6 +1878,7 @@ void ERI_Stored_RHF::compute_thc_sos_adc2(int n_states) {
 #ifdef GANSU_CPU_ONLY
     THROW_EXCEPTION("THC-SOS-ADC(2) requires GPU build.");
 #else
+    // Spherical handled inside compute_X_ao_gpu (Cart build + Cart→Sph AO axis).
     const int N_bas = rhf_.get_num_basis();
     const int n_occ = rhf_.get_num_electrons() / 2;
     const int n_vir = N_bas - n_occ;

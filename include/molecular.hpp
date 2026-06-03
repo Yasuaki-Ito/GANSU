@@ -194,6 +194,17 @@ public:
             THROW_EXCEPTION("No atoms are given.");
         }
 
+        // Spherical-mode tracking (Phase 1): per-shell L value + offsets in
+        // both Cartesian and Spherical basis function orderings.  Populated
+        // alongside the existing primitive_shells_ table during the shell
+        // loop, so we never have to recompute them later from primitives.
+        shell_types_.clear();
+        shell_offsets_cart_.clear();
+        shell_offsets_sph_.clear();
+        shell_offsets_cart_.push_back(0);
+        shell_offsets_sph_.push_back(0);
+        size_t basis_index_sph = 0;
+
         size_t basis_index = 0; ///< Basis index (consecutive number through all the basis functions)
 //        for(const auto& atom : atoms_){ // loop over atoms
         for(int atom_index=0; atom_index<atoms_.size(); atom_index++){
@@ -201,6 +212,8 @@ public:
 
             BasisRange basis_range;
             basis_range.start_index = basis_index;
+            BasisRange basis_range_sph;          // Spherical-offset counterpart (Phase 3)
+            basis_range_sph.start_index = basis_index_sph;
 
             const ElementBasisSet& element_basis_set = basis_set.get_element_basis_set(atomic_number_to_element_name(atom.atomic_number));
             for(size_t i=0; i<element_basis_set.get_num_contracted_gausses(); i++){ // loop over basis function (contracted Gauss functions)
@@ -225,15 +238,24 @@ public:
                 }
                 basis_index += shell_type_to_num_basis(shell_type);
 
+                // Record per-shell L + cart/sph offsets for Phase 1 spherical transform.
+                shell_types_.push_back(shell_type);
+                shell_offsets_cart_.push_back(static_cast<int>(basis_index));
+                basis_index_sph += (2 * shell_type + 1);
+                shell_offsets_sph_.push_back(static_cast<int>(basis_index_sph));
+
                 // store the normalization factor of the contracted Gauss function
                 const std::vector<real_t> normalization_factors = contracted_gauss.get_normalization_factor();
                 cgto_normalization_factors_.insert(cgto_normalization_factors_.end(), normalization_factors.begin(), normalization_factors.end());
             }
             basis_range.end_index = basis_index;
             atom_to_basis_range_.push_back(basis_range);
+            basis_range_sph.end_index = basis_index_sph;
+            atom_to_basis_range_sph_.push_back(basis_range_sph);
         }
 
-        num_basis_ = basis_index;
+        num_basis_     = basis_index;       // Cartesian count
+        num_basis_sph_ = basis_index_sph;   // Spherical count (= Σ 2L+1 per shell)
 
         if(num_basis_ != cgto_normalization_factors_.size()){
             THROW_EXCEPTION("The number of basis functions is not equal to the number of normalization factors.");
@@ -268,9 +290,29 @@ public:
     }
 
     /**
-     * @brief Get the number of basis functions
+     * @brief Get the (active) number of basis functions.
+     *        When use_spherical_=true, returns Spherical count (= Σ 2L+1 per shell);
+     *        otherwise returns Cartesian count (= Σ (L+1)(L+2)/2 per shell).
+     *        HF allocates matrices at this size.
      */
-    size_t get_num_basis() const { return num_basis_;}
+    size_t get_num_basis() const { return use_spherical_ ? num_basis_sph_ : num_basis_; }
+
+    /// Get the Cartesian basis count (always the original GANSU native count).
+    size_t get_num_basis_cart() const { return num_basis_; }
+    /// Get the Spherical basis count.
+    size_t get_num_basis_sph()  const { return num_basis_sph_; }
+
+    /// Whether spherical-harmonic basis is requested (toggled by set_use_spherical).
+    bool   get_use_spherical()  const { return use_spherical_; }
+    /// Toggle spherical-harmonic basis mode (call before HF construction).
+    void   set_use_spherical(bool v) { use_spherical_ = v; }
+
+    /// Per-shell L values (size = n_shells), in basis-function order.
+    const std::vector<int>& get_shell_types()        const { return shell_types_; }
+    /// Per-shell start offsets in Cartesian basis (size = n_shells+1, last = nbf_cart).
+    const std::vector<int>& get_shell_offsets_cart() const { return shell_offsets_cart_; }
+    /// Per-shell start offsets in Spherical basis (size = n_shells+1, last = nbf_sph).
+    const std::vector<int>& get_shell_offsets_sph()  const { return shell_offsets_sph_; }
 
     /**
      * @brief Get the list of atoms
@@ -290,7 +332,16 @@ public:
     /**
      * @brief Get the list of the basis range for each atom
      */
-    const std::vector<BasisRange>& get_atom_to_basis_range() const { return atom_to_basis_range_; }
+    /// Atom→basis-function ranges in the ACTIVE basis ordering.  When
+    /// use_spherical_ is set, every downstream array (overlap, MO coeffs, RI B,
+    /// localizer C/SC, PAO/domain indices) is Spherical-dimensioned, so the
+    /// ranges must use Spherical offsets too — otherwise AO↔atom partitioning
+    /// reads out of bounds / assigns the wrong AOs (Phase 3 fix).  Cartesian
+    /// ranges remain available via get_atom_to_basis_range_cart().
+    const std::vector<BasisRange>& get_atom_to_basis_range() const {
+        return use_spherical_ ? atom_to_basis_range_sph_ : atom_to_basis_range_;
+    }
+    const std::vector<BasisRange>& get_atom_to_basis_range_cart() const { return atom_to_basis_range_; }
 
     /**
      * @brief Get the number of electrons
@@ -416,8 +467,24 @@ private:
     std::vector<Atom> atoms_; ///< Atoms
     std::vector<PrimitiveShell> primitive_shells_; ///< Primitive shells
     std::vector<ShellTypeInfo> shell_type_infos_; ///< The list of shell type information
-    std::vector<BasisRange> atom_to_basis_range_; ///< The list of the basis range for each atom
-    size_t num_basis_; ///< Number of basis functions
+    std::vector<BasisRange> atom_to_basis_range_; ///< The list of the basis range for each atom (Cartesian offsets)
+    std::vector<BasisRange> atom_to_basis_range_sph_; ///< Same, in Spherical offsets (used when use_spherical_)
+    size_t num_basis_; ///< Number of basis functions (= cart count, kept for backward compat)
+
+    // Spherical-harmonic basis support (Phase 1: cc-pVDZ scale, d shells max)
+    //   When use_spherical_=true, get_num_basis() returns num_basis_sph_ and the
+    //   HF class allocates matrices at that size.  The integral engine still
+    //   computes in Cartesian internally; spherical_transform.hpp applies a
+    //   per-shell Cart→Sph transformation on the resulting S/T/V/H/ERI.
+    //
+    //   shell_types_      : L value per contracted shell, in basis-function order
+    //   shell_offsets_cart_ : start index in Cartesian basis per shell (size +1, last = nbf_cart)
+    //   shell_offsets_sph_  : start index in Spherical basis per shell (size +1, last = nbf_sph)
+    bool use_spherical_ = false;
+    size_t num_basis_sph_ = 0;
+    std::vector<int> shell_types_;          ///< per-shell L
+    std::vector<int> shell_offsets_cart_;   ///< per-shell start in cart basis (size n_shells+1)
+    std::vector<int> shell_offsets_sph_;    ///< per-shell start in sph basis (size n_shells+1)
 
     std::vector<real_t> cgto_normalization_factors_; ///< The list of the normalization factors of the contracted Gauss functions
 

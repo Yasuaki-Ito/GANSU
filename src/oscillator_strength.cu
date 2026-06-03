@@ -24,6 +24,8 @@
  */
 
 #include "oscillator_strength.hpp"
+#include "spherical_transform.hpp"  // Cart→Sph dipole transform (spherical basis)
+#include <map>
 
 #include <algorithm>
 #include <cmath>
@@ -130,10 +132,31 @@ void compute_ao_dipole_integrals(
     std::vector<real_t>& dipole_y,
     std::vector<real_t>& dipole_z)
 {
-    size_t n2 = (size_t)nao * nao;
-    dipole_x.assign(n2, 0.0);
-    dipole_y.assign(n2, 0.0);
-    dipole_z.assign(n2, 0.0);
+    // The dipole kernel below is inherently Cartesian: it enumerates Cartesian
+    // components (lmn) at Cartesian offsets (basis_index) and indexes the
+    // Cartesian-sized cgto_norms.  When the active basis is spherical, `nao` is
+    // the Spherical count (< Cartesian count), so we build the dipole in its
+    // native Cartesian dimension and then transform Cart→Sph on both indices
+    // (M_sph = U·M_cart·Uᵀ, identical to the overlap transform).  Reconstruct
+    // the contracted-shell layout from the primitive shells' basis_index/L.
+    std::map<size_t,int> shell_L;   // basis_index (Cartesian) → L
+    for (size_t i = 0; i < num_shells; ++i) shell_L[shells[i].basis_index] = shells[i].shell_type;
+    std::vector<int> sh_types, off_cart, off_sph;
+    off_cart.push_back(0); off_sph.push_back(0);
+    int nc_orb = 0, ns_orb = 0;
+    for (const auto& kv : shell_L) {   // std::map → ascending basis_index = Cartesian order
+        const int L = kv.second;
+        sh_types.push_back(L);
+        nc_orb += (L + 1) * (L + 2) / 2;
+        ns_orb += 2 * L + 1;
+        off_cart.push_back(nc_orb);
+        off_sph.push_back(ns_orb);
+    }
+    const bool spherical = (nao != nc_orb);   // in spherical mode nao == ns_orb < nc_orb
+
+    // Build in Cartesian dimension (nc_orb); copy or transform into the output.
+    const size_t ncd = (size_t)nc_orb;
+    std::vector<real_t> dx(ncd * ncd, 0.0), dy(ncd * ncd, 0.0), dz(ncd * ncd, 0.0);
 
     // Iterate over all pairs of primitive shells
     for (size_t ia = 0; ia < num_shells; ia++) {
@@ -197,12 +220,26 @@ void compute_ao_dipole_integrals(
                     double Sy_plus = overlap_1d(m1 + 1, m2, YPA, YPB, one_over_2p);
                     double Sz_plus = overlap_1d(n1 + 1, n2, ZPA, ZPB, one_over_2p);
 
-                    dipole_x[mu * nao + nu] += norm_coeff * (Sx_plus + Ax * Sx) * Sy * Sz;
-                    dipole_y[mu * nao + nu] += norm_coeff * Sx * (Sy_plus + Ay * Sy) * Sz;
-                    dipole_z[mu * nao + nu] += norm_coeff * Sx * Sy * (Sz_plus + Az * Sz);
+                    dx[mu * ncd + nu] += norm_coeff * (Sx_plus + Ax * Sx) * Sy * Sz;
+                    dy[mu * ncd + nu] += norm_coeff * Sx * (Sy_plus + Ay * Sy) * Sz;
+                    dz[mu * ncd + nu] += norm_coeff * Sx * Sy * (Sz_plus + Az * Sz);
                 }
             }
         }
+    }
+
+    if (!spherical) {
+        dipole_x = std::move(dx);
+        dipole_y = std::move(dy);
+        dipole_z = std::move(dz);
+    } else {
+        const size_t ns2 = (size_t)nao * nao;
+        dipole_x.assign(ns2, 0.0);
+        dipole_y.assign(ns2, 0.0);
+        dipole_z.assign(ns2, 0.0);
+        spherical::transform_matrix_cart_to_sph(dx.data(), dipole_x.data(), sh_types, off_cart, off_sph);
+        spherical::transform_matrix_cart_to_sph(dy.data(), dipole_y.data(), sh_types, off_cart, off_sph);
+        spherical::transform_matrix_cart_to_sph(dz.data(), dipole_z.data(), sh_types, off_cart, off_sph);
     }
 }
 

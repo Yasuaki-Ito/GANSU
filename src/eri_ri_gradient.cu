@@ -30,6 +30,7 @@
 #include "gradients.hpp"
 #include "grad_2c.hpp"
 #include "grad_3c.hpp"
+#include "spherical_transform.hpp"
 
 namespace gansu {
 
@@ -785,12 +786,330 @@ std::vector<double> ERI_RI::compute_ri_gradient(
     const real_t* d_orbital_energies,
     const int num_electron)
 {
+    if (hf_.get_use_spherical()) {
+        return compute_ri_gradient_spherical(
+            d_density_matrix, d_coefficient_matrix, d_orbital_energies, num_electron);
+    }
     return compute_ri_gradient_impl(
         d_density_matrix, d_coefficient_matrix, d_orbital_energies, num_electron,
         intermediate_matrix_B_.device_ptr(),
         /*P_local_start=*/0,
         /*P_local_end=*/(size_t)num_auxiliary_basis_,
         /*include_one_electron=*/true);
+}
+
+// ============================================================================
+// ERI_RI::build_ri_gamma_cart_spherical — assemble Γ^(3)_cart / Γ^(2)_cart
+// from spherical B and D (steps 1–6b of the spherical RI gradient), on the
+// current device. Caller owns the two returned device allocations.
+// ============================================================================
+void ERI_RI::build_ri_gamma_spherical_sph(
+    const real_t* d_B_sph,
+    const real_t* d_density_sph,
+    real_t** d_gamma3_sph_out,
+    real_t** d_gamma2_sph_out)
+{
+    const int ns_orb = num_basis_;
+    const int ns_aux = num_auxiliary_basis_;
+    const int nc_aux = num_auxiliary_basis_cart_;
+    const size_t ns_orb2 = (size_t)ns_orb * ns_orb;
+    const auto& boys_grid = hf_.get_boys_grid();
+
+    // (1) L_sph = chol(V_sph), V_sph = U_aux·(P|Q)_cart·U_auxᵀ.
+    real_t *d_V_cart=nullptr, *d_L=nullptr;
+    gansu::tracked_cudaMalloc(&d_V_cart, (size_t)nc_aux * nc_aux * sizeof(real_t));
+    gansu::tracked_cudaMalloc(&d_L,      (size_t)ns_aux * ns_aux * sizeof(real_t));
+    cudaMemset(d_V_cart, 0, (size_t)nc_aux * nc_aux * sizeof(real_t));
+    gpu::computeTwoCenterERIs(
+        auxiliary_shell_type_infos_,
+        auxiliary_primitive_shells_.device_ptr(),
+        auxiliary_cgto_normalization_factors_.device_ptr(),
+        d_V_cart, nc_aux,
+        boys_grid.device_ptr(),
+        auxiliary_schwarz_upper_bound_factors.device_ptr(),
+        hf_.get_schwarz_screening_threshold(),
+        hf_.get_verbose());
+    spherical::transform_matrix_cart_to_sph_device(
+        d_V_cart, d_L, aux_shell_types_, aux_shell_offsets_cart_, aux_shell_offsets_sph_);
+    gansu::tracked_cudaFree(d_V_cart);
+    gpu::choleskyDecomposition(d_L, ns_aux);
+
+    // (2) B̄_sph = L_sph^{-T} · B_sph
+    real_t* d_Bbar = nullptr;
+    gansu::tracked_cudaMalloc(&d_Bbar, (size_t)ns_aux * ns_orb2 * sizeof(real_t));
+    cudaMemcpy(d_Bbar, d_B_sph, (size_t)ns_aux * ns_orb2 * sizeof(real_t),
+               cudaMemcpyDeviceToDevice);
+    apply_LinvT_to_Bbar_inplace(d_L, d_Bbar, ns_aux, (int)ns_orb2);
+
+    // (3) γ_sph = L_sph^{-T}(B_sph·D_sph)
+    real_t* d_w = nullptr;
+    gansu::tracked_cudaMalloc(&d_w, (size_t)ns_aux * sizeof(real_t));
+    cudaMemset(d_w, 0, (size_t)ns_aux * sizeof(real_t));
+    build_w(d_w, d_B_sph, d_density_sph, ns_aux, ns_orb);
+    apply_LinvT_to_w_inplace(d_L, d_w, ns_aux);
+    gansu::tracked_cudaFree(d_L);
+
+    // (4) A_sph[P,μν] = (D_sph · B̄_P · D_sph)_{μν}
+    real_t* d_A = nullptr;
+    gansu::tracked_cudaMalloc(&d_A, (size_t)ns_aux * ns_orb2 * sizeof(real_t));
+    build_A_from_DBbarD(d_A, d_density_sph, d_Bbar, ns_aux, ns_orb);
+
+    // (5) Γ^(3)_sph[P,μν] = w_P D_μν − ½ A_{P,μν}
+    real_t* d_gamma3_sph = nullptr;
+    gansu::tracked_cudaMalloc(&d_gamma3_sph, (size_t)ns_aux * ns_orb2 * sizeof(real_t));
+    launch_assemble_gamma3(d_gamma3_sph, d_A, d_w, d_density_sph, ns_aux, ns_orb);
+
+    // (6) Γ^(2)_sph[PQ] = −½ w_P w_Q + ¼ (A · B̄ᵀ)_{PQ}
+    real_t* d_gamma2_sph = nullptr;
+    gansu::tracked_cudaMalloc(&d_gamma2_sph, (size_t)ns_aux * ns_aux * sizeof(real_t));
+    build_gamma2(d_gamma2_sph, d_A, d_Bbar, d_w, ns_aux, ns_orb);
+
+    gansu::tracked_cudaFree(d_A);
+    gansu::tracked_cudaFree(d_Bbar);
+    gansu::tracked_cudaFree(d_w);
+
+    *d_gamma3_sph_out = d_gamma3_sph;
+    *d_gamma2_sph_out = d_gamma2_sph;
+}
+
+void ERI_RI::build_ri_gamma_cart_spherical(
+    const real_t* d_B_sph,
+    const real_t* d_density_sph,
+    real_t** d_gamma3_cart_out,
+    real_t** d_gamma2_cart_out)
+{
+    const int ns_orb = num_basis_;
+    const int nc_orb = hf_.get_num_basis_cart();
+    const int nc_aux = num_auxiliary_basis_cart_;
+    const size_t nc_orb2 = (size_t)nc_orb * nc_orb;
+    const auto& orb_sht  = hf_.get_shell_types();
+    const auto& orb_offc = hf_.get_shell_offsets_cart();
+    const auto& orb_offs = hf_.get_shell_offsets_sph();
+    (void)ns_orb;
+
+    // Steps 1–6: assemble Γ_sph.
+    real_t *d_gamma3_sph=nullptr, *d_gamma2_sph=nullptr;
+    build_ri_gamma_spherical_sph(d_B_sph, d_density_sph, &d_gamma3_sph, &d_gamma2_sph);
+
+    // (6b) Back-transform Γ_sph → Γ_cart for the Cartesian derivative kernels.
+    real_t *d_gamma3_cart=nullptr, *d_gamma2_cart=nullptr;
+    gansu::tracked_cudaMalloc(&d_gamma3_cart, (size_t)nc_aux * nc_orb2 * sizeof(real_t));
+    gansu::tracked_cudaMalloc(&d_gamma2_cart, (size_t)nc_aux * nc_aux * sizeof(real_t));
+    spherical::transform_3index_sph_to_cart_device(
+        d_gamma3_sph, d_gamma3_cart,
+        aux_shell_types_, aux_shell_offsets_cart_, aux_shell_offsets_sph_,
+        orb_sht, orb_offc, orb_offs);
+    spherical::transform_matrix_sph_to_cart_device(
+        d_gamma2_sph, d_gamma2_cart,
+        aux_shell_types_, aux_shell_offsets_cart_, aux_shell_offsets_sph_);
+    gansu::tracked_cudaFree(d_gamma3_sph);
+    gansu::tracked_cudaFree(d_gamma2_sph);
+
+    *d_gamma3_cart_out = d_gamma3_cart;
+    *d_gamma2_cart_out = d_gamma2_cart;
+}
+
+// ============================================================================
+// ERI_RI::compute_ri_gradient_spherical — spherical-basis RI gradient.
+//
+// Mirrors compute_ri_gradient_impl, but:
+//   • The RI 2-electron "Γ" assembly (steps 1–6) runs in the SPHERICAL basis,
+//     using the spherical metric L_sph = chol(U_aux·(P|Q)_cart·U_auxᵀ) and the
+//     spherical B = intermediate_matrix_B_ (= L_sph⁻¹·(P|μν)_sph) and D_sph.
+//   • Γ^(3)_sph / Γ^(2)_sph are then back-transformed to the Cartesian basis
+//     (transform_3index_sph_to_cart / transform_matrix_sph_to_cart) so the
+//     Cartesian 3c2e / 2c2e derivative kernels — which differentiate the
+//     underlying Cartesian Gaussians — contract the correct quantity.
+//   • The 1-electron / overlap / nuclear terms run in Cartesian with
+//     D_cart = Uᵀ D_sph U and W_cart = Uᵀ W_sph U.
+//
+// Exact (up to the RI approximation, identical to the spherical RI energy)
+// because U is geometry-independent and (P|μν)_sph = U_aux U U (P|μν)_cart.
+// ============================================================================
+std::vector<double> ERI_RI::compute_ri_gradient_spherical(
+    const real_t* d_density_matrix,
+    const real_t* d_coefficient_matrix,
+    const real_t* d_orbital_energies,
+    const int num_electron)
+{
+    const int ns_orb = num_basis_;                  // spherical orbital count
+    const int nc_orb = hf_.get_num_basis_cart();    // Cartesian orbital count
+    const int nc_aux = num_auxiliary_basis_cart_;   // Cartesian aux count
+    const size_t ns_orb2 = (size_t)ns_orb * ns_orb;
+    const size_t nc_orb2 = (size_t)nc_orb * nc_orb;
+    const int num_atoms = (int)hf_.get_atoms().size();
+    const int n3 = 3 * num_atoms;
+    const size_t grad_bytes = n3 * sizeof(double);
+
+    // Orbital / aux shell descriptors for the Cart↔Sph transforms.
+    const auto& orb_sht  = hf_.get_shell_types();
+    const auto& orb_offc = hf_.get_shell_offsets_cart();
+    const auto& orb_offs = hf_.get_shell_offsets_sph();
+
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        cudaDeviceSetLimit(cudaLimitStackSize, 64 * 1024);
+    }
+#endif
+
+    // ----- Gradient buffers (Cartesian-dimensioned) -----
+    double *d_grad_total=nullptr, *d_grad_N=nullptr, *d_grad_S=nullptr;
+    double *d_grad_K=nullptr, *d_grad_V=nullptr, *d_grad_2el=nullptr;
+    gansu::tracked_cudaMalloc(&d_grad_total, grad_bytes);
+    gansu::tracked_cudaMalloc(&d_grad_N, grad_bytes);
+    gansu::tracked_cudaMalloc(&d_grad_S, grad_bytes);
+    gansu::tracked_cudaMalloc(&d_grad_K, grad_bytes);
+    gansu::tracked_cudaMalloc(&d_grad_V, grad_bytes);
+    gansu::tracked_cudaMalloc(&d_grad_2el, grad_bytes);
+    cudaMemset(d_grad_total, 0, grad_bytes);
+    cudaMemset(d_grad_N, 0, grad_bytes);
+    cudaMemset(d_grad_S, 0, grad_bytes);
+    cudaMemset(d_grad_K, 0, grad_bytes);
+    cudaMemset(d_grad_V, 0, grad_bytes);
+    cudaMemset(d_grad_2el, 0, grad_bytes);
+
+    const auto& shell_type_infos = hf_.get_shell_type_infos();
+    const auto& primitive_shells = hf_.get_primitive_shells();
+    const auto& cgto_norms       = hf_.get_cgto_normalization_factors();
+    const auto& boys_grid        = hf_.get_boys_grid();
+    const auto& atoms_dh         = hf_.get_atoms();
+
+    // === Cartesian D and W (energy-weighted density) via back-transform ===
+    // D_cart = Uᵀ D_sph U ;  W_sph = Σ_i ε_i C_sph C_sphᵀ (occ) → W_cart = Uᵀ W_sph U.
+    real_t *d_D_cart=nullptr, *d_W_sph=nullptr, *d_W_cart=nullptr;
+    gansu::tracked_cudaMalloc(&d_D_cart, nc_orb2 * sizeof(real_t));
+    gansu::tracked_cudaMalloc(&d_W_sph,  ns_orb2 * sizeof(real_t));
+    gansu::tracked_cudaMalloc(&d_W_cart, nc_orb2 * sizeof(real_t));
+    cudaMemset(d_W_sph, 0, ns_orb2 * sizeof(real_t));
+
+    spherical::transform_matrix_sph_to_cart_device(
+        d_density_matrix, d_D_cart, orb_sht, orb_offc, orb_offs);
+    gpu::compute_W(d_W_sph, d_coefficient_matrix, d_orbital_energies, ns_orb, num_electron);
+    spherical::transform_matrix_sph_to_cart_device(
+        d_W_sph, d_W_cart, orb_sht, orb_offc, orb_offs);
+    gansu::tracked_cudaFree(d_W_sph);
+
+    // === 1-electron + S + N gradient (Cartesian dims, reuse the 4c launchers) ===
+    {
+        const int shell_type_count = (int)shell_type_infos.size();
+        const int threads_per_block = 128;
+#ifndef GANSU_CPU_ONLY
+        if (gpu::gpu_available()) {
+            for (int s0 = shell_type_count - 1; s0 >= 0; s0--) {
+                for (int s1 = shell_type_count - 1; s1 >= s0; s1--) {
+                    const auto info0 = shell_type_infos[s0];
+                    const auto info1 = shell_type_infos[s1];
+                    const size_t n_pairs = (s0 == s1) ? (size_t)info0.count*(info0.count+1)/2
+                                                      : (size_t)info0.count*info1.count;
+                    if (n_pairs == 0) continue;
+                    const size_t blocks = (n_pairs + threads_per_block - 1) / threads_per_block;
+                    gpu::compute_gradients_overlap<<<(unsigned int)blocks, threads_per_block>>>(
+                        d_grad_S, d_W_cart, primitive_shells.device_ptr(), cgto_norms.device_ptr(),
+                        nc_orb, info0, info1, n_pairs);
+                    gpu::compute_gradients_kinetic<<<(unsigned int)blocks, threads_per_block>>>(
+                        d_grad_K, d_D_cart, primitive_shells.device_ptr(), cgto_norms.device_ptr(),
+                        nc_orb, info0, info1, n_pairs);
+                    gpu::compute_gradients_nuclear<<<(unsigned int)blocks, threads_per_block>>>(
+                        d_grad_V, d_D_cart, primitive_shells.device_ptr(), cgto_norms.device_ptr(),
+                        atoms_dh.device_ptr(), num_atoms, nc_orb, info0, info1, n_pairs,
+                        boys_grid.device_ptr());
+                }
+            }
+            const size_t nr_threads = (size_t)num_atoms * (size_t)num_atoms;
+            const size_t nr_blocks  = (nr_threads + threads_per_block - 1) / threads_per_block;
+            gpu::compute_nuclear_repulsion_gradient_kernel<<<(unsigned int)nr_blocks, threads_per_block>>>(
+                d_grad_N, atoms_dh.device_ptr(), num_atoms);
+            cudaDeviceSynchronize();
+        } else
+#endif
+        {
+            for (int s0 = shell_type_count - 1; s0 >= 0; s0--) {
+                for (int s1 = shell_type_count - 1; s1 >= s0; s1--) {
+                    const auto info0 = shell_type_infos[s0];
+                    const auto info1 = shell_type_infos[s1];
+                    const size_t n_pairs = (s0 == s1) ? (size_t)info0.count*(info0.count+1)/2
+                                                      : (size_t)info0.count*info1.count;
+                    if (n_pairs == 0) continue;
+                    gpu::compute_gradients_overlap_cpu(
+                        d_grad_S, d_W_cart, primitive_shells.host_ptr(), cgto_norms.host_ptr(),
+                        nc_orb, info0, info1, n_pairs);
+                    gpu::compute_gradients_kinetic_cpu(
+                        d_grad_K, d_D_cart, primitive_shells.host_ptr(), cgto_norms.host_ptr(),
+                        nc_orb, info0, info1, n_pairs);
+                    gpu::compute_gradients_nuclear_cpu(
+                        d_grad_V, d_D_cart, primitive_shells.host_ptr(), cgto_norms.host_ptr(),
+                        atoms_dh.host_ptr(), num_atoms, nc_orb, info0, info1, n_pairs,
+                        boys_grid.host_ptr());
+                }
+            }
+            gpu::compute_nuclear_repulsion_gradient_cpu(d_grad_N, atoms_dh.host_ptr(), num_atoms);
+        }
+    }
+    gansu::tracked_cudaFree(d_W_cart);
+
+    // ===================== RI 2-electron gradient (spherical algebra) =========
+    // Steps 1–6b (Γ_sph assembly + back-transform to Γ_cart) are factored into
+    // build_ri_gamma_cart_spherical so the distributed path can reuse them.
+    real_t *d_gamma3_cart=nullptr, *d_gamma2_cart=nullptr;
+    build_ri_gamma_cart_spherical(
+        intermediate_matrix_B_.device_ptr(), d_density_matrix,
+        &d_gamma3_cart, &d_gamma2_cart);
+
+    // (7) 3c2e gradient kernel (Cartesian shell triple sweep, full P range)
+    launch_3c2e_grad(
+        d_grad_2el, d_gamma3_cart,
+        shell_type_infos, auxiliary_shell_type_infos_,
+        primitive_shells.device_ptr(),
+        auxiliary_primitive_shells_.device_ptr(),
+        cgto_norms.device_ptr(),
+        auxiliary_cgto_normalization_factors_.device_ptr(),
+        nc_orb, nc_aux, boys_grid.device_ptr(),
+        /*P_local_start=*/0, /*P_local_end=*/(size_t)nc_aux);
+    gansu::tracked_cudaFree(d_gamma3_cart);
+
+    // (8) 2c2e gradient kernel (Cartesian aux shell-pair sweep, full P range)
+    launch_2c2e_grad(
+        d_grad_2el, d_gamma2_cart,
+        auxiliary_shell_type_infos_,
+        auxiliary_primitive_shells_.device_ptr(),
+        auxiliary_cgto_normalization_factors_.device_ptr(),
+        nc_aux, boys_grid.device_ptr(),
+        /*P_local_start=*/0, /*P_local_end=*/(size_t)nc_aux);
+    gansu::tracked_cudaFree(d_gamma2_cart);
+
+    // ----- Sum total = N + S + K + V + 2el -----
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        cublasHandle_t handle;
+        cublasCreate(&handle);
+        const double one = 1.0;
+        cudaMemcpy(d_grad_total, d_grad_N, grad_bytes, cudaMemcpyDeviceToDevice);
+        cublasDaxpy(handle, n3, &one, d_grad_S,   1, d_grad_total, 1);
+        cublasDaxpy(handle, n3, &one, d_grad_K,   1, d_grad_total, 1);
+        cublasDaxpy(handle, n3, &one, d_grad_V,   1, d_grad_total, 1);
+        cublasDaxpy(handle, n3, &one, d_grad_2el, 1, d_grad_total, 1);
+        cublasDestroy(handle);
+    } else
+#endif
+    {
+        for (int i = 0; i < n3; i++) {
+            d_grad_total[i] = d_grad_N[i] + d_grad_S[i] + d_grad_K[i] +
+                              d_grad_V[i] + d_grad_2el[i];
+        }
+    }
+
+    std::vector<double> gradient(n3);
+    cudaMemcpy(gradient.data(), d_grad_total, grad_bytes, cudaMemcpyDeviceToHost);
+
+    gansu::tracked_cudaFree(d_D_cart);
+    gansu::tracked_cudaFree(d_grad_N);
+    gansu::tracked_cudaFree(d_grad_S);
+    gansu::tracked_cudaFree(d_grad_K);
+    gansu::tracked_cudaFree(d_grad_V);
+    gansu::tracked_cudaFree(d_grad_2el);
+    gansu::tracked_cudaFree(d_grad_total);
+
+    return gradient;
 }
 
 } // namespace gansu

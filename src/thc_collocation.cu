@@ -25,6 +25,8 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include "gpu_manager.hpp"
+#include "spherical_transform.hpp"  // Cart→Sph AO-axis transform of the collocation
+#include <map>
 #include <iostream>
 #include <stdexcept>
 #endif
@@ -341,23 +343,77 @@ compute_X_ao_gpu(int N_bas,
     const int N_g   = static_cast<int>(grid.num_points);
     const int N_prim = static_cast<int>(prims.size());
 
-    // Mirror primitive shells + cgto norms to device.
+    // The collocation kernel is inherently Cartesian: it writes X[basis_index+c]
+    // with the Cartesian basis_index and indexes the Cartesian-sized cgto norms.
+    // Reconstruct the contracted-shell layout from the primitive shells to get
+    // the true Cartesian count nc_orb; if the requested N_bas is smaller (the
+    // Spherical count) we build X in Cartesian and transform the AO axis
+    // Cart→Sph (X_sph = U · X_cart, U block-diagonal per shell).  `norms` is the
+    // Cartesian-sized cgto_normalization_factors regardless.
+    std::map<size_t,int> shell_L;
+    for (const auto& p : prims) shell_L[p.basis_index] = p.shell_type;
+    std::vector<int> sh_types, off_cart, off_sph;
+    off_cart.push_back(0); off_sph.push_back(0);
+    int nc_orb = 0, ns_orb = 0;
+    for (const auto& kv : shell_L) {
+        const int L = kv.second;
+        sh_types.push_back(L);
+        nc_orb += (L + 1) * (L + 2) / 2;
+        ns_orb += 2 * L + 1;
+        off_cart.push_back(nc_orb);
+        off_sph.push_back(ns_orb);
+    }
+    const bool spherical = (N_bas != nc_orb);   // N_bas == ns_orb < nc_orb in spherical mode
+
+    // Mirror primitive shells + (Cartesian-sized) cgto norms to device.
     PrimitiveShell* d_prims = nullptr;
     cudaMalloc(&d_prims, N_prim * sizeof(PrimitiveShell));
     cudaMemcpy(d_prims, prims.data(),
                N_prim * sizeof(PrimitiveShell), cudaMemcpyHostToDevice);
 
     real_t* d_norms = nullptr;
-    cudaMalloc(&d_norms, N_bas * sizeof(real_t));
+    cudaMalloc(&d_norms, (size_t)nc_orb * sizeof(real_t));
     cudaMemcpy(d_norms, norms.data(),
-               N_bas * sizeof(real_t), cudaMemcpyHostToDevice);
+               (size_t)nc_orb * sizeof(real_t), cudaMemcpyHostToDevice);
 
-    auto X = std::make_unique<DeviceHostMatrix<real_t>>(N_bas, N_g);
+    if (!spherical) {
+        auto X = std::make_unique<DeviceHostMatrix<real_t>>(N_bas, N_g);
+        compute_X_ao_gpu_impl(N_bas, N_g, N_prim,
+                              grid.d_x, grid.d_y, grid.d_z,
+                              d_prims, d_norms, X->device_ptr());
+        cudaFree(d_prims);
+        cudaFree(d_norms);
+        return X;
+    }
 
-    compute_X_ao_gpu_impl(N_bas, N_g, N_prim,
+    // Spherical: build X_cart [nc_orb × N_g], then X_sph = U · X_cart.
+    real_t* d_X_cart = nullptr;
+    cudaMalloc(&d_X_cart, (size_t)nc_orb * N_g * sizeof(real_t));
+    compute_X_ao_gpu_impl(nc_orb, N_g, N_prim,
                           grid.d_x, grid.d_y, grid.d_z,
-                          d_prims, d_norms, X->device_ptr());
+                          d_prims, d_norms, d_X_cart);
 
+    real_t* d_U = nullptr;   // block-diagonal U [ns_orb × nc_orb] (row-major)
+    spherical::build_cart_to_sph_U_device(sh_types, off_cart, off_sph, &d_U);
+
+    auto X = std::make_unique<DeviceHostMatrix<real_t>>(N_bas, N_g);  // N_bas == ns_orb
+    {
+        // X_sph[ns × N_g] (col-major) = U[ns × nc] · X_cart[nc × N_g].
+        // d_U is row-major [ns × nc] = col-major U^T [nc × ns] → use op_A=T.
+        cublasHandle_t h = gpu::GPUHandle::cublas();
+        const double one = 1.0, zero = 0.0;
+        cublasDgemm(h, CUBLAS_OP_T, CUBLAS_OP_N,
+                    ns_orb, N_g, nc_orb,
+                    &one,
+                    d_U,      nc_orb,
+                    d_X_cart, nc_orb,
+                    &zero,
+                    X->device_ptr(), ns_orb);
+        cudaDeviceSynchronize();
+    }
+
+    cudaFree(d_U);
+    cudaFree(d_X_cart);
     cudaFree(d_prims);
     cudaFree(d_norms);
     return X;

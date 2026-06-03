@@ -112,6 +112,13 @@ public:
      */
     int get_num_basis() const { return num_basis; }
 
+    /// Phase 1 spherical-basis accessors (forwarded from Molecular at construction).
+    bool get_use_spherical()              const { return use_spherical_; }
+    int  get_num_basis_cart()             const { return num_basis_cart_; }
+    const std::vector<int>& get_shell_types()         const { return shell_types_; }
+    const std::vector<int>& get_shell_offsets_cart()  const { return shell_offsets_cart_; }
+    const std::vector<int>& get_shell_offsets_sph()   const { return shell_offsets_sph_; }
+
     /**
      * @brief Get the number of electrons
      */
@@ -201,6 +208,10 @@ public:
      * @brief Get atom_to_basis_range
      */
     const std::vector<BasisRange>& get_atom_to_basis_range() const { return atom_to_basis_range; }
+
+    /// Always-Cartesian atom→basis ranges (for Molden [GTO] block, which writes
+    /// Cartesian shell info regardless of the active basis).
+    const std::vector<BasisRange>& get_atom_to_basis_range_cart() const { return atom_to_basis_range_cart; }
 
     /**
      * @brief Get Atoms
@@ -594,7 +605,19 @@ public:
 protected:
     long long solve_time_in_milliseconds_; ///< Time to solve the HF equation
 
-    const int num_basis; ///< Number of basis functions
+    const int num_basis; ///< Number of basis functions (= Spherical when use_spherical_=true, else Cartesian)
+
+    // Phase 1 spherical-harmonic basis support (Molden 5D/7F/9G).  When
+    // use_spherical_=true the integral engine still computes in Cartesian
+    // (size num_basis_cart_), then compute_core_hamiltonian_matrix /
+    // precompute_eri_matrix apply spherical_transform.hpp to produce the
+    // matrices at size num_basis (= num_basis_sph).  SCF and post-HF then
+    // operate entirely in the smaller Spherical basis.
+    const bool use_spherical_;
+    const int  num_basis_cart_;                   ///< Cartesian count (always set)
+    const std::vector<int> shell_types_;          ///< per-shell L values
+    const std::vector<int> shell_offsets_cart_;   ///< per-shell cart offsets (size n_shells+1)
+    const std::vector<int> shell_offsets_sph_;    ///< per-shell sph  offsets (size n_shells+1)
 
     const int num_electrons; ///< Number of electrons
     const int num_alpha_spins; ///< Number of alpha electrons
@@ -702,7 +725,8 @@ protected:
     const std::string optimizer_; ///< Optimizer: "bfgs"
     
     const std::vector<ShellTypeInfo> shell_type_infos; ///< Shell type info in the primitive shell list
-    const std::vector<BasisRange> atom_to_basis_range; ///< Basis range for each atom
+    const std::vector<BasisRange> atom_to_basis_range; ///< Basis range for each atom (active basis: Spherical when use_spherical, else Cartesian)
+    const std::vector<BasisRange> atom_to_basis_range_cart; ///< Always Cartesian-offset ranges (Molden [GTO] block writes Cart shell info)
 
     DeviceHostMemory<Atom> atoms; ///< Atoms
     DeviceHostMemory<PrimitiveShell> primitive_shells; ///< Primitive shells

@@ -16,6 +16,9 @@
 #include <memory>
 
 #include <cstdlib>  // std::getenv
+#include <cstdio>   // std::printf
+#include <cmath>
+#include <vector>
 #include <string>   // std::string
 #include <fstream>
 #include <iomanip>
@@ -333,21 +336,24 @@ void calc_RI_RMP2_energy_kernel1(int nocc, int nocc_block, int nvir, int nocc_st
     __syncthreads();
 
     uint64_t id = blockDim.x * (uint64_t)blockIdx.x + threadIdx.x;
-    if (id >= (((uint64_t)nocc_block*nocc_stride + nocc_block*(nocc_block-1)/2) *  nvir*(nvir-1)/2)) return;
-
-
-    size_t2 ab = index1to2_upper_wo_trace(id % (nvir * (nvir-1) / 2), nvir);
-    // const size_t a = ab.x, b=ab.y;
-    id /= (nvir * (nvir-1) / 2);
-
-    const size_t i = calc_i(id, nocc_stride, nocc_block); // full-rangeの値が出てくる(0~kでなく、stride~stride+k)
-    const size_t j = calc_j(id, i, nocc_stride);
-    if (i >= nocc) return;
-
-
-    double iajb = d_iajb[(i-nocc_stride)*(size_t)nvir*nocc*nvir + (size_t)ab.x*nocc*nvir + j*nvir + ab.y];
-    double ibja = d_iajb[(i-nocc_stride)*(size_t)nvir*nocc*nvir + (size_t)ab.y*nocc*nvir + j*nvir + ab.x];        
-    double val = 4.0 * ((iajb-ibja)*(iajb-ibja) + iajb*ibja) / (d_eps[i] + d_eps[j] - d_eps[ab.x+nocc] - d_eps[ab.y+nocc]);
+    // NOTE: out-of-range threads must NOT `return` before the warp reduction —
+    // __shfl_down_sync(0xffffffff,…) and __syncthreads() require every lane of
+    // the block to participate.  Early-return left inactive lanes in the full
+    // mask (undefined on Volta+), which corrupted the sum for some dimensions
+    // (e.g. spherical nvir=19).  Instead, compute val (0 if out of range) and
+    // let all threads reduce.
+    double val = 0.0;
+    if (id < (((uint64_t)nocc_block*nocc_stride + nocc_block*(nocc_block-1)/2) *  nvir*(nvir-1)/2)) {
+        size_t2 ab = index1to2_upper_wo_trace(id % (nvir * (nvir-1) / 2), nvir);
+        uint64_t idp = id / (nvir * (nvir-1) / 2);
+        const size_t i = calc_i(idp, nocc_stride, nocc_block); // full-rangeの値 (stride~stride+k)
+        const size_t j = calc_j(idp, i, nocc_stride);
+        if (i < nocc) {
+            double iajb = d_iajb[(i-nocc_stride)*(size_t)nvir*nocc*nvir + (size_t)ab.x*nocc*nvir + j*nvir + ab.y];
+            double ibja = d_iajb[(i-nocc_stride)*(size_t)nvir*nocc*nvir + (size_t)ab.y*nocc*nvir + j*nvir + ab.x];
+            val = 4.0 * ((iajb-ibja)*(iajb-ibja) + iajb*ibja) / (d_eps[i] + d_eps[j] - d_eps[ab.x+nocc] - d_eps[ab.y+nocc]);
+        }
+    }
 
     // warp-wide reduction
     val += __shfl_down_sync(0xffffffff, val, 16, 32);    
@@ -379,19 +385,24 @@ void calc_RI_RMP2_energy_kernel2(int nocc, int nocc_block, int nvir, int nocc_st
     __syncthreads();
 
     uint64_t id = blockDim.x * (uint64_t)blockIdx.x + threadIdx.x;
-    if (id > (((uint64_t)nocc_block*nocc_stride + nocc_block*(nocc_block-1)/2) *  nvir)) {
-        return;
+    // (see kernel1) all lanes must reach the reduction — no early return.
+    // BUGFIX: the bound is EXCLUSIVE ( id < N_pairs·nvir ), matching kernels
+    // 1/3/4.  The original `if (id > bound) return` (inclusive) processed one
+    // extra thread (id == bound) that decodes to a NEXT-block (i,j) pair whose
+    // (i a | j a) lives outside this block's d_iajb chunk → out-of-bounds read.
+    // For Cartesian dims that OOB slot happened to read ~0 (benign); for
+    // spherical (nvir=19) it read garbage, inflating E2 (-0.0022 → -0.9163).
+    double val = 0.0;
+    if (id < (((uint64_t)nocc_block*nocc_stride + nocc_block*(nocc_block-1)/2) *  nvir)) {
+        const size_t a = id % nvir;
+        uint64_t idp = id / nvir;
+        const size_t i = calc_i(idp, nocc_stride, nocc_block);
+        const size_t j = calc_j(idp, i, nocc_stride);
+        if (i < nocc) {
+            double iaja = d_iajb[(i-nocc_stride)*(size_t)nvir*nocc*nvir + a*(size_t)nocc*nvir + j*nvir + a];
+            val = 2.0*iaja*iaja / (d_eps[i] + d_eps[j] - 2.0*d_eps[a+nocc]);
+        }
     }
-
-    const size_t a = id % nvir;
-    id /= nvir;
-
-    const size_t i = calc_i(id, nocc_stride, nocc_block); // full-rangeの値が出てくる(0~kでなく、stride~stride+k)
-    const size_t j = calc_j(id, i, nocc_stride);
-    if (i >= nocc) return;
-
-    double iaja = d_iajb[(i-nocc_stride)*(size_t)nvir*nocc*nvir + a*(size_t)nocc*nvir + j*nvir + a];     
-    double val = 2.0*iaja*iaja / (d_eps[i] + d_eps[j] - 2.0*d_eps[a+nocc]);
 
     // warp-wide reduction
     val += __shfl_down_sync(0xffffffff, val, 16, 32);    
@@ -423,18 +434,17 @@ void calc_RI_RMP2_energy_kernel3(int nocc, int nocc_block, int nvir, int nocc_st
     __syncthreads();
 
     uint64_t id = blockDim.x * (uint64_t)blockIdx.x + threadIdx.x;
-    if (id >= (uint64_t)nocc_block * nvir * (nvir - 1.0) / 2) {
-        return;
+    // (see kernel1) all lanes must reach the reduction — no early return.
+    double val = 0.0;
+    if (id < (uint64_t)(nocc_block * nvir * (nvir - 1.0) / 2)) {
+        size_t2 ab = index1to2_upper_wo_trace(id % (nvir * (nvir-1) / 2), nvir);
+        const size_t a = ab.x, b = ab.y;
+        const size_t i = id / (nvir * (nvir-1) / 2);  // このiは0~k-1
+        if (i + nocc_stride < (size_t)nocc) {
+            double iaib = d_iajb[i*nvir*(size_t)nocc*nvir + a*(size_t)nocc*nvir + (i+nocc_stride)*nvir + b];
+            val = 2.0*iaib*iaib / (2.0*d_eps[i+nocc_stride] - d_eps[a+nocc] - d_eps[b+nocc]);
+        }
     }
-
-    size_t2 ab = index1to2_upper_wo_trace(id % (nvir * (nvir-1) / 2), nvir);
-    const size_t a = ab.x, b = ab.y;
-
-    const size_t i = id / (nvir * (nvir-1) / 2);  // このiは0~k-1
-    if (i + nocc_stride >= nocc) return;
-
-    double iaib = d_iajb[i*nvir*(size_t)nocc*nvir + a*(size_t)nocc*nvir + (i+nocc_stride)*nvir + b];     
-    double val = 2.0*iaib*iaib / (2.0*d_eps[i+nocc_stride] - d_eps[a+nocc] - d_eps[b+nocc]);
 
     // warp-wide reduction
     val += __shfl_down_sync(0xffffffff, val, 16, 32);    
@@ -464,17 +474,16 @@ void calc_RI_RMP2_energy_kernel4(int nocc, int nocc_block, int nvir, int nocc_st
     __syncthreads();
 
     uint64_t id = blockDim.x * (uint64_t)blockIdx.x + threadIdx.x;
-    if (id >= (uint64_t)nocc_block * nvir) {
-        return;
+    // (see kernel1) all lanes must reach the reduction — no early return.
+    double val = 0.0;
+    if (id < (uint64_t)nocc_block * nvir) {
+        const size_t a = id % nvir;
+        const size_t i = id / nvir;  // このiは0~k-1
+        if (i + nocc_stride < (size_t)nocc) {
+            double iaia = d_iajb[i*nvir*(size_t)nocc*nvir + a*(size_t)nocc*nvir + (i+nocc_stride)*nvir + a];
+            val = 0.5*iaia*iaia / (d_eps[i+nocc_stride] - d_eps[a+nocc]);
+        }
     }
-
-    const size_t a = id % nvir;
-    const size_t i = id / nvir;  // このiは0~k-1
-    if (i + nocc_stride >= nocc) return;
-
-    double iaia = d_iajb[i*nvir*(size_t)nocc*nvir + a*(size_t)nocc*nvir + (i+nocc_stride)*nvir + a];     
-    double val = 0.5*iaia*iaia / (d_eps[i+nocc_stride] - d_eps[a+nocc]);
-    // printf("[iter %d] (%d %d) 0.5*%f**2 / (E[%d](%f) - E[%d](%f)) = %f\n", nocc_stride/nocc_block,i,a,iaia, i+nocc_stride, d_eps[i+nocc_stride], a+nocc,d_eps[a+nocc], val);
 
     // warp-wide reduction
     val += __shfl_down_sync(0xffffffff, val, 16, 32);
@@ -1720,6 +1729,8 @@ void ERI_RI_RHF::compute_thc_sos_adc2(int n_states) {
 #ifdef GANSU_CPU_ONLY
     THROW_EXCEPTION("THC-SOS-ADC(2) requires GPU build.");
 #else
+    // Spherical: compute_X_ao_gpu builds the collocation in Cartesian and
+    // transforms the AO axis Cart→Sph internally, so N_bas (sph) is consistent.
     const int N_bas = rhf_.get_num_basis();
     const int n_occ = rhf_.get_num_electrons() / 2;
     const int n_vir = N_bas - n_occ;

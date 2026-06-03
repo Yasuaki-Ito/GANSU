@@ -163,6 +163,11 @@ void ROHF::guess_initial_fock_matrix(const real_t* density_matrix_a, const real_
         if(gbsfilename_.empty()){
             THROW_EXCEPTION("The basis set file is not specified for SAD initial guess method. Please specify the basis set file name by -gbsfilename option.");
         }
+        // SAD places Cartesian per-atom density blocks into the Spherical-dim
+        // molecular density — guard until per-atom Cart→Sph transform is added.
+        if(get_use_spherical())
+            THROW_EXCEPTION("SAD initial guess does not yet support spherical basis "
+                "(--use_spherical 1). Use --initial_guess core (default) or gwh.");
         initial_guess = std::make_unique<InitialGuess_ROHF_SAD>(*this);
     }else{
         THROW_EXCEPTION("Invalid initial guess method: " + initial_guess_method_);
@@ -453,8 +458,11 @@ void ROHF::export_molden_file(const std::string& filename) {
     }
     ofs << "[GTO]" << std::endl;
     primitive_shells.toHost();
-    std::vector<int> num_primitives(num_basis, 0);
-    std::vector<int> shell_types(num_basis, 0);
+    // [GTO] writes Cart-indexed primitive shell info; when use_spherical we must
+    // size by Cart count to avoid OOB writes via primitive_shells[i].basis_index.
+    const size_t nbf_for_gto = get_use_spherical() ? get_num_basis_cart() : num_basis;
+    std::vector<int> num_primitives(nbf_for_gto, 0);
+    std::vector<int> shell_types(nbf_for_gto, 0);
     for(size_t i=0; i<primitive_shells.size(); i++){
         num_primitives[primitive_shells[i].basis_index]++;
         shell_types[primitive_shells[i].basis_index] = primitive_shells[i].shell_type;
@@ -462,7 +470,7 @@ void ROHF::export_molden_file(const std::string& filename) {
 
     for(size_t i=0; i<atoms.size(); i++){
         ofs << i+1 << " " << 0 << std::endl;
-        BasisRange basis_range = get_atom_to_basis_range()[i];
+        BasisRange basis_range = get_atom_to_basis_range_cart()[i];  // Molden [GTO]: Cartesian shell layout
         for(size_t j=basis_range.start_index; j<basis_range.end_index; j++){
             if(num_primitives[j] == 0){
                 continue;
@@ -482,6 +490,13 @@ void ROHF::export_molden_file(const std::string& filename) {
     // write the orbital energies
     orbital_energies.toHost();
     coefficient_matrix.toHost();
+    if (get_use_spherical()) {
+        // Molden spherical-basis markers (per Molden file format spec):
+        // [5D] = 5 D functions in spherical order, [7F] = 7 F, [9G] = 9 G.
+        ofs << "[5D]" << std::endl;
+        ofs << "[7F]" << std::endl;
+        ofs << "[9G]" << std::endl;
+    }
     ofs << "[MO]" << std::endl;
     for(size_t i=0; i<num_basis; i++){
         ofs << "Sym= A" << std::endl;
@@ -523,15 +538,18 @@ void ROHF::export_lmo_molden_file(const std::string& filename) {
     }
     ofs << "[GTO]" << std::endl;
     primitive_shells.toHost();
-    std::vector<int> num_primitives(num_basis, 0);
-    std::vector<int> shell_types(num_basis, 0);
+    // [GTO] writes Cart-indexed primitive shell info; when use_spherical we must
+    // size by Cart count to avoid OOB writes via primitive_shells[i].basis_index.
+    const size_t nbf_for_gto = get_use_spherical() ? get_num_basis_cart() : num_basis;
+    std::vector<int> num_primitives(nbf_for_gto, 0);
+    std::vector<int> shell_types(nbf_for_gto, 0);
     for(size_t i=0; i<primitive_shells.size(); i++){
         num_primitives[primitive_shells[i].basis_index]++;
         shell_types[primitive_shells[i].basis_index] = primitive_shells[i].shell_type;
     }
     for(size_t i=0; i<atoms.size(); i++){
         ofs << i+1 << " " << 0 << std::endl;
-        BasisRange basis_range = get_atom_to_basis_range()[i];
+        BasisRange basis_range = get_atom_to_basis_range_cart()[i];  // Molden [GTO]: Cartesian shell layout
         for(size_t j=basis_range.start_index; j<basis_range.end_index; j++){
             if(num_primitives[j] == 0) continue;
             ofs << " " << shell_type_to_shell_name(shell_types[j]) << " " << num_primitives[j] << " " << "1.00" << std::endl;
@@ -598,6 +616,13 @@ void ROHF::export_lmo_molden_file(const std::string& filename) {
     auto eps_docc_lmo = eps_lmo_diag(loc_docc, 0, n_docc);
     auto eps_socc_lmo = eps_lmo_diag(loc_socc, n_docc, n_socc);
 
+    if (get_use_spherical()) {
+        // Molden spherical-basis markers (per Molden file format spec):
+        // [5D] = 5 D functions in spherical order, [7F] = 7 F, [9G] = 9 G.
+        ofs << "[5D]" << std::endl;
+        ofs << "[7F]" << std::endl;
+        ofs << "[9G]" << std::endl;
+    }
     ofs << "[MO]" << std::endl;
     // doubly-occupied LMOs
     for (int i = 0; i < n_docc; ++i) {

@@ -69,6 +69,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"wiberg", "0"},                            // int (bool)
         {"export_molden", "0"},                     // int (bool)
         {"export_lmo_molden", "0"},                 // int (bool) — export Pipek-Mezey localized occupied orbitals as <basename>_lmo.molden for visualization (Avogadro/Jmol/VMD)
+        {"use_spherical", "0"},                     // int (bool) — Phase 1: 5D / 7F / 9G real solid harmonics (Molden ordering); 0 = native Cartesian 6D/10F/15G. cc-pVDZ d shells validated against ORCA spherical default.
         {"int1e_method", "hybrid"},                 // string
         {"n_excited_states", "5"},                   // int
         {"adc2_solver", "auto"},                     // string (auto, schur_static, schur_omega, full)

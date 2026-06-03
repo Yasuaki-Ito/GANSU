@@ -23,9 +23,11 @@
 #include "hf.hpp"
 #include "rohf.hpp" // for SAD
 #include <memory> // std::unique_ptr
+#include <vector>
 #include "profiler.hpp"
 #include "gpu_manager.hpp"
 #include "utils.hpp" // THROW_EXCEPTION
+#include "spherical_transform.hpp" // SAD Cart→Sph density transform
 
 
 
@@ -805,10 +807,18 @@ public:
     }
 
     void guess() override {
-        // allocate and initialize the density matrices of alpha and beta spins
-        std::unique_ptr<real_t[]> density_matrix(new real_t[hf_.get_num_basis() * hf_.get_num_basis()]);
-        memset(density_matrix.get(), 0, hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t));
+        // The per-atom .sad density blocks are stored in the CARTESIAN atomic
+        // basis, so assemble the molecular density in Cartesian (placing each
+        // block at the atom's Cartesian range), then — under spherical basis —
+        // transform the whole matrix Cart→Sph (D_sph = U·D_cart·Uᵀ).  The
+        // converged SCF energy is independent of the initial guess, so this
+        // operator-transform approximation only seeds the iteration (Phase 3c).
+        const bool sph = hf_.get_use_spherical();
+        const size_t nsph = hf_.get_num_basis();                            // active (sph) count
+        const size_t nwork = sph ? hf_.get_num_basis_cart() : nsph;         // build in Cartesian when sph
+        const auto& ranges = sph ? hf_.get_atom_to_basis_range_cart() : hf_.get_atom_to_basis_range();
 
+        std::vector<real_t> dwork(nwork * nwork, 0.0);
 
         // solve ROHF for each atom to get the density matrix
         for(int i=0; i<hf_.get_atoms().size(); i++){
@@ -828,18 +838,26 @@ public:
             int atom_num_basis;
             auto [atom_density_matrix_alpha, atom_density_matrix_beta] = read_density_from_sad(element_name, hf_.get_gbsfilename(), atom_num_basis);
 
-            // copy the density matrix of the atom to the density matrix of the molecule in the corresponding diagonal block
+            // copy the (Cartesian) atomic density block into the molecular diagonal block
             for(size_t p=0; p < atom_num_basis; p++){
                 for(size_t q = 0; q < atom_num_basis; q++){
-                    size_t p_molecule = hf_.get_atom_to_basis_range()[i].start_index + p;
-                    size_t q_molecule = hf_.get_atom_to_basis_range()[i].start_index + q;
-                    density_matrix[p_molecule * hf_.get_num_basis() + q_molecule] = atom_density_matrix_alpha[p * atom_num_basis + q] + atom_density_matrix_beta [p * atom_num_basis + q];
+                    size_t p_molecule = ranges[i].start_index + p;
+                    size_t q_molecule = ranges[i].start_index + q;
+                    dwork[p_molecule * nwork + q_molecule] = atom_density_matrix_alpha[p * atom_num_basis + q] + atom_density_matrix_beta [p * atom_num_basis + q];
                 }
             }
         }
-        
 
-        cudaMemcpy(hf_.get_density_matrix().device_ptr(), density_matrix.get(), hf_.get_num_basis() * hf_.get_num_basis() * sizeof(real_t));
+        std::unique_ptr<real_t[]> density_matrix(new real_t[nsph * nsph]);
+        if (sph) {
+            spherical::transform_matrix_cart_to_sph(
+                dwork.data(), density_matrix.get(),
+                hf_.get_shell_types(), hf_.get_shell_offsets_cart(), hf_.get_shell_offsets_sph());
+        } else {
+            std::copy(dwork.begin(), dwork.end(), density_matrix.get());
+        }
+
+        cudaMemcpy(hf_.get_density_matrix().device_ptr(), density_matrix.get(), nsph * nsph * sizeof(real_t));
         hf_.compute_fock_matrix(); // compute the Fock matrix from the density matrix
 
         // Since the above Fock matrix is not correct (the density matrix is not correct), the coefficient matrix is computed from the Fock matrix
@@ -1214,6 +1232,19 @@ private:
     /// Allocate full B[naux × nao²] on device 0 and peer-gather every d_B_local_ slab
     /// into its aux range (contiguous ascending partition). Caller frees the result.
     real_t* gather_full_B_device0() const;
+
+    /// Spherical multi-GPU RI gradient. Γ^(3)_cart / Γ^(2)_cart are built ONCE on
+    /// GPU 0 (single-device, via ERI_RI::build_ri_gamma_cart_spherical — avoids the
+    /// multi-GPU thread_local cuBLAS-handle hazard), replicated to all GPUs, then
+    /// each GPU contracts its local Cartesian aux P-slab with kernel-only OpenMP
+    /// (3c2e/2c2e). 1-electron / S / N built on GPU 0. NCCL AllReduce sums the
+    /// per-GPU gradients. Dispatched from compute_ri_gradient when use_spherical.
+    std::vector<double> compute_ri_gradient_spherical_distributed(
+        const real_t* d_density_matrix,
+        const real_t* d_coefficient_matrix,
+        const real_t* d_orbital_energies,
+        const int num_electron);
+
     int num_gpus_;
     std::vector<int> naux_local_;
     std::vector<size_t> P_start_;
@@ -1239,6 +1270,12 @@ private:
     /// Cached L⁻¹ on GPU 0 (computed once in precomputation, reused in distributed_build_B)
     real_t* d_cached_L_inv_ = nullptr;
 
+    /// Phase 2b (spherical distributed RI): cached M = L_sph⁻¹ · U_aux on GPU 0,
+    /// shape [ns_aux × nc_aux] row-major.  Replaces d_cached_L_inv_ for the
+    /// spherical path — folds the auxiliary Cart→Sph mixing into the L⁻¹
+    /// contraction so each 3c2e chunk only needs the orbital pair transformed.
+    real_t* d_cached_M_ = nullptr;
+
     /// Replicated full B [naux × nao²] on each GPU (Replicated-B fragment-parallel DMET).
     /// d_B_full_per_gpu_[g] points to memory allocated on device g, or nullptr.
     mutable std::vector<real_t*> d_B_full_per_gpu_;
@@ -1256,6 +1293,12 @@ private:
         real_t* d_aux_schwarz = nullptr;
         real_t* d_boys = nullptr;
         real_t* d_chunk = nullptr;       ///< Pre-allocated chunk buffer (max aux type size)
+        // --- Phase 2b spherical-distributed-RI scratch (allocated only when
+        //     hf_.get_use_spherical(); nullptr otherwise) ---
+        real_t* d_M = nullptr;           ///< M = L_sph⁻¹·U_aux [ns_aux × nc_aux] (GPU 0 borrows d_cached_M_)
+        real_t* d_chunk_cart = nullptr;  ///< Cart 3c2e chunk [max_nfunc × nc_orb²] (kernel output, pre-transform)
+        real_t* d_T_orb = nullptr;       ///< Orbital-transform Stage-A scratch [max_nfunc × ns_orb × nc_orb]
+        real_t* d_U_orb = nullptr;       ///< Prebuilt orbital U [ns_orb × nc_orb]
     };
     std::vector<PerGpuData> per_gpu_data_;
     bool per_gpu_data_ready_ = false;
@@ -1488,6 +1531,16 @@ public:
     real_t compute_mp2_energy() override;
 
     void compute_fock_matrix() override {
+        // Spherical-basis support for direct_ri/semi_direct_ri is provided by the
+        // multi-GPU ERI_RI_Distributed_RHF (OnTheFly) path (Phase 2c); this
+        // single-GPU fused-kernel class (non-multi-GPU builds only) computes
+        // 3c2e/Fock in Cartesian with no Cart→Sph transform — fail loudly to
+        // avoid silent corruption.  Use --eri_method ri, or a multi-GPU build.
+        if (hf_.get_use_spherical())
+            THROW_EXCEPTION("Spherical-basis direct_ri/semi_direct_ri is only "
+                "supported via the multi-GPU (GANSU_MULTI_GPU) on-the-fly path; "
+                "this single-GPU direct-RI class does not support spherical. "
+                "Use --eri_method ri.");
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
         const DeviceHostMatrix<real_t>& core_hamiltonian_matrix = rhf_.get_core_hamiltonian_matrix();
         const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
@@ -1594,6 +1647,16 @@ public:
     real_t compute_mp2_energy() override;
 
     void compute_fock_matrix() override {
+        // Spherical-basis support for direct_ri/semi_direct_ri is provided by the
+        // multi-GPU ERI_RI_Distributed_RHF (OnTheFly) path (Phase 2c); this
+        // single-GPU fused-kernel class (non-multi-GPU builds only) computes
+        // 3c2e/Fock in Cartesian with no Cart→Sph transform — fail loudly to
+        // avoid silent corruption.  Use --eri_method ri, or a multi-GPU build.
+        if (hf_.get_use_spherical())
+            THROW_EXCEPTION("Spherical-basis direct_ri/semi_direct_ri is only "
+                "supported via the multi-GPU (GANSU_MULTI_GPU) on-the-fly path; "
+                "this single-GPU direct-RI class does not support spherical. "
+                "Use --eri_method ri.");
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
         const DeviceHostMatrix<real_t>& core_hamiltonian_matrix = rhf_.get_core_hamiltonian_matrix();
         const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();

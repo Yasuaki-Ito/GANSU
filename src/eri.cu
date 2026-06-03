@@ -14,6 +14,7 @@
 
 
 #include "eri.hpp"
+#include "spherical_transform.hpp"
 #include "utils_cuda.hpp"
 #include "rys_eri.hpp"
 #include "gpu_kernels.hpp"
@@ -22,6 +23,7 @@
 #include "ao2mo.cuh"
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #ifndef GANSU_CPU_ONLY
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
@@ -156,28 +158,64 @@ void ERI_Stored::precomputation() {
     gpu::computeSchwarzUpperBounds(
         shell_type_infos,
         shell_pair_type_infos,
-        primitive_shells.device_ptr(), 
-        boys_grid.device_ptr(), 
-        cgto_normalization_factors.device_ptr(), 
-        schwarz_upper_bound_factors.device_ptr(), 
-        verbose
-        );
-
-
-    //gpu::computeERIMatrix(shell_type_infos, primitive_shells.device_ptr(), boys_grid.device_ptr(), cgto_normalization_factors.device_ptr(), eri_matrix_.device_ptr(), schwarz_screening_threshold, num_basis_, verbose);
-
-    gpu::computeERIMatrix(
-        shell_type_infos, 
-        shell_pair_type_infos, 
-        primitive_shells.device_ptr(), 
+        primitive_shells.device_ptr(),
         boys_grid.device_ptr(),
-        cgto_normalization_factors.device_ptr(),   
-        eri_matrix_.device_ptr(), 
+        cgto_normalization_factors.device_ptr(),
         schwarz_upper_bound_factors.device_ptr(),
-        schwarz_screening_threshold, 
-        num_basis_, 
         verbose
         );
+
+
+    if (hf_.get_use_spherical()) {
+        // Phase 1 spherical-basis ERI path: compute in Cartesian (nbf_cart)
+        // on GPU, then apply the GPU Cart→Sph transform (4 cuBLAS DGEMMs)
+        // directly on device memory.  No D2H / H2D round trip.
+        const int nbf_cart = hf_.get_num_basis_cart();
+        const int nbf_sph  = num_basis_;
+        DeviceHostMatrix<real_t> eri_cart_tmp(nbf_cart * nbf_cart,
+                                              nbf_cart * nbf_cart);
+        cudaMemset(eri_cart_tmp.device_ptr(), 0,
+                   sizeof(real_t) * (size_t)nbf_cart * nbf_cart * nbf_cart * nbf_cart);
+
+        gpu::computeERIMatrix(
+            shell_type_infos,
+            shell_pair_type_infos,
+            primitive_shells.device_ptr(),
+            boys_grid.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
+            eri_cart_tmp.device_ptr(),
+            schwarz_upper_bound_factors.device_ptr(),
+            schwarz_screening_threshold,
+            nbf_cart,
+            verbose
+            );
+
+        // GPU-side Cart→Sph: write directly into eri_matrix_.device_ptr()
+        // (already sized nbf_sph × nbf_sph × nbf_sph × nbf_sph on device).
+        spherical::transform_eri_cart_to_sph_device(
+            eri_cart_tmp.device_ptr(), eri_matrix_.device_ptr(),
+            hf_.get_shell_types(),
+            hf_.get_shell_offsets_cart(),
+            hf_.get_shell_offsets_sph());
+
+        if (verbose) {
+            std::cout << "[Spherical] Cart→Sph transform applied to ERI tensor "
+                      << "(" << nbf_cart << "⁴ → " << nbf_sph << "⁴)" << std::endl;
+        }
+    } else {
+        gpu::computeERIMatrix(
+            shell_type_infos,
+            shell_pair_type_infos,
+            primitive_shells.device_ptr(),
+            boys_grid.device_ptr(),
+            cgto_normalization_factors.device_ptr(),
+            eri_matrix_.device_ptr(),
+            schwarz_upper_bound_factors.device_ptr(),
+            schwarz_screening_threshold,
+            num_basis_,
+            verbose
+            );
+    }
 
     // print the eri matrix
     if(verbose){
@@ -200,7 +238,7 @@ void ERI_Stored::precomputation() {
 
 
 
-ERI_RI::ERI_RI(const HF& hf, const Molecular& auxiliary_molecular): 
+ERI_RI::ERI_RI(const HF& hf, const Molecular& auxiliary_molecular):
         hf_(hf),
         num_basis_(hf.get_num_basis()),
         num_auxiliary_basis_(auxiliary_molecular.get_num_basis()),
@@ -208,6 +246,10 @@ ERI_RI::ERI_RI(const HF& hf, const Molecular& auxiliary_molecular):
         auxiliary_shell_type_infos_(auxiliary_molecular.get_shell_type_infos()),
         auxiliary_primitive_shells_(auxiliary_molecular.get_primitive_shells()),
         auxiliary_cgto_normalization_factors_(auxiliary_molecular.get_cgto_normalization_factors()),
+        num_auxiliary_basis_cart_(auxiliary_molecular.get_num_basis_cart()),
+        aux_shell_types_(auxiliary_molecular.get_shell_types()),
+        aux_shell_offsets_cart_(auxiliary_molecular.get_shell_offsets_cart()),
+        aux_shell_offsets_sph_(auxiliary_molecular.get_shell_offsets_sph()),
         intermediate_matrix_B_(num_auxiliary_basis_, num_basis_*num_basis_),
         d_J_(num_basis_, num_basis_),
         d_K_(num_basis_, num_basis_),
@@ -242,6 +284,10 @@ ERI_RI::ERI_RI(const HF& hf, const Molecular& auxiliary_molecular, LightweightTa
         auxiliary_shell_type_infos_(auxiliary_molecular.get_shell_type_infos()),
         auxiliary_primitive_shells_(auxiliary_molecular.get_primitive_shells()),
         auxiliary_cgto_normalization_factors_(auxiliary_molecular.get_cgto_normalization_factors()),
+        num_auxiliary_basis_cart_(auxiliary_molecular.get_num_basis_cart()),
+        aux_shell_types_(auxiliary_molecular.get_shell_types()),
+        aux_shell_offsets_cart_(auxiliary_molecular.get_shell_offsets_cart()),
+        aux_shell_offsets_sph_(auxiliary_molecular.get_shell_offsets_sph()),
         intermediate_matrix_B_(1, 1),  // dummy — not used in distributed mode
         d_J_(1, 1),
         d_K_(1, 1),
@@ -1079,24 +1125,115 @@ void ERI_RI::precomputation() {
     const real_t schwarz_screening_threshold = hf_.get_schwarz_screening_threshold();
     const int verbose = hf_.get_verbose();
 
-    cudaMemset(intermediate_matrix_B_.device_ptr(), 0,
-               (size_t)num_auxiliary_basis_ * num_basis_ * num_basis_ * sizeof(real_t));
+    if (hf_.get_use_spherical()) {
+        // === Phase 2 Spherical RI path ===
+        // Compute (P|Q)_cart and (P|μν)_cart with the standard kernels in
+        // Cart-sized buffers, then run Cart→Sph on each via cuBLAS DGEMM
+        // (V_sph^{-1/2} ≠ U_aux · V_cart^{-1/2} · U_aux^T, so we must
+        // transform 2c2e and 3c2e separately *before* computing V^{-1/2}).
+        const int nc_orb = hf_.get_num_basis_cart();
+        const int ns_orb = num_basis_;
+        const int nc_aux = num_auxiliary_basis_cart_;
+        const int ns_aux = num_auxiliary_basis_;
 
-    gpu::compute_RI_IntermediateMatrixB(
-        shell_type_infos, shell_pair_type_infos,
-        primitive_shells.device_ptr(), cgto_normalization_factors.device_ptr(),
-        auxiliary_shell_type_infos_,
-        auxiliary_primitive_shells_.device_ptr(),
-        auxiliary_cgto_normalization_factors_.device_ptr(),
-        intermediate_matrix_B_.device_ptr(),
-        d_persistent_shell_pair_indices_,
-        schwarz_upper_bound_factors.device_ptr(),
-        auxiliary_schwarz_upper_bound_factors.device_ptr(),
-        schwarz_screening_threshold,
-        num_basis_, num_auxiliary_basis_,
-        boys_grid.device_ptr(), verbose);
+        const size_t bytes_3c_cart = (size_t)nc_aux * nc_orb * nc_orb * sizeof(real_t);
+        const size_t bytes_2c_cart = (size_t)nc_aux * nc_aux        * sizeof(real_t);
+        const size_t bytes_3c_sph  = (size_t)ns_aux * ns_orb * ns_orb * sizeof(real_t);
+        const size_t bytes_2c_sph  = (size_t)ns_aux * ns_aux        * sizeof(real_t);
 
-    cudaDeviceSynchronize();
+        // Allocate Cart buffers for 3c2e and 2c2e (released after transform)
+        real_t* d_3c_cart = nullptr;
+        real_t* d_2c_cart = nullptr;
+        cudaMalloc((void**)&d_3c_cart, bytes_3c_cart);
+        cudaMalloc((void**)&d_2c_cart, bytes_2c_cart);
+        cudaMemset(d_3c_cart, 0, bytes_3c_cart);
+        cudaMemset(d_2c_cart, 0, bytes_2c_cart);
+
+        // (P|μν) in Cart
+        gpu::computeThreeCenterERIs(
+            shell_type_infos, shell_pair_type_infos,
+            primitive_shells.device_ptr(), cgto_normalization_factors.device_ptr(),
+            auxiliary_shell_type_infos_,
+            auxiliary_primitive_shells_.device_ptr(),
+            auxiliary_cgto_normalization_factors_.device_ptr(),
+            d_3c_cart,
+            d_persistent_shell_pair_indices_,
+            nc_orb, nc_aux,
+            boys_grid.device_ptr(),
+            schwarz_upper_bound_factors.device_ptr(),
+            auxiliary_schwarz_upper_bound_factors.device_ptr(),
+            schwarz_screening_threshold,
+            verbose);
+
+        // (P|Q) in Cart
+        gpu::computeTwoCenterERIs(
+            auxiliary_shell_type_infos_,
+            auxiliary_primitive_shells_.device_ptr(),
+            auxiliary_cgto_normalization_factors_.device_ptr(),
+            d_2c_cart, nc_aux,
+            boys_grid.device_ptr(),
+            auxiliary_schwarz_upper_bound_factors.device_ptr(),
+            schwarz_screening_threshold,
+            verbose);
+
+        // Allocate Sph buffers
+        real_t* d_3c_sph = nullptr;
+        real_t* d_2c_sph = nullptr;
+        cudaMalloc((void**)&d_3c_sph, bytes_3c_sph);
+        cudaMalloc((void**)&d_2c_sph, bytes_2c_sph);
+
+        // 3-index Cart→Sph on (P|μν)
+        spherical::transform_3index_cart_to_sph_device(
+            d_3c_cart, d_3c_sph,
+            aux_shell_types_, aux_shell_offsets_cart_, aux_shell_offsets_sph_,
+            hf_.get_shell_types(), hf_.get_shell_offsets_cart(), hf_.get_shell_offsets_sph());
+        cudaFree(d_3c_cart);
+
+        // 2-index Cart→Sph on (P|Q)
+        spherical::transform_matrix_cart_to_sph_device(
+            d_2c_cart, d_2c_sph,
+            aux_shell_types_, aux_shell_offsets_cart_, aux_shell_offsets_sph_);
+        cudaFree(d_2c_cart);
+
+        // Same algorithm as compute_RI_IntermediateMatrixB (Cart fused path):
+        // (1) Cholesky V_sph = L_sph · L_sph^T  (overwrites 2c_sph with L_sph)
+        // (2) solve L_sph · X = 3c_sph  →  X = L_sph^{-1} · 3c_sph
+        // (3) B_sph := X.   Validates B^T·B = 3c^T·V^{-1}·3c = sph ERI.
+        gpu::choleskyDecomposition(d_2c_sph, ns_aux);
+        gpu::solve_lower_triangular(d_2c_sph, d_3c_sph, ns_aux, ns_orb * ns_orb);
+        cudaMemcpy(intermediate_matrix_B_.device_ptr(), d_3c_sph,
+                   bytes_3c_sph, cudaMemcpyDeviceToDevice);
+
+        cudaFree(d_3c_sph);
+        cudaFree(d_2c_sph);
+        cudaDeviceSynchronize();
+
+        if (verbose) {
+            std::cout << "[RI Spherical] B matrix built via Cart 2c+3c → Sph transform "
+                      << "→ V^{-1/2} (orb " << nc_orb << "→" << ns_orb
+                      << ", aux " << nc_aux << "→" << ns_aux << ")" << std::endl;
+        }
+    } else {
+        // === Cartesian path (fused kernel, unchanged) ===
+        cudaMemset(intermediate_matrix_B_.device_ptr(), 0,
+                   (size_t)num_auxiliary_basis_ * num_basis_ * num_basis_ * sizeof(real_t));
+
+        gpu::compute_RI_IntermediateMatrixB(
+            shell_type_infos, shell_pair_type_infos,
+            primitive_shells.device_ptr(), cgto_normalization_factors.device_ptr(),
+            auxiliary_shell_type_infos_,
+            auxiliary_primitive_shells_.device_ptr(),
+            auxiliary_cgto_normalization_factors_.device_ptr(),
+            intermediate_matrix_B_.device_ptr(),
+            d_persistent_shell_pair_indices_,
+            schwarz_upper_bound_factors.device_ptr(),
+            auxiliary_schwarz_upper_bound_factors.device_ptr(),
+            schwarz_screening_threshold,
+            num_basis_, num_auxiliary_basis_,
+            boys_grid.device_ptr(), verbose);
+
+        cudaDeviceSynchronize();
+    }
 }
 
 
@@ -1190,8 +1327,14 @@ const real_t* ERI_Direct::get_eri_matrix_device() const {
     return d_eri_reconstructed_;
 }
 
-void ERI_Direct::precomputation() 
+void ERI_Direct::precomputation()
 {
+    // Direct SCF builds the Fock matrix directly from Cartesian 2e integrals
+    // (no Cart→Sph transform of the orbital indices). Guard spherical until a
+    // sph-aware Direct path exists; use --eri_method ri/stored for spherical.
+    if (hf_.get_use_spherical())
+        THROW_EXCEPTION("eri_method=Direct does not support spherical basis "
+            "(--use_spherical 1). Use --eri_method stored or ri.");
     const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
     const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
     const DeviceHostMemory<PrimitiveShell>& primitive_shells = hf_.get_primitive_shells();
@@ -1374,6 +1517,11 @@ real_t* ERI_Hash::build_mo_eri(const real_t* d_C, int nmo) const {
 }
 
 void ERI_Hash::precomputation() {
+    // Hash-based Fock build uses Cartesian 2e integrals with no Cart→Sph
+    // transform. Guard spherical (use --eri_method stored or ri instead).
+    if (hf_.get_use_spherical())
+        THROW_EXCEPTION("eri_method=hash does not support spherical basis "
+            "(--use_spherical 1). Use --eri_method stored or ri.");
     const std::vector<ShellTypeInfo>& shell_type_infos = hf_.get_shell_type_infos();
     const std::vector<ShellPairTypeInfo>& shell_pair_type_infos = hf_.get_shell_pair_type_infos();
     const DeviceHostMemory<PrimitiveShell>& primitive_shells = hf_.get_primitive_shells();
