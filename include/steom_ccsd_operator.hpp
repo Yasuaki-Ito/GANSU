@@ -49,6 +49,7 @@
 
 #include "linear_operator.hpp"
 #include "types.hpp"
+#include "steom_barh_cache.hpp"   // (A) shared dressed bar-H cache
 
 namespace gansu {
 
@@ -112,7 +113,12 @@ public:
                       // + extracts; operator takes ownership and uses them in
                       // canonical-skip Term A GEMM). Non-null + size ≥ 2
                       // enables slab mode (forces canonical_skip_wvvvv_=true).
-                      std::vector<real_t*>* d_eri_vvvv_slabs_input = nullptr);
+                      std::vector<real_t*>* d_eri_vvvv_slabs_input = nullptr,
+                      // (A) shared bar-H: when non-null and complete(), borrow
+                      // all 11 dressed intermediates from the cache (published by
+                      // IP+EA) and SKIP build_dressed_intermediates entirely. The
+                      // dtor then skips freeing the 11 (the driver owns them).
+                      SteomBarHCache* barh_cache = nullptr);
 
     ~STEOMCCSDOperator();
 
@@ -244,6 +250,14 @@ private:
     real_t* d_Wvovv_  = nullptr;
     real_t* d_Wvvvv_  = nullptr;
     real_t* d_Wvvvo_  = nullptr;
+
+    // === (A) shared bar-H borrowing ===
+    // When barh_cache_ != nullptr and complete() (dims + canonical_skip match),
+    // build_dressed_intermediates points the 11 d_* members at the cache's
+    // device buffers and returns without building; barh_borrowed_ is set so the
+    // destructor skips freeing them (the STEOM driver owns + frees the cache).
+    SteomBarHCache* barh_cache_ = nullptr;
+    bool barh_borrowed_ = false;
 
     // === Fock diagonals (for bar-H build) ===
     real_t* d_f_oo_  = nullptr;  // [nocc_active]

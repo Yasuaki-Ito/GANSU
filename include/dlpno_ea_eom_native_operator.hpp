@@ -348,6 +348,26 @@ private:
     // uploads either if ph1 is on regardless of ph2/ph3.
     bool use_gpu_ph1_ = false;
 
+    // B-a.6h(grouped) EA ph-ladder as batched cublasDgemmBatched (env
+    // GANSU_DLPNO_NATIVE_GPU_PH_GROUPED, ⊂ use_gpu_ph1_&&ph2&&ph3; single-device only). The
+    // ph-ladder is the EA-solve hotspot (~89% of sigma apply): per-(j,l) uniform nvir×nvir×
+    // nvir GEMMs accumulating over l into acc[j], ~4·nact² of them/matvec, each ~38× more
+    // overhead than its flops. They collapse into ~4·nact batched GEMMs by looping the
+    // reduction index l and batching over the active occ j (distinct acc[j] → no race);
+    // ph2→ph3→ph1 with ph1A/ph1B interleaved per l preserves the per-j accumulation order
+    // → bit-exact. The 4 device pointer arrays (R[l]/Wovov/Wovvo/acc[j]) are fixed →
+    // built once in the ctor. Default off → the per-(j,l) loops run. IP phl mirror.
+    bool use_ph_grouped_ = false;
+    const real_t** d_pR_     = nullptr;  ///< [nact·nact] r2c[l] (repeated over j)
+    const real_t** d_pWovov_ = nullptr;  ///< [nact·nact] Wovov_lmo A_j[l] base (ldb=nocc·nvir)
+    const real_t** d_pWovvo_ = nullptr;  ///< [nact·nact] Wovvo_re B_j[l] base (contiguous nvir²)
+    real_t** d_pAcc_ = nullptr;          ///< [nact·nact] acc[j] (= d_acc_all_ + j·nvir²)
+    std::vector<int> ph_act_;            ///< active occ indices (n_pno_ii>0)
+    int ph_nact_ = 0;                    ///< number of active occ
+    /// B-a.6h(grouped): the batched ph-ladder (ph2 + ph3 + ph1; replaces the per-(j,l)
+    /// loops when use_ph_grouped_). Bit-exact (same GEMMs, batched, order preserved).
+    void add_tph_grouped_gpu() const;
+
     // B-a.6a GPU port — Stage 3b T_tmp (env GANSU_DLPNO_NATIVE_GPU_TMP=1; requires
     // use_gpu_xpair_). The two-stage T_tmp term, both stages as a single GEMV:
     //   stage 1  tmp[K] = Σ_{l,c,d} ovov_Llmo[K,c,l,d]·r2c_sym[l](c,d)   (r2c_sym = 2R-Rᵀ,

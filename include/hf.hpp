@@ -37,6 +37,7 @@
 #include "ea_eom_result.hpp"
 #include "steom_result.hpp"
 #include "bt_pno_backtransform.hpp"  // BTAmplitudes (hybrid DLPNO-STEOM P5b)
+#include "steom_barh_cache.hpp"      // SteomBarHCache (DLPNO-STEOM build_dressed sharing, (A))
 
 
 namespace gansu{
@@ -565,6 +566,17 @@ public:
     void set_use_dlpno_projected_eom(bool b) { use_dlpno_projected_eom_ = b; }
     bool use_dlpno_projected_eom() const { return use_dlpno_projected_eom_; }
 
+    /// (A) build_dressed de-duplication (env GANSU_STEOM_SHARE_BARH=1).
+    /// When set by the DLPNO-STEOM driver, the IP/EA operators publish their
+    /// dressed bar-H tensors into steom_barh_cache_ and the STEOM operator
+    /// borrows all 11, skipping its own build_dressed_intermediates entirely.
+    /// Default false → each operator rebuilds independently (byte-identical).
+    /// See include/steom_barh_cache.hpp.
+    void set_steom_share_barh(bool b) { steom_share_barh_ = b; }
+    bool steom_share_barh() const { return steom_share_barh_; }
+    SteomBarHCache& steom_barh_cache() { return steom_barh_cache_; }
+    const SteomBarHCache& steom_barh_cache() const { return steom_barh_cache_; }
+
     /// stage B (a): IP impl runs the NATIVE per-pair DLPNO-IP-EOM σ operator
     /// (DLPNOIPEOMNativeOperator) instead of the project-up reference. Set
     /// alongside use_dlpno_projected_eom_ (EA stays projected until native EA
@@ -765,6 +777,8 @@ protected:
     DLPNOLMP2Result dlpno_res_;                  ///< stage B: converged DLPNO pair state (set when collect_dlpno_bt_)
     bool         use_dlpno_projected_eom_ = false; ///< stage B: IP/EA impls run the projected DLPNO operator
     bool         use_dlpno_native_eom_ = false; ///< stage B (a): IP impl runs the native per-pair DLPNO-IP-EOM σ
+    bool         steom_share_barh_ = false;        ///< (A): IP/EA publish dressed bar-H, STEOM borrows (env GANSU_STEOM_SHARE_BARH=1)
+    SteomBarHCache steom_barh_cache_;              ///< (A): shared dressed bar-H, owned across IP→EA→STEOM dispatch, freed by driver
 
     // ECP data (from Molecular)
     bool has_ecp_ = false;

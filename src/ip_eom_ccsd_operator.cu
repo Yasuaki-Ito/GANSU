@@ -292,13 +292,15 @@ IPEOMCCSDOperator::IPEOMCCSDOperator(
     const ERI_RI* eri_block_src,
     const real_t* d_B_mo_blocks,
     int nmo_full,
-    int num_gpus)
+    int num_gpus,
+    SteomBarHCache* barh_cache)
     : nocc_(nocc), nvir_(nvir), nao_(nao),
       h_dim_(nocc),
       h2p_dim_(nocc * nocc * nvir),
       total_dim_(nocc + nocc * nocc * nvir),
       d_t1_(d_t1), d_t2_(d_t2),
-      eri_block_src_(eri_block_src), d_B_mo_blocks_(d_B_mo_blocks), nmo_full_(nmo_full)
+      eri_block_src_(eri_block_src), d_B_mo_blocks_(d_B_mo_blocks), nmo_full_(nmo_full),
+      barh_cache_(barh_cache)
 {
     if (nocc <= 0 || nvir <= 0 || nao != nocc + nvir) {
         throw std::invalid_argument(
@@ -333,6 +335,25 @@ IPEOMCCSDOperator::IPEOMCCSDOperator(
         };
         tphase("extract_eri_blocks",          [&]{ extract_eri_blocks(d_eri_mo); });
         tphase("build_dressed_intermediates", [&]{ build_dressed_intermediates(); });
+        // (A) shared bar-H: publish the 8 IP-side intermediates and relinquish
+        // ownership (dtor will skip freeing them). EA later adds Wvovv/Wvvvv/
+        // Wvvvo; STEOM borrows the union. All bit-identical across operators.
+        if (barh_cache_ != nullptr) {
+            barh_cache_->d_Loo   = d_Loo_;
+            barh_cache_->d_Lvv   = d_Lvv_;
+            barh_cache_->d_Fov   = d_Fov_;
+            barh_cache_->d_Woooo = d_Woooo_;
+            barh_cache_->d_Wooov = d_Wooov_;
+            barh_cache_->d_Wovov = d_Wovov_;
+            barh_cache_->d_Wovvo = d_Wovvo_;
+            barh_cache_->d_Wovoo = d_Wovoo_;
+            barh_cache_->nocc    = nocc_;
+            barh_cache_->nvir    = nvir_;
+            barh_cache_->has_ip  = true;
+            barh_published_      = true;
+            std::cout << "  [STEOM share-barH] IP published 8 bar-H intermediates "
+                         "(Loo/Lvv/Fov/Woooo/Wooov/Wovov/Wovvo/Wovoo)." << std::endl;
+        }
         num_gpus_ = (num_gpus > 1 ? num_gpus : 1);
         setup_multi_gpu();   // Stage IP-5: per-device replicas (no-op when num_gpus_==1)
     }
@@ -352,14 +373,20 @@ IPEOMCCSDOperator::~IPEOMCCSDOperator() {
     if (d_eri_ovvo_)  tracked_cudaFree(d_eri_ovvo_);
     if (d_eri_ooov_)  tracked_cudaFree(d_eri_ooov_);
     if (d_eri_ovvv_)  tracked_cudaFree(d_eri_ovvv_);
-    if (d_Loo_)       tracked_cudaFree(d_Loo_);
-    if (d_Lvv_)       tracked_cudaFree(d_Lvv_);
-    if (d_Fov_)       tracked_cudaFree(d_Fov_);
-    if (d_Woooo_)     tracked_cudaFree(d_Woooo_);
-    if (d_Wooov_)     tracked_cudaFree(d_Wooov_);
-    if (d_Wovov_)     tracked_cudaFree(d_Wovov_);
-    if (d_Wovvo_)     tracked_cudaFree(d_Wovvo_);
-    if (d_Wovoo_)     tracked_cudaFree(d_Wovoo_);
+    // (A) shared bar-H: when published, the cache owns these 8 device buffers
+    // (freed by the STEOM driver after STEOM borrows them). Skip here to avoid
+    // a double-free / use-after-free. The per-device replicas (d≥1) below are
+    // SEPARATE allocations and are always freed.
+    if (!barh_published_) {
+        if (d_Loo_)       tracked_cudaFree(d_Loo_);
+        if (d_Lvv_)       tracked_cudaFree(d_Lvv_);
+        if (d_Fov_)       tracked_cudaFree(d_Fov_);
+        if (d_Woooo_)     tracked_cudaFree(d_Woooo_);
+        if (d_Wooov_)     tracked_cudaFree(d_Wooov_);
+        if (d_Wovov_)     tracked_cudaFree(d_Wovov_);
+        if (d_Wovvo_)     tracked_cudaFree(d_Wovvo_);
+        if (d_Wovoo_)     tracked_cudaFree(d_Wovoo_);
+    }
 #ifndef GANSU_CPU_ONLY
     // Stage IP-5: free per-device replicas + scratch (ws_[0] only owns scratch;
     // its replica pointers alias the device-0 members freed above).
@@ -656,6 +683,20 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
     cudaMemcpy(h_f_oo.data(), d_f_oo_, NO * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_f_vv.data(), d_f_vv_, NV * sizeof(real_t), cudaMemcpyDeviceToHost);
 
+    // Per-intermediate profiler (env GANSU_EOM_BUILD_PROF2=1) — pinpoints the host-loop
+    // hotspot inside build_dressed (GANSU_EOM_BUILD_PROF times only the whole phase). Each
+    // blap() prints the wall time since the previous call. Off → zero overhead.
+    const bool bprof2 = [](){ const char* e = std::getenv("GANSU_EOM_BUILD_PROF2"); return e && e[0] == '1'; }();
+    auto bp_t0 = std::chrono::high_resolution_clock::now();
+    auto blap = [&](const char* name) {
+        if (!bprof2) return;
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        std::cout << "    [IP build-PROF2] " << name << " = " << std::fixed << std::setprecision(3)
+                  << std::chrono::duration<double>(t1 - bp_t0).count() << " s" << std::endl;
+        bp_t0 = t1;
+    };
+    blap("D2H inputs");
+
     // ============================================================
     //  cc_Fov[k,c] = fov + 2 ovov[k,c,l,d] t1[l,d] - ovov[k,d,l,c] t1[l,d]
     //  (Canonical: fov = 0.)
@@ -673,6 +714,78 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
             h_Fov[k*NV + c] = v;
         }
 
+    // GPU GEMM port of cc_Foo Σlcd (NO³·NV²) + cc_Fvv Σkld (NO²·NV³) — the build_dressed
+    // hotspot (~45% / 6 s at naphthalene per build-PROF2). Each is a single [N×N] = P·Qᵀ
+    // contraction over a 3-index (Foo: m=(l,c,d); Fvv: m=(k,l,d)). The A factor is the
+    // (2 ovov - ovovᵀ) combination; the B factor is (t2 + t1·t1). Mirrors the validated
+    // Woooo Σcd port below. Host fallback (CPU-only) = the per-element cc_Foo/cc_Fvv loops.
+    std::vector<real_t> ct_foo, ct_fvv;
+    bool foo_fvv_gpu = false;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+        const real_t one = 1.0, zero = 0.0;
+        const size_t M_foo = (size_t)NO * NV * NV;   // (l,c,d)
+        const size_t M_fvv = (size_t)NO * NO * NV;   // (k,l,d)
+        std::vector<real_t> hAfoo((size_t)NO*M_foo), hBfoo((size_t)NO*M_foo);
+        std::vector<real_t> hAfvv((size_t)NV*M_fvv), hBfvv((size_t)NV*M_fvv);
+        // Foo (first index x = k for A / i for B): A[x,(l,c,d)] = 2 ovov[x,c,l,d] - ovov[x,d,l,c];
+        //   B[x,(l,c,d)] = t2[x,l,c,d] + t1[x,c] t1[l,d].
+        #pragma omp parallel for collapse(2)
+        for (int x=0;x<NO;++x) for (int l=0;l<NO;++l)
+            for (int c=0;c<NV;++c) for (int d=0;d<NV;++d) {
+                const size_t m=((size_t)l*NV+c)*NV+d;
+                hAfoo[(size_t)x*M_foo+m] = 2.0*H_OVOV(x,c,l,d) - H_OVOV(x,d,l,c);
+                hBfoo[(size_t)x*M_foo+m] = H_T2(x,l,c,d) + H_T1(x,c)*H_T1(l,d);
+            }
+        // Fvv (first index x = c for A / a for B): A[x,(k,l,d)] = 2 ovov[k,x,l,d] - ovov[k,d,l,x];
+        //   B[x,(k,l,d)] = t2[k,l,x,d] + t1[k,x] t1[l,d].
+        #pragma omp parallel for collapse(2)
+        for (int x=0;x<NV;++x) for (int k=0;k<NO;++k)
+            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) {
+                const size_t m=((size_t)k*NO+l)*NV+d;
+                hAfvv[(size_t)x*M_fvv+m] = 2.0*H_OVOV(k,x,l,d) - H_OVOV(k,d,l,x);
+                hBfvv[(size_t)x*M_fvv+m] = H_T2(k,l,x,d) + H_T1(k,x)*H_T1(l,d);
+            }
+        real_t *dAfoo=nullptr,*dBfoo=nullptr,*dCfoo=nullptr,*dAfvv=nullptr,*dBfvv=nullptr,*dCfvv=nullptr;
+        tracked_cudaMalloc(&dAfoo,(size_t)NO*M_foo*sizeof(real_t));
+        tracked_cudaMalloc(&dBfoo,(size_t)NO*M_foo*sizeof(real_t));
+        tracked_cudaMalloc(&dCfoo,(size_t)NO*NO*sizeof(real_t));
+        tracked_cudaMalloc(&dAfvv,(size_t)NV*M_fvv*sizeof(real_t));
+        tracked_cudaMalloc(&dBfvv,(size_t)NV*M_fvv*sizeof(real_t));
+        tracked_cudaMalloc(&dCfvv,(size_t)NV*NV*sizeof(real_t));
+        cudaMemcpy(dAfoo,hAfoo.data(),(size_t)NO*M_foo*sizeof(real_t),cudaMemcpyHostToDevice);
+        cudaMemcpy(dBfoo,hBfoo.data(),(size_t)NO*M_foo*sizeof(real_t),cudaMemcpyHostToDevice);
+        cudaMemcpy(dAfvv,hAfvv.data(),(size_t)NV*M_fvv*sizeof(real_t),cudaMemcpyHostToDevice);
+        cudaMemcpy(dBfvv,hBfvv.data(),(size_t)NV*M_fvv*sizeof(real_t),cudaMemcpyHostToDevice);
+        // ct_foo[k,i] = Σ_m A_foo[k,m] B_foo[i,m]  (row-major [NO×NO], elem k*NO+i).
+        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,NO,NO,(int)M_foo,&one,dBfoo,(int)M_foo,dAfoo,(int)M_foo,&zero,dCfoo,NO);
+        // ct_fvv[a,c] = Σ_m B_fvv[a,m] A_fvv[c,m]  (row-major [NV×NV], elem a*NV+c).
+        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,NV,NV,(int)M_fvv,&one,dAfvv,(int)M_fvv,dBfvv,(int)M_fvv,&zero,dCfvv,NV);
+        ct_foo.assign((size_t)NO*NO,0.0); ct_fvv.assign((size_t)NV*NV,0.0);
+        cudaMemcpy(ct_foo.data(),dCfoo,(size_t)NO*NO*sizeof(real_t),cudaMemcpyDeviceToHost);
+        cudaMemcpy(ct_fvv.data(),dCfvv,(size_t)NV*NV*sizeof(real_t),cudaMemcpyDeviceToHost);
+        tracked_cudaFree(dAfoo);tracked_cudaFree(dBfoo);tracked_cudaFree(dCfoo);
+        tracked_cudaFree(dAfvv);tracked_cudaFree(dBfvv);tracked_cudaFree(dCfvv);
+        foo_fvv_gpu = true;
+        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+            real_t d1=0.0,d2=0.0;
+            for (int k=0;k<NO;k+=(NO/2>0?NO/2:1)) for (int i=0;i<NO;++i) {
+                real_t v=0.0; for (int l=0;l<NO;++l) for (int c=0;c<NV;++c) for (int d=0;d<NV;++d)
+                    v += (2.0*H_OVOV(k,c,l,d)-H_OVOV(k,d,l,c))*(H_T2(i,l,c,d)+H_T1(i,c)*H_T1(l,d));
+                d1=std::max(d1,std::fabs(v-ct_foo[(size_t)k*NO+i]));
+            }
+            for (int a=0;a<NV;a+=(NV/2>0?NV/2:1)) for (int c=0;c<NV;c+=(NV/2>0?NV/2:1)) {
+                real_t v=0.0; for (int k=0;k<NO;++k) for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
+                    v += (2.0*H_OVOV(k,c,l,d)-H_OVOV(k,d,l,c))*(H_T2(k,l,a,d)+H_T1(k,a)*H_T1(l,d));
+                d2=std::max(d2,std::fabs(v-ct_fvv[(size_t)a*NV+c]));
+            }
+            std::cout << "[IP-EOM build self-check] cc_Foo Σlcd max|Δ| = " << std::scientific << d1
+                      << ", cc_Fvv Σkld max|Δ| = " << d2 << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+        }
+    }
+#endif
+
     // ============================================================
     //  cc_Foo[k,i] = foo[k,i]
     //              + 2 ovov[k,c,l,d] t2[i,l,c,d]  -  ovov[k,d,l,c] t2[i,l,c,d]
@@ -683,14 +796,18 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
     for (int k = 0; k < NO; ++k)
         for (int i = 0; i < NO; ++i) {
             real_t v = (k == i ? h_f_oo[k] : 0.0);
-            for (int l = 0; l < NO; ++l)
-                for (int c = 0; c < NV; ++c)
-                    for (int d = 0; d < NV; ++d) {
-                        real_t kcld = H_OVOV(k,c,l,d);
-                        real_t kdlc = H_OVOV(k,d,l,c);
-                        v += 2.0 * kcld * H_T2(i,l,c,d) - kdlc * H_T2(i,l,c,d);
-                        v += (2.0 * kcld - kdlc) * H_T1(i,c) * H_T1(l,d);
-                    }
+            if (foo_fvv_gpu) {
+                v += ct_foo[(size_t)k*NO + i];                 // GPU GEMM Σlcd
+            } else {
+                for (int l = 0; l < NO; ++l)
+                    for (int c = 0; c < NV; ++c)
+                        for (int d = 0; d < NV; ++d) {
+                            real_t kcld = H_OVOV(k,c,l,d);
+                            real_t kdlc = H_OVOV(k,d,l,c);
+                            v += 2.0 * kcld * H_T2(i,l,c,d) - kdlc * H_T2(i,l,c,d);
+                            v += (2.0 * kcld - kdlc) * H_T1(i,c) * H_T1(l,d);
+                        }
+            }
             h_ccFoo[k*NO + i] = v;
         }
 
@@ -704,14 +821,18 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
     for (int a = 0; a < NV; ++a)
         for (int c = 0; c < NV; ++c) {
             real_t v = (a == c ? h_f_vv[a] : 0.0);
-            for (int k = 0; k < NO; ++k)
-                for (int l = 0; l < NO; ++l)
-                    for (int d = 0; d < NV; ++d) {
-                        real_t kcld = H_OVOV(k,c,l,d);
-                        real_t kdlc = H_OVOV(k,d,l,c);
-                        v -= 2.0 * kcld * H_T2(k,l,a,d) - kdlc * H_T2(k,l,a,d);
-                        v -= (2.0 * kcld - kdlc) * H_T1(k,a) * H_T1(l,d);
-                    }
+            if (foo_fvv_gpu) {
+                v -= ct_fvv[(size_t)a*NV + c];                 // GPU GEMM Σkld
+            } else {
+                for (int k = 0; k < NO; ++k)
+                    for (int l = 0; l < NO; ++l)
+                        for (int d = 0; d < NV; ++d) {
+                            real_t kcld = H_OVOV(k,c,l,d);
+                            real_t kdlc = H_OVOV(k,d,l,c);
+                            v -= 2.0 * kcld * H_T2(k,l,a,d) - kdlc * H_T2(k,l,a,d);
+                            v -= (2.0 * kcld - kdlc) * H_T1(k,a) * H_T1(l,d);
+                        }
+            }
             h_ccFvv[a*NV + c] = v;
         }
 
@@ -756,6 +877,8 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
             h_Lvv[a*NV + c] = v;
         }
 
+    blap("F+L (Fov/Foo/Fvv/Loo/Lvv)");
+
     // ============================================================
     //  Wooov[k,l,i,d] = Σ_c t1[i,c] ovov[k,c,l,d] + ooov[k,i,l,d]
     //  (PySCF Wooov)
@@ -772,6 +895,7 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
                     h_Wooov[(((size_t)k * NO + l) * NO + i) * NV + d] = v;
                 }
     #define H_WOOOV(k,l,i,d) h_Wooov[(((size_t)(k) * NO + (l)) * NO + (i)) * NV + (d)]
+    blap("Wooov");
 
     // ============================================================
     //  Woooo[k,l,i,j] (IP/PySCF version — NO t1·t1 symmetrization)
@@ -961,6 +1085,8 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
     }
 #endif
 
+    blap("Woooo + ct_ovov/ovvo Σcd GEMM");
+
     // ============================================================
     //  W1ovov[k,b,i,d] = oovv[k,i,b,d] - Σ_{c,l} ovov[k,c,l,d] t2[i,l,c,b]
     //  W2ovov[k,b,i,d] = -Σ_l Wooov[k,l,i,d] t1[l,b]
@@ -1021,6 +1147,7 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
                         v += H_OVVV(k,c,a,d) * H_T1(i,d);
                     h_Wovvo[(((size_t)k * NV + a) * NV + c) * NO + i] = v;
                 }
+    blap("Wovov + Wovvo (W2: ovvv·t1, Wooov·t1)");
 
     // ============================================================
     //  Wovoo[k,b,i,j] — used by the σ2 ← r1 coupling. Same form as
@@ -1228,6 +1355,7 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
                         v += h_Fov[k*NV + c] * H_T2(i,j,c,b);
                     h_Wovoo[(((size_t)k * NV + b) * NO + i) * NO + j] = v;
                 }
+    blap("Wovoo (+ W1ovov/W1ovvo)");
 
     // ==========================================================
     //  Upload all intermediates to device
@@ -1253,6 +1381,7 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
     tracked_cudaMalloc(&d_Wovoo_, wovoo_sz * sizeof(real_t));
     cudaMemcpy(d_Wovoo_, h_Wovoo.data(), wovoo_sz * sizeof(real_t), cudaMemcpyHostToDevice);
 
+    blap("D2H upload");
     std::cout << "  IP-EOM-CCSD dressed intermediates built (PySCF IP definitions)." << std::endl;
 
     #undef H_WOOOV

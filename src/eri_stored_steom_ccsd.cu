@@ -134,6 +134,35 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     }
 
     // ----------------------------------------------------------------------
+    // (A) build_dressed de-duplication. The IP operator publishes its 8 dressed
+    // bar-H tensors into the HF-owned SteomBarHCache, EA publishes its 3 extra
+    // (Wvovv/Wvvvv/Wvvvo), and the STEOM operator borrows all 11 — skipping its
+    // own build_dressed (~30s at naphthalene). All 11 are bit-identical across
+    // IP/EA/STEOM, so the share is mathematically inert; the borrow is fail-safe
+    // (completeness + dims/skip checks → per-operator build on any mismatch).
+    // Master-switch consolidation (2026-06-03): DEFAULTS ON for every STEOM
+    // dispatch — opt out with GANSU_STEOM_SHARE_BARH=0. Guarded OFF under device
+    // balancing (STEOM may be redirected to another device → cross-device borrow
+    // of the IP/EA-device bar-H is UNVERIFIED). Flag is set BEFORE the IP/EA
+    // dispatch so the auto-run operators see it; freed at the end of this function
+    // after the STEOM operator (which only reads bar-H at build time) is finished.
+    // ----------------------------------------------------------------------
+    {
+        const char* env     = std::getenv("GANSU_STEOM_SHARE_BARH");
+        const char* env_bal = std::getenv("GANSU_STEOM_OPERATOR_DEVICE_BALANCING");
+        const bool balancing = (env_bal && env_bal[0] == '1');
+        const bool share = (!env || env[0] != '0') && !balancing;  // default ON, "=0" opt-out
+        rhf.set_steom_share_barh(share);
+        if (share)
+            std::cout << "  [STEOM share-barH] ON (default; GANSU_STEOM_SHARE_BARH=0 to "
+                         "disable) — IP/EA publish dressed bar-H, STEOM borrows "
+                         "(skips its build_dressed)." << std::endl;
+        else if (balancing)
+            std::cout << "  [STEOM share-barH] OFF (device-balancing on → cross-device "
+                         "bar-H borrow unverified; per-operator build retained)." << std::endl;
+    }
+
+    // ----------------------------------------------------------------------
     // Composite dispatch: ensure CIS-NTO + IP-EOM + EA-EOM are populated.
     // Sub-phase 3.0+3.1 auto-runs each phase if its result struct is empty;
     // future P3 optimization (sub-phase 3.x) can pipe T2 / MO ERI through
@@ -640,7 +669,9 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                                n_act_occ_eff, n_act_vir_eff,
                                eri_ri_block, d_B_mo_blocks, num_basis,
                                steom_d_eri_vvvv_slabs.empty()
-                                   ? nullptr : &steom_d_eri_vvvv_slabs);
+                                   ? nullptr : &steom_d_eri_vvvv_slabs,
+                               // (A) shared bar-H: borrow all 11, skip build_dressed
+                               rhf.steom_share_barh() ? &rhf.steom_barh_cache() : nullptr);
 
     // Operator owns T1/T2 + has copied bar-H intermediates; we can free the
     // trimmed / full MO ERI tensor (operator pulled the sub-blocks it needs).
@@ -829,6 +860,17 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 
     rhf.append_excited_state_report(result.report);
     rhf.set_steom_result(std::move(result));
+
+    // (A) shared bar-H: release the cache device buffers. Safe here — the STEOM
+    // operator only reads bar-H during its build (build_F_eff_*/build_W_eff_and_G);
+    // the apply()/matvec consumed by the solve above uses the dense d_G_ only, so
+    // the borrowed bar-H pointers are no longer referenced. steom_op (still in
+    // scope) borrowed them and its dtor skips freeing (barh_borrowed_), so this is
+    // the single owner-side release with no double-free.
+    if (rhf.steom_share_barh()) {
+        rhf.steom_barh_cache().free();
+        rhf.set_steom_share_barh(false);
+    }
 
     // Ship 11 — restore caller's device after STEOM operator + Davidson are
     // both destructed (RAII), so downstream output / API code sees the same

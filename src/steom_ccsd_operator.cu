@@ -508,12 +508,14 @@ STEOMCCSDOperator::STEOMCCSDOperator(
     const ERI_RI* eri_block_src,
     const real_t* d_B_mo_blocks,
     int nmo_full,
-    std::vector<real_t*>* d_eri_vvvv_slabs_input)
+    std::vector<real_t*>* d_eri_vvvv_slabs_input,
+    SteomBarHCache* barh_cache)
     : nocc_active_(nocc_active), nvir_(nvir), nao_active_(nao_active),
       n_act_occ_(n_act_occ), n_act_vir_(n_act_vir),
       total_dim_(nocc_active * nvir),
       d_t1_(d_t1), d_t2_(d_t2),
-      eri_block_src_(eri_block_src), d_B_mo_blocks_(d_B_mo_blocks), nmo_full_(nmo_full)
+      eri_block_src_(eri_block_src), d_B_mo_blocks_(d_B_mo_blocks), nmo_full_(nmo_full),
+      barh_cache_(barh_cache)
 {
     // Ship 14 — take ownership of per-device d_eri_vvvv slabs allocated +
     // extracted by the driver (compute_steom_ccsd_impl).  Slab boundaries
@@ -655,12 +657,16 @@ STEOMCCSDOperator::STEOMCCSDOperator(
         // takes over the dressed-W reads (only NATIVE_EOM+NATIVE_BARE supplies
         // the per-pair dressed PNO substitute, so we gate behind that).
         {
-            const char* env_skip   = std::getenv("GANSU_DLPNO_CANONICAL_SKIP");
-            const char* env_native = std::getenv("GANSU_DLPNO_NATIVE_EOM");
-            const char* env_bare   = std::getenv("GANSU_DLPNO_NATIVE_BARE");
-            canonical_skip_wvvvv_ = (env_skip   && env_skip[0]   == '1') &&
-                                    (env_native && env_native[0] == '1') &&
-                                    (env_bare   && env_bare[0]   == '1');
+            // Master-switch (2026-06-03, mirror of EA): NATIVE_EOM is the explicit
+            // gate (default OFF — built on the reference path too); NATIVE_BARE and
+            // CANONICAL_SKIP default ON under it. NATIVE_EOM=1 alone enables skip.
+            auto on = [](const char* n, bool d) {
+                const char* e = std::getenv(n);
+                return (!e || !e[0]) ? d : (e[0] != '0');
+            };
+            canonical_skip_wvvvv_ = on("GANSU_DLPNO_NATIVE_EOM", false) &&
+                                    on("GANSU_DLPNO_NATIVE_BARE", true) &&
+                                    on("GANSU_DLPNO_CANONICAL_SKIP", true);
             if (canonical_skip_wvvvv_)
                 std::cout << "  [STEOM canonical-skip] dressed Wvvvv build SKIPPED "
                              "(nvir⁴ host+device elided; Wvvvo·t1 refactored)" << std::endl;
@@ -806,17 +812,22 @@ STEOMCCSDOperator::~STEOMCCSDOperator() {
         cudaSetDevice(saved);
     }
 #endif
-    if (d_Loo_)       tracked_cudaFree(d_Loo_);
-    if (d_Lvv_)       tracked_cudaFree(d_Lvv_);
-    if (d_Fov_)       tracked_cudaFree(d_Fov_);
-    if (d_Woooo_)     tracked_cudaFree(d_Woooo_);
-    if (d_Wooov_)     tracked_cudaFree(d_Wooov_);
-    if (d_Wovov_)     tracked_cudaFree(d_Wovov_);
-    if (d_Wovvo_)     tracked_cudaFree(d_Wovvo_);
-    if (d_Wovoo_)     tracked_cudaFree(d_Wovoo_);
-    if (d_Wvovv_)     tracked_cudaFree(d_Wvovv_);
-    if (d_Wvvvv_)     tracked_cudaFree(d_Wvvvv_);
-    if (d_Wvvvo_)     tracked_cudaFree(d_Wvvvo_);
+    // (A) shared bar-H: when borrowed, the 11 d_* alias the cache's buffers
+    // (owned + freed by the STEOM driver after this operator is destroyed).
+    // Skip here to avoid double-free / use-after-free.
+    if (!barh_borrowed_) {
+        if (d_Loo_)       tracked_cudaFree(d_Loo_);
+        if (d_Lvv_)       tracked_cudaFree(d_Lvv_);
+        if (d_Fov_)       tracked_cudaFree(d_Fov_);
+        if (d_Woooo_)     tracked_cudaFree(d_Woooo_);
+        if (d_Wooov_)     tracked_cudaFree(d_Wooov_);
+        if (d_Wovov_)     tracked_cudaFree(d_Wovov_);
+        if (d_Wovvo_)     tracked_cudaFree(d_Wovvo_);
+        if (d_Wovoo_)     tracked_cudaFree(d_Wovoo_);
+        if (d_Wvovv_)     tracked_cudaFree(d_Wvovv_);
+        if (d_Wvvvv_)     tracked_cudaFree(d_Wvvvv_);
+        if (d_Wvvvo_)     tracked_cudaFree(d_Wvvvo_);
+    }
 }
 
 void STEOMCCSDOperator::build_diagonal(const real_t* d_orbital_energies) {
@@ -1058,6 +1069,31 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
 #define H_T2(p,q,a,b)   h_t2[(size_t)(p)*NO*NV*NV + (size_t)(q)*NV*NV + (size_t)(a)*NV + (b)]
 
 void STEOMCCSDOperator::build_dressed_intermediates() {
+    // (A) shared bar-H: borrow all 11 dressed intermediates from the cache
+    // (published by IP's 8 + EA's 3) and SKIP the build entirely. All are
+    // bit-identical across IP/EA/STEOM. Fail-safe: any dims / canonical-skip
+    // mismatch falls through to a full build. d_f_oo_/d_f_vv_ are already
+    // allocated (ctor) and simply go unused; downstream build_F_eff_*/
+    // build_W_eff_and_G read the borrowed bar-H, not the raw Fock diagonals.
+    if (barh_cache_ && barh_cache_->complete()
+        && barh_cache_->nocc == nocc_active_ && barh_cache_->nvir == nvir_
+        && barh_cache_->canonical_skip_wvvvv == canonical_skip_wvvvv_) {
+        d_Loo_   = barh_cache_->d_Loo;
+        d_Lvv_   = barh_cache_->d_Lvv;
+        d_Fov_   = barh_cache_->d_Fov;
+        d_Woooo_ = barh_cache_->d_Woooo;
+        d_Wooov_ = barh_cache_->d_Wooov;
+        d_Wovov_ = barh_cache_->d_Wovov;
+        d_Wovvo_ = barh_cache_->d_Wovvo;
+        d_Wovoo_ = barh_cache_->d_Wovoo;
+        d_Wvovv_ = barh_cache_->d_Wvovv;
+        d_Wvvvv_ = barh_cache_->d_Wvvvv;   // nullptr under canonical-skip (consistent)
+        d_Wvvvo_ = barh_cache_->d_Wvvvo;
+        barh_borrowed_ = true;
+        std::cout << "  [STEOM share-barH] borrowed all 11 bar-H from IP+EA — "
+                     "build_dressed_intermediates SKIPPED." << std::endl;
+        return;
+    }
     const int NO = nocc_active_;
     const int NV = nvir_;
     const size_t t1_sz   = (size_t)NO * NV;
@@ -3995,19 +4031,127 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
             }
             UAKEI(a,k,e,i)=t;
         }
+    // GPU GEMM port of UAMEI T3+T4 (the last fully-host phph block, O(NMo·NMv·NV²·NO²)):
+    //   T3:  Σ_{l,d} UMLID(m,l,i,d)·(2·seA(e,l,a,d)−seA(e,l,d,a))
+    //   T4: −Σ_{l,d} UKMID(l,m,i,d)·seA(e,l,a,d)
+    //   C[(m,i),(e,a)] = A3·B3ᵀ − A4·B4ᵀ, contract (l,d). Scattered into UAMEI(a,m,e,i).
+    std::vector<real_t> ct_uamei_td;
+    bool uamei_td_gpu = false;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+        const int MI=NMo*NO, EA=NMv*NV, LD=NO*NV;
+        std::vector<real_t> hA3((size_t)MI*LD), hB3((size_t)EA*LD),
+                            hA4((size_t)MI*LD), hB4((size_t)EA*LD);
+        #pragma omp parallel for collapse(2)
+        for (int m=0;m<NMo;++m) for (int i=0;i<NO;++i)
+            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) {
+                const size_t o=(size_t)(m*NO+i)*LD+(l*NV+d);
+                hA3[o]=UMLID(m,l,i,d); hA4[o]=UKMID(l,m,i,d);
+            }
+        #pragma omp parallel for collapse(2)
+        for (int e=0;e<NMv;++e) for (int a=0;a<NV;++a)
+            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) {
+                const size_t o=(size_t)(e*NV+a)*LD+(l*NV+d);
+                hB3[o]=2.0*seA(e,l,a,d)-seA(e,l,d,a); hB4[o]=seA(e,l,a,d);
+            }
+        real_t *dA3=nullptr,*dB3=nullptr,*dA4=nullptr,*dB4=nullptr,*dC=nullptr;
+        tracked_cudaMalloc(&dA3,(size_t)MI*LD*sizeof(real_t));
+        tracked_cudaMalloc(&dB3,(size_t)EA*LD*sizeof(real_t));
+        tracked_cudaMalloc(&dA4,(size_t)MI*LD*sizeof(real_t));
+        tracked_cudaMalloc(&dB4,(size_t)EA*LD*sizeof(real_t));
+        tracked_cudaMalloc(&dC, (size_t)MI*EA*sizeof(real_t));
+        cudaMemcpy(dA3,hA3.data(),(size_t)MI*LD*sizeof(real_t),cudaMemcpyHostToDevice);
+        cudaMemcpy(dB3,hB3.data(),(size_t)EA*LD*sizeof(real_t),cudaMemcpyHostToDevice);
+        cudaMemcpy(dA4,hA4.data(),(size_t)MI*LD*sizeof(real_t),cudaMemcpyHostToDevice);
+        cudaMemcpy(dB4,hB4.data(),(size_t)EA*LD*sizeof(real_t),cudaMemcpyHostToDevice);
+        const real_t one=1.0,negone=-1.0,zero=0.0;
+        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,EA,MI,LD,&one,   dB3,LD,dA3,LD,&zero,dC,EA);
+        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,EA,MI,LD,&negone,dB4,LD,dA4,LD,&one, dC,EA);
+        ct_uamei_td.assign((size_t)MI*EA,0.0);
+        cudaMemcpy(ct_uamei_td.data(),dC,(size_t)MI*EA*sizeof(real_t),cudaMemcpyDeviceToHost);
+        tracked_cudaFree(dA3);tracked_cudaFree(dB3);tracked_cudaFree(dA4);tracked_cudaFree(dB4);tracked_cudaFree(dC);
+        uamei_td_gpu=true;
+        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+            real_t dmax=0.0;
+            for (int m=0;m<NMo;++m) for (int i=0;i<NO;++i)
+                for (int e=0;e<NMv;e+=(NMv/2>0?NMv/2:1)) for (int a=0;a<NV;a+=(NV/2>0?NV/2:1)) {
+                    real_t t=0.0;
+                    for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) {
+                        const real_t st=2.0*seA(e,l,a,d)-seA(e,l,d,a);
+                        t += UMLID(m,l,i,d)*st - UKMID(l,m,i,d)*seA(e,l,a,d);
+                    }
+                    dmax=std::max(dmax,std::fabs(t-ct_uamei_td[(size_t)(m*NO+i)*EA+(e*NV+a)]));
+                }
+            std::cout << "[W_eff_and_G self-check] UAMEI T3+T4 GEMM vs host: max|Δ| = "
+                      << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+        }
+    }
+#endif
+    // GPU GEMM port of UAMEI T5 (Σ_{k,l} UKLIE(k,l,i,e)·siP(m,l,k,a), contract (k,l)):
+    //   C[(e,i),(m,a)] = A·Bᵀ; A[(e,i),(k,l)]=UKLIE(k,l,i,e), B[(m,a),(k,l)]=siP(m,l,k,a).
+    std::vector<real_t> ct_uamei_t5;
+    bool uamei_t5_gpu = false;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+        const int EI=NMv*NO, MA=NMo*NV, KL=NO*NO;
+        std::vector<real_t> hA((size_t)EI*KL), hB((size_t)MA*KL);
+        #pragma omp parallel for collapse(2)
+        for (int e=0;e<NMv;++e) for (int i=0;i<NO;++i)
+            for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
+                hA[(size_t)(e*NO+i)*KL+(k*NO+l)] = UKLIE(k,l,i,e);
+        #pragma omp parallel for collapse(2)
+        for (int m=0;m<NMo;++m) for (int a=0;a<NV;++a)
+            for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
+                hB[(size_t)(m*NV+a)*KL+(k*NO+l)] = siP(m,l,k,a);
+        real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
+        tracked_cudaMalloc(&dA,(size_t)EI*KL*sizeof(real_t));
+        tracked_cudaMalloc(&dB,(size_t)MA*KL*sizeof(real_t));
+        tracked_cudaMalloc(&dC,(size_t)EI*MA*sizeof(real_t));
+        cudaMemcpy(dA,hA.data(),(size_t)EI*KL*sizeof(real_t),cudaMemcpyHostToDevice);
+        cudaMemcpy(dB,hB.data(),(size_t)MA*KL*sizeof(real_t),cudaMemcpyHostToDevice);
+        const real_t one=1.0,zero=0.0;
+        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,MA,EI,KL,&one,dB,KL,dA,KL,&zero,dC,MA);
+        ct_uamei_t5.assign((size_t)EI*MA,0.0);
+        cudaMemcpy(ct_uamei_t5.data(),dC,(size_t)EI*MA*sizeof(real_t),cudaMemcpyDeviceToHost);
+        tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
+        uamei_t5_gpu=true;
+        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+            real_t dmax=0.0;
+            for (int e=0;e<NMv;e+=(NMv/2>0?NMv/2:1)) for (int i=0;i<NO;++i)
+                for (int m=0;m<NMo;++m) for (int a=0;a<NV;a+=(NV/2>0?NV/2:1)) {
+                    real_t t=0.0;
+                    for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
+                        t += UKLIE(k,l,i,e)*siP(m,l,k,a);
+                    dmax=std::max(dmax,std::fabs(t-ct_uamei_t5[(size_t)(e*NO+i)*MA+(m*NV+a)]));
+                }
+            std::cout << "[W_eff_and_G self-check] UAMEI T5 GEMM vs host: max|Δ| = "
+                      << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+        }
+    }
+#endif
     #pragma omp parallel for collapse(2)
     for (int m=0;m<NMo;++m) for(int e=0;e<NMv;++e)
         for (int a=0;a<NV;++a) for(int i=0;i<NO;++i){
             real_t t=0.0;
             for (int c=0;c<NV;++c) t += u_ma[(size_t)m*NV+c]*seA(e,i,a,c);         // T1
             for (int k=0;k<NO;++k) t -= u_ie[(size_t)k*NMv+e]*siP(m,i,k,a);        // T2
-            for (int l=0;l<NO;++l) for(int d=0;d<NV;++d){
-                const real_t st = 2.0*seA(e,l,a,d)-seA(e,l,d,a);
-                t += UMLID(m,l,i,d)*st;                                            // T3
-                t -= UKMID(l,m,i,d)*seA(e,l,a,d);                                  // T4
+            if (uamei_td_gpu) {
+                t += ct_uamei_td[(size_t)(m*NO+i)*(NMv*NV)+(e*NV+a)];              // T3+T4 (GEMM)
+            } else {
+                for (int l=0;l<NO;++l) for(int d=0;d<NV;++d){
+                    const real_t st = 2.0*seA(e,l,a,d)-seA(e,l,d,a);
+                    t += UMLID(m,l,i,d)*st;                                        // T3
+                    t -= UKMID(l,m,i,d)*seA(e,l,a,d);                              // T4
+                }
             }
-            for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
-                t += UKLIE(k,l,i,e)*siP(m,l,k,a);                                  // T5
+            if (uamei_t5_gpu) {
+                t += ct_uamei_t5[(size_t)(e*NO+i)*(NMo*NV)+(m*NV+a)];              // T5 (GEMM)
+            } else {
+                for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
+                    t += UKLIE(k,l,i,e)*siP(m,l,k,a);                             // T5
+            }
             UAMEI(a,m,e,i)=t;
         }
 
@@ -4229,16 +4373,110 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
             }
             UBKJE(b,k,j,e)=t;
         }
+    // GPU GEMM port of UBMJE T3 (Σ_{k,l} UKLIE(k,l,j,e)·siP(m,k,l,b), contract (k,l)):
+    //   C[(e,j),(m,b)] = A·Bᵀ; A[(e,j),(k,l)]=UKLIE(k,l,j,e), B[(m,b),(k,l)]=siP(m,k,l,b).
+    std::vector<real_t> ct_ubmje_t3;
+    bool ubmje_t3_gpu = false;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+        const int EJ=NMv*NO, MB=NMo*NV, KL=NO*NO;
+        std::vector<real_t> hA((size_t)EJ*KL), hB((size_t)MB*KL);
+        #pragma omp parallel for collapse(2)
+        for (int e=0;e<NMv;++e) for (int j=0;j<NO;++j)
+            for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
+                hA[(size_t)(e*NO+j)*KL+(k*NO+l)] = UKLIE(k,l,j,e);
+        #pragma omp parallel for collapse(2)
+        for (int m=0;m<NMo;++m) for (int b=0;b<NV;++b)
+            for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
+                hB[(size_t)(m*NV+b)*KL+(k*NO+l)] = siP(m,k,l,b);
+        real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
+        tracked_cudaMalloc(&dA,(size_t)EJ*KL*sizeof(real_t));
+        tracked_cudaMalloc(&dB,(size_t)MB*KL*sizeof(real_t));
+        tracked_cudaMalloc(&dC,(size_t)EJ*MB*sizeof(real_t));
+        cudaMemcpy(dA,hA.data(),(size_t)EJ*KL*sizeof(real_t),cudaMemcpyHostToDevice);
+        cudaMemcpy(dB,hB.data(),(size_t)MB*KL*sizeof(real_t),cudaMemcpyHostToDevice);
+        const real_t one=1.0,zero=0.0;
+        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,MB,EJ,KL,&one,dB,KL,dA,KL,&zero,dC,MB);
+        ct_ubmje_t3.assign((size_t)EJ*MB,0.0);
+        cudaMemcpy(ct_ubmje_t3.data(),dC,(size_t)EJ*MB*sizeof(real_t),cudaMemcpyDeviceToHost);
+        tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
+        ubmje_t3_gpu=true;
+        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+            real_t dmax=0.0;
+            for (int e=0;e<NMv;e+=(NMv/2>0?NMv/2:1)) for (int j=0;j<NO;++j)
+                for (int m=0;m<NMo;++m) for (int b=0;b<NV;b+=(NV/2>0?NV/2:1)) {
+                    real_t t=0.0;
+                    for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
+                        t += UKLIE(k,l,j,e)*siP(m,k,l,b);
+                    dmax=std::max(dmax,std::fabs(t-ct_ubmje_t3[(size_t)(e*NO+j)*MB+(m*NV+b)]));
+                }
+            std::cout << "[W_eff_and_G self-check] UBMJE T3 GEMM vs host: max|Δ| = "
+                      << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+        }
+    }
+#endif
+    // GPU GEMM port of UBMJE T4 (−Σ_{l,d} UMLID(m,l,j,d)·seA(e,l,d,b), contract (l,d)):
+    //   C[(m,j),(e,b)] = A·Bᵀ; A[(m,j),(l,d)]=UMLID(m,l,j,d), B[(e,b),(l,d)]=seA(e,l,d,b).
+    std::vector<real_t> ct_ubmje_t4;
+    bool ubmje_t4_gpu = false;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+        const int MJ=NMo*NO, EB=NMv*NV, LD=NO*NV;
+        std::vector<real_t> hA((size_t)MJ*LD), hB((size_t)EB*LD);
+        #pragma omp parallel for collapse(2)
+        for (int m=0;m<NMo;++m) for (int j=0;j<NO;++j)
+            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
+                hA[(size_t)(m*NO+j)*LD+(l*NV+d)] = UMLID(m,l,j,d);
+        #pragma omp parallel for collapse(2)
+        for (int e=0;e<NMv;++e) for (int b=0;b<NV;++b)
+            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
+                hB[(size_t)(e*NV+b)*LD+(l*NV+d)] = seA(e,l,d,b);
+        real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
+        tracked_cudaMalloc(&dA,(size_t)MJ*LD*sizeof(real_t));
+        tracked_cudaMalloc(&dB,(size_t)EB*LD*sizeof(real_t));
+        tracked_cudaMalloc(&dC,(size_t)MJ*EB*sizeof(real_t));
+        cudaMemcpy(dA,hA.data(),(size_t)MJ*LD*sizeof(real_t),cudaMemcpyHostToDevice);
+        cudaMemcpy(dB,hB.data(),(size_t)EB*LD*sizeof(real_t),cudaMemcpyHostToDevice);
+        const real_t one=1.0,zero=0.0;
+        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,EB,MJ,LD,&one,dB,LD,dA,LD,&zero,dC,EB);
+        ct_ubmje_t4.assign((size_t)MJ*EB,0.0);
+        cudaMemcpy(ct_ubmje_t4.data(),dC,(size_t)MJ*EB*sizeof(real_t),cudaMemcpyDeviceToHost);
+        tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
+        ubmje_t4_gpu=true;
+        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+            real_t dmax=0.0;
+            for (int m=0;m<NMo;++m) for (int j=0;j<NO;++j)
+                for (int e=0;e<NMv;e+=(NMv/2>0?NMv/2:1)) for (int b=0;b<NV;b+=(NV/2>0?NV/2:1)) {
+                    real_t t=0.0;
+                    for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
+                        t += UMLID(m,l,j,d)*seA(e,l,d,b);
+                    dmax=std::max(dmax,std::fabs(t-ct_ubmje_t4[(size_t)(m*NO+j)*EB+(e*NV+b)]));
+                }
+            std::cout << "[W_eff_and_G self-check] UBMJE T4 GEMM vs host: max|Δ| = "
+                      << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+        }
+    }
+#endif
     #pragma omp parallel for collapse(2)
     for (int m=0;m<NMo;++m) for(int e=0;e<NMv;++e)
         for (int b=0;b<NV;++b) for(int j=0;j<NO;++j){
             real_t t=0.0;
             for (int d=0;d<NV;++d) t += u_ma[(size_t)m*NV+d]*seA(e,j,d,b);         // T1
             for (int k=0;k<NO;++k) t -= u_ie[(size_t)k*NMv+e]*siP(m,k,j,b);        // T2
-            for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
-                t += UKLIE(k,l,j,e)*siP(m,k,l,b);                                  // T3
-            for (int l=0;l<NO;++l) for(int d=0;d<NV;++d)
-                t -= UMLID(m,l,j,d)*seA(e,l,d,b);                                  // T4
+            if (ubmje_t3_gpu) {
+                t += ct_ubmje_t3[(size_t)(e*NO+j)*(NMo*NV)+(m*NV+b)];              // T3 (GEMM)
+            } else {
+                for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
+                    t += UKLIE(k,l,j,e)*siP(m,k,l,b);                              // T3
+            }
+            if (ubmje_t4_gpu) {
+                t -= ct_ubmje_t4[(size_t)(m*NO+j)*(NMv*NV)+(e*NV+b)];              // T4 (GEMM)
+            } else {
+                for (int l=0;l<NO;++l) for(int d=0;d<NV;++d)
+                    t -= UMLID(m,l,j,d)*seA(e,l,d,b);                              // T4
+            }
             UBMJE(b,m,j,e)=t;
         }
 

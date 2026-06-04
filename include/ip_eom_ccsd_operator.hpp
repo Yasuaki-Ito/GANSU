@@ -45,6 +45,7 @@
 
 #include "linear_operator.hpp"
 #include "types.hpp"
+#include "steom_barh_cache.hpp"   // (A) shared dressed bar-H cache
 
 namespace gansu {
 
@@ -73,7 +74,11 @@ public:
                       const ERI_RI* eri_block_src = nullptr,
                       const real_t* d_B_mo_blocks = nullptr,
                       int nmo_full = 0,
-                      int num_gpus = 1);   // multi-GPU σ (Stage IP-5; 1 = legacy single-GPU)
+                      int num_gpus = 1,    // multi-GPU σ (Stage IP-5; 1 = legacy single-GPU)
+                      // (A) shared bar-H: when non-null + GANSU_STEOM_SHARE_BARH,
+                      // publish the 8 IP-side dressed intermediates here and
+                      // relinquish ownership (dtor skips freeing them).
+                      SteomBarHCache* barh_cache = nullptr);
 
     ~IPEOMCCSDOperator();
 
@@ -148,6 +153,14 @@ private:
     real_t* d_Wovov_  = nullptr;  // [nocc · nvir · nocc · nvir]  Wovov = W1ovov + W2ovov         (PySCF Wovov, IP)
     real_t* d_Wovvo_  = nullptr;  // [nocc · nvir · nvir · nocc]  Wovvo = W1ovvo + W2ovvo         (PySCF Wovvo, IP)
     real_t* d_Wovoo_  = nullptr;  // [nocc · nvir · nocc²]  Wovoo (PySCF, used in 1h↔2h1p coupling)
+
+    // === (A) shared bar-H publishing ===
+    // When barh_cache_ != nullptr, build_dressed_intermediates publishes the 8
+    // IP-side intermediates (Loo/Lvv/Fov/Woooo/Wooov/Wovov/Wovvo/Wovoo) into the
+    // cache and sets barh_published_; the destructor then skips freeing them (the
+    // cache owns them now, freed by the STEOM driver). Default nullptr → owned.
+    SteomBarHCache* barh_cache_ = nullptr;
+    bool barh_published_ = false;
 
     // === Diagonal & denominators ===
     real_t* d_D_h_   = nullptr;  // [nocc]            ≈ -ε_i

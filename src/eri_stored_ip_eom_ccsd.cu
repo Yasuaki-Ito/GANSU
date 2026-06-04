@@ -250,7 +250,9 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
     IPEOMCCSDOperator ip_op(d_eri_for_op, d_eps_for_op,
                             d_t1, d_t2,
                             nocc_active, nvir, nao_active,
-                            eri_block_src, d_B_mo_blocks, num_basis, eom_gpus);
+                            eri_block_src, d_B_mo_blocks, num_basis, eom_gpus,
+                            // (A) shared bar-H: publish 8 IP-side intermediates
+                            rhf.steom_share_barh() ? &rhf.steom_barh_cache() : nullptr);
 
     // The intermediates have been built; we no longer need the trimmed /
     // full MO ERI tensor (the operator owns the extracted sub-blocks).
@@ -313,10 +315,43 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
 
         const DLPNOIPPacking pack = build_ip_packing(dres);
         std::unique_ptr<LinearOperator> dlpno_op;
+        // Auto-policy (B-a.6h): run the SOLVE single-GPU when the operator fits on device 0
+        // (the grouped single-GPU solve is 3-5× faster than the multi-GPU slab solve at
+        // small/medium scale; multi-GPU only pays off when the operator does not fit). The IP
+        // operator has no nvir⁴ buffer, so its footprint is the nocc²·nvir² packs. Override:
+        // GANSU_DLPNO_NATIVE_EOM_SOLVE1=1 force single / =0 force multi.
+        int eom_solve_gpus = rhf.get_num_gpus();
+#ifndef GANSU_CPU_ONLY
+        if (native && eom_solve_gpus > 1) {
+            const char* e = std::getenv("GANSU_DLPNO_NATIVE_EOM_SOLVE1");
+            const int forced = e ? (e[0] == '0' ? -1 : 1) : 0;
+            if (forced == 1) {
+                eom_solve_gpus = 1;
+                std::cout << "[bt-PNO auto-solve IP] forced single-GPU grouped solve "
+                          << "(GANSU_DLPNO_NATIVE_EOM_SOLVE1)" << std::endl;
+            } else if (forced == 0) {
+                const size_t nv = static_cast<size_t>(nvir), no = static_cast<size_t>(nocc_active);
+                const size_t est = (6 * no * no * nv * nv) * sizeof(real_t)
+                                 + static_cast<size_t>(1) * 1024 * 1024 * 1024;  // packs + 1 GB
+                int cur = 0; cudaGetDevice(&cur); cudaSetDevice(0);
+                size_t freeb = 0, totalb = 0; cudaMemGetInfo(&freeb, &totalb); cudaSetDevice(cur);
+                if (est < static_cast<size_t>(freeb * 0.7)) {
+                    eom_solve_gpus = 1;
+                    std::cout << "[bt-PNO auto-solve IP] operator fits on GPU 0 (est "
+                              << std::fixed << std::setprecision(1) << est / 1e9 << " GB < 0.7×free "
+                              << freeb * 0.7 / 1e9 << " GB) → single-GPU grouped solve" << std::endl;
+                } else {
+                    std::cout << "[bt-PNO auto-solve IP] operator too large for GPU 0 (est "
+                              << std::fixed << std::setprecision(1) << est / 1e9
+                              << " GB) → multi-GPU slab solve (" << eom_solve_gpus << " GPUs)" << std::endl;
+                }
+            }
+        }
+#endif
         if (native)
             dlpno_op = std::make_unique<DLPNOIPEOMNativeOperator>(
                 ip_op, dres, pack, dres.U_loc, C_vir, h_S, num_basis, nvir, eps_o,
-                rhf.get_num_gpus());
+                eom_solve_gpus);
         else
             dlpno_op = std::make_unique<DLPNOIPEOMProjectedOperator>(
                 ip_op, dres, pack, dres.U_loc, C_vir, h_S, num_basis, nvir, eps_o);

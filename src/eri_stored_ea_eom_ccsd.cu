@@ -436,7 +436,9 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
                             d_t1, d_t2,
                             nocc_active, nvir, nao_active,
                             eri_block_src, d_B_mo_blocks, num_basis, eom_gpus,
-                            d_eri_vvvv_slabs.empty() ? nullptr : &d_eri_vvvv_slabs);
+                            d_eri_vvvv_slabs.empty() ? nullptr : &d_eri_vvvv_slabs,
+                            // (A) shared bar-H: publish 3 EA-unique intermediates
+                            rhf.steom_share_barh() ? &rhf.steom_barh_cache() : nullptr);
 
     if (free_eri_for_op) tracked_cudaFree(d_eri_for_op);
     if (free_eri_mo)     tracked_cudaFree(d_eri_mo);
@@ -564,10 +566,44 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
         }
 #endif
 
+        // Auto-policy (B-a.6h): the grouped single-GPU EOM solve is 3-5× faster than the
+        // multi-GPU slab solve at small/medium scale — the per-matvec broadcast/gather/sync
+        // overhead dominates the tiny per-device compute, so multi-GPU is only worth it when
+        // the operator does not fit on one device. The build phases already ran multi-GPU; run
+        // the SOLVE single-GPU (device 0) whenever the operator fits. Override:
+        // GANSU_DLPNO_NATIVE_EOM_SOLVE1=1 force single / =0 force multi.
+        int eom_solve_gpus = rhf.get_num_gpus();
+#ifndef GANSU_CPU_ONLY
+        if (native && eom_solve_gpus > 1) {
+            const char* e = std::getenv("GANSU_DLPNO_NATIVE_EOM_SOLVE1");
+            const int forced = e ? (e[0] == '0' ? -1 : 1) : 0;
+            if (forced == 1) {
+                eom_solve_gpus = 1;
+                std::cout << "[bt-PNO auto-solve EA] forced single-GPU grouped solve "
+                          << "(GANSU_DLPNO_NATIVE_EOM_SOLVE1)" << std::endl;
+            } else if (forced == 0) {   // auto: device-0 footprint vs free memory
+                const size_t nv = static_cast<size_t>(nvir), no = static_cast<size_t>(nocc_active);
+                const size_t est = (nv*nv*nv*nv + 4*no*no*nv*nv) * sizeof(real_t)
+                                 + static_cast<size_t>(2) * 1024 * 1024 * 1024;  // d_eri_vvvv + packs + 2 GB
+                int cur = 0; cudaGetDevice(&cur); cudaSetDevice(0);
+                size_t freeb = 0, totalb = 0; cudaMemGetInfo(&freeb, &totalb); cudaSetDevice(cur);
+                if (est < static_cast<size_t>(freeb * 0.7)) {
+                    eom_solve_gpus = 1;
+                    std::cout << "[bt-PNO auto-solve EA] operator fits on GPU 0 (est "
+                              << std::fixed << std::setprecision(1) << est / 1e9 << " GB < 0.7×free "
+                              << freeb * 0.7 / 1e9 << " GB) → single-GPU grouped solve" << std::endl;
+                } else {
+                    std::cout << "[bt-PNO auto-solve EA] operator too large for GPU 0 (est "
+                              << std::fixed << std::setprecision(1) << est / 1e9
+                              << " GB) → multi-GPU slab solve (" << eom_solve_gpus << " GPUs)" << std::endl;
+                }
+            }
+        }
+#endif
         if (native)
             dlpno_op = std::make_unique<DLPNOEAEOMNativeOperator>(
                 ea_op, dres, pack, dres.U_loc, C_vir, h_S, num_basis, nvir, eps_v,
-                rhf.get_num_gpus());
+                eom_solve_gpus);
         else
             dlpno_op = std::make_unique<DLPNOEAEOMProjectedOperator>(
                 ea_op, dres, pack, dres.U_loc, C_vir, h_S, num_basis, eps_v);

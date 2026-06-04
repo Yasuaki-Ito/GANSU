@@ -212,6 +212,7 @@ set(SOURCES
     src/eri_stored_ea_eom_ccsd.cu
     src/ea_eom_routing.cpp
     src/steom_ccsd_operator.cu
+    src/steom_barh_cache.cu
     src/eri_stored_steom_ccsd.cu
     src/hash_half_transform.cu
     src/half_transform_mp3.cu

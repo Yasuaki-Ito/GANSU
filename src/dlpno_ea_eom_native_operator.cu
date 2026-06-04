@@ -41,6 +41,18 @@ namespace gansu {
 namespace {
 using RowMatXd = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
+// Master-switch env reader (see the IP native operator for the full rationale):
+// the native operator is only constructed under the driver gate
+// GANSU_DLPNO_NATIVE_EOM=1, so the validated GPU stack DEFAULTS ON inside the
+// ctor — production needs only NATIVE_EOM=1. `dflt` is returned when unset; a set
+// var turns the stage on unless it starts with '0' ("=0" opt-out). Diagnostics
+// pass dflt=false to stay opt-in.
+inline bool env_on(const char* name, bool dflt) {
+    const char* e = std::getenv(name);
+    if (!e || !e[0]) return dflt;
+    return e[0] != '0';
+}
+
 bool uloc_is_identity(const std::vector<real_t>& U_loc, int nocc) {
     if (static_cast<int>(U_loc.size()) != nocc * nocc) return true;
     for (int I = 0; I < nocc; ++I)
@@ -220,6 +232,42 @@ void pull_device(const real_t* d_src, std::vector<real_t>& dst) {
     if (d_src == nullptr) { std::fill(dst.begin(), dst.end(), real_t(0.0)); return; }
     cudaMemcpy(dst.data(), d_src, dst.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
 }
+
+#ifndef GANSU_CPU_ONLY
+// B-a.6g GPU rotate of a single TRAILING occ index: for a [nlead × nocc]
+// row-major tensor, out[m,j] = Σ_J in[m,J] U[J,j]. (EA Wvvvo: m=(a,b,c).)
+// Reads the source operator's resident `d_in` directly; result D2H'd into host
+// `out` → downstream byte-identical (≈1e-13 GEMM reduction-order drift). `d_U` =
+// U_loc [nocc²] row-major (U[J,j] at J·nocc+j). col-major: outᵀ(j,m) = U·inᵀ.
+void rotate_last_occ_gpu(cublasHandle_t cublas, const real_t* d_in, const real_t* d_U,
+                         std::vector<real_t>& out, int nlead, int nocc) {
+    const size_t sz = static_cast<size_t>(nlead) * nocc;
+    out.assign(sz, 0.0);
+    if (d_in == nullptr) return;
+    real_t* d_out = nullptr;
+    tracked_cudaMalloc(&d_out, sz * sizeof(real_t));
+    const real_t one = 1.0, zero = 0.0;
+    cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+        nocc, nlead, nocc, &one,
+        d_U, nocc, d_in, nocc, &zero, d_out, nocc);
+    cudaMemcpy(out.data(), d_out, sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    tracked_cudaFree(d_out);
+}
+
+// Max-abs diff reporter for the B-a.6g rotation self-check (VALIDATE only).
+void rot_check_report(const char* tag, const char* nm,
+                      const std::vector<real_t>& ref, const std::vector<real_t>& got) {
+    double md = 0.0; size_t at = 0;
+    const size_t n = std::min(ref.size(), got.size());
+    for (size_t i = 0; i < n; ++i) {
+        const double d = std::fabs(ref[i] - got[i]);
+        if (d > md) { md = d; at = i; }
+    }
+    std::cout << "  [" << tag << "] " << nm << " max|gpu-host| = "
+              << std::scientific << md << std::defaultfloat
+              << " (@" << at << ")" << std::endl;
+}
+#endif
 }  // namespace
 
 DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
@@ -239,78 +287,89 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
       total_dim_(packing.total_dim),
       num_gpus_(num_gpus > 1 ? num_gpus : 1)   // Stage 5 multi-GPU (scaffolding; ≥1)
 {
+    // (D) construction profiler (env GANSU_DLPNO_NATIVE_PROF=1). Attributes the
+    // EA native-operator ctor wall (~18 s at naphthalene, incl Wvvvv ring 5.3 s)
+    // across phases. Default off → no output. Sync-bracketed. Mirrors the IP
+    // native profiler.
+    const bool _nprof = std::getenv("GANSU_DLPNO_NATIVE_PROF") != nullptr;
+    auto _npclk = std::chrono::high_resolution_clock::now();
+    auto _npmark = [&](const char* nm) {
+        if (!_nprof) return;
+#ifndef GANSU_CPU_ONLY
+        if (gpu::gpu_available()) cudaDeviceSynchronize();
+#endif
+        const auto now = std::chrono::high_resolution_clock::now();
+        std::cout << "  [EA-native-PROF] " << nm << " = " << std::fixed
+                  << std::setprecision(3)
+                  << std::chrono::duration<double>(now - _npclk).count() << " s"
+                  << std::defaultfloat << std::endl;
+        _npclk = now;
+    };
+
     // B-EA.6c/6d/6e env flags (read first so the dense-Wvvvv borrow can be
     // skipped under the true-scaling bare path). NATIVE_RING ⊂ NATIVE_DRESSED;
     // NATIVE_BARE ⊂ NATIVE_RING (W_pair seed + native-only ring, no dense nvir⁴).
     {
-        const char* env = std::getenv("GANSU_DLPNO_NATIVE_DRESSED");
-        use_dressed_pno_ = (env && env[0] == '1');
-        const char* env_ring = std::getenv("GANSU_DLPNO_NATIVE_RING");
-        use_native_ring_ = use_dressed_pno_ && (env_ring && env_ring[0] == '1');
-        const char* env_bare = std::getenv("GANSU_DLPNO_NATIVE_BARE");
-        use_native_bare_ = use_native_ring_ && (env_bare && env_bare[0] == '1');
+        // Master-switch defaults: NATIVE_EOM=1 (driver gate) ⇒ the whole validated
+        // stack defaults ON here; each stage is overridable with "=0" for bisection.
+        // GPU stages also require gpu_available(). NATIVE_RING ⊂ NATIVE_DRESSED;
+        // NATIVE_BARE ⊂ NATIVE_RING (W_pair seed + native-only ring, no dense nvir⁴).
+        const bool gpu_ok = gpu::gpu_available();
+        use_dressed_pno_ = env_on("GANSU_DLPNO_NATIVE_DRESSED", true);
+        use_native_ring_ = use_dressed_pno_ && env_on("GANSU_DLPNO_NATIVE_RING", true);
+        use_native_bare_ = use_native_ring_ && env_on("GANSU_DLPNO_NATIVE_BARE", true);
         // B-a.6a GPU port (Stage 1): only meaningful for the dressed PNO path.
-        const char* env_gpu = std::getenv("GANSU_DLPNO_NATIVE_GPU");
-        use_gpu_ = use_dressed_pno_ && (env_gpu && env_gpu[0] == '1');
-        const char* env_gv = std::getenv("GANSU_DLPNO_NATIVE_GPU_VALIDATE");
-        gpu_selfcheck_ = use_gpu_ && (env_gv && env_gv[0] == '1');
+        use_gpu_ = use_dressed_pno_ && gpu_ok && env_on("GANSU_DLPNO_NATIVE_GPU", true);
+        gpu_selfcheck_ = use_gpu_ && env_on("GANSU_DLPNO_NATIVE_GPU_VALIDATE", false);
         // B-a.6a GPU port (Stage 2): the two-sided PNO projection on device.
-        const char* env_gp = std::getenv("GANSU_DLPNO_NATIVE_GPU_PROJ");
-        use_gpu_proj_ = use_gpu_ && (env_gp && env_gp[0] == '1');
+        use_gpu_proj_ = use_gpu_ && env_on("GANSU_DLPNO_NATIVE_GPU_PROJ", true);
         // B-a.6a GPU port (Stage 3a): the per-matvec source lift on device.
-        const char* env_gl = std::getenv("GANSU_DLPNO_NATIVE_GPU_LIFT");
-        use_gpu_lift_ = use_gpu_proj_ && (env_gl && env_gl[0] == '1');
+        use_gpu_lift_ = use_gpu_proj_ && env_on("GANSU_DLPNO_NATIVE_GPU_LIFT", true);
         // B-a.6a GPU port (Stage 3b): cross-pair contraction on device (T_Loo first).
-        const char* env_gx = std::getenv("GANSU_DLPNO_NATIVE_GPU_XPAIR");
-        use_gpu_xpair_ = use_gpu_lift_ && (env_gx && env_gx[0] == '1');
+        use_gpu_xpair_ = use_gpu_lift_ && env_on("GANSU_DLPNO_NATIVE_GPU_XPAIR", true);
         // B-a.6a GPU port (Stage 3b T_ph2): the second cross-pair term on device.
-        const char* env_gp2 = std::getenv("GANSU_DLPNO_NATIVE_GPU_PH2");
-        use_gpu_ph2_ = use_gpu_xpair_ && (env_gp2 && env_gp2[0] == '1');
+        use_gpu_ph2_ = use_gpu_xpair_ && env_on("GANSU_DLPNO_NATIVE_GPU_PH2", true);
         // B-a.6a GPU port (Stage 3b T_ph3): the third cross-pair term on device.
-        const char* env_gp3 = std::getenv("GANSU_DLPNO_NATIVE_GPU_PH3");
-        use_gpu_ph3_ = use_gpu_xpair_ && (env_gp3 && env_gp3[0] == '1');
+        use_gpu_ph3_ = use_gpu_xpair_ && env_on("GANSU_DLPNO_NATIVE_GPU_PH3", true);
         // B-a.6a GPU port (Stage 3b T_ph1): the first cross-pair ph term on device.
-        const char* env_gp1 = std::getenv("GANSU_DLPNO_NATIVE_GPU_PH1");
-        use_gpu_ph1_ = use_gpu_xpair_ && (env_gp1 && env_gp1[0] == '1');
+        use_gpu_ph1_ = use_gpu_xpair_ && env_on("GANSU_DLPNO_NATIVE_GPU_PH1", true);
+        // B-a.6h(grouped) EA ph-ladder batched (single-device only; opt-in). num_gpus_ is the
+        // ctor param (set early) → gate on ==1 (equivalent to !use_gpu_multi_, resolved later).
+        // Default ON for the single-GPU operator: the grouped batched ph-ladder is bit-exact
+        // (machine-eps σ2) and ~7× faster than the per-(j,l) path; the auto-solve policy builds
+        // the operator single-GPU whenever it fits, so this fires automatically. =0 to force the
+        // per-(j,l) loops. (Always off at num_gpus>1 — the multi path has no grouped.)
+        use_ph_grouped_ = use_gpu_ph1_ && use_gpu_ph2_ && use_gpu_ph3_ && num_gpus_ == 1 &&
+                          env_on("GANSU_DLPNO_NATIVE_GPU_PH_GROUPED", true);
         // B-a.6a GPU port (Stage 3b T_tmp): the two-stage T_tmp term on device.
-        const char* env_gtmp = std::getenv("GANSU_DLPNO_NATIVE_GPU_TMP");
-        use_gpu_tmp_ = use_gpu_xpair_ && (env_gtmp && env_gtmp[0] == '1');
+        use_gpu_tmp_ = use_gpu_xpair_ && env_on("GANSU_DLPNO_NATIVE_GPU_TMP", true);
         // B-a.6a GPU port (Stage 3c T_Lvv): pair-local T_Lvv on device.
-        const char* env_gtlvv = std::getenv("GANSU_DLPNO_NATIVE_GPU_TLVV");
-        use_gpu_tlvv_ = use_gpu_xpair_ && (env_gtlvv && env_gtlvv[0] == '1');
+        use_gpu_tlvv_ = use_gpu_xpair_ && env_on("GANSU_DLPNO_NATIVE_GPU_TLVV", true);
         // B-a.6a GPU port (Stage 3c T_r1): the last host acc term on device.
-        const char* env_gtr1 = std::getenv("GANSU_DLPNO_NATIVE_GPU_TR1");
-        use_gpu_tr1_ = use_gpu_xpair_ && (env_gtr1 && env_gtr1[0] == '1');
+        use_gpu_tr1_ = use_gpu_xpair_ && env_on("GANSU_DLPNO_NATIVE_GPU_TR1", true);
         // B-a.6a GPU port (Stage 4 σ1): the 1p sector on device, reusing the
         // device-resident lifted r2 (d_r2c_all_, ⊂ use_gpu_xpair_). Nested:
         // S1LVV ⊃ S1FOV ⊃ S1WVOVV (bring up Lvv·r1 → Fov·r2 → Wvovv·r2 in order).
-        const char* env_s1lvv = std::getenv("GANSU_DLPNO_NATIVE_GPU_S1LVV");
-        use_gpu_s1lvv_ = use_gpu_xpair_ && (env_s1lvv && env_s1lvv[0] == '1');
-        const char* env_s1fov = std::getenv("GANSU_DLPNO_NATIVE_GPU_S1FOV");
-        use_gpu_s1fov_ = use_gpu_s1lvv_ && (env_s1fov && env_s1fov[0] == '1');
-        const char* env_s1wv = std::getenv("GANSU_DLPNO_NATIVE_GPU_S1WVOVV");
-        use_gpu_s1wvovv_ = use_gpu_s1fov_ && (env_s1wv && env_s1wv[0] == '1');
+        use_gpu_s1lvv_ = use_gpu_xpair_ && env_on("GANSU_DLPNO_NATIVE_GPU_S1LVV", true);
+        use_gpu_s1fov_ = use_gpu_s1lvv_ && env_on("GANSU_DLPNO_NATIVE_GPU_S1FOV", true);
+        use_gpu_s1wvovv_ = use_gpu_s1fov_ && env_on("GANSU_DLPNO_NATIVE_GPU_S1WVOVV", true);
         // B-a.6a GPU port (Stage 4 full residency): only when EVERY σ2 acc term + the
         // 3 σ1 terms are on device (host builds nothing) — then the per-matvec host
         // round-trips can be removed. Requires the complete set + the env flag.
-        const char* env_res = std::getenv("GANSU_DLPNO_NATIVE_GPU_RESIDENT");
         use_gpu_resident_ = use_gpu_xpair_ && use_gpu_tlvv_ && use_gpu_tr1_ &&
                             use_gpu_ph1_ && use_gpu_ph2_ && use_gpu_ph3_ && use_gpu_tmp_ &&
                             use_gpu_s1lvv_ && use_gpu_s1fov_ && use_gpu_s1wvovv_ &&
-                            (env_res && env_res[0] == '1');
+                            env_on("GANSU_DLPNO_NATIVE_GPU_RESIDENT", true);
         // Stage 5b multi-GPU: broadcast d_input + per-device lift. Only meaningful
         // with the full residency path on AND >1 device requested (rhf.get_num_gpus()).
-        const char* env_multi = std::getenv("GANSU_DLPNO_NATIVE_GPU_MULTI");
-        use_gpu_multi_ = use_gpu_resident_ && num_gpus_ > 1 && (env_multi && env_multi[0] == '1');
-        const char* env_mv = std::getenv("GANSU_DLPNO_NATIVE_GPU_MULTI_VALIDATE");
-        multi_selfcheck_ = use_gpu_multi_ && (env_mv && env_mv[0] == '1');
+        use_gpu_multi_ = use_gpu_resident_ && num_gpus_ > 1 &&
+                         env_on("GANSU_DLPNO_NATIVE_GPU_MULTI", true);
+        multi_selfcheck_ = use_gpu_multi_ && env_on("GANSU_DLPNO_NATIVE_GPU_MULTI_VALIDATE", false);
         // Stage 5c-step2: actual compute split (default ON for multi); NOSLAB forces step1.
-        const char* env_noslab = std::getenv("GANSU_DLPNO_NATIVE_GPU_MULTI_NOSLAB");
-        use_gpu_multi_slab_ = use_gpu_multi_ && !(env_noslab && env_noslab[0] == '1');
+        use_gpu_multi_slab_ = use_gpu_multi_ && !env_on("GANSU_DLPNO_NATIVE_GPU_MULTI_NOSLAB", false);
         // Per-term apply profiling (diagnostic; run with --num_gpus 1 for a clean
         // per-matvec breakdown). Adds a cudaDeviceSynchronize around each timed term.
-        const char* env_prof = std::getenv("GANSU_DLPNO_NATIVE_PROF");
-        prof_ = use_gpu_ && (env_prof && env_prof[0] == '1');
+        prof_ = use_gpu_ && env_on("GANSU_DLPNO_NATIVE_PROF", false);
 #ifdef GANSU_CPU_ONLY
         use_gpu_ = false; gpu_selfcheck_ = false; use_gpu_proj_ = false;
         use_gpu_lift_ = false; use_gpu_xpair_ = false;
@@ -319,8 +378,35 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
         use_gpu_s1lvv_ = false; use_gpu_s1fov_ = false; use_gpu_s1wvovv_ = false;
         use_gpu_resident_ = false;
         use_gpu_multi_ = false; multi_selfcheck_ = false; use_gpu_multi_slab_ = false;
+        use_ph_grouped_ = false;
 #endif
     }
+
+    // B-a.6g GPU rotation of the pre-dressed canonical→LMO transforms (env
+    // GANSU_DLPNO_NATIVE_GPU_ROT=1). Replaces the host rotation loops (PROF
+    // "pre-dressed", ~10.5 s at naphthalene under PM localizer) with cuBLAS GEMMs
+    // reading ea_op's resident device buffers. Off by default → host path,
+    // bit-exact. _ROT_VALIDATE=1 compares device vs host (max|gpu-host|).
+#ifndef GANSU_CPU_ONLY
+    bool use_gpu_rot = false, rot_selfcheck = false;
+    cublasHandle_t cublas_rot = nullptr;
+    real_t* d_U_rot = nullptr;
+    {
+        use_gpu_rot = gpu::gpu_available() && env_on("GANSU_DLPNO_NATIVE_GPU_ROT", true)
+                      && !uloc_is_identity(U_loc_, nocc_);
+        rot_selfcheck = use_gpu_rot && env_on("GANSU_DLPNO_NATIVE_GPU_ROT_VALIDATE", false);
+        if (use_gpu_rot) {
+            cublasCreate(&cublas_rot);
+            const size_t no2 = static_cast<size_t>(nocc_) * nocc_;
+            tracked_cudaMalloc(&d_U_rot, no2 * sizeof(real_t));
+            cudaMemcpy(d_U_rot, U_loc_.data(), no2 * sizeof(real_t),
+                       cudaMemcpyHostToDevice);
+            std::cout << "[bt-PNO B-a.6g EA] pre-dressed LMO rotation on device "
+                         "(Wvvvo trailing-occ cuBLAS GEMM)"
+                      << (rot_selfcheck ? " [VALIDATE]" : "") << std::endl;
+        }
+    }
+#endif
 
     // Borrow the canonical σ1 intermediates (bit-identical to ea_op).
     h_Lvv_.assign(static_cast<size_t>(nvir_) * nvir_, 0.0);
@@ -335,11 +421,38 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
     // Layout ((a*nvir+b)*nvir+c)*nocc + j.
     {
         const size_t sz = static_cast<size_t>(nvir_) * nvir_ * nvir_ * nocc_;
-        std::vector<real_t> h_Wvvvo(sz, 0.0);
-        pull_device(ea_op.get_Wvvvo_device(), h_Wvvvo);
         if (uloc_is_identity(U_loc_, nocc_)) {
+            std::vector<real_t> h_Wvvvo(sz, 0.0);
+            pull_device(ea_op.get_Wvvvo_device(), h_Wvvvo);
             h_Wvvvo_lmo_ = std::move(h_Wvvvo);
+#ifndef GANSU_CPU_ONLY
+        } else if (use_gpu_rot) {
+            // B-a.6g: rotate the trailing occ index J→j on device (single cuBLAS
+            // GEMM over m=(a,b,c)) instead of the host omp loop. Reads ea_op's
+            // resident Wvvvo directly; result D2H'd → downstream byte-identical.
+            rotate_last_occ_gpu(cublas_rot, ea_op.get_Wvvvo_device(), d_U_rot,
+                                h_Wvvvo_lmo_, nvir_ * nvir_ * nvir_, nocc_);
+            if (rot_selfcheck) {
+                std::vector<real_t> h_Wvvvo(sz, 0.0), ref(sz, 0.0);
+                pull_device(ea_op.get_Wvvvo_device(), h_Wvvvo);
+                const int nv = nvir_, no = nocc_;
+                #pragma omp parallel for
+                for (int ab = 0; ab < nv * nv; ++ab)
+                    for (int c = 0; c < nv; ++c) {
+                        const size_t base = (static_cast<size_t>(ab) * nv + c) * no;
+                        for (int j = 0; j < no; ++j) {
+                            real_t s = 0.0;
+                            for (int J = 0; J < no; ++J)
+                                s += U_loc_[static_cast<size_t>(J) * no + j] * h_Wvvvo[base + J];
+                            ref[base + j] = s;
+                        }
+                    }
+                rot_check_report("EA-ROT-CHK", "Wvvvo_lmo", ref, h_Wvvvo_lmo_);
+            }
+#endif
         } else {
+            std::vector<real_t> h_Wvvvo(sz, 0.0);
+            pull_device(ea_op.get_Wvvvo_device(), h_Wvvvo);
             h_Wvvvo_lmo_.assign(sz, 0.0);
             const int nv = nvir_, no = nocc_;
             #pragma omp parallel for
@@ -374,15 +487,27 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
     }
 
     // B-a.6f Stage F5b activation flag — under production BARE + GPU residency +
-    // single-GPU + !VALIDATE, the persistent host members h_Wovov_lmo_/h_Wovvo_lmo_
-    // are NEVER materialised; instead `borrow_ph_to_device_f5b()` (called after the
-    // Stage 3b device allocs below) builds d_Wovov_lmo_ + d_Wovvo_re_ directly from
-    // the canonical EA-op device buffers via D2D copy + on-device rotation. Other
-    // modes (multi-GPU, !resident, VALIDATE on, !BARE) keep the F5 host-rotation +
+    // !VALIDATE, the persistent host members h_Wovov_lmo_/h_Wovvo_lmo_ are NEVER
+    // materialised; instead `borrow_ph_to_device_f5b()` (called after the Stage 3b
+    // device allocs below) builds d_Wovov_lmo_ + d_Wovvo_re_ on device 0 directly
+    // from the canonical EA-op device buffers via D2D copy + on-device rotation.
+    // B-a.6h: extended to multi-GPU (num_gpus>1) — f5b populates the device-0
+    // buffers; the d>0 slab gather (below) then sources Wovov from device 0
+    // (peer-copy of the j-subrange) instead of the elided host array, and Wovvo
+    // already peer-copies from device-0 d_Wovvo_re_. This removes the SERIAL host
+    // Wovvo/Wovov rotation (PROF "pre-dressed" ~9.5 s at naphthalene, omp-less)
+    // from the num_gpus>1 path — the EA-side analogue of the IP (D) win.
+    // Other modes (!resident, VALIDATE on, !BARE) keep the F5 host-rotation +
     // late-free path. ALL Stage 3b host uploads + the F5 late-free below are gated
     // by the SAME `f5b_active`.
-    const bool f5b_active = use_native_bare_ && use_gpu_resident_
-                            && !gpu_selfcheck_ && num_gpus_ == 1;
+    // ⚠ device-balancing guard: f5b builds its device-0 buffers and (multi-GPU)
+    // peer-gathers slabs from device 0, which assumes the EA operator's buffers live
+    // on device 0. Under GANSU_STEOM_OPERATOR_DEVICE_BALANCING the operator may be
+    // redirected to another device → cross-device f5b is UNVERIFIED. Disable f5b
+    // there (fall back to the validated F5 host-rotation path) until validated.
+    const bool device_balancing = env_on("GANSU_STEOM_OPERATOR_DEVICE_BALANCING", false);
+    const bool f5b_active = use_native_bare_ && use_gpu_resident_ && !gpu_selfcheck_
+                            && !device_balancing;
 
     // ph-ladder: Wovvo[l,b,d,j] (occ pos 0,3) and Wovov[l,b,j,d] (occ pos 0,2),
     // each with its two occ indices rotated canonical→LMO (copy none). Borrowed
@@ -517,6 +642,13 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
     cudaMemcpy(d_diagonal_, h_diagonal_.data(),
                static_cast<size_t>(total_dim_) * sizeof(real_t), cudaMemcpyHostToDevice);
 
+#ifndef GANSU_CPU_ONLY
+    // B-a.6g: release the rotation scratch (all pre-dressed rotations done).
+    if (d_U_rot)    { tracked_cudaFree(d_U_rot);   d_U_rot = nullptr; }
+    if (cublas_rot) { cublasDestroy(cublas_rot);   cublas_rot = nullptr; }
+#endif
+
+    _npmark("pre-dressed (env flags + optional dense Wvvvv borrow)");
     // B-EA.6d/6e true-scaling path (env GANSU_DLPNO_NATIVE_DRESSED=1; flags read
     // at the ctor top). Precompute the per-occ diagonal-pair virtual transforms
     // U^(jj) = C_virᵀ S bar_Q_jj once, then the per-occ PNO Wvvvv^(jj). Off by
@@ -665,7 +797,8 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
             if (!use_gpu_resident_) {
                 std::cout << "  [WARN] residency OFF → matvec drops to host-Eigen "
                              "compute_sigma2 (the 60 s/matvec failure mode)." << std::endl;
-                std::cout << "  Missing sub-flags (require =1 with NATIVE_BARE):";
+                std::cout << "  Disabled sub-flags (default ON under NATIVE_EOM; "
+                             "listed = explicitly set =0 or GPU unavailable):";
                 if (!use_gpu_)         std::cout << " GANSU_DLPNO_NATIVE_GPU";
                 if (!use_gpu_proj_)    std::cout << " GANSU_DLPNO_NATIVE_GPU_PROJ";
                 if (!use_gpu_lift_)    std::cout << " GANSU_DLPNO_NATIVE_GPU_LIFT";
@@ -679,10 +812,8 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
                 if (!use_gpu_s1lvv_)   std::cout << " GANSU_DLPNO_NATIVE_GPU_S1LVV";
                 if (!use_gpu_s1fov_)   std::cout << " GANSU_DLPNO_NATIVE_GPU_S1FOV";
                 if (!use_gpu_s1wvovv_) std::cout << " GANSU_DLPNO_NATIVE_GPU_S1WVOVV";
-                {
-                    const char* e = std::getenv("GANSU_DLPNO_NATIVE_GPU_RESIDENT");
-                    if (!e || e[0] != '1') std::cout << " GANSU_DLPNO_NATIVE_GPU_RESIDENT";
-                }
+                if (!env_on("GANSU_DLPNO_NATIVE_GPU_RESIDENT", true))
+                    std::cout << " GANSU_DLPNO_NATIVE_GPU_RESIDENT";
                 std::cout << std::endl;
             }
             std::cout << "  ctor builder wall:  vvvv bare seed = " << std::fixed
@@ -693,6 +824,7 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
         }
     }
 
+    _npmark("dressed_pno_ea + bare seed + Wvvvv ring (host, see BARE-AUDIT)");
     // B-a.6a GPU port — Stage 1 setup. Pack the per-occ diagonal Wvvvv^(jj) into
     // one device buffer + offsets, allocate the packed r2/σ2 scratch, and create
     // a cuBLAS handle. dressed_ is built above (use_gpu_ ⊂ use_dressed_pno_).
@@ -810,6 +942,44 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
             // Fires only when both buffers were allocated (controlled by use_gpu_ph*_).
             if (f5b_active && d_Wovov_lmo_ != nullptr && d_Wovvo_re_ != nullptr) {
                 borrow_ph_to_device_f5b(ea_op.get_Wovvo_device(), ea_op.get_Wovov_device());
+            }
+            // B-a.6h(grouped): build the batched ph-ladder pointer arrays (single-device). The
+            // per-(j,l) GEMMs are batched by looping the reduction index l and batching over the
+            // active occ j (distinct acc[j]). All base device pointers (d_r2c_all_/d_acc_all_/
+            // d_Wovov_lmo_/d_Wovvo_re_) are allocated above and operator-lifetime-fixed; the
+            // arrays are laid out [l_active][j_active] (block l = [l·nact, (l+1)·nact)).
+            // j_extent=nocc / j_base=0 at single-GPU (set above) so the W bases simplify.
+            if (use_ph_grouped_ && d_Wovov_lmo_ != nullptr && d_Wovvo_re_ != nullptr) {
+                const int nv = nvir_, no = nocc_;
+                ph_act_.clear();
+                for (int o = 0; o < no; ++o)
+                    if (packing_.n_pno_ii[o] > 0) ph_act_.push_back(o);
+                ph_nact_ = static_cast<int>(ph_act_.size());
+                const int na = ph_nact_;
+                const size_t tot = static_cast<size_t>(na) * na;
+                std::vector<const real_t*> pR(tot), pWovov(tot), pWovvo(tot);
+                std::vector<real_t*> pAcc(tot);
+                for (int li = 0; li < na; ++li) {
+                    const int l = ph_act_[li];
+                    for (int ji = 0; ji < na; ++ji) {
+                        const int j = ph_act_[ji];
+                        const size_t idx = static_cast<size_t>(li) * na + ji;
+                        pR[idx]     = d_r2c_all_  + static_cast<size_t>(l) * nv * nv;
+                        pWovov[idx] = d_Wovov_lmo_ + (static_cast<size_t>(l) * nv * no + j) * nv;
+                        pWovvo[idx] = d_Wovvo_re_  + (static_cast<size_t>(l) * no + j) * nv * nv;
+                        pAcc[idx]   = d_acc_all_  + static_cast<size_t>(j) * nv * nv;
+                    }
+                }
+                auto up = [&](auto& dptr, const void* hsrc) {
+                    if (tot == 0) return;
+                    tracked_cudaMalloc(&dptr, sizeof(dptr) * tot);
+                    cudaMemcpy(dptr, hsrc, sizeof(dptr) * tot, cudaMemcpyHostToDevice);
+                };
+                up(d_pR_, pR.data());       up(d_pWovov_, pWovov.data());
+                up(d_pWovvo_, pWovvo.data()); up(d_pAcc_, pAcc.data());
+                std::cout << "[bt-PNO B-a.6h(grouped) EA] ph-ladder batched ON: " << na
+                          << " active occ → ~" << 4 * na << " batched calls/matvec (was ~"
+                          << 4 * na * na << " per-(j,l) GEMMs)" << std::endl;
             }
             // Stage 3b T_tmp: borrow ovov_Llmo + t2_Jlmo, alloc the r2c_sym_re / tmp scratch.
             if (use_gpu_tmp_) {
@@ -998,26 +1168,44 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
                     }
                     cpy(&w.d_Loo_xpair, d_Loo_xpair_, no2);
                     // 5j: Wovov_lmo slab-only in slab mode. Layout [l,a,j,d] (j is the 3rd
-                    // axis, stride nvir) → slicing j is a per-(l,a) deep gather, done as a
-                    // HOST repack from h_Wovov_lmo_ + H2D (a device peer copy would be
-                    // nocc·nvir tiny strided copies). Readers use ldB = j_extent·nvir and base
-                    // (l·nvir·j_extent + (j-j_base))·nvir. else full peer-replica.
+                    // axis, stride nvir) → slicing j is a per-(l,a) deep gather. When the host
+                    // array exists (F5 host-rotation path) this is a HOST repack + H2D; under
+                    // the B-a.6h F5b on-device path the host array is elided, so we gather
+                    // per-(l,a) directly from device-0 d_Wovov_lmo_ via cudaMemcpyPeer (the
+                    // nocc·nvir tiny strided copies the host repack originally avoided, but
+                    // now unavoidable and harmless at ctor time). Readers use ldB =
+                    // j_extent·nvir and base (l·nvir·j_extent + (j-j_base))·nvir. else full.
                     if (use_gpu_multi_slab_ && occ_end_[d] > occ_begin_[d]) {
                         const int jb = occ_begin_[d], jext = occ_end_[d] - occ_begin_[d];
                         w.wovov_j_extent = jext; w.wovov_j_base = jb;
                         const size_t la = static_cast<size_t>(nocc_) * nvir_;   // (l,a) pairs
                         const size_t slab_sz = la * jext * nvir_;
-                        std::vector<real_t> h_slab(slab_sz);
-                        #pragma omp parallel for
-                        for (long long p = 0; p < static_cast<long long>(la); ++p) {  // p = l·nvir + a
-                            const real_t* src = h_Wovov_lmo_.data()
-                                + (static_cast<size_t>(p) * nocc_ + jb) * nvir_;
-                            std::copy(src, src + static_cast<size_t>(jext) * nvir_,
-                                      h_slab.data() + static_cast<size_t>(p) * jext * nvir_);
-                        }
                         tracked_cudaMalloc(&w.d_Wovov_lmo, slab_sz * sizeof(real_t));
-                        cudaMemcpy(w.d_Wovov_lmo, h_slab.data(), slab_sz * sizeof(real_t),
-                                   cudaMemcpyHostToDevice);
+                        if (h_Wovov_lmo_.empty()) {
+                            // B-a.6h F5b multi-GPU: the host array was elided (on-device
+                            // rotation). Gather the j-subrange straight from device-0
+                            // d_Wovov_lmo_ ([l,a,j,d], j is the 3rd axis, stride nvir): per
+                            // (l,a) the subrange [jb,jb+jext)×d is contiguous (jext·nvir block)
+                            // → one peer copy each, packed to [p, j_rel, d] (p=l·nvir+a) so the
+                            // result is byte-identical to the host-repack output above. Same
+                            // per-row peer-copy idiom as the Wovvo/t2 slabs.
+                            for (size_t p = 0; p < la; ++p)
+                                cudaMemcpyPeer(
+                                    w.d_Wovov_lmo + p * jext * nvir_, d,
+                                    d_Wovov_lmo_ + (p * nocc_ + jb) * nvir_, 0,
+                                    static_cast<size_t>(jext) * nvir_ * sizeof(real_t));
+                        } else {
+                            std::vector<real_t> h_slab(slab_sz);
+                            #pragma omp parallel for
+                            for (long long p = 0; p < static_cast<long long>(la); ++p) {  // p = l·nvir + a
+                                const real_t* src = h_Wovov_lmo_.data()
+                                    + (static_cast<size_t>(p) * nocc_ + jb) * nvir_;
+                                std::copy(src, src + static_cast<size_t>(jext) * nvir_,
+                                          h_slab.data() + static_cast<size_t>(p) * jext * nvir_);
+                            }
+                            cudaMemcpy(w.d_Wovov_lmo, h_slab.data(), slab_sz * sizeof(real_t),
+                                       cudaMemcpyHostToDevice);
+                        }
                     } else {
                         w.wovov_j_extent = nocc_; w.wovov_j_base = 0;
                         cpy(&w.d_Wovov_lmo, d_Wovov_lmo_, ovov_len);
@@ -1111,6 +1299,7 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
         use_gpu_resident_ = false;
     }
 #endif
+    _npmark("GPU Stage 1-4 device setup (per-occ pack + H2D)");
 }
 
 // Dump the accumulated per-term apply timings (env GANSU_DLPNO_NATIVE_PROF=1).
@@ -1146,7 +1335,8 @@ void DLPNOEAEOMNativeOperator::print_profile() const {
 // the EA-ctor's ~6.4 GB transient host peak at anthracene (~1.4 TB at 100 atoms). Chunked
 // over the virtual `a` axis so the device scratch stays inside a tuneable budget; identity
 // uloc skips the cuBLAS GEMMs entirely. Gating + call site live in the ctor (under
-// `f5b_active = use_native_bare_ && use_gpu_resident_ && !gpu_selfcheck_ && num_gpus_==1`).
+// `f5b_active = use_native_bare_ && use_gpu_resident_ && !gpu_selfcheck_`). Builds the
+// device-0 buffers only; under num_gpus>1 (B-a.6h) the d>0 slab gather peer-copies them.
 void DLPNOEAEOMNativeOperator::borrow_ph_to_device_f5b(
     const real_t* d_Wovvo_canon, const real_t* d_Wovov_canon)
 {
@@ -1452,6 +1642,11 @@ DLPNOEAEOMNativeOperator::~DLPNOEAEOMNativeOperator() {
     if (d_Loo_xpair_)      tracked_cudaFree(d_Loo_xpair_);
     if (d_Wovov_lmo_)      tracked_cudaFree(d_Wovov_lmo_);
     if (d_Wovvo_re_)       tracked_cudaFree(d_Wovvo_re_);
+    // B-a.6h(grouped) EA ph-ladder batched pointer arrays.
+    if (d_pR_)             tracked_cudaFree(d_pR_);
+    if (d_pWovov_)         tracked_cudaFree(d_pWovov_);
+    if (d_pWovvo_)         tracked_cudaFree(d_pWovvo_);
+    if (d_pAcc_)           tracked_cudaFree(d_pAcc_);
     if (d_ovov_Llmo_)      tracked_cudaFree(d_ovov_Llmo_);
     if (d_t2_Jlmo_)        tracked_cudaFree(d_t2_Jlmo_);
     if (d_r2c_sym_re_)     tracked_cudaFree(d_r2c_sym_re_);
@@ -1985,9 +2180,15 @@ void DLPNOEAEOMNativeOperator::apply_xpair_projection_gpu(
     });
     tick(prof_t_tlvv_, [&] { if (use_gpu_tlvv_) add_tlvv_gpu(); });
     tick(prof_t_tr1_,  [&] { if (use_gpu_tr1_)  add_tr1_gpu(r1); });
-    tick(prof_t_ph2_,  [&] { if (use_gpu_ph2_)  add_tph2_gpu(); });
-    tick(prof_t_ph3_,  [&] { if (use_gpu_ph3_)  add_tph3_gpu(); });
-    tick(prof_t_ph1_,  [&] { if (use_gpu_ph1_)  add_tph1_gpu(); });
+    // B-a.6h(grouped): one batched ph-ladder replaces the 3 per-(j,l) loops. Timed under
+    // prof_t_ph2_ (T_ph3/T_ph1 read 0 in the PROF dump — sum them for the combined ph cost).
+    if (use_ph_grouped_) {
+        tick(prof_t_ph2_, [&] { add_tph_grouped_gpu(); });
+    } else {
+        tick(prof_t_ph2_,  [&] { if (use_gpu_ph2_)  add_tph2_gpu(); });
+        tick(prof_t_ph3_,  [&] { if (use_gpu_ph3_)  add_tph3_gpu(); });
+        tick(prof_t_ph1_,  [&] { if (use_gpu_ph1_)  add_tph1_gpu(); });
+    }
     tick(prof_t_tmp_,  [&] { if (use_gpu_tmp_)  add_ttmp_gpu(); });
     tick(prof_t_proj_, [&] { project_acc_stack_gpu(d_acc_all_, packed_r2, packed_sigma2); });
     if (prof_) ++prof_calls_;
@@ -2087,6 +2288,42 @@ void DLPNOEAEOMNativeOperator::add_tph1_gpu() const {
             cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, nv, nv, nv, &neg_one,
                         WB, wovov_j_extent_ * nv, R, nv, &one, C, nv);
         }
+    }
+#endif
+}
+
+// B-a.6h(grouped): the ph-ladder (T_ph2 + T_ph3 + T_ph1) as batched cublasDgemmBatched.
+// Each per-(j,l) GEMM is replicated exactly (same m/n/k=nvir, same ops, same lda/ldb/ldc,
+// same α/β) but batched over the active occ j for a fixed reduction index l. Looping l
+// outside and batching j inside keeps every acc[j]'s l-accumulation order identical to the
+// per-(j,l) path (distinct acc[j] per batch entry → no race); ph2→ph3→ph1 with ph1's
+// termA/termB interleaved per l matches the per-(j,l) A,B,A,B order → bit-exact. Single-
+// device only (the pointer arrays index the device-0 buffers, built in the ctor).
+void DLPNOEAEOMNativeOperator::add_tph_grouped_gpu() const {
+#ifndef GANSU_CPU_ONLY
+    cublasHandle_t cublas = reinterpret_cast<cublasHandle_t>(cublas_);
+    const real_t one = 1.0, two = 2.0, neg_one = -1.0;
+    const int nv = nvir_, no = nocc_;
+    const int na = ph_nact_;
+    // T_ph2: C=acc[j] += -1 · R[l]·A_j[l]  (ops N,N; lda(R)=nv, ldb(Wovov)=nocc·nv, ldc=nv).
+    for (int li = 0; li < na; ++li) {
+        const size_t off = static_cast<size_t>(li) * na;
+        cublasDgemmBatched(cublas, CUBLAS_OP_N, CUBLAS_OP_N, nv, nv, nv, &neg_one,
+                           d_pR_ + off, nv, d_pWovov_ + off, no * nv, &one, d_pAcc_ + off, nv, na);
+    }
+    // T_ph3: C += -1 · Wovvo_reᵀ·Rᵀ  (ops T,T; lda(Wovvo)=nv, ldb(R)=nv, ldc=nv).
+    for (int li = 0; li < na; ++li) {
+        const size_t off = static_cast<size_t>(li) * na;
+        cublasDgemmBatched(cublas, CUBLAS_OP_T, CUBLAS_OP_T, nv, nv, nv, &neg_one,
+                           d_pWovvo_ + off, nv, d_pR_ + off, nv, &one, d_pAcc_ + off, nv, na);
+    }
+    // T_ph1: per l, termA (+2·Wovvo_reᵀ·R) then termB (-1·Wovovᵀ·R)  (both ops T,N).
+    for (int li = 0; li < na; ++li) {
+        const size_t off = static_cast<size_t>(li) * na;
+        cublasDgemmBatched(cublas, CUBLAS_OP_T, CUBLAS_OP_N, nv, nv, nv, &two,
+                           d_pWovvo_ + off, nv, d_pR_ + off, nv, &one, d_pAcc_ + off, nv, na);
+        cublasDgemmBatched(cublas, CUBLAS_OP_T, CUBLAS_OP_N, nv, nv, nv, &neg_one,
+                           d_pWovov_ + off, no * nv, d_pR_ + off, nv, &one, d_pAcc_ + off, nv, na);
     }
 #endif
 }

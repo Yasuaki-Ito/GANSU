@@ -43,6 +43,7 @@
 #include <string>
 #include <vector>
 
+#include "steom_barh_cache.hpp"   // (A) shared dressed bar-H cache
 #include "linear_operator.hpp"
 #include "types.hpp"
 
@@ -78,7 +79,11 @@ public:
                       // + extracts; operator takes ownership and uses them in
                       // canonical-skip Term A GEMM).  Non-null + size ≥ 2
                       // enables slab mode (forces canonical_skip_wvvvv_=true).
-                      std::vector<real_t*>* d_eri_vvvv_slabs_input = nullptr);
+                      std::vector<real_t*>* d_eri_vvvv_slabs_input = nullptr,
+                      // (A) shared bar-H: when non-null, publish the 3 EA-unique
+                      // dressed intermediates (Wvovv/Wvvvv/Wvvvo) here and skip
+                      // freeing them in the dtor (the cache owns them).
+                      SteomBarHCache* barh_cache = nullptr);
 
     ~EAEOMCCSDOperator();
 
@@ -151,6 +156,15 @@ private:
     real_t* d_Wvovv_  = nullptr;  // [nvir · nocc · nvir · nvir]
     real_t* d_Wvvvv_  = nullptr;  // [nvir^4]
     real_t* d_Wvvvo_  = nullptr;  // [nvir · nvir · nvir · nocc]
+
+    // === (A) shared bar-H publishing ===
+    // When barh_cache_ != nullptr, build_dressed_intermediates publishes the 3
+    // EA-unique intermediates (Wvovv/Wvvvv/Wvvvo) into the cache (IP already
+    // published the 8 shared ones) and sets barh_published_; the destructor then
+    // skips freeing ONLY those 3 (Loo/Lvv/Fov/Wovov/Wovvo are EA-owned copies,
+    // always freed — the cache holds IP's bit-identical versions).
+    SteomBarHCache* barh_cache_ = nullptr;
+    bool barh_published_ = false;
 
     // === σ2 ring-term GEMM acceleration (reorganized W matrices, built once) ===
     // Lift the 3 O(nocc²·nvir³) ring contractions of σ2 out of the per-thread

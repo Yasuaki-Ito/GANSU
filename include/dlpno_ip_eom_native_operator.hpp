@@ -78,6 +78,7 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -399,6 +400,80 @@ private:
     mutable bool resident_ = false;            ///< set true only inside apply_resident
     mutable const real_t* d_r2_src_ = nullptr; ///< resident packed-r2 source (= d_input+nocc)
     mutable const real_t* d_r1_src_ = nullptr; ///< resident r1 source (= d_input)
+
+    // Per-term apply profiler (env GANSU_DLPNO_NATIVE_PROF=1; mirror of the EA
+    // operator). Sync-bracketed timers around each σ matvec term; dumped in the
+    // destructor. Run with --num_gpus 1 → prof_calls_ = matvec count and each total
+    // is the full per-matvec cost of that term (the multi-GPU slab path times only
+    // a sub-slab and over-counts prof_calls_ by the device count).
+    mutable bool   prof_ = false;
+    mutable long   prof_calls_ = 0;
+    mutable double prof_t_lift_ = 0, prof_t_s1_ = 0, prof_t_xpair_ = 0, prof_t_t1_ = 0,
+                   prof_t_t8_ = 0, prof_t_proj_ = 0, prof_t_phl_ = 0;
+    void print_profile() const;          ///< dump the accumulated per-term timings (if prof_)
+
+    // B-a.6h σ2 per-term CUDA-graph capture/replay (xpair / T8 / ph-ladder). Each is a
+    // per-slot loop of small cuBLAS calls over the FIXED orientation slots, reading only
+    // operator-lifetime-fixed device buffers (d_r2c_all_/d_acc_all_/d_sig_pack_ + the W
+    // packs; NO d_input) → pure launch overhead the PNO truncation makes compute-trivial.
+    // The naphthalene num_gpus=1 PROF pinned this: ph-ladder 44.5% + xpair 20.5% + T8 7.5%
+    // are all ~4.5 µs/op launch-floor-bound. Each loop is captured once into a cudaGraph
+    // (on a shared per-device blocking stream; the legacy NULL stream's implicit sync
+    // orders the graphs w.r.t. the un-captured memsets / T1 / proj that interleave them)
+    // and replayed every subsequent matvec → host launch overhead ≈ 0. T1 + proj read
+    // d_input (r1/r2) so they are NOT captured here (a later staging step). ON unless
+    // GANSU_DLPNO_NATIVE_GPU_PHL_GRAPH=0 (math-inert; GPU_VALIDATE=1 catches any capture
+    // error vs the host reference). void* avoids a CUDA include in the hpp.
+    mutable bool graph_enabled_ = false;          ///< env-enabled σ2 graph capture/replay (xpair/T8/phl)
+    mutable int  cur_bound_dev_ = 0;              ///< device index bound by bind_device (0 = single-GPU)
+    mutable std::vector<void*> cap_stream_;       ///< shared capture/replay cudaStream_t per device (lazy)
+    mutable std::vector<void*> xpair_graph_exec_; ///< cudaGraphExec_t per device for add_xpair_gpu (lazy)
+    mutable std::vector<void*> t8_graph_exec_;    ///< cudaGraphExec_t per device for add_t8_gpu (lazy)
+    mutable std::vector<void*> phl_graph_exec_;   ///< cudaGraphExec_t per device for add_phl_gpu (lazy)
+    // Step 2: lift / T1 / proj+T2 read r1/r2. In the resident path apply_resident stages
+    // r1/r2 into fixed scratch (d_r1_ / d_r2_pack_) first (D2D, bit-exact), so these loops
+    // also see operator-lifetime-fixed pointers and become capturable. Off → un-staged.
+    mutable std::vector<void*> lift_graph_exec_;  ///< cudaGraphExec_t per device for lift_r2c_gpu (lazy)
+    mutable std::vector<void*> t1_graph_exec_;    ///< cudaGraphExec_t per device for add_t1_gpu (lazy)
+    mutable std::vector<void*> proj_graph_exec_;  ///< cudaGraphExec_t per device for the proj+T2 loop (lazy)
+    mutable void* active_stream_ = nullptr;       ///< stream raw kernels launch on during capture (0=NULL outside)
+    /// Replay the captured graph for (exec_vec, current device) if present, else capture
+    /// `fn` into it. The shared per-device cap_stream_ (blocking) serialises the term
+    /// graphs and orders them against the interleaved NULL-stream memsets / T1 / proj.
+    /// `fn` must issue ONLY cuBLAS (on cublas_) + kernels on active_stream_. Capture
+    /// failure → permanent fallback (graph_enabled_=false) + direct issue (no garbage).
+    void graph_replay(std::vector<void*>& exec_vec, const char* label,
+                      const std::function<void()>& fn) const;
+
+    // B-a.6h(grouped) ph-ladder as n-grouped cublasDgemmBatched (env
+    // GANSU_DLPNO_NATIVE_GPU_PHL_GROUPED, ⊂ use_gpu_phl_; single-device only). The
+    // ~n_orient×7 per-slot ph-ladder cuBLAS ops — the graphed-but-still device-exec-floor-
+    // bound IP hotspot (~5250 tiny ops × ~4.3µs/op = 22.5 ms/matvec while the real flops are
+    // ~20µs) — collapse into ~7×(distinct n) batched GEMMs by grouping slots of identical PNO
+    // dim n (uniform m/n/k per group → NO padding → bit-exact). The device pointer arrays +
+    // group ranges are operator-lifetime-fixed → built once in the ctor. Default off → the
+    // per-slot graph path runs; on → replaces add_phl_gpu's run_loop with add_phl_grouped_gpu.
+    bool use_phl_grouped_ = false;
+    real_t* d_RP_oim_pack_ = nullptr;   ///< [Σ_slot n·nocc] per-slot RP(oi,m) batched scratch
+    real_t* d_RP_moi_pack_ = nullptr;
+    real_t* d_RP_moj_pack_ = nullptr;
+    const real_t** d_pA_U_   = nullptr; ///< RP A array (U^(ij)) [n_active_slots] device ptrs
+    const real_t** d_pB_oim_ = nullptr; ///< RP B array for RP_oim (r2c base oi·nocc·nvir, ldb=nvir)
+    const real_t** d_pB_moi_ = nullptr; ///< RP B array for RP_moi (r2c base oi·nvir, ldb=nocc·nvir)
+    const real_t** d_pB_moj_ = nullptr; ///< RP B array for RP_moj (r2c base oj·nvir, ldb=nocc·nvir)
+    real_t** d_pC_RPoim_ = nullptr;     ///< RP C / W B (= d_RP_oim_pack_ + slot off)
+    real_t** d_pC_RPmoi_ = nullptr;
+    real_t** d_pC_RPmoj_ = nullptr;
+    const real_t** d_pA_W6_   = nullptr;///< W A array (W6 per slot)
+    const real_t** d_pA_W7oj_ = nullptr;
+    const real_t** d_pA_W7oi_ = nullptr;
+    real_t** d_pC_sig_ = nullptr;       ///< W C array (= d_sig_pack_ + off)
+    std::vector<int> phl_grp_n_;        ///< per-group PNO dim n (sorted ascending)
+    std::vector<int> phl_grp_begin_;    ///< per-group sorted-slot start
+    std::vector<int> phl_grp_end_;      ///< per-group sorted-slot end (exclusive)
+    /// B-a.6h(grouped): the n-grouped batched ph-ladder (3 RP + 4 W batched GEMMs per
+    /// n-group; replaces the per-slot loop when use_phl_grouped_). Bit-exact (same GEMMs).
+    void add_phl_grouped_gpu() const;
 
     /// Stage 1 GPU T2: packed_sigma2^(orient) += Lvv^(ij)·r2_packed^(orient) on
     /// device (per-orientation cublasDgemv). Exactly mirrors the host PNO block.
