@@ -509,12 +509,14 @@ STEOMCCSDOperator::STEOMCCSDOperator(
     const real_t* d_B_mo_blocks,
     int nmo_full,
     std::vector<real_t*>* d_eri_vvvv_slabs_input,
-    SteomBarHCache* barh_cache)
+    SteomBarHCache* barh_cache,
+    int frozen_off)
     : nocc_active_(nocc_active), nvir_(nvir), nao_active_(nao_active),
       n_act_occ_(n_act_occ), n_act_vir_(n_act_vir),
       total_dim_(nocc_active * nvir),
       d_t1_(d_t1), d_t2_(d_t2),
       eri_block_src_(eri_block_src), d_B_mo_blocks_(d_B_mo_blocks), nmo_full_(nmo_full),
+      frozen_off_(frozen_off),
       barh_cache_(barh_cache)
 {
     // Ship 14 — take ownership of per-device d_eri_vvvv slabs allocated +
@@ -946,16 +948,20 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
     // nao==nmo_full_).
     if (eri_block_src_ != nullptr) {
         const int M = nmo_full_;
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,0,nocc,      0,nocc,0,nocc,      d_eri_oooo_); // (ij|kl)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,0,nocc,      0,nocc,nocc,nvir,   d_eri_ooov_); // (ji|kb)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,nocc,nvir,   0,nocc,nocc,nvir,   d_eri_ovov_); // (ia|jb)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,0,nocc,      nocc,nvir,nocc,nvir,d_eri_oovv_); // (ij|ab)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,nocc,nvir,   nocc,nvir,0,nocc,   d_eri_ovvo_); // (ia|bj)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,nocc,nvir,   nocc,nvir,nocc,nvir,d_eri_ovvv_); // (ia|bc)
+        // Frozen core: B_mo spans the full C (M MOs); shift every range start by
+        // frozen_off_ to read the active occ [O,O+nocc) / vir [O+nocc,O+nocc+nvir)
+        // window. O = 0 ⇒ non-frozen (byte-identical).
+        const int O = frozen_off_;
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         O,nocc,O,nocc,           d_eri_oooo_); // (ij|kl)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         O,nocc,nocc+O,nvir,      d_eri_ooov_); // (ji|kb)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    O,nocc,nocc+O,nvir,      d_eri_ovov_); // (ia|jb)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         nocc+O,nvir,nocc+O,nvir, d_eri_oovv_); // (ij|ab)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,O,nocc,      d_eri_ovvo_); // (ia|bj)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,nocc+O,nvir, d_eri_ovvv_); // (ia|bc)
         // Ship 14: slab mode skips legacy single-device vvvv extract (driver
         // pre-populated d_eri_vvvv_slabs_).
         if (eri_vvvv_nslab_ <= 1) {
-            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, nocc,nvir,nocc,nvir,nocc,nvir,nocc,nvir,d_eri_vvvv_); // (ab|cd)
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, nocc+O,nvir,nocc+O,nvir,nocc+O,nvir,nocc+O,nvir,d_eri_vvvv_); // (ab|cd)
         }
         cudaDeviceSynchronize();
         return;

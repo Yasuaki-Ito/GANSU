@@ -293,13 +293,15 @@ IPEOMCCSDOperator::IPEOMCCSDOperator(
     const real_t* d_B_mo_blocks,
     int nmo_full,
     int num_gpus,
-    SteomBarHCache* barh_cache)
+    SteomBarHCache* barh_cache,
+    int frozen_off)
     : nocc_(nocc), nvir_(nvir), nao_(nao),
       h_dim_(nocc),
       h2p_dim_(nocc * nocc * nvir),
       total_dim_(nocc + nocc * nocc * nvir),
       d_t1_(d_t1), d_t2_(d_t2),
       eri_block_src_(eri_block_src), d_B_mo_blocks_(d_B_mo_blocks), nmo_full_(nmo_full),
+      frozen_off_(frozen_off),
       barh_cache_(barh_cache)
 {
     if (nocc <= 0 || nvir <= 0 || nao != nocc + nvir) {
@@ -555,12 +557,15 @@ void IPEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
     // full nmo⁴. o=[0,nocc), v=[nocc,nmo). Layouts match the gather kernels below.
     if (eri_block_src_ != nullptr) {
         const int M = nmo_full_;
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,0,nocc,      0,nocc,0,nocc,      d_eri_oooo_); // (ij|kl)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,0,nocc,      0,nocc,nocc,nvir,   d_eri_ooov_); // (ji|kb)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,nocc,nvir,   0,nocc,nocc,nvir,   d_eri_ovov_); // (ia|jb)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,0,nocc,      nocc,nvir,nocc,nvir,d_eri_oovv_); // (ij|ab)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,nocc,nvir,   nocc,nvir,0,nocc,   d_eri_ovvo_); // (ia|bj)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, 0,nocc,nocc,nvir,   nocc,nvir,nocc,nvir,d_eri_ovvv_); // (ia|bc)
+        // Frozen core: shift every range start by frozen_off_ to read the active
+        // window from the full-C B_mo. O = 0 ⇒ non-frozen (byte-identical).
+        const int O = frozen_off_;
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         O,nocc,O,nocc,           d_eri_oooo_); // (ij|kl)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         O,nocc,nocc+O,nvir,      d_eri_ooov_); // (ji|kb)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    O,nocc,nocc+O,nvir,      d_eri_ovov_); // (ia|jb)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         nocc+O,nvir,nocc+O,nvir, d_eri_oovv_); // (ij|ab)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,O,nocc,      d_eri_ovvo_); // (ia|bj)
+        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,nocc+O,nvir, d_eri_ovvv_); // (ia|bc)
         cudaDeviceSynchronize();
         return;
     }

@@ -437,10 +437,12 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // (naux×nmo²) inside the STEOM operator, never the full nmo⁴ tensor.
     // Single-GPU uses intermediate_matrix_B_; distributed-RI's build_B_mo
     // lazily replicates B to each GPU and returns nullptr only if the
-    // replication budget would fail. Requires DLPNO amplitudes + num_frozen==0.
+    // replication budget would fail. Frozen core: the operator reads the active
+    // window from the full-C B_mo via its frozen_off (num_frozen) shift, so the
+    // block path is no longer gated on num_frozen==0 (avoids the nao⁴ tensor).
     const ERI_RI* eri_ri_block = nullptr;
     const real_t* d_B_mo_blocks = nullptr;
-    if (rhf.use_dlpno_amplitudes() && num_frozen == 0 && gpu::gpu_available()) {
+    if (rhf.use_dlpno_amplitudes() && gpu::gpu_available()) {
         eri_ri_block = dynamic_cast<const ERI_RI*>(&eri_method);
         if (eri_ri_block) {
             d_B_mo_blocks = eri_ri_block->build_B_mo(d_C, num_basis);
@@ -464,7 +466,10 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 
     real_t* d_eri_for_op = d_eri_mo;
     bool free_eri_for_op = false;
-    if (num_frozen > 0) {
+    // Full-tensor frozen-core trim ONLY when not on the on-the-fly block path.
+    // With eri_ri_block the operator reads active blocks straight from the
+    // full-C B_mo via the frozen_off (num_frozen) shift — no nao⁴ tensor.
+    if (num_frozen > 0 && !eri_ri_block) {
         const size_t na4 = (size_t)nao_active * nao_active * nao_active * nao_active;
         tracked_cudaMalloc(&d_eri_for_op, na4 * sizeof(real_t));
         free_eri_for_op = true;
@@ -613,11 +618,13 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                     const int an      = a_end - a_start;
                     const size_t slab_sz = (size_t)an * nvir * nvir * nvir;
                     tracked_cudaMalloc(&steom_d_eri_vvvv_slabs[d], slab_sz * sizeof(real_t));
+                    // Frozen core: virtual block starts at full_occ = nocc_active
+                    // + num_frozen in the full-C B_mo (B_d built over num_basis MOs).
                     eri_ri_block->mo_eri_block_into(B_d, num_basis,
-                        nocc_active + a_start, an,   // a range (slab)
-                        nocc_active, nvir,           // b range
-                        nocc_active, nvir,           // c range
-                        nocc_active, nvir,           // d range
+                        nocc_active + num_frozen + a_start, an,   // a range (slab)
+                        nocc_active + num_frozen, nvir,           // b range
+                        nocc_active + num_frozen, nvir,           // c range
+                        nocc_active + num_frozen, nvir,           // d range
                         steom_d_eri_vvvv_slabs[d]);
                     cudaDeviceSynchronize();
                     std::cout << "  [STEOM Ship 14] slab d=" << d
@@ -671,7 +678,10 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                                steom_d_eri_vvvv_slabs.empty()
                                    ? nullptr : &steom_d_eri_vvvv_slabs,
                                // (A) shared bar-H: borrow all 11, skip build_dressed
-                               rhf.steom_share_barh() ? &rhf.steom_barh_cache() : nullptr);
+                               rhf.steom_share_barh() ? &rhf.steom_barh_cache() : nullptr,
+                               // Frozen core: block ranges read [num_frozen, num_basis)
+                               // of the full-C B_mo (only used on the block path).
+                               num_frozen);
 
     // Operator owns T1/T2 + has copied bar-H intermediates; we can free the
     // trimmed / full MO ERI tensor (operator pulled the sub-blocks it needs).
@@ -972,8 +982,10 @@ void ERI_RI_RHF::compute_dlpno_steom_ccsd(int n_states) {
     // distributed (lazy replicate). Probe build_B_mo here; if it returns
     // nullptr (CPU / budget refused) we must pre-build the full nmo⁴ tensor
     // because compute_steom_ccsd_impl has no d_eri_ao to AO→MO transform from.
+    // Frozen core: the block path reads the active window from the full-C B_mo
+    // via the operator's frozen_off shift, so it is NO LONGER gated on
+    // num_frozen==0 — avoids the nao⁴ MO-ERI tensor (OOM for ~tetracene+).
     const bool want_block = rhf_.use_dlpno_amplitudes()
-                            && rhf_.get_num_frozen_core() == 0
                             && gpu::gpu_available();
     const real_t* probe = want_block ? build_B_mo(d_C, num_basis) : nullptr;
     real_t* d_eri_mo = (probe != nullptr) ? nullptr : build_mo_eri(d_C, num_basis);

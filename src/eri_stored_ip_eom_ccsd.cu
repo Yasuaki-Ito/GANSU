@@ -212,7 +212,10 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
 
     real_t* d_eri_for_op = d_eri_mo;
     bool free_eri_for_op = false;
-    if (num_frozen > 0) {
+    // Full-tensor frozen-core trim ONLY when not using the on-the-fly block
+    // path. With eri_block_src the operator reads active blocks straight from
+    // the full-C B_mo via the frozen_off (num_frozen) shift — no nao⁴ tensor.
+    if (num_frozen > 0 && !eri_block_src) {
         const size_t na4 = (size_t)nao_active * nao_active * nao_active * nao_active;
         tracked_cudaMalloc(&d_eri_for_op, na4 * sizeof(real_t));
         free_eri_for_op = true;
@@ -252,7 +255,10 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
                             nocc_active, nvir, nao_active,
                             eri_block_src, d_B_mo_blocks, num_basis, eom_gpus,
                             // (A) shared bar-H: publish 8 IP-side intermediates
-                            rhf.steom_share_barh() ? &rhf.steom_barh_cache() : nullptr);
+                            rhf.steom_share_barh() ? &rhf.steom_barh_cache() : nullptr,
+                            // Frozen core: block ranges read [num_frozen, num_basis)
+                            // of the full-C B_mo (only used on the block path).
+                            num_frozen);
 
     // The intermediates have been built; we no longer need the trimmed /
     // full MO ERI tensor (the operator owns the extracted sub-blocks).
@@ -530,8 +536,10 @@ void ERI_RI_RHF::compute_ip_eom_ccsd(int n_states) {
     // (no full nmo⁴). Single-GPU uses intermediate_matrix_B_; distributed-RI's
     // build_B_mo lazily replicates B to each GPU (~580 MB at anthracene scale).
     // build_B_mo returns nullptr when budget exceeded → fallback to full tensor.
+    // Frozen core: the block path now reads the active window from the full-C
+    // B_mo via the operator's frozen_off shift, so it is NO LONGER gated on
+    // num_frozen==0 — this avoids the nao⁴ MO-ERI tensor (OOM for ~tetracene+).
     const bool want_block = rhf_.use_dlpno_amplitudes()
-                            && rhf_.get_num_frozen_core() == 0
                             && gpu::gpu_available();
     const real_t* d_B_mo = want_block ? build_B_mo(d_C, num_basis) : nullptr;
     const bool block     = want_block && d_B_mo != nullptr;

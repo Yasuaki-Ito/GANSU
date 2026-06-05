@@ -78,7 +78,12 @@ public:
                       // (A) shared bar-H: when non-null + GANSU_STEOM_SHARE_BARH,
                       // publish the 8 IP-side dressed intermediates here and
                       // relinquish ownership (dtor skips freeing them).
-                      SteomBarHCache* barh_cache = nullptr);
+                      SteomBarHCache* barh_cache = nullptr,
+                      // Frozen core: MO-index offset (= num_frozen) added to every
+                      // on-the-fly mo_eri_block_into range so the active blocks are
+                      // read from the full-C B_mo at columns [num_frozen, num_basis).
+                      // 0 ⇒ no frozen core (byte-identical).
+                      int frozen_off = 0);
 
     ~IPEOMCCSDOperator();
 
@@ -175,6 +180,7 @@ private:
     const ERI_RI* eri_block_src_ = nullptr;
     const real_t* d_B_mo_blocks_ = nullptr;
     int nmo_full_ = 0;
+    int frozen_off_ = 0;   // frozen-core MO offset for block ranges (0 = none)
     void extract_eri_blocks(const real_t* d_eri_mo);
     void compute_denominators_and_fock(const real_t* d_orbital_energies);
     void build_diagonal();

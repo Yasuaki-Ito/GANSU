@@ -83,7 +83,13 @@ public:
                       // (A) shared bar-H: when non-null, publish the 3 EA-unique
                       // dressed intermediates (Wvovv/Wvvvv/Wvvvo) here and skip
                       // freeing them in the dtor (the cache owns them).
-                      SteomBarHCache* barh_cache = nullptr);
+                      SteomBarHCache* barh_cache = nullptr,
+                      // Frozen core: MO-index offset (= num_frozen) added to every
+                      // on-the-fly mo_eri_block_into range so the active blocks are
+                      // read from the full-C B_mo at columns [num_frozen, num_basis).
+                      // 0 ⇒ no frozen core (byte-identical). Lets the block path
+                      // replace the nao⁴ full-tensor build under frozen core.
+                      int frozen_off = 0);
 
     ~EAEOMCCSDOperator();
 
@@ -183,12 +189,15 @@ private:
     real_t* d_f_oo_  = nullptr;  // [nocc] diagonal Fock-occ
     real_t* d_f_vv_  = nullptr;  // [nvir] diagonal Fock-vir
 
-    // Phase 0: optional on-the-fly MO-ERI block source (single-GPU RI,
-    // num_frozen==0). When set, extract_eri_blocks builds the 7 blocks from
-    // d_B_mo_blocks_ via eri_block_src_->mo_eri_block_into, never the full nmo⁴.
+    // Phase 0: optional on-the-fly MO-ERI block source (single-GPU RI). When
+    // set, extract_eri_blocks builds the 7 blocks from d_B_mo_blocks_ via
+    // eri_block_src_->mo_eri_block_into, never the full nmo⁴. Frozen core: B_mo
+    // is built over the full C (nmo_full_ MOs); frozen_off_ (= num_frozen)
+    // shifts every block range into the active window [num_frozen, num_basis).
     const ERI_RI* eri_block_src_ = nullptr;
     const real_t* d_B_mo_blocks_ = nullptr;
     int nmo_full_ = 0;
+    int frozen_off_ = 0;
     void extract_eri_blocks(const real_t* d_eri_mo);
     void compute_denominators_and_fock(const real_t* d_orbital_energies);
     void build_diagonal();

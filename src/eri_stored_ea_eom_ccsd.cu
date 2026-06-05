@@ -310,7 +310,10 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
 
     real_t* d_eri_for_op = d_eri_mo;
     bool free_eri_for_op = false;
-    if (num_frozen > 0) {
+    // Full-tensor frozen-core trim ONLY when not using the on-the-fly block
+    // path. With eri_block_src the operator reads active blocks straight from
+    // the full-C B_mo via the frozen_off (num_frozen) shift — no nao⁴ tensor.
+    if (num_frozen > 0 && !eri_block_src) {
         const size_t na4 = (size_t)nao_active * nao_active * nao_active * nao_active;
         tracked_cudaMalloc(&d_eri_for_op, na4 * sizeof(real_t));
         free_eri_for_op = true;
@@ -382,11 +385,13 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
                     const int an      = a_end - a_start;
                     const size_t slab_sz = (size_t)an * nvir * nvir * nvir;
                     tracked_cudaMalloc(&d_eri_vvvv_slabs[d], slab_sz * sizeof(real_t));
+                    // Frozen core: virtual block starts at full_occ = nocc_active
+                    // + num_frozen in the full-C B_mo (B_d built over num_basis MOs).
                     eri_block_src->mo_eri_block_into(B_d, num_basis,
-                        nocc_active + a_start, an,   // a range (slab)
-                        nocc_active, nvir,           // b range
-                        nocc_active, nvir,           // c range
-                        nocc_active, nvir,           // d range
+                        nocc_active + num_frozen + a_start, an,   // a range (slab)
+                        nocc_active + num_frozen, nvir,           // b range
+                        nocc_active + num_frozen, nvir,           // c range
+                        nocc_active + num_frozen, nvir,           // d range
                         d_eri_vvvv_slabs[d]);
                     cudaDeviceSynchronize();
                     std::cout << "  [EA-EOM Ship 12] slab d=" << d
@@ -438,7 +443,10 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
                             eri_block_src, d_B_mo_blocks, num_basis, eom_gpus,
                             d_eri_vvvv_slabs.empty() ? nullptr : &d_eri_vvvv_slabs,
                             // (A) shared bar-H: publish 3 EA-unique intermediates
-                            rhf.steom_share_barh() ? &rhf.steom_barh_cache() : nullptr);
+                            rhf.steom_share_barh() ? &rhf.steom_barh_cache() : nullptr,
+                            // Frozen core: block ranges read [num_frozen, num_basis)
+                            // of the full-C B_mo (only used on the block path).
+                            num_frozen);
 
     if (free_eri_for_op) tracked_cudaFree(d_eri_for_op);
     if (free_eri_mo)     tracked_cudaFree(d_eri_mo);
@@ -591,19 +599,25 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
                 eom_solve_gpus = 1;
                 std::cout << "[bt-PNO auto-solve EA] forced single-GPU grouped solve "
                           << "(GANSU_DLPNO_NATIVE_EOM_SOLVE1)" << std::endl;
-            } else if (forced == 0) {   // auto: device-0 footprint vs free memory
+            } else if (forced == 0) {   // auto: balanced-device footprint vs free memory
                 const size_t nv = static_cast<size_t>(nvir), no = static_cast<size_t>(nocc_active);
                 const size_t est = (nv*nv*nv*nv + 4*no*no*nv*nv) * sizeof(real_t)
                                  + static_cast<size_t>(2) * 1024 * 1024 * 1024;  // d_eri_vvvv + packs + 2 GB
-                int cur = 0; cudaGetDevice(&cur); cudaSetDevice(0);
-                size_t freeb = 0, totalb = 0; cudaMemGetInfo(&freeb, &totalb); cudaSetDevice(cur);
+                // Probe the device the native operator + Davidson will ACTUALLY run
+                // on, i.e. the current device — which is the Ship 13 native-balance
+                // target when balancing redirected (free GPU), else the caller's
+                // device. Probing GPU 0 unconditionally under-counts free memory on
+                // the balanced device and wrongly forces the (fragile, cross-device)
+                // multi-GPU slab solve when the operator fits on the balanced GPU.
+                int probe_dev = 0; cudaGetDevice(&probe_dev);
+                size_t freeb = 0, totalb = 0; cudaMemGetInfo(&freeb, &totalb);
                 if (est < static_cast<size_t>(freeb * 0.7)) {
                     eom_solve_gpus = 1;
-                    std::cout << "[bt-PNO auto-solve EA] operator fits on GPU 0 (est "
+                    std::cout << "[bt-PNO auto-solve EA] operator fits on GPU " << probe_dev << " (est "
                               << std::fixed << std::setprecision(1) << est / 1e9 << " GB < 0.7×free "
                               << freeb * 0.7 / 1e9 << " GB) → single-GPU grouped solve" << std::endl;
                 } else {
-                    std::cout << "[bt-PNO auto-solve EA] operator too large for GPU 0 (est "
+                    std::cout << "[bt-PNO auto-solve EA] operator too large for GPU " << probe_dev << " (est "
                               << std::fixed << std::setprecision(1) << est / 1e9
                               << " GB) → multi-GPU slab solve (" << eom_solve_gpus << " GPUs)" << std::endl;
                 }
@@ -797,8 +811,10 @@ void ERI_RI_RHF::compute_ea_eom_ccsd(int n_states) {
     // (no full nmo⁴). Single-GPU uses intermediate_matrix_B_; distributed-RI's
     // build_B_mo lazily replicates B to each GPU (~580 MB at anthracene scale).
     // build_B_mo returns nullptr when budget exceeded → fallback to full tensor.
+    // Frozen core: the block path reads the active window from the full-C B_mo
+    // via the operator's frozen_off shift, so it is NO LONGER gated on
+    // num_frozen==0 — avoids the nao⁴ MO-ERI tensor (OOM for ~tetracene+).
     const bool want_block = rhf_.use_dlpno_amplitudes()
-                            && rhf_.get_num_frozen_core() == 0
                             && gpu::gpu_available();
     const real_t* d_B_mo = want_block ? build_B_mo(d_C, num_basis) : nullptr;
     const bool block     = want_block && d_B_mo != nullptr;

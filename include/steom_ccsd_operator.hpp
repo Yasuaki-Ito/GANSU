@@ -118,7 +118,12 @@ public:
                       // all 11 dressed intermediates from the cache (published by
                       // IP+EA) and SKIP build_dressed_intermediates entirely. The
                       // dtor then skips freeing the 11 (the driver owns them).
-                      SteomBarHCache* barh_cache = nullptr);
+                      SteomBarHCache* barh_cache = nullptr,
+                      // Frozen core: MO-index offset (= num_frozen) added to every
+                      // on-the-fly mo_eri_block_into range so the active blocks are
+                      // read from the full-C B_mo at columns [num_frozen, num_basis).
+                      // 0 ⇒ no frozen core (byte-identical).
+                      int frozen_off = 0);
 
     ~STEOMCCSDOperator();
 
@@ -277,6 +282,7 @@ private:
     const ERI_RI* eri_block_src_ = nullptr;
     const real_t* d_B_mo_blocks_ = nullptr;
     int nmo_full_ = 0;
+    int frozen_off_ = 0;   // frozen-core MO offset for block ranges (0 = none)
     void extract_eri_blocks(const real_t* d_eri_mo);
     void build_dressed_intermediates();
 
