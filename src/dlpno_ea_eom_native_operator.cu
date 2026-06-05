@@ -1251,7 +1251,26 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
                         cpy(&w.d_t2_Jlmo, d_t2_Jlmo_, oovv_len);
                     }
                     cpy(&w.d_Lvv, d_Lvv_, nv2);
-                    cpy(&w.d_Wvvvo_r1, d_Wvvvo_r1_, wvvvo_len);
+                    // 5l: Wvvvo_r1 slab-only in slab mode. Layout [j,a,b,c], j OUTERMOST
+                    // (stride nvir³) → the device's output-occ j-slab is one CONTIGUOUS
+                    // block [occ_begin·nvir³, occ_end·nvir³) → a single peer copy (no
+                    // per-row strided gather). The sole reader add_tr1_gpu indexes block
+                    // j at (j - wvvvo_r1_j_base_)·nvir³. else full. (7×1 GB → 7×slab.)
+                    if (use_gpu_multi_slab_ && occ_end_[d] > occ_begin_[d]) {
+                        const int jb = occ_begin_[d], jext = occ_end_[d] - occ_begin_[d];
+                        w.wvvvo_r1_j_base = jb;
+                        const size_t nv3 = static_cast<size_t>(nvir_) * nvir_ * nvir_;
+                        const size_t slab_sz = static_cast<size_t>(jext) * nv3;
+                        if (slab_sz && d_Wvvvo_r1_) {
+                            tracked_cudaMalloc(&w.d_Wvvvo_r1, slab_sz * sizeof(real_t));
+                            cudaMemcpyPeer(w.d_Wvvvo_r1, d,
+                                           d_Wvvvo_r1_ + static_cast<size_t>(jb) * nv3, 0,
+                                           slab_sz * sizeof(real_t));
+                        }
+                    } else {
+                        w.wvvvo_r1_j_base = 0;
+                        cpy(&w.d_Wvvvo_r1, d_Wvvvo_r1_, wvvvo_len);
+                    }
                 }
             }
         }
@@ -2412,8 +2431,9 @@ void DLPNOEAEOMNativeOperator::add_tr1_gpu(const std::vector<real_t>& r1) const 
     for (int j = j_lo; j < j_hi; ++j) {
         if (packing_.n_pno_ii[j] == 0) continue;
         // M_j row-major [nvir²×nvir] → col-major [nvir×nvir²] lda=nvir; op_T → M_j·r1.
+        // 5l: d_Wvvvo_r1_ may be a j-slab (multi-GPU) → index block at (j - base)·nvir³.
         cublasDgemv(cublas, CUBLAS_OP_T, nv, nv * nv, &one,
-                    d_Wvvvo_r1_ + static_cast<size_t>(j) * nv * nv * nv, nv,
+                    d_Wvvvo_r1_ + static_cast<size_t>(j - wvvvo_r1_j_base_) * nv * nv * nv, nv,
                     r1src, 1, &one,
                     d_acc_all_ + static_cast<size_t>(j) * nv * nv, 1);
     }
@@ -2507,6 +2527,7 @@ void DLPNOEAEOMNativeOperator::bind_device(int d) const {
     t2_jlmo_j_base_      = w.t2_jlmo_j_base;
     s->d_Lvv_            = w.d_Lvv;
     s->d_Wvvvo_r1_       = w.d_Wvvvo_r1;
+    wvvvo_r1_j_base_     = w.wvvvo_r1_j_base;     // 5l: slab-only Wvvvo_r1 j base
 #else
     (void)d;
 #endif

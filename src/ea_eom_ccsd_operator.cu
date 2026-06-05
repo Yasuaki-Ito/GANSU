@@ -434,6 +434,123 @@ __global__ void ea_wvvvo_scatter_kernel(
     }
 }
 
+// ---- ct_ovov / ct_ovvo GEMM-input builders (mirror of the validated IP-EOM
+//      increment 5) — fill dA/dB/dA1/dB1/dA2/dB2 on device from the resident
+//      d_eri_ovov_ / d_t2_, eliminating the 6×(NO·NV)² host arrays + ~1.35 GB H2D
+//      (host omp-fill + memcpy was the build_dressed hotspot). EA ct_ovvo uses
+//      (j,b) in the (Y,X) slot ⇒ byte-identical to IP. Grid-stride, size_t safe.
+//   ovov[k,c,l,d] = ovov[((k*NV+c)*NO+l)*NV+d];  t2[i,j,c,d] = t2[((i*NO+j)*NV+c)*NV+d]
+__global__ void ea_ctovov_buildA(real_t* __restrict__ dA,
+                                 const real_t* __restrict__ ovov, int NO, int NV) {
+    // dA[(k,d),(c,l)] = ovov[k,c,l,d];  enumerate (k,d,c,l)
+    const size_t tot = (size_t)NO*NV*NV*NO, KOcl = (size_t)NV*NO;
+    for (size_t x = (size_t)blockIdx.x*blockDim.x + threadIdx.x; x < tot;
+         x += (size_t)gridDim.x*blockDim.x) {
+        const int l = x % NO; size_t t = x / NO;
+        const int c = t % NV; t /= NV;
+        const int d = t % NV; const int k = (int)(t / NV);
+        dA[((size_t)(k*NV+d))*KOcl + (c*NO+l)] = ovov[(((size_t)k*NV+c)*NO+l)*NV+d];
+    }
+}
+__global__ void ea_ctovov_buildB(real_t* __restrict__ dB,
+                                 const real_t* __restrict__ t2, int NO, int NV) {
+    // dB[(c,l),(i,b)] = t2[i,l,c,b];  enumerate (c,l,i,b)
+    const size_t tot = (size_t)NV*NO*NO*NV, NOib = (size_t)NO*NV;
+    for (size_t x = (size_t)blockIdx.x*blockDim.x + threadIdx.x; x < tot;
+         x += (size_t)gridDim.x*blockDim.x) {
+        const int b = x % NV; size_t t = x / NV;
+        const int i = t % NO; t /= NO;
+        const int l = t % NO; const int c = (int)(t / NO);
+        dB[((size_t)(c*NO+l))*NOib + (i*NV+b)] = t2[(((size_t)i*NO+l)*NV+c)*NV+b];
+    }
+}
+__global__ void ea_ctovvo_buildA12(real_t* __restrict__ dA1, real_t* __restrict__ dA2,
+                                   const real_t* __restrict__ ovov, int NO, int NV) {
+    // dA1[(k,c),(l,d)] = 2·ovov[k,c,l,d] − ovov[k,d,l,c];  dA2 = ovov[k,c,l,d];  enumerate (k,c,l,d)
+    const size_t tot = (size_t)NO*NV*NO*NV, Nld = (size_t)NO*NV;
+    for (size_t x = (size_t)blockIdx.x*blockDim.x + threadIdx.x; x < tot;
+         x += (size_t)gridDim.x*blockDim.x) {
+        const int d = x % NV; size_t t = x / NV;
+        const int l = t % NO; t /= NO;
+        const int c = t % NV; const int k = (int)(t / NV);
+        const real_t kcld = ovov[(((size_t)k*NV+c)*NO+l)*NV+d];
+        const real_t kdlc = ovov[(((size_t)k*NV+d)*NO+l)*NV+c];
+        const size_t o = ((size_t)(k*NV+c))*Nld + (l*NV+d);
+        dA1[o] = 2.0*kcld - kdlc;  dA2[o] = kcld;
+    }
+}
+__global__ void ea_ctovvo_buildB12(real_t* __restrict__ dB1, real_t* __restrict__ dB2,
+                                   const real_t* __restrict__ t2, int NO, int NV) {
+    // dB1[(l,d),(j,b)] = t2[j,l,b,d];  dB2 = t2[l,j,b,d];  enumerate (l,d,j,b)
+    const size_t tot = (size_t)NO*NV*NO*NV, Njb = (size_t)NO*NV;
+    for (size_t x = (size_t)blockIdx.x*blockDim.x + threadIdx.x; x < tot;
+         x += (size_t)gridDim.x*blockDim.x) {
+        const int b = x % NV; size_t t = x / NV;
+        const int j = t % NO; t /= NO;
+        const int d = t % NV; const int l = (int)(t / NV);
+        const size_t o = ((size_t)(l*NV+d))*Njb + (j*NV+b);
+        dB1[o] = t2[(((size_t)j*NO+l)*NV+b)*NV+d];
+        dB2[o] = t2[(((size_t)l*NO+j)*NV+b)*NV+d];
+    }
+}
+// [EA build device-build] cc_Foo / cc_Fvv GEMM-input builders — fill hA/hB on
+// device from d_eri_ovov_ / d_t2_ / d_t1_, eliminating the 4×(NO·NV)² host arrays
+// (~900 MB) + H2D (EA build "cc_Foo + cc_Fvv" 0.835 s). Each flat thread index
+// equals the output offset (layouts match the host repacks exactly).
+//   ovov[k,c,l,d]=ovov[((k*NV+c)*NO+l)*NV+d];  t2[i,j,c,d]=t2[((i*NO+j)*NV+c)*NV+d]
+__global__ void ea_ccfoo_buildA(real_t* __restrict__ dA,
+                                const real_t* __restrict__ ovov, int NO, int NV) {
+    // dA[k*Kf + (l*NV+c)*NV+d] = 2 ovov[k,c,l,d] − ovov[k,d,l,c];  enumerate (k,l,c,d)
+    const size_t tot = (size_t)NO*NO*NV*NV;
+    for (size_t x = (size_t)blockIdx.x*blockDim.x + threadIdx.x; x < tot;
+         x += (size_t)gridDim.x*blockDim.x) {
+        const int d = (int)(x % NV); size_t t = x / NV;
+        const int c = (int)(t % NV); t /= NV;
+        const int l = (int)(t % NO); const int k = (int)(t / NO);
+        const real_t kcld = ovov[(((size_t)k*NV+c)*NO+l)*NV+d];
+        const real_t kdlc = ovov[(((size_t)k*NV+d)*NO+l)*NV+c];
+        dA[x] = 2.0*kcld - kdlc;
+    }
+}
+__global__ void ea_ccfoo_buildB(real_t* __restrict__ dB, const real_t* __restrict__ t2,
+                                const real_t* __restrict__ t1, int NO, int NV) {
+    // dB[((l*NV+c)*NV+d)*NO + i] = t2[i,l,c,d] + t1[i,c]·t1[l,d];  enumerate (l,c,d,i)
+    const size_t tot = (size_t)NO*NV*NV*NO;
+    for (size_t y = (size_t)blockIdx.x*blockDim.x + threadIdx.x; y < tot;
+         y += (size_t)gridDim.x*blockDim.x) {
+        const int i = (int)(y % NO); size_t t = y / NO;
+        const int d = (int)(t % NV); t /= NV;
+        const int c = (int)(t % NV); const int l = (int)(t / NV);
+        dB[y] = t2[(((size_t)i*NO+l)*NV+c)*NV+d] + t1[(size_t)i*NV+c]*t1[(size_t)l*NV+d];
+    }
+}
+__global__ void ea_ccfvv_buildA(real_t* __restrict__ dA, const real_t* __restrict__ t2,
+                                const real_t* __restrict__ t1, int NO, int NV) {
+    // dA[a*Kv + (k*NO+l)*NV+d] = t2[k,l,a,d] + t1[k,a]·t1[l,d];  enumerate (a,k,l,d)
+    const size_t tot = (size_t)NV*NO*NO*NV;
+    for (size_t x = (size_t)blockIdx.x*blockDim.x + threadIdx.x; x < tot;
+         x += (size_t)gridDim.x*blockDim.x) {
+        const int d = (int)(x % NV); size_t t = x / NV;
+        const int l = (int)(t % NO); t /= NO;
+        const int k = (int)(t % NO); const int a = (int)(t / NO);
+        dA[x] = t2[(((size_t)k*NO+l)*NV+a)*NV+d] + t1[(size_t)k*NV+a]*t1[(size_t)l*NV+d];
+    }
+}
+__global__ void ea_ccfvv_buildB(real_t* __restrict__ dB,
+                                const real_t* __restrict__ ovov, int NO, int NV) {
+    // dB[((k*NO+l)*NV+d)*NV + c] = 2 ovov[k,c,l,d] − ovov[k,d,l,c];  enumerate (k,l,d,c)
+    const size_t tot = (size_t)NO*NO*NV*NV;
+    for (size_t y = (size_t)blockIdx.x*blockDim.x + threadIdx.x; y < tot;
+         y += (size_t)gridDim.x*blockDim.x) {
+        const int c = (int)(y % NV); size_t t = y / NV;
+        const int d = (int)(t % NV); t /= NV;
+        const int l = (int)(t % NO); const int k = (int)(t / NO);
+        const real_t kcld = ovov[(((size_t)k*NV+c)*NO+l)*NV+d];
+        const real_t kdlc = ovov[(((size_t)k*NV+d)*NO+l)*NV+c];
+        dB[y] = 2.0*kcld - kdlc;
+    }
+}
+
 // ---- canonical-skip wvvvo_w_t1 device-resident scatter (Term A/B/C/D) ----
 // Accumulate coeff·src into wt1[a,b,c,j] (= ((a*NV+b)*NV+c)*NO+j), reading the
 // per-term GEMM result still resident on the device.  Eliminates the 4× D2H of
@@ -1086,8 +1203,18 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     // Slab mode enforces canonical_skip_wvvvv_=true and uses the Term A slab
     // GEMM directly off device, so h_vvvv stays empty.  Saves NV⁴·8B host RAM
     // (Pentacene: 91 GB host alloc avoided).
+    // h_vvvv (host NV⁴ = 4.7 GB at naphthalene) is read ONLY by: the canonical-skip
+    // OFF Wvvvv build (line ~1807, gated by !canonical_skip_wvvvv_), the VALIDATE
+    // self-check (line ~1952), and the CPU fallback. Under canonical-skip ON + GPU
+    // + non-validate the wvvvo_w_t1 Term A reads d_eri_vvvv_ straight off the device
+    // (line ~1927), so h_vvvv is never touched — skip its 4.7 GB host alloc + D2H
+    // entirely (EA build_dressed "host alloc + D2H inputs" 4.6→~0.6 s at naphthalene).
+    const bool need_h_vvvv = (eri_vvvv_nslab_ <= 1) &&
+        (!canonical_skip_wvvvv_
+         || std::getenv("GANSU_STEOM_BUILD_VALIDATE") != nullptr
+         || !gpu::gpu_available());
     std::vector<real_t> h_vvvv;
-    if (eri_vvvv_nslab_ <= 1) h_vvvv.assign(vvvv_sz, 0.0);
+    if (need_h_vvvv) h_vvvv.assign(vvvv_sz, 0.0);
 
     cudaMemcpy(h_t1.data(),   d_t1_,        t1_sz   * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_t2.data(),   d_t2_,        t2_sz   * sizeof(real_t), cudaMemcpyDeviceToHost);
@@ -1096,7 +1223,7 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     cudaMemcpy(h_oovv.data(), d_eri_oovv_,  oovv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_ovvo.data(), d_eri_ovvo_,  ovvo_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_ovvv.data(), d_eri_ovvv_,  ovvv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
-    if (eri_vvvv_nslab_ <= 1)
+    if (need_h_vvvv)
         cudaMemcpy(h_vvvv.data(), d_eri_vvvv_,  vvvv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
 
     std::vector<real_t> h_f_oo(NO), h_f_vv(NV);
@@ -1142,27 +1269,13 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         const real_t one = 1.0, zero = 0.0;
         {   // ---- cc_Foo: row-major C[k,i] = Σ_q A_foo[k,q]·τ_oo[i,q], q=(l,c,d) ----
             const int Mf = NO, Nf = NO, Kf = NO * NV * NV;
-            std::vector<real_t> hA((size_t)Mf * Kf), hB((size_t)Kf * Nf);
-            #pragma omp parallel for collapse(2)
-            for (int k = 0; k < NO; ++k)
-                for (int l = 0; l < NO; ++l)
-                    for (int c = 0; c < NV; ++c)
-                        for (int d = 0; d < NV; ++d)
-                            hA[(size_t)k * Kf + ((size_t)(l*NV+c)*NV+d)] =
-                                2.0 * H_OVOV(k,c,l,d) - H_OVOV(k,d,l,c);
-            #pragma omp parallel for collapse(2)
-            for (int i = 0; i < NO; ++i)
-                for (int l = 0; l < NO; ++l)
-                    for (int c = 0; c < NV; ++c)
-                        for (int d = 0; d < NV; ++d)
-                            hB[((size_t)(l*NV+c)*NV+d) * Nf + i] =
-                                H_T2(i,l,c,d) + H_T1(i,c) * H_T1(l,d);
             real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
             tracked_cudaMalloc(&dA,(size_t)Mf*Kf*sizeof(real_t));
             tracked_cudaMalloc(&dB,(size_t)Kf*Nf*sizeof(real_t));
             tracked_cudaMalloc(&dC,(size_t)Mf*Nf*sizeof(real_t));
-            cudaMemcpy(dA,hA.data(),(size_t)Mf*Kf*sizeof(real_t),cudaMemcpyHostToDevice);
-            cudaMemcpy(dB,hB.data(),(size_t)Kf*Nf*sizeof(real_t),cudaMemcpyHostToDevice);
+            { const size_t n=(size_t)NO*NO*NV*NV; const unsigned NB=(unsigned)((n+255)/256);
+              ea_ccfoo_buildA<<<NB,256>>>(dA, d_eri_ovov_, NO, NV);
+              ea_ccfoo_buildB<<<NB,256>>>(dB, d_t2_, d_t1_, NO, NV); }
             cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,Nf,Mf,Kf,&one,dB,Nf,dA,Kf,&zero,dC,Nf);
             std::vector<real_t> hC((size_t)Mf*Nf);
             cudaMemcpy(hC.data(),dC,(size_t)Mf*Nf*sizeof(real_t),cudaMemcpyDeviceToHost);
@@ -1174,27 +1287,13 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         }
         {   // ---- cc_Fvv: row-major C[a,c] = Σ_q σ_vv[a,q]·B_vv[c,q], q=(k,l,d) ----
             const int Mv = NV, Nv = NV, Kv = NO * NO * NV;
-            std::vector<real_t> hA((size_t)Mv * Kv), hB((size_t)Kv * Nv);
-            #pragma omp parallel for collapse(2)
-            for (int a = 0; a < NV; ++a)
-                for (int k = 0; k < NO; ++k)
-                    for (int l = 0; l < NO; ++l)
-                        for (int d = 0; d < NV; ++d)
-                            hA[(size_t)a * Kv + ((size_t)(k*NO+l)*NV+d)] =
-                                H_T2(k,l,a,d) + H_T1(k,a) * H_T1(l,d);
-            #pragma omp parallel for collapse(2)
-            for (int c = 0; c < NV; ++c)
-                for (int k = 0; k < NO; ++k)
-                    for (int l = 0; l < NO; ++l)
-                        for (int d = 0; d < NV; ++d)
-                            hB[((size_t)(k*NO+l)*NV+d) * Nv + c] =
-                                2.0 * H_OVOV(k,c,l,d) - H_OVOV(k,d,l,c);
             real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
             tracked_cudaMalloc(&dA,(size_t)Mv*Kv*sizeof(real_t));
             tracked_cudaMalloc(&dB,(size_t)Kv*Nv*sizeof(real_t));
             tracked_cudaMalloc(&dC,(size_t)Mv*Nv*sizeof(real_t));
-            cudaMemcpy(dA,hA.data(),(size_t)Mv*Kv*sizeof(real_t),cudaMemcpyHostToDevice);
-            cudaMemcpy(dB,hB.data(),(size_t)Kv*Nv*sizeof(real_t),cudaMemcpyHostToDevice);
+            { const size_t n=(size_t)NV*NO*NO*NV; const unsigned NB=(unsigned)((n+255)/256);
+              ea_ccfvv_buildA<<<NB,256>>>(dA, d_t2_, d_t1_, NO, NV);
+              ea_ccfvv_buildB<<<NB,256>>>(dB, d_eri_ovov_, NO, NV); }
             cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,Nv,Mv,Kv,&one,dB,Nv,dA,Kv,&zero,dC,Nv);
             std::vector<real_t> hC((size_t)Mv*Nv);
             cudaMemcpy(hC.data(),dC,(size_t)Mv*Nv*sizeof(real_t),cudaMemcpyDeviceToHost);
@@ -1385,53 +1484,30 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     if (gpu::gpu_available()) {
         cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
         const real_t one = 1.0, negone = -1.0, zero = 0.0;
-        {   // ct_ovov
-            std::vector<real_t> hA((size_t)EA_MO_kd*EA_KO_cl), hB((size_t)EA_KO_cl*EA_NO_ib);
-            #pragma omp parallel for collapse(2)
-            for (int k=0;k<NO;++k) for (int d=0;d<NV;++d)
-                for (int c=0;c<NV;++c) for (int l=0;l<NO;++l)
-                    hA[(size_t)(k*NV+d)*EA_KO_cl+(c*NO+l)] = H_OVOV(k,c,l,d);
-            #pragma omp parallel for collapse(2)
-            for (int c=0;c<NV;++c) for (int l=0;l<NO;++l)
-                for (int i=0;i<NO;++i) for (int b=0;b<NV;++b)
-                    hB[(size_t)(c*NO+l)*EA_NO_ib+(i*NV+b)] = H_T2(i,l,c,b);
+        {   // ct_ovov: C[(k,d),(i,b)] = A[(k,d),(c,l)]·B[(c,l),(i,b)] — inputs device-built
             real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
             tracked_cudaMalloc(&dA,(size_t)EA_MO_kd*EA_KO_cl*sizeof(real_t));
             tracked_cudaMalloc(&dB,(size_t)EA_KO_cl*EA_NO_ib*sizeof(real_t));
             tracked_cudaMalloc(&dC,(size_t)EA_MO_kd*EA_NO_ib*sizeof(real_t));
-            cudaMemcpy(dA,hA.data(),(size_t)EA_MO_kd*EA_KO_cl*sizeof(real_t),cudaMemcpyHostToDevice);
-            cudaMemcpy(dB,hB.data(),(size_t)EA_KO_cl*EA_NO_ib*sizeof(real_t),cudaMemcpyHostToDevice);
+            const size_t nel=(size_t)NO*NV*NV*NO; const unsigned NB=(unsigned)((nel+255)/256);
+            ea_ctovov_buildA<<<NB,256>>>(dA, d_eri_ovov_, NO, NV);
+            ea_ctovov_buildB<<<NB,256>>>(dB, d_t2_, NO, NV);
             cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,EA_NO_ib,EA_MO_kd,EA_KO_cl,&one,
                         dB,EA_NO_ib,dA,EA_KO_cl,&zero,dC,EA_NO_ib);
             ct_ovov.assign((size_t)EA_MO_kd*EA_NO_ib,0.0);
             cudaMemcpy(ct_ovov.data(),dC,(size_t)EA_MO_kd*EA_NO_ib*sizeof(real_t),cudaMemcpyDeviceToHost);
             tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
         }
-        {   // ct_ovvo
-            std::vector<real_t> hA1((size_t)EA_M_kc*EA_K_ld), hB1((size_t)EA_K_ld*EA_N_jb),
-                                hA2((size_t)EA_M_kc*EA_K_ld), hB2((size_t)EA_K_ld*EA_N_jb);
-            #pragma omp parallel for collapse(2)
-            for (int k=0;k<NO;++k) for (int c=0;c<NV;++c)
-                for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) {
-                    const size_t o=(size_t)(k*NV+c)*EA_K_ld+(l*NV+d);
-                    hA1[o]=2.0*H_OVOV(k,c,l,d)-H_OVOV(k,d,l,c); hA2[o]=H_OVOV(k,c,l,d);
-                }
-            #pragma omp parallel for collapse(2)
-            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
-                for (int j=0;j<NO;++j) for (int b=0;b<NV;++b) {
-                    const size_t o=(size_t)(l*NV+d)*EA_N_jb+(j*NV+b);
-                    hB1[o]=H_T2(j,l,b,d); hB2[o]=H_T2(l,j,b,d);
-                }
+        {   // ct_ovvo: C[(k,c),(j,b)] = A1·B1 − A2·B2 — inputs device-built
             real_t *dA1=nullptr,*dB1=nullptr,*dA2=nullptr,*dB2=nullptr,*dC=nullptr;
             tracked_cudaMalloc(&dA1,(size_t)EA_M_kc*EA_K_ld*sizeof(real_t));
             tracked_cudaMalloc(&dB1,(size_t)EA_K_ld*EA_N_jb*sizeof(real_t));
             tracked_cudaMalloc(&dA2,(size_t)EA_M_kc*EA_K_ld*sizeof(real_t));
             tracked_cudaMalloc(&dB2,(size_t)EA_K_ld*EA_N_jb*sizeof(real_t));
             tracked_cudaMalloc(&dC, (size_t)EA_M_kc*EA_N_jb*sizeof(real_t));
-            cudaMemcpy(dA1,hA1.data(),(size_t)EA_M_kc*EA_K_ld*sizeof(real_t),cudaMemcpyHostToDevice);
-            cudaMemcpy(dB1,hB1.data(),(size_t)EA_K_ld*EA_N_jb*sizeof(real_t),cudaMemcpyHostToDevice);
-            cudaMemcpy(dA2,hA2.data(),(size_t)EA_M_kc*EA_K_ld*sizeof(real_t),cudaMemcpyHostToDevice);
-            cudaMemcpy(dB2,hB2.data(),(size_t)EA_K_ld*EA_N_jb*sizeof(real_t),cudaMemcpyHostToDevice);
+            const size_t nel=(size_t)NO*NV*NO*NV; const unsigned NB=(unsigned)((nel+255)/256);
+            ea_ctovvo_buildA12<<<NB,256>>>(dA1, dA2, d_eri_ovov_, NO, NV);
+            ea_ctovvo_buildB12<<<NB,256>>>(dB1, dB2, d_t2_, NO, NV);
             cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,EA_N_jb,EA_M_kc,EA_K_ld,&one,
                         dB1,EA_N_jb,dA1,EA_K_ld,&zero,dC,EA_N_jb);
             cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,EA_N_jb,EA_M_kc,EA_K_ld,&negone,

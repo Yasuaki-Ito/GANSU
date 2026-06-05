@@ -178,6 +178,7 @@ private:
         int     t2_jlmo_j_base    = 0; ///< 5i: j-dim base of the d_t2_Jlmo slice (0 full, occ_begin slab)
         int     wovov_j_extent    = 0; ///< 5j: j-dim extent of the d_Wovov_lmo slice (nocc full, slab) → GEMM ldB = extent·nvir
         int     wovov_j_base      = 0; ///< 5j: j-dim base of the d_Wovov_lmo slice (0 full, occ_begin slab)
+        int     wvvvo_r1_j_base   = 0; ///< 5l: j (outermost) base of the d_Wvvvo_r1 slab (0 full, occ_begin slab)
     };
     std::vector<DeviceWorkspace> ws_;  ///< size = #devices used (ws_[0] aliases device 0)
     std::vector<int> occ_begin_;       ///< [#dev] output-occ slab start per device
@@ -220,6 +221,11 @@ private:
     // extent = nocc / base = 0 on device 0 / full / single-GPU (→ ldB = nocc·nvir, original).
     mutable int wovov_j_extent_ = 0;
     mutable int wovov_j_base_   = 0;
+    // 5l: d_Wvvvo_r1 (layout [j,a,b,c], j OUTERMOST stride nvir³) is sliced on d>0 in slab
+    // mode to the device's output-occ j-slab — a single contiguous peer copy. The sole reader
+    // (add_tr1_gpu) indexes block j at (j - wvvvo_r1_j_base_)·nvir³. base = 0 on device 0 /
+    // full / single-GPU (→ the original j·nvir³). Set per device in bind_device.
+    mutable int wvvvo_r1_j_base_ = 0;
     /// Stage 5c: point the (const_cast) σ2 members at device d's workspace buffers +
     /// cublas handle (NULL stream); bind_device(0) restores the device-0 members.
     void bind_device(int d) const;

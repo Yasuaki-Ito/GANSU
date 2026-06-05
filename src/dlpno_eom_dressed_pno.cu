@@ -891,22 +891,22 @@ void build_dressed_pno_ea_vvvv_ring(DressedPnoEA& io,
         // native_ring[a',b',c',d'] = Σ_{k,l} V[k,l,c',d'] · t2_proj[k,l][a',b'].
         const auto t0_vt = std::chrono::high_resolution_clock::now();
         std::vector<real_t> nat(static_cast<size_t>(n) * n * n * n, 0.0);
-        for (int k = 0; k < nocc; ++k)
-            for (int l = 0; l < nocc; ++l) {
-                const RowMatXd& T = t2kl[static_cast<size_t>(k) * nocc + l];
-                const size_t vbase = (static_cast<size_t>(k) * nocc + l) * n * n;  // V[k,l,·,·]
-                #pragma omp parallel for num_threads(dlpno_eom_ring_omp_cap())
-                for (int ap = 0; ap < n; ++ap)
-                    for (int bp = 0; bp < n; ++bp) {
-                        const real_t Tab = T(ap, bp);
-                        if (Tab == 0.0) continue;
-                        real_t* row = nat.data() + (((static_cast<size_t>(ap) * n + bp) * n) * n);
-                        for (int cp = 0; cp < n; ++cp)
-                            for (int dp = 0; dp < n; ++dp)
-                                row[static_cast<size_t>(cp) * n + dp] +=
-                                    Tab * V[vbase + static_cast<size_t>(cp) * n + dp];
-                    }
-            }
+        // F2a: native_ring[(a',b'),(c',d')] = Σ_{k,l} t2kl[k,l][a',b'] · V[k,l][c',d']
+        //   = Tmatᵀ · Vmat with Tmat,Vmat = [nocc²×n²] (V is already in that layout;
+        //   Tmat = the flattened t2kl stack). One Eigen BLAS3 GEMM replaces the naive
+        //   O(nocc²·n⁴) host triple-loop — the EA Wvvvv ring V·T hotspot (IP F2a
+        //   mirror). Bit-identical up to GEMM reduction order (FP64 ~1e-13).
+        {
+            const int n2 = n * n, nkl = nocc * nocc;
+            RowMatXd Tmat(nkl, n2);
+            for (int kl = 0; kl < nkl; ++kl)
+                std::copy(t2kl[static_cast<size_t>(kl)].data(),
+                          t2kl[static_cast<size_t>(kl)].data() + n2,
+                          Tmat.data() + static_cast<size_t>(kl) * n2);
+            Eigen::Map<const RowMatXd> Vmat(V.data(), nkl, n2);
+            Eigen::Map<RowMatXd> natM(nat.data(), n2, n2);
+            natM.noalias() = Tmat.transpose() * Vmat;
+        }
         vt_ms += std::chrono::duration<double, std::milli>(
                      std::chrono::high_resolution_clock::now() - t0_vt).count();
 

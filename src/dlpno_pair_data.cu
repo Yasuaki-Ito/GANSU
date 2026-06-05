@@ -339,6 +339,42 @@ LMP2Status iterate_lmp2(
 #endif
     }
 
+    // [picache-gather] Build the per-pair list of pi_cache columns the LMP2
+    // residual actually reads: kl ∈ {(k,j): k≠i} ∪ {(i,l): l≠j}. That is only
+    // ~2·nocc of the N_pair columns, so D2H'ing/scattering ONLY these (vs the
+    // full column sweep) cuts the rebuild's dominant D2H (~76% of picache on
+    // the critical-path device) by ~6×. Iter-invariant — depends only on pair
+    // structure, not Y_old. Default ON (opt out with
+    // GANSU_DLPNO_LMP2_PICACHE_GATHER=0); bit-exact (same projection blocks,
+    // fewer transferred; host residual unchanged) — VALIDATED on naphthalene
+    // A100×8: dev0 picache D2H 1.279→0.162 s (7.9×), MP2 iterate 8.3→3.1 s,
+    // corr/IP0/EA0 bit-identical.
+    const bool picache_gather = []() {
+        const char* e = std::getenv("GANSU_DLPNO_LMP2_PICACHE_GATHER");
+        return !e || e[0] != '0';
+    }();
+    std::vector<std::vector<int>> needed_ikl_per_pair;
+    if (picache_gather) {
+        needed_ikl_per_pair.resize(pairs.size());
+        for (size_t idx = 0; idx < pairs.size(); ++idx) {
+            if (pairs[idx].n_pno == 0) continue;
+            const int i = setups[idx].i, j = setups[idx].j;
+            std::vector<int>& nb = needed_ikl_per_pair[idx];
+            for (int k = 0; k < nocc; ++k) {           // i-coupling: (k, j)
+                if (k == i) continue;
+                const int idx_kj = pair_lookup[static_cast<size_t>(k) * nocc + j];
+                if (idx_kj >= 0 && pairs[idx_kj].n_pno > 0) nb.push_back(idx_kj);
+            }
+            for (int l = 0; l < nocc; ++l) {           // j-coupling: (i, l)
+                if (l == j) continue;
+                const int idx_il = pair_lookup[static_cast<size_t>(i) * nocc + l];
+                if (idx_il >= 0 && pairs[idx_il].n_pno > 0) nb.push_back(idx_il);
+            }
+            std::sort(nb.begin(), nb.end());
+            nb.erase(std::unique(nb.begin(), nb.end()), nb.end());
+        }
+    }
+
     for (int iter = 0; iter < max_iter; ++iter) {
         for (size_t idx = 0; idx < pairs.size(); ++idx) {
             Y_old[idx] = pairs[idx].Y;
@@ -358,11 +394,19 @@ LMP2Status iterate_lmp2(
                     const int d = 0;
 #endif
                     MultiGpuManager::DeviceGuard guard(d);
-                    pgpus[d]->rebuild(Y_old, pi_cache);
+                    if (picache_gather)
+                        pgpus[d]->rebuild_needed(Y_old, pi_cache,
+                                                 needed_ikl_per_pair);
+                    else
+                        pgpus[d]->rebuild(Y_old, pi_cache);
                 }
 #endif
             } else {
-                pgpus[0]->rebuild(Y_old, pi_cache);
+                if (picache_gather)
+                    pgpus[0]->rebuild_needed(Y_old, pi_cache,
+                                             needed_ikl_per_pair);
+                else
+                    pgpus[0]->rebuild(Y_old, pi_cache);
             }
             dt_picache += std::chrono::duration<double>(
                 prof_clock::now() - t_pi0).count();

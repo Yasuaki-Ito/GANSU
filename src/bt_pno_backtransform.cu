@@ -60,6 +60,12 @@ BTAmplitudes bt_pno_to_canonical(
     // ----------------------------------------------------------------------
     std::vector<real_t> T2_lmo(t2size, 0.0);
     const int n_pairs = static_cast<int>(res.pairs.size());
+    // Each stored pair idx maps to a unique (i,j) with i≤j and writes only its
+    // own [i,j] and [j,i] blocks of T2_lmo, so the writes are disjoint across
+    // pairs → safe to parallelise. Per-pair Eigen temporaries are thread-local
+    // (declared inside the loop body). The GEMMs are small (nvir × n_pno) so
+    // Eigen will not spawn nested threads. Matches the rebuild_cpu_ idiom.
+    #pragma omp parallel for schedule(dynamic, 4)
     for (int idx = 0; idx < n_pairs; ++idx) {
         const PairData& pd = res.pairs[idx];
         const int n_pno = pd.n_pno;
@@ -104,19 +110,30 @@ BTAmplitudes bt_pno_to_canonical(
     if (uloc_is_identity) {
         out.T2 = std::move(T2_lmo);
     } else {
+        // Occupied LMO → canonical rotation, factored as two GEMMs. This is
+        // the SAME contraction (and the same left-to-right reduction order)
+        // as the per-(a,b)  C_ab = Uloc · M_ab · Ulocᵀ  form, so it is
+        // bit-exact — but with contiguous memory access and parallelism
+        // instead of the cache-hostile stride-vv gather/scatter that made
+        // this the single largest item in the stage-1 timeline (~5.6 s).
+        //   Step A:  tmp[I,(j,a,b)] = Σ_i  Uloc[I,i] · T2_lmo[i,(j,a,b)]
+        //   Step B:  out[I,J,(a,b)] = Σ_j  Uloc[J,j] · tmp [I,(j,a,b)]   (∀ I)
         Eigen::Map<const RowMatXd> Uloc(U_loc.data(), nocc, nocc);  // U[I,i]
-        RowMatXd M_ab(nocc, nocc), C_ab(nocc, nocc);
-        for (int a = 0; a < nvir; ++a) {
-            for (int b = 0; b < nvir; ++b) {
-                const size_t off = static_cast<size_t>(a) * nvir + b;
-                for (int i = 0; i < nocc; ++i)
-                    for (int jj = 0; jj < nocc; ++jj)
-                        M_ab(i, jj) = T2_lmo[(static_cast<size_t>(i) * nocc + jj) * vv + off];
-                C_ab.noalias() = Uloc * M_ab * Uloc.transpose();
-                for (int I = 0; I < nocc; ++I)
-                    for (int J = 0; J < nocc; ++J)
-                        out.T2[(static_cast<size_t>(I) * nocc + J) * vv + off] = C_ab(I, J);
-            }
+        const Eigen::Index ncol = static_cast<Eigen::Index>(nocc) * vv;
+        std::vector<real_t> tmp(t2size);
+        Eigen::Map<const RowMatXd> T2lmo_mat(T2_lmo.data(), nocc, ncol);
+        Eigen::Map<RowMatXd>       tmp_mat(tmp.data(), nocc, ncol);
+        tmp_mat.noalias() = Uloc * T2lmo_mat;            // Step A (one GEMM)
+
+        #pragma omp parallel for schedule(static)
+        for (int I = 0; I < nocc; ++I) {                 // Step B (per-I GEMM)
+            Eigen::Map<const RowMatXd> tmp_I(
+                tmp.data() + static_cast<size_t>(I) * nocc * vv,
+                nocc, static_cast<Eigen::Index>(vv));
+            Eigen::Map<RowMatXd> out_I(
+                out.T2.data() + static_cast<size_t>(I) * nocc * vv,
+                nocc, static_cast<Eigen::Index>(vv));
+            out_I.noalias() = Uloc * tmp_I;
         }
     }
 

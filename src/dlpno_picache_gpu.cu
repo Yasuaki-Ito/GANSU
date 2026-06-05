@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -150,6 +151,30 @@ struct PiCacheGpu::Impl {
     // Borrowed cuBLAS handle (thread_local from GPUHandle).
     cublasHandle_t cublas = nullptr;
 
+    // [picache-PROF] per-iter rebuild() sub-phase accumulators (seconds),
+    // dumped per-device in the dtor when GANSU_DLPNO_PICACHE_PROF=1. Splits
+    // the MP2 rebuild() cost into pack_Y(+H2D) / tile GEMM / D2H / host
+    // scatter so the next optimization targets the real dominant sub-phase.
+    double t_packY = 0.0, t_gemm = 0.0, t_d2h = 0.0, t_scatter = 0.0;
+    int    n_rebuild = 0;
+
+    // [picache-gather] rebuild_needed() device map + compact buffers. Built
+    // lazily on the first rebuild_needed() call (iter-invariant), reused
+    // across iters. Indexed by ACTIVE i_ij position ai (0..N_act_ij-1):
+    //   d_needed_ak[ai*max_needed + n] = active-kl position of the n-th needed
+    //       column for active-ij ai (valid for n < needed_count[ai]).
+    //   d_needed_count[ai]             = number of needed columns for ai.
+    //   needed_ikl_host[ai][n]         = original i_kl (host, for the scatter).
+    // d_pi_needed/h_pi_needed hold the gathered (tile_rows × max_needed)
+    // max_n² blocks per tile.
+    bool     needed_built  = false;
+    int      max_needed    = 0;
+    int*     d_needed_ak    = nullptr;   // [N_act_ij · max_needed]
+    int*     d_needed_count = nullptr;   // [N_act_ij]
+    real_t*  d_pi_needed    = nullptr;   // [tile_size · max_needed · max_n²]
+    real_t*  h_pi_needed    = nullptr;   // pinned mirror of d_pi_needed
+    std::vector<std::vector<int>> needed_ikl_host;  // [N_act_ij][count]
+
     void free_all() {
         if (d_barS_pad)    cudaFree(d_barS_pad);
         if (d_Y_pad)       cudaFree(d_Y_pad);
@@ -167,6 +192,10 @@ struct PiCacheGpu::Impl {
         if (d_active_ij_pos) cudaFree(d_active_ij_pos);
         if (d_active_kl_pos) cudaFree(d_active_kl_pos);
         if (d_active_i_kl)   cudaFree(d_active_i_kl);
+        if (d_needed_ak)     cudaFree(d_needed_ak);
+        if (d_needed_count)  cudaFree(d_needed_count);
+        if (d_pi_needed)     cudaFree(d_pi_needed);
+        if (h_pi_needed)     cudaFreeHost(h_pi_needed);
         d_barS_pad = d_Y_pad = d_Y_pad_T = d_half_pad = d_pi_pad = nullptr;
         h_Y_pad = h_pi_pad = nullptr;
         d_pair_lookup = d_setup_i = d_n_pno = nullptr;
@@ -175,6 +204,9 @@ struct PiCacheGpu::Impl {
         h_pi_T_stack = nullptr;
         d_active_ij_pos = d_active_kl_pos = nullptr;
         d_active_i_kl = nullptr;
+        d_needed_ak = d_needed_count = nullptr;
+        d_pi_needed = nullptr;
+        h_pi_needed = nullptr;
     }
 };
 
@@ -290,6 +322,40 @@ __global__ void pack_pi_T_stack_kernel(
             *dst = v;
         }
     }
+}
+
+// [picache-gather] Compact the needed columns of the tile's d_pi_pad into
+// d_pi_needed so only ~2·nocc columns/row are D2H'd (vs N_act_kl). Each block
+// copies one (ai_in_tile, n) max_n² padded projection block verbatim — the
+// orientation/transpose stays in the host residual, so this is a pure byte
+// copy and is bit-exact w.r.t. the full rebuild() scatter.
+//   src: d_pi_pad   [(ai_in_tile·N_act_kl + ak)         · max_n²]
+//   dst: d_pi_needed[(ai_in_tile·max_needed + n)        · max_n²]
+// where ak = d_needed_ak[ai·max_needed + n], ai = ai_in_tile + tile_start.
+// Threads with n >= d_needed_count[ai] do nothing (those dst slots are never
+// read by the host scatter).
+__global__ void gather_needed_kernel(
+    const real_t* __restrict__ d_pi_pad,
+    real_t*       __restrict__ d_pi_needed,
+    const int*    __restrict__ d_needed_ak,
+    const int*    __restrict__ d_needed_count,
+    int tile_start, int tile_rows, int max_needed,
+    long long stride_pair /* = max_n² */, int N_act_kl)
+{
+    const int slot = blockIdx.x;                 // = ai_in_tile · max_needed + n
+    const int ai_in_tile = slot / max_needed;
+    const int n          = slot % max_needed;
+    if (ai_in_tile >= tile_rows) return;
+    const int ai = ai_in_tile + tile_start;
+    if (n >= d_needed_count[ai]) return;
+    const int ak = d_needed_ak[static_cast<size_t>(ai) * max_needed + n];
+    if (ak < 0) return;
+
+    const real_t* src = d_pi_pad
+        + (static_cast<size_t>(ai_in_tile) * N_act_kl + ak) * stride_pair;
+    real_t* dst = d_pi_needed + static_cast<size_t>(slot) * stride_pair;
+    for (long long e = threadIdx.x; e < stride_pair; e += blockDim.x)
+        dst[e] = src[e];
 }
 
 #else  // GANSU_CPU_ONLY
@@ -852,6 +918,23 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
 PiCacheGpu::~PiCacheGpu() {
 #ifndef GANSU_CPU_ONLY
     if (p_) {
+        // [picache-PROF] dump the per-iter rebuild() sub-phase split (env
+        // GANSU_DLPNO_PICACHE_PROF=1). Per-device line; sum over the slab's
+        // n_rebuild calls. Tells us whether the MP2 picache cost is pack_Y,
+        // tile GEMM, D2H, or host scatter before targeting an optimization.
+        if (p_->n_rebuild > 0) {
+            const char* e = std::getenv("GANSU_DLPNO_PICACHE_PROF");
+            if (e && e[0] == '1') {
+                std::printf("[picache-PROF dev=%d] rebuild calls=%d  "
+                            "pack_Y=%.3fs  tile_GEMM=%.3fs  D2H=%.3fs  "
+                            "scatter=%.3fs  (slab [%d,%d) N_act_ij=%d "
+                            "N_act_kl=%d)\n",
+                            device_id_, p_->n_rebuild, p_->t_packY,
+                            p_->t_gemm, p_->t_d2h, p_->t_scatter,
+                            pair_begin_, pair_end_, N_act_ij_, N_act_kl_);
+                std::fflush(stdout);
+            }
+        }
         // Free buffers on the device that allocated them.
         MultiGpuManager::DeviceGuard _guard(device_id_);
         p_->free_all();
@@ -959,7 +1042,23 @@ void PiCacheGpu::rebuild(const std::vector<std::vector<real_t>>& Y_old,
                     "cudaMallocHost h_pi_pad (tile, Step Z)");
     }
 
+    // [picache-PROF] sub-phase split (env GANSU_DLPNO_PICACHE_PROF=1). When on,
+    // each timed phase is bracketed by a cudaDeviceSynchronize so async GPU
+    // work is attributed to the right phase; off ⇒ zero cost (no syncs added).
+    static const bool picache_prof = []() {
+        const char* e = std::getenv("GANSU_DLPNO_PICACHE_PROF");
+        return e && e[0] == '1';
+    }();
+    std::chrono::steady_clock::time_point pc_t0;
+    if (picache_prof) ++s.n_rebuild;
+
+    if (picache_prof) pc_t0 = std::chrono::steady_clock::now();
     pack_Y_and_transpose_(Y_old);
+    if (picache_prof) {
+        cudaDeviceSynchronize();
+        s.t_packY += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pc_t0).count();
+    }
 
     // Pre-resize pi_cache_out for inactive pairs (zero-size, so downstream
     // consumers handle "no contribution"). Only ROWS in our slab; peer
@@ -977,19 +1076,29 @@ void PiCacheGpu::rebuild(const std::vector<std::vector<real_t>>& Y_old,
              tile_start += tile_size_) {
         const int tile_end = std::min(tile_start + tile_size_, N_act_ij_);
         const int tile_rows = tile_end - tile_start;
+        if (picache_prof) pc_t0 = std::chrono::steady_clock::now();
         compute_pi_tile_(tile_start, tile_end);
+        if (picache_prof) {
+            cudaDeviceSynchronize();
+            s.t_gemm += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - pc_t0).count();
+        }
 
         // D2H only this tile's worth.
         const size_t bytes_this_tile =
             static_cast<size_t>(tile_rows) * N_act_kl_
             * static_cast<size_t>(max_n) * max_n * sizeof(real_t);
+        if (picache_prof) pc_t0 = std::chrono::steady_clock::now();
         check_cuda_(cudaMemcpy(s.h_pi_pad, s.d_pi_pad,
                                bytes_this_tile, cudaMemcpyDeviceToHost),
                     "D2H d_pi_pad (tile, Step Z)");
+        if (picache_prof) s.t_d2h += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pc_t0).count();
 
         // Host scatter: per active (ai_in_tile, ak) → pi_cache_out[i_ij][i_kl].
         // pi block shape is (n_ij × n_ij) — n_kl only appears in the
         // intermediate compute, not the output.
+        if (picache_prof) pc_t0 = std::chrono::steady_clock::now();
         #pragma omp parallel for schedule(static)
         for (int ai_in_tile = 0; ai_in_tile < tile_rows; ++ai_in_tile) {
             const int ai = ai_in_tile + tile_start;
@@ -1018,8 +1127,171 @@ void PiCacheGpu::rebuild(const std::vector<std::vector<real_t>>& Y_old,
                 }
             }
         }
+        if (picache_prof) s.t_scatter += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pc_t0).count();
     }
 #endif // !GANSU_CPU_ONLY
+}
+
+// ---------------------------------------------------------------------------
+//  rebuild_needed — LMP2 needed-column variant of rebuild(). Same GEMM into
+//  the tile's d_pi_pad, but a device gather kernel compacts only the columns
+//  the residual reads ((k,j)/(i,l) per i_ij) before a (~6× smaller) D2H and a
+//  needed-only host scatter. Bit-exact w.r.t. rebuild() for consumed entries.
+// ---------------------------------------------------------------------------
+void PiCacheGpu::rebuild_needed(
+    const std::vector<std::vector<real_t>>& Y_old,
+    std::vector<std::vector<RowMatXd>>& pi_cache_out,
+    const std::vector<std::vector<int>>& needed_ikl_per_pair)
+{
+    // CPU fallback / inactive GPU: full rebuild (correct; no D2H saving).
+    if (!active_) {
+        rebuild_cpu_(Y_old, pi_cache_out);
+        return;
+    }
+#ifdef GANSU_CPU_ONLY
+    rebuild_cpu_(Y_old, pi_cache_out);
+#else
+    MultiGpuManager::DeviceGuard _guard(device_id_);
+    Impl& s = *p_;
+    const int max_n = max_n_;
+    const long long stride_pair = s.stride_pair;   // max_n²
+
+    // --- one-time build of the device needed-column map (iter-invariant) ---
+    if (!s.needed_built) {
+        s.needed_ikl_host.assign(N_act_ij_, {});
+        int max_needed = 0;
+        for (int ai = 0; ai < N_act_ij_; ++ai) {
+            const int i_ij = active_i_ij_[ai];
+            std::vector<int>& dst = s.needed_ikl_host[ai];
+            if (i_ij >= 0 && i_ij < static_cast<int>(needed_ikl_per_pair.size())) {
+                for (int i_kl : needed_ikl_per_pair[i_ij]) {
+                    if (i_kl >= 0 && i_kl < N_pair_ && active_kl_pos_[i_kl] >= 0)
+                        dst.push_back(i_kl);
+                }
+            }
+            if (static_cast<int>(dst.size()) > max_needed)
+                max_needed = static_cast<int>(dst.size());
+        }
+        s.max_needed = std::max(1, max_needed);
+
+        std::vector<int> h_ak(static_cast<size_t>(N_act_ij_) * s.max_needed, -1);
+        std::vector<int> h_cnt(std::max(1, N_act_ij_), 0);
+        for (int ai = 0; ai < N_act_ij_; ++ai) {
+            const std::vector<int>& dst = s.needed_ikl_host[ai];
+            h_cnt[ai] = static_cast<int>(dst.size());
+            for (int n = 0; n < static_cast<int>(dst.size()); ++n)
+                h_ak[static_cast<size_t>(ai) * s.max_needed + n] =
+                    active_kl_pos_[dst[n]];
+        }
+        check_cuda_(cudaMalloc(&s.d_needed_ak,
+                               sizeof(int) * std::max<size_t>(1, h_ak.size())),
+                    "cudaMalloc d_needed_ak");
+        check_cuda_(cudaMalloc(&s.d_needed_count,
+                               sizeof(int) * std::max(1, N_act_ij_)),
+                    "cudaMalloc d_needed_count");
+        check_cuda_(cudaMemcpy(s.d_needed_ak, h_ak.data(),
+                               sizeof(int) * h_ak.size(),
+                               cudaMemcpyHostToDevice), "H2D d_needed_ak");
+        check_cuda_(cudaMemcpy(s.d_needed_count, h_cnt.data(),
+                               sizeof(int) * h_cnt.size(),
+                               cudaMemcpyHostToDevice), "H2D d_needed_count");
+        const size_t bytes_needed =
+            static_cast<size_t>(tile_size_) * s.max_needed
+            * static_cast<size_t>(stride_pair) * sizeof(real_t);
+        if (bytes_needed > 0) {
+            check_cuda_(cudaMalloc(&s.d_pi_needed, bytes_needed),
+                        "cudaMalloc d_pi_needed");
+            check_cuda_(cudaMallocHost(&s.h_pi_needed, bytes_needed),
+                        "cudaMallocHost h_pi_needed");
+        }
+        s.needed_built = true;
+    }
+
+    static const bool picache_prof = []() {
+        const char* e = std::getenv("GANSU_DLPNO_PICACHE_PROF");
+        return e && e[0] == '1';
+    }();
+    std::chrono::steady_clock::time_point pc_t0;
+    if (picache_prof) ++s.n_rebuild;
+
+    if (picache_prof) pc_t0 = std::chrono::steady_clock::now();
+    pack_Y_and_transpose_(Y_old);
+    if (picache_prof) {
+        cudaDeviceSynchronize();
+        s.t_packY += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pc_t0).count();
+    }
+
+    // Inactive-pair rows → 0×0 (those i_ij are never written below).
+    for (long long i_ij = pair_begin_; i_ij < pair_end_; ++i_ij) {
+        if (n_pno_[i_ij] == 0) {
+            for (int i_kl = 0; i_kl < N_pair_; ++i_kl)
+                pi_cache_out[i_ij][i_kl].resize(0, 0);
+        }
+    }
+
+    for (int tile_start = 0; tile_start < N_act_ij_;
+             tile_start += tile_size_) {
+        const int tile_end  = std::min(tile_start + tile_size_, N_act_ij_);
+        const int tile_rows = tile_end - tile_start;
+
+        if (picache_prof) pc_t0 = std::chrono::steady_clock::now();
+        compute_pi_tile_(tile_start, tile_end);
+        if (picache_prof) {
+            cudaDeviceSynchronize();
+            s.t_gemm += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - pc_t0).count();
+        }
+
+        // Gather the needed columns of this tile into the compact buffer.
+        const int n_slots = tile_rows * s.max_needed;
+        if (n_slots > 0) {
+            gather_needed_kernel<<<n_slots, 256>>>(
+                s.d_pi_pad, s.d_pi_needed, s.d_needed_ak, s.d_needed_count,
+                tile_start, tile_rows, s.max_needed, stride_pair, N_act_kl_);
+            check_cuda_(cudaGetLastError(), "gather_needed_kernel launch");
+        }
+
+        // D2H only the compact (tile_rows × max_needed) needed blocks.
+        const size_t bytes_this =
+            static_cast<size_t>(tile_rows) * s.max_needed
+            * static_cast<size_t>(stride_pair) * sizeof(real_t);
+        if (picache_prof) pc_t0 = std::chrono::steady_clock::now();
+        if (bytes_this > 0)
+            check_cuda_(cudaMemcpy(s.h_pi_needed, s.d_pi_needed, bytes_this,
+                                   cudaMemcpyDeviceToHost),
+                        "D2H d_pi_needed");
+        if (picache_prof) s.t_d2h += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pc_t0).count();
+
+        // Host scatter: only the needed (i_ij, i_kl) entries.
+        if (picache_prof) pc_t0 = std::chrono::steady_clock::now();
+        #pragma omp parallel for schedule(static)
+        for (int ai_in_tile = 0; ai_in_tile < tile_rows; ++ai_in_tile) {
+            const int ai   = ai_in_tile + tile_start;
+            const int i_ij = active_i_ij_[ai];
+            const int n_ij = n_pno_[i_ij];
+            const std::vector<int>& need = s.needed_ikl_host[ai];
+            for (int n = 0; n < static_cast<int>(need.size()); ++n) {
+                const int i_kl = need[n];
+                pi_cache_out[i_ij][i_kl].resize(n_ij, n_ij);
+                const real_t* srcb = s.h_pi_needed
+                    + (static_cast<size_t>(ai_in_tile) * s.max_needed
+                       + static_cast<size_t>(n))
+                      * static_cast<size_t>(stride_pair);
+                real_t* dstb = pi_cache_out[i_ij][i_kl].data();
+                for (int r = 0; r < n_ij; ++r) {
+                    std::memcpy(dstb + static_cast<ptrdiff_t>(r) * n_ij,
+                                srcb + static_cast<size_t>(r) * max_n,
+                                static_cast<size_t>(n_ij) * sizeof(real_t));
+                }
+            }
+        }
+        if (picache_prof) s.t_scatter += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pc_t0).count();
+    }
+#endif // GANSU_CPU_ONLY
 }
 
 #ifndef GANSU_CPU_ONLY

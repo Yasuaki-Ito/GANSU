@@ -387,6 +387,10 @@ real_t DLPNOCCSD::compute_energy()
     }
     if (res.nocc <= 0) return 0.0;
 
+    // [gap-PROF] classification + f_ia + T1 iteration (host) — previously
+    // unaccounted between solve_dlpno_lmp2 and precompute_phase24_integrals.
+    const auto t_classt1_0 = prof_clock::now();
+
     int n_strong = 0, n_weak = 0, n_empty = 0;
     real_t E_strong = 0.0, E_weak = 0.0;
     size_t T2_strong = 0, T2_weak = 0;
@@ -619,6 +623,14 @@ real_t DLPNOCCSD::compute_energy()
     //       ΔW_akci^{(ij)} = -½ Σ_{ld} (lk|cd) π_{il}[d,a]
     //   DIIS (2.7) accelerates / stabilises the iteration.
     // -----------------------------------------------------------------------
+    const double dt_classt1 = std::chrono::duration<double>(
+        prof_clock::now() - t_classt1_0).count();
+    if (params_.verbose >= 1) {
+        std::cout << "[DLPNO-CCSD-PROF] classify+f_ia+T1 = "
+                  << std::fixed << std::setprecision(3)
+                  << dt_classt1 << " s" << std::endl;
+    }
+
     const auto t_pre_0 = prof_clock::now();
     Phase24Integrals phase24 =
         precompute_phase24_integrals(eri_, res, nao_);
@@ -741,6 +753,11 @@ real_t DLPNOCCSD::compute_energy()
     const bool bt_validate = [](){ const char* e = std::getenv("GANSU_DLPNO_BT_VALIDATE");
                                     return e && e[0] == '1'; }();
     if (bt_validate || rhf_.collect_dlpno_bt()) {
+        // [gap-PROF] PNO→canonical back-transform (host reconstruct of the
+        // nocc²·nvir² canonical T2/T1 for the STEOM hand-off). Largest single
+        // item in the previously-unaccounted stage-1 gap.
+        const auto t_bt_0 = prof_clock::now();
+        double t_bt_fn_s = -1.0;   // back-transform function time (split from collect)
         {
             const int num_fc        = rhf_.get_num_frozen_core();
             const int num_occ_total = nocc_ + num_fc;
@@ -759,18 +776,47 @@ real_t DLPNOCCSD::compute_energy()
             // PNO → canonical back-transform (T1 from the per-LMO PAO vector).
             BTAmplitudes bt = bt_pno_to_canonical(
                 res, res.U_loc, C_vir, h_S, nao_, nvir, T1, /*include_t1=*/true);
+            t_bt_fn_s = std::chrono::duration<double>(
+                prof_clock::now() - t_bt_0).count();
 
             // Hybrid DLPNO-STEOM (P5b): hand the canonical amplitudes to the
             // STEOM driver via the RHF object. (Sets use_dlpno_amplitudes_.)
             if (rhf_.collect_dlpno_bt()) {
-                rhf_.set_dlpno_bt_amplitudes(bt);
+                // bt is re-read below only inside the bt_validate canonical-CCSD
+                // comparison; set_dlpno_bt_amplitudes takes its argument by value
+                // (copying the ~225 MB canonical T2), so hand ownership over with
+                // a move when no validation needs the local copy.
+                if (bt_validate) rhf_.set_dlpno_bt_amplitudes(bt);
+                else             rhf_.set_dlpno_bt_amplitudes(std::move(bt));
                 // stage B (a): the native per-pair σ reads the converged per-pair
                 // PNO integral blocks. phase24 is still needed below (line ~929,
                 // Λ dressing when compute_density is on), so copy rather than
-                // move. set_dlpno_res copies res by value, so phase24 must be in
-                // place first. Cost is incurred only on the collect path.
-                res.phase24 = phase24;
-                rhf_.set_dlpno_res(res);  // stage B: projected DLPNO-IP/EA needs per-pair PNOs
+                // move. set_dlpno_res takes its argument by value then moves it
+                // into dlpno_res_, so passing the lvalue `res` copies the whole
+                // DLPNOLMP2Result (all per-pair PNO blocks + barS_cache, ~GBs) —
+                // this copy dominated the stage-1 collect cost. `res` is only
+                // read again below inside the env-gated *_VALIDATE blocks and the
+                // (flag-gated) compute_density block; when NONE of those are
+                // active (production STEOM) `res` is dead after this point, so we
+                // hand ownership over with a move and skip the copy entirely.
+                // phase24's local copy is re-read below only by the
+                // compute_density block (line ~1444); otherwise move it into res.
+                if (rhf_.get_dlpno_compute_density()) res.phase24 = phase24;
+                else                                  res.phase24 = std::move(phase24);
+                const bool need_res_after = [&]() {
+                    auto on = [](const char* n) {
+                        const char* e = std::getenv(n);
+                        return e && e[0] == '1';
+                    };
+                    return on("GANSU_DLPNO_IP_VALIDATE")
+                        || on("GANSU_DLPNO_IP_NATIVE_VALIDATE")
+                        || on("GANSU_DLPNO_EA_NATIVE_VALIDATE")
+                        || rhf_.get_dlpno_compute_density();
+                }();
+                if (need_res_after)
+                    rhf_.set_dlpno_res(res);             // copy (res reused below)
+                else
+                    rhf_.set_dlpno_res(std::move(res));  // move (no GB-scale copy)
             }
 
             // Canonical-CCSD element-wise comparison (validation only; the
@@ -820,6 +866,14 @@ real_t DLPNOCCSD::compute_energy()
             tracked_cudaFree(d_t2c);
             tracked_cudaFree(d_mo_eri);
             }  // if (bt_validate)
+        }
+        const double dt_bt = std::chrono::duration<double>(
+            prof_clock::now() - t_bt_0).count();
+        if (params_.verbose >= 1) {
+            std::cout << "[DLPNO-CCSD-PROF] bt_pno_to_canonical+collect = "
+                      << std::fixed << std::setprecision(3)
+                      << dt_bt << " s  (back-transform=" << t_bt_fn_s
+                      << "  collect=" << (dt_bt - t_bt_fn_s) << ")" << std::endl;
         }
     }
 

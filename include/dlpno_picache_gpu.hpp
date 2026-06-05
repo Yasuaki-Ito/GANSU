@@ -98,6 +98,34 @@ public:
                  std::vector<std::vector<RowMatXd>>& pi_cache_out);
 
     /**
+     * @brief LMP2 needed-column variant of rebuild().
+     *
+     * Identical to rebuild() (pad Y → H2D → 2× batched DGEMM filling the
+     * compact d_pi_pad on device) EXCEPT that, instead of D2H'ing + host
+     * scattering every active (i_ij, i_kl) column, it transfers ONLY the
+     * columns the LMP2 inter-pair Fock residual actually reads — namely the
+     * (k,j) and (i,l) pairs supplied per i_ij in `needed_ikl_per_pair`.
+     *
+     * A device gather kernel compacts those columns of d_pi_pad into a small
+     * d_pi_needed buffer (≈ 2·nocc of N_pair columns), which is D2H'd (~6×
+     * smaller) and scattered into pi_cache_out[i_ij][i_kl] only for the needed
+     * i_kl. Non-needed entries are left as the caller initialised them (the
+     * residual never reads them). Bit-exact w.r.t. rebuild() for every entry
+     * the residual consumes.
+     *
+     * @param needed_ikl_per_pair  size N_pair; needed_ikl_per_pair[i_ij] is the
+     *        (deduped) list of original pair indices i_kl whose projection
+     *        pi[i_ij][i_kl] the residual reads for output pair i_ij. Built once
+     *        by the caller (iter-invariant). The device-side needed map is
+     *        constructed lazily on the first call and reused across iters.
+     *
+     * Falls back to rebuild() when GANSU_CPU_ONLY / !active().
+     */
+    void rebuild_needed(const std::vector<std::vector<real_t>>& Y_old,
+                        std::vector<std::vector<RowMatXd>>& pi_cache_out,
+                        const std::vector<std::vector<int>>& needed_ikl_per_pair);
+
+    /**
      * @brief Step 6.1 — also produce pi_T_stack on the same call.
      *
      * pi_T_stack_out[i_ij](a, (k·nocc + l)·n_ij + d) = π_{k, l}^{oriented}[a, d]
