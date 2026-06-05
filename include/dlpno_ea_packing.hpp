@@ -47,7 +47,10 @@ struct DLPNOEAPacking {
 };
 
 /// Build the EA packed-vector offset table from a converged DLPNO result.
-/// nvir is taken as res.nao - res.nocc (no frozen core).
-DLPNOEAPacking build_ea_packing(const DLPNOLMP2Result& res);
+/// `nvir` is the true virtual count (= num_basis - full_occ). Pass it explicitly:
+/// with frozen core res.nao (full AO) - res.nocc (active occ) overcounts virtuals
+/// by num_frozen. nvir < 0 falls back to that legacy derivation (correct only when
+/// res.nocc == full_occ, i.e. no frozen core).
+DLPNOEAPacking build_ea_packing(const DLPNOLMP2Result& res, int nvir = -1);
 
 } // namespace gansu

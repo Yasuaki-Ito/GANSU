@@ -285,11 +285,16 @@ void ERI_RI_RHF::compute_cis_ri_impl(int n_states, std::vector<real_t>* out_eige
     PROFILE_FUNCTION();
 
     const int nao = rhf_.get_num_basis();
-    const int nocc = rhf_.get_num_electrons() / 2;
-    const int nvir = nao - nocc;
+    const int full_occ = rhf_.get_num_electrons() / 2;
+    const int num_frozen = rhf_.get_num_frozen_core();   // frozen-core support
+    const int nocc = full_occ - num_frozen;              // active occupied (frozen core excluded)
+    const int nvir = nao - full_occ;
     const int naux = num_auxiliary_basis_;
     const int cis_dim = nocc * nvir;
     const bool is_triplet = rhf_.is_triplet();
+    // Active-occ MOs span [num_frozen, full_occ); virtuals span [full_occ, nao). The B
+    // sub-block extraction + the orbital-energy pointer below shift by these offsets so
+    // the CIS excitation space excludes the frozen core. num_frozen==0 ⇒ byte-unchanged.
 
     // Guard: the RI CIS path assumes the full B matrix is materialized on a
     // single GPU.  In multi-GPU distributed mode (ERI_RI_Distributed_RHF) the
@@ -456,16 +461,20 @@ void ERI_RI_RHF::compute_cis_ri_impl(int n_states, std::vector<real_t>* out_eige
         std::vector<real_t> h_B_oo(naux * nocc * nocc);
         std::vector<real_t> h_B_vv(naux * nvir * nvir);
 
+        // Active-occ MO index = num_frozen + i; virtual MO index = full_occ + a.
         for (int Q = 0; Q < naux; Q++) {
             for (int i = 0; i < nocc; i++)
                 for (int a = 0; a < nvir; a++)
-                    h_B_ov[Q * nocc * nvir + i * nvir + a] = h_B_mo[Q * nao * nao + i * nao + (a + nocc)];
+                    h_B_ov[Q * nocc * nvir + i * nvir + a] =
+                        h_B_mo[Q * nao * nao + (num_frozen + i) * nao + (full_occ + a)];
             for (int i = 0; i < nocc; i++)
                 for (int j = 0; j < nocc; j++)
-                    h_B_oo[Q * nocc * nocc + i * nocc + j] = h_B_mo[Q * nao * nao + i * nao + j];
+                    h_B_oo[Q * nocc * nocc + i * nocc + j] =
+                        h_B_mo[Q * nao * nao + (num_frozen + i) * nao + (num_frozen + j)];
             for (int a = 0; a < nvir; a++)
                 for (int b = 0; b < nvir; b++)
-                    h_B_vv[Q * nvir * nvir + a * nvir + b] = h_B_mo[Q * nao * nao + (a + nocc) * nao + (b + nocc)];
+                    h_B_vv[Q * nvir * nvir + a * nvir + b] =
+                        h_B_mo[Q * nao * nao + (full_occ + a) * nao + (full_occ + b)];
         }
 
         cudaMemcpy(d_B_ov, h_B_ov.data(), h_B_ov.size() * sizeof(real_t), cudaMemcpyHostToDevice);
@@ -474,9 +483,12 @@ void ERI_RI_RHF::compute_cis_ri_impl(int n_states, std::vector<real_t>* out_eige
     }
     tracked_cudaFree(d_B_mo);
 
-    // Step 2: Build RI CIS operator and solve
+    // Step 2: Build RI CIS operator and solve. The diagonal kernel reads eps[i] (occ) and
+    // eps[nocc+a] (vir); offsetting the energy pointer by num_frozen makes eps[i] →
+    // full_eps[num_frozen+i] (active occ) and eps[nocc+a] → full_eps[full_occ+a] (vir).
     const real_t* d_orbital_energies = rhf_.get_orbital_energies().device_ptr();
-    CISOperator_RI cis_op(d_B_ov, d_B_oo, d_B_vv, d_orbital_energies, nocc, nvir, naux, is_triplet);
+    CISOperator_RI cis_op(d_B_ov, d_B_oo, d_B_vv, d_orbital_energies + num_frozen,
+                          nocc, nvir, naux, is_triplet);
 
     DavidsonConfig config;
     config.num_eigenvalues = n_states;
@@ -512,7 +524,8 @@ void ERI_RI_RHF::compute_cis_ri_impl(int n_states, std::vector<real_t>* out_eige
         rhf_.get_shell_type_infos(),
         rhf_.get_coefficient_matrix().host_ptr(),
         eigenvalues, h_eigenvectors.data(),
-        n_states, nao, nocc, nvir);
+        n_states, nao, nocc, nvir,
+        num_frozen, full_occ);   // frozen-core: occ MOs at [num_frozen, full_occ), vir at [full_occ, nao)
     rhf_.set_oscillator_strengths(es_result.oscillator_strengths);
     rhf_.set_excited_state_report(es_result.report);
 
@@ -541,18 +554,10 @@ void ERI_RI_RHF::compute_cis_nto(int n_states_cis) {
             "compute_cis_nto (RI): invalid orbital partition (nocc_active or nvir <= 0)");
     }
 
-    // Note: frozen_core is not yet plumbed into compute_cis_ri_impl on the RI
-    // path. The Stored CIS path subtracts num_frozen from nocc; the RI path
-    // currently does not. For P0 the CIS NTO call uses CIS amplitudes from
-    // the active-occupied block only when the Stored path runs. When P1 (RI
-    // IP-EOM) lands we will revisit RI frozen-core. For now, refuse the
-    // combination with a clear message.
-    if (num_frozen != 0) {
-        throw std::runtime_error(
-            "compute_cis_nto (RI): frozen_core is not yet supported on the RI CIS "
-            "path. Use --eri_method stored, or rerun without frozen_core.");
-    }
-
+    // Frozen core is now plumbed through compute_cis_ri_impl: the CIS excitation space
+    // is built from the active-occupied block [num_frozen, full_occ) → virtuals, so the
+    // returned amplitudes are (n_states × nocc_active × nvir) — exactly what the NTO
+    // active-space builder below expects. (num_frozen==0 ⇒ byte-unchanged.)
     std::vector<real_t> cis_amplitudes;
     compute_cis_ri_impl(n_states_cis, &cis_amplitudes);
 

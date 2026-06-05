@@ -1314,7 +1314,7 @@ real_t DLPNOCCSD::compute_energy()
             std::vector<real_t> eps_v(nvir);
             for (int a = 0; a < nvir; ++a) eps_v[a] = h_eps[nocc_ + a];
 
-            const DLPNOEAPacking pack = build_ea_packing(res);
+            const DLPNOEAPacking pack = build_ea_packing(res, nvir);
             DLPNOEAEOMProjectedOperator proj_op(
                 ea_op, res, pack, res.U_loc, C_vir, h_S, nao_, eps_v);
             // Stage 5 multi-GPU: thread the device count into the validation-gate

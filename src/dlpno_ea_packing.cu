@@ -20,10 +20,18 @@
 
 namespace gansu {
 
-DLPNOEAPacking build_ea_packing(const DLPNOLMP2Result& res) {
+DLPNOEAPacking build_ea_packing(const DLPNOLMP2Result& res, int nvir) {
     DLPNOEAPacking p;
     p.nocc = res.nocc;
-    p.nvir = res.nao - res.nocc;
+    // nvir < 0 ⇒ legacy derivation res.nao - res.nocc, valid ONLY without frozen
+    // core (then res.nocc == full_occ). With frozen core res.nao is the full AO
+    // count (num_basis) while res.nocc is the ACTIVE occupied count, so the
+    // difference overcounts the virtuals by num_frozen — the caller must pass the
+    // true nvir (= num_basis - full_occ). Passing the wrong nvir inflates the 1p
+    // sector, creating num_frozen phantom (decoupled) singles dimensions: Davidson
+    // returns them as spurious zero eigenvalues and the R2 back-transform reads
+    // C_vir [nao × nvir] out of bounds → NaN. (num_frozen==0 ⇒ both agree.)
+    p.nvir = (nvir >= 0) ? nvir : (res.nao - res.nocc);
     p.n_pno_ii.assign(p.nocc, 0);
     p.off_i.assign(p.nocc, -1);
 

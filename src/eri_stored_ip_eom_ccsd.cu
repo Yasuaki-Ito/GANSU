@@ -293,8 +293,12 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
         // is byte-for-byte unchanged. (Native σ == projected σ to machine
         // epsilon, validated by GANSU_DLPNO_IP_NATIVE_VALIDATE.)
         const bool native = rhf.use_dlpno_native_eom();
-        if (num_frozen != 0)
-            throw std::runtime_error("DLPNO IP-EOM (projected/native) currently requires --frozen_core none.");
+        // Frozen core: the canonical ip_op above is already built in the active space
+        // (ERI trimmed + d_eps offset by num_frozen). The native/projected path's own
+        // orbital data must match that convention — virtuals are MO columns
+        // [full_occ, nao), active-occ energies are eps[num_frozen + i]. full_occ =
+        // nocc_active + num_frozen. (num_frozen==0 ⇒ byte-unchanged.)
+        const int full_occ_ip = nocc_active + num_frozen;
         const DLPNOLMP2Result& dres = rhf.get_dlpno_res();
         if (dres.pairs.empty())
             throw std::runtime_error("DLPNO IP-EOM: DLPNO pair state not stowed (set_dlpno_res).");
@@ -305,13 +309,13 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
         std::vector<real_t> C_vir((size_t)num_basis * nvir, 0.0);
         for (int mu = 0; mu < num_basis; ++mu)
             for (int a = 0; a < nvir; ++a)
-                C_vir[(size_t)mu * nvir + a] = C_full[(size_t)mu * num_basis + (nocc_active + a)];
+                C_vir[(size_t)mu * nvir + a] = C_full[(size_t)mu * num_basis + (full_occ_ip + a)];
         rhf.get_overlap_matrix().toHost();
         const real_t* h_S = rhf.get_overlap_matrix().host_ptr();
         orbital_energies.toHost();
         const real_t* h_eps = orbital_energies.host_ptr();
         std::vector<real_t> eps_o(nocc_active);
-        for (int i = 0; i < nocc_active; ++i) eps_o[i] = h_eps[i];
+        for (int i = 0; i < nocc_active; ++i) eps_o[i] = h_eps[num_frozen + i];
 
         const DLPNOIPPacking pack = build_ip_packing(dres);
         std::unique_ptr<LinearOperator> dlpno_op;
