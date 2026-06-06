@@ -229,6 +229,15 @@ private:
     bool active_ = false;
     bool stacked_ = false;
 
+    // Phase 1 (sparse barS) — LMP2-only sparse storage mode. When true, the
+    // dense d_barS_pad / d_pi_pad device buffers are NOT allocated; instead a
+    // CSR-style d_barS_csr (only the needed_ikl coupling columns per row) is
+    // built lazily on the first rebuild_needed(), cutting device barS memory
+    // by ~N_act_kl/max_needed (≈6.5×, fixes the Decacene OOM). Set in the
+    // constructor when GANSU_DLPNO_LMP2_BARS_SPARSE=1 AND this is the
+    // non-stacked LMP2 instance. Implies the ragged GEMM path. Bit-exact.
+    bool sparse_lmp2_ = false;
+
     // CPU fallback for !active() — keeps the public API stable when GPU
     // is unavailable. Same pi_cache_out layout.
     void rebuild_cpu_(const std::vector<std::vector<real_t>>& Y_old,
@@ -253,6 +262,17 @@ private:
     void pack_Y_and_transpose_(
         const std::vector<std::vector<real_t>>& Y_old);
     void compute_pi_tile_(int tile_start, int tile_end);
+
+    // Phase 1 (sparse barS) — ragged coupling-list variant of compute_pi_tile_.
+    // Instead of the dense per-row strided-batched GEMM over ALL N_act_kl
+    // columns followed by gather_needed_kernel, this computes pi ONLY for the
+    // ~2·nocc coupling columns the LMP2 residual reads (the needed_ikl set),
+    // writing the result directly into d_pi_needed via a per-row pointer-array
+    // cublasDgemmBatched. Bit-exact w.r.t. compute_pi_tile_ + gather for every
+    // consumed (i_ij, i_kl) block. Requires the ragged pointer arrays to have
+    // been built (one-time, iter-invariant) and a single tile
+    // (tile_size_ >= N_act_ij_). Gated by GANSU_DLPNO_LMP2_BARS_RAGGED_GEMM.
+    void compute_pi_needed_ragged_(int tile_start, int tile_end);
 
     // D2H d_pi_pad → h_pi_pad (slab range) and unpad into pi_cache_out.
     // Only called when the host pi_cache is actually needed downstream.

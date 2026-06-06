@@ -182,6 +182,31 @@ struct PiCacheGpu::Impl {
     real_t*  h_pi_needed    = nullptr;   // pinned mirror of d_pi_needed
     std::vector<std::vector<int>> needed_ikl_host;  // [N_act_ij][count]
 
+    // Phase 1 (sparse barS) — ragged coupling-list batched-GEMM pointer arrays.
+    // Built once (iter-invariant: the ak mapping + base buffer pointers are
+    // fixed after allocation, and Y is repacked IN PLACE into d_Y_pad each
+    // iter so the pointer values stay valid). Indexed by slot = ai·max_needed+n
+    // for n < needed_count[ai]; padded slots are never dereferenced (per-row
+    // cublasDgemmBatched uses batchCount = needed_count[ai]).
+    //   d_pY_ptrs[slot]    = d_Y_pad    + ak·stride_pair          (stage1 A)
+    //   d_pBarS_ptrs[slot] = d_barS_pad + (ai·N_act_kl+ak)·stride (stage1 B / stage2 A)
+    //   d_pHalf_ptrs[slot] = d_half_pad + n·stride_pair           (stage1 C / stage2 B)
+    //   d_pPi_ptrs[slot]   = d_pi_needed+ slot·stride_pair        (stage2 C)
+    bool     coupling_ptrs_built = false;
+    real_t** d_pY_ptrs    = nullptr;
+    real_t** d_pBarS_ptrs = nullptr;
+    real_t** d_pHalf_ptrs = nullptr;
+    real_t** d_pPi_ptrs   = nullptr;
+
+    // Phase 1 (sparse barS / Stage 2a) — CSR barS storage built lazily on the
+    // first rebuild_needed when sparse_lmp2_. Layout:
+    //   d_barS_csr[(ai·max_needed + n)·max_n² + r·max_n + c] = barS[i_ij][i_kl](r,c)
+    // for the n-th needed column (i_kl = needed_ikl_host[ai][n]). Replaces the
+    // dense d_barS_pad [N_act_ij·N_act_kl·max_n²] which is NOT allocated in
+    // sparse mode. Identical padded bytes to the dense block ⇒ bit-exact.
+    bool     barS_csr_built = false;
+    real_t*  d_barS_csr     = nullptr;
+
     void free_all() {
         if (d_barS_pad)    cudaFree(d_barS_pad);
         if (d_Y_pad)       cudaFree(d_Y_pad);
@@ -203,6 +228,11 @@ struct PiCacheGpu::Impl {
         if (d_needed_count)  cudaFree(d_needed_count);
         if (d_pi_needed)     cudaFree(d_pi_needed);
         if (h_pi_needed)     cudaFreeHost(h_pi_needed);
+        if (d_pY_ptrs)       cudaFree(d_pY_ptrs);
+        if (d_pBarS_ptrs)    cudaFree(d_pBarS_ptrs);
+        if (d_pHalf_ptrs)    cudaFree(d_pHalf_ptrs);
+        if (d_pPi_ptrs)      cudaFree(d_pPi_ptrs);
+        if (d_barS_csr)      cudaFree(d_barS_csr);
         if (d_T_meta_dpair)  cudaFree(d_T_meta_dpair);
         if (d_DF_scratch)    cudaFree(d_DF_scratch);
         d_T_meta_dpair = nullptr;
@@ -218,6 +248,8 @@ struct PiCacheGpu::Impl {
         d_needed_ak = d_needed_count = nullptr;
         d_pi_needed = nullptr;
         h_pi_needed = nullptr;
+        d_pY_ptrs = d_pBarS_ptrs = d_pHalf_ptrs = d_pPi_ptrs = nullptr;
+        d_barS_csr = nullptr;
     }
 };
 
@@ -511,6 +543,18 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
                               && !setup_i_per_pair_.empty()
                               && static_cast<int>(pair_lookup_.size()) == nocc_ * nocc_
                               && static_cast<int>(setup_i_per_pair_.size()) == N_pair_;
+
+    // Phase 1 (sparse barS / Stage 2a) — enable the LMP2 sparse storage path
+    // for the non-stacked (LMP2) instance when the env flag is set. The dense
+    // d_barS_pad / d_pi_pad are skipped below; a CSR barS is built lazily on
+    // the first rebuild_needed(). want_stacked instances (CCSD) keep the dense
+    // path (their coupling is the full (k,l) superset, handled in a later
+    // phase). Requires active rows.
+    {
+        const char* e = std::getenv("GANSU_DLPNO_LMP2_BARS_SPARSE");
+        sparse_lmp2_ = (e && e[0] == '1') && !want_stacked && N_act_ij_ > 0;
+    }
+
     size_t pi_T_total = 0;
     // Step S9 — also accumulate slab-only counts. `pi_T_slab_base_offset` is
     // the element offset of pair `pair_begin_` within the full pi_T_stack
@@ -539,9 +583,25 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
         if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
             delete p_; p_ = nullptr; active_ = false; return;
         }
+        // Phase 1 (sparse barS): the dense d_barS_pad + d_pi_pad are NOT
+        // allocated; a single tile is forced (tile_size_ = N_act_ij_) and the
+        // CSR barS / d_pi_needed (both ≈ N_act_kl/max_needed × smaller) are
+        // built lazily in rebuild_needed. So the dense fixed-need check (which
+        // would false-OOM on Decacene) is bypassed; only the small fixed
+        // buffers (d_Y_pad ×2 + d_Y_pad_T) are required here.
+        const size_t margin = (size_t)256 * 1024 * 1024;  // 256 MB
+        if (sparse_lmp2_) {
+            const size_t fixed_need_sparse = bytes_Y_compact   // d_Y_pad
+                                           + bytes_Y_T_full     // d_Y_pad_T
+                                           + bytes_Y_compact    // d_half_pad
+                                           + margin;
+            if (fixed_need_sparse > free_b || N_act_ij_ == 0) {
+                delete p_; p_ = nullptr; active_ = false; return;
+            }
+            tile_size_ = N_act_ij_;   // single tile; d_pi_pad not allocated
+        } else {
         // Fixed needs (everything except d_pi_pad):
         //   d_barS_pad + d_Y_pad + d_Y_pad_T (full) + d_half_pad + d_pi_T_stack + margin
-        const size_t margin = (size_t)256 * 1024 * 1024;  // 256 MB
         const size_t fixed_need = bytes_barS_compact
                                 + bytes_Y_compact      // d_Y_pad
                                 + bytes_Y_T_full       // d_Y_pad_T (FULL)
@@ -572,6 +632,7 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
             if (max_tile == 0) max_tile = 1;
         }
         tile_size_ = static_cast<int>(max_tile);
+        }  // end !sparse_lmp2_ tiling branch
     }
     const size_t bytes_pi_tile =
         static_cast<size_t>(tile_size_) * per_pi_row_bytes;
@@ -579,10 +640,15 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
     const auto t_mem_probe = std::chrono::steady_clock::now();
 
     try {
-        check_cuda_(cudaMalloc(&s.d_barS_pad, bytes_barS_compact),
-                    "cudaMalloc d_barS_pad (compact)");
-        check_cuda_(cudaMalloc(&s.d_pi_pad,   bytes_pi_tile),
-                    "cudaMalloc d_pi_pad (tile)");
+        // Phase 1 (sparse barS): skip the dense d_barS_pad [N_act_ij·N_act_kl·
+        // max_n²] and the d_pi_pad tile — both replaced by the smaller CSR
+        // d_barS_csr + d_pi_needed built lazily in rebuild_needed.
+        if (!sparse_lmp2_) {
+            check_cuda_(cudaMalloc(&s.d_barS_pad, bytes_barS_compact),
+                        "cudaMalloc d_barS_pad (compact)");
+            check_cuda_(cudaMalloc(&s.d_pi_pad,   bytes_pi_tile),
+                        "cudaMalloc d_pi_pad (tile)");
+        }
         check_cuda_(cudaMalloc(&s.d_Y_pad,    bytes_Y_compact),
                     "cudaMalloc d_Y_pad (compact)");
         check_cuda_(cudaMalloc(&s.d_Y_pad_T,  bytes_Y_T_full),
@@ -753,7 +819,9 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
     //
     // Layout: d_barS_pad[(i_ij·N_pair + i_kl)·max_n² + r·max_n + c]
     //         row-major within each (max_n × max_n) padded block.
-    {
+    // Phase 1 (sparse barS): skipped entirely — d_barS_pad is not allocated;
+    // the CSR barS is built lazily in rebuild_needed from barS_cache_ref_.
+    if (!sparse_lmp2_) {
         const int N_act_ij = static_cast<int>(active_i_ij_.size());
         const int N_act_kl = static_cast<int>(active_i_kl_.size());
 
@@ -936,13 +1004,28 @@ PiCacheGpu::~PiCacheGpu() {
         if (p_->n_rebuild > 0) {
             const char* e = std::getenv("GANSU_DLPNO_PICACHE_PROF");
             if (e && e[0] == '1') {
+                // [Stage 0] coupling sparsity: dense barS grid is
+                // N_act_ij·N_act_kl blocks; the LMP2 residual only needs
+                // max_needed (~2·nocc) columns per row. The byte figures are
+                // the dense d_barS_pad footprint vs a sparse (CSR) barS holding
+                // only the needed columns (the Stage 2 target storage).
+                const double blk_mb = static_cast<double>(max_n_)
+                    * max_n_ * sizeof(real_t) / (1024.0 * 1024.0);
+                const double dense_barS_mb = static_cast<double>(N_act_ij_)
+                    * N_act_kl_ * blk_mb;
+                const double sparse_barS_mb = static_cast<double>(N_act_ij_)
+                    * p_->max_needed * blk_mb;
                 std::printf("[picache-PROF dev=%d] rebuild calls=%d  "
                             "pack_Y=%.3fs  tile_GEMM=%.3fs  D2H=%.3fs  "
                             "scatter=%.3fs  (slab [%d,%d) N_act_ij=%d "
-                            "N_act_kl=%d)\n",
+                            "N_act_kl=%d max_needed=%d  barS dense=%.0f MB "
+                            "sparse=%.0f MB (%.1fx))\n",
                             device_id_, p_->n_rebuild, p_->t_packY,
                             p_->t_gemm, p_->t_d2h, p_->t_scatter,
-                            pair_begin_, pair_end_, N_act_ij_, N_act_kl_);
+                            pair_begin_, pair_end_, N_act_ij_, N_act_kl_,
+                            p_->max_needed, dense_barS_mb, sparse_barS_mb,
+                            sparse_barS_mb > 0.0
+                                ? dense_barS_mb / sparse_barS_mb : 0.0);
                 std::fflush(stdout);
             }
         }
@@ -1027,6 +1110,14 @@ void PiCacheGpu::rebuild(const std::vector<std::vector<real_t>>& Y_old,
                          std::vector<std::vector<RowMatXd>>& pi_cache_out)
 {
     if (!active_) {
+        rebuild_cpu_(Y_old, pi_cache_out);
+        return;
+    }
+    // Phase 1 (Stage 2a): sparse mode does not allocate the dense d_barS_pad
+    // that this full-column rebuild needs. It only ever runs via rebuild_needed
+    // (picache_gather, default on). If a caller disables gather while sparse is
+    // on, fall back to the CPU path (uses the host barS_cache, correct).
+    if (sparse_lmp2_) {
         rebuild_cpu_(Y_old, pi_cache_out);
         return;
     }
@@ -1168,6 +1259,21 @@ void PiCacheGpu::rebuild_needed(
     const int max_n = max_n_;
     const long long stride_pair = s.stride_pair;   // max_n²
 
+    // Phase 1 (sparse barS) — ragged coupling-list batched GEMM. Computes pi
+    // ONLY for the needed_ikl columns directly into d_pi_needed (no dense
+    // N_act_kl GEMM + gather). Bit-exact for every consumed block. Requires a
+    // single tile (tile_size_ >= N_act_ij_); falls back to the dense path
+    // otherwise. Opt-in, default off = the dense path (bit-identical).
+    static const bool coupling_ragged_env = []() {
+        const char* e = std::getenv("GANSU_DLPNO_LMP2_BARS_RAGGED_GEMM");
+        return e && e[0] == '1';
+    }();
+    // sparse_lmp2_ (Stage 2a) implies the ragged path (the dense d_barS_pad /
+    // d_pi_pad are not allocated, so the dense compute_pi_tile_ cannot run).
+    // sparse_lmp2_ forces tile_size_ = N_act_ij_, so the single-tile gate holds.
+    const bool use_ragged =
+        (coupling_ragged_env || sparse_lmp2_) && (tile_size_ >= N_act_ij_);
+
     // --- one-time build of the device needed-column map (iter-invariant) ---
     if (!s.needed_built) {
         s.needed_ikl_host.assign(N_act_ij_, {});
@@ -1216,7 +1322,94 @@ void PiCacheGpu::rebuild_needed(
             check_cuda_(cudaMallocHost(&s.h_pi_needed, bytes_needed),
                         "cudaMallocHost h_pi_needed");
         }
+
+        // Phase 1 (Stage 2a) — lazy CSR barS build. Pack ONLY the needed
+        // coupling blocks (max_needed per row) into d_barS_csr, with the exact
+        // same max_n-padded layout the dense scatter_barS_kernel produces, so
+        // the ragged GEMM is bit-exact w.r.t. the dense path. barS_cache_ref_
+        // is the host barS_cache passed to the constructor (alive for the iter
+        // loop scope). Only built in sparse mode (dense path uses d_barS_pad).
+        if (sparse_lmp2_ && !s.barS_csr_built) {
+            const auto& barS_cache = *barS_cache_ref_;
+            const size_t csr_elems =
+                static_cast<size_t>(N_act_ij_) * s.max_needed
+                * static_cast<size_t>(stride_pair);
+            real_t* h_csr = nullptr;
+            check_cuda_(cudaMallocHost(&h_csr, csr_elems * sizeof(real_t)),
+                        "cudaMallocHost h_barS_csr");
+            std::memset(h_csr, 0, csr_elems * sizeof(real_t));
+            #pragma omp parallel for schedule(static)
+            for (int ai = 0; ai < N_act_ij_; ++ai) {
+                const int i_ij = active_i_ij_[ai];
+                const int n_ij = n_pno_[i_ij];
+                const std::vector<int>& need = s.needed_ikl_host[ai];
+                for (int n = 0; n < static_cast<int>(need.size()); ++n) {
+                    const int i_kl = need[n];
+                    const int n_kl = n_pno_[i_kl];
+                    const RowMatXd& bs = barS_cache[i_ij][i_kl];
+                    if (bs.rows() == 0 || bs.cols() == 0) continue;
+                    real_t* dst = h_csr
+                        + (static_cast<size_t>(ai) * s.max_needed + n)
+                          * static_cast<size_t>(stride_pair);
+                    const real_t* src = bs.data();
+                    for (int r = 0; r < n_ij; ++r)
+                        std::memcpy(dst + static_cast<size_t>(r) * max_n,
+                                    src + static_cast<size_t>(r) * n_kl,
+                                    static_cast<size_t>(n_kl) * sizeof(real_t));
+                }
+            }
+            check_cuda_(cudaMalloc(&s.d_barS_csr, csr_elems * sizeof(real_t)),
+                        "cudaMalloc d_barS_csr");
+            check_cuda_(cudaMemcpy(s.d_barS_csr, h_csr,
+                                   csr_elems * sizeof(real_t),
+                                   cudaMemcpyHostToDevice), "H2D d_barS_csr");
+            cudaFreeHost(h_csr);
+            s.barS_csr_built = true;
+        }
+
         s.needed_built = true;
+    }
+
+    // Phase 1 — one-time build of the ragged GEMM pointer arrays. Depends on
+    // the needed map (d_pi_needed alloc, max_needed) built above, and on the
+    // fixed device base buffers (d_Y_pad / d_barS_pad / d_half_pad). Y is
+    // repacked in place each iter, so these pointers stay valid across iters.
+    if (use_ragged && !s.coupling_ptrs_built && N_act_ij_ > 0) {
+        const size_t ns = static_cast<size_t>(N_act_ij_) * s.max_needed;
+        std::vector<real_t*> hY(ns, nullptr), hB(ns, nullptr),
+                             hH(ns, nullptr), hP(ns, nullptr);
+        for (int ai = 0; ai < N_act_ij_; ++ai) {
+            const std::vector<int>& need = s.needed_ikl_host[ai];
+            for (int n = 0; n < static_cast<int>(need.size()); ++n) {
+                const int ak = active_kl_pos_[need[n]];
+                const size_t slot = static_cast<size_t>(ai) * s.max_needed + n;
+                hY[slot] = s.d_Y_pad
+                         + static_cast<size_t>(ak) * stride_pair;
+                // barS source: CSR slot (sparse mode) or dense (ai,ak) block.
+                hB[slot] = sparse_lmp2_
+                         ? (s.d_barS_csr + slot * stride_pair)
+                         : (s.d_barS_pad
+                            + (static_cast<size_t>(ai) * N_act_kl_
+                               + static_cast<size_t>(ak)) * stride_pair);
+                hH[slot] = s.d_half_pad
+                         + static_cast<size_t>(n) * stride_pair;
+                hP[slot] = s.d_pi_needed + slot * stride_pair;
+            }
+        }
+        const size_t bytes_ptrs = std::max<size_t>(1, ns) * sizeof(real_t*);
+        check_cuda_(cudaMalloc(&s.d_pY_ptrs,    bytes_ptrs), "cudaMalloc d_pY_ptrs");
+        check_cuda_(cudaMalloc(&s.d_pBarS_ptrs, bytes_ptrs), "cudaMalloc d_pBarS_ptrs");
+        check_cuda_(cudaMalloc(&s.d_pHalf_ptrs, bytes_ptrs), "cudaMalloc d_pHalf_ptrs");
+        check_cuda_(cudaMalloc(&s.d_pPi_ptrs,   bytes_ptrs), "cudaMalloc d_pPi_ptrs");
+        check_cuda_(cudaMemcpy(s.d_pY_ptrs, hY.data(), ns * sizeof(real_t*),
+                               cudaMemcpyHostToDevice), "H2D d_pY_ptrs");
+        check_cuda_(cudaMemcpy(s.d_pBarS_ptrs, hB.data(), ns * sizeof(real_t*),
+                               cudaMemcpyHostToDevice), "H2D d_pBarS_ptrs");
+        check_cuda_(cudaMemcpy(s.d_pHalf_ptrs, hH.data(), ns * sizeof(real_t*),
+                               cudaMemcpyHostToDevice), "H2D d_pHalf_ptrs");
+        check_cuda_(cudaMemcpy(s.d_pPi_ptrs, hP.data(), ns * sizeof(real_t*),
+                               cudaMemcpyHostToDevice), "H2D d_pPi_ptrs");
+        s.coupling_ptrs_built = true;
     }
 
     static const bool picache_prof = []() {
@@ -1248,7 +1441,14 @@ void PiCacheGpu::rebuild_needed(
         const int tile_rows = tile_end - tile_start;
 
         if (picache_prof) pc_t0 = std::chrono::steady_clock::now();
-        compute_pi_tile_(tile_start, tile_end);
+        if (use_ragged) {
+            // Ragged path: per-row pointer-array batched GEMM writes pi for the
+            // needed columns straight into d_pi_needed — no dense GEMM, no
+            // gather kernel. (Single tile guaranteed by use_ragged gate.)
+            compute_pi_needed_ragged_(tile_start, tile_end);
+        } else {
+            compute_pi_tile_(tile_start, tile_end);
+        }
         if (picache_prof) {
             cudaDeviceSynchronize();
             s.t_gemm += std::chrono::duration<double>(
@@ -1256,8 +1456,9 @@ void PiCacheGpu::rebuild_needed(
         }
 
         // Gather the needed columns of this tile into the compact buffer.
+        // (Skipped in the ragged path: d_pi_needed is already filled.)
         const int n_slots = tile_rows * s.max_needed;
-        if (n_slots > 0) {
+        if (!use_ragged && n_slots > 0) {
             gather_needed_kernel<<<n_slots, 256>>>(
                 s.d_pi_pad, s.d_pi_needed, s.d_needed_ak, s.d_needed_count,
                 tile_start, tile_rows, s.max_needed, stride_pair, N_act_kl_);
@@ -1437,6 +1638,54 @@ void PiCacheGpu::compute_pi_tile_(int tile_start, int tile_end)
             &zero,
             dC_row,       /*ldc=*/ max_n, /*strideC=*/ stride_pair,
             N_kl), "stage2 strided batched (tile)");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 (sparse barS) — ragged coupling-list compute. Same two GEMMs as
+// compute_pi_tile_ but batched over the needed_ikl coupling columns per row
+// (count = needed_count[ai]) via pointer arrays, writing pi straight into
+// d_pi_needed at slot (ai·max_needed + n). Each (ai, n) batch element is
+// arithmetically identical to compute_pi_tile_'s (ai, ak) element followed by
+// gather_needed_kernel's copy of column ak into slot n → bit-exact. Requires
+// the single-tile gate (ai_in_tile == ai) and the pointer arrays built.
+// ---------------------------------------------------------------------------
+void PiCacheGpu::compute_pi_needed_ragged_(int tile_start, int tile_end)
+{
+    Impl& s = *p_;
+    const int max_n = max_n_;
+    const real_t one  = 1.0;
+    const real_t zero = 0.0;
+
+    for (int ai = tile_start; ai < tile_end; ++ai) {
+        const int i_ij = active_i_ij_[ai];
+        const int n_ij = n_pno_[i_ij];
+        if (n_ij == 0) continue;
+        const int cnt = static_cast<int>(s.needed_ikl_host[ai].size());
+        if (cnt == 0) continue;
+        const size_t base = static_cast<size_t>(ai) * s.max_needed;
+
+        // Stage 1: half = Y · barS   (matches compute_pi_tile_ stage1).
+        check_cublas_(cublasDgemmBatched(
+            s.cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+            /*m=*/ max_n, /*n=*/ n_ij, /*k=*/ max_n,
+            &one,
+            (const real_t* const*)(s.d_pY_ptrs   + base), /*lda=*/ max_n,
+            (const real_t* const*)(s.d_pBarS_ptrs + base), /*ldb=*/ max_n,
+            &zero,
+            (real_t* const*)(s.d_pHalf_ptrs + base), /*ldc=*/ max_n,
+            cnt), "ragged stage1 batched");
+
+        // Stage 2: pi = barS^T · half  (matches compute_pi_tile_ stage2).
+        check_cublas_(cublasDgemmBatched(
+            s.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            /*m=*/ n_ij, /*n=*/ n_ij, /*k=*/ max_n,
+            &one,
+            (const real_t* const*)(s.d_pBarS_ptrs + base), /*lda=*/ max_n,
+            (const real_t* const*)(s.d_pHalf_ptrs + base), /*ldb=*/ max_n,
+            &zero,
+            (real_t* const*)(s.d_pPi_ptrs + base), /*ldc=*/ max_n,
+            cnt), "ragged stage2 batched");
     }
 }
 

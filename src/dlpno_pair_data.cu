@@ -183,6 +183,37 @@ LMP2Status iterate_lmp2(
 
     std::vector<std::vector<real_t>> Y_old(pairs.size());
 
+    // Phase 1 (sparse barS) — per-output-pair coupling list: the LMP2 residual
+    // reads pi_cache[idx][idx_kl] only for idx_kl ∈ {(k,j): k≠i} ∪ {(i,l): l≠j}
+    // (~2·nocc of N_pair columns), and pi[idx][idx_kl] depends on a SINGLE barS
+    // block barS[idx][idx_kl]. So this list is the EXACT set of barS blocks the
+    // LMP2 path ever needs — restricting the build to it is bit-exact, not an
+    // approximation. Built here (early) so the sparse barS build below can use
+    // it; also consumed by the picache_gather rebuild_needed path further down
+    // and by the PiCacheGpu CSR build (rebuild_needed). Cheap: O(N_pair·nocc).
+    const bool bars_sparse = []() {
+        const char* e = std::getenv("GANSU_DLPNO_LMP2_BARS_SPARSE");
+        return e && e[0] == '1';
+    }();
+    std::vector<std::vector<int>> needed_ikl_per_pair(pairs.size());
+    for (size_t idx = 0; idx < pairs.size(); ++idx) {
+        if (pairs[idx].n_pno == 0) continue;
+        const int i = setups[idx].i, j = setups[idx].j;
+        std::vector<int>& nb = needed_ikl_per_pair[idx];
+        for (int k = 0; k < nocc; ++k) {           // i-coupling: (k, j)
+            if (k == i) continue;
+            const int idx_kj = pair_lookup[static_cast<size_t>(k) * nocc + j];
+            if (idx_kj >= 0 && pairs[idx_kj].n_pno > 0) nb.push_back(idx_kj);
+        }
+        for (int l = 0; l < nocc; ++l) {           // j-coupling: (i, l)
+            if (l == j) continue;
+            const int idx_il = pair_lookup[static_cast<size_t>(i) * nocc + l];
+            if (idx_il >= 0 && pairs[idx_il].n_pno > 0) nb.push_back(idx_il);
+        }
+        std::sort(nb.begin(), nb.end());
+        nb.erase(std::unique(nb.begin(), nb.end()), nb.end());
+    }
+
     // ---- Pre-computed bar_S^{(ij,kl)} cache (one-time). ----
     // Identical role to the CCSD iter's barS_cache: the inter-pair Fock
     // coupling needs Σ projection · Y · projection^T for every (idx, idx_kl),
@@ -206,12 +237,25 @@ LMP2Status iterate_lmp2(
             Eigen::Map<const RowMatXd> bQ_ij(
                 pairs[i_ij].bar_Q.data(), nao, n_ij);
             const RowMatXd bQ_ij_T_S = bQ_ij.transpose() * Smat;  // n_ij × nao
-            for (size_t i_kl = 0; i_kl < pairs.size(); ++i_kl) {
-                const int n_kl = pairs[i_kl].n_pno;
-                if (n_kl == 0) continue;
-                Eigen::Map<const RowMatXd> bQ_kl(
-                    pairs[i_kl].bar_Q.data(), nao, n_kl);
-                barS_cache[i_ij][i_kl].noalias() = bQ_ij_T_S * bQ_kl;
+            if (bars_sparse) {
+                // Phase 1 (Stage 2b): build only the coupling columns the
+                // residual reads → O(N_pair·nocc) host work instead of
+                // O(N_pair²). Bit-exact (same blocks, others never consumed).
+                for (int i_kl : needed_ikl_per_pair[i_ij]) {
+                    const int n_kl = pairs[i_kl].n_pno;
+                    if (n_kl == 0) continue;
+                    Eigen::Map<const RowMatXd> bQ_kl(
+                        pairs[i_kl].bar_Q.data(), nao, n_kl);
+                    barS_cache[i_ij][i_kl].noalias() = bQ_ij_T_S * bQ_kl;
+                }
+            } else {
+                for (size_t i_kl = 0; i_kl < pairs.size(); ++i_kl) {
+                    const int n_kl = pairs[i_kl].n_pno;
+                    if (n_kl == 0) continue;
+                    Eigen::Map<const RowMatXd> bQ_kl(
+                        pairs[i_kl].bar_Q.data(), nao, n_kl);
+                    barS_cache[i_ij][i_kl].noalias() = bQ_ij_T_S * bQ_kl;
+                }
             }
         }
         dt_barS += std::chrono::duration<double>(prof_clock::now() - t0).count();
@@ -353,27 +397,8 @@ LMP2Status iterate_lmp2(
         const char* e = std::getenv("GANSU_DLPNO_LMP2_PICACHE_GATHER");
         return !e || e[0] != '0';
     }();
-    std::vector<std::vector<int>> needed_ikl_per_pair;
-    if (picache_gather) {
-        needed_ikl_per_pair.resize(pairs.size());
-        for (size_t idx = 0; idx < pairs.size(); ++idx) {
-            if (pairs[idx].n_pno == 0) continue;
-            const int i = setups[idx].i, j = setups[idx].j;
-            std::vector<int>& nb = needed_ikl_per_pair[idx];
-            for (int k = 0; k < nocc; ++k) {           // i-coupling: (k, j)
-                if (k == i) continue;
-                const int idx_kj = pair_lookup[static_cast<size_t>(k) * nocc + j];
-                if (idx_kj >= 0 && pairs[idx_kj].n_pno > 0) nb.push_back(idx_kj);
-            }
-            for (int l = 0; l < nocc; ++l) {           // j-coupling: (i, l)
-                if (l == j) continue;
-                const int idx_il = pair_lookup[static_cast<size_t>(i) * nocc + l];
-                if (idx_il >= 0 && pairs[idx_il].n_pno > 0) nb.push_back(idx_il);
-            }
-            std::sort(nb.begin(), nb.end());
-            nb.erase(std::unique(nb.begin(), nb.end()), nb.end());
-        }
-    }
+    // needed_ikl_per_pair is now built once early (above), so the sparse barS
+    // build and the gather rebuild_needed call share the same coupling list.
 
     for (int iter = 0; iter < max_iter; ++iter) {
         for (size_t idx = 0; idx < pairs.size(); ++idx) {
