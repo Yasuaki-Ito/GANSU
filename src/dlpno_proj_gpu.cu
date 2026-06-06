@@ -283,10 +283,19 @@ bool TripleProjGpu::project_for_triple(
     std::vector<std::vector<real_t>>& T_il_ext_out,
     std::vector<std::vector<real_t>>& T_jl_ext_out,
     std::vector<std::vector<real_t>>& T_kl_ext_out,
-    std::array<std::vector<real_t>, 9>& T_part_out)
+    std::array<std::vector<real_t>, 9>& T_part_out,
+    bool download,
+    int* b_il, int* b_jl, int* b_kl, int* b_part, void* ev)
 {
     if (!active_) return false;
     if (n_tno <= 0 || n_tno > max_n_) return false;
+    // Device-pack: pre-clear the inverse batch map (logical → -1).
+    if (!download) {
+        if (b_il)   for (int l = 0; l < nocc_; ++l) b_il[l] = -1;
+        if (b_jl)   for (int l = 0; l < nocc_; ++l) b_jl[l] = -1;
+        if (b_kl)   for (int l = 0; l < nocc_; ++l) b_kl[l] = -1;
+        if (b_part) for (int s = 0; s < 9; ++s)     b_part[s] = -1;
+    }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_);
     cublasHandle_t cublas = reinterpret_cast<cublasHandle_t>(cublas_);
@@ -346,6 +355,10 @@ bool TripleProjGpu::project_for_triple(
 
     const int batch_n = static_cast<int>(slot_idx.size());
     if (batch_n == 0) {
+        if (!download) {
+            if (ev) cudaEventRecord(reinterpret_cast<cudaEvent_t>(ev), stream);
+            return true;
+        }
         T_il_ext_out.assign(nocc_, {});
         T_jl_ext_out.assign(nocc_, {});
         T_kl_ext_out.assign(nocc_, {});
@@ -454,6 +467,20 @@ bool TripleProjGpu::project_for_triple(
                       batch_n),
                   "DGEMM step 3 (T = R^T · RY)");
 
+    // Device-pack path: leave T results in d_T_batch_ (slot b at b·n², row-major
+    // (c,d)); expose the inverse batch map and record the event. No D2H.
+    if (!download) {
+        for (int b = 0; b < batch_n; ++b) {
+            const int slot = slot_idx[b];
+            if      (slot < slot_jl_base)   { if (b_il)   b_il[slot - slot_il_base]   = b; }
+            else if (slot < slot_kl_base)   { if (b_jl)   b_jl[slot - slot_jl_base]   = b; }
+            else if (slot < slot_part_base) { if (b_kl)   b_kl[slot - slot_kl_base]   = b; }
+            else                            { if (b_part) b_part[slot - slot_part_base] = b; }
+        }
+        if (ev) cudaEventRecord(reinterpret_cast<cudaEvent_t>(ev), stream);
+        return true;
+    }
+
     // Download T_batch to pinned host buffer (only first batch_n slots used).
     const size_t download_words = static_cast<size_t>(batch_n) * n * n;
     check_cuda_(cudaMemcpyAsync(h_pinned_T_, d_T_batch_,
@@ -499,7 +526,8 @@ bool TripleProjGpu::project_for_triple(
     std::vector<std::vector<real_t>>&,
     std::vector<std::vector<real_t>>&,
     std::vector<std::vector<real_t>>&,
-    std::array<std::vector<real_t>, 9>&) { return false; }
+    std::array<std::vector<real_t>, 9>&,
+    bool, int*, int*, int*, int*, void*) { return false; }
 
 #endif
 

@@ -288,6 +288,94 @@ __global__ void contract36_batched_kernel(
 } // anonymous namespace
 
 // ===========================================================================
+//  Device-pack kernels (GANSU_DLPNO_T_DEVICE_PACK)
+//  Copy GPU-resident K/M/T into one d_input_ slot with the SAME padded/
+//  transposed layout that host add_to_batch produces (so flush_batch's
+//  energy kernels are unchanged). Each kernel is a 1D grid-stride over the
+//  valid [0,n) element count; the slot was zeroed (cudaMemsetAsync) first so
+//  padding (n→max_n) and empty (b<0) entries stay zero.
+// ===========================================================================
+__global__ void pack_K_dev_kernel(real_t* __restrict__ dst,        // H + off_K_
+                                  const real_t* __restrict__ d_K,  // 3·n³ (s,a,b,d)
+                                  int n, int mn) {
+    const size_t total = static_cast<size_t>(3) * n * n * n;
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const int d = static_cast<int>(idx % n);
+        size_t r = idx / n;
+        const int b = static_cast<int>(r % n); r /= n;
+        const int a = static_cast<int>(r % n); r /= n;
+        const int s = static_cast<int>(r);          // 0..2
+        const size_t dst_i =
+            (static_cast<size_t>(s) * mn * mn + (static_cast<size_t>(a) * mn + b)) * mn + d;
+        dst[dst_i] = d_K[idx];
+    }
+}
+
+__global__ void pack_M_dev_kernel(real_t* __restrict__ dst,        // H + off_M_
+                                  const real_t* __restrict__ d_M,  // 9·nocc·n (slot,l,a)
+                                  int n, int nocc, int mn) {
+    const size_t total = static_cast<size_t>(9) * nocc * n;
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const int a = static_cast<int>(idx % n);
+        size_t r = idx / n;
+        const int l = static_cast<int>(r % nocc); r /= nocc;
+        const int slot = static_cast<int>(r);       // 0..8
+        if (slot / 3 == slot % 3) continue;         // diagonal slots unused
+        const size_t dst_i = (static_cast<size_t>(slot) * nocc + l) * mn + a;
+        const size_t src_i = (static_cast<size_t>(slot) * nocc + l) * n  + a;
+        dst[dst_i] = d_M[src_i];
+    }
+}
+
+__global__ void pack_Tpart_dev_kernel(real_t* __restrict__ dst,    // H + off_T_part_
+                                      const real_t* __restrict__ d_T_batch,
+                                      const int* __restrict__ d_b_part,
+                                      int n, int mn) {
+    // element (slot, c, d); transpose [c,d] → [d,c]
+    const size_t total = static_cast<size_t>(9) * n * n;
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const int d = static_cast<int>(idx % n);
+        size_t r = idx / n;
+        const int c = static_cast<int>(r % n); r /= n;
+        const int slot = static_cast<int>(r);       // 0..8
+        if (slot / 3 == slot % 3) continue;
+        const int b = d_b_part[slot];
+        if (b < 0) continue;
+        dst[static_cast<size_t>(slot) * mn * mn + static_cast<size_t>(d) * mn + c] =
+            d_T_batch[static_cast<size_t>(b) * n * n + static_cast<size_t>(c) * n + d];
+    }
+}
+
+__global__ void pack_Text_dev_kernel(real_t* __restrict__ dst,     // H + off_T_ext_
+                                     const real_t* __restrict__ d_T_batch,
+                                     const int* __restrict__ d_b_il,
+                                     const int* __restrict__ d_b_jl,
+                                     const int* __restrict__ d_b_kl,
+                                     int n, int nocc, int mn) {
+    // element (which∈{0,1,2}, l, a, b); transpose [a,b] → [b,a]
+    const size_t total = static_cast<size_t>(3) * nocc * n * n;
+    const size_t mn2    = static_cast<size_t>(mn) * mn;
+    const size_t no_mn2 = static_cast<size_t>(nocc) * mn2;
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const int bb = static_cast<int>(idx % n);   // the 'b' index
+        size_t r = idx / n;
+        const int a = static_cast<int>(r % n); r /= n;
+        const int l = static_cast<int>(r % nocc); r /= nocc;
+        const int which = static_cast<int>(r);      // 0,1,2
+        const int* map = (which == 0) ? d_b_il : (which == 1) ? d_b_jl : d_b_kl;
+        const int bidx = map[l];
+        if (bidx < 0) continue;
+        dst[static_cast<size_t>(which) * no_mn2 + static_cast<size_t>(l) * mn2
+            + static_cast<size_t>(bb) * mn + a] =
+            d_T_batch[static_cast<size_t>(bidx) * n * n + static_cast<size_t>(a) * n + bb];
+    }
+}
+
+// ===========================================================================
 //  Class implementation
 // ===========================================================================
 
@@ -369,6 +457,10 @@ TripleTGpu::TripleTGpu(int max_n_tno, int nocc, int max_batch)
     ok &= try_alloc_d(&d_eps_sum_,   sizeof(real_t) * B);
     ok &= try_alloc_di(&d_n_tno_,    sizeof(int) * B);
     ok &= try_alloc_di(&d_d3_factor_, sizeof(int) * B);
+    ok &= try_alloc_di(&d_b_il_,     sizeof(int) * nocc);
+    ok &= try_alloc_di(&d_b_jl_,     sizeof(int) * nocc);
+    ok &= try_alloc_di(&d_b_kl_,     sizeof(int) * nocc);
+    ok &= try_alloc_di(&d_b_part_,   sizeof(int) * 9);
 
     if (ok) {
         ok &= (cudaHostAlloc(reinterpret_cast<void**>(&h_pinned_input_),
@@ -405,8 +497,13 @@ TripleTGpu::TripleTGpu(int max_n_tno, int nocc, int max_batch)
         if (h_pinned_n_tno_)    cudaFreeHost(h_pinned_n_tno_);
         if (h_pinned_d3_)       cudaFreeHost(h_pinned_d3_);
         if (h_pinned_eps_sum_)  cudaFreeHost(h_pinned_eps_sum_);
+        if (d_b_il_)            cudaFree(d_b_il_);
+        if (d_b_jl_)            cudaFree(d_b_jl_);
+        if (d_b_kl_)            cudaFree(d_b_kl_);
+        if (d_b_part_)          cudaFree(d_b_part_);
         d_input_ = d_W_ = d_R3W_ = d_D_inv_ = d_partial_ = d_eps_sum_ = nullptr;
         d_n_tno_ = d_d3_factor_ = nullptr;
+        d_b_il_ = d_b_jl_ = d_b_kl_ = d_b_part_ = nullptr;
         h_pinned_input_ = h_pinned_partial_ = h_pinned_eps_sum_ = nullptr;
         h_pinned_n_tno_ = h_pinned_d3_ = nullptr;
         active_ = false;
@@ -433,6 +530,10 @@ TripleTGpu::~TripleTGpu() {
     if (h_pinned_n_tno_)    cudaFreeHost(h_pinned_n_tno_);
     if (h_pinned_d3_)       cudaFreeHost(h_pinned_d3_);
     if (h_pinned_eps_sum_)  cudaFreeHost(h_pinned_eps_sum_);
+    if (d_b_il_)            cudaFree(d_b_il_);
+    if (d_b_jl_)            cudaFree(d_b_jl_);
+    if (d_b_kl_)            cudaFree(d_b_kl_);
+    if (d_b_part_)          cudaFree(d_b_part_);
 }
 
 void TripleTGpu::begin_batch() {
@@ -550,6 +651,78 @@ bool TripleTGpu::add_to_batch(
     return true;
 }
 
+bool TripleTGpu::add_to_batch_device(
+    int i, int j, int k,
+    real_t eps_i, real_t eps_j, real_t eps_k,
+    const TNOData& tno,
+    real_t* d_K, real_t* d_M, real_t* d_T_batch,
+    const int* b_il, const int* b_jl, const int* b_kl, const int* b_part,
+    void* ev_eri, void* ev_proj, int nocc)
+{
+    if (!active_) return false;
+    if (batch_n_ >= max_batch_) return false;
+    const int n = tno.n_tno;
+    if (n == 0) { device_packed_ = true; return true; }   // no-op slot
+    if (n > max_n_ || nocc != nocc_) return false;
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_);
+
+    // Cross-stream ordering: the pack reads K/M (eri stream) and T (proj
+    // stream); wait for both producers' completion events before packing.
+    if (ev_eri)  cudaStreamWaitEvent(stream, reinterpret_cast<cudaEvent_t>(ev_eri),  0);
+    if (ev_proj) cudaStreamWaitEvent(stream, reinterpret_cast<cudaEvent_t>(ev_proj), 0);
+
+    real_t* H = d_input_ + static_cast<size_t>(batch_n_) * per_triple_words_;
+    // Zero the padded slot on device; pack kernels write only the [0,n) regions.
+    cudaMemsetAsync(H, 0, sizeof(real_t) * per_triple_words_, stream);
+
+    // Upload the per-triple proj inverse batch map (tiny; reused buffer — the
+    // end-of-call stream sync guarantees the pack kernels read it before the
+    // next triple overwrites it).
+    cudaMemcpyAsync(d_b_il_,   b_il,   sizeof(int) * nocc_, cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_b_jl_,   b_jl,   sizeof(int) * nocc_, cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_b_kl_,   b_kl,   sizeof(int) * nocc_, cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_b_part_, b_part, sizeof(int) * 9,     cudaMemcpyHostToDevice, stream);
+
+    const int TPB = 128;
+    auto nblk = [](size_t total) -> int {
+        size_t b = (total + TPB - 1) / TPB;
+        if (b < 1) b = 1; if (b > 65535) b = 65535;
+        return static_cast<int>(b);
+    };
+    pack_K_dev_kernel<<<nblk(static_cast<size_t>(3) * n * n * n), TPB, 0, stream>>>(
+        H + off_K_, d_K, n, max_n_);
+    pack_M_dev_kernel<<<nblk(static_cast<size_t>(9) * nocc_ * n), TPB, 0, stream>>>(
+        H + off_M_, d_M, n, nocc_, max_n_);
+    pack_Tpart_dev_kernel<<<nblk(static_cast<size_t>(9) * n * n), TPB, 0, stream>>>(
+        H + off_T_part_, d_T_batch, d_b_part_, n, max_n_);
+    pack_Text_dev_kernel<<<nblk(static_cast<size_t>(3) * nocc_ * n * n), TPB, 0, stream>>>(
+        H + off_T_ext_, d_T_batch, d_b_il_, d_b_jl_, d_b_kl_, n, nocc_, max_n_);
+
+    // eps_tno is host-resident (from TNOData) → small H2D into the slot.
+    cudaMemcpyAsync(H + off_eps_, tno.eps_tno.data(),
+                    sizeof(real_t) * n, cudaMemcpyHostToDevice, stream);
+
+    // Serialize: the pack must finish reading the producers' scratch
+    // (d_K/d_M/d_T_batch, overwritten on the next triple) and d_b_* before the
+    // caller issues the next eri/proj. The pack is a device-bandwidth memset +
+    // 4 small kernels (~µs), so this per-triple sync is cheap vs the eliminated
+    // host memset/pack.
+    cudaStreamSynchronize(stream);
+
+    // Host scalar metadata (identical to the host add_to_batch path).
+    h_pinned_n_tno_[batch_n_] = n;
+    if (n > batch_max_n_) batch_max_n_ = n;
+    int d3 = 1;
+    if (i == j && j == k)        d3 = 6;
+    else if (i == j || j == k)   d3 = 2;
+    h_pinned_d3_[batch_n_]      = d3;
+    h_pinned_eps_sum_[batch_n_] = eps_i + eps_j + eps_k;
+    ++batch_n_;
+    device_packed_ = true;
+    return true;
+}
+
 real_t TripleTGpu::flush_batch() {
     if (!active_ || batch_n_ == 0) {
         batch_n_ = 0;
@@ -560,11 +733,15 @@ real_t TripleTGpu::flush_batch() {
     const int mn = max_n_;          // slot stride (constant across batches)
     const int gn = batch_max_n_;    // tight grid bound: actual max n in this batch
 
-    // -- Single big H→D upload of the batched input + scalars
-    check_cuda_(cudaMemcpyAsync(d_input_, h_pinned_input_,
-                                sizeof(real_t) * N * per_triple_words_,
-                                cudaMemcpyHostToDevice, stream),
-                "memcpy batched input");
+    // -- Single big H→D upload of the batched input + scalars. In device-pack
+    //    mode the per-triple slots were written directly into d_input_ by the
+    //    pack kernels, so skip the input H2D (scalars stay host-staged).
+    if (!device_packed_) {
+        check_cuda_(cudaMemcpyAsync(d_input_, h_pinned_input_,
+                                    sizeof(real_t) * N * per_triple_words_,
+                                    cudaMemcpyHostToDevice, stream),
+                    "memcpy batched input");
+    }
     check_cuda_(cudaMemcpyAsync(d_n_tno_, h_pinned_n_tno_,
                                 sizeof(int) * N,
                                 cudaMemcpyHostToDevice, stream),
@@ -671,6 +848,10 @@ bool   TripleTGpu::add_to_batch(int,int,int,real_t,real_t,real_t,
                                 const std::vector<std::vector<real_t>>&,
                                 const std::vector<std::vector<real_t>>&,
                                 int) { return false; }
+bool   TripleTGpu::add_to_batch_device(int,int,int,real_t,real_t,real_t,
+                                const TNOData&,real_t*,real_t*,real_t*,
+                                const int*,const int*,const int*,const int*,
+                                void*,void*,int) { return false; }
 real_t TripleTGpu::flush_batch()       { return real_t(0); }
 real_t TripleTGpu::compute_triple(int, int, int,
     real_t, real_t, real_t,

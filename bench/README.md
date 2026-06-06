@@ -6,8 +6,10 @@ Measures, per method, on **H200×4**:
 3. **GANSU (GPU) vs ORCA (CPU) wall time** at production settings.
 
 Methods: `rihf` (distributed RI-HF), `rimp2` (RI-MP2), `dlpno_ccsd` (DLPNO-CCSD ground
-state — yields both DLPNO-MP2 and CCSD phase times), `dlpno_steom` (STEOM-DLPNO-CCSD,
-frozen-core, env-free auto-scaling).
+state — yields both DLPNO-MP2 and CCSD phase times), `dlpno_ccsd_t` (DLPNO-CCSD(T),
+perturbative triples on top of the ground CCSD — O(N^7), steeper size ceiling),
+`dlpno_steom` (STEOM-DLPNO-CCSD, frozen-core, env-free auto-scaling).
+All DLPNO methods run `--frozen_core auto` (matches ORCA's default frozen core).
 
 All GANSU runs use **spherical harmonics** (`--use_spherical 1`, 5D/7F) and the **SAD**
 initial guess — cc-pVDZ is defined spherical and ORCA uses spherical for cc-pVnZ by

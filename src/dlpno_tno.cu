@@ -22,9 +22,10 @@ TNOBuilder::TNOBuilder(const std::vector<PairData>& pairs,
                        const real_t* F_AO,
                        const real_t* S_AO,
                        int nao,
-                       real_t tol_lin_dep)
+                       real_t tol_lin_dep,
+                       real_t t_cut_tno)
     : pairs_(pairs), F_AO_(F_AO), S_AO_(S_AO), nao_(nao),
-      tol_lin_dep_(tol_lin_dep) {
+      tol_lin_dep_(tol_lin_dep), t_cut_tno_(t_cut_tno) {
     if (F_AO == nullptr || S_AO == nullptr)
         throw std::invalid_argument("TNOBuilder: F_AO/S_AO null");
     if (nao <= 0)
@@ -96,10 +97,55 @@ TNOData TNOBuilder::build_for_triple(int idx_ij,
     // By construction: Q_orth^T · S_AO · Q_orth = I_n_keep.
     RowMatXd Q_orth = Q_union * M; // (nao × n_keep)
 
-    // Step 7: project Fock onto the orthonormal subspace.
-    // F_sub[a, b] = Q_orth_col_a^T · F_AO · Q_orth_col_b.
-    const RowMatXd FQ = F_map * Q_orth;             // (nao × n_keep)
-    RowMatXd F_sub = Q_orth.transpose() * FQ;       // (n_keep × n_keep)
+    // Step 6b: TNO occupation-number truncation (t_cut_tno > 0). Build the
+    // triple pair density D in the orthonormal union span — the sum of the
+    // three pair PNO densities Dp = T̃·Tᵀ + T̃ᵀ·T (T̃ = 2T − Tᵀ, T = Y_pair),
+    // each mapped into the union via R_p = Q_orthᵀ·S·bar_Q_p — diagonalise it,
+    // and keep only directions whose occupation exceeds t_cut_tno. This is the
+    // ORCA-style TNO truncation that makes per-triple cost (~n_tno³) affordable;
+    // the union span (Q_orth, n_keep) is the most-complete/slowest limit (off).
+    int      n_use = n_keep;
+    RowMatXd Q_use = Q_orth;   // (nao × n_use), S-orthonormal
+    if (t_cut_tno_ > 0.0) {
+        RowMatXd D = RowMatXd::Zero(n_keep, n_keep);
+        const PairData* trip[3] = {&p_ij, &p_ik, &p_jk};
+        for (int t = 0; t < 3; ++t) {
+            const PairData& p = *trip[t];
+            const int n_p = p.n_pno;
+            if (n_p == 0 || p.Y.empty()) continue;
+            Eigen::Map<const RowMatXd> bQ_p(p.bar_Q.data(), nao_, n_p);
+            const RowMatXd R_p =
+                Q_orth.transpose() * (S_map * bQ_p);          // (n_keep × n_p)
+            Eigen::Map<const RowMatXd> T(p.Y.data(), n_p, n_p);
+            const RowMatXd Ttil = 2.0 * T - T.transpose();
+            RowMatXd Dp = Ttil * T.transpose()
+                        + Ttil.transpose() * T;               // (n_p × n_p)
+            Dp = 0.5 * (Dp + Dp.transpose());
+            D.noalias() += R_p * Dp * R_p.transpose();
+        }
+        D = 0.5 * (D + D.transpose());
+        Eigen::SelfAdjointEigenSolver<RowMatXd> es_D(D);
+        if (es_D.info() == Eigen::Success) {
+            const Eigen::VectorXd d_eig = es_D.eigenvalues();   // ascending
+            const RowMatXd        d_vec = es_D.eigenvectors();
+            int n_tno = 0;
+            for (int k = 0; k < n_keep; ++k)
+                if (d_eig(k) > t_cut_tno_) ++n_tno;
+            if (n_tno > 0 && n_tno < n_keep) {
+                // Keep the largest-occupation directions (tail, ascending order).
+                RowMatXd U_keep(n_keep, n_tno);
+                for (int k = 0; k < n_tno; ++k)
+                    U_keep.col(k) = d_vec.col(n_keep - n_tno + k);
+                Q_use = Q_orth * U_keep;   // (nao × n_tno), still S-orthonormal
+                n_use = n_tno;
+            }
+        }
+    }
+
+    // Step 7: project Fock onto the (possibly truncated) orthonormal subspace.
+    // F_sub[a, b] = Q_use_col_a^T · F_AO · Q_use_col_b.
+    const RowMatXd FQ = F_map * Q_use;              // (nao × n_use)
+    RowMatXd F_sub = Q_use.transpose() * FQ;        // (n_use × n_use)
     F_sub = 0.5 * (F_sub + F_sub.transpose());
 
     // Step 8: diagonalise F_sub to get semi-canonical TNOs.
@@ -109,15 +155,15 @@ TNOData TNOBuilder::build_for_triple(int idx_ij,
     const Eigen::VectorXd f_eigvals = es_F.eigenvalues(); // ascending
     const RowMatXd        V_can     = es_F.eigenvectors();
 
-    // Step 9: pack results. Q_tno = Q_orth · V_can (nao × n_keep), eps in
+    // Step 9: pack results. Q_tno = Q_use · V_can (nao × n_use), eps in
     // ascending order (matches LMO Fock convention used elsewhere).
-    RowMatXd Q_tno = Q_orth * V_can;
+    RowMatXd Q_tno = Q_use * V_can;
 
-    out.n_tno = n_keep;
-    out.Q_tno.assign(static_cast<size_t>(nao_) * n_keep, 0.0);
-    out.eps_tno.assign(n_keep, 0.0);
-    Eigen::Map<RowMatXd>(out.Q_tno.data(), nao_, n_keep) = Q_tno;
-    for (int k = 0; k < n_keep; ++k) out.eps_tno[k] = f_eigvals(k);
+    out.n_tno = n_use;
+    out.Q_tno.assign(static_cast<size_t>(nao_) * n_use, 0.0);
+    out.eps_tno.assign(n_use, 0.0);
+    Eigen::Map<RowMatXd>(out.Q_tno.data(), nao_, n_use) = Q_tno;
+    for (int k = 0; k < n_use; ++k) out.eps_tno[k] = f_eigvals(k);
 
     return out;
 }

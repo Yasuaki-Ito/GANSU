@@ -209,7 +209,8 @@ bool EriBuildGpu::build_eri_and_m(const real_t* Q_tno_host,
                                    int n_tno,
                                    const int triple_lmos[3],
                                    std::vector<real_t>& K_iadc_out,
-                                   std::array<std::vector<real_t>, 9>& M_out)
+                                   std::array<std::vector<real_t>, 9>& M_out,
+                                   bool download)
 {
     if (!active_) return false;
     if (n_tno <= 0 || n_tno > max_n_) return false;
@@ -380,6 +381,11 @@ bool EriBuildGpu::build_eri_and_m(const real_t* Q_tno_host,
         }
     }
 
+    // Device-pack path: leave K/M on device (d_K_iadc_/d_M_), skip the D2H.
+    // The DGEMMs above are queued async on `stream`; the caller records an
+    // event on `stream` (build_eri_and_m_device) for cross-stream ordering.
+    if (!download) return true;
+
     // -----------------------------------------------------------------
     // Download K_iadc and M tensors to host pinned buffers.
     // -----------------------------------------------------------------
@@ -413,6 +419,21 @@ bool EriBuildGpu::build_eri_and_m(const real_t* Q_tno_host,
     return true;
 }
 
+bool EriBuildGpu::build_eri_and_m_device(const real_t* Q_tno_host,
+                                          int n_tno,
+                                          const int triple_lmos[3],
+                                          void* ev)
+{
+    std::vector<real_t> dummy_K;
+    std::array<std::vector<real_t>, 9> dummy_M;
+    if (!build_eri_and_m(Q_tno_host, n_tno, triple_lmos, dummy_K, dummy_M,
+                         /*download=*/false))
+        return false;
+    cudaEventRecord(reinterpret_cast<cudaEvent_t>(ev),
+                    reinterpret_cast<cudaStream_t>(stream_));
+    return true;
+}
+
 #else // GANSU_CPU_ONLY: stub-out
 
 EriBuildGpu::EriBuildGpu(const real_t*, const real_t*, const real_t*,
@@ -421,7 +442,10 @@ EriBuildGpu::~EriBuildGpu() = default;
 bool EriBuildGpu::build_eri_and_m(
     const real_t*, int, const int*,
     std::vector<real_t>&,
-    std::array<std::vector<real_t>, 9>&) { return false; }
+    std::array<std::vector<real_t>, 9>&, bool) { return false; }
+
+bool EriBuildGpu::build_eri_and_m_device(
+    const real_t*, int, const int*, void*) { return false; }
 
 #endif
 

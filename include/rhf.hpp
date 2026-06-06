@@ -43,6 +43,7 @@ namespace gansu{
 class Convergence_RHF;
 class Convergence_RHF_Damping;
 class Convergence_RHF_DIIS;
+struct DLPNOLMP2Result;   // dlpno_mp2.hpp — by-ref param of compute_dlpno_ccsd_capture
 
 /**
  * @brief RHF class
@@ -1021,6 +1022,10 @@ private:
 
     real_t compute_dlpno_mp2() override;     // DLPNO Phase 1
     real_t compute_dlpno_ccsd() override;    // DLPNO Phase 2
+    // Non-virtual variant that also hands back the converged LMP2 pair state
+    // (pre-CCSD-dressing) so compute_dlpno_ccsd_t can reuse it instead of
+    // re-solving LMP2. Returns the CCSD correlation energy.
+    real_t compute_dlpno_ccsd_capture(DLPNOLMP2Result& lmp2_out);
     real_t compute_dlpno_ccsd_t() override;  // DLPNO Phase 3 (skeleton)
 
     void compute_fock_matrix() override {

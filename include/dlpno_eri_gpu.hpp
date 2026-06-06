@@ -55,7 +55,23 @@ public:
                          int n_tno,
                          const int triple_lmos[3],
                          std::vector<real_t>& K_iadc_out,
-                         std::array<std::vector<real_t>, 9>& M_out);
+                         std::array<std::vector<real_t>, 9>& M_out,
+                         bool download = true);
+
+    /// Device-resident batch path (GANSU_DLPNO_T_DEVICE_PACK): run the same
+    /// DGEMMs but leave K/M on device (skip the D2H) and record `ev` on the
+    /// internal stream so a consumer on another stream can cudaStreamWaitEvent.
+    /// Returns false if inactive. Read the results via device_K()/device_M().
+    bool build_eri_and_m_device(const real_t* Q_tno_host,
+                                int n_tno,
+                                const int triple_lmos[3],
+                                void* ev /*cudaEvent_t*/);
+
+    /// Device pointers to the most recent build's K_iadc (3·n³, row-major
+    /// (s,a,b,d) stride max_n_tno-padded? NO — contiguous stride n) and M
+    /// (9·nocc·n, (slot,l,a) stride n; only 6 off-diag slots valid).
+    real_t* device_K() const { return d_K_iadc_; }
+    real_t* device_M() const { return d_M_; }
 
 private:
     bool  active_ = false;

@@ -56,6 +56,8 @@ for log in sorted(glob.glob(os.path.join(LOGDIR, "*.log"))):
     if mp2 is None:
         mp2 = grab(r"solve_dlpno_lmp2 = ([0-9.]+) s", t)
     ccsd   = grab(r"iterate_dlpno_ccsd_t2 = ([0-9.]+) s", t)                # s
+    # DLPNO-CCSD(T) perturbative triples loop (printed at dlpno_verbose>=2; NA otherwise).
+    triples = grab(r"run_phase33_triple_loop=([0-9.]+)s", t)                # s
     # Timing Summary block: "<fn>: <val> microseconds total" (values are ms)
     def summ(fn):
         v = grab(rf"{fn}:\s*([0-9.]+)\s*microseconds", t)
@@ -78,13 +80,13 @@ for log in sorted(glob.glob(os.path.join(LOGDIR, "*.log"))):
         method=m["method"], num_gpus=int(m["ng"]), molecule=m["mol"],
         natoms=natoms, nbf=nbf, status=status_of(t),
         scf_iters=scf_iters, fock_per_iter_ms=fock_per_iter,
-        ri_Bbuild=ri_b, scf=scf, dlpno_mp2=mp2, dlpno_ccsd_t2=ccsd,
+        ri_Bbuild=ri_b, scf=scf, dlpno_mp2=mp2, dlpno_ccsd_t2=ccsd, triples=triples,
         cis=cis, ip_eom=ip, ea_eom=ea, steom=steom, postproc=pp,
     ))
 
 cols = ["method","num_gpus","molecule","natoms","nbf","status","wall_s",
         "scf_iters","fock_per_iter_ms","ri_Bbuild","scf","dlpno_mp2","dlpno_ccsd_t2",
-        "cis","ip_eom","ea_eom","steom","postproc"]
+        "triples","cis","ip_eom","ea_eom","steom","postproc"]
 
 # pull the authoritative wall_s from results_*.tsv (actual /SECONDS wall)
 wall = {}

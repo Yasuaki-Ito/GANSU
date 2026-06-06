@@ -11,6 +11,7 @@
 
 #include "types.hpp"
 #include "dlpno_params.hpp"
+#include "dlpno_mp2.hpp"   // DLPNOLMP2Result (value member for the (T) re-use)
 
 namespace gansu {
 
@@ -62,6 +63,14 @@ public:
     /// Throws gansu::Exception while the residual is under construction
     /// (sub-phases 2.1 onwards).
     real_t compute_energy();
+
+    /// DLPNO-CCSD(T) re-use hook: when capture_lmp2_ is set before
+    /// compute_energy(), the converged LMP2 pair state (amplitudes BEFORE the
+    /// CCSD dressing) is snapshotted into lmp2_snapshot_ so the (T) driver can
+    /// reuse it instead of re-solving LMP2 from scratch. Bit-exact w.r.t. the
+    /// re-solve (same thresholds; only verbose differs, which is numerics-inert).
+    bool             capture_lmp2_ = false;
+    DLPNOLMP2Result  lmp2_snapshot_;
 
 private:
     RHF& rhf_;

@@ -55,12 +55,19 @@ public:
      * @param nao         number of AO basis functions.
      * @param tol_lin_dep eigenvalue threshold for the union overlap to drop
      *                    redundant linear-dependent directions (default 1e-7).
+     * @param t_cut_tno   TNO occupation-number truncation threshold. When > 0,
+     *                    build_for_triple diagonalizes the triple pair density
+     *                    (sum of the 3 pair PNO densities) in the union span and
+     *                    keeps only directions with occupation > t_cut_tno,
+     *                    shrinking n_tno (per-triple cost ~ n_tno³). 0 = off =
+     *                    use the full union span (legacy, most accurate/slowest).
      */
     TNOBuilder(const std::vector<PairData>& pairs,
                const real_t* F_AO,
                const real_t* S_AO,
                int nao,
-               real_t tol_lin_dep = 1e-7);
+               real_t tol_lin_dep = 1e-7,
+               real_t t_cut_tno = 0.0);
 
     /**
      * @brief Build the semi-canonical TNO basis for triple (i, j, k).
@@ -77,6 +84,7 @@ private:
     const real_t* S_AO_;
     int           nao_;
     real_t        tol_lin_dep_;
+    real_t        t_cut_tno_;
 };
 
 /**

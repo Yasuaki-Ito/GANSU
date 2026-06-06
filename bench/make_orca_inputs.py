@@ -12,6 +12,7 @@ Method header lines (cc-pVDZ everywhere; frozen core = ORCA default = matches GA
   rihf        : ! RHF cc-pVDZ RIJCOSX             (ORCA production fast HF)
   rimp2       : ! RI-MP2 cc-pVDZ cc-pVDZ/C        (cc-pVDZ/C ≈ cc-pvdz-rifit aux)
   dlpno_ccsd  : ! DLPNO-CCSD cc-pVDZ cc-pVDZ/C
+  dlpno_ccsd_t: ! DLPNO-CCSD(T) cc-pVDZ cc-pVDZ/C   (semi-canonical (T0), ORCA default)
   dlpno_steom : ! STEOM-DLPNO-CCSD cc-pVDZ cc-pVDZ/C  + %mdci nroots 5
 NOTE: algorithms are not byte-identical to GANSU (e.g. ORCA HF=RIJCOSX vs GANSU full
 RI-JK); this measures *production-setting* wall time per package. Adjust headers to taste.
@@ -28,6 +29,7 @@ HEADERS = {
     "rihf":        "! RHF cc-pVDZ RIJCOSX TightSCF",
     "rimp2":       "! RI-MP2 cc-pVDZ cc-pVDZ/C TightSCF",
     "dlpno_ccsd":  "! DLPNO-CCSD cc-pVDZ cc-pVDZ/C TightSCF",
+    "dlpno_ccsd_t": "! DLPNO-CCSD(T) cc-pVDZ cc-pVDZ/C TightSCF",
     "dlpno_steom": "! STEOM-DLPNO-CCSD cc-pVDZ cc-pVDZ/C TightSCF",
 }
 EXTRA = {  # method-specific blocks

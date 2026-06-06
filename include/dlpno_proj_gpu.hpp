@@ -59,6 +59,13 @@ public:
     ///                    pair (i, l) is empty.
     ///   T_jl_ext_out, T_kl_ext_out  — similarly for j, k.
     ///   T_part_out[sp*3 + sq] for sp≠sq: t_{lmo_{sp}, lmo_{sq}}^{ab}.
+    /// When download=false (GANSU_DLPNO_T_DEVICE_PACK), the T results are left
+    /// in d_T_batch_ on device (T_*_out untouched); instead the inverse batch
+    /// map is written to the caller-provided arrays b_il/b_jl/b_kl (size nocc)
+    /// and b_part (size 9): b_*[logical] = batch index b into d_T_batch_, or -1
+    /// if that pair is empty. `ev` (cudaEvent_t) is recorded on the internal
+    /// stream for cross-stream ordering. Read the device tensor via
+    /// device_T_batch() — slot b is at offset b·n_tno², row-major (c,d).
     bool project_for_triple(
         const real_t* Q_tno_host,
         int n_tno,
@@ -66,7 +73,12 @@ public:
         std::vector<std::vector<real_t>>& T_il_ext_out,
         std::vector<std::vector<real_t>>& T_jl_ext_out,
         std::vector<std::vector<real_t>>& T_kl_ext_out,
-        std::array<std::vector<real_t>, 9>& T_part_out);
+        std::array<std::vector<real_t>, 9>& T_part_out,
+        bool download = true,
+        int* b_il = nullptr, int* b_jl = nullptr, int* b_kl = nullptr,
+        int* b_part = nullptr, void* ev = nullptr);
+
+    real_t* device_T_batch() const { return d_T_batch_; }
 
 private:
     bool  active_ = false;

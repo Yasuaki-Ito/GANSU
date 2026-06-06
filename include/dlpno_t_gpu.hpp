@@ -72,6 +72,22 @@ public:
         const std::vector<std::vector<real_t>>& T_kl_ext,
         int nocc);
 
+    /// Device-resident pack (GANSU_DLPNO_T_DEVICE_PACK): copy the GPU-resident
+    /// K/M/T (from EriBuildGpu::device_K/device_M and TripleProjGpu::
+    /// device_T_batch) directly into this triple's batch slot via device
+    /// kernels — NO host download / memset / transpose round-trip. ev_eri /
+    /// ev_proj are the producers' completion events (waited on for cross-stream
+    /// ordering). b_il/b_jl/b_kl (size nocc) + b_part (size 9) are the proj
+    /// inverse batch map (logical → d_T_batch slot, -1 = empty). Returns false
+    /// if the batch is full (caller flushes + retries).
+    bool add_to_batch_device(
+        int i, int j, int k,
+        real_t eps_i, real_t eps_j, real_t eps_k,
+        const TNOData& tno,
+        real_t* d_K, real_t* d_M, real_t* d_T_batch,
+        const int* b_il, const int* b_jl, const int* b_kl, const int* b_part,
+        void* ev_eri, void* ev_proj, int nocc);
+
     /// Compute the (T) energy contribution from all queued triples in one
     /// batched kernel launch. Returns the sum of contributions.
     real_t flush_batch();
@@ -132,6 +148,15 @@ private:
     int*    h_pinned_n_tno_   = nullptr;   // max_batch
     int*    h_pinned_d3_      = nullptr;   // max_batch
     real_t* h_pinned_eps_sum_ = nullptr;   // max_batch
+
+    // Device-pack (GANSU_DLPNO_T_DEVICE_PACK): proj inverse batch maps (reused
+    // per triple; pack kernels read them before the per-triple stream sync) +
+    // a flag telling flush_batch the slots are already device-resident.
+    int*  d_b_il_   = nullptr;   // nocc
+    int*  d_b_jl_   = nullptr;   // nocc
+    int*  d_b_kl_   = nullptr;   // nocc
+    int*  d_b_part_ = nullptr;   // 9
+    bool  device_packed_ = false;
 };
 
 } // namespace gansu

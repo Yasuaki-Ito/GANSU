@@ -667,6 +667,16 @@ real_t DLPNOCCSD::compute_energy()
                   << std::endl;
     }
 
+    // (T) re-use: snapshot the converged LMP2 amplitudes BEFORE the CCSD
+    // dressing below mutates res.pairs[].Y in place, so the (T) driver can
+    // reuse this LMP2 pair state instead of re-solving LMP2 from scratch.
+    std::vector<std::vector<real_t>> lmp2_Y_snap;
+    if (capture_lmp2_) {
+        lmp2_Y_snap.resize(res.pairs.size());
+        for (size_t idx = 0; idx < res.pairs.size(); ++idx)
+            lmp2_Y_snap[idx] = res.pairs[idx].Y;
+    }
+
     LMP2Status t2_status{};
     const auto t_iter_0 = prof_clock::now();
     {
@@ -1630,6 +1640,16 @@ real_t DLPNOCCSD::compute_energy()
         }
     }
 
+    // (T) re-use: restore the LMP2 amplitudes (undo the in-place CCSD dressing)
+    // and hand the LMP2 pair state to the (T) driver via lmp2_snapshot_. The
+    // CCSD correlation energy (E_total) was already computed from the dressed
+    // amplitudes above, so restoring Y here does not change it.
+    if (capture_lmp2_) {
+        for (size_t idx = 0; idx < res.pairs.size(); ++idx)
+            res.pairs[idx].Y = lmp2_Y_snap[idx];
+        lmp2_snapshot_ = std::move(res);
+    }
+
     return E_total;
 }
 
@@ -1662,6 +1682,37 @@ real_t ERI_RI_RHF::compute_dlpno_ccsd() {
         rhf_.get_dlpno_verbose());
     DLPNOCCSD driver(rhf_, *this, std::move(p));
     return driver.compute_energy();
+}
+
+real_t ERI_RI_RHF::compute_dlpno_ccsd_capture(DLPNOLMP2Result& lmp2_out) {
+    // Same as compute_dlpno_ccsd() but captures the converged LMP2 pair state
+    // (pre-CCSD-dressing) into lmp2_out so the (T) driver can reuse it instead
+    // of re-solving LMP2 — bit-exact, ~LMP2-time saved.
+    OmpThreadCapGuard omp_cap(rhf_.get_dlpno_cpu_threads());
+    DLPNOParams p = resolve_dlpno_params(
+        rhf_.get_dlpno_preset(),
+        rhf_.get_dlpno_localizer(),
+        rhf_.get_dlpno_t_cut_pno(),
+        rhf_.get_dlpno_t_cut_do(),
+        rhf_.get_dlpno_t_cut_pairs(),
+        rhf_.get_dlpno_t_cut_mkn(),
+        rhf_.get_dlpno_t_cut_triples(),
+        rhf_.get_dlpno_t_cut_tno(),
+        rhf_.get_dlpno_pair_distance_cutoff(),
+        rhf_.get_dlpno_max_iter(),
+        rhf_.get_dlpno_diis_size(),
+        rhf_.get_dlpno_localizer_max_sweep(),
+        rhf_.get_dlpno_localizer_conv(),
+        rhf_.get_dlpno_lmp2_max_iter(),
+        rhf_.get_dlpno_lmp2_conv(),
+        rhf_.get_dlpno_sc_pno_iter(),
+        rhf_.get_dlpno_pno_os_only(),
+        rhf_.get_dlpno_verbose());
+    DLPNOCCSD driver(rhf_, *this, std::move(p));
+    driver.capture_lmp2_ = true;
+    const real_t e = driver.compute_energy();
+    lmp2_out = std::move(driver.lmp2_snapshot_);
+    return e;
 }
 
 // ---------------------------------------------------------------------------
@@ -1803,6 +1854,30 @@ real_t run_phase33_triple_loop(const DLPNOLMP2Result& res,
     long long skipped_empty = 0;
     long long sum_union_size = 0;
     int max_union_size = 0;
+
+    // Phase 3.2.7 — triples-energy prescreen (ORCA-style). When
+    // GANSU_DLPNO_T_PRESCREEN=<thresh> (>0) is set, skip a triple whose cheap
+    // amplitude-product estimate is below <thresh>; 0/unset = off = compute all
+    // active triples (today's behavior, bit-identical). The estimate
+    //   e_ijk^est = |Y_ij|·|Y_ik| + |Y_ij|·|Y_jk| + |Y_ik|·|Y_jk|
+    // (the three pair channels feeding a triple) is a near-free proxy for the
+    // (T) contribution magnitude (|Y|_F = Frobenius norm of the LMP2 amplitude).
+    // Calibrate <thresh> by sweeping vs the unscreened E((T)) — the (T) energy
+    // must stay within the intended truncation error. This is the GANSU
+    // analogue of ORCA's TCutTriplesPreScreen that makes DLPNO-(T) affordable.
+    const char* presc_env = std::getenv("GANSU_DLPNO_T_PRESCREEN");
+    const real_t t_prescreen = (presc_env != nullptr) ? std::atof(presc_env) : 0.0;
+    long long skipped_prescreen = 0;
+    std::vector<real_t> s_norm;
+    if (t_prescreen > 0.0) {
+        s_norm.assign(res.pairs.size(), 0.0);
+        for (size_t p = 0; p < res.pairs.size(); ++p) {
+            real_t s = 0.0;
+            for (real_t y : res.pairs[p].Y) s += y * y;
+            s_norm[p] = std::sqrt(s);
+        }
+    }
+
     for (int i = 0; i < nocc; ++i)
         for (int j = i; j < nocc; ++j)
             for (int k = j; k < nocc; ++k) {
@@ -1817,6 +1892,12 @@ real_t run_phase33_triple_loop(const DLPNOLMP2Result& res,
                     ++skipped_empty;
                     continue;
                 }
+                if (t_prescreen > 0.0) {
+                    const real_t e_est = s_norm[idx_ij] * s_norm[idx_ik]
+                                       + s_norm[idx_ij] * s_norm[idx_jk]
+                                       + s_norm[idx_ik] * s_norm[idx_jk];
+                    if (e_est < t_prescreen) { ++skipped_prescreen; continue; }
+                }
                 const int u = n_ij + n_ik + n_jk;
                 sum_union_size += u;
                 max_union_size = std::max(max_union_size, u);
@@ -1825,7 +1906,22 @@ real_t run_phase33_triple_loop(const DLPNOLMP2Result& res,
             }
 
     // Phase 3.2.0: TNO builder is shared across threads (read-only).
-    TNOBuilder tno_builder(res.pairs, h_F, h_S, nao);
+    // TNO occupation-number truncation (env GANSU_DLPNO_T_CUT_TNO=<thresh>, 0/unset
+    // = off = full union span = today's behavior). Per-triple cost ~ n_tno³, so a
+    // nonzero threshold (e.g. 1e-8) shrinks the avg TNO (≈44 → ~20) for a large
+    // speedup; calibrate vs the unscreened E((T)) like the prescreen threshold.
+    const char* tcut_tno_env = std::getenv("GANSU_DLPNO_T_CUT_TNO");
+    const real_t t_cut_tno = (tcut_tno_env != nullptr) ? std::atof(tcut_tno_env) : 0.0;
+    TNOBuilder tno_builder(res.pairs, h_F, h_S, nao, /*tol_lin_dep=*/1e-7, t_cut_tno);
+
+    // Device-resident batch pack (eliminates the per-triple host memset + pack
+    // round-trip; eri/proj K/M/T stay on device and are written straight into
+    // the energy batch slot by device kernels). Default ON (validated bit-exact
+    // on Anthracene + PTCDA; falls back to the host path when the GPU helpers
+    // are inactive). Opt out with GANSU_DLPNO_T_DEVICE_PACK=0.
+    const char* devpack_env = std::getenv("GANSU_DLPNO_T_DEVICE_PACK");
+    const bool kDevPack = (devpack_env == nullptr)
+                          || (std::string(devpack_env) != "0");
 
     // Per-thread accumulators (one entry per GPU = OpenMP thread).
     const int n_threads = std::max(1, num_gpus);
@@ -1876,6 +1972,33 @@ real_t run_phase33_triple_loop(const DLPNOLMP2Result& res,
     // Per-thread setup wall time (outside the per-triple sections).
     std::vector<double> local_setup(n_threads, 0.0);
 
+    // ===================================================================
+    // Phase 1 (ALL CPU cores): build every triple's TNO basis up front.
+    // build_for_triple is pure CPU (union-overlap + density + Fock
+    // eigensolves) and was the dominant (T) cost, but inside the GPU energy
+    // loop below it ran on only num_gpus threads. Triples are independent and
+    // write disjoint tnos[t_idx], so this is a plain all-cores parallel-for
+    // (same split that fixed DLPNO-MP2 pair_setup). The GPU loop then consumes
+    // tnos[t_idx] on num_gpus threads. Memory: Σ nao·n_tno doubles (~0.4 GB at
+    // anthracene, a few GB at PTCDA — within the (T)-feasible size range).
+    // ===================================================================
+    std::vector<TNOData> tnos(static_cast<size_t>(n_triples));
+    {
+        const auto t_p1 = std::chrono::steady_clock::now();
+        #pragma omp parallel for schedule(dynamic, 8)
+        for (int t_idx = 0; t_idx < n_triples; ++t_idx) {
+            const TripleEntry& tr = triples[t_idx];
+            tnos[t_idx] = tno_builder.build_for_triple(
+                tr.idx_ij, tr.idx_ik, tr.idx_jk);
+        }
+        if (verbose >= 2)
+            std::cout << "[DLPNO-(T)-PROF] phase1 tno_build (all cores)="
+                      << std::fixed << std::setprecision(3)
+                      << std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t_p1).count()
+                      << "s" << std::endl;
+    }
+
     #pragma omp parallel num_threads(n_threads)
     {
 #ifdef _OPENMP
@@ -1906,6 +2029,9 @@ real_t run_phase33_triple_loop(const DLPNOLMP2Result& res,
         // when inactive.
         TripleProjGpu proj_gpu(res.pairs, res.setups, res.pair_lookup,
                                 h_S, nao, nocc, nvir_bound);
+        // Device-pack producer-completion events (per thread).
+        cudaEvent_t ev_eri = nullptr, ev_proj = nullptr;
+        if (kDevPack) { cudaEventCreate(&ev_eri); cudaEventCreate(&ev_proj); }
         local_setup[tid] = std::chrono::duration<double>(
                               Clk_setup::now() - t_setup0).count();
         real_t local_e_gpu = 0.0;   // accumulated by this thread's flush
@@ -1915,15 +2041,54 @@ real_t run_phase33_triple_loop(const DLPNOLMP2Result& res,
             using Clk = std::chrono::steady_clock;
             auto t_sec0 = Clk::now();
             const TripleEntry& tr = triples[t_idx];
-            // Phase 3.2.0: build orthogonalised TNO basis for this triple.
-            // Used only for size statistics here; subsequent sub-phases
-            // (3.2.1+) will project amplitudes/integrals into Q_tno and
-            // compute the (T) contribution.
-            const TNOData tno = tno_builder.build_for_triple(
-                tr.idx_ij, tr.idx_ik, tr.idx_jk);
+            // Phase 3.2.0: TNO basis was built in the all-cores Phase-1 pre-pass
+            // above (tnos[t_idx]); the GPU energy loop only consumes it here.
+            const TNOData& tno = tnos[t_idx];
             local_tno_sum[tid] += tno.n_tno;
             local_tno_max[tid] = std::max(local_tno_max[tid], tno.n_tno);
             local_dropped_sum[tid] += tno.n_dropped_overlap;
+
+            // ---- Device-pack fast path: K/M/T computed + packed entirely on
+            // device (no host download / memset / transpose). Skips the host
+            // eri_t / hole_m / T_*_ext / T_part construction below.
+            if (kDevPack && eri_gpu.active() && proj_gpu.active()
+                && tgpu.active() && tno.n_tno > 0) {
+                const int triple_lmos_d[3] = {tr.i, tr.j, tr.k};
+                const real_t eps_i_d = res.F_LMO[tr.i * nocc + tr.i];
+                const real_t eps_j_d = res.F_LMO[tr.j * nocc + tr.j];
+                const real_t eps_k_d = res.F_LMO[tr.k * nocc + tr.k];
+                eri_gpu.build_eri_and_m_device(
+                    tno.Q_tno.data(), tno.n_tno, triple_lmos_d, ev_eri);
+                std::vector<int> bil(nocc, -1), bjl(nocc, -1),
+                                 bkl(nocc, -1), bpart(9, -1);
+                std::vector<std::vector<real_t>> du_il, du_jl, du_kl;
+                std::array<std::vector<real_t>, 9> du_part;
+                proj_gpu.project_for_triple(
+                    tno.Q_tno.data(), tno.n_tno, triple_lmos_d,
+                    du_il, du_jl, du_kl, du_part, /*download=*/false,
+                    bil.data(), bjl.data(), bkl.data(), bpart.data(), ev_proj);
+                bool queued = tgpu.add_to_batch_device(
+                    tr.i, tr.j, tr.k, eps_i_d, eps_j_d, eps_k_d, tno,
+                    eri_gpu.device_K(), eri_gpu.device_M(),
+                    proj_gpu.device_T_batch(),
+                    bil.data(), bjl.data(), bkl.data(), bpart.data(),
+                    ev_eri, ev_proj, nocc);
+                if (!queued) {
+                    local_e[tid] += tgpu.flush_batch();
+                    tgpu.begin_batch();
+                    // d_K/d_M/d_T_batch still hold this triple (untouched by the
+                    // energy kernels); just re-pack into the fresh batch.
+                    queued = tgpu.add_to_batch_device(
+                        tr.i, tr.j, tr.k, eps_i_d, eps_j_d, eps_k_d, tno,
+                        eri_gpu.device_K(), eri_gpu.device_M(),
+                        proj_gpu.device_T_batch(),
+                        bil.data(), bjl.data(), bkl.data(), bpart.data(),
+                        ev_eri, ev_proj, nocc);
+                }
+                if (queued) ++local_gpu_count[tid];
+                ++local_count[tid];
+                continue;
+            }
 
             // Phase 3.2.1: project the converged T2 amplitudes for the three
             // pairs into the TNO basis. The result is consumed by Phase 3.2.3
@@ -2104,6 +2269,8 @@ real_t run_phase33_triple_loop(const DLPNOLMP2Result& res,
             local_sec[tid][4] +=
                 std::chrono::duration<double>(t_flush1 - t_flush0).count();
         }
+        if (ev_eri)  cudaEventDestroy(ev_eri);
+        if (ev_proj) cudaEventDestroy(ev_proj);
     }
 
     real_t e_triples = 0.0;
@@ -2113,12 +2280,12 @@ real_t run_phase33_triple_loop(const DLPNOLMP2Result& res,
         total_counted += local_count[t];
     }
 
-    const long long active_total = total - skipped_empty;
+    const long long active_total = total - skipped_empty - skipped_prescreen;
     if (out_total_triples)  *out_total_triples  = total;
     if (out_active_triples) *out_active_triples = active_total;
 
     if (verbose >= 1) {
-        const long long active = total - skipped_empty;
+        const long long active = total - skipped_empty - skipped_prescreen;
         const real_t avg_union = active > 0
             ? static_cast<real_t>(sum_union_size) / active : 0.0;
         long long tno_sum_total = 0;
@@ -2144,6 +2311,9 @@ real_t run_phase33_triple_loop(const DLPNOLMP2Result& res,
                   << "  num GPUs (OpenMP threads)  : " << n_threads << "\n"
                   << "  total triples (i≤j≤k)      : " << total << "\n"
                   << "  skipped (empty pair PNO)   : " << skipped_empty << "\n"
+                  << "  skipped (prescreen)        : " << skipped_prescreen
+                  << "  (thresh=" << std::scientific << std::setprecision(2)
+                  << t_prescreen << std::defaultfloat << ")\n"
                   << "  active triples             : " << active
                   << "  (counted across threads: " << total_counted << ")\n"
                   << "  avg PNO-union size (upper) : "
@@ -2205,29 +2375,12 @@ real_t ERI_RI_RHF::compute_dlpno_ccsd_t() {
     // per-triple TNOBuilder eigensolves' Eigen->OpenBLAS calls under the 128
     // per-caller-thread buffer limit — this is exactly where the crash hit.
     OmpThreadCapGuard omp_cap(rhf_.get_dlpno_cpu_threads());
-    const real_t e_ccsd = compute_dlpno_ccsd();
-
-    // Phase 3.1: rebuild the LMP2 pair state for TNO statistics.
-    DLPNOParams p_tno = resolve_dlpno_params(
-        rhf_.get_dlpno_preset(),
-        rhf_.get_dlpno_localizer(),
-        rhf_.get_dlpno_t_cut_pno(),
-        rhf_.get_dlpno_t_cut_do(),
-        rhf_.get_dlpno_t_cut_pairs(),
-        rhf_.get_dlpno_t_cut_mkn(),
-        rhf_.get_dlpno_t_cut_triples(),
-        rhf_.get_dlpno_t_cut_tno(),
-        rhf_.get_dlpno_pair_distance_cutoff(),
-        rhf_.get_dlpno_max_iter(),
-        rhf_.get_dlpno_diis_size(),
-        rhf_.get_dlpno_localizer_max_sweep(),
-        rhf_.get_dlpno_localizer_conv(),
-        rhf_.get_dlpno_lmp2_max_iter(),
-        rhf_.get_dlpno_lmp2_conv(),
-        rhf_.get_dlpno_sc_pno_iter(),
-        rhf_.get_dlpno_pno_os_only(),
-        /*verbose=*/0);
-    auto res = solve_dlpno_lmp2(rhf_, *this, p_tno);
+    // (T) reuses the ground CCSD's converged LMP2 pair state (snapshotted
+    // pre-dressing inside compute_dlpno_ccsd_capture) — removes the redundant
+    // second solve_dlpno_lmp2 that previously cost ~one full LMP2 solve.
+    // Bit-exact: the old re-solve used the same thresholds (only verbose=0).
+    DLPNOLMP2Result res;
+    const real_t e_ccsd = compute_dlpno_ccsd_capture(res);
 
     // Phase 3.3 multi-GPU framework: detect distributed B at this level so
     // the per-GPU OpenMP triple loop can run on `num_gpus` threads. The

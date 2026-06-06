@@ -2,7 +2,7 @@
 # GANSU size-scaling + max-size benchmark runner.
 # Run from the build/ directory (where ./gansu lives):
 #     bash ../bench/run_gansu.sh <method> <num_gpus> [timeout_min]
-#   method  : rihf | rimp2 | dlpno_ccsd | dlpno_steom
+#   method  : rihf | rimp2 | dlpno_ccsd | dlpno_ccsd_t | dlpno_steom
 #   num_gpus: 1 2 4 ...   (H200x4 → use 4; pass 1 for the single-GPU reference column)
 #   timeout : per-job wall cap in minutes (default 120). A job that hits the cap
 #             or OOMs is recorded as the size ceiling for that method.
@@ -12,7 +12,7 @@
 # Parse all results into a CSV with: python3 ../bench/parse_gansu.py
 set -u
 
-METHOD="${1:?method: rihf|rimp2|dlpno_ccsd|dlpno_steom}"
+METHOD="${1:?method: rihf|rimp2|dlpno_ccsd|dlpno_ccsd_t|dlpno_steom}"
 NG="${2:?num_gpus}"
 TIMEOUT_MIN="${3:-120}"
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -41,6 +41,7 @@ gansu_args() {
     rihf)        echo "--eri_method ri -ag $AUX -m RHF" ;;
     rimp2)       echo "--eri_method ri -ag $AUX --post_hf_method MP2" ;;
     dlpno_ccsd)  echo "--eri_method ri -ag $AUX --post_hf_method dlpno_ccsd --frozen_core auto" ;;
+    dlpno_ccsd_t) echo "--eri_method ri -ag $AUX --post_hf_method dlpno_ccsd_t --frozen_core auto" ;;
     dlpno_steom) echo "--eri_method ri -ag $AUX --post_hf_method dlpno_steom_ccsd --frozen_core auto" ;;
     *) echo "UNKNOWN_METHOD" ;;
   esac
@@ -95,6 +96,7 @@ while IFS=$'\t' read -r NAME XYZ NAT TAGS; do
   EXTRA=""
   case "$METHOD" in
     dlpno_ccsd)  EXTRA=$(grep -oE 'E\(total CCSD corr\)  = -[0-9.]+' "$LOG" | tail -1) ;;
+    dlpno_ccsd_t) EXTRA=$(grep -oE 'E\(\(T\)\) +=  *-?[0-9.eE+-]+' "$LOG" | tail -1) ;;
     dlpno_steom) EXTRA=$(grep -A6 'STEOM excited-state energies' "$LOG" | grep -oE '\-?[0-9]+\.[0-9]+ *$' | head -1) ;;
     rimp2)       EXTRA=$(grep -oiE 'MP2 correlation[^-]*-[0-9.]+' "$LOG" | tail -1) ;;
     rihf)        EXTRA=$(grep -oE 'Total Energy: -[0-9.]+' "$LOG" | tail -1) ;;
