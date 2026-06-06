@@ -157,6 +157,30 @@ public:
                             bool skip_pi_cache_host = false);
 
     /**
+     * @brief DFpair GPU port — upload the iter-invariant T_meta_dpair to this
+     *        instance's device (slab range only) ONCE per iterate() call.
+     *
+     * T_meta_dpair[idx] is row-major [(nocc²·n_ij) × n_ij] (built host-side,
+     * iter-invariant). Each element block has the SAME per-pair element count
+     * (nocc²·n_ij²) as pi_T_stack[idx], so the device segments reuse the
+     * pi_T_stack offset cumulant. Only the slab [pair_begin_, pair_end_) is
+     * uploaded; the device buffer is slab-sized. Returns false (caller keeps
+     * the CPU DFpair loop) when stacked-mode is off or a cudaMalloc fails.
+     */
+    bool upload_T_meta_dpair(const std::vector<RowMatXd>& T_meta_dpair);
+
+    /**
+     * @brief DFpair GPU port — compute DF_per_pair[idx] = −(pi_T_stack[idx] ·
+     *        T_meta_dpair[idx]) for this instance's slab [pair_begin_,pair_end_)
+     *        as a per-pair cublasDgemm, D2H each [n_ij × n_ij] block into
+     *        DF_per_pair_out[idx]. MUST be called AFTER rebuild_with_stack so
+     *        d_pi_T_stack reflects the current iter's Y_old. No-op if
+     *        upload_T_meta_dpair was not (successfully) called first.
+     *        DF_per_pair_out must be pre-sized to N_pair (disjoint slab writes).
+     */
+    void compute_dfpair(std::vector<RowMatXd>& DF_per_pair_out);
+
+    /**
      * @brief Whether the GPU path is active. False = CPU fallback is in use.
      * Returns true when the constructor successfully built device buffers.
      */

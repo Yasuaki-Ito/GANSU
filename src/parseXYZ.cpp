@@ -72,11 +72,17 @@ std::vector<Atom> parseXYZ(const std::string& filename) {
     while (std::getline(file, line)) {
         ++line_index;
 
+        // Tolerate CRLF line endings + trailing whitespace (Windows-edited / rsync'd
+        // xyz files commonly carry a trailing blank line or a stray '\r'); strip them
+        // and skip blank / whitespace-only lines instead of failing on them.
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
+                                 line.back() == ' '  || line.back() == '\t'))
+            line.pop_back();
+        if (line.empty()) continue;
+
         std::istringstream iss(line);
         std::string symbol;
         Coordinate coordinate;
-
-        if (line.empty()) continue;
 
         if (!(iss >> symbol >> coordinate.x >> coordinate.y >> coordinate.z)) {
             THROW_EXCEPTION("Invalid line format in file at line " + std::to_string(line_index) + ": " + line);

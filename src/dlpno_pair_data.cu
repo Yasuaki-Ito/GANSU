@@ -1018,6 +1018,50 @@ LMP2Status iterate_dlpno_ccsd_t2(
 #endif
     std::vector<ResidCpuStage> resid_prof(kMaxThreads_resid_prof);
 
+    // ---- DFpair GPU port: upload iter-invariant T_meta_dpair once. ----
+    // DFpair (per-pair pi_T_stack·T_meta_dpair) is the largest single CCSD-T2
+    // cost (~33% of wall). pi_T_stack is already device-resident (rebuilt each
+    // iter); T_meta_dpair is iter-invariant, so we upload its slab to each
+    // device once here and replace the per-iter host GEMM with a per-pair
+    // cublasDgemm in compute_dfpair below. Each pgpus[d] handles its slab; the
+    // small [n×n] DF blocks are D2H'd back into DF_per_pair (consumed on CPU).
+    // Default OFF (env opt-in); VALIDATE runs both paths and compares.
+    bool dfpair_gpu_on = false;
+    const bool dfpair_gpu_env =
+        std::getenv("GANSU_DLPNO_DFPAIR_GPU") != nullptr;
+    const bool dfpair_gpu_validate =
+        std::getenv("GANSU_DLPNO_DFPAIR_GPU_VALIDATE") != nullptr;
+#ifndef GANSU_CPU_ONLY
+    if (dfpair_gpu_env && phase24 != nullptr && phase24->nocc == nocc
+        && n_gpus > 0) {
+        bool all_ok = true;
+        if (n_gpus > 1) {
+            std::vector<char> ok(n_gpus, 0);
+            #pragma omp parallel num_threads(n_gpus)
+            {
+#ifdef _OPENMP
+                const int d = omp_get_thread_num();
+#else
+                const int d = 0;
+#endif
+                MultiGpuManager::DeviceGuard guard(d);
+                ok[d] = (pgpus[d] && pgpus[d]->stacked()
+                         && pgpus[d]->upload_T_meta_dpair(T_meta_dpair))
+                        ? 1 : 0;
+            }
+            for (int d = 0; d < n_gpus; ++d) if (!ok[d]) all_ok = false;
+        } else {
+            all_ok = (pgpus[0] && pgpus[0]->stacked()
+                      && pgpus[0]->upload_T_meta_dpair(T_meta_dpair));
+        }
+        dfpair_gpu_on = all_ok;
+        std::cout << "  [DFpair-GPU] "
+                  << (dfpair_gpu_on ? "ON" : "OFF (upload failed → CPU)")
+                  << (dfpair_gpu_validate ? "  (VALIDATE: both paths)" : "")
+                  << std::endl;
+    }
+#endif
+
     for (int iter = 0; iter < max_iter; ++iter) {
         {
             const auto t_yold_0 = prof_clock::now();
@@ -1194,22 +1238,74 @@ LMP2Status iterate_dlpno_ccsd_t2(
         //                 = -(pi_T_stack[idx] · T_meta_dpair[idx])[a, c]
         const auto t_DFpair_0 = prof_clock::now();
         if (phase24 != nullptr && phase24->nocc == nocc) {
-            // dynamic(4): same workload-skew rationale as the residual loop.
-            #pragma omp parallel for schedule(dynamic, 4)
-            for (long long idx = 0; idx < static_cast<long long>(pairs.size()); ++idx) {
-                const PairData&  pij = pairs[idx];
-                const int n_ij = pij.n_pno;
-                if (n_ij == 0) { DF_per_pair[idx].resize(0, 0); continue; }
-                if (idx >= static_cast<long long>(T_meta_dpair.size())
-                    || T_meta_dpair[idx].size() == 0
-                    || pi_T_stack[idx].size() == 0)
-                {
-                    DF_per_pair[idx].setZero(n_ij, n_ij);
-                    continue;
+            // Host reference loop (single (n × nocc²·n × n) Eigen GEMM/pair).
+            auto dfpair_cpu = [&](std::vector<RowMatXd>& DFout) {
+                // dynamic(4): same workload-skew rationale as the residual loop.
+                #pragma omp parallel for schedule(dynamic, 4)
+                for (long long idx = 0;
+                     idx < static_cast<long long>(pairs.size()); ++idx) {
+                    const PairData&  pij = pairs[idx];
+                    const int n_ij = pij.n_pno;
+                    if (n_ij == 0) { DFout[idx].resize(0, 0); continue; }
+                    if (idx >= static_cast<long long>(T_meta_dpair.size())
+                        || T_meta_dpair[idx].size() == 0
+                        || pi_T_stack[idx].size() == 0)
+                    {
+                        DFout[idx].setZero(n_ij, n_ij);
+                        continue;
+                    }
+                    DFout[idx].setZero(n_ij, n_ij);
+                    DFout[idx].noalias() -=
+                        pi_T_stack[idx] * T_meta_dpair[idx];
                 }
-                DF_per_pair[idx].setZero(n_ij, n_ij);
-                DF_per_pair[idx].noalias() -=
-                    pi_T_stack[idx] * T_meta_dpair[idx];
+            };
+            // GPU path: per-pair cublasDgemm in each device's slab.
+            auto dfpair_gpu = [&](std::vector<RowMatXd>& DFout) {
+#ifndef GANSU_CPU_ONLY
+                if (n_gpus > 1) {
+                    #pragma omp parallel num_threads(n_gpus)
+                    {
+#ifdef _OPENMP
+                        const int d = omp_get_thread_num();
+#else
+                        const int d = 0;
+#endif
+                        MultiGpuManager::DeviceGuard guard(d);
+                        pgpus[d]->compute_dfpair(DFout);
+                    }
+                } else {
+                    pgpus[0]->compute_dfpair(DFout);
+                }
+#else
+                (void)DFout;
+#endif
+            };
+
+            if (dfpair_gpu_on && dfpair_gpu_validate) {
+                dfpair_cpu(DF_per_pair);          // reference — used downstream
+                std::vector<RowMatXd> DF_gpu(pairs.size());
+                dfpair_gpu(DF_gpu);
+                double maxdiff = 0.0; long long argmax = -1;
+                for (long long idx = 0;
+                     idx < static_cast<long long>(pairs.size()); ++idx) {
+                    if (DF_per_pair[idx].size() == 0) continue;
+                    if (DF_gpu[idx].rows() != DF_per_pair[idx].rows()
+                        || DF_gpu[idx].cols() != DF_per_pair[idx].cols()) {
+                        maxdiff = 1e99; argmax = idx; break;
+                    }
+                    const double diff =
+                        (DF_per_pair[idx] - DF_gpu[idx]).cwiseAbs().maxCoeff();
+                    if (diff > maxdiff) { maxdiff = diff; argmax = idx; }
+                }
+                if (iter == 0 || maxdiff > 1e-9)
+                    std::cout << "  [DFpair-GPU-VALIDATE] iter=" << iter
+                              << " max|CPU-GPU|=" << std::scientific << maxdiff
+                              << std::defaultfloat << "  (pair " << argmax << ")"
+                              << std::endl;
+            } else if (dfpair_gpu_on) {
+                dfpair_gpu(DF_per_pair);
+            } else {
+                dfpair_cpu(DF_per_pair);
             }
         }
         dt_DFpair += std::chrono::duration<double>(prof_clock::now() - t_DFpair_0).count();

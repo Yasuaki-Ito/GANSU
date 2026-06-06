@@ -303,11 +303,79 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     // Reductions across the parallel region.
     long long n_pao_kept_sum_par = 0;
     real_t    E_pao_total_par    = 0.0;
+    // Sub-profiler (GANSU_DLPNO_PAIRSETUP_PROF=1): split the per-pair cost into the
+    // HOST part (PAO orthogonalization + F_PAO eigendecomposition + Eigen GEMMs +
+    // the diagnostic-MP2 energy loop) vs the GPU part (build_mo_eri_into + V extract
+    // + D2H). This decides the fix: host-bound ⇒ the num_threads(num_gpus) cap (only
+    // num_gpus CPU threads do the eig work) is the bottleneck → use all cores;
+    // GPU-bound ⇒ the per-pair n_emb⁴ build_mo_eri is the target. (Times are summed
+    // over threads, so wall ≈ sum / num_gpus.)
+    const bool ps_prof = std::getenv("GANSU_DLPNO_PAIRSETUP_PROF") != nullptr;
 
     const auto t_pair_setup_0 = clock::now();
 
-    #pragma omp parallel num_threads(num_gpus) \
-        reduction(+:n_pao_kept_sum_par, E_pao_total_par)
+    // ============================================================
+    // Phase 1 (ALL CPU cores): per-pair HOST setup — PAO-domain orthogonalization
+    // + F_PAO eigendecomposition (→ semi-canonical PAOs). No GPU here, so it is NOT
+    // capped to num_gpus threads. The previous fused loop ran this host eig on only
+    // num_gpus threads (each iteration also drove a GPU); the PROF showed ~196 s host
+    // on 4 of 64 cores = the DLPNO-MP2 scaling bottleneck. Pairs are independent and
+    // write disjoint setups[idx], so this is a plain all-cores parallel-for. Phase 2
+    // below reads setups[idx] and does the GPU MO-ERI block + energy.
+    // ============================================================
+    #pragma omp parallel for schedule(dynamic, 4) reduction(+:n_pao_kept_sum_par)
+    for (long long idx = 0; idx < n_pairs_total; ++idx) {
+        const int i = pair_ij[static_cast<size_t>(idx)].first;
+        const int j = pair_ij[static_cast<size_t>(idx)].second;
+        const bool diag = (i == j);
+
+        const auto pair_aos = merge_ao_index_sets(
+            lmo_domains[i].ao_indices, lmo_domains[j].ao_indices);
+        auto dom = orthogonalize_pao_domain(
+            C_pao_global.data(), h_S, pair_aos, nao_, params.t_cut_do);
+        const int n_pao = dom.n_kept;
+
+        PairSetup s;
+        s.i = i; s.j = j;
+        s.n_pao = n_pao;
+        s.F_ii = F_LMO[i * nocc_ + i];
+        s.F_jj = F_LMO[j * nocc_ + j];
+        s.pair_factor = diag ? 1.0 : 2.0;
+
+        if (n_pao == 0) {
+            setups[static_cast<size_t>(idx)] = std::move(s);
+            continue;
+        }
+        n_pao_kept_sum_par += n_pao;
+
+        Eigen::Map<const RowMatXd> Cpao(dom.C_pao_orth.data(), nao_, n_pao);
+
+        // F_PAO eigendecomposition → semi-canonical PAOs.
+        const RowMatXd FCpao = Fmat * Cpao;
+        RowMatXd Fpao_pair = Cpao.transpose() * FCpao;
+        Fpao_pair = 0.5 * (Fpao_pair + Fpao_pair.transpose());
+        auto fdec = eig_sym(Fpao_pair.data(), n_pao);
+        Eigen::Map<const RowMatXd> Upao(fdec.eigvecs.data(), n_pao, n_pao);
+        const RowMatXd C_can_pair = Cpao * Upao;
+
+        // Cache the semi-canonical PAOs + their orbital energies for Phase 2 and
+        // the SC-PNO rounds. (Phase 2 rebuilds C_pair = [C_LMO | C_can_pair].)
+        s.C_can_pair.assign(static_cast<size_t>(nao_) * n_pao, 0.0);
+        Eigen::Map<RowMatXd>(s.C_can_pair.data(), nao_, n_pao) = C_can_pair;
+        s.eps_a = std::move(fdec.eigvals);
+
+        setups[static_cast<size_t>(idx)] = std::move(s);
+    }
+    n_pao_kept_sum = n_pao_kept_sum_par;
+    const auto t_pair_setup_host = clock::now();
+
+    // ============================================================
+    // Phase 2 (num_gpus threads, one per GPU): per-pair GPU MO-ERI block
+    // (build_mo_eri_into) + V extraction/D2H + diagnostic pre-PNO MP2 energy. Kept
+    // at num_gpus threads because the n_emb⁴ ERI scratch is large (only num_gpus
+    // copies). Reads the Phase-1 results from setups[idx].
+    // ============================================================
+    #pragma omp parallel num_threads(num_gpus) reduction(+:E_pao_total_par)
     {
 #ifdef _OPENMP
         const int tid = omp_get_thread_num();
@@ -316,16 +384,8 @@ DLPNOLMP2Result solve_dlpno_lmp2(
 #endif
         if (num_gpus > 1) cudaSetDevice(tid);
 
-        // Step 6.3c / Step S2a — per-thread workspaces. Grow once per
-        // thread to the running max n_emb / n_pao seen by that thread;
-        // freed at end of parallel region.
-        //
-        //   d_C_pair_ws / ws_C_pair_capacity : per-pair C_pair buffer
-        //   d_eri_ws    / ws_eri_capacity    : full n_emb⁴ ERI output
-        //   d_V_ws      / ws_V_capacity      : extracted V block (n_pao²)
-        //
-        // Per-pair D2H drops from n_emb⁴ ≈ 16 MB to n_pao² ≈ 30 KB via
-        // extract_V_block_kernel.
+        // Per-thread workspaces (one cudaMalloc per buffer per thread, grown to the
+        // thread's running max and reused; D2H is only n_pao² via extract_V_block).
         real_t* d_C_pair_ws        = nullptr;
         real_t* d_eri_ws           = nullptr;
         real_t* d_V_ws             = nullptr;
@@ -333,61 +393,26 @@ DLPNOLMP2Result solve_dlpno_lmp2(
         size_t  ws_eri_capacity    = 0;
         size_t  ws_V_capacity      = 0;
 
-        // schedule(dynamic, 1) — per-pair cost varies with n_pao (12-60
-        // at hexamer, even wider on cholesterol), so dynamic outperforms
-        // static for load balance across GPUs.
         #pragma omp for schedule(dynamic, 1)
         for (long long idx = 0; idx < n_pairs_total; ++idx) {
-            const int i = pair_ij[static_cast<size_t>(idx)].first;
-            const int j = pair_ij[static_cast<size_t>(idx)].second;
+            PairSetup& s = setups[static_cast<size_t>(idx)];
+            const int n_pao = s.n_pao;
+            if (n_pao == 0) continue;
+            const int i = s.i, j = s.j;
             const bool diag = (i == j);
-            const real_t pair_factor = diag ? 1.0 : 2.0;
-
-            const auto pair_aos = merge_ao_index_sets(
-                lmo_domains[i].ao_indices, lmo_domains[j].ao_indices);
-            auto dom = orthogonalize_pao_domain(
-                C_pao_global.data(), h_S, pair_aos, nao_, params.t_cut_do);
-            const int n_pao = dom.n_kept;
-
-            PairSetup s;
-            s.i = i; s.j = j;
-            s.n_pao = n_pao;
-            s.F_ii = F_LMO[i * nocc_ + i];
-            s.F_jj = F_LMO[j * nocc_ + j];
-            s.pair_factor = pair_factor;
-
-            if (n_pao == 0) {
-                setups[static_cast<size_t>(idx)] = std::move(s);
-                continue;
-            }
-            n_pao_kept_sum_par += n_pao;
-
-            Eigen::Map<const RowMatXd> Cpao(
-                dom.C_pao_orth.data(), nao_, n_pao);
-
-            // F_PAO eigendecomposition → semi-canonical PAOs.
-            const RowMatXd FCpao = Fmat * Cpao;
-            RowMatXd Fpao_pair = Cpao.transpose() * FCpao;
-            Fpao_pair = 0.5 * (Fpao_pair + Fpao_pair.transpose());
-            auto fdec = eig_sym(Fpao_pair.data(), n_pao);
-            const std::vector<real_t>& eps_a = fdec.eigvals;
-            Eigen::Map<const RowMatXd> Upao(
-                fdec.eigvecs.data(), n_pao, n_pao);
-            const RowMatXd C_can_pair = Cpao * Upao;
-
-            // Pair MO ERI block via build_mo_eri.
             const int n_lmo = diag ? 1 : 2;
             const int n_emb = n_lmo + n_pao;
-            std::vector<real_t> C_pair(
-                static_cast<size_t>(nao_) * n_emb, 0.0);
+
+            // Rebuild C_pair = [C_LMO_i (,C_LMO_j) | C_can_pair] from Phase 1's cache.
+            Eigen::Map<const RowMatXd> C_can(s.C_can_pair.data(), nao_, n_pao);
+            std::vector<real_t> C_pair(static_cast<size_t>(nao_) * n_emb, 0.0);
             for (int mu = 0; mu < nao_; ++mu) {
                 C_pair[mu * n_emb + 0] = h_C_LMO[mu * nocc_ + i];
                 if (!diag) C_pair[mu * n_emb + 1] = h_C_LMO[mu * nocc_ + j];
                 for (int a = 0; a < n_pao; ++a)
-                    C_pair[mu * n_emb + n_lmo + a] = C_can_pair(mu, a);
+                    C_pair[mu * n_emb + n_lmo + a] = C_can(mu, a);
             }
 
-            // Step S2a — grow per-thread d_C_pair workspace.
             const size_t n_C = static_cast<size_t>(nao_) * n_emb;
             if (n_C > ws_C_pair_capacity) {
                 if (d_C_pair_ws) tracked_cudaFree(d_C_pair_ws);
@@ -397,16 +422,13 @@ DLPNOLMP2Result solve_dlpno_lmp2(
             cudaMemcpy(d_C_pair_ws, C_pair.data(),
                 n_C * sizeof(real_t), cudaMemcpyHostToDevice);
 
-            // Step 6.3c — grow per-thread d_eri workspace.
-            const size_t n_emb4 = static_cast<size_t>(n_emb) * n_emb
-                                * n_emb * n_emb;
+            const size_t n_emb4 = static_cast<size_t>(n_emb) * n_emb * n_emb * n_emb;
             if (n_emb4 > ws_eri_capacity) {
                 if (d_eri_ws) tracked_cudaFree(d_eri_ws);
                 tracked_cudaMalloc(&d_eri_ws, n_emb4 * sizeof(real_t));
                 ws_eri_capacity = n_emb4;
             }
 
-            // Step S2a — grow per-thread d_V workspace.
             const size_t n_V = static_cast<size_t>(n_pao) * n_pao;
             if (n_V > ws_V_capacity) {
                 if (d_V_ws) tracked_cudaFree(d_V_ws);
@@ -416,8 +438,6 @@ DLPNOLMP2Result solve_dlpno_lmp2(
 
             eri.build_mo_eri_into(d_C_pair_ws, n_emb, d_eri_ws);
 
-            // Step S2a — extract V block on device, then D2H only n_pao²
-            // doubles instead of the full n_emb⁴ ERI tensor.
             const int j_col = diag ? 0 : 1;
             {
                 const dim3 block(16, 16);
@@ -433,6 +453,7 @@ DLPNOLMP2Result solve_dlpno_lmp2(
                        n_V * sizeof(real_t), cudaMemcpyDeviceToHost);
 
             // Diagnostic pre-PNO MP2 in semi-canonical PAO basis.
+            const std::vector<real_t>& eps_a = s.eps_a;
             real_t E_pair_pao = 0.0;
             for (int a = 0; a < n_pao; ++a)
                 for (int b = 0; b < n_pao; ++b) {
@@ -443,28 +464,31 @@ DLPNOLMP2Result solve_dlpno_lmp2(
                         / (eps_a[b] + eps_a[a] - s.F_ii - s.F_jj);
                     E_pair_pao += Vab * (2.0 * Tab - Tba);
                 }
-            E_pao_total_par += pair_factor * E_pair_pao;
+            E_pao_total_par += s.pair_factor * E_pair_pao;
 
-            // Cache invariants for SC-PNO rounds.
-            s.C_can_pair.assign(
-                static_cast<size_t>(nao_) * n_pao, 0.0);
-            Eigen::Map<RowMatXd>(
-                s.C_can_pair.data(), nao_, n_pao) = C_can_pair;
-            s.eps_a = std::move(fdec.eigvals);
-            s.V     = std::move(V);
-
-            setups[static_cast<size_t>(idx)] = std::move(s);
+            s.V = std::move(V);
         }
 
-        // Step S2a — release per-thread workspaces (one cudaMalloc per
-        // buffer per thread, reused across the thread's pair slice).
         if (d_C_pair_ws) tracked_cudaFree(d_C_pair_ws);
         if (d_eri_ws)    tracked_cudaFree(d_eri_ws);
         if (d_V_ws)      tracked_cudaFree(d_V_ws);
     }
+    E_pao_total = E_pao_total_par;
 
-    n_pao_kept_sum = n_pao_kept_sum_par;
-    E_pao_total    = E_pao_total_par;
+    if (ps_prof) {
+        const double t_host = std::chrono::duration<double>(t_pair_setup_host - t_pair_setup_0).count();
+        const double t_gpu  = std::chrono::duration<double>(clock::now() - t_pair_setup_host).count();
+        const int ncores =
+#ifdef _OPENMP
+            omp_get_max_threads();
+#else
+            1;
+#endif
+        std::cout << "  [DLPNO pair_setup-PROF] phase1 host(orth+eig, " << ncores
+                  << " cores)=" << std::fixed << std::setprecision(2) << t_host
+                  << "s   phase2 gpu(build_mo_eri+energy, " << num_gpus << " GPU)=" << t_gpu
+                  << "s   total=" << (t_host + t_gpu) << "s" << std::defaultfloat << std::endl;
+    }
 
     // Restore device 0 as the active device (parallel region may have
     // left thread 0 on a non-zero device on entry, but threads other

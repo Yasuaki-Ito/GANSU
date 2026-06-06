@@ -133,6 +133,51 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         }
     }
 
+    // Auto-scale (env-free): the EA/STEOM d_eri_vvvv (nvir⁴·8B) is the memory wall.
+    // When it is a large fraction of the tightest GPU's TOTAL memory and >1 GPU is
+    // available, auto-enable the multi-GPU BUILD distribution that otherwise needs
+    // GANSU_EA_VVVV_NSLAB / _OPERATOR_DEVICE_BALANCING / _STEOM_BUILD_GPUS.
+    // CRITICAL: this runs BEFORE the share-barH decision + the IP/EA dispatch, so
+    // device-balancing is decided consistently for the WHOLE chain — setting it
+    // mid-chain (e.g. at EA start) makes IP publish bar-H balancing-OFF then EA/STEOM
+    // borrow cross-device → garbage G (all-zero STEOM roots). setenv(overwrite=0):
+    // explicit env always wins; small systems untouched → single-GPU build, byte-
+    // identical. Threshold 0.40×total (not free) is GPU-size-scaled / resident-
+    // independent: H200 140GB ⇒ 56 GB (pentacene nvir=305⇒64 GB distributes,
+    // tetracene 30 GB single-GPU); A100 80GB ⇒ 32 GB (anthracene 28 GB single-GPU,
+    // keeping the share-barH fast path).
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available() && rhf.get_num_gpus() > 1) {
+        const int full_occ = rhf.get_num_electrons() / 2;
+        const size_t nv = static_cast<size_t>(rhf.get_num_basis() - full_occ);
+        const size_t vvvv_bytes = nv * nv * nv * nv * sizeof(real_t);
+        int n_dev = 0; cudaGetDeviceCount(&n_dev);
+        const int ng = std::min(rhf.get_num_gpus(), n_dev);
+        size_t min_total = 0; bool have = false;
+        int saved = 0; cudaGetDevice(&saved);
+        for (int d = 0; d < ng; ++d) {
+            cudaSetDevice(d);
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
+                min_total = have ? std::min(min_total, tb) : tb; have = true;
+            }
+        }
+        cudaSetDevice(saved);
+        if (have && ng >= 2 && vvvv_bytes > static_cast<size_t>(0.40 * min_total)) {
+            const std::string ns = std::to_string(ng);
+            setenv("GANSU_EA_VVVV_NSLAB", ns.c_str(), 0);
+            setenv("GANSU_STEOM_OPERATOR_DEVICE_BALANCING", "1", 0);
+            setenv("GANSU_STEOM_BUILD_GPUS", ns.c_str(), 0);
+            std::cout << "  [STEOM auto-scale] d_eri_vvvv = " << std::fixed
+                      << std::setprecision(1) << vvvv_bytes / 1e9
+                      << " GB > 0.40×total " << (0.40 * min_total) / 1e9
+                      << " GB → auto-enabling NSLAB=" << ng
+                      << " + device-balancing + STEOM_BUILD_GPUS=" << ng
+                      << " (explicit env overrides)." << std::defaultfloat << std::endl;
+        }
+    }
+#endif
+
     // ----------------------------------------------------------------------
     // (A) build_dressed de-duplication. The IP operator publishes its 8 dressed
     // bar-H tensors into the HF-owned SteomBarHCache, EA publishes its 3 extra

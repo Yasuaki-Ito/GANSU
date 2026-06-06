@@ -139,6 +139,13 @@ struct PiCacheGpu::Impl {
     size_t   pi_T_slab_base_offset = 0;   // Σ_{i<pair_begin_} n_pno_[i]²·nocc²
     size_t   pi_T_slab_total       = 0;   // Σ_{pair_begin_≤i<pair_end_} n_pno_[i]²·nocc²
 
+    // DFpair GPU port — iter-invariant T_meta_dpair uploaded ONCE per iterate(),
+    // slab-sized (Σ_{slab} nocc²·n²). Read at (idx_offset[idx] - slab_base) while
+    // d_pi_T_stack is read at the FULL idx_offset[idx]. d_DF_scratch is a single
+    // reused max_n² block (GEMM target before the per-pair D2H).
+    real_t*  d_T_meta_dpair = nullptr;
+    real_t*  d_DF_scratch   = nullptr;
+
     // Step Z stacked-mode buffers — orig idx → compact active position.
     int*     d_active_ij_pos = nullptr;   // [N_pair]
     int*     d_active_kl_pos = nullptr;   // [N_pair]
@@ -196,6 +203,10 @@ struct PiCacheGpu::Impl {
         if (d_needed_count)  cudaFree(d_needed_count);
         if (d_pi_needed)     cudaFree(d_pi_needed);
         if (h_pi_needed)     cudaFreeHost(h_pi_needed);
+        if (d_T_meta_dpair)  cudaFree(d_T_meta_dpair);
+        if (d_DF_scratch)    cudaFree(d_DF_scratch);
+        d_T_meta_dpair = nullptr;
+        d_DF_scratch   = nullptr;
         d_barS_pad = d_Y_pad = d_Y_pad_T = d_half_pad = d_pi_pad = nullptr;
         h_Y_pad = h_pi_pad = nullptr;
         d_pair_lookup = d_setup_i = d_n_pno = nullptr;
@@ -1812,6 +1823,140 @@ void PiCacheGpu::rebuild_with_stack(
                     bytes);
     }
 #endif // !GANSU_CPU_ONLY
+}
+
+// ---------------------------------------------------------------------------
+//  DFpair GPU port — upload_T_meta_dpair + compute_dfpair.
+//
+//  DF_per_pair[idx] = -(pi_T_stack[idx] · T_meta_dpair[idx]), one cublasDgemm
+//  per pair (variable K = nocc²·n_ij), replacing the per-pair host Eigen GEMM
+//  at dlpno_pair_data.cu DFpair loop (the largest single CCSD-T2 cost).
+//
+//  Layouts (row-major):
+//    pi_T_stack[idx]   [n × K]   at d_pi_T_stack   + off[idx]        (FULL off)
+//    T_meta_dpair[idx] [K × n]   at d_T_meta_dpair + off[idx]-base   (slab off)
+//    DF[idx]           [n × n]   → d_DF_scratch → D2H to DF_out[idx]
+//  Both pi_T and T_meta per-pair blocks have nocc²·n² elements, so the pi_T
+//  offset cumulant indexes both; d_T_meta_dpair is slab-sized.
+// ---------------------------------------------------------------------------
+bool PiCacheGpu::upload_T_meta_dpair(const std::vector<RowMatXd>& T_meta_dpair)
+{
+#ifdef GANSU_CPU_ONLY
+    (void)T_meta_dpair;
+    return false;
+#else
+    if (!active_ || !stacked_) return false;
+    MultiGpuManager::DeviceGuard _guard(device_id_);
+    Impl& s = *p_;
+    const int N    = N_pair_;
+    const int nocc = nocc_;
+    if (N <= 0 || nocc <= 0) return false;
+
+    // Per-pair offsets (cumulative nocc²·n²) — identical formula to d_idx_offset.
+    std::vector<size_t> off(static_cast<size_t>(N) + 1, 0);
+    for (int i = 0; i < N; ++i) {
+        const size_t n = static_cast<size_t>(n_pno_[i]);
+        off[i + 1] = off[i] + n * n * static_cast<size_t>(nocc)
+                                    * static_cast<size_t>(nocc);
+    }
+    const int    ib         = pair_begin_, ie = pair_end_;
+    const size_t slab_base  = off[ib];
+    const size_t slab_total = off[ie] - off[ib];
+    if (slab_total == 0) return false;
+
+    if (s.d_T_meta_dpair == nullptr) {
+        if (cudaMalloc(&s.d_T_meta_dpair, slab_total * sizeof(real_t))
+            != cudaSuccess) {
+            s.d_T_meta_dpair = nullptr;
+            return false;   // OOM → caller keeps the CPU DFpair loop
+        }
+    }
+    if (s.d_DF_scratch == nullptr) {
+        const size_t df_bytes =
+            static_cast<size_t>(max_n_) * max_n_ * sizeof(real_t);
+        if (df_bytes > 0
+            && cudaMalloc(&s.d_DF_scratch, df_bytes) != cudaSuccess) {
+            s.d_DF_scratch = nullptr;
+            return false;
+        }
+    }
+    // Zero so empty-host-T_meta pairs (and padding) contribute exactly 0.
+    if (cudaMemset(s.d_T_meta_dpair, 0, slab_total * sizeof(real_t))
+        != cudaSuccess) {
+        return false;
+    }
+    // Upload this device's slab pairs only.
+    for (int idx = ib; idx < ie; ++idx) {
+        const int n = n_pno_[idx];
+        if (n == 0) continue;
+        if (idx >= static_cast<int>(T_meta_dpair.size())
+            || T_meta_dpair[idx].size() == 0) continue;
+        const size_t cnt = off[idx + 1] - off[idx];   // = nocc²·n²
+        if (cudaMemcpy(s.d_T_meta_dpair + (off[idx] - slab_base),
+                       T_meta_dpair[idx].data(),
+                       cnt * sizeof(real_t), cudaMemcpyHostToDevice)
+            != cudaSuccess) {
+            return false;
+        }
+    }
+    return true;
+#endif
+}
+
+void PiCacheGpu::compute_dfpair(std::vector<RowMatXd>& DF_per_pair_out)
+{
+#ifndef GANSU_CPU_ONLY
+    if (!active_ || !stacked_ || p_->d_T_meta_dpair == nullptr
+        || p_->d_DF_scratch == nullptr) {
+        return;   // not set up → caller's CPU path already filled DF_per_pair
+    }
+    MultiGpuManager::DeviceGuard _guard(device_id_);
+    Impl& s = *p_;
+    const int N    = N_pair_;
+    const int nocc = nocc_;
+
+    std::vector<size_t> off(static_cast<size_t>(N) + 1, 0);
+    for (int i = 0; i < N; ++i) {
+        const size_t n = static_cast<size_t>(n_pno_[i]);
+        off[i + 1] = off[i] + n * n * static_cast<size_t>(nocc)
+                                    * static_cast<size_t>(nocc);
+    }
+    const int    ib        = pair_begin_, ie = pair_end_;
+    const size_t slab_base = off[ib];
+
+    const real_t alpha = -1.0, beta = 0.0;
+    for (int idx = ib; idx < ie; ++idx) {
+        const int n = n_pno_[idx];
+        if (n == 0) { DF_per_pair_out[idx].resize(0, 0); continue; }
+        DF_per_pair_out[idx].setZero(n, n);
+        const int K = static_cast<int>(
+            static_cast<size_t>(nocc) * nocc * n);
+        // row-major DF[n×n] = pi_T[n×K] · T_meta[K×n]; cuBLAS col-major idiom
+        // (= resid_gpu Op-1): first ptr = right factor T_meta (lda=n), second
+        // ptr = left factor pi_T (ldb=K), C = DF (ldc=n), alpha=-1 folds the −=.
+        const real_t* A_piT   = s.d_pi_T_stack   + off[idx];                // full
+        const real_t* B_tmeta = s.d_T_meta_dpair + (off[idx] - slab_base);  // slab
+        const cublasStatus_t st = cublasDgemm(
+            s.cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+            n, n, K,
+            &alpha,
+            B_tmeta, n,
+            A_piT,   K,
+            &beta,
+            s.d_DF_scratch, n);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            throw std::runtime_error(
+                "PiCacheGpu::compute_dfpair: cublasDgemm failed (status "
+                + std::to_string(static_cast<int>(st)) + ")");
+        }
+        check_cuda_(cudaMemcpy(DF_per_pair_out[idx].data(), s.d_DF_scratch,
+                               static_cast<size_t>(n) * n * sizeof(real_t),
+                               cudaMemcpyDeviceToHost),
+                    "D2H DF_per_pair (compute_dfpair)");
+    }
+#else
+    (void)DF_per_pair_out;
+#endif
 }
 
 } // namespace gansu

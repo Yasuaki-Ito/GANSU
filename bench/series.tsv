@@ -1,0 +1,24 @@
+# Benchmark molecule size series.  Columns: name  xyz_relpath  natoms  tags
+# tags = comma-separated method keys this molecule is intended for:
+#   rihf rimp2 dlpno_ccsd dlpno_steom
+# (size-appropriate; edit freely. run_gansu.sh processes in this order = increasing size.)
+Naphthalene	../xyz/Naphthalene.xyz	18	rihf,rimp2,dlpno_ccsd,dlpno_steom
+Anthracene	../xyz/Anthracene.xyz	24	rihf,rimp2,dlpno_ccsd,dlpno_steom
+Tetracene	../xyz/Tetracene.xyz	30	rihf,rimp2,dlpno_ccsd,dlpno_steom
+Pentacene	../xyz/Pentacene.xyz	36	rihf,rimp2,dlpno_ccsd,dlpno_steom
+PTCDA	../xyz/large_molecular/PTCDA.xyz	38	rihf,rimp2,dlpno_ccsd,dlpno_steom
+Phthalocyanine	../xyz/large_molecular/Phthalocyanine.xyz	58	rihf,rimp2,dlpno_ccsd,dlpno_steom
+Decacene	../xyz/large_molecular/Decacene.xyz	66	rihf,dlpno_ccsd,dlpno_steom
+Dicoronylene	../xyz/large_molecular/Dicoronylene.xyz	68	rihf,dlpno_ccsd,dlpno_steom
+Kekulene	../xyz/large_molecular/Kekulene.xyz	72	rihf,dlpno_ccsd,dlpno_steom
+Cholesterol	../xyz/large_molecular/Cholesterol.xyz	74	rihf,dlpno_ccsd
+Dodecacene	../xyz/large_molecular/Dodecacene.xyz	78	rihf,dlpno_ccsd,dlpno_steom
+C90	../xyz/large_molecular/C90.xyz	90	rihf,dlpno_ccsd
+Beta-Carotene	../xyz/large_molecular/Beta-Carotene.xyz	96	rihf,dlpno_ccsd
+Taxol	../xyz/large_molecular/Taxol.xyz	113	rihf,dlpno_ccsd
+Sirolimus	../xyz/large_molecular/Sirolimus.xyz	144	rihf,dlpno_ccsd
+CoenzymeQ10	../xyz/large_molecular/CoenzymeQ10.xyz	153	rihf,dlpno_ccsd
+C240	../xyz/larger_molecular/C240.xyz	240	rihf
+C320	../xyz/larger_molecular/C320.xyz	320	rihf
+C540	../xyz/larger_molecular/C540.xyz	540	rihf
+C720	../xyz/larger_molecular/C720.xyz	720	rihf
