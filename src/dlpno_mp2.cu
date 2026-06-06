@@ -369,11 +369,15 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     n_pao_kept_sum = n_pao_kept_sum_par;
     const auto t_pair_setup_host = clock::now();
 
+    // RI back-end handle for the on-the-fly V-block build (build_B_mo +
+    // mo_eri_block_into) — avoids materializing the full n_emb⁴ MO-ERI per pair.
+    // Non-null for every DLPNO path (RI is required); null → full-build fallback.
+    const ERI_RI* eri_ri = dynamic_cast<const ERI_RI*>(&eri);
+
     // ============================================================
     // Phase 2 (num_gpus threads, one per GPU): per-pair GPU MO-ERI block
-    // (build_mo_eri_into) + V extraction/D2H + diagnostic pre-PNO MP2 energy. Kept
-    // at num_gpus threads because the n_emb⁴ ERI scratch is large (only num_gpus
-    // copies). Reads the Phase-1 results from setups[idx].
+    // (V block only, via build_B_mo + mo_eri_block_into) + diagnostic pre-PNO MP2
+    // energy. Reads the Phase-1 results from setups[idx].
     // ============================================================
     #pragma omp parallel num_threads(num_gpus) reduction(+:E_pao_total_par)
     {
@@ -422,13 +426,6 @@ DLPNOLMP2Result solve_dlpno_lmp2(
             cudaMemcpy(d_C_pair_ws, C_pair.data(),
                 n_C * sizeof(real_t), cudaMemcpyHostToDevice);
 
-            const size_t n_emb4 = static_cast<size_t>(n_emb) * n_emb * n_emb * n_emb;
-            if (n_emb4 > ws_eri_capacity) {
-                if (d_eri_ws) tracked_cudaFree(d_eri_ws);
-                tracked_cudaMalloc(&d_eri_ws, n_emb4 * sizeof(real_t));
-                ws_eri_capacity = n_emb4;
-            }
-
             const size_t n_V = static_cast<size_t>(n_pao) * n_pao;
             if (n_V > ws_V_capacity) {
                 if (d_V_ws) tracked_cudaFree(d_V_ws);
@@ -436,10 +433,31 @@ DLPNOLMP2Result solve_dlpno_lmp2(
                 ws_V_capacity = n_V;
             }
 
-            eri.build_mo_eri_into(d_C_pair_ws, n_emb, d_eri_ws);
-
             const int j_col = diag ? 0 : 1;
-            {
+            // Build ONLY the V block V[a,b] = (i,a|j,b) = n_pao² from the half-
+            // transformed B_mo — never the full n_emb⁴ MO-ERI tensor (which hit
+            // ~58 GB for the largest pairs and dominated pair_setup phase2).
+            // Bit-identical to build_mo_eri_into + extract_V_block_kernel (same
+            // B_mo, same RI contraction), but O(n_pao²·naux) vs O(n_emb⁴).
+            if (eri_ri) {
+                const real_t* d_B_mo = eri_ri->build_B_mo(d_C_pair_ws, n_emb);
+                eri_ri->mo_eri_block_into(
+                    d_B_mo, n_emb,
+                    /*p=i*/ 0,     1,
+                    /*q=a*/ n_lmo, n_pao,
+                    /*r=j*/ j_col, 1,
+                    /*s=b*/ n_lmo, n_pao,
+                    d_V_ws);
+            } else {
+                // Non-RI fallback: full n_emb⁴ build + extract.
+                const size_t n_emb4 = static_cast<size_t>(n_emb)
+                                    * n_emb * n_emb * n_emb;
+                if (n_emb4 > ws_eri_capacity) {
+                    if (d_eri_ws) tracked_cudaFree(d_eri_ws);
+                    tracked_cudaMalloc(&d_eri_ws, n_emb4 * sizeof(real_t));
+                    ws_eri_capacity = n_emb4;
+                }
+                eri.build_mo_eri_into(d_C_pair_ws, n_emb, d_eri_ws);
                 const dim3 block(16, 16);
                 const dim3 grid(
                     static_cast<unsigned>((n_pao + 15) / 16),
