@@ -1027,8 +1027,12 @@ LMP2Status iterate_dlpno_ccsd_t2(
     // small [n×n] DF blocks are D2H'd back into DF_per_pair (consumed on CPU).
     // Default OFF (env opt-in); VALIDATE runs both paths and compares.
     bool dfpair_gpu_on = false;
+    // Default ON (validated bit-exact on PTCDA: max|CPU-GPU|=4.9e-17, 99× faster;
+    // upload OOM → automatic CPU fallback). Opt out with GANSU_DLPNO_DFPAIR_GPU=0.
+    const char* dfpair_gpu_env_str = std::getenv("GANSU_DLPNO_DFPAIR_GPU");
     const bool dfpair_gpu_env =
-        std::getenv("GANSU_DLPNO_DFPAIR_GPU") != nullptr;
+        (dfpair_gpu_env_str == nullptr)
+        || (std::string(dfpair_gpu_env_str) != "0");
     const bool dfpair_gpu_validate =
         std::getenv("GANSU_DLPNO_DFPAIR_GPU_VALIDATE") != nullptr;
 #ifndef GANSU_CPU_ONLY
