@@ -614,7 +614,8 @@ LMP2Status iterate_dlpno_ccsd_t2(
     int verbose, const char* round_tag,
     const Phase24Integrals* phase24,
     int num_gpus,
-    bool user_explicit_n_gpus)
+    bool user_explicit_n_gpus,
+    const real_t* lmo_centroids)
 {
     if (!enable_dressing) {
         return iterate_lmp2(
@@ -770,6 +771,80 @@ LMP2Status iterate_dlpno_ccsd_t2(
     for (size_t i = 0; i < pairs.size(); ++i) {
         setup_i_per_pair[i] = setups[i].i;
     }
+    // Phase 2 (CCSD sparse barS) — setups[].j (for the pi_T_stack scatter) and
+    // the per-output-pair coupling list. Every CCSD term contracts
+    // pi_T_stack[i_ij][kl] = barS[i_ij][idx_kl]·Y·barS^T, so dropping a small
+    // barS block removes its contribution from ALL terms (inter-Fock, oooo,
+    // DFpair). Coupling = inter-Fock seed {(k,j),(i,l)} (ResidGpu reads these
+    // via pair_lookup, must always be present) ∪ {idx_kl whose ‖barS‖_F > thr}.
+    // thr=0 keeps every active (overlapping) pair ⇒ bit-exact; thr>0 screens
+    // (ΔE<1e-4 calibrated). Opt-in via GANSU_DLPNO_CCSD_BARS_SPARSE.
+    std::vector<int> setup_j_per_pair(pairs.size(), 0);
+    for (size_t i = 0; i < pairs.size(); ++i) setup_j_per_pair[i] = setups[i].j;
+
+    const bool ccsd_bars_sparse = []() {
+        const char* e = std::getenv("GANSU_DLPNO_CCSD_BARS_SPARSE");
+        return e && e[0] == '1';
+    }();
+    // Distance-based coupling screen (Bohr). barS-norm proved a poor
+    // discriminator (PTCDA: ΔE~1e-14 yet no coupling shrink at thr≤1e-4 — the
+    // surviving active pairs' inter-pair barS is dense in norm). Pair-pair
+    // CENTROID distance is the sharper, ORCA-like criterion: cut (i_ij,i_kl)
+    // when the two pairs are spatially far. cutoff<=0 (or no centroids) ⇒ keep
+    // all active ⇒ bit-exact (validation). Energy-contribution decay is
+    // captured by the cutoff (calibrated to ΔE<1e-4).
+    const real_t ccsd_bars_dist = []() {
+        const char* e = std::getenv("GANSU_DLPNO_CCSD_BARS_DIST");
+        return e ? std::atof(e) : 0.0;
+    }();
+    const bool ccsd_dist_screen =
+        ccsd_bars_sparse && lmo_centroids != nullptr && ccsd_bars_dist > 0.0;
+    const real_t dist2_cut = ccsd_bars_dist * ccsd_bars_dist;
+    auto pair_centroid = [&](int idx, real_t& cx, real_t& cy, real_t& cz) {
+        const int i = setups[idx].i, j = setups[idx].j;
+        cx = 0.5 * (lmo_centroids[3*i+0] + lmo_centroids[3*j+0]);
+        cy = 0.5 * (lmo_centroids[3*i+1] + lmo_centroids[3*j+1]);
+        cz = 0.5 * (lmo_centroids[3*i+2] + lmo_centroids[3*j+2]);
+    };
+    std::vector<std::vector<int>> coupling_ccsd_per_pair;
+    if (ccsd_bars_sparse) {
+        coupling_ccsd_per_pair.resize(pairs.size());
+        #pragma omp parallel for schedule(dynamic, 4)
+        for (long long idx = 0; idx < static_cast<long long>(pairs.size());
+             ++idx)
+        {
+            if (pairs[idx].n_pno == 0) continue;
+            const int i = setups[idx].i, j = setups[idx].j;
+            std::vector<int>& nb = coupling_ccsd_per_pair[idx];
+            for (int k = 0; k < nocc; ++k) {           // inter-Fock (k, j)
+                if (k == i) continue;
+                const int idx_kj = pair_lookup[static_cast<size_t>(k) * nocc + j];
+                if (idx_kj >= 0 && pairs[idx_kj].n_pno > 0) nb.push_back(idx_kj);
+            }
+            for (int l = 0; l < nocc; ++l) {           // inter-Fock (i, l)
+                if (l == j) continue;
+                const int idx_il = pair_lookup[static_cast<size_t>(i) * nocc + l];
+                if (idx_il >= 0 && pairs[idx_il].n_pno > 0) nb.push_back(idx_il);
+            }
+            // distance screen over all active pairs (or keep-all when off).
+            real_t cx, cy, cz;
+            if (ccsd_dist_screen) pair_centroid(static_cast<int>(idx), cx, cy, cz);
+            for (size_t i_kl = 0; i_kl < pairs.size(); ++i_kl) {
+                if (pairs[i_kl].n_pno == 0) continue;
+                const RowMatXd& bs = barS_cache[idx][i_kl];
+                if (bs.rows() == 0 || bs.cols() == 0) continue;  // no overlap ⇒ 0 anyway
+                if (ccsd_dist_screen) {
+                    real_t kx, ky, kz;
+                    pair_centroid(static_cast<int>(i_kl), kx, ky, kz);
+                    const real_t dx = cx - kx, dy = cy - ky, dz = cz - kz;
+                    if (dx*dx + dy*dy + dz*dz > dist2_cut) continue;  // too far ⇒ drop
+                }
+                nb.push_back(static_cast<int>(i_kl));
+            }
+            std::sort(nb.begin(), nb.end());
+            nb.erase(std::unique(nb.begin(), nb.end()), nb.end());
+        }
+    }
 
     // ---- Multi-GPU pair-slab partition (n_pno²-weighted greedy). ----
     // Each device handles its own slab of pair indices. Single-GPU
@@ -856,7 +931,7 @@ LMP2Status iterate_dlpno_ccsd_t2(
         pgpus[0] = std::make_unique<PiCacheGpu>(
             barS_cache, n_pno_per_pair, max_n_pno,
             &pair_lookup, &setup_i_per_pair, nocc,
-            0, N_pair, 0);
+            0, N_pair, 0, &setup_j_per_pair);
     } else {
 #ifndef GANSU_CPU_ONLY
         // Step S8 (2026-05-17): parallel construction across devices.
@@ -878,13 +953,13 @@ LMP2Status iterate_dlpno_ccsd_t2(
             pgpus[d] = std::make_unique<PiCacheGpu>(
                 barS_cache, n_pno_per_pair, max_n_pno,
                 &pair_lookup, &setup_i_per_pair, nocc,
-                slab_starts[d], slab_starts[d + 1], d);
+                slab_starts[d], slab_starts[d + 1], d, &setup_j_per_pair);
         }
 #else
         pgpus[0] = std::make_unique<PiCacheGpu>(
             barS_cache, n_pno_per_pair, max_n_pno,
             &pair_lookup, &setup_i_per_pair, nocc,
-            0, N_pair, 0);
+            0, N_pair, 0, &setup_j_per_pair);
 #endif
     }
     dt_setup_pgpu += std::chrono::duration<double>(
@@ -1143,13 +1218,15 @@ LMP2Status iterate_dlpno_ccsd_t2(
                     const int d = 0;
 #endif
                     MultiGpuManager::DeviceGuard guard(d);
-                    pgpus[d]->rebuild_with_stack(Y_old, pi_cache, pi_T_stack,
-                                                 skip_pi_cache_host);
+                    pgpus[d]->rebuild_with_stack(
+                        Y_old, pi_cache, pi_T_stack, skip_pi_cache_host,
+                        ccsd_bars_sparse ? &coupling_ccsd_per_pair : nullptr);
                 }
 #endif
             } else {
-                pgpus[0]->rebuild_with_stack(Y_old, pi_cache, pi_T_stack,
-                                             skip_pi_cache_host);
+                pgpus[0]->rebuild_with_stack(
+                    Y_old, pi_cache, pi_T_stack, skip_pi_cache_host,
+                    ccsd_bars_sparse ? &coupling_ccsd_per_pair : nullptr);
             }
             dt_picache += std::chrono::duration<double>(
                 prof_clock::now() - t_pi0).count();

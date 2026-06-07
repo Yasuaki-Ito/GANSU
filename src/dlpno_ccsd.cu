@@ -677,6 +677,49 @@ real_t DLPNOCCSD::compute_energy()
             lmp2_Y_snap[idx] = res.pairs[idx].Y;
     }
 
+    // Phase 2 (CCSD sparse barS) — per-LMO Mulliken centroids for the
+    // distance-based coupling screen. Only built when the sparse path is on
+    // (cheap: O(nocc·nao²)). centroid(i) = Σ_A R_A · q_A^i with Mulliken pop
+    // q_A^i = Σ_{μ∈A} C_μi (S·C_i)_μ. Passed to iterate_dlpno_ccsd_t2; the
+    // distance cutoff is read there from GANSU_DLPNO_CCSD_BARS_DIST.
+    std::vector<real_t> lmo_centroids;
+    {
+        const char* e = std::getenv("GANSU_DLPNO_CCSD_BARS_SPARSE");
+        if (e && e[0] == '1' && static_cast<int>(res.C_LMO.size())
+                                  == nao_ * nocc_) {
+            lmo_centroids.assign(static_cast<size_t>(nocc_) * 3, 0.0);
+            const auto& atoms = rhf_.get_atoms();
+            const auto& abr   = rhf_.get_atom_to_basis_range();
+            const int natoms  = static_cast<int>(abr.size());
+            const real_t* Clmo = res.C_LMO.data();
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < nocc_; ++i) {
+                std::vector<real_t> SC(nao_, 0.0);
+                for (int mu = 0; mu < nao_; ++mu) {
+                    const real_t* Srow = h_S + static_cast<size_t>(mu) * nao_;
+                    real_t s = 0.0;
+                    for (int nu = 0; nu < nao_; ++nu)
+                        s += Srow[nu] * Clmo[static_cast<size_t>(nu) * nocc_ + i];
+                    SC[mu] = s;
+                }
+                real_t cx = 0, cy = 0, cz = 0, qtot = 0;
+                for (int a = 0; a < natoms; ++a) {
+                    const int b0 = static_cast<int>(abr[a].start_index);
+                    const int b1 = static_cast<int>(abr[a].end_index);
+                    real_t qA = 0.0;
+                    for (int mu = b0; mu < b1; ++mu)
+                        qA += Clmo[static_cast<size_t>(mu) * nocc_ + i] * SC[mu];
+                    const auto& R = atoms[a].coordinate;
+                    cx += qA * R.x; cy += qA * R.y; cz += qA * R.z; qtot += qA;
+                }
+                if (qtot != 0.0) { cx /= qtot; cy /= qtot; cz /= qtot; }
+                lmo_centroids[3*i+0] = cx;
+                lmo_centroids[3*i+1] = cy;
+                lmo_centroids[3*i+2] = cz;
+            }
+        }
+    }
+
     LMP2Status t2_status{};
     const auto t_iter_0 = prof_clock::now();
     {
@@ -687,7 +730,8 @@ real_t DLPNOCCSD::compute_energy()
             nocc_, nao_, t2_max_iter, t2_conv,
             /*enable_dressing=*/true,
             params_.verbose, "CCSD T2 iteration",
-            &phase24, t2_num_gpus, user_explicit_n_gpus);
+            &phase24, t2_num_gpus, user_explicit_n_gpus,
+            lmo_centroids.empty() ? nullptr : lmo_centroids.data());
     }
     const double dt_iter = std::chrono::duration<double>(
         prof_clock::now() - t_iter_0).count();

@@ -75,7 +75,12 @@ public:
                int nocc = 0,
                int pair_begin = 0,
                int pair_end = -1,
-               int device_id = 0);
+               int device_id = 0,
+               // Phase 2 (CCSD sparse barS): setups[idx].j per pair, needed by
+               // the sparse pi_T_stack scatter to place each coupling block at
+               // both (p·nocc+q) and (q·nocc+p) slots. Optional; only used when
+               // GANSU_DLPNO_CCSD_BARS_SPARSE is on for a stacked instance.
+               const std::vector<int>* setup_j_per_pair = nullptr);
 
     ~PiCacheGpu();
 
@@ -154,7 +159,9 @@ public:
     void rebuild_with_stack(const std::vector<std::vector<real_t>>& Y_old,
                             std::vector<std::vector<RowMatXd>>& pi_cache_out,
                             std::vector<RowMatXd>& pi_T_stack_out,
-                            bool skip_pi_cache_host = false);
+                            bool skip_pi_cache_host = false,
+                            const std::vector<std::vector<int>>*
+                                coupling_ikl_per_pair = nullptr);
 
     /**
      * @brief DFpair GPU port — upload the iter-invariant T_meta_dpair to this
@@ -218,6 +225,17 @@ public:
     int            device_N_pair()          const noexcept { return N_pair_; }
     int            device_nocc()            const noexcept { return nocc_; }
 
+    // Stage D — sparse pi_T_stack kl-slot list + slot maps (orig-idx indexed).
+    // nullptr until setup_sparse_stacked_ has run (sparse stacked mode). Used by
+    // the D1b ResidGpu consumers to read the coupling-list pi_T_stack layout.
+    const int*     device_n_slots()          const noexcept;   // [N_pair]
+    const size_t*  device_slot_offset()      const noexcept;   // [N_pair+1] (kl_slot CSR)
+    const int*     device_kl_slot()          const noexcept;   // [Σ n_slots] kl per slot
+    const size_t*  device_idx_offset_sparse()const noexcept;   // [N_pair+1] pi_T sparse offsets
+    const int*     device_slot_jcol()        const noexcept;   // [N_pair·nocc]
+    const int*     device_slot_irow()        const noexcept;   // [N_pair·nocc]
+    bool           pitstack_sparse_ready()   const noexcept;   // kl_slot_built
+
     /// Slab info (output-row range and CUDA device).
     int            pair_begin()              const noexcept { return pair_begin_; }
     int            pair_end()                const noexcept { return pair_end_; }
@@ -237,6 +255,16 @@ private:
     // constructor when GANSU_DLPNO_LMP2_BARS_SPARSE=1 AND this is the
     // non-stacked LMP2 instance. Implies the ragged GEMM path. Bit-exact.
     bool sparse_lmp2_ = false;
+
+    // Phase 2 (CCSD sparse barS) — stacked (CCSD T2) analogue of sparse_lmp2_.
+    // When true, the dense d_barS_pad / d_pi_pad are NOT allocated; the CSR
+    // barS + ragged pi (coupling columns only) are built lazily on the first
+    // rebuild_with_stack() that supplies a coupling list, and a scatter kernel
+    // writes the ragged pi into the DENSE d_pi_T_stack at the (k·nocc+l) slots
+    // (non-coupling slots stay zero). ResidGpu reads d_pi_T_stack unchanged.
+    // Set in the constructor when GANSU_DLPNO_CCSD_BARS_SPARSE=1 AND this is a
+    // stacked instance. Screening (norm/distance) ⇒ NOT bit-exact (ΔE<1e-4).
+    bool sparse_stacked_ = false;
 
     // CPU fallback for !active() — keeps the public API stable when GPU
     // is unavailable. Same pi_cache_out layout.
@@ -273,6 +301,14 @@ private:
     // been built (one-time, iter-invariant) and a single tile
     // (tile_size_ >= N_act_ij_). Gated by GANSU_DLPNO_LMP2_BARS_RAGGED_GEMM.
     void compute_pi_needed_ragged_(int tile_start, int tile_end);
+
+    // Phase 2 (CCSD sparse barS) — one-time setup of the stacked sparse path
+    // from a coupling list: builds needed_ikl_host / d_needed_* / d_coupling_ikl,
+    // the CSR d_barS_csr (coupling blocks only), d_pi_needed, and the ragged
+    // GEMM pointer arrays (barS → CSR). Idempotent (guarded). Mirrors the
+    // one-time blocks of rebuild_needed but sourced from the CCSD coupling list.
+    void setup_sparse_stacked_(
+        const std::vector<std::vector<int>>& coupling_ikl_per_pair);
 
     // D2H d_pi_pad → h_pi_pad (slab range) and unpad into pi_cache_out.
     // Only called when the host pi_cache is actually needed downstream.
@@ -318,6 +354,7 @@ private:
     // CPU fallback paths of build_stack_cpu_).
     std::vector<int> pair_lookup_;        // size nocc² (or empty)
     std::vector<int> setup_i_per_pair_;   // size N_pair (or empty)
+    std::vector<int> setup_j_per_pair_;   // size N_pair (or empty); Phase 2 scatter
     int nocc_ = 0;
 
     // Multi-GPU slab info: this instance owns output rows for

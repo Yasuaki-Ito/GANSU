@@ -344,6 +344,11 @@ LMP2Status iterate_dlpno_ccsd_t2(
     int verbose, const char* round_tag,
     const Phase24Integrals* phase24 = nullptr,
     int num_gpus = 1,
-    bool user_explicit_n_gpus = false);
+    bool user_explicit_n_gpus = false,
+    // Phase 2 (CCSD sparse barS) — per-LMO Mulliken centroids [nocc × 3] (xyz,
+    // Bohr) for the distance-based coupling screen. nullptr = no distance
+    // screen (keep all active = bit-exact). Used only when
+    // GANSU_DLPNO_CCSD_BARS_SPARSE is on with GANSU_DLPNO_CCSD_BARS_DIST > 0.
+    const real_t* lmo_centroids = nullptr);
 
 } // namespace gansu
