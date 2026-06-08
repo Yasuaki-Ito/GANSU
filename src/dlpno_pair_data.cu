@@ -826,6 +826,22 @@ LMP2Status iterate_dlpno_ccsd_t2(
                 const int idx_il = pair_lookup[static_cast<size_t>(i) * nocc + l];
                 if (idx_il >= 0 && pairs[idx_il].n_pno > 0) nb.push_back(idx_il);
             }
+            // Stage D: the j-side ResidGpu slices read (j,l) [slot_jrow] and
+            // (k,i) [slot_icol]. These are structural (every l / every k), the
+            // j-side mirror of the i-side (k,j)/(i,l) above. They must be
+            // force-seeded so the distance screen below cannot drop them —
+            // otherwise the j-side ph-ladder would be screened while the i-side
+            // is not (asymmetric, wrong). No effect when screen is off (all
+            // active pairs already included). All l / all k (no self-skip) so
+            // every slot_jrow[l]/slot_icol[k] the j-side slices index exists.
+            for (int l = 0; l < nocc; ++l) {           // j-side slice (j, l)
+                const int idx_jl = pair_lookup[static_cast<size_t>(j) * nocc + l];
+                if (idx_jl >= 0 && pairs[idx_jl].n_pno > 0) nb.push_back(idx_jl);
+            }
+            for (int k = 0; k < nocc; ++k) {           // j-side slice (k, i)
+                const int idx_ki = pair_lookup[static_cast<size_t>(k) * nocc + i];
+                if (idx_ki >= 0 && pairs[idx_ki].n_pno > 0) nb.push_back(idx_ki);
+            }
             // distance screen over all active pairs (or keep-all when off).
             real_t cx, cy, cz;
             if (ccsd_dist_screen) pair_centroid(static_cast<int>(idx), cx, cy, cz);
@@ -902,9 +918,39 @@ LMP2Status iterate_dlpno_ccsd_t2(
     {
         long long total_w = 0;
         std::vector<long long> w(N_pair, 0);
+        // Partition weight. Default = n_pno² (residual flop balance). For the
+        // CCSD sparse path the picache MEMORY (d_pi_needed + d_barS_csr =
+        // 2·coupling_count·max_n², plus the sparse d_pi_T_stack ≈ n²·2·count)
+        // is what OOMs on the heaviest slab, and a pure flop balance piles the
+        // high-coupling pairs onto dev 0. So when the coupling list is known,
+        // weight by coupling_count·(max_n² + n²) to balance picache memory
+        // across the GPUs (correctness is unaffected — only which device owns
+        // which pair changes). Falls back to n_pno² when no coupling list.
+        // Picache ragged memory (d_pi_needed + d_barS_csr ≈ 2·coupling_count·
+        // max_n²) drives the per-device OOM in the sparse path; weight by the
+        // coupling count so it balances across GPUs. IMPORTANT: this also tends
+        // to place the LOW-coupling (= weak, small-n_pno) pairs on the LAST
+        // device, which matters because if a device's ResidGpu can't fit (large
+        // systems) its slab's ph-ladder falls back to the CPU path — and that
+        // fallback drops the ph-ladder contribution in sparse mode, so it must
+        // land on the least-important (weak) pairs. (A weight that includes
+        // n²·nocc² balances ResidGpu instead but concentrates STRONG pairs on
+        // the last device → large error if it falls back — see project notes.)
+        // Falls back to n_pno² when no coupling list.
+        const bool mem_balance =
+            ccsd_bars_sparse
+            && coupling_ccsd_per_pair.size() == static_cast<size_t>(N_pair);
+        const long long max_n2 =
+            static_cast<long long>(max_n_pno) * static_cast<long long>(max_n_pno);
         for (int i = 0; i < N_pair; ++i) {
             const long long n = pairs[i].n_pno;
-            w[i] = n * n;
+            if (mem_balance) {
+                const long long cnt =
+                    static_cast<long long>(coupling_ccsd_per_pair[i].size());
+                w[i] = cnt * (max_n2 + n * n);
+            } else {
+                w[i] = n * n;
+            }
             total_w += w[i];
         }
         long long target = (total_w + n_gpus - 1) / n_gpus;
@@ -922,6 +968,16 @@ LMP2Status iterate_dlpno_ccsd_t2(
             if (slab_starts[d] < slab_starts[d - 1])
                 slab_starts[d] = slab_starts[d - 1];
         }
+    }
+
+    // Stage D debug — show how the picache pairs got partitioned across GPUs.
+    {
+        std::printf("[DLPNO-slab] num_gpus(param)=%d n_gpus(effective)=%d "
+                    "N_pair=%d slab_starts=[", num_gpus, n_gpus, N_pair);
+        for (int d = 0; d <= n_gpus; ++d)
+            std::printf("%d%s", slab_starts[d], d < n_gpus ? "," : "");
+        std::printf("]\n");
+        std::fflush(stdout);
     }
 
     // Construct N_gpus PiCacheGpu instances (one per device).
@@ -964,6 +1020,15 @@ LMP2Status iterate_dlpno_ccsd_t2(
     }
     dt_setup_pgpu += std::chrono::duration<double>(
         prof_clock::now() - t_setup_pgpu_0).count();
+
+    // (D3a's pre-build of the sparse kl-slot machinery before the ResidGpu
+    // constructors was reverted: it allocated the ragged d_pi_needed/d_barS_csr
+    // early, shrinking the ResidGpu memory budget and forcing MORE devices into
+    // the CPU fallback. The kl-slot list is built at its original point (before
+    // the DFpair upload). D3a's V_stacked_oooo sparsify — which relied on
+    // host_n_slots() being ready at ResidGpu-ctor time — is therefore dormant
+    // unless that pre-build is restored; option (a) keeps the ph-ladder exact
+    // via the corrected CPU fallback instead.)
 
     // Step 6.2 — GPU port for ph-ladder R contributions. One ResidGpu per
     // device, borrowing the per-device pgpu and uploading iter-invariant
@@ -1136,6 +1201,17 @@ LMP2Status iterate_dlpno_ccsd_t2(
     const bool dfpair_gpu_validate =
         std::getenv("GANSU_DLPNO_DFPAIR_GPU_VALIDATE") != nullptr;
 #ifndef GANSU_CPU_ONLY
+    // Stage D (D1b): when pi_T_stack is sparse, the upload below packs
+    // T_meta_dpair into the kl-slot layout, which requires the kl-slot list to
+    // already exist. That list is otherwise first built inside
+    // rebuild_with_stack() (first iter, AFTER this one-time pre-loop upload), so
+    // pre-build it here per device. No-op unless pitstack_sparse_; idempotent.
+    if (ccsd_bars_sparse && n_gpus > 0) {
+        // Serial over devices: setup_sparse_stacked_ is itself omp-parallel inside.
+        for (int d = 0; d < n_gpus; ++d) {
+            if (pgpus[d]) pgpus[d]->ensure_sparse_stacked(coupling_ccsd_per_pair);
+        }
+    }
     if (dfpair_gpu_env && phase24 != nullptr && phase24->nocc == nocc
         && n_gpus > 0) {
         bool all_ok = true;
@@ -1201,13 +1277,15 @@ LMP2Status iterate_dlpno_ccsd_t2(
             // per-idx CPU fallback (lines 1113/1137/else-branch below) would
             // read uninitialized pi_cache. pi_T_stack host is still produced
             // because DFpair always consumes it on CPU.
-            bool all_rgpu_active = (n_gpus > 0);
-            for (int d = 0; d < n_gpus; ++d) {
-                if (!(rgpus[d] && rgpus[d]->active())) {
-                    all_rgpu_active = false; break;
-                }
-            }
-            const bool skip_pi_cache_host = all_rgpu_active;
+            // Per-device skip: a device whose ResidGpu is ACTIVE fills
+            // R_ph_acc for its slab, so its host pi_cache / pi_T_stack are never
+            // read (the CPU resid loop is gated out for those pairs) ⇒ skip the
+            // expensive D2H + host build. A device whose ResidGpu is INACTIVE
+            // (failed to fit) needs its slab's host pi_cache (CPU inter-Fock +
+            // ph-ladder) and host pi_T_stack (CPU oooo) produced for the
+            // per-idx CPU fallback. (Previously this was a single all_rgpu_active
+            // flag; per-device is both more efficient AND correct — the inactive
+            // slab's owner always produces its own pi_cache.)
             if (n_gpus > 1) {
 #ifndef GANSU_CPU_ONLY
                 #pragma omp parallel num_threads(n_gpus)
@@ -1218,14 +1296,16 @@ LMP2Status iterate_dlpno_ccsd_t2(
                     const int d = 0;
 #endif
                     MultiGpuManager::DeviceGuard guard(d);
+                    const bool skip_d = (rgpus[d] && rgpus[d]->active());
                     pgpus[d]->rebuild_with_stack(
-                        Y_old, pi_cache, pi_T_stack, skip_pi_cache_host,
+                        Y_old, pi_cache, pi_T_stack, skip_d,
                         ccsd_bars_sparse ? &coupling_ccsd_per_pair : nullptr);
                 }
 #endif
             } else {
+                const bool skip_0 = (rgpus[0] && rgpus[0]->active());
                 pgpus[0]->rebuild_with_stack(
-                    Y_old, pi_cache, pi_T_stack, skip_pi_cache_host,
+                    Y_old, pi_cache, pi_T_stack, skip_0,
                     ccsd_bars_sparse ? &coupling_ccsd_per_pair : nullptr);
             }
             dt_picache += std::chrono::duration<double>(

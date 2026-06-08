@@ -177,6 +177,17 @@ public:
     bool upload_T_meta_dpair(const std::vector<RowMatXd>& T_meta_dpair);
 
     /**
+     * @brief Stage D (D1b): pre-build the sparse kl-slot machinery (kl-slot list,
+     *        slot maps, sparse d_pi_T_stack) BEFORE the iter loop. No-op unless
+     *        pitstack_sparse_ is on. Needed because upload_T_meta_dpair() (a
+     *        one-time pre-loop call) reads the kl-slot list to pack T_meta_dpair
+     *        in sparse layout, but the list is otherwise first built in
+     *        rebuild_with_stack() (first iter, AFTER the upload). Idempotent
+     *        (setup_sparse_stacked_ is guarded); rebuild's later call early-returns.
+     */
+    void ensure_sparse_stacked(const std::vector<std::vector<int>>& coupling);
+
+    /**
      * @brief DFpair GPU port — compute DF_per_pair[idx] = −(pi_T_stack[idx] ·
      *        T_meta_dpair[idx]) for this instance's slab [pair_begin_,pair_end_)
      *        as a per-pair cublasDgemm, D2H each [n_ij × n_ij] block into
@@ -232,9 +243,16 @@ public:
     const size_t*  device_slot_offset()      const noexcept;   // [N_pair+1] (kl_slot CSR)
     const int*     device_kl_slot()          const noexcept;   // [Σ n_slots] kl per slot
     const size_t*  device_idx_offset_sparse()const noexcept;   // [N_pair+1] pi_T sparse offsets
-    const int*     device_slot_jcol()        const noexcept;   // [N_pair·nocc]
-    const int*     device_slot_irow()        const noexcept;   // [N_pair·nocc]
+    const int*     device_slot_jcol()        const noexcept;   // [N_pair·nocc] (k,j)
+    const int*     device_slot_irow()        const noexcept;   // [N_pair·nocc] (i,l)
+    const int*     device_slot_icol()        const noexcept;   // [N_pair·nocc] (k,i)
+    const int*     device_slot_jrow()        const noexcept;   // [N_pair·nocc] (j,l)
     bool           pitstack_sparse_ready()   const noexcept;   // kl_slot_built
+    bool           pitstack_sparse()         const noexcept { return pitstack_sparse_; } // sparse storage active
+    /// Host n_slots per ORIG pair idx (size N_pair) or nullptr if kl-slot list
+    /// not built. Used by ResidGpu (D3a) to size the sparse V_stacked_oooo by
+    /// the per-pair coupling-slot count instead of nocc².
+    const int*     host_n_slots()            const noexcept;   // [N_pair] or nullptr
 
     /// Slab info (output-row range and CUDA device).
     int            pair_begin()              const noexcept { return pair_begin_; }
@@ -265,6 +283,14 @@ private:
     // Set in the constructor when GANSU_DLPNO_CCSD_BARS_SPARSE=1 AND this is a
     // stacked instance. Screening (norm/distance) ⇒ NOT bit-exact (ΔE<1e-4).
     bool sparse_stacked_ = false;
+
+    // Stage D (D1b) — sparse pi_T_stack layout active. When true, d_pi_T_stack
+    // is stored in the coupling-list (kl-slot) layout (per pair n_ij²·n_slots,
+    // offsets d_idx_offset_sparse) instead of the dense n_ij²·nocc². The scatter
+    // writes slot positions and ResidGpu consumers read via the slot maps.
+    // Set = GANSU_DLPNO_CCSD_PITSTACK_SPARSE && sparse_stacked_. The dense
+    // d_pi_T_stack / h_pi_T_stack are then NOT allocated (pi_T 48.8→~5GB Decacene).
+    bool pitstack_sparse_ = false;
 
     // CPU fallback for !active() — keeps the public API stable when GPU
     // is unavailable. Same pi_cache_out layout.

@@ -183,6 +183,19 @@ struct PiCacheGpu::Impl {
     real_t*  h_pi_needed    = nullptr;   // pinned mirror of d_pi_needed
     std::vector<std::vector<int>> needed_ikl_host;  // [N_act_ij][count]
 
+    // Stage D (offset-CSR) — when non-empty, the ragged coupling buffers
+    // (d_needed_ak / d_coupling_ikl / d_coupling_slot_base / d_pi_needed /
+    // d_barS_csr) are sized by Σ count[ai] (= total_needed, AVG) instead of
+    // N_act_ij·max_needed (MAX, rectangular padding). Each row ai's slots start
+    // at needed_offset[ai] instead of ai·max_needed. This is what makes the
+    // distance screen actually shrink memory (padding kept buffers at max-
+    // coupling size regardless of avg). Populated ONLY in setup_sparse_stacked_
+    // (CCSD); LMP2's setup leaves it empty ⇒ the shared compute_pi_needed_ragged_
+    // falls back to padded indexing. Pure layout change ⇒ bit-exact.
+    std::vector<size_t> needed_offset;   // [N_act_ij+1] cumulative count (host)
+    size_t              total_needed = 0;// Σ count[ai] (= needed_offset[N_act_ij])
+    size_t*             d_needed_offset = nullptr; // [N_act_ij+1] device mirror
+
     // Phase 1 (sparse barS) — ragged coupling-list batched-GEMM pointer arrays.
     // Built once (iter-invariant: the ak mapping + base buffer pointers are
     // fixed after allocation, and Y is repacked IN PLACE into d_Y_pad each
@@ -237,7 +250,19 @@ struct PiCacheGpu::Impl {
     size_t*  d_idx_offset_sparse = nullptr; // [N_pair+1] cumulative n_ij²·n_slots (pi_T sparse)
     int*     d_slot_jcol    = nullptr;  // [N_pair·nocc] slot of (k,j) or -1
     int*     d_slot_irow    = nullptr;  // [N_pair·nocc] slot of (i,l) or -1
+    int*     d_slot_icol    = nullptr;  // [N_pair·nocc] slot of (k,i) or -1 (j-side slice)
+    int*     d_slot_jrow    = nullptr;  // [N_pair·nocc] slot of (j,l) or -1 (j-side slice)
+    int*     d_coupling_slot_base = nullptr; // [N_act_ij·max_needed] local slot of
+                                             // coupling n's canonical (p,q); +1 = transpose
     size_t   pi_T_sparse_total = 0;     // Σ n_ij²·n_slots (full N_pair)
+    size_t   pi_T_sparse_slab_base  = 0; // Σ_{i<pair_begin} n_ij²·n_slots
+    size_t   pi_T_sparse_slab_total = 0; // slab's own elem count (sparse)
+    // Host copies of the kl-slot list (for the sparse T_meta_dpair gather in
+    // upload_T_meta_dpair, which re-orders the dense host T_meta into kl-slot
+    // device layout). Small ints.
+    std::vector<int>    h_kl_slot_host;     // [Σ n_slots] kl per slot
+    std::vector<size_t> h_slot_offset_host; // [N_pair+1] cumulative n_slots
+    std::vector<int>    h_n_slots_host;     // [N_pair]
 
     void free_all() {
         if (d_barS_pad)    cudaFree(d_barS_pad);
@@ -259,6 +284,7 @@ struct PiCacheGpu::Impl {
         if (d_active_i_kl)   cudaFree(d_active_i_kl);
         if (d_needed_ak)     cudaFree(d_needed_ak);
         if (d_needed_count)  cudaFree(d_needed_count);
+        if (d_needed_offset) cudaFree(d_needed_offset);
         if (d_pi_needed)     cudaFree(d_pi_needed);
         if (h_pi_needed)     cudaFreeHost(h_pi_needed);
         if (d_pY_ptrs)       cudaFree(d_pY_ptrs);
@@ -275,6 +301,9 @@ struct PiCacheGpu::Impl {
         if (d_idx_offset_sparse) cudaFree(d_idx_offset_sparse);
         if (d_slot_jcol)     cudaFree(d_slot_jcol);
         if (d_slot_irow)     cudaFree(d_slot_irow);
+        if (d_slot_icol)     cudaFree(d_slot_icol);
+        if (d_slot_jrow)     cudaFree(d_slot_jrow);
+        if (d_coupling_slot_base) cudaFree(d_coupling_slot_base);
         if (d_T_meta_dpair)  cudaFree(d_T_meta_dpair);
         if (d_DF_scratch)    cudaFree(d_DF_scratch);
         d_T_meta_dpair = nullptr;
@@ -284,13 +313,16 @@ struct PiCacheGpu::Impl {
         d_pair_lookup = d_setup_i = d_setup_j = d_n_pno = nullptr;
         d_active_i_ij = d_coupling_ikl = nullptr;
         d_n_slots = d_kl_slot = d_slot_jcol = d_slot_irow = nullptr;
+        d_slot_icol = d_slot_jrow = nullptr;
         d_slot_offset = d_idx_offset_sparse = nullptr;
+        d_coupling_slot_base = nullptr;
         d_idx_offset = nullptr;
         d_pi_T_stack = nullptr;
         h_pi_T_stack = nullptr;
         d_active_ij_pos = d_active_kl_pos = nullptr;
         d_active_i_kl = nullptr;
         d_needed_ak = d_needed_count = nullptr;
+        d_needed_offset = nullptr;
         d_pi_needed = nullptr;
         h_pi_needed = nullptr;
         d_pY_ptrs = d_pBarS_ptrs = d_pHalf_ptrs = d_pPi_ptrs = nullptr;
@@ -432,9 +464,19 @@ __global__ void scatter_pi_T_coupling_kernel(
     const int*    __restrict__ d_setup_i,       // idx → setups[idx].i (= p)
     const int*    __restrict__ d_setup_j,       // idx → setups[idx].j (= q)
     const int*    __restrict__ d_n_pno,
-    const size_t* __restrict__ d_idx_offset,
+    const size_t* __restrict__ d_idx_offset,    // dense pi_T offsets (n_ij²·nocc²)
     real_t*       __restrict__ d_pi_T_stack,
-    int nocc, int max_n, int max_coupling, int N_act_ij)
+    int nocc, int max_n, int max_coupling, int N_act_ij,
+    // Stage D sparse-output extras (used when pitstack_sparse != 0):
+    int pitstack_sparse,
+    const size_t* __restrict__ d_idx_offset_sparse, // sparse pi_T offsets
+    const int*    __restrict__ d_n_slots,           // [N_pair] slots per pair
+    const int*    __restrict__ d_coupling_slot_base,// (ai·max_coupling+slot) → canon local slot
+    // Stage D offset-CSR: when non-null, the ragged companions (d_pi_needed,
+    // d_coupling_ikl, d_coupling_slot_base) are indexed by needed_offset[ai]+slot
+    // instead of ai·max_coupling+slot. d_coupling_count still gives the per-row
+    // valid slot count; the grid.y span (max_coupling) is the padded max.
+    const size_t* __restrict__ d_needed_offset)
 {
     const int ai   = blockIdx.x;
     const int slot = blockIdx.y;
@@ -445,29 +487,40 @@ __global__ void scatter_pi_T_coupling_kernel(
     const int n_ij = d_n_pno[i_ij];
     if (n_ij == 0) return;
 
-    const size_t cslot = static_cast<size_t>(ai) * max_coupling + slot;
+    const size_t cslot = d_needed_offset
+        ? (d_needed_offset[ai] + slot)
+        : (static_cast<size_t>(ai) * max_coupling + slot);
     const int idx_kl = d_coupling_ikl[cslot];
     const int p = d_setup_i[idx_kl];
     const int q = d_setup_j[idx_kl];
-    const int kl1 = p * nocc + q;          // k=p (=s_i_kl) → canon
-    const int kl2 = q * nocc + p;          // k=q (≠p)      → transpose
 
     const real_t* src = d_pi_needed
         + cslot * static_cast<size_t>(max_n) * static_cast<size_t>(max_n);
-    const size_t base = d_idx_offset[i_ij];
-    const size_t row_stride = static_cast<size_t>(nocc)
-                            * static_cast<size_t>(nocc)
-                            * static_cast<size_t>(n_ij);
+
+    // Output position: dense (k·nocc+l) layout, or sparse (kl-slot) layout.
+    size_t out_base, out_row_stride;
+    int pos1, pos2;  // canon, transpose column positions (× n_ij)
+    if (pitstack_sparse) {
+        out_base       = d_idx_offset_sparse[i_ij];
+        out_row_stride = static_cast<size_t>(d_n_slots[i_ij]) * n_ij;
+        pos1 = d_coupling_slot_base[cslot];   // canonical local slot
+        pos2 = pos1 + 1;                       // transpose slot (if p!=q)
+    } else {
+        out_base       = d_idx_offset[i_ij];
+        out_row_stride = static_cast<size_t>(nocc) * nocc * n_ij;
+        pos1 = p * nocc + q;                   // canon kl
+        pos2 = q * nocc + p;                   // transpose kl
+    }
 
     for (int a = threadIdx.y; a < n_ij; a += blockDim.y) {
         for (int d = threadIdx.x; d < n_ij; d += blockDim.x) {
             const real_t v_canon = src[static_cast<size_t>(a) * max_n + d];
-            d_pi_T_stack[base + static_cast<size_t>(a) * row_stride
-                         + static_cast<size_t>(kl1) * n_ij + d] = v_canon;
+            d_pi_T_stack[out_base + static_cast<size_t>(a) * out_row_stride
+                         + static_cast<size_t>(pos1) * n_ij + d] = v_canon;
             if (p != q) {
                 const real_t v_t = src[static_cast<size_t>(d) * max_n + a];
-                d_pi_T_stack[base + static_cast<size_t>(a) * row_stride
-                             + static_cast<size_t>(kl2) * n_ij + d] = v_t;
+                d_pi_T_stack[out_base + static_cast<size_t>(a) * out_row_stride
+                             + static_cast<size_t>(pos2) * n_ij + d] = v_t;
             }
         }
     }
@@ -689,6 +742,9 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
         const char* ec = std::getenv("GANSU_DLPNO_CCSD_BARS_SPARSE");
         sparse_stacked_ = (ec && ec[0] == '1') && want_stacked
                           && !setup_j_per_pair_.empty() && N_act_ij_ > 0;
+        // Stage D: sparse pi_T_stack storage (implies sparse_stacked_).
+        const char* ep = std::getenv("GANSU_DLPNO_CCSD_PITSTACK_SPARSE");
+        pitstack_sparse_ = (ep && ep[0] == '1') && sparse_stacked_;
     }
     // Unified gate: skip the dense d_barS_pad / d_pi_pad in either sparse mode.
     const bool sparse_barS = sparse_lmp2_ || sparse_stacked_;
@@ -735,10 +791,13 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
             // d_pi_T_stack (+ slab pinned mirror) IS still allocated, so count
             // bytes_pi_T here. Bypasses the dense fixed-need check that would
             // false-OOM on Decacene.
+            // Stage D: when pitstack_sparse_, the dense d_pi_T_stack is NOT
+            // allocated (sparse one built lazily in setup, much smaller), so
+            // exclude bytes_pi_T from the ctor budget.
             const size_t fixed_need_sparse = bytes_Y_compact   // d_Y_pad
                                            + bytes_Y_T_full     // d_Y_pad_T
                                            + bytes_Y_compact    // d_half_pad
-                                           + bytes_pi_T         // d_pi_T_stack (stacked; 0 if LMP2)
+                                           + (pitstack_sparse_ ? 0 : bytes_pi_T)
                                            + margin;
             if (fixed_need_sparse > free_b || N_act_ij_ == 0) {
                 delete p_; p_ = nullptr; active_ = false; return;
@@ -850,20 +909,21 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
             check_cuda_(cudaMalloc(&s.d_idx_offset,
                                    static_cast<size_t>(N_pair_ + 1) * sizeof(size_t)),
                         "cudaMalloc d_idx_offset");
-            check_cuda_(cudaMalloc(&s.d_pi_T_stack, bytes_pi_T),
-                        "cudaMalloc d_pi_T_stack");
-            // Step S9 — size the pinned host mirror to the slab range only.
-            // For a single-GPU run this is the same as bytes_pi_T; for
-            // num_gpus=8 it is ~1/8 the size, which cuts the per-device
-            // pinning time from ~8 s to ~1 s and (more importantly) lets
-            // 8 concurrent cudaMallocHost calls fight over the kernel
-            // mmap_lock for less wall time. Without the slab-only sizing,
-            // cholesterol CCSD T2 setup_pgpu was 63 s wall with all 8
-            // devices stuck in alloc_stack at the same time (per-stage
-            // profile, 2026-05-17).
-            if (bytes_pi_T_slab > 0) {
-                check_cuda_(cudaMallocHost(&s.h_pi_T_stack, bytes_pi_T_slab),
-                            "cudaMallocHost h_pi_T_stack (slab)");
+            // Stage D: when pitstack_sparse_, d_pi_T_stack + h_pi_T_stack use
+            // the sparse (kl-slot) sizing and are allocated lazily in
+            // setup_sparse_stacked_ (pi_T_sparse_total unknown until then).
+            if (!pitstack_sparse_) {
+                check_cuda_(cudaMalloc(&s.d_pi_T_stack, bytes_pi_T),
+                            "cudaMalloc d_pi_T_stack");
+                // Step S9 — size the pinned host mirror to the slab range only.
+                // For a single-GPU run this is the same as bytes_pi_T; for
+                // num_gpus=8 it is ~1/8 the size, which cuts the per-device
+                // pinning time and lets concurrent cudaMallocHost calls fight
+                // over the kernel mmap_lock for less wall time.
+                if (bytes_pi_T_slab > 0) {
+                    check_cuda_(cudaMallocHost(&s.h_pi_T_stack, bytes_pi_T_slab),
+                                "cudaMallocHost h_pi_T_stack (slab)");
+                }
             }
             s.pi_T_slab_base_offset = pi_T_slab_base_off;
             s.pi_T_slab_total       = pi_T_slab_count;
@@ -1847,14 +1907,18 @@ void PiCacheGpu::compute_pi_needed_ragged_(int tile_start, int tile_end)
         if (n_ij == 0) continue;
         const int cnt = static_cast<int>(s.needed_ikl_host[ai].size());
         if (cnt == 0) continue;
-        const size_t base = static_cast<size_t>(ai) * s.max_needed
-                          * static_cast<size_t>(stride_pair);
+        // Offset-CSR (Stage D, CCSD): row ai's slots start at needed_offset[ai];
+        // padded fallback (LMP2, needed_offset empty): ai·max_needed.
+        const size_t row_slot = s.needed_offset.empty()
+            ? static_cast<size_t>(ai) * s.max_needed
+            : s.needed_offset[ai];
+        const size_t base = row_slot * static_cast<size_t>(stride_pair);
 
         // Gather this row's coupling Y into the contiguous one-row buffer
         // (on the cuBLAS stream so it precedes stage1 reading d_Y_coupling).
         gather_Y_row_kernel<<<static_cast<unsigned>(cnt), 256, 0, gemm_stream>>>(
             s.d_Y_pad,
-            s.d_needed_ak + static_cast<size_t>(ai) * s.max_needed,
+            s.d_needed_ak + row_slot,
             cnt, s.d_Y_coupling, stride_pair);
         check_cuda_(cudaGetLastError(), "gather_Y_row_kernel launch");
 
@@ -2045,7 +2109,10 @@ const int*    PiCacheGpu::device_kl_slot()          const noexcept { return (p_ 
 const size_t* PiCacheGpu::device_idx_offset_sparse()const noexcept { return (p_ && p_->kl_slot_built) ? p_->d_idx_offset_sparse : nullptr; }
 const int*    PiCacheGpu::device_slot_jcol()        const noexcept { return (p_ && p_->kl_slot_built) ? p_->d_slot_jcol : nullptr; }
 const int*    PiCacheGpu::device_slot_irow()        const noexcept { return (p_ && p_->kl_slot_built) ? p_->d_slot_irow : nullptr; }
+const int*    PiCacheGpu::device_slot_icol()        const noexcept { return (p_ && p_->kl_slot_built) ? p_->d_slot_icol : nullptr; }
+const int*    PiCacheGpu::device_slot_jrow()        const noexcept { return (p_ && p_->kl_slot_built) ? p_->d_slot_jrow : nullptr; }
 bool          PiCacheGpu::pitstack_sparse_ready()   const noexcept { return p_ && p_->kl_slot_built; }
+const int*    PiCacheGpu::host_n_slots()            const noexcept { return (p_ && p_->kl_slot_built && !p_->h_n_slots_host.empty()) ? p_->h_n_slots_host.data() : nullptr; }
 #else
 const int*    PiCacheGpu::device_n_slots()          const noexcept { return nullptr; }
 const size_t* PiCacheGpu::device_slot_offset()      const noexcept { return nullptr; }
@@ -2053,7 +2120,10 @@ const int*    PiCacheGpu::device_kl_slot()          const noexcept { return null
 const size_t* PiCacheGpu::device_idx_offset_sparse()const noexcept { return nullptr; }
 const int*    PiCacheGpu::device_slot_jcol()        const noexcept { return nullptr; }
 const int*    PiCacheGpu::device_slot_irow()        const noexcept { return nullptr; }
+const int*    PiCacheGpu::device_slot_icol()        const noexcept { return nullptr; }
+const int*    PiCacheGpu::device_slot_jrow()        const noexcept { return nullptr; }
 bool          PiCacheGpu::pitstack_sparse_ready()   const noexcept { return false; }
+const int*    PiCacheGpu::host_n_slots()            const noexcept { return nullptr; }
 #endif
 
 // ---------------------------------------------------------------------------
@@ -2084,6 +2154,9 @@ void PiCacheGpu::build_stack_cpu_(
                 const int idx_kl = pl[k * nocc + l];
                 if (n_pno_[idx_kl] == 0) continue;
                 const RowMatXd& pi_canon = pi_cache[i_ij][idx_kl];
+                // Sparse pi_cache (coupling-only): non-coupling (k,l) blocks are
+                // 0×0 ⇒ leave their pi_T_stack column block zero (setZero above).
+                if (pi_canon.rows() == 0 || pi_canon.cols() == 0) continue;
                 const size_t col_off =
                     (static_cast<size_t>(k) * nocc + l) * n_ij;
                 if (si[idx_kl] != k) {
@@ -2131,16 +2204,51 @@ void PiCacheGpu::setup_sparse_stacked_(
     }
     s.max_needed = std::max(1, max_needed);
 
+    // Stage D (offset-CSR): cumulative per-row offsets so the big ragged buffers
+    // are sized by Σ count (AVG) not N_act_ij·max_needed (MAX padding). Row ai's
+    // slots live at [needed_offset[ai], needed_offset[ai]+count[ai]). This is
+    // what lets the distance screen actually reduce memory.
+    s.needed_offset.assign(static_cast<size_t>(N_act_ij_) + 1, 0);
+    for (int ai = 0; ai < N_act_ij_; ++ai)
+        s.needed_offset[ai + 1] =
+            s.needed_offset[ai] + s.needed_ikl_host[ai].size();
+    s.total_needed = s.needed_offset[N_act_ij_];
+    const size_t ns = std::max<size_t>(1, s.total_needed);  // offset-CSR total
+
+    // Stage D — print the PLANNED ragged footprint BEFORE the big allocs so an
+    // OOM here still reports avg/max coupling + buffer sizes (the post-build
+    // diagnostic at the end never prints when an alloc throws first).
+    {
+        const double blk_mb = static_cast<double>(stride_pair)
+                            * sizeof(real_t) / (1024.0 * 1024.0);
+        const double avg = N_act_ij_ > 0
+            ? static_cast<double>(s.total_needed) / N_act_ij_ : 0.0;
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const double ragged_mb = static_cast<double>(s.total_needed) * blk_mb;
+        std::printf("[CCSD-sparse-plan dev=%d slab=[%d,%d)] N_act_ij=%d "
+                    "max_coupling=%d avg_coupling=%.1f total_needed=%zu "
+                    "→ d_pi_needed=%.0f MB + d_barS_csr=%.0f MB "
+                    "(padded would be %.0f MB each); GPU free=%.0f MB / "
+                    "total=%.0f MB\n",
+                    device_id_, pair_begin_, pair_end_, N_act_ij_,
+                    s.max_needed, avg, s.total_needed,
+                    ragged_mb, ragged_mb,
+                    static_cast<double>(N_act_ij_) * s.max_needed * blk_mb,
+                    free_b / (1024.0 * 1024.0), total_b / (1024.0 * 1024.0));
+        std::fflush(stdout);
+    }
+
     // 2) device maps: d_needed_ak (active-kl pos), d_needed_count, d_coupling_ikl.
-    const size_t ns = static_cast<size_t>(N_act_ij_) * s.max_needed;
-    std::vector<int> h_ak(std::max<size_t>(1, ns), -1);
+    //    Offset-CSR layout: slot = needed_offset[ai] + n (NOT ai·max_needed).
+    std::vector<int> h_ak(ns, -1);
     std::vector<int> h_cnt(std::max(1, N_act_ij_), 0);
-    std::vector<int> h_cik(std::max<size_t>(1, ns), -1);
+    std::vector<int> h_cik(ns, -1);
     for (int ai = 0; ai < N_act_ij_; ++ai) {
         const std::vector<int>& dst = s.needed_ikl_host[ai];
         h_cnt[ai] = static_cast<int>(dst.size());
         for (int n = 0; n < static_cast<int>(dst.size()); ++n) {
-            const size_t slot = static_cast<size_t>(ai) * s.max_needed + n;
+            const size_t slot = s.needed_offset[ai] + n;
             h_ak[slot]  = active_kl_pos_[dst[n]];
             h_cik[slot] = dst[n];
         }
@@ -2151,12 +2259,18 @@ void PiCacheGpu::setup_sparse_stacked_(
                 "cudaMalloc d_needed_count (stacked)");
     check_cuda_(cudaMalloc(&s.d_coupling_ikl, sizeof(int) * h_cik.size()),
                 "cudaMalloc d_coupling_ikl");
+    check_cuda_(cudaMalloc(&s.d_needed_offset,
+                           sizeof(size_t) * s.needed_offset.size()),
+                "cudaMalloc d_needed_offset");
     check_cuda_(cudaMemcpy(s.d_needed_ak, h_ak.data(), sizeof(int) * h_ak.size(),
                            cudaMemcpyHostToDevice), "H2D d_needed_ak (stacked)");
     check_cuda_(cudaMemcpy(s.d_needed_count, h_cnt.data(), sizeof(int) * h_cnt.size(),
                            cudaMemcpyHostToDevice), "H2D d_needed_count (stacked)");
     check_cuda_(cudaMemcpy(s.d_coupling_ikl, h_cik.data(), sizeof(int) * h_cik.size(),
                            cudaMemcpyHostToDevice), "H2D d_coupling_ikl");
+    check_cuda_(cudaMemcpy(s.d_needed_offset, s.needed_offset.data(),
+                           sizeof(size_t) * s.needed_offset.size(),
+                           cudaMemcpyHostToDevice), "H2D d_needed_offset");
 
     // 3) d_pi_needed (device). h_pi_needed (pinned mirror) is NOT allocated
     //    here — it is only needed by the CPU-resid host-pi_cache path
@@ -2191,7 +2305,7 @@ void PiCacheGpu::setup_sparse_stacked_(
                 const RowMatXd& bs = barS_cache[i_ij][i_kl];
                 if (bs.rows() == 0 || bs.cols() == 0) continue;
                 real_t* dstb = h_csr.data()
-                    + (static_cast<size_t>(ai) * s.max_needed + n)
+                    + (s.needed_offset[ai] + n)
                       * static_cast<size_t>(stride_pair);
                 const real_t* srcb = bs.data();
                 for (int r = 0; r < n_ij; ++r)
@@ -2243,6 +2357,12 @@ void PiCacheGpu::setup_sparse_stacked_(
         std::vector<int> h_kl_slot(std::max<size_t>(1, kl_total), -1);
         std::vector<int> h_jcol(static_cast<size_t>(N_pair_) * nocc, -1);
         std::vector<int> h_irow(static_cast<size_t>(N_pair_) * nocc, -1);
+        std::vector<int> h_icol(static_cast<size_t>(N_pair_) * nocc, -1); // (k,i)
+        std::vector<int> h_jrow(static_cast<size_t>(N_pair_) * nocc, -1); // (j,l)
+        // coupling n → its canonical local slot (transpose = base+1 if p!=q).
+        // Offset-CSR: indexed by needed_offset[ai]+n (same as the other ragged
+        // companions), sized total_needed.
+        std::vector<int> h_csb(std::max<size_t>(1, s.total_needed), -1);
         int max_sl = 0;
         // Second pass: fill kl-slot list (local slot index) + slot maps.
         for (int ai = 0; ai < N_act_ij_; ++ai) {
@@ -2253,20 +2373,41 @@ void PiCacheGpu::setup_sparse_stacked_(
             int slot = 0;
             auto emit = [&](int k, int l) {
                 h_kl_slot[base + slot] = k * nocc + l;
-                if (l == j) h_jcol[static_cast<size_t>(i_ij) * nocc + k] = slot;
-                if (k == i) h_irow[static_cast<size_t>(i_ij) * nocc + l] = slot;
+                if (l == j) h_jcol[static_cast<size_t>(i_ij) * nocc + k] = slot; // (k,j)
+                if (k == i) h_irow[static_cast<size_t>(i_ij) * nocc + l] = slot; // (i,l)
+                if (l == i) h_icol[static_cast<size_t>(i_ij) * nocc + k] = slot; // (k,i)
+                if (k == j) h_jrow[static_cast<size_t>(i_ij) * nocc + l] = slot; // (j,l)
                 ++slot;
             };
-            for (int idx_kl : s.needed_ikl_host[ai]) {
+            const std::vector<int>& need = s.needed_ikl_host[ai];
+            for (int n = 0; n < static_cast<int>(need.size()); ++n) {
+                const int idx_kl = need[n];
                 const int p = setup_i_per_pair_[idx_kl];
                 const int q = setup_j_per_pair_[idx_kl];
-                emit(p, q);                 // canonical (k,l)=(p,q)
-                if (p != q) emit(q, p);     // transpose (q,p)
+                h_csb[s.needed_offset[ai] + n] = slot;
+                emit(p, q);                 // canonical (k,l)=(p,q) at slot base
+                if (p != q) emit(q, p);     // transpose (q,p) at base+1
             }
             if (slot > max_sl) max_sl = slot;
         }
         s.max_slots = max_sl;
         s.pi_T_sparse_total = h_idx_off_sp[N_pair_];
+        // Stage D (multi-GPU) — slab the sparse d_pi_T_stack: each device stores
+        // ONLY its slab pairs [pair_begin_, pair_end_), not the full N_pair
+        // replica (ResidGpu + compute_dfpair only read pi_T_stack[idx] for idx
+        // in this slab). pi_T_sparse_slab_{base,total} are the full-cumulative
+        // base + slab elem count. d_idx_offset_sparse is uploaded SLAB-RELATIVE
+        // (− slab_base) so all kernels indexing d_idx_offset_sparse[idx] hit the
+        // slab buffer at the right offset with NO kernel change. Out-of-slab idx
+        // entries become garbage but are never read. Single-GPU: slab_base=0 ⇒
+        // identical to the old full layout (bit-exact).
+        s.pi_T_sparse_slab_base  = h_idx_off_sp[pair_begin_];
+        s.pi_T_sparse_slab_total = h_idx_off_sp[pair_end_]
+                                 - h_idx_off_sp[pair_begin_];
+        // Keep host copies for the sparse T_meta_dpair gather (upload).
+        s.h_kl_slot_host     = h_kl_slot;
+        s.h_slot_offset_host = h_slot_off;
+        s.h_n_slots_host     = h_n_slots;
         check_cuda_(cudaMalloc(&s.d_n_slots, sizeof(int) * N_pair_), "d_n_slots");
         check_cuda_(cudaMalloc(&s.d_slot_offset, sizeof(size_t) * (N_pair_ + 1)), "d_slot_offset");
         check_cuda_(cudaMalloc(&s.d_kl_slot, sizeof(int) * std::max<size_t>(1, kl_total)), "d_kl_slot");
@@ -2276,9 +2417,56 @@ void PiCacheGpu::setup_sparse_stacked_(
         check_cuda_(cudaMemcpy(s.d_n_slots, h_n_slots.data(), sizeof(int) * N_pair_, cudaMemcpyHostToDevice), "H2D n_slots");
         check_cuda_(cudaMemcpy(s.d_slot_offset, h_slot_off.data(), sizeof(size_t) * (N_pair_ + 1), cudaMemcpyHostToDevice), "H2D slot_offset");
         check_cuda_(cudaMemcpy(s.d_kl_slot, h_kl_slot.data(), sizeof(int) * std::max<size_t>(1, kl_total), cudaMemcpyHostToDevice), "H2D kl_slot");
-        check_cuda_(cudaMemcpy(s.d_idx_offset_sparse, h_idx_off_sp.data(), sizeof(size_t) * (N_pair_ + 1), cudaMemcpyHostToDevice), "H2D idx_offset_sparse");
+        // Slab-relative offsets for the sparse (slabbed) d_pi_T_stack. Subtract
+        // the slab base so kernels reading d_idx_offset_sparse[idx] (idx in slab)
+        // address the slab-local buffer. !pitstack_sparse_: keep full (unused).
+        if (pitstack_sparse_) {
+            std::vector<size_t> h_idx_off_rel(h_idx_off_sp.size());
+            const size_t base = s.pi_T_sparse_slab_base;
+            for (size_t t = 0; t < h_idx_off_sp.size(); ++t)
+                h_idx_off_rel[t] = h_idx_off_sp[t] - base;  // wraps for idx<begin (unused)
+            check_cuda_(cudaMemcpy(s.d_idx_offset_sparse, h_idx_off_rel.data(), sizeof(size_t) * (N_pair_ + 1), cudaMemcpyHostToDevice), "H2D idx_offset_sparse (slab-rel)");
+        } else {
+            check_cuda_(cudaMemcpy(s.d_idx_offset_sparse, h_idx_off_sp.data(), sizeof(size_t) * (N_pair_ + 1), cudaMemcpyHostToDevice), "H2D idx_offset_sparse");
+        }
         check_cuda_(cudaMemcpy(s.d_slot_jcol, h_jcol.data(), sizeof(int) * h_jcol.size(), cudaMemcpyHostToDevice), "H2D slot_jcol");
         check_cuda_(cudaMemcpy(s.d_slot_irow, h_irow.data(), sizeof(int) * h_irow.size(), cudaMemcpyHostToDevice), "H2D slot_irow");
+        check_cuda_(cudaMalloc(&s.d_slot_icol, sizeof(int) * h_icol.size()), "d_slot_icol");
+        check_cuda_(cudaMalloc(&s.d_slot_jrow, sizeof(int) * h_jrow.size()), "d_slot_jrow");
+        check_cuda_(cudaMemcpy(s.d_slot_icol, h_icol.data(), sizeof(int) * h_icol.size(), cudaMemcpyHostToDevice), "H2D slot_icol");
+        check_cuda_(cudaMemcpy(s.d_slot_jrow, h_jrow.data(), sizeof(int) * h_jrow.size(), cudaMemcpyHostToDevice), "H2D slot_jrow");
+        check_cuda_(cudaMalloc(&s.d_coupling_slot_base, sizeof(int) * std::max<size_t>(1, h_csb.size())), "d_coupling_slot_base");
+        check_cuda_(cudaMemcpy(s.d_coupling_slot_base, h_csb.data(), sizeof(int) * h_csb.size(), cudaMemcpyHostToDevice), "H2D coupling_slot_base");
+
+        if (pitstack_sparse_) {
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            std::printf("[CCSD-sparse-piT dev=%d] d_pi_T_stack slab=%.0f MB "
+                        "(full-replica would be %.0f MB); GPU free=%.0f MB\n",
+                        device_id_,
+                        static_cast<double>(s.pi_T_sparse_slab_total)
+                            * sizeof(real_t) / (1024.0 * 1024.0),
+                        static_cast<double>(s.pi_T_sparse_total)
+                            * sizeof(real_t) / (1024.0 * 1024.0),
+                        free_b / (1024.0 * 1024.0));
+            std::fflush(stdout);
+        }
+
+        // Stage D (multi-GPU): allocate the SPARSE d_pi_T_stack SLAB-SIZED (only
+        // this device's [pair_begin_, pair_end_) pairs), not the full-N_pair
+        // replica. Device buffer base corresponds to pair_begin_; the slab-
+        // relative d_idx_offset_sparse uploaded above makes kernels address it
+        // correctly. Plus the slab pinned mirror.
+        if (pitstack_sparse_) {
+            check_cuda_(cudaMalloc(&s.d_pi_T_stack,
+                            std::max<size_t>(1, s.pi_T_sparse_slab_total) * sizeof(real_t)),
+                        "cudaMalloc d_pi_T_stack (sparse slab)");
+            if (s.pi_T_sparse_slab_total > 0) {
+                check_cuda_(cudaMallocHost(&s.h_pi_T_stack,
+                                s.pi_T_sparse_slab_total * sizeof(real_t)),
+                            "cudaMallocHost h_pi_T_stack (sparse slab)");
+            }
+        }
         s.kl_slot_built = true;
     }
 
@@ -2293,17 +2481,35 @@ void PiCacheGpu::setup_sparse_stacked_(
             ? static_cast<double>(total_coupling) / N_act_ij_ : 0.0;
         const double blk_mb = static_cast<double>(stride_pair)
                             * sizeof(real_t) / (1024.0 * 1024.0);
-        const double csr_mb = static_cast<double>(N_act_ij_)
-                            * s.max_needed * blk_mb;          // d_barS_csr
+        // Offset-CSR: the big buffers are sized total_needed (= Σ count = avg×
+        // N_act_ij), NOT N_act_ij·max_needed (padded). pad_mb shows what the old
+        // rectangular layout would have cost, so the screen's memory win is visible.
+        const double csr_mb = static_cast<double>(s.total_needed) * blk_mb;
+        const double pad_mb = static_cast<double>(N_act_ij_)
+                            * s.max_needed * blk_mb;
         std::printf("[CCSD-sparse dev=%d slab=[%d,%d)] N_act_ij=%d N_act_kl=%d "
                     "max_coupling=%d avg_coupling=%.1f (dense N_act_kl=%d) "
-                    "CSR=%.0f MB d_pi_needed=%.0f MB\n",
+                    "CSR=%.0f MB d_pi_needed=%.0f MB (padded would be %.0f MB)\n",
                     device_id_, pair_begin_, pair_end_, N_act_ij_, N_act_kl_,
-                    s.max_needed, avg_coupling, N_act_kl_, csr_mb, csr_mb);
+                    s.max_needed, avg_coupling, N_act_kl_, csr_mb, csr_mb, pad_mb);
         std::fflush(stdout);
     }
 }
 #endif // !GANSU_CPU_ONLY
+
+// Stage D (D1b): pre-build the sparse kl-slot machinery before the iter loop so
+// the one-time pre-loop upload_T_meta_dpair() can pack T_meta in sparse layout.
+// No-op unless pitstack_sparse_; idempotent (setup_sparse_stacked_ guarded).
+void PiCacheGpu::ensure_sparse_stacked(
+    const std::vector<std::vector<int>>& coupling) {
+#ifndef GANSU_CPU_ONLY
+    if (!pitstack_sparse_) return;
+    MultiGpuManager::DeviceGuard _guard(device_id_);
+    setup_sparse_stacked_(coupling);
+#else
+    (void)coupling;
+#endif
+}
 
 void PiCacheGpu::rebuild_with_stack(
     const std::vector<std::vector<real_t>>& Y_old,
@@ -2344,7 +2550,8 @@ void PiCacheGpu::rebuild_with_stack(
     const bool use_sparse = sparse_stacked_ && (coupling_ikl_per_pair != nullptr)
                             && N_act_ij_ > 0;
 
-    // Per-pair offsets into d_pi_T_stack — needed to compute the slab range.
+    // Per-pair DENSE offsets into d_pi_T_stack (slab range for the dense path;
+    // also used by the dense memset/D2H + host pi_T_stack_out scatter).
     std::vector<size_t> idx_offset_host(static_cast<size_t>(N + 1), 0);
     for (int i = 0; i < N; ++i) {
         const size_t n = static_cast<size_t>(n_pno_[i]);
@@ -2353,17 +2560,12 @@ void PiCacheGpu::rebuild_with_stack(
             * static_cast<size_t>(nocc)
             * static_cast<size_t>(nocc);
     }
-
-    // Zero the slab range of d_pi_T_stack. Empty (i_ij, i_kl) cells skip
-    // their writes; we need them zero on entry so they don't carry stale data.
     const size_t bytes_pi_T_slab = (idx_offset_host[ie] - idx_offset_host[ib])
                                  * sizeof(real_t);
-    if (bytes_pi_T_slab > 0) {
-        check_cuda_(cudaMemsetAsync(
-            s.d_pi_T_stack + idx_offset_host[ib],
-            0, bytes_pi_T_slab, /*stream=*/0),
-            "memset d_pi_T_stack (slab)");
-    }
+    // NOTE: the slab memset is deferred to AFTER setup_sparse_stacked_ below,
+    // because in the sparse pi_T_stack mode (pitstack_sparse_) the device
+    // d_pi_T_stack buffer itself is allocated there (its size = pi_T_sparse_total
+    // is unknown until the kl-slot list is built).
 
     // Step Z — unified tile loop: pack Y once, then per-tile compute +
     // (optional) D2H scatter to pi_cache_out + pack into pi_T_stack.
@@ -2371,8 +2573,27 @@ void PiCacheGpu::rebuild_with_stack(
     pack_Y_and_transpose_(Y_old);
 
     // Phase 2 (CCSD sparse): one-time build of the coupling machinery (CSR barS,
-    // ragged pointers, d_coupling_ikl, d_pi_needed). Idempotent.
+    // ragged pointers, d_coupling_ikl, d_pi_needed). Idempotent. In
+    // pitstack_sparse_ mode this also allocates the sparse d_pi_T_stack.
     if (use_sparse) setup_sparse_stacked_(*coupling_ikl_per_pair);
+
+    // Zero the slab range of d_pi_T_stack (sparse or dense layout). Scattered
+    // writes only fill coupling slots; the rest must be zero on entry.
+    // Sparse (pitstack) buffer is SLAB-SIZED ⇒ base 0; dense buffer is full ⇒
+    // slab base idx_offset_host[ib].
+    {
+        const size_t zero_base = pitstack_sparse_ ? size_t(0)
+                                                   : idx_offset_host[ib];
+        const size_t zero_bytes = (pitstack_sparse_ ? s.pi_T_sparse_slab_total
+                                                     : (idx_offset_host[ie]
+                                                        - idx_offset_host[ib]))
+                                  * sizeof(real_t);
+        if (zero_bytes > 0) {
+            check_cuda_(cudaMemsetAsync(s.d_pi_T_stack + zero_base, 0,
+                                        zero_bytes, /*stream=*/0),
+                        "memset d_pi_T_stack (slab)");
+        }
+    }
 
     // Pinned tile mirror for D2H scatter (non-skip only). Sized one tile.
     // (sparse path uses h_pi_needed instead, allocated in setup_sparse_stacked_.)
@@ -2422,7 +2643,10 @@ void PiCacheGpu::rebuild_with_stack(
         scatter_pi_T_coupling_kernel<<<sgrid, sblock>>>(
             s.d_pi_needed, s.d_active_i_ij, s.d_coupling_ikl, s.d_needed_count,
             s.d_setup_i, s.d_setup_j, s.d_n_pno, s.d_idx_offset,
-            s.d_pi_T_stack, nocc, max_n, s.max_needed, N_act_ij_);
+            s.d_pi_T_stack, nocc, max_n, s.max_needed, N_act_ij_,
+            pitstack_sparse_ ? 1 : 0,
+            s.d_idx_offset_sparse, s.d_n_slots, s.d_coupling_slot_base,
+            s.d_needed_offset);  // offset-CSR (Stage D); null in padded fallback
         if (sp_prof) {
             const auto sp_t2 = sp_now();
             std::printf("[CCSD-sparse-PROF dev=%d] ragged_compute=%.3fs "
@@ -2443,8 +2667,10 @@ void PiCacheGpu::rebuild_with_stack(
         // scatter the coupling blocks into pi_cache_out (others stay 0×0). The
         // CPU residual only reads {(k,j),(i,l)} which are in the coupling.
         if (!skip_host_pi) {
+            // Offset-CSR: mirror is sized total_needed (= Σ count), indexed by
+            // needed_offset[ai]+n.
             const size_t bytes_needed =
-                static_cast<size_t>(N_act_ij_) * s.max_needed
+                std::max<size_t>(1, s.total_needed)
                 * static_cast<size_t>(stride_pair) * sizeof(real_t);
             // Lazy pinned mirror (only the CPU-resid path needs it).
             if (s.h_pi_needed == nullptr && bytes_needed > 0)
@@ -2462,7 +2688,7 @@ void PiCacheGpu::rebuild_with_stack(
                     const int i_kl = need[n];
                     pi_cache_out[i_ij][i_kl].resize(n_ij, n_ij);
                     const real_t* src = s.h_pi_needed
-                        + (static_cast<size_t>(ai) * s.max_needed + n)
+                        + (s.needed_offset[ai] + n)
                           * static_cast<size_t>(stride_pair);
                     real_t* dst = pi_cache_out[i_ij][i_kl].data();
                     for (int r = 0; r < n_ij; ++r)
@@ -2537,6 +2763,25 @@ void PiCacheGpu::rebuild_with_stack(
                     + cudaGetErrorString(e));
             }
         }
+    }
+
+    // Stage D: in pitstack_sparse_ mode the host pi_T_stack_out (dense layout)
+    // is normally NOT produced — d_pi_T_stack is sparse, and the GPU consumers
+    // (ResidGpu + compute_dfpair) read the device buffer. BUT when a device's
+    // ResidGpu failed to fit (not all_rgpu_active ⇒ skip_host_pi=false), that
+    // slab's residual falls back to the CPU oooo ladder, which reads the host
+    // pi_T_stack[idx]. Build it here from the (just-produced, coupling-only)
+    // pi_cache_out so the fallback is CORRECT (non-coupling (k,l) stay zero ⇒
+    // bit-consistent with the GPU sparse oooo). When skip_host_pi (all GPU
+    // active), no fallback runs ⇒ leave 0×0.
+    if (pitstack_sparse_) {
+        if (!skip_host_pi) {
+            build_stack_cpu_(pi_cache_out, pi_T_stack_out);  // CPU oooo fallback
+        } else {
+            for (long long i_ij = ib; i_ij < ie; ++i_ij)
+                pi_T_stack_out[i_ij].resize(0, 0);
+        }
+        return;
     }
 
     // D2H — only the slab range of pi_T_stack.
@@ -2620,6 +2865,56 @@ bool PiCacheGpu::upload_T_meta_dpair(const std::vector<RowMatXd>& T_meta_dpair)
     const size_t slab_total = off[ie] - off[ib];
     if (slab_total == 0) return false;
 
+    // Stage D: sparse T_meta_dpair — gather the dense host T_meta (nocc²·n × n)
+    // into the kl-slot (n_slots·n × n) device layout that matches the sparse
+    // pi_T_stack, so compute_dfpair contracts over n_slots instead of nocc².
+    // Per-pair sparse size = n_slots·n² (= n²·n_slots = same as sparse pi_T).
+    if (pitstack_sparse_ && s.kl_slot_built) {
+        std::vector<size_t> sp_off(static_cast<size_t>(N) + 1, 0);
+        for (int i = 0; i < N; ++i) {
+            const size_t n = static_cast<size_t>(n_pno_[i]);
+            sp_off[i + 1] = sp_off[i]
+                + n * n * static_cast<size_t>(s.h_n_slots_host[i]);
+        }
+        const size_t sp_base  = sp_off[ib];
+        const size_t sp_slab  = sp_off[ie] - sp_off[ib];
+        if (sp_slab == 0) return false;
+        if (s.d_T_meta_dpair == nullptr) {
+            if (cudaMalloc(&s.d_T_meta_dpair, sp_slab * sizeof(real_t))
+                != cudaSuccess) { s.d_T_meta_dpair = nullptr; return false; }
+        }
+        if (s.d_DF_scratch == nullptr) {
+            const size_t df_bytes =
+                static_cast<size_t>(max_n_) * max_n_ * sizeof(real_t);
+            if (df_bytes > 0
+                && cudaMalloc(&s.d_DF_scratch, df_bytes) != cudaSuccess) {
+                s.d_DF_scratch = nullptr; return false;
+            }
+        }
+        std::vector<real_t> stage(sp_slab, real_t(0));
+        for (int idx = ib; idx < ie; ++idx) {
+            const int n = n_pno_[idx];
+            if (n == 0) continue;
+            if (idx >= static_cast<int>(T_meta_dpair.size())
+                || T_meta_dpair[idx].size() == 0) continue;
+            const real_t* src = T_meta_dpair[idx].data();    // (nocc²·n × n)
+            real_t* dstp = stage.data() + (sp_off[idx] - sp_base);
+            const size_t blk  = static_cast<size_t>(n) * n;  // per-(kl) n×n block
+            const size_t soff = s.h_slot_offset_host[idx];
+            const int    ns   = s.h_n_slots_host[idx];
+            for (int sslot = 0; sslot < ns; ++sslot) {
+                const int kl = s.h_kl_slot_host[soff + sslot];
+                std::memcpy(dstp + static_cast<size_t>(sslot) * blk,
+                            src + static_cast<size_t>(kl) * blk,
+                            blk * sizeof(real_t));
+            }
+        }
+        if (cudaMemcpy(s.d_T_meta_dpair, stage.data(),
+                       sp_slab * sizeof(real_t), cudaMemcpyHostToDevice)
+            != cudaSuccess) return false;
+        return true;
+    }
+
     if (s.d_T_meta_dpair == nullptr) {
         if (cudaMalloc(&s.d_T_meta_dpair, slab_total * sizeof(real_t))
             != cudaSuccess) {
@@ -2671,11 +2966,17 @@ void PiCacheGpu::compute_dfpair(std::vector<RowMatXd>& DF_per_pair_out)
     const int N    = N_pair_;
     const int nocc = nocc_;
 
+    // Per-pair offsets + contracted dim K. Stage D sparse: K = n_slots·n and the
+    // pi_T / T_meta offsets use the kl-slot (n²·n_slots) cumulative; else dense
+    // (K = nocc²·n, offsets nocc²·n²). Both pi_T and T_meta share the same sparse
+    // per-pair size (n²·n_slots) ⇒ one offset array.
+    const bool sp = pitstack_sparse_ && s.kl_slot_built;
     std::vector<size_t> off(static_cast<size_t>(N) + 1, 0);
     for (int i = 0; i < N; ++i) {
         const size_t n = static_cast<size_t>(n_pno_[i]);
-        off[i + 1] = off[i] + n * n * static_cast<size_t>(nocc)
-                                    * static_cast<size_t>(nocc);
+        const size_t per = sp ? (n * n * static_cast<size_t>(s.h_n_slots_host[i]))
+                              : (n * n * static_cast<size_t>(nocc) * nocc);
+        off[i + 1] = off[i] + per;
     }
     const int    ib        = pair_begin_, ie = pair_end_;
     const size_t slab_base = off[ib];
@@ -2685,12 +2986,17 @@ void PiCacheGpu::compute_dfpair(std::vector<RowMatXd>& DF_per_pair_out)
         const int n = n_pno_[idx];
         if (n == 0) { DF_per_pair_out[idx].resize(0, 0); continue; }
         DF_per_pair_out[idx].setZero(n, n);
-        const int K = static_cast<int>(
-            static_cast<size_t>(nocc) * nocc * n);
+        const int K = sp
+            ? static_cast<int>(static_cast<size_t>(s.h_n_slots_host[idx]) * n)
+            : static_cast<int>(static_cast<size_t>(nocc) * nocc * n);
+        if (K == 0) continue;  // pair with no coupling slots ⇒ DF stays 0
         // row-major DF[n×n] = pi_T[n×K] · T_meta[K×n]; cuBLAS col-major idiom
         // (= resid_gpu Op-1): first ptr = right factor T_meta (lda=n), second
         // ptr = left factor pi_T (ldb=K), C = DF (ldc=n), alpha=-1 folds the −=.
-        const real_t* A_piT   = s.d_pi_T_stack   + off[idx];                // full
+        // Sparse d_pi_T_stack is SLAB-SIZED (Stage D multi-GPU) ⇒ slab-relative
+        // offset; dense is full ⇒ absolute. T_meta is always slab-sized.
+        const real_t* A_piT   = s.d_pi_T_stack
+                              + (sp ? (off[idx] - slab_base) : off[idx]);
         const real_t* B_tmeta = s.d_T_meta_dpair + (off[idx] - slab_base);  // slab
         const cublasStatus_t st = cublasDgemm(
             s.cublas, CUBLAS_OP_N, CUBLAS_OP_N,

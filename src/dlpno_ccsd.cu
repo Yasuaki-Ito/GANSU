@@ -788,7 +788,7 @@ real_t DLPNOCCSD::compute_energy()
                   << std::scientific << std::setprecision(3) << r_max_last
                   << ", max|T1|=" << t1_norm_max
                   << "\n[DLPNO-CCSD]   E(strong-pair CCSD) = "
-                  << std::scientific << std::setprecision(10) << E_strong
+                  << std::scientific << std::setprecision(15) << E_strong
                   << "\n[DLPNO-CCSD]   E(weak-pair MP2)    = " << E_weak
                   << "\n[DLPNO-CCSD]   E(T1 contribution)  = " << E_T1
                   << "\n[DLPNO-CCSD]   E(total CCSD corr)  = " << E_total

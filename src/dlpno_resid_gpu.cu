@@ -105,7 +105,15 @@ __global__ void pack_V_meta_kernel(
     real_t*       __restrict__ d_V_meta_TT_packed,
     real_t*       __restrict__ d_T_meta_packed,
     real_t*       __restrict__ d_V_stacked_oooo_pad,
-    int nocc)
+    int nocc,
+    // Stage D (D3a): when voooo_sparse, d_V_stacked_oooo_pad holds only the
+    // coupling (k,l) blocks (slot layout). The (l,k) loop below skips the dense
+    // V_stacked write; a separate slot loop writes V_stacked[slot] for the
+    // n_slots[idx] coupling (k,l) from the kl-slot list. V_meta stays dense.
+    int voooo_sparse,
+    const int*    __restrict__ d_kl_slot,      // [Σ n_slots] kl(=k·nocc+l) per slot
+    const size_t* __restrict__ d_slot_offset,  // [N_pair+1] kl-slot CSR offsets
+    const int*    __restrict__ d_n_slots)      // [N_pair] slots per pair
 {
     const int idx = blockIdx.x;
     const int n   = d_n_pno[idx];
@@ -121,7 +129,8 @@ __global__ void pack_V_meta_kernel(
     const size_t nn_ij            = static_cast<size_t>(n) * nocc;
     const size_t pair_src_off     = d_pair_src_off[idx];
 
-    // Outer (l, k) loop, inner (d, c) strided by thread.
+    // Outer (l, k) loop, inner (d, c) strided by thread. Writes V_meta (dense)
+    // always; writes the dense V_stacked_oooo only when !voooo_sparse.
     for (int l = 0; l < nocc; ++l) {
         for (int k = 0; k < nocc; ++k) {
             const size_t lk_off = static_cast<size_t>(l * nocc + k)
@@ -148,12 +157,36 @@ __global__ void pack_V_meta_kernel(
                                           + static_cast<size_t>(d) * nn_ij;
                 for (int c = threadIdx.x; c < n; c += blockDim.x) {
                     const real_t v_dc = V_lk[d * n + c];
-                    d_V_stacked_oooo_pad [oooo_off + c]  = v_dc;
+                    if (!voooo_sparse)
+                        d_V_stacked_oooo_pad [oooo_off + c]  = v_dc;
                     d_V_meta_T_packed    [row_off_pack + c] = v_dc;
                     d_V_meta_TT_packed   [row_off_pack + c] = V_lk[c * n + d];
                     d_T_meta_packed      [row_off_pack + c] = T_kl[c * n + d];
                 }
             }
+        }
+    }
+
+    // Stage D (D3a): sparse V_stacked_oooo — write only the coupling (k,l)
+    // blocks at their slot positions. slot s ↔ kl = d_kl_slot[slot_base + s];
+    // source V_lk lives at (l·nocc + k) in d_V_flat. The oooo ladder reads
+    // V_stacked at the same slot index (Phase 1 sparse).
+    if (voooo_sparse) {
+        const size_t slot_base = d_slot_offset[idx];
+        const int    ns        = d_n_slots[idx];
+        for (int s = 0; s < ns; ++s) {
+            const int kl = d_kl_slot[slot_base + s];
+            const int k  = kl / nocc;
+            const int l  = kl % nocc;
+            const size_t lk_off = static_cast<size_t>(l * nocc + k)
+                                * static_cast<size_t>(n) * n;
+            const real_t* V_lk = d_V_flat + pair_src_off + lk_off;
+            const size_t slot_off = pair_oooo_off
+                                  + static_cast<size_t>(s) * per_pair_kl_oooo;
+            for (int d = threadIdx.y; d < n; d += blockDim.y)
+                for (int c = threadIdx.x; c < n; c += blockDim.x)
+                    d_V_stacked_oooo_pad[slot_off + static_cast<size_t>(d) * n + c]
+                        = V_lk[d * n + c];
         }
     }
 }
@@ -208,7 +241,12 @@ __global__ void slice_pi_N_T_for_I_kernel(
     real_t*       __restrict__ d_pi_N_packed,
     real_t*       __restrict__ d_pi_T_packed,
     int N_pair, int nocc, int max_n,
-    int pair_begin)
+    int pair_begin,
+    // Stage D sparse: (I_lmo,l) slot via d_slot_irow, row stride n_slots·n_ij,
+    // d_idx_offset_pi_T = sparse offsets.
+    int pit_sparse,
+    const int* __restrict__ d_n_slots,
+    const int* __restrict__ d_slot_irow)
 {
     const int idx = blockIdx.x + pair_begin;
     const int l   = blockIdx.y;
@@ -223,6 +261,9 @@ __global__ void slice_pi_N_T_for_I_kernel(
     const size_t pi_T_pack_off = d_per_pair_stack_off[idx];
     const size_t nn_ij_szt = static_cast<size_t>(n_ij)
                            * static_cast<size_t>(nocc);
+    const size_t row_stride = pit_sparse
+        ? static_cast<size_t>(d_n_slots[idx]) * n_ij
+        : static_cast<size_t>(nocc) * nocc * n_ij;
 
     // Step 6.6 fix: strided per-thread loop so block (TILE × TILE) covers
     // the full n_ij × n_ij grid even when n_ij > sqrt(1024) = 32. max_n is
@@ -237,11 +278,12 @@ __global__ void slice_pi_N_T_for_I_kernel(
             const int I_lmo = d_per_pair_I[idx];
             const int idx_il = d_pair_lookup[I_lmo * nocc + l];
             const int n_il   = d_n_pno[idx_il];
-            if (n_il > 0) {
+            int KL = pit_sparse ? -1 : (I_lmo * nocc + l);
+            if (pit_sparse && n_il > 0)
+                KL = d_slot_irow[static_cast<size_t>(idx) * nocc + l];
+            if (n_il > 0 && KL >= 0) {
                 const size_t base = d_idx_offset_pi_T[idx]
-                    + (static_cast<size_t>(I_lmo) * nocc + l)
-                    * static_cast<size_t>(n_ij);
-                const size_t row_stride = static_cast<size_t>(nocc) * nocc * n_ij;
+                    + static_cast<size_t>(KL) * static_cast<size_t>(n_ij);
                 v_N = d_pi_T_stack[base + static_cast<size_t>(a) * row_stride + d];
                 v_T = d_pi_T_stack[base + static_cast<size_t>(d) * row_stride + a];
             }
@@ -288,7 +330,13 @@ __global__ void inter_pair_fock_i_kernel(
     real_t*       __restrict__ d_R_packed,
     int N_pair, int nocc, int /*max_n*/,
     real_t threshold,
-    int pair_begin)
+    int pair_begin,
+    // Stage D sparse pi_T_stack: when pit_sparse, d_idx_offset is the sparse
+    // (kl-slot) offset array, row stride is n_slots[idx]·n_ij, and the (k,J_j)
+    // column is found via d_slot_jcol[idx·nocc+k] (−1 = not coupled ⇒ pi=0).
+    int pit_sparse,
+    const int* __restrict__ d_n_slots,
+    const int* __restrict__ d_slot_jcol)
 {
     const int idx = blockIdx.x + pair_begin;
     if (idx >= N_pair) return;
@@ -298,15 +346,16 @@ __global__ void inter_pair_fock_i_kernel(
 
     const int I_i = d_I_i[idx];
     const int J_j = d_I_j[idx];
-    const size_t k_stride = static_cast<size_t>(nocc) * n_ij;
     const size_t R_pair_off = d_per_pair_R_off[idx];
+    const size_t row_stride = pit_sparse
+        ? static_cast<size_t>(d_n_slots[idx]) * n_ij
+        : static_cast<size_t>(nocc) * nocc * n_ij;
 
     // Step 6.6 fix: strided per-thread loop so max_n > sqrt(1024) = 32 works.
     for (int a = threadIdx.y; a < n_ij; a += blockDim.y) {
         for (int d = threadIdx.x; d < n_ij; d += blockDim.x) {
-            const size_t base = d_idx_offset[idx]
-                              + static_cast<size_t>(a) * nocc * nocc * n_ij
-                              + static_cast<size_t>(J_j) * n_ij + d;
+            const size_t abase = d_idx_offset[idx]
+                               + static_cast<size_t>(a) * row_stride + d;
             real_t sum = real_t(0);
             for (int k = 0; k < nocc; ++k) {
                 if (k == I_i) continue;
@@ -318,8 +367,15 @@ __global__ void inter_pair_fock_i_kernel(
                 const int idx_kj = d_pair_lookup[k * nocc + J_j];
                 if (d_n_pno[idx_kj] == 0) continue;
 
-                const real_t pi_val = d_pi_T_stack[base
-                                                + static_cast<size_t>(k) * k_stride];
+                int KL;
+                if (pit_sparse) {
+                    KL = d_slot_jcol[static_cast<size_t>(idx) * nocc + k];
+                    if (KL < 0) continue;          // (k,J_j) not in coupling ⇒ 0
+                } else {
+                    KL = k * nocc + J_j;
+                }
+                const real_t pi_val = d_pi_T_stack[abase
+                                                + static_cast<size_t>(KL) * n_ij];
                 sum -= F_ik * pi_val;
             }
             d_R_packed[R_pair_off
@@ -351,7 +407,12 @@ __global__ void inter_pair_fock_j_kernel(
     real_t*       __restrict__ d_R_packed,
     int N_pair, int nocc, int /*max_n*/,
     real_t threshold,
-    int pair_begin)
+    int pair_begin,
+    // Stage D sparse: d_idx_offset = sparse offsets, row stride n_slots·n_ij,
+    // (I_i,l) column via d_slot_irow[idx·nocc+l] (−1 = not coupled).
+    int pit_sparse,
+    const int* __restrict__ d_n_slots,
+    const int* __restrict__ d_slot_irow)
 {
     const int idx = blockIdx.x + pair_begin;
     if (idx >= N_pair) return;
@@ -361,15 +422,16 @@ __global__ void inter_pair_fock_j_kernel(
 
     const int I_i = d_I_i[idx];
     const int J_j = d_I_j[idx];
-    const size_t l_stride = static_cast<size_t>(n_ij);
     const size_t R_pair_off = d_per_pair_R_off[idx];
+    const size_t row_stride = pit_sparse
+        ? static_cast<size_t>(d_n_slots[idx]) * n_ij
+        : static_cast<size_t>(nocc) * nocc * n_ij;
 
     // Step 6.6 fix: strided per-thread loop for max_n > sqrt(1024).
     for (int a = threadIdx.y; a < n_ij; a += blockDim.y) {
         for (int d = threadIdx.x; d < n_ij; d += blockDim.x) {
-            const size_t base = d_idx_offset[idx]
-                              + static_cast<size_t>(a) * nocc * nocc * n_ij
-                              + static_cast<size_t>(I_i) * nocc * n_ij + d;
+            const size_t abase = d_idx_offset[idx]
+                               + static_cast<size_t>(a) * row_stride + d;
             real_t sum = real_t(0);
             for (int l = 0; l < nocc; ++l) {
                 if (l == J_j) continue;
@@ -381,8 +443,15 @@ __global__ void inter_pair_fock_j_kernel(
                 const int idx_il = d_pair_lookup[I_i * nocc + l];
                 if (d_n_pno[idx_il] == 0) continue;
 
-                const real_t pi_val = d_pi_T_stack[base
-                                                + static_cast<size_t>(l) * l_stride];
+                int KL;
+                if (pit_sparse) {
+                    KL = d_slot_irow[static_cast<size_t>(idx) * nocc + l];
+                    if (KL < 0) continue;
+                } else {
+                    KL = I_i * nocc + l;
+                }
+                const real_t pi_val = d_pi_T_stack[abase
+                                                + static_cast<size_t>(KL) * n_ij];
                 sum -= F_lj * pi_val;
             }
             d_R_packed[R_pair_off
@@ -435,7 +504,20 @@ __global__ void oooo_lad_kernel(
     const size_t* __restrict__ d_per_pair_R_off,
     real_t*       __restrict__ d_R_packed,
     int N_pair, int nocc, int max_n,
-    int pair_begin)
+    int pair_begin,
+    // Stage D sparse pi_T_stack: Phase 2 reads pi over the kl-slot list instead
+    // of all nocc². W_oooo + V_stacked_oooo (Phase 1) stay dense (W_oooo is the
+    // O(N·nocc²) blocker; V_stacked sparsify is D3). d_idx_offset_pi_T is the
+    // sparse offset array when pit_sparse.
+    int pit_sparse,
+    const int*    __restrict__ d_n_slots,
+    const int*    __restrict__ d_kl_slot,
+    const size_t* __restrict__ d_slot_offset,
+    // Stage D (D3a): when voooo_sparse, d_V_stacked_oooo_pad holds only the
+    // coupling (k,l) blocks (slot layout); Phase 1 iterates the kl-slots and
+    // fills s_W_eff[kl] only for coupling (k,l). Requires pit_sparse (Phase 2
+    // reads s_W_eff only at coupling kl), guaranteed by the ctor gate.
+    int voooo_sparse)
 {
     extern __shared__ real_t s_W_eff[];  // size nocc² doubles
 
@@ -465,28 +547,50 @@ __global__ void oooo_lad_kernel(
     const int tid       = threadIdx.y * blockDim.x + threadIdx.x;
     const int nthreads  = blockDim.x * blockDim.y;
 
-    // ---- Phase 1: cooperatively compute s_W_eff[kl] for all kl ∈ [0, nocc²). ----
-    // Threads stride through kl. Per kl: read W_oooo + compute W_dress
-    // (n_ij² mul-adds on V and Y_pad_T, both accessed sequentially row-wise
-    // for L1-friendly cache-line reuse).
-    for (int kl = tid; kl < nocc2; kl += nthreads) {
-        // Step S10b — V_lk now uses per-(k,l) packed stride n_ij² and
-        // per-row stride n_ij (was max_n² block and max_n row stride).
-        const real_t* V_lk = d_V_stacked_oooo_pad
-                           + v_pair_off
-                           + static_cast<size_t>(kl) * v_kl_stride;
-        real_t W_dress = real_t(0);
-        for (int dd = 0; dd < n_ij; ++dd) {
-            const real_t* V_row  = V_lk + static_cast<size_t>(dd) * n_ij;
-            const real_t* Y_row  = d_Y_pad_T + y_pair_off
-                                 + static_cast<size_t>(dd) * max_n;
-            // Y_pad_T[idx, dd, cc] = Y[cc, dd] (per-pair transpose),
-            // so the cc-loop is now sequential in both V_row and Y_row.
-            for (int cc = 0; cc < n_ij; ++cc) {
-                W_dress += V_row[cc] * Y_row[cc];
+    // ---- Phase 1: cooperatively compute s_W_eff[kl] = W_oooo[kl] + W_dress. ----
+    // Threads stride through kl (dense) or over the kl-slots (D3a sparse). Per
+    // kl: read W_oooo + compute W_dress (n_ij² mul-adds on V and Y_pad_T, both
+    // accessed sequentially row-wise for L1-friendly cache-line reuse).
+    if (voooo_sparse) {
+        // V_stacked_oooo holds only coupling blocks (slot s ↔ kl). s_W_eff is
+        // filled only at coupling kl; Phase 2 (pit_sparse) reads only those.
+        const int    ns_o      = d_n_slots[idx];
+        const size_t slot_base_o = d_slot_offset[idx];
+        for (int s = tid; s < ns_o; s += nthreads) {
+            const int kl = d_kl_slot[slot_base_o + s];
+            const real_t* V_lk = d_V_stacked_oooo_pad
+                               + v_pair_off
+                               + static_cast<size_t>(s) * v_kl_stride;
+            real_t W_dress = real_t(0);
+            for (int dd = 0; dd < n_ij; ++dd) {
+                const real_t* V_row = V_lk + static_cast<size_t>(dd) * n_ij;
+                const real_t* Y_row = d_Y_pad_T + y_pair_off
+                                    + static_cast<size_t>(dd) * max_n;
+                for (int cc = 0; cc < n_ij; ++cc)
+                    W_dress += V_row[cc] * Y_row[cc];
             }
+            s_W_eff[kl] = d_W_oooo[w_pair_off + kl] + W_dress;
         }
-        s_W_eff[kl] = d_W_oooo[w_pair_off + kl] + W_dress;
+    } else {
+        for (int kl = tid; kl < nocc2; kl += nthreads) {
+            // Step S10b — V_lk now uses per-(k,l) packed stride n_ij² and
+            // per-row stride n_ij (was max_n² block and max_n row stride).
+            const real_t* V_lk = d_V_stacked_oooo_pad
+                               + v_pair_off
+                               + static_cast<size_t>(kl) * v_kl_stride;
+            real_t W_dress = real_t(0);
+            for (int dd = 0; dd < n_ij; ++dd) {
+                const real_t* V_row  = V_lk + static_cast<size_t>(dd) * n_ij;
+                const real_t* Y_row  = d_Y_pad_T + y_pair_off
+                                     + static_cast<size_t>(dd) * max_n;
+                // Y_pad_T[idx, dd, cc] = Y[cc, dd] (per-pair transpose),
+                // so the cc-loop is now sequential in both V_row and Y_row.
+                for (int cc = 0; cc < n_ij; ++cc) {
+                    W_dress += V_row[cc] * Y_row[cc];
+                }
+            }
+            s_W_eff[kl] = d_W_oooo[w_pair_off + kl] + W_dress;
+        }
     }
     __syncthreads();
 
@@ -497,16 +601,32 @@ __global__ void oooo_lad_kernel(
     // n_ij stride across kl (strided), but threads within a warp read
     // adjacent b indices for fixed kl (coalesced across the warp).
     const size_t R_pair_off = d_per_pair_R_off[idx];
+    const int    n_slots = pit_sparse ? d_n_slots[idx] : 0;
+    const size_t row_stride = pit_sparse
+        ? static_cast<size_t>(n_slots) * n_ij
+        : static_cast<size_t>(nocc) * nocc * n_ij;
+    const size_t slot_base = pit_sparse
+        ? d_slot_offset[idx] : static_cast<size_t>(0);
     for (int a = threadIdx.y; a < n_ij; a += blockDim.y) {
         for (int b = threadIdx.x; b < n_ij; b += blockDim.x) {
             const size_t pi_pair_off = d_idx_offset_pi_T[idx]
-                                     + static_cast<size_t>(a) * nocc * nocc * n_ij + b;
+                                     + static_cast<size_t>(a) * row_stride + b;
             real_t acc = real_t(0);
-            for (int kl = 0; kl < nocc2; ++kl) {
-                const real_t W_eff  = s_W_eff[kl];
-                const real_t pi_val = d_pi_T_stack[pi_pair_off
-                                                 + static_cast<size_t>(kl) * pi_kl_stride];
-                acc += W_eff * pi_val;
+            if (pit_sparse) {
+                // Iterate only the kl-slots; W_eff still indexed by the real kl.
+                for (int s = 0; s < n_slots; ++s) {
+                    const int kl = d_kl_slot[slot_base + s];
+                    const real_t pi_val = d_pi_T_stack[pi_pair_off
+                                             + static_cast<size_t>(s) * pi_kl_stride];
+                    acc += s_W_eff[kl] * pi_val;
+                }
+            } else {
+                for (int kl = 0; kl < nocc2; ++kl) {
+                    const real_t W_eff  = s_W_eff[kl];
+                    const real_t pi_val = d_pi_T_stack[pi_pair_off
+                                             + static_cast<size_t>(kl) * pi_kl_stride];
+                    acc += W_eff * pi_val;
+                }
             }
             // S11 Phase 2c — packed R write (n_ij × n_ij row-major).
             d_R_packed[R_pair_off
@@ -532,7 +652,12 @@ __global__ void slice_PI_outer_for_J_kernel(
     real_t*       __restrict__ d_PI_stack_packed,
     real_t*       __restrict__ d_PI_TT_packed,
     int N_pair, int nocc, int max_n,
-    int pair_begin)
+    int pair_begin,
+    // Stage D sparse: (k,J_lmo) slot via d_slot_jcol, row stride n_slots·n_ij,
+    // d_idx_offset_pi_T = sparse offsets.
+    int pit_sparse,
+    const int* __restrict__ d_n_slots,
+    const int* __restrict__ d_slot_jcol)
 {
     const int idx = blockIdx.x + pair_begin;
     const int k   = blockIdx.y;
@@ -547,6 +672,9 @@ __global__ void slice_PI_outer_for_J_kernel(
     const size_t PI_TT_pack_off    = d_per_pair_block_off[idx];
     const size_t nn_ij_szt = static_cast<size_t>(n_ij)
                            * static_cast<size_t>(nocc);
+    const size_t row_stride = pit_sparse
+        ? static_cast<size_t>(d_n_slots[idx]) * n_ij
+        : static_cast<size_t>(nocc) * nocc * n_ij;
 
     // Step 6.6 fix: strided per-thread loop for n_ij > sqrt(1024).
     for (int r = threadIdx.y; r < max_n; r += blockDim.y) {
@@ -559,11 +687,12 @@ __global__ void slice_PI_outer_for_J_kernel(
             const int J_lmo = d_per_pair_J[idx];
             const int idx_kJ = d_pair_lookup[k * nocc + J_lmo];
             const int n_kJ   = d_n_pno[idx_kJ];
-            if (n_kJ > 0) {
+            int KL = pit_sparse ? -1 : (k * nocc + J_lmo);
+            if (pit_sparse && n_kJ > 0)
+                KL = d_slot_jcol[static_cast<size_t>(idx) * nocc + k];
+            if (n_kJ > 0 && KL >= 0) {
                 const size_t base = d_idx_offset_pi_T[idx]
-                    + (static_cast<size_t>(k) * nocc + J_lmo)
-                    * static_cast<size_t>(n_ij);
-                const size_t row_stride = static_cast<size_t>(nocc) * nocc * n_ij;
+                    + static_cast<size_t>(KL) * static_cast<size_t>(n_ij);
                 v_stack = d_pi_T_stack[base + static_cast<size_t>(r) * row_stride + c];
                 v_TT    = d_pi_T_stack[base + static_cast<size_t>(c) * row_stride + r];
             }
@@ -624,6 +753,12 @@ struct ResidGpu::Impl {
     int*    d_active_pos         = nullptr;   // (N_pair) orig pair idx → a in [0, n_active_in_slab_) or -1
     size_t* d_v_oooo_off_packed  = nullptr;   // (n_active_in_slab_ + 1) prefix sum of nocc² · n_ij²
     size_t  v_oooo_packed_total  = 0;         // total packed element count (= host offset_packed.back())
+    // Stage D (D3a): when true, d_V_stacked_oooo_pad is sized/written/read by
+    // the per-pair coupling-slot count (n_slots · n_ij²) instead of nocc²·n_ij².
+    // The oooo ladder's Phase-2 sparse pi path only reads W_eff[kl] for coupling
+    // (k,l), so the dropped non-coupling W_dress was never used ⇒ bit-exact.
+    // Gated on env GANSU_DLPNO_CCSD_VOOOO_SPARSE + pgpu kl-slot list ready.
+    bool    voooo_sparse         = false;
 
     // Step S11 Phase 1 (2026-05-17 night-3) — packed V_meta/T_meta buffers
     // and per-pair offset table. Allocated alongside the legacy padded
@@ -1004,12 +1139,28 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
     // device for kernel-side indexing. Both kernels that read/write
     // d_V_stacked_oooo_pad (pack_V_meta_kernel writer, oooo_lad_kernel
     // reader) consult this table via d_v_oooo_off_packed[a].
+    // Stage D (D3a): decide whether V_stacked_oooo is sparse (per-pair
+    // coupling-slot sized) — requires the pgpu kl-slot list to be built and the
+    // opt-in env flag. host n_slots is indexed by ORIG pair idx.
+    const int* h_n_slots_oooo = pgpu.host_n_slots();
+    {
+        const char* e = std::getenv("GANSU_DLPNO_CCSD_VOOOO_SPARSE");
+        // Require pitstack_sparse(): the oooo Phase-1 sparse path fills s_W_eff
+        // only for coupling (k,l), so Phase-2 MUST iterate the kl-slots (the
+        // pit_sparse branch), else non-coupling s_W_eff garbage would be read.
+        s.voooo_sparse = (e && e[0] == '1') && (h_n_slots_oooo != nullptr)
+                       && pgpu.pitstack_sparse();
+    }
     std::vector<size_t> v_oooo_off_packed_host(
         static_cast<size_t>(n_active_in_slab_) + 1, 0);
     for (int a = 0; a < n_active_in_slab_; ++a) {
-        const int    n_ij = n_pno_[active_pair_list_[a]];
-        const size_t per  = static_cast<size_t>(nocc_) * nocc_
-                          * static_cast<size_t>(n_ij) * n_ij;
+        const int    idx  = active_pair_list_[a];
+        const int    n_ij = n_pno_[idx];
+        // Dense: nocc²·n²; sparse (D3a): n_slots·n² (n_slots ≈ 2·coupling).
+        const size_t kl_count = s.voooo_sparse
+            ? static_cast<size_t>(h_n_slots_oooo[idx])
+            : static_cast<size_t>(nocc_) * nocc_;
+        const size_t per  = kl_count * static_cast<size_t>(n_ij) * n_ij;
         v_oooo_off_packed_host[a + 1] = v_oooo_off_packed_host[a] + per;
     }
     s.v_oooo_packed_total = v_oooo_off_packed_host[n_active_in_slab_];
@@ -1506,13 +1657,21 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
         // S11 Phase 2d — pack_V_meta_kernel writes only to packed sinks.
         // Inactive pairs (d_active_pos[idx] < 0) early-return inside the
         // kernel.
+        // Stage D (D3a): sparse V_stacked_oooo needs the pgpu kl-slot list.
+        const int*    d_kl_slot_pack   = s.voooo_sparse ? pgpu.device_kl_slot()     : nullptr;
+        const size_t* d_slot_off_pack  = s.voooo_sparse ? pgpu.device_slot_offset() : nullptr;
+        const int*    d_n_slots_pack   = s.voooo_sparse ? pgpu.device_n_slots()     : nullptr;
+        const int     voooo_sparse_i   =
+            (s.voooo_sparse && d_kl_slot_pack && d_slot_off_pack && d_n_slots_pack)
+            ? 1 : 0;
         pack_V_meta_kernel<<<grid, block>>>(
             d_V_flat, d_T_flat, d_n_pno, d_pair_src_off,
             s.d_active_pos, s.d_v_oooo_off_packed,
             s.d_per_pair_meta_off,
             s.d_V_meta_T_packed, s.d_V_meta_TT_packed, s.d_T_meta_packed,
             s.d_V_stacked_oooo_pad,
-            nocc_);
+            nocc_,
+            voooo_sparse_i, d_kl_slot_pack, d_slot_off_pack, d_n_slots_pack);
         check_cuda_(cudaGetLastError(),
                     "pack_V_meta_kernel launch");
 
@@ -1693,10 +1852,20 @@ void ResidGpu::compute_async_phladder_only_()
     const size_t* d_idx_offset    = pgpu_->device_idx_offset_pi_T();
     const int*    d_pair_lookup   = pgpu_->device_pair_lookup();
     const int*    d_n_pno         = pgpu_->device_n_pno();
-    if (!d_pi_T_stack || !d_idx_offset || !d_pair_lookup || !d_n_pno) {
+    if (!d_pi_T_stack || !d_pair_lookup || !d_n_pno) {
         record_phladder_stubs();
         return;
     }
+    // Stage D: sparse pi_T_stack reads — swap to sparse offsets + slot maps.
+    const bool    pit_sparse  = pgpu_->pitstack_sparse();
+    const size_t* d_idx_pit   = pit_sparse ? pgpu_->device_idx_offset_sparse()
+                                           : d_idx_offset;
+    const int*    d_n_slots   = pgpu_->device_n_slots();
+    const int*    d_slot_jcol = pgpu_->device_slot_jcol();  // (k,j)
+    const int*    d_slot_irow = pgpu_->device_slot_irow();  // (i,l)
+    const int*    d_slot_icol = pgpu_->device_slot_icol();  // (k,i) j-side
+    const int*    d_slot_jrow = pgpu_->device_slot_jrow();  // (j,l) j-side
+    if (!d_idx_pit) { record_phladder_stubs(); return; }
 
     // ---- Stage 1: slice pi_T_stack into per-pair pad blocks. ----
     // Two kernel launches per side: one for I (= sij.i for i-side, sij.j for j-side)
@@ -1719,27 +1888,28 @@ void ResidGpu::compute_async_phladder_only_()
         // S11 Phase 2d — slice kernels write only to packed buffers.
         // i-side: I = sij.i, J = sij.j
         slice_pi_N_T_for_I_kernel<<<grid, block>>>(
-            d_pi_T_stack, d_idx_offset, d_n_pno, s.d_I_i, d_pair_lookup,
+            d_pi_T_stack, d_idx_pit, d_n_pno, s.d_I_i, d_pair_lookup,
             s.d_active_pos, s.d_per_pair_block_off, s.d_per_pair_stack_off,
             s.d_pi_N_i_packed, s.d_pi_T_i_packed,
-            N, nocc, max_n, ib);
+            N, nocc, max_n, ib, pit_sparse ? 1 : 0, d_n_slots, d_slot_irow);
         slice_PI_outer_for_J_kernel<<<grid, block>>>(
-            d_pi_T_stack, d_idx_offset, d_n_pno, s.d_I_j, d_pair_lookup,
+            d_pi_T_stack, d_idx_pit, d_n_pno, s.d_I_j, d_pair_lookup,
             s.d_active_pos, s.d_per_pair_block_off, s.d_per_pair_stack_off,
             s.d_PI_kj_stack_packed, s.d_PI_kj_TT_packed,
-            N, nocc, max_n, ib);
+            N, nocc, max_n, ib, pit_sparse ? 1 : 0, d_n_slots, d_slot_jcol);
 
-        // j-side: I = sij.j, J = sij.i
+        // j-side: I = sij.j, J = sij.i — reads (j,l) row and (k,i) column, so
+        // uses slot_jrow / slot_icol (NOT the i-side maps).
         slice_pi_N_T_for_I_kernel<<<grid, block>>>(
-            d_pi_T_stack, d_idx_offset, d_n_pno, s.d_I_j, d_pair_lookup,
+            d_pi_T_stack, d_idx_pit, d_n_pno, s.d_I_j, d_pair_lookup,
             s.d_active_pos, s.d_per_pair_block_off, s.d_per_pair_stack_off,
             s.d_pi_N_j_packed, s.d_pi_T_j_packed,
-            N, nocc, max_n, ib);
+            N, nocc, max_n, ib, pit_sparse ? 1 : 0, d_n_slots, d_slot_jrow);
         slice_PI_outer_for_J_kernel<<<grid, block>>>(
-            d_pi_T_stack, d_idx_offset, d_n_pno, s.d_I_i, d_pair_lookup,
+            d_pi_T_stack, d_idx_pit, d_n_pno, s.d_I_i, d_pair_lookup,
             s.d_active_pos, s.d_per_pair_block_off, s.d_per_pair_stack_off,
             s.d_PI_ki_stack_packed, s.d_PI_ki_TT_packed,
-            N, nocc, max_n, ib);
+            N, nocc, max_n, ib, pit_sparse ? 1 : 0, d_n_slots, d_slot_icol);
 
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) {
@@ -2075,19 +2245,30 @@ void ResidGpu::compute_async(const std::vector<real_t>& dF_ki_host)
         const size_t* d_idx_offset    = pgpu_->device_idx_offset_pi_T();
         const int*    d_pair_lookup   = pgpu_->device_pair_lookup();
         const int*    d_n_pno         = pgpu_->device_n_pno();
+        // Stage D sparse pi_T_stack reads.
+        const bool    pit_sparse  = pgpu_->pitstack_sparse();
+        const size_t* d_idx_pit   = pit_sparse ? pgpu_->device_idx_offset_sparse()
+                                               : d_idx_offset;
+        const int*    d_n_slots   = pgpu_->device_n_slots();
+        const int*    d_slot_jcol = pgpu_->device_slot_jcol();
+        const int*    d_slot_irow = pgpu_->device_slot_irow();
+        const int*    d_kl_slot   = pgpu_->device_kl_slot();
+        const size_t* d_slot_off  = pgpu_->device_slot_offset();
 
         // S11 Phase 2c — both inter-pair Fock kernels write to packed R
         // at d_per_pair_R_off[idx]; padded R buffer is dead from here on.
         inter_pair_fock_i_kernel<<<grid, block>>>(
-            d_pi_T_stack, d_idx_offset, d_n_pno, d_pair_lookup,
+            d_pi_T_stack, d_idx_pit, d_n_pno, d_pair_lookup,
             s.d_I_i, s.d_I_j, s.d_F_LMO, s.d_dF_ki,
             s.d_per_pair_R_off, s.d_R_ph_packed,
-            N, nocc, max_n, threshold, ib);
+            N, nocc, max_n, threshold, ib,
+            pit_sparse ? 1 : 0, d_n_slots, d_slot_jcol);
         inter_pair_fock_j_kernel<<<grid, block>>>(
-            d_pi_T_stack, d_idx_offset, d_n_pno, d_pair_lookup,
+            d_pi_T_stack, d_idx_pit, d_n_pno, d_pair_lookup,
             s.d_I_i, s.d_I_j, s.d_F_LMO, s.d_dF_ki,
             s.d_per_pair_R_off, s.d_R_ph_packed,
-            N, nocc, max_n, threshold, ib);
+            N, nocc, max_n, threshold, ib,
+            pit_sparse ? 1 : 0, d_n_slots, d_slot_irow);
         if (s.e_after_F) cudaEventRecord(s.e_after_F, /*stream=*/0);
 
         // Step 6.6 + 6.7: fused oooo ladder kernel — borrows pre-transposed
@@ -2107,10 +2288,12 @@ void ResidGpu::compute_async(const std::vector<real_t>& dF_ki_host)
             // S11 Phase 2c — oooo ladder R write also switched to packed.
             oooo_lad_kernel<<<grid, block, shmem_bytes>>>(
                 s.d_V_stacked_oooo_pad, s.d_W_oooo,
-                d_pi_T_stack, d_Y_pad_T, d_idx_offset, d_n_pno,
+                d_pi_T_stack, d_Y_pad_T, d_idx_pit, d_n_pno,
                 s.d_active_pos, s.d_v_oooo_off_packed,   // S10b
                 s.d_per_pair_R_off, s.d_R_ph_packed,
-                N, nocc, max_n, ib);
+                N, nocc, max_n, ib,
+                pit_sparse ? 1 : 0, d_n_slots, d_kl_slot, d_slot_off,
+                s.voooo_sparse ? 1 : 0);   // Stage D (D3a): sparse V_stacked_oooo
         }
         if (s.e_after_O) cudaEventRecord(s.e_after_O, /*stream=*/0);
 
