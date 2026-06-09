@@ -1241,13 +1241,14 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
         }
     }
 
-    // Step S8 profiling — dump per-stage timings as a single atomic line
-    // per device (printf is line-atomic on glibc up to PIPE_BUF). The
-    // double-precision values below are in milliseconds. With multi-GPU
-    // OMP construction this will produce n_gpus lines, each tagged with
-    // its device_id_ for attribution. Bytes annotated so we can compute
-    // per-stage throughput (MB / ms = GB / s).
-    {
+    // Step S8 profiling — per-device per-stage construction timings. This is a
+    // per-device diagnostic dump (n_gpus lines × each construction), off by
+    // default to keep the log readable. Enable with GANSU_DLPNO_SETUP_LOG=1.
+    static const bool setup_log = []() {
+        const char* e = std::getenv("GANSU_DLPNO_SETUP_LOG");
+        return e && e[0] == '1';
+    }();
+    if (setup_log) {
         const auto t_barS_h2d = std::chrono::steady_clock::now();
         using msd = std::chrono::duration<double, std::milli>;
         const double ms_cpu      = msd(t_cpu_prep   - t_ctor_0).count();

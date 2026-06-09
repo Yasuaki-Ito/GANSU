@@ -1304,22 +1304,31 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
         const double mib_stack_packed = static_cast<double>(bytes_stack_packed) / kMiB;
         const double mib_R_packed     = static_cast<double>(bytes_R_packed)     / kMiB;
         const double mib_need_packed  = static_cast<double>(need_packed)        / kMiB;
-        std::printf(
-            "[ResidGpu-budget dev=%d slab=[%d,%d) n_active=%d N_pair=%d nocc=%d max_n=%d max_nn=%d]"
-            " free=%.0f need=%.0f proj_active=%.0f need_packed=%.0f MiB"
-            "  meta(x3)=%.0f block(x10)=%.0f stack(x4)=%.0f R(x2)=%.0f"
-            "  packed meta(x3)=%.0f block(x10)=%.0f stack(x4)=%.0f R(x2)=%.0f"
-            "  v_oooo_full=%.0f v_oooo_packed=%.0f MiB  n_buckets=%zu active=%s\n",
-            pgpu.device_id(), pgpu.pair_begin(), pgpu.pair_end(),
-            n_active_in_slab_, N_pair_, nocc_, max_n_, max_nn,
-            mib_free, mib_need, mib_proj_need, mib_need_packed,
-            3 * mib_meta, 10 * mib_block, 4 * mib_stack, 2 * mib_R,
-            3 * mib_meta_packed, 10 * mib_block_packed,
-            4 * mib_stack_packed, 2 * mib_R_packed,
-            mib_voooo_full, mib_voooo_packed,
-            bucket_n_ij_.size(),
-            (need > free_b) ? "NO" : "YES");
-        std::fflush(stdout);
+        // Per-device budget dump — diagnostic, off by default to keep the log
+        // readable (n_gpus lines). Enable with GANSU_DLPNO_SETUP_LOG=1. The
+        // need>free_b deactivation below is functional and ALWAYS runs.
+        static const bool setup_log = []() {
+            const char* e = std::getenv("GANSU_DLPNO_SETUP_LOG");
+            return e && e[0] == '1';
+        }();
+        if (setup_log) {
+            std::printf(
+                "[ResidGpu-budget dev=%d slab=[%d,%d) n_active=%d N_pair=%d nocc=%d max_n=%d max_nn=%d]"
+                " free=%.0f need=%.0f proj_active=%.0f need_packed=%.0f MiB"
+                "  meta(x3)=%.0f block(x10)=%.0f stack(x4)=%.0f R(x2)=%.0f"
+                "  packed meta(x3)=%.0f block(x10)=%.0f stack(x4)=%.0f R(x2)=%.0f"
+                "  v_oooo_full=%.0f v_oooo_packed=%.0f MiB  n_buckets=%zu active=%s\n",
+                pgpu.device_id(), pgpu.pair_begin(), pgpu.pair_end(),
+                n_active_in_slab_, N_pair_, nocc_, max_n_, max_nn,
+                mib_free, mib_need, mib_proj_need, mib_need_packed,
+                3 * mib_meta, 10 * mib_block, 4 * mib_stack, 2 * mib_R,
+                3 * mib_meta_packed, 10 * mib_block_packed,
+                4 * mib_stack_packed, 2 * mib_R_packed,
+                mib_voooo_full, mib_voooo_packed,
+                bucket_n_ij_.size(),
+                (need > free_b) ? "NO" : "YES");
+            std::fflush(stdout);
+        }
         if (need > free_b) {
             delete p_; p_ = nullptr; active_ = false; return;
         }

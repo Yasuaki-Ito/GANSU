@@ -2220,7 +2220,12 @@ LMP2Status iterate_dlpno_ccsd_t2(
         }
         st.iters = iter + 1;
     }
-    {
+    // CCSD T2 per-phase profiling (ITER-PROF + per-stage RESID-CPU/GPU-PROF).
+    // Detailed diagnostic — gated to verbose>=2 to keep the default log to
+    // one progress line per phase (the [DLPNO-CCSD-PROF] markers print at
+    // verbose>=1). reset_stage_times() inside is diagnostic-only (event-timer
+    // accumulators, not read on the compute path) so gating it is harmless.
+    if (verbose >= 2) {
         const double dt_total =
             std::chrono::duration<double>(prof_clock::now() - t_iter_total_0).count();
         const double dt_acct =
