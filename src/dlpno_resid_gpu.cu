@@ -10,7 +10,6 @@
 #include "dlpno_resid_gpu.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -983,25 +982,6 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
       max_n_(max_n),
       nocc_(nocc)
 {
-    // [ResidGpu-CTOR-PROF] env-gated coarse split of the one-time ctor cost
-    // (setup_rgpu): "pre+malloc" (host scaffolding + budget + ~20 device
-    // cudaMalloc, driver-lock serialised across the parallel devices) vs
-    // "h2d+pack" (pinned cudaMallocHost staging + host gather + H2D + pack
-    // kernels for V_flat/T_flat + W_bare ×4 + W_oooo). Each device prints one
-    // line. Enable with GANSU_DLPNO_RESID_CTOR_PROF=1.
-    static const bool ctor_prof = []() {
-        const char* e = std::getenv("GANSU_DLPNO_RESID_CTOR_PROF");
-        return e && e[0] == '1';
-    }();
-    auto cprof_now = [&]() {
-#ifndef GANSU_CPU_ONLY
-        if (ctor_prof) cudaDeviceSynchronize();
-#endif
-        return std::chrono::steady_clock::now();
-    };
-    const auto t_ctor_start = cprof_now();
-    std::chrono::steady_clock::time_point t_ctor_mid = t_ctor_start;
-
     // Capture per-pair host metadata.
     n_pno_.assign(N_pair_, 0);
     setup_i_per_pair_.assign(N_pair_, 0);
@@ -1499,8 +1479,6 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
         return;
     }
 
-    t_ctor_mid = cprof_now();   // after the device cudaMalloc block
-
     // Per-device cuBLAS handle. Fallback to thread-local single-GPU handle.
     s.cublas = nullptr;
     {
@@ -1805,19 +1783,6 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
         check_cuda_(cudaMemcpy(s.d_W_oooo, h_W.data(),
                                bytes_w, cudaMemcpyHostToDevice),
                     "H2D W_oooo");
-    }
-
-    if (ctor_prof) {
-        const auto t_ctor_end = cprof_now();
-        const double pre_malloc =
-            std::chrono::duration<double>(t_ctor_mid - t_ctor_start).count();
-        const double h2d_pack =
-            std::chrono::duration<double>(t_ctor_end - t_ctor_mid).count();
-        std::printf("[ResidGpu-CTOR-PROF dev=%d] pre+malloc=%.3f  h2d+pack=%.3f s"
-                    "  (n_active=%d N_pair=%d)\n",
-                    pgpu.device_id(), pre_malloc, h2d_pack,
-                    n_active_in_slab_, N_pair_);
-        std::fflush(stdout);
     }
 
     active_ = true;
