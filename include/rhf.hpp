@@ -1182,6 +1182,10 @@ public:
     /// free); nullptr if replication memory budget would be exceeded.
     const real_t* build_B_mo(const real_t* d_C, int nmo) const override;
 
+    /// P4b source lookup for the asymmetric V-block builder (build_B_mo_asym):
+    /// lazily replicates and returns d_B_full_per_gpu_[curr_dev] (or device-0).
+    const real_t* B_ao_src_for_mo() const override;
+
     /// Step 6.3c — workspace variant. Writes MO ERI into the caller-supplied
     /// d_eri_out (≥ nmo⁴ doubles). Replicated path runs the pipeline directly
     /// on d_eri_out; distributed/multi-GPU paths fall back to the base-class

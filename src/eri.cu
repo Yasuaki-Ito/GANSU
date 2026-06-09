@@ -969,6 +969,151 @@ const real_t* ERI_RI::build_B_mo_impl(const real_t* d_B_ao_src,
 #endif
 }
 
+// P4b base — AO-basis B source for the MO half-transform. Base RI keeps the
+// full naux×nao² B in intermediate_matrix_B_ on the current device. The
+// distributed override lazily replicates and returns its per-GPU copy.
+const real_t* ERI_RI::B_ao_src_for_mo() const {
+#ifdef GANSU_CPU_ONLY
+    return nullptr;
+#else
+    if (!gpu::gpu_available()) return nullptr;
+    return intermediate_matrix_B_.device_ptr();
+#endif
+}
+
+// V-block — build_B_mo with separate left/right MO column sets. Source-B lookup
+// is shared with build_B_mo via the virtual B_ao_src_for_mo(); build_B_mo
+// itself is untouched so the validated P4b path is byte-for-byte unchanged.
+const real_t* ERI_RI::build_B_mo_asym(const real_t* d_C1, int n1,
+                                      const real_t* d_C2, int n2) const {
+#ifdef GANSU_CPU_ONLY
+    (void)d_C1; (void)n1; (void)d_C2; (void)n2;
+    return nullptr;
+#else
+    if (!gpu::gpu_available()) return nullptr;
+    const real_t* d_B_ao_src = B_ao_src_for_mo();
+    if (!d_B_ao_src) return nullptr;
+    return build_B_mo_asym_impl(d_B_ao_src, d_C1, n1, d_C2, n2);
+#endif
+}
+
+// V-block workhorse — same two-GEMM half-transform as build_B_mo_impl but with
+// d_C1 (n1 cols) for Step 1 (ν→q1) and d_C2 (n2 cols) for Step 2b (μ→p2).
+// Output B_mo[Q·n1·n2 + q1·n2 + p2] = (Q, q1, p2), p2 contiguous. Separate
+// thread-local workspaces from build_B_mo_impl (different sizes).
+const real_t* ERI_RI::build_B_mo_asym_impl(const real_t* d_B_ao_src,
+                                           const real_t* d_C1, int n1,
+                                           const real_t* d_C2, int n2) const {
+#ifdef GANSU_CPU_ONLY
+    (void)d_B_ao_src; (void)d_C1; (void)n1; (void)d_C2; (void)n2;
+    return nullptr;
+#else
+    if (!gpu::gpu_available() || !d_B_ao_src) return nullptr;
+
+    const int nao  = num_basis_;
+    const int naux = num_auxiliary_basis_;
+
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    const double alpha = 1.0, beta = 0.0;
+
+    static thread_local real_t* ws_B_tmp       = nullptr;
+    static thread_local real_t* ws_B_tmp2      = nullptr;
+    static thread_local real_t* ws_B_mo        = nullptr;
+    static thread_local size_t  ws_B_tmp_bytes = 0;
+    static thread_local size_t  ws_B_mo_bytes  = 0;
+    static thread_local int     ws_device      = -1;
+
+    int curr_dev = 0;
+    cudaGetDevice(&curr_dev);
+    const size_t need_B_tmp_bytes = (size_t)naux * nao * n1 * sizeof(real_t);
+    const size_t need_B_mo_bytes  = (size_t)naux * n1 * n2 * sizeof(real_t);
+
+    if (curr_dev != ws_device) {
+        if (ws_device >= 0 && (ws_B_tmp || ws_B_tmp2 || ws_B_mo)) {
+            const int saved = curr_dev;
+            cudaSetDevice(ws_device);
+            if (ws_B_tmp)  { tracked_cudaFree(ws_B_tmp);  ws_B_tmp  = nullptr; }
+            if (ws_B_tmp2) { tracked_cudaFree(ws_B_tmp2); ws_B_tmp2 = nullptr; }
+            if (ws_B_mo)   { tracked_cudaFree(ws_B_mo);   ws_B_mo   = nullptr; }
+            ws_B_tmp_bytes = 0;
+            ws_B_mo_bytes  = 0;
+            cudaSetDevice(saved);
+        }
+        ws_device = curr_dev;
+    }
+    if (need_B_tmp_bytes > ws_B_tmp_bytes) {
+        if (ws_B_tmp)  { tracked_cudaFree(ws_B_tmp);  ws_B_tmp  = nullptr; }
+        if (ws_B_tmp2) { tracked_cudaFree(ws_B_tmp2); ws_B_tmp2 = nullptr; }
+        tracked_cudaMalloc(&ws_B_tmp,  need_B_tmp_bytes);
+        tracked_cudaMalloc(&ws_B_tmp2, need_B_tmp_bytes);
+        ws_B_tmp_bytes = need_B_tmp_bytes;
+    }
+    if (need_B_mo_bytes > ws_B_mo_bytes) {
+        if (ws_B_mo) { tracked_cudaFree(ws_B_mo); ws_B_mo = nullptr; }
+        tracked_cudaMalloc(&ws_B_mo, need_B_mo_bytes);
+        ws_B_mo_bytes = need_B_mo_bytes;
+    }
+
+    real_t* d_B_tmp  = ws_B_tmp;
+    real_t* d_B_tmp2 = ws_B_tmp2;
+    real_t* d_B_mo   = ws_B_mo;
+
+    // Step 1: B_tmp(Q,μ,q1) = Σ_ν B(Q,μ,ν)·C1(ν,q1)   (q1 ∈ n1; cheap when n1 small)
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        n1, (long long)naux * nao, nao, &alpha,
+        d_C1, n1,
+        d_B_ao_src, nao,
+        &beta, d_B_tmp, n1);
+
+    // Step 2a: per-aux transpose B_tmp(Q,μ,q1) → B_tmp2(Q,q1,μ)
+    {
+        cudaStream_t stream = nullptr;
+        cublasGetStream(handle, &stream);
+        launch_eri_ri_transpose_b_tmp(d_B_tmp, d_B_tmp2, naux, n1, nao, stream);
+    }
+
+    // Step 2b: B_mo(Q,q1,p2) = Σ_μ C2(μ,p2)·B_tmp2(Q,q1,μ)   (p2 ∈ n2, contiguous)
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        n2, (long long)naux * n1, nao, &alpha,
+        d_C2, n2,
+        d_B_tmp2, nao,
+        &beta, d_B_mo, n2);
+
+    cudaDeviceSynchronize();
+    return d_B_mo;
+#endif
+}
+
+// DLPNO V-block — V[a,b] = (i,a|j,b) via the LMO-first half-transform. See hdr.
+bool ERI_RI::build_v_block_ia_jb(const real_t* d_C_lmo, int n_lmo,
+                                 const real_t* d_C_pao, int n_pao,
+                                 int i_loc, int j_loc, real_t* d_V_out) const {
+#ifdef GANSU_CPU_ONLY
+    (void)d_C_lmo; (void)n_lmo; (void)d_C_pao; (void)n_pao;
+    (void)i_loc; (void)j_loc; (void)d_V_out;
+    return false;
+#else
+    if (!gpu::gpu_available()) return false;
+    // B_mo(Q, l, a) with a contiguous, l-stride n_pao, Q-stride n_lmo·n_pao.
+    const real_t* d_B_mo = build_B_mo_asym(d_C_lmo, n_lmo, d_C_pao, n_pao);
+    if (!d_B_mo) return false;
+
+    const int naux = num_auxiliary_basis_;
+    cublasHandle_t handle = gpu::GPUHandle::cublas();
+    const double alpha = 1.0, beta = 0.0;
+    // V[a·n_pao+b] = (i,a|j,b) = Σ_Q B_mo(Q,i,a)·B_mo(Q,j,b). With opB=T the
+    // GEMM writes C(b,a) col-major at [b + a·n_pao] = the row-major (a,b) slot.
+    // M_l = d_B_mo + l·n_pao (l = LMO column), Q-stride lda = n_lmo·n_pao.
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+        n_pao, n_pao, naux, &alpha,
+        d_B_mo + (size_t)j_loc * n_pao, n_lmo * n_pao,
+        d_B_mo + (size_t)i_loc * n_pao, n_lmo * n_pao,
+        &beta, d_V_out, n_pao);
+    cudaDeviceSynchronize();
+    return true;
+#endif
+}
+
 // Phase 0 — form one MO-ERI sub-block from B_mo (built by build_B_mo) as
 // block[(p,q),(r,s)] row-major ((pn*qn)×(rn*sn)) = (p q | r s), via two strided
 // gathers + a single Bra^T·Ket DGEMM over the aux axis. Never materializes nmo⁴.

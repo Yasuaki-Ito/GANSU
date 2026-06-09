@@ -488,6 +488,38 @@ public:
     const real_t* build_B_mo_impl(const real_t* d_B_ao_src,
                                   const real_t* d_C, int nmo) const;
 
+    /// AO-basis B source for the MO half-transform: intermediate_matrix_B_ for
+    /// the base RI; the replicated per-GPU full B for distributed RI (lazily
+    /// replicated). Returns nullptr if unavailable (caller falls back). Virtual
+    /// so the asymmetric V-block builder reuses the distributed source lookup
+    /// without re-deriving the full B_mo through build_B_mo.
+    virtual const real_t* B_ao_src_for_mo() const;
+
+    /// Phase 0 (V-block): half-transformed B_mo with DIFFERENT left/right MO
+    /// sets — Step 1 transforms the AO ν-index with d_C1 (n1 cols), Step 2b the
+    /// μ-index with d_C2 (n2 cols). Output row-major B_mo[Q·n1·n2 + q1·n2 + p2]
+    /// = (Q, q1, p2) with p2 contiguous. Transforming the SMALL set first (e.g.
+    /// n1 = n_lmo LMOs for the DLPNO (i,a|j,b) block) makes Step 1 cost
+    /// naux·nao²·n1 instead of naux·nao²·n_emb (~n_emb/n_lmo cheaper) and never
+    /// materialises the full naux×n_emb² B_mo. Thread-local cached device ptr.
+    const real_t* build_B_mo_asym_impl(const real_t* d_B_ao_src,
+                                       const real_t* d_C1, int n1,
+                                       const real_t* d_C2, int n2) const;
+    const real_t* build_B_mo_asym(const real_t* d_C1, int n1,
+                                  const real_t* d_C2, int n2) const;
+
+    /// DLPNO V-block: V[a,b] = (i,a|j,b) for a,b ∈ PAOs. Builds the LMO×PAO
+    /// half-transform via build_B_mo_asym (2 LMOs transformed first) then
+    /// contracts over aux with a single offset-strided DGEMM — never the full
+    /// naux×n_emb² B_mo. d_C_lmo is nao×n_lmo (LMO i, optionally j) row-major;
+    /// d_C_pao is nao×n_pao (semi-canonical PAOs) row-major; i_loc/j_loc index
+    /// the LMO columns (0 and diag?0:1). Writes d_V_out (n_pao×n_pao row-major,
+    /// V[a·n_pao+b]). Returns false if the RI source B is unavailable (caller
+    /// falls back to the full build_B_mo + mo_eri_block_into path).
+    bool build_v_block_ia_jb(const real_t* d_C_lmo, int n_lmo,
+                             const real_t* d_C_pao, int n_pao,
+                             int i_loc, int j_loc, real_t* d_V_out) const;
+
     /// Phase 0: form one MO-ERI sub-block directly from a B_mo built by
     /// build_B_mo, written as block[(p,q),(r,s)] row-major
     /// ((pn*qn) × (rn*sn)) = (p q | r s) with p∈[p0,p0+pn) etc. Peak extra =

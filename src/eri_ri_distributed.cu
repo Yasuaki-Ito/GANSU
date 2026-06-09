@@ -2720,6 +2720,36 @@ const real_t* ERI_RI_Distributed_RHF::build_B_mo(const real_t* d_C, int nmo) con
 #endif
 }
 
+// P4b source lookup for the asymmetric V-block builder (build_B_mo_asym). Same
+// lazy-replication + current-device selection as build_B_mo above, but returns
+// the AO-basis B pointer instead of the full B_mo. Keeping build_B_mo untouched
+// (it duplicates this small logic) preserves the validated P4b path exactly.
+const real_t* ERI_RI_Distributed_RHF::B_ao_src_for_mo() const {
+#ifdef GANSU_CPU_ONLY
+    return nullptr;
+#else
+    if (!gpu::gpu_available()) return nullptr;
+    if (!b_replicated_) {
+        const bool ok = const_cast<ERI_RI_Distributed_RHF*>(this)->
+                        replicate_B_to_all_gpus();
+        if (!ok) return nullptr;
+    }
+    int curr_dev = 0;
+    cudaGetDevice(&curr_dev);
+    const bool curr_dev_bad   = (curr_dev < 0 || curr_dev >= num_gpus_);
+    const bool curr_dev_empty = (!curr_dev_bad) && !d_B_full_per_gpu_[curr_dev];
+    if (curr_dev_bad || curr_dev_empty) {
+        if (num_gpus_ > 0 && (int)d_B_full_per_gpu_.size() > 0
+            && d_B_full_per_gpu_[0]) {
+            cudaSetDevice(0);
+            return d_B_full_per_gpu_[0];
+        }
+        return nullptr;
+    }
+    return d_B_full_per_gpu_[curr_dev];
+#endif
+}
+
 // Step 6.3c — workspace variant for the replicated-B path. Writes the MO ERI
 // directly into the caller-supplied d_eri_out buffer (must be ≥ nmo⁴ doubles).
 // For the multi-GPU NCCL distributed path the caller-provided buffer can't
