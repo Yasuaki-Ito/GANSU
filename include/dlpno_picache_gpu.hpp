@@ -185,6 +185,18 @@ public:
     bool upload_T_meta_dpair(const std::vector<RowMatXd>& T_meta_dpair);
 
     /**
+     * @brief Device-build variant: build d_T_meta_dpair directly from the raw
+     *        (contiguous) phase24 T_pair via per-pair H2D + a device reshape
+     *        kernel, skipping the host strided T_meta_dpair build. Dense path
+     *        only — returns false for the sparse (pitstack) layout so the caller
+     *        falls back to the host gather in upload_T_meta_dpair(). Bit-exact
+     *        (pure index permutation). T_pair[idx] is the contiguous
+     *        [nocc²·n_ij²] block (phase24 layout [kl·n² + c·n + d]).
+     */
+    bool build_T_meta_dpair_dev(
+        const std::vector<std::vector<real_t>>& T_pair);
+
+    /**
      * @brief Stage D (D1b): pre-build the sparse kl-slot machinery (kl-slot list,
      *        slot maps, sparse d_pi_T_stack) BEFORE the iter loop. No-op unless
      *        pitstack_sparse_ is on. Needed because upload_T_meta_dpair() (a

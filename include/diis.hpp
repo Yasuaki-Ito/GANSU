@@ -97,12 +97,23 @@ public:
         int m = (int)xs.size();
         int dim = (int)xs[0].size();
 
-        // enlarge B matrix
+        // enlarge B matrix. The error-vector Gram is symmetric, so compute
+        // only the upper triangle and mirror, parallelising over the unique
+        // (i,j) dots. Each dot keeps its serial summation order ⇒ the B matrix
+        // (and hence the coefficients and extrapolated x) is bit-identical to
+        // the serial build. dim is large (≈ Σ n_pno² for DLPNO CCSD), so this
+        // O(m²·dim) build dominated the per-iter DIIS cost.
         std::vector<std::vector<double>> B(m+1, std::vector<double>(m+1, -1.0));
+        #pragma omp parallel for schedule(dynamic) collapse(2)
         for (int i=0;i<m;i++){
             for (int j=0;j<m;j++){
-                B[i][j] = dot(es[i], es[j]);
+                if (j < i) continue;
+                const double d = dot(es[i], es[j]);
+                B[i][j] = d;
+                B[j][i] = d;
             }
+        }
+        for (int i=0;i<m;i++){
             B[i][i] += 1e-12; // to avoid singularity
             B[i][m] = -1.0;
             B[m][i] = -1.0;
@@ -114,18 +125,14 @@ public:
         std::vector<double> c(m);
         for (int i=0;i<m;i++) c[i] = c_full[i];
 
-
-        // debug: print DIIS coefficients
-        /*
-        std::cout << "DIIS coefficients: ";
-        for (int i=0;i<m;i++) std::cout << c[i] << " ";
-        std::cout << std::endl;
-        */
-       
-        // x = Σ c_i x_i
+        // x = Σ c_i x_i. Each output element is an independent reduction over
+        // i in the same order as the serial loop ⇒ bit-identical.
         std::vector<double> x(dim, 0.0);
-        for (int i=0;i<m;i++){
-            for (int k=0;k<dim;k++) x[k] += c[i]*xs[i][k];
+        #pragma omp parallel for schedule(static)
+        for (int k=0;k<dim;k++){
+            double acc = 0.0;
+            for (int i=0;i<m;i++) acc += c[i]*xs[i][k];
+            x[k] = acc;
         }
         return x;
     }

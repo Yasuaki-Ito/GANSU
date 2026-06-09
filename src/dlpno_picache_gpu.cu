@@ -3050,6 +3050,117 @@ void PiCacheGpu::rebuild_with_stack(
 //  Both pi_T and T_meta per-pair blocks have nocc²·n² elements, so the pi_T
 //  offset cumulant indexes both; d_T_meta_dpair is slab-sized.
 // ---------------------------------------------------------------------------
+#ifndef GANSU_CPU_ONLY
+// Device reshape: raw phase24 T_pair → T_meta_dpair layout, per pair.
+//   src (T_pair[idx], contiguous): [kl·n² + c·n + d]  with kl ∈ [0,nocc²)
+//   dst (T_meta_dpair[idx]):       [(kl·n + d)·n + c]
+// One block per slab pair; threads grid-stride the pair's nocc²·n² elements.
+// Both src and dst use the dense slab-relative offset d_idx_offset[idx]-slab_base.
+__global__ void reshape_tpair_to_tmeta_kernel(
+    const real_t* __restrict__ d_tpair,
+    real_t*       __restrict__ d_tmeta,
+    const int*    __restrict__ d_n_pno,
+    const size_t* __restrict__ d_idx_offset,
+    size_t slab_base_elems,
+    int nocc, int ib)
+{
+    const int idx = ib + static_cast<int>(blockIdx.x);
+    const int n = d_n_pno[idx];
+    if (n == 0) return;
+    const size_t base = d_idx_offset[idx] - slab_base_elems;
+    const size_t total =
+        static_cast<size_t>(nocc) * nocc * n * n;
+    for (size_t t = threadIdx.x; t < total; t += blockDim.x) {
+        const int d = static_cast<int>(t % n);
+        const size_t t1 = t / n;
+        const int c = static_cast<int>(t1 % n);
+        const size_t kl = t1 / n;
+        const size_t dst = base
+            + (kl * static_cast<size_t>(n) + d) * static_cast<size_t>(n) + c;
+        d_tmeta[dst] = d_tpair[base + t];
+    }
+}
+#endif
+
+// Device-build variant of upload_T_meta_dpair: builds d_T_meta_dpair directly
+// from the raw (host, contiguous) phase24 T_pair via a per-pair H2D + a device
+// reshape kernel — skipping the host strided T_meta_dpair build (the `vmeta`
+// cost). Dense path only; returns false for the sparse (pitstack) layout so the
+// caller falls back to the host gather in upload_T_meta_dpair(). Bit-exact: the
+// reshape is a pure index permutation of the same values.
+bool PiCacheGpu::build_T_meta_dpair_dev(
+    const std::vector<std::vector<real_t>>& T_pair)
+{
+#ifdef GANSU_CPU_ONLY
+    (void)T_pair;
+    return false;
+#else
+    if (!active_ || !stacked_ || pitstack_sparse_) return false;
+    MultiGpuManager::DeviceGuard _guard(device_id_);
+    Impl& s = *p_;
+    const int N = N_pair_, nocc = nocc_;
+    if (N <= 0 || nocc <= 0) return false;
+
+    std::vector<size_t> off(static_cast<size_t>(N) + 1, 0);
+    for (int i = 0; i < N; ++i) {
+        const size_t n = static_cast<size_t>(n_pno_[i]);
+        off[i + 1] = off[i] + n * n * static_cast<size_t>(nocc)
+                                    * static_cast<size_t>(nocc);
+    }
+    const int    ib         = pair_begin_, ie = pair_end_;
+    const size_t slab_base  = off[ib];
+    const size_t slab_total = off[ie] - off[ib];
+    if (slab_total == 0) return false;
+
+    if (s.d_T_meta_dpair == nullptr) {
+        if (cudaMalloc(&s.d_T_meta_dpair, slab_total * sizeof(real_t))
+            != cudaSuccess) { s.d_T_meta_dpair = nullptr; return false; }
+    }
+    if (s.d_DF_scratch == nullptr) {
+        const size_t df_bytes =
+            static_cast<size_t>(max_n_) * max_n_ * sizeof(real_t);
+        if (df_bytes > 0
+            && cudaMalloc(&s.d_DF_scratch, df_bytes) != cudaSuccess) {
+            s.d_DF_scratch = nullptr; return false;
+        }
+    }
+    // Temp device buffer for the raw T_pair slab (contiguous per pair).
+    real_t* d_tpair = nullptr;
+    if (cudaMalloc(&d_tpair, slab_total * sizeof(real_t)) != cudaSuccess)
+        return false;
+    // Zero the temp src so any pair skipped below (empty/absent T_pair) reshapes
+    // to 0, matching the host build's setZero. (dst is fully written by the
+    // reshape for every n>0 pair, so it need not be pre-zeroed, but the src
+    // does — skipped pairs leave their src region untouched.)
+    if (cudaMemset(d_tpair, 0, slab_total * sizeof(real_t)) != cudaSuccess) {
+        cudaFree(d_tpair); return false;
+    }
+    bool ok = true;
+    for (int idx = ib; idx < ie && ok; ++idx) {
+        const int n = n_pno_[idx];
+        if (n == 0) continue;
+        if (idx >= static_cast<int>(T_pair.size()) || T_pair[idx].empty())
+            continue;
+        const size_t cnt = off[idx + 1] - off[idx];   // = nocc²·n²
+        if (cudaMemcpy(d_tpair + (off[idx] - slab_base), T_pair[idx].data(),
+                       cnt * sizeof(real_t), cudaMemcpyHostToDevice)
+            != cudaSuccess) ok = false;
+    }
+    if (ok) {
+        const int n_blocks = ie - ib;
+        if (n_blocks > 0) {
+            reshape_tpair_to_tmeta_kernel<<<n_blocks, 256>>>(
+                d_tpair, s.d_T_meta_dpair, s.d_n_pno, s.d_idx_offset,
+                slab_base, nocc, ib);
+            if (cudaGetLastError() != cudaSuccess) ok = false;
+            if (ok && cudaDeviceSynchronize() != cudaSuccess) ok = false;
+        }
+    }
+    cudaFree(d_tpair);
+    return ok;
+#endif
+}
+
 bool PiCacheGpu::upload_T_meta_dpair(const std::vector<RowMatXd>& T_meta_dpair)
 {
 #ifdef GANSU_CPU_ONLY

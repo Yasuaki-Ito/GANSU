@@ -1158,62 +1158,88 @@ LMP2Status iterate_dlpno_ccsd_t2(
     //     (rows index (k, l, d), columns the c output index)
     std::vector<RowMatXd> V_stacked_oooo(pairs.size());
     std::vector<RowMatXd> T_meta_dpair(pairs.size());
-    if (phase24 != nullptr && phase24->nocc == nocc) {
-        const auto t_vm0 = prof_clock::now();
-        // dynamic(4): per-pair V_meta / T_meta construction scales with
-        // n_pno²; empty pairs skip. Same imbalance pattern as resid loop.
+
+    // T_meta_dpair device-build: when GPU DFpair is wanted, build d_T_meta_dpair
+    // directly on the device from the raw phase24 T_pair (PiCacheGpu::
+    // build_T_meta_dpair_dev) instead of the host strided reshape here (the
+    // `vmeta` cost). Skip the host T_meta_dpair build when attempting it; the
+    // upload section below falls back to a host build only if the device build
+    // fails (OOM) or the sparse/pitstack layout is in use. T_meta_dpair host is
+    // still needed when GPU DFpair is off (host DFpair reads it).
+    const bool tmeta_dev_attempt =
+        []() {
+            const char* e = std::getenv("GANSU_DLPNO_DFPAIR_GPU");
+            return e == nullptr || std::string(e) != "0";
+        }()
+        // VALIDATE compares the host dfpair_cpu (reads host T_meta_dpair)
+        // against the GPU path, so keep the host build in that mode.
+        && std::getenv("GANSU_DLPNO_DFPAIR_GPU_VALIDATE") == nullptr
+        && phase24 != nullptr && phase24->nocc == nocc && n_gpus > 0;
+
+    // Host build of T_meta_dpair (per pair: [(k·nocc+l)·n+d, c] = T_kl[c·n+d]).
+    // Used when not device-building, or as the device-build fallback.
+    auto build_host_tmeta_dpair = [&]() {
         #pragma omp parallel for schedule(dynamic, 4)
         for (long long idx = 0; idx < static_cast<long long>(pairs.size());
-             ++idx)
-        {
+             ++idx) {
             const int n = pairs[idx].n_pno;
             if (n == 0) continue;
-            if (idx >= static_cast<long long>(phase24->V_ovov_pair.size())
-                || phase24->V_ovov_pair[idx].empty()
+            if (idx >= static_cast<long long>(phase24->T_pair.size())
                 || phase24->T_pair[idx].empty()) continue;
-            // When every device's ResidGpu is active, the host V_meta_T/TT/
-            // T_meta/V_stacked_oooo caches are never read (GPU does the
-            // ph-ladder + oooo for all pairs) — skip building them. T_meta_dpair
-            // is still required (uploaded for the GPU DFpair). See all_rgpu_active.
-            const bool host_meta = !all_rgpu_active;
-            if (host_meta) {
+            T_meta_dpair[idx].setZero(
+                static_cast<size_t>(nocc) * nocc * n, n);
+            const real_t* T_p = phase24->T_pair[idx].data();
+            for (int k = 0; k < nocc; ++k)
+                for (int l = 0; l < nocc; ++l) {
+                    const real_t* T_kl =
+                        T_p + (static_cast<size_t>(k) * nocc + l)
+                            * static_cast<size_t>(n) * n;
+                    for (int d = 0; d < n; ++d)
+                        for (int c = 0; c < n; ++c)
+                            T_meta_dpair[idx](
+                                (static_cast<size_t>(k) * nocc + l) * n + d, c) =
+                                T_kl[c * n + d];
+                }
+        }
+    };
+
+    if (phase24 != nullptr && phase24->nocc == nocc) {
+        const auto t_vm0 = prof_clock::now();
+        // V_meta_T/TT/T_meta/V_stacked_oooo: host ph-ladder + oooo caches, only
+        // read when a device's ResidGpu is inactive (CPU fallback). Skipped
+        // entirely when all_rgpu_active. dynamic(4): per-pair work ~ n_pno².
+        if (!all_rgpu_active) {
+            #pragma omp parallel for schedule(dynamic, 4)
+            for (long long idx = 0; idx < static_cast<long long>(pairs.size());
+                 ++idx)
+            {
+                const int n = pairs[idx].n_pno;
+                if (n == 0) continue;
+                if (idx >= static_cast<long long>(phase24->V_ovov_pair.size())
+                    || phase24->V_ovov_pair[idx].empty()
+                    || phase24->T_pair[idx].empty()) continue;
                 const int nn = nocc * n;
                 V_meta_T [idx].setZero(nn, nn);
                 V_meta_TT[idx].setZero(nn, nn);
                 T_meta   [idx].setZero(nn, nn);
                 V_stacked_oooo[idx].setZero(
                     static_cast<size_t>(nocc) * nocc, static_cast<size_t>(n) * n);
-            }
-            T_meta_dpair  [idx].setZero(
-                static_cast<size_t>(nocc) * nocc * n, n);
-            const real_t* V_ov = phase24->V_ovov_pair[idx].data();
-            const real_t* T_p  = phase24->T_pair[idx].data();
-            for (int l = 0; l < nocc; ++l) {
-                for (int k = 0; k < nocc; ++k) {
-                    const real_t* V_lk =
-                        V_ov + (static_cast<size_t>(l) * nocc + k)
-                             * static_cast<size_t>(n) * n;
-                    const real_t* T_kl =
-                        T_p  + (static_cast<size_t>(k) * nocc + l)
-                             * static_cast<size_t>(n) * n;
-                    for (int d = 0; d < n; ++d) {
-                        for (int c = 0; c < n; ++c) {
-                            if (host_meta) {
-                                V_meta_T [idx](l * n + d, k * n + c) =
-                                    V_lk[d * n + c];
-                                V_meta_TT[idx](l * n + d, k * n + c) =
-                                    V_lk[c * n + d];
-                                T_meta   [idx](l * n + d, k * n + c) =
-                                    T_kl[c * n + d];
+                const real_t* V_ov = phase24->V_ovov_pair[idx].data();
+                for (int l = 0; l < nocc; ++l) {
+                    for (int k = 0; k < nocc; ++k) {
+                        const real_t* V_lk =
+                            V_ov + (static_cast<size_t>(l) * nocc + k)
+                                 * static_cast<size_t>(n) * n;
+                        const real_t* T_kl =
+                            phase24->T_pair[idx].data()
+                              + (static_cast<size_t>(k) * nocc + l)
+                              * static_cast<size_t>(n) * n;
+                        for (int d = 0; d < n; ++d)
+                            for (int c = 0; c < n; ++c) {
+                                V_meta_T [idx](l * n + d, k * n + c) = V_lk[d * n + c];
+                                V_meta_TT[idx](l * n + d, k * n + c) = V_lk[c * n + d];
+                                T_meta   [idx](l * n + d, k * n + c) = T_kl[c * n + d];
                             }
-                            // T_meta_dpair: ((k, l), d) outer × c inner
-                            T_meta_dpair[idx](
-                                (static_cast<size_t>(k) * nocc + l) * n + d, c) =
-                                T_kl[c * n + d];
-                        }
-                    }
-                    // V_stacked_oooo row (k*nocc + l) = V_lk row-major flat
-                    if (host_meta) {
                         std::memcpy(
                             V_stacked_oooo[idx].data()
                               + (static_cast<size_t>(k) * nocc + l)
@@ -1224,6 +1250,8 @@ LMP2Status iterate_dlpno_ccsd_t2(
                 }
             }
         }
+        // T_meta_dpair host build only when NOT device-building it.
+        if (!tmeta_dev_attempt) build_host_tmeta_dpair();
         dt_vmeta += std::chrono::duration<double>(
             prof_clock::now() - t_vm0).count();
     }
@@ -1285,9 +1313,11 @@ LMP2Status iterate_dlpno_ccsd_t2(
     }
     if (dfpair_gpu_env && phase24 != nullptr && phase24->nocc == nocc
         && n_gpus > 0) {
-        bool all_ok = true;
-        if (n_gpus > 1) {
-            std::vector<char> ok(n_gpus, 0);
+        std::vector<char> ok(n_gpus, 0);
+        // Pass 1: device-build d_T_meta_dpair directly from raw phase24 T_pair
+        // (no host strided build). Returns false for the sparse/pitstack layout
+        // or on OOM ⇒ those devices fall to the host pass below.
+        if (tmeta_dev_attempt) {
             #pragma omp parallel num_threads(n_gpus)
             {
 #ifdef _OPENMP
@@ -1297,17 +1327,38 @@ LMP2Status iterate_dlpno_ccsd_t2(
 #endif
                 MultiGpuManager::DeviceGuard guard(d);
                 ok[d] = (pgpus[d] && pgpus[d]->stacked()
-                         && pgpus[d]->upload_T_meta_dpair(T_meta_dpair))
+                         && pgpus[d]->build_T_meta_dpair_dev(phase24->T_pair))
                         ? 1 : 0;
             }
-            for (int d = 0; d < n_gpus; ++d) if (!ok[d]) all_ok = false;
-        } else {
-            all_ok = (pgpus[0] && pgpus[0]->stacked()
-                      && pgpus[0]->upload_T_meta_dpair(T_meta_dpair));
         }
+        // Pass 2: host T_meta_dpair build + upload for any device not covered by
+        // pass 1 (sparse/pitstack, dev-build failure, or dev-build not attempted).
+        bool need_host = false;
+        for (int d = 0; d < n_gpus; ++d) if (!ok[d]) need_host = true;
+        if (need_host) {
+            // vmeta already built the host T_meta_dpair iff !tmeta_dev_attempt.
+            if (tmeta_dev_attempt) build_host_tmeta_dpair();
+            #pragma omp parallel num_threads(n_gpus)
+            {
+#ifdef _OPENMP
+                const int d = omp_get_thread_num();
+#else
+                const int d = 0;
+#endif
+                if (!ok[d]) {
+                    MultiGpuManager::DeviceGuard guard(d);
+                    ok[d] = (pgpus[d] && pgpus[d]->stacked()
+                             && pgpus[d]->upload_T_meta_dpair(T_meta_dpair))
+                            ? 1 : 0;
+                }
+            }
+        }
+        bool all_ok = true;
+        for (int d = 0; d < n_gpus; ++d) if (!ok[d]) all_ok = false;
         dfpair_gpu_on = all_ok;
         std::cout << "  [DFpair-GPU] "
                   << (dfpair_gpu_on ? "ON" : "OFF (upload failed → CPU)")
+                  << (tmeta_dev_attempt ? "  (T_meta dev-build)" : "")
                   << (dfpair_gpu_validate ? "  (VALIDATE: both paths)" : "")
                   << std::endl;
     }
@@ -2118,7 +2169,11 @@ LMP2Status iterate_dlpno_ccsd_t2(
             if (diis.can_extrapolate()) {
                 try {
                     const auto y_ext = diis.extrapolate();
-                    for (size_t idx = 0; idx < pairs.size(); ++idx) {
+                    // Independent per-pair Y writes (disjoint Y[idx] + y_offset
+                    // slabs) ⇒ parallel is bit-identical.
+                    #pragma omp parallel for schedule(static)
+                    for (long long idx = 0;
+                         idx < static_cast<long long>(pairs.size()); ++idx) {
                         const int n_p = pairs[idx].n_pno;
                         if (n_p == 0) continue;
                         const size_t off = y_offset[idx];
