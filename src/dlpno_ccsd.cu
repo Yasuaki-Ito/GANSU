@@ -499,6 +499,8 @@ real_t DLPNOCCSD::compute_energy()
     std::vector<std::vector<real_t>> T1(nocc_);
     std::vector<std::vector<real_t>> f_ia(nocc_);
 
+    // Independent per LMO i (disjoint T1[i]/f_ia[i] writes, build_f_ia pure).
+    #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < nocc_; ++i) {
         const int idx_ii = res.pair_lookup[i * nocc_ + i];
         const PairSetup& s_ii = res.setups[idx_ii];
@@ -539,6 +541,10 @@ real_t DLPNOCCSD::compute_energy()
         T1_old = T1;
         real_t r_max = 0.0;
 
+        // Each i reads the T1_old snapshot and writes its own T1[i] (disjoint),
+        // and project_t1 is pure ⇒ the i-loop is independent. Parallelise it
+        // (was serial host = the bulk of classify+f_ia+T1 on large systems).
+        #pragma omp parallel for schedule(dynamic) reduction(max:r_max)
         for (int i = 0; i < nocc_; ++i) {
             const int idx_ii = res.pair_lookup[i * nocc_ + i];
             const PairSetup& s_ii = res.setups[idx_ii];
