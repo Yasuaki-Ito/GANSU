@@ -981,15 +981,15 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
             if (!pitstack_sparse_) {
                 check_cuda_(cudaMalloc(&s.d_pi_T_stack, bytes_pi_T),
                             "cudaMalloc d_pi_T_stack");
-                // Step S9 — size the pinned host mirror to the slab range only.
-                // For a single-GPU run this is the same as bytes_pi_T; for
-                // num_gpus=8 it is ~1/8 the size, which cuts the per-device
-                // pinning time and lets concurrent cudaMallocHost calls fight
-                // over the kernel mmap_lock for less wall time.
-                if (bytes_pi_T_slab > 0) {
-                    check_cuda_(cudaMallocHost(&s.h_pi_T_stack, bytes_pi_T_slab),
-                                "cudaMallocHost h_pi_T_stack (slab)");
-                }
+                // Step S9 / lazy: the pinned host mirror h_pi_T_stack is the
+                // destination of the per-iter pi_T_stack D2H. That D2H is now
+                // SKIPPED whenever the GPU consumers (oooo + DFpair) read the
+                // device buffer directly (skip_pi_T_stack_host) — i.e. for all
+                // all-GPU-active runs it is never used. Allocating its ~slab-size
+                // pinned buffer here cost a cudaMallocHost that serialised on the
+                // kernel mmap lock across the N_gpu ctors for nothing. Defer it
+                // to the first rebuild_with_stack that actually performs the D2H
+                // (partial activation); all-active never allocates it.
             }
             s.pi_T_slab_base_offset = pi_T_slab_base_off;
             s.pi_T_slab_total       = pi_T_slab_count;
@@ -1138,11 +1138,16 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
             // n_pno_[i_ij] > 0 and n_pno_[i_kl] > 0 but bs is 0×0)
             // contributes zeros instead of leaking uninitialised pinned
             // memory into d_barS_pad.
-            real_t* h_barS_flat = nullptr;
-            check_cuda_(cudaMallocHost(&h_barS_flat,
-                            flat_size * sizeof(real_t)),
-                        "cudaMallocHost h_barS_flat");
-            std::memset(h_barS_flat, 0, flat_size * sizeof(real_t));
+            // Pageable staging (was pinned cudaMallocHost): one-time dense
+            // barS upload. The pinned alloc serialised on the kernel mmap lock
+            // across the N_gpu picache ctors — the barS_h2d cost is mostly that
+            // contention, not the transfer. Pageable removes it; the one-time
+            // H2D is marginally slower but negligible. Value-init supplies the
+            // zeros the defensively-empty barS_cache blocks rely on, and RAII
+            // frees it (also exception-safe vs the old cudaFreeHost, which the
+            // check_cuda_ throw paths below would have leaked).
+            std::vector<real_t> h_barS_flat_vec(flat_size, real_t(0));
+            real_t* h_barS_flat = h_barS_flat_vec.data();
 
             #pragma omp parallel for collapse(2) schedule(static)
             for (int ai = 0; ai < N_act_ij; ++ai) {
@@ -1227,7 +1232,7 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
             cudaFree(d_block_src_off);
             cudaFree(d_n_pno_active_kl);
             cudaFree(d_n_pno_active_ij);
-            cudaFreeHost(h_barS_flat);
+            // h_barS_flat is now a pageable std::vector (RAII-freed).
         } else {
             // No active pairs: zero everything so downstream
             // pi = barS · Y · barS^T trivially produces zero.
@@ -2987,6 +2992,13 @@ void PiCacheGpu::rebuild_with_stack(
     // its base (offset 0). The source on device keeps the full-N_pair layout
     // (used by kernels that index via d_idx_offset), so we still read from
     // d_pi_T_stack + idx_offset_host[ib].
+    // Lazy alloc: the pinned mirror is created on first use here (partial
+    // activation), not in the ctor — all-active runs return above and never
+    // pay the pinned cudaMallocHost (mmap-lock contention across the ctors).
+    if (bytes_pi_T_slab > 0 && s.h_pi_T_stack == nullptr) {
+        check_cuda_(cudaMallocHost(&s.h_pi_T_stack, bytes_pi_T_slab),
+                    "cudaMallocHost h_pi_T_stack (lazy)");
+    }
     if (bytes_pi_T_slab > 0) {
         check_cuda_(cudaMemcpy(s.h_pi_T_stack,
                                s.d_pi_T_stack + idx_offset_host[ib],
