@@ -17,6 +17,7 @@
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <string>
 #include <vector>
 
 #include <chrono>
@@ -71,6 +72,44 @@ real_t ccsd_spatial_orbital(const real_t* d_eri_ao,
 namespace {
 using RowMatXd = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 constexpr real_t kFLMOThresh = 1e-14;
+
+/// Scoped environment-variable override. set() records the prior value and
+/// installs a new one; the destructor restores the original (or unsets it if
+/// it was absent). Used by the auto-sparse heuristic so the chosen
+/// GANSU_DLPNO_CCSD_* flags are visible to every downstream getenv reader for
+/// this compute_energy() call only — without leaking the decision into a later
+/// call on a different molecule (geometry opt / Python API).
+struct ScopedEnvOverride {
+    struct Saved { const char* key; bool had; std::string val; };
+    std::vector<Saved> saved_;
+    static void put_(const char* k, const char* v) {
+#ifdef _WIN32
+        _putenv_s(k, v);
+#else
+        setenv(k, v, /*overwrite=*/1);
+#endif
+    }
+    static void unset_(const char* k) {
+#ifdef _WIN32
+        _putenv_s(k, "");
+#else
+        unsetenv(k);
+#endif
+    }
+    void set(const char* key, const char* val) {
+        const char* cur = std::getenv(key);
+        saved_.push_back({key, cur != nullptr,
+                          cur ? std::string(cur) : std::string()});
+        put_(key, val);
+    }
+    ~ScopedEnvOverride() {
+        // Restore in reverse so repeated set()s on one key unwind cleanly.
+        for (auto it = saved_.rbegin(); it != saved_.rend(); ++it) {
+            if (it->had) put_(it->key, it->val.c_str());
+            else         unset_(it->key);
+        }
+    }
+};
 
 /// Build the LMO–PAO Fock block f_{ia}^{(i)} for a given LMO i in pair
 /// (i,i)'s semi-canonical PAO basis:
@@ -761,6 +800,96 @@ real_t DLPNOCCSD::compute_energy()
     if (params_.verbose >= 1) {
         std::cout << "[DLPNO-CCSD-PROF] T2 iter num_gpus=" << t2_num_gpus
                   << std::endl;
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-enable the Stage-D sparse path for large systems so a plain
+    // DLPNO-CCSD run does not OOM on the dense barS / pi_T grid. The dense
+    // CCSD picache co-resides barS_pad (N_act²·max_n²), the d_barS_flat
+    // transient, pi_T_stack (Σ n²·nocc²), the ResidGpu V_meta (×3) and
+    // V_stacked_oooo — for a 60+ atom acene that exceeds a single GPU
+    // (Decacene dense OOMs at `cudaMalloc d_barS_flat`). We estimate that
+    // aggregate, divide by the GPU count with an imbalance allowance, and
+    // compare against the live free memory; if dense would not fit we turn on
+    // BARS_SPARSE + PITSTACK_SPARSE plus a default distance screen
+    // (BARS_DIST — the only knob that shrinks the ragged buffers themselves).
+    // Small molecules keep the dense, screen-free, bit-exact path.
+    //
+    // The decision is made HERE — before the centroid build and
+    // iterate_dlpno_ccsd_t2 — and published via the environment so that every
+    // downstream reader (centroid gate at L~783, the host barS / coupling /
+    // partition gates in dlpno_pair_data.cu, and the PiCacheGpu ctor) sees one
+    // consistent choice with no plumbing changes. Explicit
+    // GANSU_DLPNO_CCSD_BARS_SPARSE=0/1 always wins; GANSU_DLPNO_CCSD_AUTO_SPARSE=0
+    // disables the heuristic. NOTE: the screen is a ~chemical-accuracy
+    // approximation, so we only auto-apply it when dense genuinely will not fit.
+    //
+    // env_autosparse restores the original environment when compute_energy
+    // returns, so the decision never leaks into a later call on another
+    // molecule (geometry optimisation / Python API).
+    ScopedEnvOverride env_autosparse;
+    {
+        const char* e_bs   = std::getenv("GANSU_DLPNO_CCSD_BARS_SPARSE");
+        const char* e_auto = std::getenv("GANSU_DLPNO_CCSD_AUTO_SPARSE");
+        const bool auto_on = !(e_auto && e_auto[0] == '0');   // default on
+        if (auto_on && e_bs == nullptr) {                     // no explicit override
+            size_t n_act = 0, max_n = 0;
+            double sum_n = 0.0, sum_n2 = 0.0;
+            for (const auto& p : res.pairs) {
+                if (p.n_pno <= 0) continue;
+                const size_t n = static_cast<size_t>(p.n_pno);
+                ++n_act;
+                if (n > max_n) max_n = n;
+                sum_n  += static_cast<double>(n);
+                sum_n2 += static_cast<double>(n) * static_cast<double>(n);
+            }
+            const double nocc2    = static_cast<double>(nocc_) * nocc_;
+            const double barS_pad = static_cast<double>(n_act) * n_act
+                                  * static_cast<double>(max_n) * max_n;
+            const double flat     = sum_n * sum_n;        // d_barS_flat transient
+            const double pi_T     = nocc2 * sum_n2;        // pi_T_stack (per pair n²·nocc²)
+            // + ResidGpu V_meta (×3, (nocc·n)²) + V_stacked_oooo (×1, nocc²·n²)
+            // are all pi_T-shaped ⇒ 4× pi_T. Total dense doubles:
+            const double dense_doubles = barS_pad + flat + 5.0 * pi_T;
+            const double dense_bytes   = dense_doubles * sizeof(real_t);
+            const int    ng        = std::max(1, t2_num_gpus);
+            const double imbalance = 1.6;   // heavy (high-n) pairs cluster on one device
+            const double per_dev   = dense_bytes / ng * imbalance;
+
+            size_t free_b = 0, total_b = 0;
+            const bool have_mem = (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess);
+            const double GB = 1024.0 * 1024.0 * 1024.0;
+            const double margin = 4.0 * GB;
+            const bool wont_fit =
+                have_mem && (per_dev > static_cast<double>(free_b) - margin);
+
+            if (wont_fit) {
+                env_autosparse.set("GANSU_DLPNO_CCSD_BARS_SPARSE",     "1");
+                env_autosparse.set("GANSU_DLPNO_CCSD_PITSTACK_SPARSE", "1");
+                const char* e_dist = std::getenv("GANSU_DLPNO_CCSD_BARS_DIST");
+                if (e_dist == nullptr)
+                    env_autosparse.set("GANSU_DLPNO_CCSD_BARS_DIST", "12");
+                if (params_.verbose >= 1) {
+                    std::cout << "[DLPNO-CCSD] auto-sparse: dense est "
+                              << std::fixed << std::setprecision(1)
+                              << per_dev / GB << " GB/dev > free "
+                              << static_cast<double>(free_b) / GB
+                              << " GB (ng=" << ng << ") → enabling sparse "
+                                 "Stage-D + distance screen (DIST="
+                              << (e_dist ? e_dist : "12")
+                              << " Bohr, ~chemical-accuracy approximation). "
+                                 "Force dense with GANSU_DLPNO_CCSD_BARS_SPARSE=0; "
+                                 "disable heuristic with "
+                                 "GANSU_DLPNO_CCSD_AUTO_SPARSE=0." << std::endl;
+                }
+            } else if (params_.verbose >= 2 && have_mem) {
+                std::cout << "[DLPNO-CCSD] auto-sparse: dense est "
+                          << std::fixed << std::setprecision(1)
+                          << per_dev / GB << " GB/dev fits free "
+                          << static_cast<double>(free_b) / GB
+                          << " GB → dense (exact)." << std::endl;
+            }
+        }
     }
 
     // (T) re-use: snapshot the converged LMP2 amplitudes BEFORE the CCSD
