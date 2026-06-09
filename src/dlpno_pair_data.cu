@@ -1066,7 +1066,21 @@ LMP2Status iterate_dlpno_ccsd_t2(
     std::vector<std::unique_ptr<ResidGpu>> rgpus(n_gpus);
     if (phase24 != nullptr && phase24->nocc == nocc) {
 #ifndef GANSU_CPU_ONLY
-        for (int d = 0; d < n_gpus; ++d) {
+        // Parallel construction across devices — mirror of the PiCacheGpu
+        // Step S8 parallelisation above. Each ResidGpu ctor only touches its
+        // own device (DeviceGuard) and writes its own rgpus[d] slot; setups,
+        // pairs, phase24 and F_LMO are read-only inputs and pgpus[d] is this
+        // thread's own instance. Previously a sequential for-loop that
+        // serialised 8× (cudaMalloc + V_meta/W_bare H2D + pack), which was the
+        // dominant setup_rgpu cost (Pentacene 8×A100: ~12.4 s → expected
+        // ~2-3 s, limited by the heaviest device + H2D bandwidth).
+        #pragma omp parallel num_threads(n_gpus)
+        {
+#ifdef _OPENMP
+            const int d = omp_get_thread_num();
+#else
+            const int d = 0;
+#endif
             MultiGpuManager::DeviceGuard guard(d);
             if (pgpus[d] && pgpus[d]->stacked()) {
                 rgpus[d] = std::make_unique<ResidGpu>(
@@ -1083,6 +1097,24 @@ LMP2Status iterate_dlpno_ccsd_t2(
     bool any_rgpu_active = false;
     for (int d = 0; d < n_gpus; ++d) {
         if (rgpus[d] && rgpus[d]->active()) { any_rgpu_active = true; break; }
+    }
+    // all_rgpu_active: every device that owns at least one pair has an active
+    // ResidGpu. When true, every pair's ph-ladder + oooo + inter-pair Fock is
+    // produced on the GPU (R_ph_acc populated ⇒ skip_cpu_inter_pair_fock true
+    // for ALL pairs), so the host V_meta_T/V_meta_TT/T_meta/V_stacked_oooo
+    // caches below are never read. Building them is then pure dead work (the
+    // dominant `vmeta` cost for all-GPU mid-size systems), so we skip it. Only
+    // T_meta_dpair is still built unconditionally (uploaded for the GPU DFpair).
+    // When any device falls back to the CPU path (partial activation, e.g. a
+    // memory-starved device), those host caches ARE read for the inactive
+    // device's pairs, so we must keep building them (no regression).
+    bool all_rgpu_active = any_rgpu_active;
+    for (int d = 0; d < n_gpus; ++d) {
+        if (slab_starts[d] < slab_starts[d + 1]
+            && !(rgpus[d] && rgpus[d]->active())) {
+            all_rgpu_active = false;
+            break;
+        }
     }
     std::vector<RowMatXd> R_ph_acc;
     if (any_rgpu_active) {
@@ -1139,12 +1171,19 @@ LMP2Status iterate_dlpno_ccsd_t2(
             if (idx >= static_cast<long long>(phase24->V_ovov_pair.size())
                 || phase24->V_ovov_pair[idx].empty()
                 || phase24->T_pair[idx].empty()) continue;
-            const int nn = nocc * n;
-            V_meta_T [idx].setZero(nn, nn);
-            V_meta_TT[idx].setZero(nn, nn);
-            T_meta   [idx].setZero(nn, nn);
-            V_stacked_oooo[idx].setZero(
-                static_cast<size_t>(nocc) * nocc, static_cast<size_t>(n) * n);
+            // When every device's ResidGpu is active, the host V_meta_T/TT/
+            // T_meta/V_stacked_oooo caches are never read (GPU does the
+            // ph-ladder + oooo for all pairs) — skip building them. T_meta_dpair
+            // is still required (uploaded for the GPU DFpair). See all_rgpu_active.
+            const bool host_meta = !all_rgpu_active;
+            if (host_meta) {
+                const int nn = nocc * n;
+                V_meta_T [idx].setZero(nn, nn);
+                V_meta_TT[idx].setZero(nn, nn);
+                T_meta   [idx].setZero(nn, nn);
+                V_stacked_oooo[idx].setZero(
+                    static_cast<size_t>(nocc) * nocc, static_cast<size_t>(n) * n);
+            }
             T_meta_dpair  [idx].setZero(
                 static_cast<size_t>(nocc) * nocc * n, n);
             const real_t* V_ov = phase24->V_ovov_pair[idx].data();
@@ -1159,12 +1198,14 @@ LMP2Status iterate_dlpno_ccsd_t2(
                              * static_cast<size_t>(n) * n;
                     for (int d = 0; d < n; ++d) {
                         for (int c = 0; c < n; ++c) {
-                            V_meta_T [idx](l * n + d, k * n + c) =
-                                V_lk[d * n + c];
-                            V_meta_TT[idx](l * n + d, k * n + c) =
-                                V_lk[c * n + d];
-                            T_meta   [idx](l * n + d, k * n + c) =
-                                T_kl[c * n + d];
+                            if (host_meta) {
+                                V_meta_T [idx](l * n + d, k * n + c) =
+                                    V_lk[d * n + c];
+                                V_meta_TT[idx](l * n + d, k * n + c) =
+                                    V_lk[c * n + d];
+                                T_meta   [idx](l * n + d, k * n + c) =
+                                    T_kl[c * n + d];
+                            }
                             // T_meta_dpair: ((k, l), d) outer × c inner
                             T_meta_dpair[idx](
                                 (static_cast<size_t>(k) * nocc + l) * n + d, c) =
@@ -1172,12 +1213,14 @@ LMP2Status iterate_dlpno_ccsd_t2(
                         }
                     }
                     // V_stacked_oooo row (k*nocc + l) = V_lk row-major flat
-                    std::memcpy(
-                        V_stacked_oooo[idx].data()
-                          + (static_cast<size_t>(k) * nocc + l)
-                          * static_cast<size_t>(n) * n,
-                        V_lk,
-                        static_cast<size_t>(n) * n * sizeof(real_t));
+                    if (host_meta) {
+                        std::memcpy(
+                            V_stacked_oooo[idx].data()
+                              + (static_cast<size_t>(k) * nocc + l)
+                              * static_cast<size_t>(n) * n,
+                            V_lk,
+                            static_cast<size_t>(n) * n * sizeof(real_t));
+                    }
                 }
             }
         }
