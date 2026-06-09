@@ -735,8 +735,12 @@ PiCacheGpu::PiCacheGpu(const std::vector<std::vector<RowMatXd>>& barS_cache,
     // path (their coupling is the full (k,l) superset, handled in a later
     // phase). Requires active rows.
     {
+        // Default-on (bit-exact: coupling = needed_ikl is the exact set the
+        // LMP2 residual reads). Must track the host barS_cache build gate in
+        // dlpno_pair_data.cu (same env) so the device CSR and the host cache
+        // agree on which blocks exist. Opt-out: GANSU_DLPNO_LMP2_BARS_SPARSE=0.
         const char* e = std::getenv("GANSU_DLPNO_LMP2_BARS_SPARSE");
-        sparse_lmp2_ = (e && e[0] == '1') && !want_stacked && N_act_ij_ > 0;
+        sparse_lmp2_ = !(e && e[0] == '0') && !want_stacked && N_act_ij_ > 0;
         // Phase 2: CCSD (stacked) sparse barS. Requires setup_j (for the
         // pi_T_stack scatter). Coupling list is supplied per rebuild_with_stack.
         const char* ec = std::getenv("GANSU_DLPNO_CCSD_BARS_SPARSE");
@@ -1317,6 +1321,15 @@ void PiCacheGpu::rebuild_cpu_(
                 const int n_kl = n_pno_[i_kl];
 
                 const RowMatXd& barS = barS_row[i_kl];
+                // Sparse barS_cache (LMP2 default-on / CCSD opt-in): non-coupling
+                // (i_ij, i_kl) blocks are left 0×0 by the host build. The LMP2
+                // residual never reads those pi_cache entries, so leaving them
+                // empty here is bit-exact — and it keeps the CPU fallback path
+                // (this routine) from dereferencing an unbuilt block.
+                if (barS.rows() == 0 || barS.cols() == 0) {
+                    pi_row[i_kl].resize(0, 0);
+                    continue;
+                }
                 Eigen::Map<const RowMatXd> Y_canon(
                     Y_old[i_kl].data(), n_kl, n_kl);
                 Eigen::Map<RowMatXd> half(half_buf.data(), n_ij, n_kl);

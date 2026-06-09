@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #include "dlpno_pno.hpp"
+#include "lapack_syev.hpp"
 
 #include <Eigen/Dense>
 #include <algorithm>
@@ -46,13 +47,23 @@ PNOResult build_pno_from_T(
     // Symmetrise to remove FP asymmetry before eigendecomposition.
     D = 0.5 * (D + D.transpose());
 
-    Eigen::SelfAdjointEigenSolver<RowMatXd> es(D);
-    if (es.info() != Eigen::Success)
-        throw std::runtime_error("PNO eigendecomposition failed");
-
-    // Eigen returns ascending eigenvalues. Re-sort descending for our output.
-    Eigen::VectorXd ev = es.eigenvalues();
-    RowMatXd        V  = es.eigenvectors();
+    // Eigen / LAPACK both return ascending eigenvalues; we re-sort descending
+    // for the output. LAPACK divide-and-conquer (opt-in) is faster for the
+    // n_pao≈130-450 density matrices that dominate round0/SC-PNO.
+    Eigen::VectorXd ev;
+    RowMatXd        V;
+    if (use_lapack_eig()) {
+        std::vector<double> e, vv;
+        lapack_syevd(D.data(), n_pao, e, vv);
+        ev = Eigen::Map<Eigen::VectorXd>(e.data(), n_pao);
+        V  = Eigen::Map<RowMatXd>(vv.data(), n_pao, n_pao);
+    } else {
+        Eigen::SelfAdjointEigenSolver<RowMatXd> es(D);
+        if (es.info() != Eigen::Success)
+            throw std::runtime_error("PNO eigendecomposition failed");
+        ev = es.eigenvalues();
+        V  = es.eigenvectors();
+    }
 
     res.occupations.resize(n_pao);
     for (int k = 0; k < n_pao; ++k) {

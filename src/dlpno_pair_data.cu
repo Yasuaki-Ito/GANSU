@@ -191,9 +191,12 @@ LMP2Status iterate_lmp2(
     // approximation. Built here (early) so the sparse barS build below can use
     // it; also consumed by the picache_gather rebuild_needed path further down
     // and by the PiCacheGpu CSR build (rebuild_needed). Cheap: O(N_pair·nocc).
+    // LMP2 sparse barS is bit-exact (coupling = needed_ikl is the EXACT set the
+    // residual reads — pi_cache[i_ij][i_kl] depends on a single barS block), so
+    // it is enabled by default. Opt-out with GANSU_DLPNO_LMP2_BARS_SPARSE=0.
     const bool bars_sparse = []() {
         const char* e = std::getenv("GANSU_DLPNO_LMP2_BARS_SPARSE");
-        return e && e[0] == '1';
+        return !(e && e[0] == '0');
     }();
     std::vector<std::vector<int>> needed_ikl_per_pair(pairs.size());
     for (size_t idx = 0; idx < pairs.size(); ++idx) {
@@ -648,6 +651,100 @@ LMP2Status iterate_dlpno_ccsd_t2(
 
     std::vector<std::vector<real_t>> Y_old(pairs.size());
 
+    // ---- CCSD sparse barS config + per-output-pair coupling list ----
+    //
+    // Hoisted ABOVE the barS_cache build so the cache itself can be built
+    // SPARSE — only the coupling blocks the GPU stacked path actually reads
+    // (needed_ikl_host ⊆ coupling_ccsd_per_pair). Every CCSD term contracts
+    // pi_T_stack[i_ij][kl] = barS[i_ij][idx_kl]·Y·barS^T, so dropping a barS
+    // block removes its contribution from ALL terms (inter-Fock, oooo, DFpair).
+    // Coupling = inter-Fock seed {(k,j),(i,l)} ∪ j-side slice seed {(j,l),(k,i)}
+    // (ResidGpu reads these via pair_lookup, must always be present) ∪ {pairs
+    // within the centroid-distance cutoff}. cutoff<=0 (or no centroids) keeps
+    // every active (overlapping) pair ⇒ bit-exact. Opt-in via
+    // GANSU_DLPNO_CCSD_BARS_SPARSE.
+    const bool ccsd_bars_sparse = []() {
+        const char* e = std::getenv("GANSU_DLPNO_CCSD_BARS_SPARSE");
+        return e && e[0] == '1';
+    }();
+    // Distance-based coupling screen (Bohr). barS-norm proved a poor
+    // discriminator (PTCDA: ΔE~1e-14 yet no coupling shrink at thr≤1e-4 — the
+    // surviving active pairs' inter-pair barS is dense in norm). Pair-pair
+    // CENTROID distance is the sharper, ORCA-like criterion: cut (i_ij,i_kl)
+    // when the two pairs are spatially far. cutoff<=0 (or no centroids) ⇒ keep
+    // all active ⇒ bit-exact (validation). Energy-contribution decay is
+    // captured by the cutoff (calibrated to ΔE<1e-4).
+    const real_t ccsd_bars_dist = []() {
+        const char* e = std::getenv("GANSU_DLPNO_CCSD_BARS_DIST");
+        return e ? std::atof(e) : 0.0;
+    }();
+    const bool ccsd_dist_screen =
+        ccsd_bars_sparse && lmo_centroids != nullptr && ccsd_bars_dist > 0.0;
+    const real_t dist2_cut = ccsd_bars_dist * ccsd_bars_dist;
+    auto pair_centroid = [&](int idx, real_t& cx, real_t& cy, real_t& cz) {
+        const int i = setups[idx].i, j = setups[idx].j;
+        cx = 0.5 * (lmo_centroids[3*i+0] + lmo_centroids[3*j+0]);
+        cy = 0.5 * (lmo_centroids[3*i+1] + lmo_centroids[3*j+1]);
+        cz = 0.5 * (lmo_centroids[3*i+2] + lmo_centroids[3*j+2]);
+    };
+    std::vector<std::vector<int>> coupling_ccsd_per_pair;
+    if (ccsd_bars_sparse) {
+        coupling_ccsd_per_pair.resize(pairs.size());
+        #pragma omp parallel for schedule(dynamic, 4)
+        for (long long idx = 0; idx < static_cast<long long>(pairs.size());
+             ++idx)
+        {
+            if (pairs[idx].n_pno == 0) continue;
+            const int i = setups[idx].i, j = setups[idx].j;
+            std::vector<int>& nb = coupling_ccsd_per_pair[idx];
+            for (int k = 0; k < nocc; ++k) {           // inter-Fock (k, j)
+                if (k == i) continue;
+                const int idx_kj = pair_lookup[static_cast<size_t>(k) * nocc + j];
+                if (idx_kj >= 0 && pairs[idx_kj].n_pno > 0) nb.push_back(idx_kj);
+            }
+            for (int l = 0; l < nocc; ++l) {           // inter-Fock (i, l)
+                if (l == j) continue;
+                const int idx_il = pair_lookup[static_cast<size_t>(i) * nocc + l];
+                if (idx_il >= 0 && pairs[idx_il].n_pno > 0) nb.push_back(idx_il);
+            }
+            // Stage D: the j-side ResidGpu slices read (j,l) [slot_jrow] and
+            // (k,i) [slot_icol]. These are structural (every l / every k), the
+            // j-side mirror of the i-side (k,j)/(i,l) above. They must be
+            // force-seeded so the distance screen below cannot drop them —
+            // otherwise the j-side ph-ladder would be screened while the i-side
+            // is not (asymmetric, wrong). No effect when screen is off (all
+            // active pairs already included). All l / all k (no self-skip) so
+            // every slot_jrow[l]/slot_icol[k] the j-side slices index exists.
+            for (int l = 0; l < nocc; ++l) {           // j-side slice (j, l)
+                const int idx_jl = pair_lookup[static_cast<size_t>(j) * nocc + l];
+                if (idx_jl >= 0 && pairs[idx_jl].n_pno > 0) nb.push_back(idx_jl);
+            }
+            for (int k = 0; k < nocc; ++k) {           // j-side slice (k, i)
+                const int idx_ki = pair_lookup[static_cast<size_t>(k) * nocc + i];
+                if (idx_ki >= 0 && pairs[idx_ki].n_pno > 0) nb.push_back(idx_ki);
+            }
+            // distance screen over all active pairs (or keep-all when off). A
+            // (idx, i_kl) block always overlaps when both n_pno>0 (PNOs are
+            // delocalised over the AOs ⇒ bar_Q^T·S·bar_Q ≠ 0), so no barS_cache
+            // lookup is needed here — the coupling is purely structural +
+            // distance and is built BEFORE barS_cache.
+            real_t cx, cy, cz;
+            if (ccsd_dist_screen) pair_centroid(static_cast<int>(idx), cx, cy, cz);
+            for (size_t i_kl = 0; i_kl < pairs.size(); ++i_kl) {
+                if (pairs[i_kl].n_pno == 0) continue;
+                if (ccsd_dist_screen) {
+                    real_t kx, ky, kz;
+                    pair_centroid(static_cast<int>(i_kl), kx, ky, kz);
+                    const real_t dx = cx - kx, dy = cy - ky, dz = cz - kz;
+                    if (dx*dx + dy*dy + dz*dz > dist2_cut) continue;  // too far ⇒ drop
+                }
+                nb.push_back(static_cast<int>(i_kl));
+            }
+            std::sort(nb.begin(), nb.end());
+            nb.erase(std::unique(nb.begin(), nb.end()), nb.end());
+        }
+    }
+
     // ---- Pre-computed bar_S^{(ij,kl)} cache ----
     //
     // bar_S^{(ij,kl)} = bar_Q^{(ij)T} · S_AO · bar_Q^{(kl)} appears in every
@@ -655,8 +752,9 @@ LMP2Status iterate_dlpno_ccsd_t2(
     // contraction. It depends only on the (iter-invariant) bar_Q matrices,
     // so we pre-compute all combinations once before the iter loop. Storage
     // is N_pair² × n_pno² doubles (~50 MB for H2O hexamer); scales as N⁴
-    // with system size — refactor to a sparse / distance-cutoff structure
-    // if memory becomes an issue.
+    // with system size. With GANSU_DLPNO_CCSD_BARS_SPARSE the build is
+    // restricted to the coupling blocks (O(N_pair·coupling)), which is what
+    // the GPU stacked CSR + every CPU fallback (option (a)) actually read.
     std::vector<std::vector<RowMatXd>> barS_cache(pairs.size());
     {
         const auto t0 = prof_clock::now();
@@ -675,12 +773,26 @@ LMP2Status iterate_dlpno_ccsd_t2(
             Eigen::Map<const RowMatXd> bQ_ij(
                 pairs[i_ij].bar_Q.data(), nao, n_ij);
             const RowMatXd bQ_ij_T_S = bQ_ij.transpose() * Smat;  // n_ij × nao
-            for (size_t i_kl = 0; i_kl < pairs.size(); ++i_kl) {
-                const int n_kl = pairs[i_kl].n_pno;
-                if (n_kl == 0) continue;
-                Eigen::Map<const RowMatXd> bQ_kl(
-                    pairs[i_kl].bar_Q.data(), nao, n_kl);
-                barS_cache[i_ij][i_kl].noalias() = bQ_ij_T_S * bQ_kl;
+            if (ccsd_bars_sparse) {
+                // Sparse: only the coupling blocks the GPU stacked CSR build
+                // reads (needed_ikl_host ⊆ coupling_ccsd_per_pair). Non-coupling
+                // blocks are left 0×0 — never consumed ⇒ bit-exact. Cuts the
+                // host build from O(N_pair²) to O(N_pair·coupling).
+                for (int i_kl : coupling_ccsd_per_pair[i_ij]) {
+                    const int n_kl = pairs[i_kl].n_pno;
+                    if (n_kl == 0) continue;
+                    Eigen::Map<const RowMatXd> bQ_kl(
+                        pairs[i_kl].bar_Q.data(), nao, n_kl);
+                    barS_cache[i_ij][i_kl].noalias() = bQ_ij_T_S * bQ_kl;
+                }
+            } else {
+                for (size_t i_kl = 0; i_kl < pairs.size(); ++i_kl) {
+                    const int n_kl = pairs[i_kl].n_pno;
+                    if (n_kl == 0) continue;
+                    Eigen::Map<const RowMatXd> bQ_kl(
+                        pairs[i_kl].bar_Q.data(), nao, n_kl);
+                    barS_cache[i_ij][i_kl].noalias() = bQ_ij_T_S * bQ_kl;
+                }
             }
         }
         dt_barS += std::chrono::duration<double>(prof_clock::now() - t0).count();
@@ -771,96 +883,12 @@ LMP2Status iterate_dlpno_ccsd_t2(
     for (size_t i = 0; i < pairs.size(); ++i) {
         setup_i_per_pair[i] = setups[i].i;
     }
-    // Phase 2 (CCSD sparse barS) — setups[].j (for the pi_T_stack scatter) and
-    // the per-output-pair coupling list. Every CCSD term contracts
-    // pi_T_stack[i_ij][kl] = barS[i_ij][idx_kl]·Y·barS^T, so dropping a small
-    // barS block removes its contribution from ALL terms (inter-Fock, oooo,
-    // DFpair). Coupling = inter-Fock seed {(k,j),(i,l)} (ResidGpu reads these
-    // via pair_lookup, must always be present) ∪ {idx_kl whose ‖barS‖_F > thr}.
-    // thr=0 keeps every active (overlapping) pair ⇒ bit-exact; thr>0 screens
-    // (ΔE<1e-4 calibrated). Opt-in via GANSU_DLPNO_CCSD_BARS_SPARSE.
+    // setups[].j for the pi_T_stack scatter. The CCSD sparse-barS config and
+    // the per-output-pair coupling list (coupling_ccsd_per_pair) are built
+    // earlier — hoisted above the barS_cache build so the cache can be built
+    // sparse. See the "CCSD sparse barS config" block near the top of iterate.
     std::vector<int> setup_j_per_pair(pairs.size(), 0);
     for (size_t i = 0; i < pairs.size(); ++i) setup_j_per_pair[i] = setups[i].j;
-
-    const bool ccsd_bars_sparse = []() {
-        const char* e = std::getenv("GANSU_DLPNO_CCSD_BARS_SPARSE");
-        return e && e[0] == '1';
-    }();
-    // Distance-based coupling screen (Bohr). barS-norm proved a poor
-    // discriminator (PTCDA: ΔE~1e-14 yet no coupling shrink at thr≤1e-4 — the
-    // surviving active pairs' inter-pair barS is dense in norm). Pair-pair
-    // CENTROID distance is the sharper, ORCA-like criterion: cut (i_ij,i_kl)
-    // when the two pairs are spatially far. cutoff<=0 (or no centroids) ⇒ keep
-    // all active ⇒ bit-exact (validation). Energy-contribution decay is
-    // captured by the cutoff (calibrated to ΔE<1e-4).
-    const real_t ccsd_bars_dist = []() {
-        const char* e = std::getenv("GANSU_DLPNO_CCSD_BARS_DIST");
-        return e ? std::atof(e) : 0.0;
-    }();
-    const bool ccsd_dist_screen =
-        ccsd_bars_sparse && lmo_centroids != nullptr && ccsd_bars_dist > 0.0;
-    const real_t dist2_cut = ccsd_bars_dist * ccsd_bars_dist;
-    auto pair_centroid = [&](int idx, real_t& cx, real_t& cy, real_t& cz) {
-        const int i = setups[idx].i, j = setups[idx].j;
-        cx = 0.5 * (lmo_centroids[3*i+0] + lmo_centroids[3*j+0]);
-        cy = 0.5 * (lmo_centroids[3*i+1] + lmo_centroids[3*j+1]);
-        cz = 0.5 * (lmo_centroids[3*i+2] + lmo_centroids[3*j+2]);
-    };
-    std::vector<std::vector<int>> coupling_ccsd_per_pair;
-    if (ccsd_bars_sparse) {
-        coupling_ccsd_per_pair.resize(pairs.size());
-        #pragma omp parallel for schedule(dynamic, 4)
-        for (long long idx = 0; idx < static_cast<long long>(pairs.size());
-             ++idx)
-        {
-            if (pairs[idx].n_pno == 0) continue;
-            const int i = setups[idx].i, j = setups[idx].j;
-            std::vector<int>& nb = coupling_ccsd_per_pair[idx];
-            for (int k = 0; k < nocc; ++k) {           // inter-Fock (k, j)
-                if (k == i) continue;
-                const int idx_kj = pair_lookup[static_cast<size_t>(k) * nocc + j];
-                if (idx_kj >= 0 && pairs[idx_kj].n_pno > 0) nb.push_back(idx_kj);
-            }
-            for (int l = 0; l < nocc; ++l) {           // inter-Fock (i, l)
-                if (l == j) continue;
-                const int idx_il = pair_lookup[static_cast<size_t>(i) * nocc + l];
-                if (idx_il >= 0 && pairs[idx_il].n_pno > 0) nb.push_back(idx_il);
-            }
-            // Stage D: the j-side ResidGpu slices read (j,l) [slot_jrow] and
-            // (k,i) [slot_icol]. These are structural (every l / every k), the
-            // j-side mirror of the i-side (k,j)/(i,l) above. They must be
-            // force-seeded so the distance screen below cannot drop them —
-            // otherwise the j-side ph-ladder would be screened while the i-side
-            // is not (asymmetric, wrong). No effect when screen is off (all
-            // active pairs already included). All l / all k (no self-skip) so
-            // every slot_jrow[l]/slot_icol[k] the j-side slices index exists.
-            for (int l = 0; l < nocc; ++l) {           // j-side slice (j, l)
-                const int idx_jl = pair_lookup[static_cast<size_t>(j) * nocc + l];
-                if (idx_jl >= 0 && pairs[idx_jl].n_pno > 0) nb.push_back(idx_jl);
-            }
-            for (int k = 0; k < nocc; ++k) {           // j-side slice (k, i)
-                const int idx_ki = pair_lookup[static_cast<size_t>(k) * nocc + i];
-                if (idx_ki >= 0 && pairs[idx_ki].n_pno > 0) nb.push_back(idx_ki);
-            }
-            // distance screen over all active pairs (or keep-all when off).
-            real_t cx, cy, cz;
-            if (ccsd_dist_screen) pair_centroid(static_cast<int>(idx), cx, cy, cz);
-            for (size_t i_kl = 0; i_kl < pairs.size(); ++i_kl) {
-                if (pairs[i_kl].n_pno == 0) continue;
-                const RowMatXd& bs = barS_cache[idx][i_kl];
-                if (bs.rows() == 0 || bs.cols() == 0) continue;  // no overlap ⇒ 0 anyway
-                if (ccsd_dist_screen) {
-                    real_t kx, ky, kz;
-                    pair_centroid(static_cast<int>(i_kl), kx, ky, kz);
-                    const real_t dx = cx - kx, dy = cy - ky, dz = cz - kz;
-                    if (dx*dx + dy*dy + dz*dz > dist2_cut) continue;  // too far ⇒ drop
-                }
-                nb.push_back(static_cast<int>(i_kl));
-            }
-            std::sort(nb.begin(), nb.end());
-            nb.erase(std::unique(nb.begin(), nb.end()), nb.end());
-        }
-    }
 
     // ---- Multi-GPU pair-slab partition (n_pno²-weighted greedy). ----
     // Each device handles its own slab of pair indices. Single-GPU

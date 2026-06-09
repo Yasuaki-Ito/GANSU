@@ -9,6 +9,8 @@
  */
 #include "dlpno_pao.hpp"
 
+#include "lapack_syev.hpp"
+
 #include <Eigen/Dense>
 #include <algorithm>
 #include <stdexcept>
@@ -80,13 +82,23 @@ PAODomainResult orthogonalize_pao_domain(
     // Symmetrise to remove any FP asymmetry before eigendecomposition.
     Sdom = 0.5 * (Sdom + Sdom.transpose());
 
-    // Step 3: eigendecomposition (ascending eigenvalues from SelfAdjoint).
-    Eigen::SelfAdjointEigenSolver<RowMatXd> es(Sdom);
-    if (es.info() != Eigen::Success)
-        throw std::runtime_error("PAO domain overlap eigendecomp failed");
-
-    Eigen::VectorXd eigvals = es.eigenvalues();
-    RowMatXd        eigvecs = es.eigenvectors();
+    // Step 3: eigendecomposition (ascending eigenvalues). LAPACK divide-and-
+    // conquer (default; ~57x faster than Eigen's QR for the large-n domains)
+    // with the same ascending-eval, column-k eigenvector convention as Eigen.
+    Eigen::VectorXd eigvals;
+    RowMatXd        eigvecs;
+    if (use_lapack_eig()) {
+        std::vector<double> ev, vv;
+        lapack_syevd(Sdom.data(), d, ev, vv);  // Sdom symmetric & row-major
+        eigvals = Eigen::Map<Eigen::VectorXd>(ev.data(), d);
+        eigvecs = Eigen::Map<RowMatXd>(vv.data(), d, d);
+    } else {
+        Eigen::SelfAdjointEigenSolver<RowMatXd> es(Sdom);
+        if (es.info() != Eigen::Success)
+            throw std::runtime_error("PAO domain overlap eigendecomp failed");
+        eigvals = es.eigenvalues();
+        eigvecs = es.eigenvectors();
+    }
 
     // Step 4: drop redundant directions (λ < t_cut_do).
     const int n_total = d;

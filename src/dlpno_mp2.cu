@@ -35,6 +35,7 @@
 #include "dlpno_pao.hpp"
 #include "dlpno_pno.hpp"
 #include "eri.hpp"
+#include "lapack_syev.hpp"
 #include "oscillator_strength.hpp"
 #include "rhf.hpp"
 
@@ -52,11 +53,17 @@ struct EigDecomp {
 
 EigDecomp eig_sym(const real_t* M, int n)
 {
+    EigDecomp out;
+    // LAPACK divide-and-conquer path (opt-in, faster than Eigen QR for n>~50).
+    // Produces the same (ascending evals, column-k eigenvector) convention.
+    if (use_lapack_eig()) {
+        lapack_syevd(M, n, out.eigvals, out.eigvecs);
+        return out;
+    }
     Eigen::Map<const RowMatXd> A(M, n, n);
     Eigen::SelfAdjointEigenSolver<RowMatXd> es(A);
     if (es.info() != Eigen::Success)
         throw std::runtime_error("DLPNO-MP2: eigendecomposition failed");
-    EigDecomp out;
     out.eigvals.resize(n);
     out.eigvecs.assign(static_cast<size_t>(n) * n, 0.0);
     for (int k = 0; k < n; ++k) out.eigvals[k] = es.eigenvalues()(k);
