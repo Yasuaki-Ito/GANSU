@@ -176,6 +176,11 @@ struct PiCacheGpu::Impl {
     // d_pi_needed/h_pi_needed hold the gathered (tile_rows × max_needed)
     // max_n² blocks per tile.
     bool     needed_built  = false;
+    // Inactive (empty-pair) pi_cache_out rows are 0×0 from construction and are
+    // never written; the per-iter loop that re-resizes them to 0×0 is a no-op
+    // but its 2.3M-iteration host sweep (Decacene heavy slab) dominated the LMP2
+    // picache wall. Zero them ONCE per instance instead.
+    bool     inactive_zeroed = false;
     int      max_needed    = 0;
     int*     d_needed_ak    = nullptr;   // [N_act_ij · max_needed]
     int*     d_needed_count = nullptr;   // [N_act_ij]
@@ -1774,12 +1779,18 @@ void PiCacheGpu::rebuild_needed(
             std::chrono::steady_clock::now() - pc_t0).count();
     }
 
-    // Inactive-pair rows → 0×0 (those i_ij are never written below).
-    for (long long i_ij = pair_begin_; i_ij < pair_end_; ++i_ij) {
-        if (n_pno_[i_ij] == 0) {
-            for (int i_kl = 0; i_kl < N_pair_; ++i_kl)
-                pi_cache_out[i_ij][i_kl].resize(0, 0);
+    // Inactive-pair rows → 0×0 (those i_ij are never written below). One-time:
+    // the blocks are 0×0 from construction and stay 0×0 across iters, so this
+    // O(empty·N_pair) host sweep only needs to run once per instance (it was
+    // ~90% of the Decacene LMP2 picache wall when re-run every iter).
+    if (!s.inactive_zeroed) {
+        for (long long i_ij = pair_begin_; i_ij < pair_end_; ++i_ij) {
+            if (n_pno_[i_ij] == 0) {
+                for (int i_kl = 0; i_kl < N_pair_; ++i_kl)
+                    pi_cache_out[i_ij][i_kl].resize(0, 0);
+            }
         }
+        s.inactive_zeroed = true;
     }
 
     for (int tile_start = 0; tile_start < N_act_ij_;
