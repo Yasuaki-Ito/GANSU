@@ -183,6 +183,22 @@ struct PiCacheGpu::Impl {
     real_t*  h_pi_needed    = nullptr;   // pinned mirror of d_pi_needed
     std::vector<std::vector<int>> needed_ikl_host;  // [N_act_ij][count]
 
+    // picache D2H compaction (env GANSU_DLPNO_PICACHE_COMPACT_D2H, LMP2 ragged
+    // path). d_pi_needed stores each pi block padded to max_n² but the real
+    // data is only n_ij² (avg n_pno ≪ max_n ⇒ ~max_n²/n_ij² ≈ 28× waste). The
+    // D2H of the LMP2 picache (to materialise host pi for the host residual) is
+    // the dominant per-iter cost. Packing the n_ij² blocks contiguously on
+    // device before the D2H cuts the transfer ~28×. Compact slot n (ai's n-th
+    // coupling) lives at compact_offset[ai] + n·n_ij². Pure layout ⇒ bit-exact.
+    // Built once (offsets depend only on n_pno/count, iter-invariant).
+    bool     compact_built    = false;
+    real_t*  d_pi_compact     = nullptr; // [Σ count[ai]·n_ij²]
+    real_t*  h_pi_compact     = nullptr; // pinned mirror
+    size_t*  d_compact_offset = nullptr; // [N_act_ij] cumulative count·n_ij²
+    int*     d_ai_n_ij        = nullptr; // [N_act_ij] n_pno of output pair ai
+    std::vector<size_t> compact_offset;  // [N_act_ij] host
+    size_t   compact_total    = 0;
+
     // Stage D (offset-CSR) — when non-empty, the ragged coupling buffers
     // (d_needed_ak / d_coupling_ikl / d_coupling_slot_base / d_pi_needed /
     // d_barS_csr) are sized by Σ count[ai] (= total_needed, AVG) instead of
@@ -287,6 +303,10 @@ struct PiCacheGpu::Impl {
         if (d_needed_offset) cudaFree(d_needed_offset);
         if (d_pi_needed)     cudaFree(d_pi_needed);
         if (h_pi_needed)     cudaFreeHost(h_pi_needed);
+        if (d_pi_compact)    cudaFree(d_pi_compact);
+        if (h_pi_compact)    cudaFreeHost(h_pi_compact);
+        if (d_compact_offset) cudaFree(d_compact_offset);
+        if (d_ai_n_ij)       cudaFree(d_ai_n_ij);
         if (d_pY_ptrs)       cudaFree(d_pY_ptrs);
         if (d_pBarS_ptrs)    cudaFree(d_pBarS_ptrs);
         if (d_pHalf_ptrs)    cudaFree(d_pHalf_ptrs);
@@ -325,6 +345,10 @@ struct PiCacheGpu::Impl {
         d_needed_offset = nullptr;
         d_pi_needed = nullptr;
         h_pi_needed = nullptr;
+        d_pi_compact = nullptr;
+        h_pi_compact = nullptr;
+        d_compact_offset = nullptr;
+        d_ai_n_ij = nullptr;
         d_pY_ptrs = d_pBarS_ptrs = d_pHalf_ptrs = d_pPi_ptrs = nullptr;
         d_barS_csr = nullptr;
         d_Y_coupling = nullptr;
@@ -581,6 +605,39 @@ __global__ void gather_needed_kernel(
     real_t* dst = d_pi_needed + static_cast<size_t>(slot) * stride_pair;
     for (long long e = threadIdx.x; e < stride_pair; e += blockDim.x)
         dst[e] = src[e];
+}
+
+// picache D2H compaction — strip the max_n padding: pack the real n_ij² sub-
+// block out of each max_n²-padded slot of d_pi_needed into a contiguous compact
+// buffer (so the D2H transfers n_ij² instead of max_n² per block, ~28× less).
+// Grid (ai, n) — one block per coupling slot. Compact slot n of row ai lives at
+// d_compact_offset[ai] + n·n_ij². d_pi_needed uses LMP2 padded indexing
+// (ai·max_needed + n)·max_n². n_ij = n_pno of the output pair ai. bit-exact.
+__global__ void pack_pi_compact_kernel(
+    const real_t* __restrict__ d_pi_needed,
+    real_t*       __restrict__ d_pi_compact,
+    const size_t* __restrict__ d_compact_offset,
+    const int*    __restrict__ d_ai_n_ij,
+    const int*    __restrict__ d_needed_count,
+    int max_needed, int max_n, long long stride_pair, int N_act_ij)
+{
+    const int ai = blockIdx.x;
+    const int n  = blockIdx.y;          // coupling slot within row ai
+    if (ai >= N_act_ij) return;
+    const int n_ij = d_ai_n_ij[ai];
+    if (n_ij == 0) return;
+    if (n >= d_needed_count[ai]) return;
+    const real_t* src = d_pi_needed
+        + (static_cast<size_t>(ai) * max_needed + n) * stride_pair;
+    real_t* dst = d_pi_compact
+        + d_compact_offset[ai]
+        + static_cast<size_t>(n) * n_ij * n_ij;
+    const int nn = n_ij * n_ij;
+    for (int idx = threadIdx.x; idx < nn; idx += blockDim.x) {
+        const int r = idx / n_ij;
+        const int c = idx - r * n_ij;
+        dst[idx] = src[static_cast<size_t>(r) * max_n + c];
+    }
 }
 
 #else  // GANSU_CPU_ONLY
@@ -1511,6 +1568,17 @@ void PiCacheGpu::rebuild_needed(
     const bool use_ragged =
         (coupling_ragged_env || sparse_lmp2_) && (tile_size_ >= N_act_ij_);
 
+    // picache D2H compaction (default-on; opt out GANSU_DLPNO_PICACHE_COMPACT_D2H
+    // =0). Packs the real n_ij² blocks out of the max_n²-padded d_pi_needed
+    // before the D2H (~max_n²/n_ij² ≈ 28× less host traffic). LMP2 ragged path
+    // only. Bit-exact (pure layout). When active, the padded host mirror
+    // h_pi_needed is never read ⇒ its (large) pinned alloc is skipped below.
+    static const bool compact_d2h = []() {
+        const char* e = std::getenv("GANSU_DLPNO_PICACHE_COMPACT_D2H");
+        return !(e && e[0] == '0');
+    }();
+    const bool compact_active = compact_d2h && use_ragged;
+
     // --- one-time build of the device needed-column map (iter-invariant) ---
     if (!s.needed_built) {
         s.needed_ikl_host.assign(N_act_ij_, {});
@@ -1556,8 +1624,11 @@ void PiCacheGpu::rebuild_needed(
         if (bytes_needed > 0) {
             check_cuda_(cudaMalloc(&s.d_pi_needed, bytes_needed),
                         "cudaMalloc d_pi_needed");
-            check_cuda_(cudaMallocHost(&s.h_pi_needed, bytes_needed),
-                        "cudaMallocHost h_pi_needed");
+            // h_pi_needed (padded host mirror) is only read by the non-compact
+            // D2H path; skip its large pinned alloc when compaction is active.
+            if (!compact_active)
+                check_cuda_(cudaMallocHost(&s.h_pi_needed, bytes_needed),
+                            "cudaMallocHost h_pi_needed");
         }
 
         // Phase 1 (Stage 2a) — lazy CSR barS build. Pack ONLY the needed
@@ -1651,6 +1722,43 @@ void PiCacheGpu::rebuild_needed(
         s.coupling_ptrs_built = true;
     }
 
+    // picache D2H compaction (LMP2 ragged path). One-time: per-row compact
+    // offset (Σ count·n_ij²) + n_ij table + compact device/pinned buffers.
+    if (compact_active && !s.compact_built && N_act_ij_ > 0) {
+        s.compact_offset.assign(static_cast<size_t>(N_act_ij_), 0);
+        std::vector<int> h_ai_n_ij(static_cast<size_t>(N_act_ij_), 0);
+        size_t off = 0;
+        for (int ai = 0; ai < N_act_ij_; ++ai) {
+            const int i_ij = active_i_ij_[ai];
+            const int n_ij = n_pno_[i_ij];
+            const int cnt  = static_cast<int>(s.needed_ikl_host[ai].size());
+            h_ai_n_ij[ai] = n_ij;
+            s.compact_offset[ai] = off;
+            off += static_cast<size_t>(cnt) * n_ij * n_ij;
+        }
+        s.compact_total = off;
+        check_cuda_(cudaMalloc(&s.d_compact_offset,
+                               sizeof(size_t) * N_act_ij_),
+                    "cudaMalloc d_compact_offset");
+        check_cuda_(cudaMemcpy(s.d_compact_offset, s.compact_offset.data(),
+                               sizeof(size_t) * N_act_ij_,
+                               cudaMemcpyHostToDevice), "H2D d_compact_offset");
+        check_cuda_(cudaMalloc(&s.d_ai_n_ij, sizeof(int) * N_act_ij_),
+                    "cudaMalloc d_ai_n_ij");
+        check_cuda_(cudaMemcpy(s.d_ai_n_ij, h_ai_n_ij.data(),
+                               sizeof(int) * N_act_ij_,
+                               cudaMemcpyHostToDevice), "H2D d_ai_n_ij");
+        if (s.compact_total > 0) {
+            check_cuda_(cudaMalloc(&s.d_pi_compact,
+                                   s.compact_total * sizeof(real_t)),
+                        "cudaMalloc d_pi_compact");
+            check_cuda_(cudaMallocHost(&s.h_pi_compact,
+                                       s.compact_total * sizeof(real_t)),
+                        "cudaMallocHost h_pi_compact");
+        }
+        s.compact_built = true;
+    }
+
     static const bool picache_prof = []() {
         const char* e = std::getenv("GANSU_DLPNO_PICACHE_PROF");
         return e && e[0] == '1';
@@ -1704,6 +1812,51 @@ void PiCacheGpu::rebuild_needed(
             check_cuda_(cudaGetLastError(), "gather_needed_kernel launch");
         }
 
+        if (compact_active) {
+            // Compact path (single tile): pack the real n_ij² sub-blocks out of
+            // the max_n²-padded d_pi_needed on device, then D2H the compact
+            // buffer (~max_n²/n_ij² ≈ 28× less than the padded transfer). On the
+            // null stream so it is ordered after the cuBLAS GEMM and before D2H.
+            dim3 grid(static_cast<unsigned>(N_act_ij_),
+                      static_cast<unsigned>(s.max_needed));
+            pack_pi_compact_kernel<<<grid, 128>>>(
+                s.d_pi_needed, s.d_pi_compact, s.d_compact_offset,
+                s.d_ai_n_ij, s.d_needed_count,
+                s.max_needed, max_n, stride_pair, N_act_ij_);
+            check_cuda_(cudaGetLastError(), "pack_pi_compact_kernel launch");
+
+            if (picache_prof) pc_t0 = std::chrono::steady_clock::now();
+            if (s.compact_total > 0)
+                check_cuda_(cudaMemcpy(s.h_pi_compact, s.d_pi_compact,
+                                       s.compact_total * sizeof(real_t),
+                                       cudaMemcpyDeviceToHost),
+                            "D2H d_pi_compact");
+            if (picache_prof) s.t_d2h += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - pc_t0).count();
+
+            // Host scatter: compact blocks are already n_ij×n_ij contiguous, so
+            // each is a single memcpy (no per-row max_n stride).
+            if (picache_prof) pc_t0 = std::chrono::steady_clock::now();
+            #pragma omp parallel for schedule(static)
+            for (int ai = 0; ai < N_act_ij_; ++ai) {
+                const int i_ij = active_i_ij_[ai];
+                const int n_ij = n_pno_[i_ij];
+                if (n_ij == 0) continue;
+                const std::vector<int>& need = s.needed_ikl_host[ai];
+                const size_t base = s.compact_offset[ai];
+                const size_t blk  = static_cast<size_t>(n_ij) * n_ij;
+                for (int n = 0; n < static_cast<int>(need.size()); ++n) {
+                    const int i_kl = need[n];
+                    pi_cache_out[i_ij][i_kl].resize(n_ij, n_ij);
+                    std::memcpy(pi_cache_out[i_ij][i_kl].data(),
+                                s.h_pi_compact + base
+                                    + static_cast<size_t>(n) * blk,
+                                blk * sizeof(real_t));
+                }
+            }
+            if (picache_prof) s.t_scatter += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - pc_t0).count();
+        } else {
         // D2H only the compact (tile_rows × max_needed) needed blocks.
         const size_t bytes_this =
             static_cast<size_t>(tile_rows) * s.max_needed
@@ -1741,6 +1894,7 @@ void PiCacheGpu::rebuild_needed(
         }
         if (picache_prof) s.t_scatter += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - pc_t0).count();
+        }  // end else (padded D2H + scatter)
     }
 #endif // GANSU_CPU_ONLY
 }
