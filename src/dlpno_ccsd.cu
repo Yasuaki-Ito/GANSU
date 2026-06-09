@@ -189,6 +189,26 @@ inline Phase24Integrals precompute_phase24_integrals(
         }
     }
 #endif // GANSU_MULTI_GPU
+
+    // Step S7c — block-wise build path. Instead of materialising the full
+    // n_emb⁴ MO ERI per pair (build_mo_eri_into) and gathering 14 blocks from
+    // it (S7b), build only the half-transformed B_mo once per pair
+    // (build_B_mo) and form each Phase24 block directly with mo_eri_block_into
+    // — the established MP2 V-block pattern. The full n_emb⁴ tensor (and its
+    // O(naux·n_emb⁴) Step-3 product) is never built; per-pair work drops to
+    // O(naux·(n_lmo·n_pno)²) for the two big blocks (T_pair / V_ovov, both
+    // congruent slices of one (occ,pno|occ,pno) block A) plus O(naux·n_pno⁴)
+    // for W_pair. Requires an RI back-end (DLPNO always uses RI); falls back to
+    // the S7b full-build path when the cast fails or the opt-out is set.
+    // Values match the full-build path to reduction-order noise (~1e-13), the
+    // same class as the MP2 V-block (validated ΔE ~1e-14). Opt out with
+    // GANSU_DLPNO_PHASE24_BLOCKWISE=0.
+    const ERI_RI* eri_ri = dynamic_cast<const ERI_RI*>(&eri);
+    const bool phase24_blockwise = eri_ri && []() {
+        const char* e = std::getenv("GANSU_DLPNO_PHASE24_BLOCKWISE");
+        return !(e && e[0] == '0');
+    }();
+
     // Save the current OMP thread count so we can restore it after this
     // parallel region. We use `num_threads(num_gpus)` on the pragma itself
     // (which forces exactly num_gpus threads regardless of global state),
@@ -222,9 +242,11 @@ inline Phase24Integrals precompute_phase24_integrals(
         real_t* d_eri_ws           = nullptr;
         real_t* d_packed_ws        = nullptr;
         real_t* h_packed_ws        = nullptr;  // pinned
+        real_t* d_block_ws         = nullptr;  // (S7c) relayout-source block
         size_t  ws_C_ext_capacity  = 0;
         size_t  ws_eri_capacity    = 0;
         size_t  ws_packed_capacity = 0;
+        size_t  ws_block_capacity  = 0;
 
     #pragma omp for schedule(static, 1)
     for (long long idx = 0; idx < static_cast<long long>(n_pairs); ++idx) {
@@ -257,28 +279,9 @@ inline Phase24Integrals precompute_phase24_integrals(
         cudaMemcpy(d_C_ext_ws, C_ext.data(),
             n_C_ext * sizeof(real_t), cudaMemcpyHostToDevice);
 
-        const size_t n_emb4 =
-            static_cast<size_t>(n_emb) * n_emb * n_emb * n_emb;
-
-        // Step S7a — grow d_eri workspace (still n_emb⁴ since build_mo_eri_into
-        // writes the full tensor; only the host-side mirror was eliminated by
-        // S7b in favour of a much smaller packed extract buffer).
-        if (n_emb4 > ws_eri_capacity) {
-            if (d_eri_ws) tracked_cudaFree(d_eri_ws);
-            tracked_cudaMalloc(&d_eri_ws, n_emb4 * sizeof(real_t));
-            ws_eri_capacity = n_emb4;
-        }
-
-        // Build MO ERI directly into the per-thread device workspace
-        // (avoids the legacy build_mo_eri's per-call cudaMalloc).
-        eri.build_mo_eri_into(d_C_ext_ws, n_emb, d_eri_ws);
-
-        // Step S7b — GPU-side extraction of the 14 W/T/V blocks into one
-        // packed device buffer, then a single (much smaller) D2H to pinned
-        // host. For cholesterol cc-pVDZ this replaces a ~2.9 GB pinned D2H
-        // and 13 strided host extract loops with ~170 MB D2H + 14 sequential
-        // host memcpys — ~17× smaller transfer and dramatically more
-        // cache-friendly unpacking.
+        // Packed output layout + buffer growth (common to both build paths).
+        // The S7b/S7c packed layout is identical, so the downstream copy_block
+        // unpacking below is unchanged regardless of which path produced it.
         const bool is_diag = (s.i == s.j);
         const Phase24ExtractLayout layout =
             compute_phase24_extract_layout(n_lmo, n_pno, is_diag);
@@ -291,10 +294,96 @@ inline Phase24Integrals precompute_phase24_integrals(
             ws_packed_capacity = layout.total;
         }
 
-        launch_phase24_extract(
-            d_eri_ws, d_packed_ws, layout,
-            n_emb, n_lmo, n_pno, s.i, s.j, is_diag,
-            /*stream=*/0);
+        if (phase24_blockwise) {
+            // Step S7c — build only B_mo once, then form each Phase24 block
+            // directly with mo_eri_block_into into the packed buffer. No
+            // n_emb⁴ tensor, no S7b gather. (See the S7c note above.)
+            const real_t* d_B_mo = eri_ri->build_B_mo(d_C_ext_ws, n_emb);
+
+            // Relayout-source scratch: the largest non-direct block is either
+            // A = (occ,pno|occ,pno) (n_lmo²·n_pno²) or W_pair (n_pno⁴).
+            const size_t n_block_max =
+                std::max(layout.sz_T_pair, layout.sz_W_pair);
+            if (n_block_max > ws_block_capacity) {
+                if (d_block_ws) tracked_cudaFree(d_block_ws);
+                tracked_cudaMalloc(&d_block_ws, n_block_max * sizeof(real_t));
+                ws_block_capacity = n_block_max;
+            }
+
+            real_t* P = d_packed_ws;
+            const int si = s.i, sj = s.j;
+            auto BI = [&](int p0, int pn, int q0, int qn,
+                          int r0, int rn, int s0, int sn, real_t* dst) {
+                eri_ri->mo_eri_block_into(d_B_mo, n_emb,
+                                          p0, pn, q0, qn, r0, rn, s0, sn, dst);
+            };
+
+            // --- Direct blocks (natural mo_eri_block_into layout == dest) ---
+            // W_oooo[k,l] = (k si | l sj).
+            BI(0, n_lmo, si, 1, 0, n_lmo, sj, 1, P + layout.off_W_oooo);
+            // W_ovov_i[a,k,c] = (a' si | k c');  W_ovov_j with sj.
+            BI(n_lmo, n_pno, si, 1, 0, n_lmo, n_lmo, n_pno, P + layout.off_W_ovov_i);
+            BI(n_lmo, n_pno, sj, 1, 0, n_lmo, n_lmo, n_pno, P + layout.off_W_ovov_j);
+            // W_ovvo_lambda[a,b] = (si a' | b' sj);  _alt = (sj a' | b' si).
+            BI(si, 1, n_lmo, n_pno, n_lmo, n_pno, sj, 1, P + layout.off_W_ovvo_lambda);
+            BI(sj, 1, n_lmo, n_pno, n_lmo, n_pno, si, 1, P + layout.off_W_ovvo_lambda_alt);
+            // W_oovv_lambda[b,a] = (si sj | b' a').
+            BI(si, 1, sj, 1, n_lmo, n_pno, n_lmo, n_pno, P + layout.off_W_oovv_lambda);
+            // W_ovoo_lambda[a,k] = (si a' | sj k);  _alt = (sj a' | si k).
+            BI(si, 1, n_lmo, n_pno, sj, 1, 0, n_lmo, P + layout.off_W_ovoo_lambda);
+            BI(sj, 1, n_lmo, n_pno, si, 1, 0, n_lmo, P + layout.off_W_ovoo_lambda_alt);
+            // IP bare OOVV[m,a,d] = (m I | a' d') (i/j roles).
+            BI(0, n_lmo, si, 1, n_lmo, n_pno, n_lmo, n_pno, P + layout.off_W_oovv_bare_i);
+            BI(0, n_lmo, sj, 1, n_lmo, n_pno, n_lmo, n_pno, P + layout.off_W_oovv_bare_j);
+            // W_ovvv_diag[a,b,c] = (i a' | b' c'), diagonal pair only (i = si).
+            if (is_diag) {
+                BI(si, 1, n_lmo, n_pno, n_lmo, n_pno, n_lmo, n_pno,
+                   P + layout.off_W_ovvv_diag);
+            }
+
+            // --- Relayout blocks (build into scratch, transpose mid → dest) ---
+            // W_pair: natural [a,c,b,d] → [a,b,c,d].
+            BI(n_lmo, n_pno, n_lmo, n_pno, n_lmo, n_pno, n_lmo, n_pno, d_block_ws);
+            launch_phase24_transpose_mid(d_block_ws, P + layout.off_W_pair,
+                                         n_pno, n_pno, n_pno, n_pno, /*stream=*/0);
+            // W_ovvo_i: (a' c' | k si) natural [a,c,k] → [a,k,c]; _j with sj.
+            BI(n_lmo, n_pno, n_lmo, n_pno, 0, n_lmo, si, 1, d_block_ws);
+            launch_phase24_transpose_mid(d_block_ws, P + layout.off_W_ovvo_i,
+                                         n_pno, n_pno, n_lmo, 1, /*stream=*/0);
+            BI(n_lmo, n_pno, n_lmo, n_pno, 0, n_lmo, sj, 1, d_block_ws);
+            launch_phase24_transpose_mid(d_block_ws, P + layout.off_W_ovvo_j,
+                                         n_pno, n_pno, n_lmo, 1, /*stream=*/0);
+            // IP bare OVVO: (m d' | a' I) natural [m,d,a] → [m,a,d] (i/j roles).
+            BI(0, n_lmo, n_lmo, n_pno, n_lmo, n_pno, si, 1, d_block_ws);
+            launch_phase24_transpose_mid(d_block_ws, P + layout.off_W_ovvo_bare_i,
+                                         n_lmo, n_pno, n_pno, 1, /*stream=*/0);
+            BI(0, n_lmo, n_lmo, n_pno, n_lmo, n_pno, sj, 1, d_block_ws);
+            launch_phase24_transpose_mid(d_block_ws, P + layout.off_W_ovvo_bare_j,
+                                         n_lmo, n_pno, n_pno, 1, /*stream=*/0);
+
+            // --- A = (occ,pno|occ,pno), A[k,c,l,d] = (k c' | l d') ---
+            // Serves both T_pair (fuse 2A[k,c,l,d]−A[k,d,l,c]) and V_ovov
+            // (V[l,k,d,c] = A[l,d,k,c] = transpose-mid of A).
+            BI(0, n_lmo, n_lmo, n_pno, 0, n_lmo, n_lmo, n_pno, d_block_ws);
+            launch_phase24_fuse_T_from_A(d_block_ws, P + layout.off_T_pair,
+                                         n_lmo, n_pno, /*stream=*/0);
+            launch_phase24_transpose_mid(d_block_ws, P + layout.off_V_ovov,
+                                         n_lmo, n_pno, n_lmo, n_pno, /*stream=*/0);
+        } else {
+            // Legacy S7a + S7b path — build the full n_emb⁴ MO ERI then gather.
+            const size_t n_emb4 =
+                static_cast<size_t>(n_emb) * n_emb * n_emb * n_emb;
+            if (n_emb4 > ws_eri_capacity) {
+                if (d_eri_ws) tracked_cudaFree(d_eri_ws);
+                tracked_cudaMalloc(&d_eri_ws, n_emb4 * sizeof(real_t));
+                ws_eri_capacity = n_emb4;
+            }
+            eri.build_mo_eri_into(d_C_ext_ws, n_emb, d_eri_ws);
+            launch_phase24_extract(
+                d_eri_ws, d_packed_ws, layout,
+                n_emb, n_lmo, n_pno, s.i, s.j, is_diag,
+                /*stream=*/0);
+        }
 
         // Synchronous D2H — implicit wait for the kernels above (default
         // stream). After this, h_packed_ws holds all 14 blocks back-to-back
@@ -346,6 +435,7 @@ inline Phase24Integrals precompute_phase24_integrals(
     if (d_eri_ws)    tracked_cudaFree(d_eri_ws);
     if (d_packed_ws) tracked_cudaFree(d_packed_ws);
     if (h_packed_ws) cudaFreeHost(h_packed_ws);
+    if (d_block_ws)  tracked_cudaFree(d_block_ws);
     }  // end omp parallel
     return out;
 }

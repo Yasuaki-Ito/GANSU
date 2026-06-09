@@ -97,4 +97,38 @@ void launch_phase24_extract(
     bool                        is_diag,
     cudaStream_t                stream);
 
+// ---------------------------------------------------------------------------
+// Step S7c — block-wise build relayouts.
+//
+// S7c replaces the full n_emb⁴ build_mo_eri_into + S7b gather with a
+// per-pair build_B_mo + a handful of mo_eri_block_into block builds (the
+// MP2 V-block pattern). mo_eri_block_into emits a block (p q | r s) in its
+// natural "bra-outer, ket-inner" layout out[((p·qn+q)·rn+r)·sn+s]. Most of
+// the 14 Phase24 destinations match that natural layout directly, but a few
+// require a transpose of the two middle indices, and T_pair/V_ovov are both
+// derived from a single (occ,pno|occ,pno) block `A` with A[k,c,l,d]=(kc|ld).
+// These two launchers cover those non-direct cases.
+// ---------------------------------------------------------------------------
+
+/// Transpose the two middle indices of a row-major 4-index tensor:
+///   out(i,j,k,l) = in(i,k,j,l),  in dims (A0,A1,A2,A3), out dims (A0,A2,A1,A3).
+/// Used for W_pair ([a,c,b,d]→[a,b,c,d]), V_ovov ([k,c,l,d]→[k,l,c,d] i.e.
+/// the A-block congruent V layout), W_ovvo_i/j ([a,c,k]→[a,k,c], A3=1) and the
+/// IP bare W_ovvo_bare_i/j ([m,d,a]→[m,a,d], A3=1).
+void launch_phase24_transpose_mid(
+    const real_t* d_in,
+    real_t*       d_out,
+    int A0, int A1, int A2, int A3,
+    cudaStream_t  stream);
+
+/// T_pair^{(ij)}[k,l,c,d] = 2·A[k,c,l,d] − A[k,d,l,c] from the single
+/// (occ,pno|occ,pno) block A (A[k,c,l,d] = (k,c'|l,d'), natural layout
+/// ((k·n_pno+c)·n_lmo+l)·n_pno+d). Output layout ((k·n_lmo+l)·n_pno+c)·n_pno+d.
+/// Uses __dsub_rn(__dmul_rn(2,x),y) to bit-match the host 2·x−y rounding.
+void launch_phase24_fuse_T_from_A(
+    const real_t* d_A,
+    real_t*       d_out,
+    int n_lmo, int n_pno,
+    cudaStream_t  stream);
+
 } // namespace gansu

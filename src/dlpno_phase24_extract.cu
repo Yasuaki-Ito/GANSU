@@ -354,6 +354,70 @@ __global__ void extract_lambda_ovoo_kernel(
     d_ovoo_alt[tid] = d_eri_mo[e_j];
 }
 
+// ---------------------------------------------------------------------------
+// S7c relayout kernels (block-wise build path). These operate on the small
+// per-block buffers produced by mo_eri_block_into, never the n_emb⁴ tensor.
+// ---------------------------------------------------------------------------
+
+/// out(i,j,k,l) = in(i,k,j,l); in dims (A0,A1,A2,A3), out dims (A0,A2,A1,A3).
+__global__ void transpose_mid_kernel(
+    const real_t* __restrict__ d_in,
+    real_t*       __restrict__ d_out,
+    int A0, int A1, int A2, int A3)
+{
+    const std::size_t total =
+        static_cast<std::size_t>(A0) * A1 * A2 * A3;
+    const std::size_t tid =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+
+    // Decode output index (i, j, k, l) with output dims (A0, A2, A1, A3).
+    const int l = static_cast<int>(tid % A3);
+    const std::size_t t1 = tid / A3;
+    const int k = static_cast<int>(t1 % A1);   // out dim 2 has extent A1
+    const std::size_t t2 = t1 / A1;
+    const int j = static_cast<int>(t2 % A2);   // out dim 1 has extent A2
+    const int i = static_cast<int>(t2 / A2);
+
+    // in(i, k, j, l) with in dims (A0, A1, A2, A3).
+    const std::size_t in_idx =
+        ((static_cast<std::size_t>(i) * A1 + k) * A2 + j) * A3 + l;
+    d_out[tid] = d_in[in_idx];
+}
+
+/// T_pair[k,l,c,d] = 2·A[k,c,l,d] − A[k,d,l,c], A natural layout
+/// ((k·n_pno+c)·n_lmo+l)·n_pno+d, output ((k·n_lmo+l)·n_pno+c)·n_pno+d.
+__global__ void fuse_T_from_A_kernel(
+    const real_t* __restrict__ d_A,
+    real_t*       __restrict__ d_out,
+    int n_lmo, int n_pno)
+{
+    const std::size_t total =
+        static_cast<std::size_t>(n_lmo) * n_lmo * n_pno * n_pno;
+    const std::size_t tid =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+
+    const int d = static_cast<int>(tid % n_pno);
+    const std::size_t t1 = tid / n_pno;
+    const int c = static_cast<int>(t1 % n_pno);
+    const std::size_t t2 = t1 / n_pno;
+    const int l = static_cast<int>(t2 % n_lmo);
+    const int k = static_cast<int>(t2 / n_lmo);
+
+    const std::size_t a_kcld =
+        (static_cast<std::size_t>(k) * n_pno + c) * n_lmo * n_pno
+        + static_cast<std::size_t>(l) * n_pno + d;
+    const std::size_t a_kdlc =
+        (static_cast<std::size_t>(k) * n_pno + d) * n_lmo * n_pno
+        + static_cast<std::size_t>(l) * n_pno + c;
+
+    const real_t x = d_A[a_kcld];
+    const real_t y = d_A[a_kdlc];
+    // Forbid FMA contraction to bit-match host (2.0*x) - y.
+    d_out[tid] = __dsub_rn(__dmul_rn(2.0, x), y);
+}
+
 } // anonymous namespace
 
 Phase24ExtractLayout compute_phase24_extract_layout(
@@ -514,6 +578,32 @@ void launch_phase24_extract(
                 n_emb, n_lmo, n_pno, sj, /*mode=*/1);
         }
     }
+}
+
+void launch_phase24_transpose_mid(
+    const real_t* d_in,
+    real_t*       d_out,
+    int A0, int A1, int A2, int A3,
+    cudaStream_t  stream)
+{
+    const std::size_t total =
+        static_cast<std::size_t>(A0) * A1 * A2 * A3;
+    if (total == 0) return;
+    transpose_mid_kernel<<<grid_for(total), kBlock, 0, stream>>>(
+        d_in, d_out, A0, A1, A2, A3);
+}
+
+void launch_phase24_fuse_T_from_A(
+    const real_t* d_A,
+    real_t*       d_out,
+    int n_lmo, int n_pno,
+    cudaStream_t  stream)
+{
+    const std::size_t total =
+        static_cast<std::size_t>(n_lmo) * n_lmo * n_pno * n_pno;
+    if (total == 0) return;
+    fuse_T_from_A_kernel<<<grid_for(total), kBlock, 0, stream>>>(
+        d_A, d_out, n_lmo, n_pno);
 }
 
 } // namespace gansu
