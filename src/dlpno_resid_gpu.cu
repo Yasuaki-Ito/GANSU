@@ -10,7 +10,9 @@
 #include "dlpno_resid_gpu.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -45,20 +47,33 @@ namespace {
 class PinnedHost {
 public:
     PinnedHost() = default;
-    explicit PinnedHost(size_t n_doubles) {
+    // pinned=true → cudaMallocHost (page-locked, fast repeated DMA but the
+    // allocation itself takes the kernel mmap semaphore). pinned=false →
+    // plain malloc (pageable): the H2D is a touch slower but there is NO
+    // mmap-lock contention. For the ONE-TIME ResidGpu ctor staging buffers,
+    // 7 pinned allocs × N_gpu construct concurrently and serialise on that
+    // lock (Pentacene 8×A100: ~8-11 s, ~independent of data size). Those use
+    // pinned=false; per-iter buffers (repeated DMA) keep pinned=true.
+    explicit PinnedHost(size_t n_doubles, bool pinned = true) : pinned_(pinned) {
         if (n_doubles > 0) {
-            const cudaError_t e = cudaMallocHost(&p_, n_doubles * sizeof(real_t));
-            if (e != cudaSuccess) p_ = nullptr;
+            if (pinned_) {
+                const cudaError_t e = cudaMallocHost(&p_, n_doubles * sizeof(real_t));
+                if (e != cudaSuccess) p_ = nullptr;
+            } else {
+                p_ = static_cast<real_t*>(std::malloc(n_doubles * sizeof(real_t)));
+            }
         }
         n_ = (p_ ? n_doubles : 0);
     }
     PinnedHost(const PinnedHost&) = delete;
     PinnedHost& operator=(const PinnedHost&) = delete;
-    PinnedHost(PinnedHost&& other) noexcept : p_(other.p_), n_(other.n_) {
+    PinnedHost(PinnedHost&& other) noexcept
+        : p_(other.p_), n_(other.n_), pinned_(other.pinned_) {
         other.p_ = nullptr; other.n_ = 0;
     }
     PinnedHost& operator=(PinnedHost&& other) noexcept {
         if (this != &other) { free_(); p_ = other.p_; n_ = other.n_;
+                              pinned_ = other.pinned_;
                               other.p_ = nullptr; other.n_ = 0; }
         return *this;
     }
@@ -72,10 +87,15 @@ public:
     }
 private:
     void free_() noexcept {
-        if (p_) { cudaFreeHost(p_); p_ = nullptr; n_ = 0; }
+        if (p_) {
+            if (pinned_) cudaFreeHost(p_);
+            else         std::free(p_);
+            p_ = nullptr; n_ = 0;
+        }
     }
     real_t* p_ = nullptr;
     size_t  n_ = 0;
+    bool    pinned_ = true;
 };
 
 // Step 6.9 — GPU pack kernel for V_meta_T / V_meta_TT / T_meta / V_stacked_oooo.
@@ -963,6 +983,25 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
       max_n_(max_n),
       nocc_(nocc)
 {
+    // [ResidGpu-CTOR-PROF] env-gated coarse split of the one-time ctor cost
+    // (setup_rgpu): "pre+malloc" (host scaffolding + budget + ~20 device
+    // cudaMalloc, driver-lock serialised across the parallel devices) vs
+    // "h2d+pack" (pinned cudaMallocHost staging + host gather + H2D + pack
+    // kernels for V_flat/T_flat + W_bare ×4 + W_oooo). Each device prints one
+    // line. Enable with GANSU_DLPNO_RESID_CTOR_PROF=1.
+    static const bool ctor_prof = []() {
+        const char* e = std::getenv("GANSU_DLPNO_RESID_CTOR_PROF");
+        return e && e[0] == '1';
+    }();
+    auto cprof_now = [&]() {
+#ifndef GANSU_CPU_ONLY
+        if (ctor_prof) cudaDeviceSynchronize();
+#endif
+        return std::chrono::steady_clock::now();
+    };
+    const auto t_ctor_start = cprof_now();
+    std::chrono::steady_clock::time_point t_ctor_mid = t_ctor_start;
+
     // Capture per-pair host metadata.
     n_pno_.assign(N_pair_, 0);
     setup_i_per_pair_.assign(N_pair_, 0);
@@ -1460,6 +1499,8 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
         return;
     }
 
+    t_ctor_mid = cprof_now();   // after the device cudaMalloc block
+
     // Per-device cuBLAS handle. Fallback to thread-local single-GPU handle.
     s.cublas = nullptr;
     {
@@ -1582,8 +1623,10 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
         // Host pinned source buffers (slab-active sized; 1-byte stub for
         // empty slabs so the pointer is non-null).
         const size_t total_src_sz_alloc = total_src_sz > 0 ? total_src_sz : 1;
-        PinnedHost h_V_flat(total_src_sz_alloc);
-        PinnedHost h_T_flat(total_src_sz_alloc);
+        // Pageable (pinned=false): one-time staging; avoids the mmap-lock
+        // contention of concurrent cudaMallocHost across the N_gpu ctors.
+        PinnedHost h_V_flat(total_src_sz_alloc, /*pinned=*/false);
+        PinnedHost h_T_flat(total_src_sz_alloc, /*pinned=*/false);
         if (!h_V_flat.valid() || !h_T_flat.valid()) {
             delete p_; p_ = nullptr; active_ = false; return;
         }
@@ -1694,7 +1737,7 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
                            const char* label_packed)
     {
         if (packed_block_total_ == 0) return;
-        PinnedHost h_W_packed(packed_block_total_);
+        PinnedHost h_W_packed(packed_block_total_, /*pinned=*/false);
         if (!h_W_packed.valid()) {
             check_cuda_(cudaErrorMemoryAllocation,
                         "cudaMallocHost h_W_packed for pack_W_bare");
@@ -1745,8 +1788,8 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
     {
         const size_t per_pair_w = static_cast<size_t>(nocc_) * nocc_;
         const size_t bytes_w = static_cast<size_t>(N_pair_) * per_pair_w * sizeof(real_t);
-        // Step 6.8c: pinned host staging (small, ~1 MB; pinning is cheap).
-        PinnedHost h_W(static_cast<size_t>(N_pair_) * per_pair_w);
+        // Pageable staging (one-time; avoids cudaMallocHost mmap-lock contention).
+        PinnedHost h_W(static_cast<size_t>(N_pair_) * per_pair_w, /*pinned=*/false);
         if (!h_W.valid()) {
             delete p_; p_ = nullptr; active_ = false; return;
         }
@@ -1762,6 +1805,19 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
         check_cuda_(cudaMemcpy(s.d_W_oooo, h_W.data(),
                                bytes_w, cudaMemcpyHostToDevice),
                     "H2D W_oooo");
+    }
+
+    if (ctor_prof) {
+        const auto t_ctor_end = cprof_now();
+        const double pre_malloc =
+            std::chrono::duration<double>(t_ctor_mid - t_ctor_start).count();
+        const double h2d_pack =
+            std::chrono::duration<double>(t_ctor_end - t_ctor_mid).count();
+        std::printf("[ResidGpu-CTOR-PROF dev=%d] pre+malloc=%.3f  h2d+pack=%.3f s"
+                    "  (n_active=%d N_pair=%d)\n",
+                    pgpu.device_id(), pre_malloc, h2d_pack,
+                    n_active_in_slab_, N_pair_);
+        std::fflush(stdout);
     }
 
     active_ = true;
