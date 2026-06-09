@@ -2183,6 +2183,12 @@ void PiCacheGpu::setup_sparse_stacked_(
 {
     Impl& s = *p_;
     if (s.coupling_ptrs_built) return;              // idempotent (one-time)
+    // Sparse-path diagnostics (coupling/memory footprint per device). Off by
+    // default; enable with GANSU_DLPNO_CCSD_SPARSE_DIAG=1.
+    static const bool diag_on = []() {
+        const char* e = std::getenv("GANSU_DLPNO_CCSD_SPARSE_DIAG");
+        return e && e[0] == '1';
+    }();
     const long long stride_pair = s.stride_pair;    // max_n²
     const int max_n = max_n_;
 
@@ -2218,7 +2224,7 @@ void PiCacheGpu::setup_sparse_stacked_(
     // Stage D — print the PLANNED ragged footprint BEFORE the big allocs so an
     // OOM here still reports avg/max coupling + buffer sizes (the post-build
     // diagnostic at the end never prints when an alloc throws first).
-    {
+    if (diag_on) {
         const double blk_mb = static_cast<double>(stride_pair)
                             * sizeof(real_t) / (1024.0 * 1024.0);
         const double avg = N_act_ij_ > 0
@@ -2438,7 +2444,7 @@ void PiCacheGpu::setup_sparse_stacked_(
         check_cuda_(cudaMalloc(&s.d_coupling_slot_base, sizeof(int) * std::max<size_t>(1, h_csb.size())), "d_coupling_slot_base");
         check_cuda_(cudaMemcpy(s.d_coupling_slot_base, h_csb.data(), sizeof(int) * h_csb.size(), cudaMemcpyHostToDevice), "H2D coupling_slot_base");
 
-        if (pitstack_sparse_) {
+        if (pitstack_sparse_ && diag_on) {
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
             std::printf("[CCSD-sparse-piT dev=%d] d_pi_T_stack slab=%.0f MB "
@@ -2473,7 +2479,7 @@ void PiCacheGpu::setup_sparse_stacked_(
     // Phase 2 diagnostic — coupling sparsity for this slab. Shows how much the
     // norm/distance screen shrank the per-row coupling vs the dense N_act_kl
     // grid, plus the CSR barS + d_pi_needed footprint. One line per device.
-    {
+    if (diag_on) {
         size_t total_coupling = 0;
         for (int ai = 0; ai < N_act_ij_; ++ai)
             total_coupling += s.needed_ikl_host[ai].size();

@@ -971,7 +971,7 @@ LMP2Status iterate_dlpno_ccsd_t2(
     }
 
     // Stage D debug — show how the picache pairs got partitioned across GPUs.
-    {
+    if (verbose >= 2) {
         std::printf("[DLPNO-slab] num_gpus(param)=%d n_gpus(effective)=%d "
                     "N_pair=%d slab_starts=[", num_gpus, n_gpus, N_pair);
         for (int d = 0; d <= n_gpus; ++d)
