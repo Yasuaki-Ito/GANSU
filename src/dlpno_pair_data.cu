@@ -1368,16 +1368,23 @@ LMP2Status iterate_dlpno_ccsd_t2(
 #endif
                     MultiGpuManager::DeviceGuard guard(d);
                     const bool skip_d = (rgpus[d] && rgpus[d]->active());
+                    // Dense path: also skip the per-iter host pi_T_stack D2H +
+                    // scatter when this slab's ResidGpu is active AND DFpair runs
+                    // on the GPU — then nothing on the CPU reads pi_T_stack_out
+                    // for these pairs (GPU oooo + GPU DFpair both read the device
+                    // d_pi_T_stack). ~pi_T_slab bytes/device/iter saved.
                     pgpus[d]->rebuild_with_stack(
                         Y_old, pi_cache, pi_T_stack, skip_d,
-                        ccsd_bars_sparse ? &coupling_ccsd_per_pair : nullptr);
+                        ccsd_bars_sparse ? &coupling_ccsd_per_pair : nullptr,
+                        /*skip_pi_T_stack_host=*/skip_d && dfpair_gpu_on);
                 }
 #endif
             } else {
                 const bool skip_0 = (rgpus[0] && rgpus[0]->active());
                 pgpus[0]->rebuild_with_stack(
                     Y_old, pi_cache, pi_T_stack, skip_0,
-                    ccsd_bars_sparse ? &coupling_ccsd_per_pair : nullptr);
+                    ccsd_bars_sparse ? &coupling_ccsd_per_pair : nullptr,
+                    /*skip_pi_T_stack_host=*/skip_0 && dfpair_gpu_on);
             }
             dt_picache += std::chrono::duration<double>(
                 prof_clock::now() - t_pi0).count();

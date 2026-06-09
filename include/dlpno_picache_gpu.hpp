@@ -161,7 +161,15 @@ public:
                             std::vector<RowMatXd>& pi_T_stack_out,
                             bool skip_pi_cache_host = false,
                             const std::vector<std::vector<int>>*
-                                coupling_ikl_per_pair = nullptr);
+                                coupling_ikl_per_pair = nullptr,
+                            // When true, also skip the per-iter host pi_T_stack
+                            // D2H + scatter (dense path). Safe only when this
+                            // slab's pi_T_stack_out is never read on the CPU —
+                            // i.e. the device's ResidGpu is active (GPU oooo)
+                            // AND DFpair runs on the GPU (compute_dfpair reads
+                            // the device d_pi_T_stack). Leaves pi_T_stack_out
+                            // 0×0 for the slab. Default false = unchanged.
+                            bool skip_pi_T_stack_host = false);
 
     /**
      * @brief DFpair GPU port — upload the iter-invariant T_meta_dpair to this

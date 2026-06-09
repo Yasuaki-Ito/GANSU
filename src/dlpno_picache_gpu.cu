@@ -2700,7 +2700,8 @@ void PiCacheGpu::rebuild_with_stack(
     std::vector<std::vector<RowMatXd>>& pi_cache_out,
     std::vector<RowMatXd>& pi_T_stack_out,
     bool skip_pi_cache_host,
-    const std::vector<std::vector<int>>* coupling_ikl_per_pair)
+    const std::vector<std::vector<int>>* coupling_ikl_per_pair,
+    bool skip_pi_T_stack_host)
 {
     // Fast path: when the GPU + stacked-mode buffers are both live AND the
     // caller has told us pi_cache_out is dead this iter (any_rgpu_active),
@@ -2965,6 +2966,19 @@ void PiCacheGpu::rebuild_with_stack(
             for (long long i_ij = ib; i_ij < ie; ++i_ij)
                 pi_T_stack_out[i_ij].resize(0, 0);
         }
+        return;
+    }
+
+    // Step 6 fast path (dense): when this slab's host pi_T_stack_out is never
+    // read on the CPU this iter — the device's ResidGpu is active (GPU oooo)
+    // AND DFpair runs on the GPU (compute_dfpair reads the device d_pi_T_stack
+    // directly) — the per-iter D2H + host scatter below is pure waste
+    // (~pi_T_slab bytes/device/iter). Skip it and leave pi_T_stack_out 0×0 for
+    // the slab; the consumers guard on pi_T_stack[idx].size() > 0. Mirrors the
+    // skip_pi_cache_host fast path for pi_cache above.
+    if (skip_pi_T_stack_host) {
+        for (long long i_ij = ib; i_ij < ie; ++i_ij)
+            pi_T_stack_out[i_ij].resize(0, 0);
         return;
     }
 
