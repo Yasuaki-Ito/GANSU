@@ -453,7 +453,7 @@ public:
     void precompute_schwarz_and_shell_pairs();
 
     DeviceHostMemory<PrimitiveShell>& get_auxiliary_primitive_shells() { return auxiliary_primitive_shells_; } ///< Get the auxiliary primitive shells
-    int get_num_auxiliary_basis() { return num_auxiliary_basis_; }
+    int get_num_auxiliary_basis() const { return num_auxiliary_basis_; }
 
     std::string get_algorithm_name() override { return "RI"; } ///< Get the algorithm name
 
@@ -870,7 +870,7 @@ public:
     void precomputation() override;
 
     DeviceHostMemory<PrimitiveShell>& get_auxiliary_primitive_shells() { return auxiliary_primitive_shells_; } ///< Get the auxiliary primitive shells
-    int get_num_auxiliary_basis() { return num_auxiliary_basis_; }
+    int get_num_auxiliary_basis() const { return num_auxiliary_basis_; }
 
     std::string get_algorithm_name() override { return "Direct-RI"; } ///< Get the algorithm name
 

@@ -178,6 +178,12 @@ private:
     // each at anthracene, decisive at 100 atoms. Default off → bit-exact.
     bool canonical_skip_wvvvv_ = false;
 
+    // (RI Term A) Mirror of the EA operator: the Wvvvo·t1 dressing (sole
+    // canonical-skip consumer of the nvir⁴ (ab|cd) block) is evaluated on the
+    // fly from the RI B-factors, so d_eri_vvvv_ is never materialised. Gated on
+    // canonical_skip_wvvvv_ && RI block source && GANSU_DLPNO_EA_VVVV_RI.
+    bool ri_vvvv_term_a_ = false;
+
     // === Active NTO ↔ MO index maps (host-side, copied in constructor) ===
     std::vector<int> active_occ_idx_;   // [n_act_occ]   (each ∈ [0, nocc_active))
     std::vector<int> active_vir_idx_;   // [n_act_vir]   (each ∈ [0, nvir))

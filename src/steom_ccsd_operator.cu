@@ -379,6 +379,26 @@ __global__ void steom_wvvvo_fused_assembly_kernel(
     }
 }
 
+// ---- (RI Term A) Gather the virtual-virtual block of the half-transformed
+//      B_mo (naux × nmo_full², row-major) into a contiguous [naux × nvir²]
+//      buffer:  Bvv[P, a, b] = B_mo[P, voff+a, voff+b],  voff = nocc + frozen_off.
+//      Mirror of ea_gather_bvv_kernel. Grid-stride, size_t safe.
+__global__ void steom_gather_bvv_kernel(const real_t* __restrict__ B_mo,
+                                        real_t* __restrict__ Bvv,
+                                        int naux, int nmo_full, int voff, int nvir)
+{
+    const size_t total  = (size_t)naux * nvir * nvir;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += stride) {
+        const int b = (int)(idx % nvir);
+        const size_t t = idx / nvir;
+        const int a = (int)(t % nvir);
+        const int P = (int)(t / nvir);
+        Bvv[idx] = B_mo[(size_t)P * nmo_full * nmo_full
+                      + (size_t)(voff + a) * nmo_full + (size_t)(voff + b)];
+    }
+}
+
 // ===========================================================================
 //  Streaming-accumulate Wvvvo assembly — peak-memory alternative to the
 //  fused 7-buffer kernel above.  Each kernel below folds ONE term into
@@ -672,6 +692,14 @@ STEOMCCSDOperator::STEOMCCSDOperator(
             if (canonical_skip_wvvvv_)
                 std::cout << "  [STEOM canonical-skip] dressed Wvvvv build SKIPPED "
                              "(nvir⁴ host+device elided; Wvvvo·t1 refactored)" << std::endl;
+            // (RI Term A) mirror of EA: evaluate Wvvvo·t1 from RI B-factors so the
+            // nvir⁴ (ab|cd) block is never materialised (also keeps share-barH on
+            // at scale by removing the auto device-balancing trigger).
+            ri_vvvv_term_a_ = canonical_skip_wvvvv_ && (eri_block_src_ != nullptr)
+                              && on("GANSU_DLPNO_EA_VVVV_RI", true);
+            if (ri_vvvv_term_a_)
+                std::cout << "  [STEOM RI-Term-A] Wvvvo·t1 via RI B-factors "
+                             "(d_eri_vvvv nvir⁴ not materialised)" << std::endl;
         }
         // Ship 14: vvvv slab mode requires canonical-skip ON (legacy path D2Hs
         // d_eri_vvvv_ which is null in slab mode, and reads h_vvvv which is
@@ -936,7 +964,11 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
     tracked_cudaMalloc(&d_eri_ovvv_, ovvv_sz * sizeof(real_t));
     // Ship 14: in slab mode d_eri_vvvv_ stays null; each device owns its
     // slab via d_eri_vvvv_slabs_[d] allocated by the driver before ctor.
-    if (eri_vvvv_nslab_ <= 1) {
+    // (RI Term A) skip the nvir⁴ alloc when Wvvvo·t1 is evaluated from B-factors
+    // (keep it under BUILD_VALIDATE so the host self-check reference survives).
+    const bool keep_dense_vvvv = !ri_vvvv_term_a_
+                                 || std::getenv("GANSU_STEOM_BUILD_VALIDATE") != nullptr;
+    if (eri_vvvv_nslab_ <= 1 && keep_dense_vvvv) {
         tracked_cudaMalloc(&d_eri_vvvv_, vvvv_sz * sizeof(real_t));
     }
 
@@ -960,7 +992,7 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
         eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,nocc+O,nvir, d_eri_ovvv_); // (ia|bc)
         // Ship 14: slab mode skips legacy single-device vvvv extract (driver
         // pre-populated d_eri_vvvv_slabs_).
-        if (eri_vvvv_nslab_ <= 1) {
+        if (eri_vvvv_nslab_ <= 1 && keep_dense_vvvv) {
             eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, nocc+O,nvir,nocc+O,nvir,nocc+O,nvir,nocc+O,nvir,d_eri_vvvv_); // (ab|cd)
         }
         cudaDeviceSynchronize();
@@ -1120,8 +1152,11 @@ void STEOMCCSDOperator::build_dressed_intermediates() {
     // canonical-skip OFF Wvvvv build + self-check + CPU fallback.  Slab mode
     // enforces canonical_skip_wvvvv_=true and runs Term A directly off device,
     // so host h_vvvv stays empty (saves NV⁴·8B host RAM — Pentacene: 91 GB).
+    // (RI Term A) when d_eri_vvvv_ is skipped (ri_vvvv_term_a_ && !VALIDATE) the
+    // host h_vvvv reference is neither built (canonical-skip ON) nor read, so
+    // leave it empty (gate on the actual device pointer, null ⇒ RI path).
     std::vector<real_t> h_vvvv;
-    if (eri_vvvv_nslab_ <= 1) h_vvvv.assign(vvvv_sz, 0.0);
+    if (eri_vvvv_nslab_ <= 1 && d_eri_vvvv_) h_vvvv.assign(vvvv_sz, 0.0);
 
     // Internal split-timer (env GANSU_STEOM_BUILD_PROF) to locate the host
     // 足回り hotspots inside build_dressed for the GPU-resident port.
@@ -1146,7 +1181,7 @@ void STEOMCCSDOperator::build_dressed_intermediates() {
     cudaMemcpy(h_ovvo.data(), d_eri_ovvo_,  ovvo_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_ovvv.data(), d_eri_ovvv_,  ovvv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_oooo.data(), d_eri_oooo_,  oooo_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
-    if (eri_vvvv_nslab_ <= 1)
+    if (eri_vvvv_nslab_ <= 1 && d_eri_vvvv_)
         cudaMemcpy(h_vvvv.data(), d_eri_vvvv_,  vvvv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
 
     std::vector<real_t> h_f_oo(NO), h_f_vv(NV);
@@ -1973,7 +2008,36 @@ void STEOMCCSDOperator::build_dressed_intermediates() {
         if (gpu::gpu_available()) {
             const size_t inter_sz = (size_t)NV * NV * NV * NO;
             std::vector<real_t> h_inter(inter_sz, 0.0);
-            if (eri_vvvv_nslab_ > 1) {
+            if (ri_vvvv_term_a_) {
+                // RI Term A (mirror of EA): h_inter[a,b,c,j] = Σ_d (ab|cd)·t1[j,d]
+                //   = Σ_P B_vv[P,ab]·(Σ_d B_vv[P,cd]·t1[j,d]).  Two GEMMs over the
+                // [naux×nvir²] B_vv block; the nvir⁴ tensor is never formed. Output
+                // layout matches the dense GEMM ⇒ host b↔c swap below is unchanged.
+                cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+                const int naux = eri_block_src_->get_num_auxiliary_basis();
+                const int voff = NO + frozen_off_;
+                real_t *d_Bvv=nullptr, *d_Y=nullptr, *d_t1_dev=nullptr, *d_inter=nullptr;
+                tracked_cudaMalloc(&d_Bvv,    (size_t)naux * NV * NV * sizeof(real_t));
+                tracked_cudaMalloc(&d_Y,      (size_t)naux * NV * NO * sizeof(real_t));
+                tracked_cudaMalloc(&d_t1_dev, (size_t)NO   * NV      * sizeof(real_t));
+                tracked_cudaMalloc(&d_inter,  inter_sz                * sizeof(real_t));
+                cudaMemcpy(d_t1_dev, h_t1.data(), (size_t)NO * NV * sizeof(real_t),
+                           cudaMemcpyHostToDevice);
+                { const int thr = 256;
+                  const size_t tot = (size_t)naux * NV * NV;
+                  int blk = (int)((tot + thr - 1) / thr); if (blk > 65535) blk = 65535;
+                  steom_gather_bvv_kernel<<<blk, thr>>>(d_B_mo_blocks_, d_Bvv,
+                                                        naux, nmo_full_, voff, NV); }
+                const real_t one = 1.0, zero = 0.0;
+                cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, NO, naux * NV, NV, &one,
+                            d_t1_dev, NV, d_Bvv, NV, &zero, d_Y, NO);
+                cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T, NV * NO, NV * NV, naux, &one,
+                            d_Y, NV * NO, d_Bvv, NV * NV, &zero, d_inter, NV * NO);
+                cudaMemcpy(h_inter.data(), d_inter, inter_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+                tracked_cudaFree(d_Bvv); tracked_cudaFree(d_Y);
+                tracked_cudaFree(d_t1_dev); tracked_cudaFree(d_inter);
+                termA_gpu = true;
+            } else if (eri_vvvv_nslab_ > 1) {
                 // Ship 14: per-device slab GEMM (mirror of EA Ship 12).  Each
                 // slab's GEMM output [a_local, b, c, j] (col k = a_local*NV² +
                 // b*NV + c) lines up with the global [a, b, c, j] layout, so

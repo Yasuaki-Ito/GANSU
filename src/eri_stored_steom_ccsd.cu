@@ -163,7 +163,19 @@ static void compute_steom_ccsd_impl(RHF& rhf,
             }
         }
         cudaSetDevice(saved);
-        if (have && ng >= 2 && vvvv_bytes > static_cast<size_t>(0.40 * min_total)) {
+        // (RI Term A) When the EA/STEOM operators evaluate Wvvvo·t1 from the RI
+        // B-factors, d_eri_vvvv (nvir⁴) is never materialised — there is no memory
+        // wall to distribute, so keep single-GPU + share-barH ON (STEOM borrows,
+        // no ~nvir⁴ rebuild) and avoid the device-balancing chain entirely. This
+        // driver IS the RI path, so the operators' eri_block_src_ is non-null ⇒
+        // ri_vvvv_term_a_ active under the same env flags checked here.
+        auto envon = [](const char* n, bool d){ const char* e = std::getenv(n);
+            return (!e || !e[0]) ? d : (e[0] != '0'); };
+        const bool ri_handles_vvvv = envon("GANSU_DLPNO_NATIVE_EOM", false)
+            && envon("GANSU_DLPNO_NATIVE_BARE", true)
+            && envon("GANSU_DLPNO_CANONICAL_SKIP", true)
+            && envon("GANSU_DLPNO_EA_VVVV_RI", true);
+        if (have && ng >= 2 && !ri_handles_vvvv && vvvv_bytes > static_cast<size_t>(0.40 * min_total)) {
             const std::string ns = std::to_string(ng);
             setenv("GANSU_EA_VVVV_NSLAB", ns.c_str(), 0);
             setenv("GANSU_STEOM_OPERATOR_DEVICE_BALANCING", "1", 0);
@@ -174,6 +186,13 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                       << " GB → auto-enabling NSLAB=" << ng
                       << " + device-balancing + STEOM_BUILD_GPUS=" << ng
                       << " (explicit env overrides)." << std::defaultfloat << std::endl;
+        } else if (have && ng >= 2 && ri_handles_vvvv
+                   && vvvv_bytes > static_cast<size_t>(0.40 * min_total)) {
+            std::cout << "  [STEOM auto-scale] d_eri_vvvv = " << std::fixed
+                      << std::setprecision(1) << vvvv_bytes / 1e9
+                      << " GB handled by RI B-factors (Wvvvo·t1) → single-GPU build, "
+                      << "no slab / device-balancing; share-barH stays ON."
+                      << std::defaultfloat << std::endl;
         }
     }
 #endif

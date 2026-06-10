@@ -434,6 +434,27 @@ __global__ void ea_wvvvo_scatter_kernel(
     }
 }
 
+// ---- (RI Term A) Gather the virtual-virtual block of the half-transformed
+//      B_mo (naux × nmo_full², row-major) into a contiguous [naux × nvir²]
+//      buffer:  Bvv[P, a, b] = B_mo[P, voff+a, voff+b],  voff = nocc + frozen_off.
+//      Lets the Wvvvo·t1 dressing contract B directly instead of materialising
+//      the nvir⁴ (ab|cd) tensor. Grid-stride, size_t safe.
+__global__ void ea_gather_bvv_kernel(const real_t* __restrict__ B_mo,
+                                     real_t* __restrict__ Bvv,
+                                     int naux, int nmo_full, int voff, int nvir)
+{
+    const size_t total  = (size_t)naux * nvir * nvir;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += stride) {
+        const int b = (int)(idx % nvir);
+        const size_t t = idx / nvir;
+        const int a = (int)(t % nvir);
+        const int P = (int)(t / nvir);
+        Bvv[idx] = B_mo[(size_t)P * nmo_full * nmo_full
+                      + (size_t)(voff + a) * nmo_full + (size_t)(voff + b)];
+    }
+}
+
 // ---- ct_ovov / ct_ovvo GEMM-input builders (mirror of the validated IP-EOM
 //      increment 5) — fill dA/dB/dA1/dB1/dA2/dB2 on device from the resident
 //      d_eri_ovov_ / d_t2_, eliminating the 6×(NO·NV)² host arrays + ~1.35 GB H2D
@@ -717,6 +738,14 @@ EAEOMCCSDOperator::EAEOMCCSDOperator(
         if (canonical_skip_wvvvv_)
             std::cout << "  [EA-EOM canonical-skip] dressed Wvvvv build SKIPPED "
                          "(nvir⁴ host+device elided; Wvvvo·t1 refactored)" << std::endl;
+        // (RI Term A) Evaluate the Wvvvo·t1 dressing from RI B-factors so the
+        // nvir⁴ (ab|cd) block is never materialised. Requires the canonical-skip
+        // path (Wvvvo·t1 is then the sole vvvv consumer) and an RI block source.
+        ri_vvvv_term_a_ = canonical_skip_wvvvv_ && (eri_block_src_ != nullptr)
+                          && on("GANSU_DLPNO_EA_VVVV_RI", true);
+        if (ri_vvvv_term_a_)
+            std::cout << "  [EA-EOM RI-Term-A] Wvvvo·t1 via RI B-factors "
+                         "(d_eri_vvvv nvir⁴ not materialised)" << std::endl;
     }
     // Ship 12: vvvv slab mode requires canonical-skip ON.  The legacy
     // non-skip code path D2H's d_eri_vvvv_ (nullptr in slab mode) and reads
@@ -1024,7 +1053,12 @@ void EAEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
     tracked_cudaMalloc(&d_eri_ovvv_, ovvv_sz * sizeof(real_t));
     // Ship 12: in slab mode d_eri_vvvv_ stays null; each device owns its
     // slab via d_eri_vvvv_slabs_[d] allocated below in the P4b branch.
-    if (eri_vvvv_nslab_ <= 1) {
+    // (RI Term A) skip the nvir⁴ alloc entirely when Wvvvo·t1 is evaluated from
+    // the B-factors; keep it under BUILD_VALIDATE so the host self-check
+    // reference (h_vvvv, D2H'd from d_eri_vvvv_) still survives.
+    const bool keep_dense_vvvv = !ri_vvvv_term_a_
+                                 || std::getenv("GANSU_STEOM_BUILD_VALIDATE") != nullptr;
+    if (eri_vvvv_nslab_ <= 1 && keep_dense_vvvv) {
         tracked_cudaMalloc(&d_eri_vvvv_, vvvv_sz * sizeof(real_t));
     }
 
@@ -1048,7 +1082,7 @@ void EAEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
         // and populated by the driver (compute_ea_eom_ccsd_impl) before this
         // ctor was reached — operator just owns them. Skip the legacy
         // single-device vvvv extract here.
-        if (eri_vvvv_nslab_ <= 1) {
+        if (eri_vvvv_nslab_ <= 1 && keep_dense_vvvv) {
             eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, nocc+O,nvir,nocc+O,nvir,nocc+O,nvir,nocc+O,nvir,d_eri_vvvv_); // (ab|cd)
         }
         cudaDeviceSynchronize();
@@ -1913,7 +1947,38 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                 real_t* d_interA = nullptr;
                 tracked_cudaMalloc(&d_interA, inter_sz * sizeof(real_t));
                 std::vector<real_t> h_inter;   // assembled for slab path or validate D2H
-                if (eri_vvvv_nslab_ > 1) {
+                if (ri_vvvv_term_a_) {
+                    // RI Term A: (ab|cd) = Σ_P B_vv[P,ab]·B_vv[P,cd]  ⇒
+                    //   d_interA[a,b,c,j] = Σ_P B_vv[P,ab]·(Σ_d B_vv[P,cd]·t1[j,d]).
+                    // Two GEMMs over the contiguous [naux×nvir²] B_vv block; the
+                    // nvir⁴ (ab|cd) tensor is never formed. d_interA layout is
+                    // identical to the dense GEMM below ⇒ scatter is unchanged.
+                    cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+                    const int naux = eri_block_src_->get_num_auxiliary_basis();
+                    const int voff = NO + frozen_off_;
+                    real_t *d_Bvv = nullptr, *d_Y = nullptr, *d_t1_dev = nullptr;
+                    tracked_cudaMalloc(&d_Bvv,    (size_t)naux * NV * NV * sizeof(real_t));
+                    tracked_cudaMalloc(&d_Y,      (size_t)naux * NV * NO * sizeof(real_t));
+                    tracked_cudaMalloc(&d_t1_dev, (size_t)NO   * NV      * sizeof(real_t));
+                    cudaMemcpy(d_t1_dev, h_t1.data(), (size_t)NO * NV * sizeof(real_t),
+                               cudaMemcpyHostToDevice);
+                    { const int thr = 256;
+                      const size_t tot = (size_t)naux * NV * NV;
+                      int blk = (int)((tot + thr - 1) / thr); if (blk > 65535) blk = 65535;
+                      ea_gather_bvv_kernel<<<blk, thr>>>(d_B_mo_blocks_, d_Bvv,
+                                                         naux, nmo_full_, voff, NV); }
+                    const real_t one = 1.0, zero = 0.0;
+                    // GEMM1: Y[(P,c),j] = Σ_d B_vv[(P,c),d]·t1[j,d]  (mirrors dense Term A shape)
+                    cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                NO, naux * NV, NV, &one,
+                                d_t1_dev, NV, d_Bvv, NV, &zero, d_Y, NO);
+                    // GEMM2: d_interA[(a,b),(c,j)] = Σ_P B_vv[P,(a,b)]·Y[P,(c,j)]
+                    cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                                NV * NO, NV * NV, naux, &one,
+                                d_Y, NV * NO, d_Bvv, NV * NV, &zero, d_interA, NV * NO);
+                    tracked_cudaFree(d_Bvv); tracked_cudaFree(d_Y); tracked_cudaFree(d_t1_dev);
+                    termA_gpu = true;
+                } else if (eri_vvvv_nslab_ > 1) {
                     h_inter.assign(inter_sz, 0.0);
                     // Ship 12: per-device slab GEMM.  Each slab's GEMM output
                     // [a_local, b, c, j] (col k = a_local*NV² + b*NV + c) lines

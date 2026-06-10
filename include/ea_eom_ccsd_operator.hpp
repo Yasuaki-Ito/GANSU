@@ -222,6 +222,14 @@ private:
     // intermediate (build_dressed_intermediates fused refactor). Default off → bit-exact.
     bool canonical_skip_wvvvv_ = false;
 
+    // (RI Term A) When true, the Wvvvo·t1 dressing (the sole canonical-skip
+    // consumer of the nvir⁴ (ab|cd) block) is evaluated on the fly from the RI
+    // B-factors — Σ_d (ab|cd) t1[j,d] = Σ_P B_vv[P,ab] (Σ_d B_vv[P,cd] t1[j,d]).
+    // d_eri_vvvv_ is then never materialised (64.5 GB at Pentacene), which also
+    // removes the auto device-balancing trigger. Gated on
+    // canonical_skip_wvvvv_ && RI block source && GANSU_DLPNO_EA_VVVV_RI.
+    bool ri_vvvv_term_a_ = false;
+
     // === Ship 12: d_eri_vvvv n-slab distribution =============================
     // For 30+ atom workloads (Pentacene NV=327 → NV⁴·8B = 91.5 GB) the bare
     // ERI vvvv tensor exceeds the free memory available on any single GPU
