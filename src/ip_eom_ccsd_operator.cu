@@ -461,8 +461,8 @@ void IPEOMCCSDOperator::setup_multi_gpu() {
         repl(&w.d_Fov,   d_Fov_,   fov_sz);
         repl(&w.d_Woooo, d_Woooo_, oooo_sz);
         repl(&w.d_Wooov, d_Wooov_, ooov_sz);
-        repl(&w.d_Wovov, d_Wovov_, ovov_sz);
-        repl(&w.d_Wovvo, d_Wovvo_, ovvo_sz);
+        if (d_Wovov_) repl(&w.d_Wovov, d_Wovov_, ovov_sz); else w.d_Wovov = nullptr;
+        if (d_Wovvo_) repl(&w.d_Wovvo, d_Wovvo_, ovvo_sz); else w.d_Wovvo = nullptr;
         repl(&w.d_Wovoo, d_Wovoo_, wovoo_sz);
         repl(&w.d_eri_oovv, d_eri_oovv_, oovv_sz);
         repl(&w.d_t2,    d_t2_,    t2_sz);
@@ -1337,6 +1337,32 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
 
     blap("Woooo + ct_ovov/ovvo Σcd GEMM");
 
+    // (scaling) Skip the dense canonical Wovov/Wovvo build (the ~15 s O(NO²·NV³)
+    // sub-phase that dominates build_dressed at 100-atom scale) when the
+    // native-bare operator is active AND share-barH is off:
+    //   • the native bare IP operator never borrows the dense nocc²·nvir² Wovov/
+    //     Wovvo (see the `if (!use_native_bare_)` guard in
+    //     dlpno_ip_eom_native_operator.cu — it rebuilds them per-pair from
+    //     Phase24 bare + native ring), and
+    //   • share-barH off (barh_cache_ == nullptr) means STEOM builds its own copy
+    //     rather than borrowing ours,
+    // so building them here is pure dead work.  Mirrors the EA h_Wvvvv skip.
+    // Non-native / reference / share-on paths keep the full build (byte-unchanged:
+    // d_Wovov_/d_Wovvo_ are still produced, published, and consumed as before).
+    const bool skip_dense_wovov_wovvo = [&]{
+        auto on = [](const char* n, bool d){ const char* e = std::getenv(n);
+            return (!e || !e[0]) ? d : (e[0] != '0'); };
+        return on("GANSU_DLPNO_NATIVE_EOM", false) &&
+               on("GANSU_DLPNO_NATIVE_BARE", true) &&
+               on("GANSU_DLPNO_CANONICAL_SKIP", true) &&
+               (barh_cache_ == nullptr);
+    }();
+    if (skip_dense_wovov_wovvo)
+        std::cout << "  [IP-EOM canonical-skip] dense Wovov/Wovvo build SKIPPED "
+                     "(native-bare + share-barH off; STEOM builds its own)\n";
+    std::vector<real_t> h_Wovov, h_Wovvo;   // declared out here for the D2H upload
+  if (!skip_dense_wovov_wovvo) {
+
     // ============================================================
     //  W1ovov[k,b,i,d] = oovv[k,i,b,d] - Σ_{c,l} ovov[k,c,l,d] t2[i,l,c,b]
     //  W2ovov[k,b,i,d] = -Σ_l Wooov[k,l,i,d] t1[l,b]
@@ -1366,7 +1392,7 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
         wovov_w2_gpu = true;
     }
 #endif
-    std::vector<real_t> h_Wovov(ovov_sz, 0.0);
+    h_Wovov.assign(ovov_sz, 0.0);
     #pragma omp parallel for collapse(2)
     for (int k = 0; k < NO; ++k)
         for (int b = 0; b < NV; ++b)
@@ -1437,7 +1463,7 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
         wovvo_w2_gpu = true;
     }
 #endif
-    std::vector<real_t> h_Wovvo(ovvo_sz, 0.0);
+    h_Wovvo.assign(ovvo_sz, 0.0);
     #pragma omp parallel for collapse(2)
     for (int k = 0; k < NO; ++k)
         for (int a = 0; a < NV; ++a)
@@ -1475,6 +1501,7 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
         std::cout << "[IP-EOM build self-check] Wovvo W2 (ovvv·t1) GEMM vs host: max|Δ| = "
                   << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
     }
+  }  // end if (!skip_dense_wovov_wovvo) — dense Wovov/Wovvo dead in native-bare path
     blap("Wovov + Wovvo (W2: ovvv·t1, Wooov·t1)");
 
     // ============================================================
@@ -1686,10 +1713,12 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
     }
     tracked_cudaMalloc(&d_Wooov_, ooov_sz  * sizeof(real_t));
     cudaMemcpy(d_Wooov_, h_Wooov.data(), ooov_sz  * sizeof(real_t), cudaMemcpyHostToDevice);
-    tracked_cudaMalloc(&d_Wovov_, ovov_sz  * sizeof(real_t));
-    cudaMemcpy(d_Wovov_, h_Wovov.data(), ovov_sz  * sizeof(real_t), cudaMemcpyHostToDevice);
-    tracked_cudaMalloc(&d_Wovvo_, ovvo_sz  * sizeof(real_t));
-    cudaMemcpy(d_Wovvo_, h_Wovvo.data(), ovvo_sz  * sizeof(real_t), cudaMemcpyHostToDevice);
+    if (!skip_dense_wovov_wovvo) {   // else d_Wovov_/d_Wovvo_ stay nullptr (native bare never reads them)
+        tracked_cudaMalloc(&d_Wovov_, ovov_sz  * sizeof(real_t));
+        cudaMemcpy(d_Wovov_, h_Wovov.data(), ovov_sz  * sizeof(real_t), cudaMemcpyHostToDevice);
+        tracked_cudaMalloc(&d_Wovvo_, ovvo_sz  * sizeof(real_t));
+        cudaMemcpy(d_Wovvo_, h_Wovvo.data(), ovvo_sz  * sizeof(real_t), cudaMemcpyHostToDevice);
+    }
     tracked_cudaMalloc(&d_Wovoo_, wovoo_sz * sizeof(real_t));
     cudaMemcpy(d_Wovoo_, h_Wovoo.data(), wovoo_sz * sizeof(real_t), cudaMemcpyHostToDevice);
 
@@ -1986,8 +2015,8 @@ void IPEOMCCSDOperator::print_intermediate_norms(std::ostream& os) const {
        << "    ‖Fov‖       = " << frobenius_norm_device(d_Fov_,   fov_sz)   << "\n"
        << "    ‖Woooo‖     = " << frobenius_norm_device(d_Woooo_, oooo_sz)  << "\n"
        << "    ‖Wooov‖     = " << frobenius_norm_device(d_Wooov_, ooov_sz)  << "\n"
-       << "    ‖Wovov‖     = " << frobenius_norm_device(d_Wovov_, ovov_sz)  << "\n"
-       << "    ‖Wovvo‖     = " << frobenius_norm_device(d_Wovvo_, ovvo_sz)  << "\n"
+       << "    ‖Wovov‖     = " << (d_Wovov_ ? frobenius_norm_device(d_Wovov_, ovov_sz) : 0.0)  << "\n"
+       << "    ‖Wovvo‖     = " << (d_Wovvo_ ? frobenius_norm_device(d_Wovvo_, ovvo_sz) : 0.0)  << "\n"
        << "    ‖Wovoo‖     = " << frobenius_norm_device(d_Wovoo_, wovoo_sz) << "\n";
 }
 
