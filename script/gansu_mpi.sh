@@ -35,4 +35,20 @@ fi
 
 export CUDA_VISIBLE_DEVICES="${LOCAL_RANK}"
 
+# Fair-share CPU cores among ranks co-located on this node. DLPNO/EOM host loops
+# are OpenMP-heavy; with N ranks on one node each grabbing all cores, they
+# oversubscribe and every rank slows down (single-node only — on multi-node each
+# rank owns its node's cores). If the user hasn't pinned OMP_NUM_THREADS, give
+# each local rank floor(ncores / local_size). Pair with an mpirun binding such
+# as `--bind-to numa --map-by numa` for affinity.
+if [ -z "${OMP_NUM_THREADS}" ]; then
+    LOCAL_SIZE="${OMPI_COMM_WORLD_LOCAL_SIZE:-${MV2_COMM_WORLD_LOCAL_SIZE:-${SLURM_NTASKS_PER_NODE:-1}}}"
+    NCORES="$(nproc 2>/dev/null || echo 1)"
+    if [ "${LOCAL_SIZE}" -gt 1 ] 2>/dev/null; then
+        T=$(( NCORES / LOCAL_SIZE ))
+        [ "${T}" -lt 1 ] && T=1
+        export OMP_NUM_THREADS="${T}"
+    fi
+fi
+
 exec "$@"

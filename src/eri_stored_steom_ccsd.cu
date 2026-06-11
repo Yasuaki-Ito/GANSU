@@ -50,8 +50,154 @@
 #include "gpu_manager.hpp"
 #include "profiler.hpp"
 #include "utils.hpp"
+#ifdef GANSU_MPI
+#include <mpi.h>
+#endif
 
 namespace gansu {
+
+#ifdef GANSU_MPI
+// ============================================================================
+//  MPI Step 4 — STEOM stage-2 rank0=IP / rank1=EA parallel split.
+//  rank 0 solves IP-EOM, rank 1 solves EA-EOM concurrently; rank 1 ships its
+//  EAEOMResult (host amplitudes) to rank 0, which then runs the STEOM second
+//  transform + diagonalization. See MPI_DESIGN.md Step 4.
+// ============================================================================
+namespace {
+
+void steom_mpi_rank_size(int& rank, int& size) {
+    rank = 0; size = 1;
+    int inited = 0; MPI_Initialized(&inited);
+    if (inited) {
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        MPI_Comm_size(MPI_COMM_WORLD, &size);
+    }
+}
+
+constexpr int STEOM_EA_TAG = 0x57A4;  // arbitrary unique tag for the EA hand-off
+
+// Send one PerRoot's scalar metadata + R1 + R2 to `dest`.
+void send_ea_perroot(const EAEOMResult::PerRoot& pr, int dest) {
+    double meta[3] = { pr.omega, pr.percent_singles, pr.followcis_overlap };
+    long sizes[3]  = { (long)pr.canonical_vir_label,
+                       (long)pr.R1.size(), (long)pr.R2.size() };
+    MPI_Send(meta,  3, MPI_DOUBLE, dest, STEOM_EA_TAG, MPI_COMM_WORLD);
+    MPI_Send(sizes, 3, MPI_LONG,   dest, STEOM_EA_TAG, MPI_COMM_WORLD);
+    if (!pr.R1.empty()) MPI_Send(pr.R1.data(), (int)pr.R1.size(), MPI_DOUBLE, dest, STEOM_EA_TAG, MPI_COMM_WORLD);
+    if (!pr.R2.empty()) MPI_Send(pr.R2.data(), (int)pr.R2.size(), MPI_DOUBLE, dest, STEOM_EA_TAG, MPI_COMM_WORLD);
+}
+
+void recv_ea_perroot(EAEOMResult::PerRoot& pr, int src) {
+    double meta[3]; long sizes[3];
+    MPI_Recv(meta,  3, MPI_DOUBLE, src, STEOM_EA_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    MPI_Recv(sizes, 3, MPI_LONG,   src, STEOM_EA_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    pr.omega = meta[0]; pr.percent_singles = meta[1]; pr.followcis_overlap = meta[2];
+    pr.canonical_vir_label = (int)sizes[0];
+    pr.R1.resize((size_t)sizes[1]);
+    pr.R2.resize((size_t)sizes[2]);
+    if (!pr.R1.empty()) MPI_Recv(pr.R1.data(), (int)pr.R1.size(), MPI_DOUBLE, src, STEOM_EA_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    if (!pr.R2.empty()) MPI_Recv(pr.R2.data(), (int)pr.R2.size(), MPI_DOUBLE, src, STEOM_EA_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+}
+
+// rank 1 → rank 0: ship the EAEOMResult consumed by the STEOM second transform.
+// Only the fields STEOM reads (dims + per_active) are sent; `auxiliary` is
+// diagnostic-only and skipped. `report` is sent so rank 0's final summary
+// includes the EA table.
+void send_ea_result(const EAEOMResult& ea, int dest) {
+    int header[5] = { ea.nocc_active, ea.nvir, ea.num_frozen, ea.n_active,
+                      (int)ea.per_active.size() };
+    MPI_Send(header, 5, MPI_INT, dest, STEOM_EA_TAG, MPI_COMM_WORLD);
+    for (const auto& pr : ea.per_active) send_ea_perroot(pr, dest);
+    int rlen = (int)ea.report.size();
+    MPI_Send(&rlen, 1, MPI_INT, dest, STEOM_EA_TAG, MPI_COMM_WORLD);
+    if (rlen > 0) MPI_Send(ea.report.data(), rlen, MPI_CHAR, dest, STEOM_EA_TAG, MPI_COMM_WORLD);
+}
+
+void recv_ea_result(EAEOMResult& ea, int src) {
+    int header[5];
+    MPI_Recv(header, 5, MPI_INT, src, STEOM_EA_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    ea.nocc_active = header[0]; ea.nvir = header[1];
+    ea.num_frozen  = header[2]; ea.n_active = header[3];
+    ea.per_active.resize((size_t)header[4]);
+    for (auto& pr : ea.per_active) recv_ea_perroot(pr, src);
+    int rlen = 0;
+    MPI_Recv(&rlen, 1, MPI_INT, src, STEOM_EA_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    ea.report.resize((size_t)std::max(0, rlen));
+    if (rlen > 0) MPI_Recv(&ea.report[0], rlen, MPI_CHAR, src, STEOM_EA_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+}
+
+// --- CIS-NTO active space hand-off (rank 0 → rank 1, point-to-point) ---------
+// rank 0 computes the state-averaged CIS-NTO active space and SENDS it to
+// rank 1 so the EA root routing (select_active_ea_roots, which reads
+// cis_nto.U_vir) uses the SAME active space as rank 0's STEOM, keeping the EA
+// canonical_vir_label indices consistent. Without this, each rank's independent
+// eigendecomposition of (near-)degenerate NTO blocks could order the active
+// virtuals differently and corrupt the second transform. Point-to-point (NOT
+// MPI_Bcast) so idle ranks ≥2 can exit early without deadlocking a collective.
+constexpr int STEOM_CIS_TAG = 0x57C1;
+
+void send_vec_double(const std::vector<real_t>& v, int dest) {
+    long n = (long)v.size();
+    MPI_Send(&n, 1, MPI_LONG, dest, STEOM_CIS_TAG, MPI_COMM_WORLD);
+    if (n > 0) MPI_Send(v.data(), (int)n, MPI_DOUBLE, dest, STEOM_CIS_TAG, MPI_COMM_WORLD);
+}
+void recv_vec_double(std::vector<real_t>& v, int src) {
+    long n = 0;
+    MPI_Recv(&n, 1, MPI_LONG, src, STEOM_CIS_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    v.resize((size_t)std::max(0L, n));
+    if (n > 0) MPI_Recv(v.data(), (int)n, MPI_DOUBLE, src, STEOM_CIS_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+}
+void send_vec_int(const std::vector<int>& v, int dest) {
+    long n = (long)v.size();
+    MPI_Send(&n, 1, MPI_LONG, dest, STEOM_CIS_TAG, MPI_COMM_WORLD);
+    if (n > 0) MPI_Send(v.data(), (int)n, MPI_INT, dest, STEOM_CIS_TAG, MPI_COMM_WORLD);
+}
+void recv_vec_int(std::vector<int>& v, int src) {
+    long n = 0;
+    MPI_Recv(&n, 1, MPI_LONG, src, STEOM_CIS_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    v.resize((size_t)std::max(0L, n));
+    if (n > 0) MPI_Recv(v.data(), (int)n, MPI_INT, src, STEOM_CIS_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+}
+
+void send_cis_nto(const CISNTOResult& cis, int dest) {
+    int hi[5] = { cis.nocc_active, cis.nvir, cis.num_frozen, cis.n_act_occ, cis.n_act_vir };
+    MPI_Send(hi, 5, MPI_INT, dest, STEOM_CIS_TAG, MPI_COMM_WORLD);
+    double hd[5] = { cis.trace_occ, cis.trace_vir, cis.weight_sum, cis.o_thresh, cis.v_thresh };
+    MPI_Send(hd, 5, MPI_DOUBLE, dest, STEOM_CIS_TAG, MPI_COMM_WORLD);
+    send_vec_double(cis.nto_occ_occupations, dest);
+    send_vec_double(cis.nto_vir_occupations, dest);
+    send_vec_double(cis.U_occ, dest);
+    send_vec_double(cis.U_vir, dest);
+    send_vec_int(cis.active_occ_indices, dest);
+    send_vec_int(cis.active_vir_indices, dest);
+    int rlen = (int)cis.report.size();
+    MPI_Send(&rlen, 1, MPI_INT, dest, STEOM_CIS_TAG, MPI_COMM_WORLD);
+    if (rlen > 0) MPI_Send(cis.report.data(), rlen, MPI_CHAR, dest, STEOM_CIS_TAG, MPI_COMM_WORLD);
+}
+
+void recv_cis_nto(CISNTOResult& cis, int src) {
+    int hi[5];
+    MPI_Recv(hi, 5, MPI_INT, src, STEOM_CIS_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    cis.nocc_active = hi[0]; cis.nvir = hi[1]; cis.num_frozen = hi[2];
+    cis.n_act_occ = hi[3]; cis.n_act_vir = hi[4];
+    double hd[5];
+    MPI_Recv(hd, 5, MPI_DOUBLE, src, STEOM_CIS_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    cis.trace_occ = hd[0]; cis.trace_vir = hd[1]; cis.weight_sum = hd[2];
+    cis.o_thresh = hd[3]; cis.v_thresh = hd[4];
+    recv_vec_double(cis.nto_occ_occupations, src);
+    recv_vec_double(cis.nto_vir_occupations, src);
+    recv_vec_double(cis.U_occ, src);
+    recv_vec_double(cis.U_vir, src);
+    recv_vec_int(cis.active_occ_indices, src);
+    recv_vec_int(cis.active_vir_indices, src);
+    int rlen = 0;
+    MPI_Recv(&rlen, 1, MPI_INT, src, STEOM_CIS_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    cis.report.resize((size_t)std::max(0, rlen));
+    if (rlen > 0) MPI_Recv(&cis.report[0], rlen, MPI_CHAR, src, STEOM_CIS_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+}
+
+}  // anonymous namespace
+#endif // GANSU_MPI
 
 // Forward declarations from eri_stored.cu (shared with all EOM modules).
 void transform_ao_eri_to_mo_eri_full(
@@ -211,16 +357,41 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // dispatch so the auto-run operators see it; freed at the end of this function
     // after the STEOM operator (which only reads bar-H at build time) is finished.
     // ----------------------------------------------------------------------
+    // MPI Step 4: rank topology for the IP||EA stage-2 split (see MPI_DESIGN.md).
+    // rank 0 solves IP, rank 1 solves EA; rank 0 runs the STEOM transform.
+    // OPT-IN (GANSU_STEOM_MPI_SPLIT=1) so we can validate in two stages: with the
+    // split OFF every rank runs the full STEOM redundantly (validates the X-model
+    // full-local B under MPI), then ON validates the IP/EA parallel + transfers.
+    int mpi_rank = 0, mpi_size = 1;
+#ifdef GANSU_MPI
+    steom_mpi_rank_size(mpi_rank, mpi_size);
+#endif
+    bool mpi_steom = false;
+#ifdef GANSU_MPI
+    if (mpi_size > 1) {
+        const char* e = std::getenv("GANSU_STEOM_MPI_SPLIT");
+        mpi_steom = (e && e[0] == '1');
+    }
+#endif
+
     {
         const char* env     = std::getenv("GANSU_STEOM_SHARE_BARH");
         const char* env_bal = std::getenv("GANSU_STEOM_OPERATOR_DEVICE_BALANCING");
         const bool balancing = (env_bal && env_bal[0] == '1');
-        const bool share = (!env || env[0] != '0') && !balancing;  // default ON, "=0" opt-out
+        // Step 4a (Option A): under MPI the IP and EA operators run on DIFFERENT
+        // ranks, so rank 0's STEOM cannot borrow rank 1's EA bar-H (it lives in a
+        // separate process). Force share-barH OFF → rank 0 rebuilds all 11 bar-H
+        // itself (it has the CCSD ground + active space + received EA result).
+        // Step 4b will NCCL-transfer the EA bar-H to re-enable the share.
+        const bool share = (!env || env[0] != '0') && !balancing && !mpi_steom;
         rhf.set_steom_share_barh(share);
         if (share)
             std::cout << "  [STEOM share-barH] ON (default; GANSU_STEOM_SHARE_BARH=0 to "
                          "disable) — IP/EA publish dressed bar-H, STEOM borrows "
                          "(skips its build_dressed)." << std::endl;
+        else if (mpi_steom)
+            std::cout << "  [STEOM share-barH] OFF (MPI IP||EA split → EA bar-H lives on "
+                         "rank 1; rank 0 rebuilds. Step 4b will NCCL-transfer it)." << std::endl;
         else if (balancing)
             std::cout << "  [STEOM share-barH] OFF (device-balancing on → cross-device "
                          "bar-H borrow unverified; per-operator build retained)." << std::endl;
@@ -232,20 +403,80 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // future P3 optimization (sub-phase 3.x) can pipe T2 / MO ERI through
     // to avoid the triple CCSD ground-state recomputation.
     // ----------------------------------------------------------------------
-    if (rhf.get_cis_nto_result().n_act_occ == 0) {
-        int n_cis = rhf.get_steom_n_root_cis();
-        if (n_cis <= 0) n_cis = n_states_requested + 4;  // STEOM.md §7.3 default
-        std::cout << "\n---- STEOM-CCSD composite dispatch: stage 1/3 = CIS-NTO active space ----" << std::endl;
-        eri_method.compute_cis_nto(n_cis);
+#ifdef GANSU_MPI
+    // MPI Step 4a: only ranks 0 (IP→STEOM) and 1 (EA) work in stage-2; higher
+    // ranks ran stage-1 redundantly and have nothing to do. They exit BEFORE any
+    // point-to-point hand-off so no message is left dangling. NOTE: this assumes
+    // the IP/EA solves are self-contained per rank (no world collective expecting
+    // all ranks) — see MPI_DESIGN.md Step 4 open question.
+    if (mpi_steom && mpi_rank >= 2) {
+        std::cout << "  [STEOM MPI] rank " << mpi_rank
+                  << " idle in stage-2 (IP||EA uses ranks 0,1 only)." << std::endl;
+        return;
     }
-    if (rhf.get_ip_eom_result().per_active.empty()) {
-        std::cout << "\n---- STEOM-CCSD composite dispatch: stage 2/3 = IP-EOM-CCSD (per active occ NTO) ----" << std::endl;
+#endif
+
+    // Stage 1/3 — CIS-NTO active space.
+    if (!mpi_steom) {
+        if (rhf.get_cis_nto_result().n_act_occ == 0) {
+            int n_cis = rhf.get_steom_n_root_cis();
+            if (n_cis <= 0) n_cis = n_states_requested + 4;  // STEOM.md §7.3 default
+            std::cout << "\n---- STEOM-CCSD composite dispatch: stage 1/3 = CIS-NTO active space ----" << std::endl;
+            eri_method.compute_cis_nto(n_cis);
+        }
+    }
+#ifdef GANSU_MPI
+    else if (mpi_rank == 0) {
+        // rank 0 computes CIS-NTO and ships it to rank 1 (consistent active space).
+        if (rhf.get_cis_nto_result().n_act_occ == 0) {
+            int n_cis = rhf.get_steom_n_root_cis();
+            if (n_cis <= 0) n_cis = n_states_requested + 4;
+            std::cout << "\n---- STEOM-CCSD composite dispatch: stage 1/3 = CIS-NTO active space [rank 0 → rank 1] ----" << std::endl;
+            eri_method.compute_cis_nto(n_cis);
+        }
+        send_cis_nto(rhf.get_cis_nto_result(), 1);
+    } else { // rank 1: use rank 0's CIS-NTO for EA routing
+        CISNTOResult cis;
+        recv_cis_nto(cis, 0);
+        rhf.set_cis_nto_result(std::move(cis));
+        std::cout << "  [STEOM MPI] rank 1 received CIS-NTO active space (n_act_vir="
+                  << rhf.get_cis_nto_result().n_act_vir << ") from rank 0." << std::endl;
+    }
+#endif
+
+    // Stage 2/3 (IP, rank 0) and 3/3 (EA, rank 1) run concurrently under MPI.
+    const bool do_ip = (!mpi_steom) || (mpi_rank == 0);
+    const bool do_ea = (!mpi_steom) || (mpi_rank == 1);
+
+    if (do_ip && rhf.get_ip_eom_result().per_active.empty()) {
+        std::cout << "\n---- STEOM-CCSD composite dispatch: stage 2/3 = IP-EOM-CCSD (per active occ NTO)"
+                  << (mpi_steom ? " [rank 0]" : "") << " ----" << std::endl;
         eri_method.compute_ip_eom_ccsd(n_states_requested);
     }
-    if (rhf.get_ea_eom_result().per_active.empty()) {
-        std::cout << "\n---- STEOM-CCSD composite dispatch: stage 3/3 = EA-EOM-CCSD (per active vir NTO) ----" << std::endl;
+    if (do_ea && rhf.get_ea_eom_result().per_active.empty()) {
+        std::cout << "\n---- STEOM-CCSD composite dispatch: stage 3/3 = EA-EOM-CCSD (per active vir NTO)"
+                  << (mpi_steom ? " [rank 1]" : "") << " ----" << std::endl;
         eri_method.compute_ea_eom_ccsd(n_states_requested);
     }
+
+#ifdef GANSU_MPI
+    // EA hand-off rank 1 → rank 0; rank 1 is then done with stage-2.
+    if (mpi_steom) {
+        if (mpi_rank == 1) {
+            send_ea_result(rhf.get_ea_eom_result(), 0);
+            std::cout << "  [STEOM MPI] rank 1 sent EA result ("
+                      << rhf.get_ea_eom_result().per_active.size()
+                      << " active roots) to rank 0; stage-2 done." << std::endl;
+            return;  // rank 1 does not run the STEOM second transform
+        } else { // rank 0 receives EA result, then proceeds to STEOM
+            EAEOMResult ea;
+            recv_ea_result(ea, 1);
+            std::cout << "  [STEOM MPI] rank 0 received EA result ("
+                      << ea.per_active.size() << " active roots) from rank 1." << std::endl;
+            rhf.set_ea_eom_result(std::move(ea));
+        }
+    }
+#endif
 
     // Sanity check — both per_active vectors must now have entries.
     const IPEOMResult& ip_result = rhf.get_ip_eom_result();

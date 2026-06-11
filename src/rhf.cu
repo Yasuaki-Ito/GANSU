@@ -122,16 +122,25 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
                 mgr.initialize(num_gpus);
             }
             std::cout << "[RI] " << mgr.num_devices() << " device(s)" << std::endl;
-            if (mgr.num_devices() == 1 && !mgr.is_mpi()) {
-                // Single GPU, single process: avoid the distributed class entirely
-                // so that analytical paths needing the full B matrix (e.g. RI
-                // gradient) can use it directly. The lightweight constructor used
-                // by ERI_RI_Distributed_RHF leaves intermediate_matrix_B_ as a 1x1
-                // dummy, which breaks the single-GPU RI gradient path.
-                //
-                // Under MPI each rank has one local GPU (num_devices()==1) but the
-                // aux axis is distributed across ranks, so we DO want the
-                // distributed class (partitioned over world ranks).
+            // B-model routing (MPI_DESIGN.md "X model"):
+            //  - Single GPU, single process: full-local ERI_RI_RHF (the distributed
+            //    class's lightweight ctor leaves intermediate_matrix_B_ a 1x1 dummy,
+            //    breaking analytical paths e.g. RI gradient).
+            //  - MPI + post-HF: post-HF (build_B_mo → replicate_B_to_all_gpus) needs
+            //    a FULL B on every rank, but the distributed class holds only this
+            //    rank's aux slab → partial B → wrong integrals. So each rank uses the
+            //    full-local ERI_RI_RHF (SCF redundant; parallelism comes from the
+            //    post-HF IP/EA split + pair distribution). B is naux×nao² (~580 MB),
+            //    not nvir⁴, so a full per-rank B is cheap.
+            //  - Single-process multi-GPU, OR MPI pure-SCF (post_hf==none): use the
+            //    distributed class (aux partitioned over devices / world ranks).
+            const std::string post_hf = parameters.contains("post_hf_method")
+                ? parameters.get<std::string>("post_hf_method") : std::string("none");
+            const bool mpi_post_hf = mgr.is_mpi() && !post_hf.empty() && post_hf != "none";
+            if ((mgr.num_devices() == 1 && !mgr.is_mpi()) || mpi_post_hf) {
+                if (mpi_post_hf)
+                    std::cout << "[RI] MPI post-HF (" << post_hf << "): full-local B per rank "
+                                 "(redundant SCF; parallelism in post-HF stage)." << std::endl;
                 set_eri_method(std::make_unique<ERI_RI_RHF>(*this, auxiliary_molecular));
             } else {
                 auto eri = std::make_unique<ERI_RI_Distributed_RHF>(*this, auxiliary_molecular);
