@@ -205,6 +205,53 @@ void recv_cis_nto(CISNTOResult& cis, int src) {
     if (rlen > 0) MPI_Recv(&cis.report[0], rlen, MPI_CHAR, src, STEOM_CIS_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 }
 
+// --- Stage-1 ground-state hand-off (rank 0 → rank 1, host MPI) ----------------
+// Ships the DLPNO-CCSD ground state so rank 1 can SKIP stage-1 (the expensive
+// DLPNO ground) entirely: only rank 0 computes it (at full node threads while
+// rank 1 waits), then sends the canonical coefficient matrix C, orbital energies
+// eps, and the back-transformed T1/T2 (BTAmplitudes). rank 1 MUST adopt rank 0's
+// C/eps because the canonical basis (degenerate-subspace rotations / signs) can
+// differ between independent SCF runs, and the transferred T2 lives in rank 0's
+// basis. Eliminates redundant stage-1 that otherwise runs at half threads on
+// both ranks and eats the IP||EA win. All host-side MPI.
+constexpr int STEOM_GROUND_TAG = 0x57C9;
+
+void send_ground_state(RHF& rhf, double E_corr, int dest) {
+    const int nb = rhf.get_num_basis();
+    auto& C   = rhf.get_coefficient_matrix();  C.toHost();
+    auto& eps = rhf.get_orbital_energies();    eps.toHost();
+    const BTAmplitudes& bt = rhf.get_dlpno_bt_amplitudes();
+    long hdr[5] = { (long)nb, (long)bt.nocc, (long)bt.nvir,
+                    (long)bt.T1.size(), (long)bt.T2.size() };
+    MPI_Send(hdr, 5, MPI_LONG, dest, STEOM_GROUND_TAG, MPI_COMM_WORLD);
+    MPI_Send(&E_corr, 1, MPI_DOUBLE, dest, STEOM_GROUND_TAG, MPI_COMM_WORLD);
+    MPI_Send(C.host_ptr(),   (int)((size_t)nb * nb), MPI_DOUBLE, dest, STEOM_GROUND_TAG, MPI_COMM_WORLD);
+    MPI_Send(eps.host_ptr(), nb,                     MPI_DOUBLE, dest, STEOM_GROUND_TAG, MPI_COMM_WORLD);
+    if (!bt.T1.empty()) MPI_Send(bt.T1.data(), (int)bt.T1.size(), MPI_DOUBLE, dest, STEOM_GROUND_TAG, MPI_COMM_WORLD);
+    if (!bt.T2.empty()) MPI_Send(bt.T2.data(), (int)bt.T2.size(), MPI_DOUBLE, dest, STEOM_GROUND_TAG, MPI_COMM_WORLD);
+}
+
+double recv_ground_state(RHF& rhf, int src) {
+    long hdr[5];
+    MPI_Recv(hdr, 5, MPI_LONG, src, STEOM_GROUND_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    const int nb = (int)hdr[0];
+    double E_corr = 0.0;
+    MPI_Recv(&E_corr, 1, MPI_DOUBLE, src, STEOM_GROUND_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    auto& C   = rhf.get_coefficient_matrix();  C.toHost();   // ensure host buffer exists
+    auto& eps = rhf.get_orbital_energies();    eps.toHost();
+    MPI_Recv(C.host_ptr(),   (int)((size_t)nb * nb), MPI_DOUBLE, src, STEOM_GROUND_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    MPI_Recv(eps.host_ptr(), nb,                     MPI_DOUBLE, src, STEOM_GROUND_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    C.toDevice();  eps.toDevice();   // adopt rank 0's canonical basis
+    BTAmplitudes bt;
+    bt.nocc = (int)hdr[1]; bt.nvir = (int)hdr[2];
+    bt.T1.resize((size_t)hdr[3]);
+    bt.T2.resize((size_t)hdr[4]);
+    if (!bt.T1.empty()) MPI_Recv(bt.T1.data(), (int)bt.T1.size(), MPI_DOUBLE, src, STEOM_GROUND_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    if (!bt.T2.empty()) MPI_Recv(bt.T2.data(), (int)bt.T2.size(), MPI_DOUBLE, src, STEOM_GROUND_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    rhf.set_dlpno_bt_amplitudes(std::move(bt));
+    return E_corr;
+}
+
 #ifdef GANSU_MULTI_GPU
 // --- Step 4b: EA bar-H device-tensor hand-off (rank 1 → rank 0, NCCL) ---------
 // Ships the 2 EA-side dressed bar-H tensors (Wvovv, Wvvvo; each [nvir³·nocc])
@@ -1352,17 +1399,77 @@ void ERI_RI_RHF::compute_steom_ccsd(int n_states) {
 void ERI_RI_RHF::compute_dlpno_steom_ccsd(int n_states) {
     std::cout << "\n==== DLPNO-STEOM-CCSD (hybrid bt-PNO-STEOM P5b) ====" << std::endl;
 
-    // Stage 1: DLPNO-CCSD ground state → back-transform → stash on HF.
-    std::cout << "---- DLPNO-STEOM stage 1: DLPNO-CCSD ground state (back-transformed to canonical) ----" << std::endl;
-    rhf_.set_collect_dlpno_bt(true);
-    const real_t E_dlpno = compute_dlpno_ccsd();
-    rhf_.set_collect_dlpno_bt(false);
-    rhf_.set_post_hf_energy(E_dlpno);  // report the DLPNO-CCSD ground-state correlation
-    if (!rhf_.use_dlpno_amplitudes()) {
-        throw std::runtime_error(
-            "DLPNO-STEOM-CCSD: DLPNO-CCSD did not produce back-transformed canonical "
-            "amplitudes (collect path failed). Check the DLPNO-CCSD run.");
+    // MPI Step 4 stage-1 broadcast (OPT-IN, GANSU_STEOM_STAGE1_BCAST=1): rank 0
+    // alone computes the DLPNO-CCSD ground at full node threads while rank 1
+    // waits, then ships the canonical ground state so rank 1 skips stage-1 —
+    // removing the redundant stage-1 that otherwise runs at half threads on both
+    // ranks and eats the IP||EA win. ⚠ INCOMPLETE: the NATIVE EOM operators also
+    // need the per-pair DLPNO state (dlpno_res_, set_dlpno_res) which is NOT yet
+    // transferred (DLPNOLMP2Result + phase24 serialization, TODO). Until then this
+    // flag errors with the canonical-skip native path; default OFF keeps the
+    // validated redundant-stage-1 behavior. See MPI_DESIGN.md.
+    int mpi_rank = 0, mpi_size = 1;
+    bool stage1_bcast = false;
+#ifdef GANSU_MPI
+    { int inited = 0; MPI_Initialized(&inited);
+      if (inited) { MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank); MPI_Comm_size(MPI_COMM_WORLD, &mpi_size); } }
+    if (mpi_size > 1) {
+        const char* es = std::getenv("GANSU_STEOM_MPI_SPLIT");
+        const char* eb = std::getenv("GANSU_STEOM_STAGE1_BCAST");
+        stage1_bcast = (es && es[0] == '1') && (eb && eb[0] == '1');
     }
+    // With the broadcast on, ranks >= 2 take no part — skip the whole post-HF.
+    if (stage1_bcast && mpi_rank >= 2) {
+        std::cout << "  [STEOM MPI] rank " << mpi_rank
+                  << " idle for DLPNO-STEOM (stage-1 broadcast: ranks 0,1 only)." << std::endl;
+        return;
+    }
+#endif
+
+    real_t E_dlpno = 0.0;
+    if (!stage1_bcast || mpi_rank == 0) {
+        // Stage 1 on rank 0 (or whenever the broadcast is off → all ranks compute).
+        std::cout << "---- DLPNO-STEOM stage 1: DLPNO-CCSD ground state (back-transformed to canonical)"
+                  << (stage1_bcast ? " [rank 0, full-thread; rank 1 waits]" : "") << " ----" << std::endl;
+#if defined(GANSU_MPI) && defined(_OPENMP)
+        const int omp_overlap = omp_get_max_threads();   // per-rank cap (launcher) for IP||EA overlap
+        if (stage1_bcast) {
+            const int full = omp_get_num_procs();        // rank 1 idle → rank 0 takes all cores
+            omp_set_num_threads(full);
+            if (openblas_set_num_threads) openblas_set_num_threads(full);
+        }
+#endif
+        rhf_.set_collect_dlpno_bt(true);
+        E_dlpno = compute_dlpno_ccsd();
+        rhf_.set_collect_dlpno_bt(false);
+        rhf_.set_post_hf_energy(E_dlpno);
+        if (!rhf_.use_dlpno_amplitudes()) {
+            throw std::runtime_error(
+                "DLPNO-STEOM-CCSD: DLPNO-CCSD did not produce back-transformed canonical "
+                "amplitudes (collect path failed). Check the DLPNO-CCSD run.");
+        }
+#if defined(GANSU_MPI) && defined(_OPENMP)
+        if (stage1_bcast) {   // back to per-rank threads for the upcoming IP||EA overlap
+            omp_set_num_threads(omp_overlap);
+            if (openblas_set_num_threads) openblas_set_num_threads(omp_overlap);
+        }
+#endif
+#ifdef GANSU_MPI
+        if (stage1_bcast) {
+            send_ground_state(rhf_, E_dlpno, 1);
+            std::cout << "  [STEOM MPI] rank 0 sent DLPNO ground (C/eps/T1/T2) to rank 1 — "
+                         "stage-1 not duplicated. ⚠ dlpno_res_ NOT sent (native EOM TODO)." << std::endl;
+        }
+#endif
+    }
+#ifdef GANSU_MPI
+    else {   // rank 1: skip stage-1, adopt rank 0's ground state
+        std::cout << "---- DLPNO-STEOM stage 1: SKIPPED on rank 1 (adopting rank 0's ground) ----" << std::endl;
+        E_dlpno = recv_ground_state(rhf_, 0);
+        rhf_.set_post_hf_energy(E_dlpno);
+        std::cout << "  [STEOM MPI] rank 1 received DLPNO ground from rank 0 (stage-1 skipped)." << std::endl;
+    }
+#endif
     std::cout << "  DLPNO-CCSD correlation energy = " << std::fixed << std::setprecision(10)
               << E_dlpno << " Ha  (fed to the canonical STEOM machinery)" << std::endl;
 
