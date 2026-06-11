@@ -217,12 +217,24 @@ constexpr int STEOM_BARH_TAG = 0x57B6;
 // Handshake: dims are sent UNCONDITIONALLY (nvir==0 signals "no EA bar-H", e.g.
 // build_dressed was skipped); the NCCL tensor transfer happens only when both
 // ranks agree nvir>0. This keeps send/recv matched and deadlock-free.
+// After dims, the receiver replies with a 1-int status (1=buffers allocated OK,
+// 0=alloc failed / no transfer). The sender only enters the NCCL group when the
+// receiver is ready, so an OOM at the receiver becomes a clean skip on BOTH
+// ranks instead of a deadlock (NCCL send blocked forever on a recv that the
+// OOM'd rank never posts).
 void send_ea_barh(const SteomBarHCache& cache, int dest) {
     const bool ok = cache.has_ea && cache.d_Wvovv && cache.d_Wvvvo && cache.nvir > 0;
     int dims[3] = { ok ? cache.nocc : 0, ok ? cache.nvir : 0,
                     cache.canonical_skip_wvvvv ? 1 : 0 };
     MPI_Send(dims, 3, MPI_INT, dest, STEOM_BARH_TAG, MPI_COMM_WORLD);
     if (!ok) return;
+    int rx_ready = 0;
+    MPI_Recv(&rx_ready, 1, MPI_INT, dest, STEOM_BARH_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    if (!rx_ready) {
+        std::cout << "  [STEOM MPI] rank " << dest << " could not allocate EA bar-H "
+                     "(OOM) — transfer skipped (rank 0 will rebuild)." << std::endl;
+        return;
+    }
     const size_t n = (size_t)cache.nvir * cache.nvir * cache.nvir * cache.nocc;
     auto& mgr = MultiGpuManager::instance();
     nccl::group_start();
@@ -239,9 +251,20 @@ void recv_ea_barh(SteomBarHCache& cache, int src) {
     const bool skip = dims[2] != 0;
     if (nvir == 0) return;   // sender had no EA bar-H → cache stays incomplete (STEOM rebuilds)
     const size_t n = (size_t)nvir * nvir * nvir * nocc;
+    // Try to allocate the receive buffers; on OOM, tell the sender to skip so it
+    // does not block forever in its NCCL send.
     real_t* d_Wvovv = nullptr; real_t* d_Wvvvo = nullptr;
-    tracked_cudaMalloc(&d_Wvovv, n * sizeof(real_t));
-    tracked_cudaMalloc(&d_Wvvvo, n * sizeof(real_t));
+    int ready = 1;
+    try {
+        tracked_cudaMalloc(&d_Wvovv, n * sizeof(real_t));
+        tracked_cudaMalloc(&d_Wvvvo, n * sizeof(real_t));
+    } catch (...) {
+        if (d_Wvovv) { tracked_cudaFree(d_Wvovv); d_Wvovv = nullptr; }
+        if (d_Wvvvo) { tracked_cudaFree(d_Wvvvo); d_Wvvvo = nullptr; }
+        ready = 0;
+    }
+    MPI_Send(&ready, 1, MPI_INT, src, STEOM_BARH_TAG, MPI_COMM_WORLD);
+    if (!ready) return;   // cache stays incomplete → STEOM rebuilds (or errors cleanly)
     auto& mgr = MultiGpuManager::instance();
     nccl::group_start();
     nccl::recv(d_Wvovv, n, src, 0, mgr.comm_stream(0));
