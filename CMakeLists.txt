@@ -354,13 +354,15 @@ if(ENABLE_GPU)
     # Step 0: scaffolding only (MPI_Init/Finalize + rank accessors via mpi_env.hpp).
     # When OFF the binary is byte-identical to the non-MPI build.
     if(ENABLE_MPI)
-        # mpi_env.hpp uses only the C MPI API (MPI_Init/MPI_Comm_rank/...), so
-        # require just the C component. This avoids the deprecated C++ bindings
-        # (MPI::MPI_CXX), which some OpenMPI packages register with a phantom
-        # include path that breaks FindMPI's try_compile.
-        find_package(MPI REQUIRED COMPONENTS C)
+        # We use only the C MPI API (MPI_Init/MPI_Comm_rank/...), but request the
+        # CXX component because the project enables CUDA+CXX (not C); FindMPI's
+        # COMPONENTS must match an enabled language. MPI::MPI_CXX provides the C
+        # MPI headers/libs for C++/CUDA translation units. (We never use the
+        # deprecated C++ MPI bindings.) Requires the MPI dev headers
+        # (e.g. libopenmpi-dev) to be installed.
+        find_package(MPI REQUIRED COMPONENTS CXX)
         target_compile_definitions(gansu PUBLIC GANSU_MPI)
-        target_link_libraries(gansu MPI::MPI_C)
+        target_link_libraries(gansu MPI::MPI_CXX)
         message(STATUS "MPI scale-out enabled: ${MPIEXEC_EXECUTABLE}")
     endif()
 endif()

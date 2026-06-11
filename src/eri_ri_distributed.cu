@@ -156,10 +156,20 @@ ERI_RI_Distributed_RHF::ERI_RI_Distributed_RHF(RHF& rhf, const Molecular& auxili
 
     naux_local_.resize(num_gpus_);
     P_start_.resize(num_gpus_);
-    for (int d = 0; d < num_gpus_; d++) {
-        auto [start, end] = aux_partition(num_auxiliary_basis_, num_gpus_, d);
-        P_start_[d] = start;
-        naux_local_[d] = (int)(end - start);
+    if (mgr.is_mpi()) {
+        // MPI mode: this rank owns a single local GPU (num_gpus_ == 1) and a
+        // single aux slab. The aux axis is partitioned across WORLD RANKS, not
+        // local devices; the world NCCL comm sums the per-rank J/K contributions.
+        // Every device-loop below runs once on this rank's GPU.
+        auto [start, end] = aux_partition(num_auxiliary_basis_, mgr.world_size(), mgr.world_rank());
+        P_start_[0] = start;
+        naux_local_[0] = (int)(end - start);
+    } else {
+        for (int d = 0; d < num_gpus_; d++) {
+            auto [start, end] = aux_partition(num_auxiliary_basis_, num_gpus_, d);
+            P_start_[d] = start;
+            naux_local_[d] = (int)(end - start);
+        }
     }
 
     d_B_local_.resize(num_gpus_, nullptr);
@@ -169,10 +179,16 @@ ERI_RI_Distributed_RHF::ERI_RI_Distributed_RHF(RHF& rhf, const Molecular& auxili
     d_X_local_.resize(num_gpus_, nullptr);
     d_X_packed_local_.resize(num_gpus_, nullptr);
 
-    std::cout << "[RI-Distributed] " << num_gpus_ << " GPUs, naux=" << num_auxiliary_basis_;
-    for (int d = 0; d < num_gpus_; d++)
-        std::cout << " [" << d << "]:" << naux_local_[d];
-    std::cout << std::endl;
+    if (mgr.is_mpi()) {
+        if (mgr.world_rank() == 0)
+            std::cout << "[RI-Distributed] " << mgr.world_size() << " MPI rank(s) x 1 GPU, naux="
+                      << num_auxiliary_basis_ << " (~" << naux_local_[0] << "/rank)" << std::endl;
+    } else {
+        std::cout << "[RI-Distributed] " << num_gpus_ << " GPUs, naux=" << num_auxiliary_basis_;
+        for (int d = 0; d < num_gpus_; d++)
+            std::cout << " [" << d << "]:" << naux_local_[d];
+        std::cout << std::endl;
+    }
 }
 
 ERI_RI_Distributed_RHF::~ERI_RI_Distributed_RHF() {
@@ -859,6 +875,15 @@ void ERI_RI_Distributed_RHF::compute_fock_matrix() {
             }
         }
 
+        // MPI: every rank must contract its aux slab against the SAME density
+        // (rank 0's), so the AllReduce over rank slabs reconstructs the correct
+        // global J/K. Broadcast rank 0's D into every rank's buffer.
+        if (mgr.is_mpi()) {
+            MultiGpuManager::DeviceGuard guard(0);
+            nccl::broadcast(d_D[0], nbas2, 0, 0, mgr.comm_stream(0));
+            cudaStreamSynchronize(mgr.comm_stream(0));
+        }
+
         // ---- Distributed J build (same as coefficient-based path) ----
         for (int d = 0; d < num_gpus_; d++) {
             MultiGpuManager::DeviceGuard guard(d);
@@ -971,6 +996,16 @@ void ERI_RI_Distributed_RHF::compute_fock_matrix() {
             cudaMemcpy(d_D[d], d_D_gpu0, nbas2 * sizeof(double), cudaMemcpyDefault);
             cudaMemcpy(d_C[d], d_C_gpu0, nbas2 * sizeof(double), cudaMemcpyDefault);
         }
+    }
+
+    // MPI: contract every rank's aux slab against rank 0's D and C, so the
+    // AllReduce over rank slabs reconstructs the correct global J (from D) and
+    // K (from C). Broadcast rank 0's copies into every rank.
+    if (mgr.is_mpi()) {
+        MultiGpuManager::DeviceGuard guard(0);
+        nccl::broadcast(d_D[0], nbas2, 0, 0, mgr.comm_stream(0));
+        nccl::broadcast(d_C[0], nbas2, 0, 0, mgr.comm_stream(0));
+        cudaStreamSynchronize(mgr.comm_stream(0));
     }
 
     // ---- J build ----

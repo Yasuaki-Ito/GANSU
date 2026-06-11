@@ -122,12 +122,16 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
                 mgr.initialize(num_gpus);
             }
             std::cout << "[RI] " << mgr.num_devices() << " device(s)" << std::endl;
-            if (mgr.num_devices() == 1) {
-                // Single GPU: avoid the distributed class entirely so that
-                // analytical paths needing the full B matrix (e.g. RI gradient)
-                // can use it directly. The lightweight constructor used by
-                // ERI_RI_Distributed_RHF leaves intermediate_matrix_B_ as a 1x1
+            if (mgr.num_devices() == 1 && !mgr.is_mpi()) {
+                // Single GPU, single process: avoid the distributed class entirely
+                // so that analytical paths needing the full B matrix (e.g. RI
+                // gradient) can use it directly. The lightweight constructor used
+                // by ERI_RI_Distributed_RHF leaves intermediate_matrix_B_ as a 1x1
                 // dummy, which breaks the single-GPU RI gradient path.
+                //
+                // Under MPI each rank has one local GPU (num_devices()==1) but the
+                // aux axis is distributed across ranks, so we DO want the
+                // distributed class (partitioned over world ranks).
                 set_eri_method(std::make_unique<ERI_RI_RHF>(*this, auxiliary_molecular));
             } else {
                 auto eri = std::make_unique<ERI_RI_Distributed_RHF>(*this, auxiliary_molecular);

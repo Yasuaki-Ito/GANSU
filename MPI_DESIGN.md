@@ -217,8 +217,44 @@ mpirun -np 4 --bind-to none ../script/gansu_mpi.sh ./gansu -x ../xyz/H2O.xyz -g 
 **不変条件**: `is_mpi()` でない実行（`-np 1`/非MPI）は NCCL 経路が従来 `ncclCommInitAll` のまま = 既存
 single-process multi-GPU（`--num_gpus`）挙動不変。MPI self-test/print は rank0 のみで stdout 汚染最小。
 
-### Step 2 以降 — 未着手
-- Step 2: 分散 RI を world-rank 分割（`aux_partition(global, world_size, world_rank)` + AllReduce）。
+### Step 2 — 分散 RI（GPU_Resident `ri`）の MPI 化 ✅ VALIDATED（2026-06-11）
+検証: naux=96 を 4 rank に 24/rank 分散。**MPI 4-rank energy -76.02447525885835944 == 単一プロセス
+4-GPU (b) 完全一致**、rank 間 ~1e-13、単一GPU (c) -...651203 は別RIパスで ~1e-12 差（想定内）。
+⚠ ビルド: `find_package(MPI COMPONENTS C)` は project が C 言語未有効化で「language C is not enabled」
+エラー → `COMPONENTS CXX` + `MPI::MPI_CXX` に修正（CUDA+CXX のみ有効、libopenmpi-dev 必須）。
+**設計の肝**: MPI モードでは各 rank の `mgr.num_devices()==1`。既存の「device ループ」(`for d in 0..num_gpus_`)
+は num_gpus_=1 で1回だけ回り、**aux 軸を world rank で分割**すれば、`nccl::all_reduce(..., device_id=0, ...)`
+が world comm 上で rank 間集約 → 既存ループ構造のまま distributed 化。新カーネル不要。
+- `src/rhf.cu`（`ri` site）: `num_devices()==1 && !is_mpi()` のみ単一GPU `ERI_RI_RHF`。MPI 時は
+  `ERI_RI_Distributed_RHF`（local 1 GPU だが aux を world 分散）。
+- `src/eri_ri_distributed.cu` ctor: `is_mpi()` 時 `aux_partition(naux, world_size, world_rank)` で自 rank の
+  aux slab のみ確保（`P_start_[0]`/`naux_local_[0]`）。print も rank0 のみ world サマリ。
+- `compute_fock_matrix`（GPU_Resident、density-based + coefficient-based 両 branch）: J/K build 前に
+  **rank0 の D（と C）を `nccl::broadcast`** → 全 rank が一貫密度で自 slab を contract → AllReduce で
+  正しい global J/K 再構成。AllReduce は既存コードが world comm で自動集約。
+- B_local build（`distributed_build_B`）は各 rank が自 L_inv 行 slice で自 slab を独立構築（cross-rank 不要）。
+
+**カバー範囲**: `--eri_method ri`（GPU_Resident、DLPNO/STEOM の RI 土台）の **SCF Fock build** のみ。
+OnTheFly（direct_ri/semi_direct_ri）/OutOfCore の fock build と post-HF の RI 利用は別構造 → Step 2b/3-4。
+
+**リモート検証（user）**:
+```bash
+cd build && cmake .. -DENABLE_MULTI_GPU=ON -DENABLE_MPI=ON && make
+AUX=../auxiliary_basis/cc-pvdz-rifit.gbs
+# (a) MPI 4 rank 分散 RI
+mpirun -np 4 --bind-to none ../script/gansu_mpi.sh ./gansu -x ../xyz/H2O.xyz -g cc-pvdz \
+  --eri_method ri -ag $AUX -m RHF 2>&1 | grep -E 'RI-Distributed|Total Energy'
+# (b) 参照: 単一プロセス 4-GPU（既存 distributed）
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --eri_method ri -ag $AUX --num_gpus 4 -m RHF | grep 'Total Energy'
+# (c) 参照: 単一 GPU
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --eri_method ri -ag $AUX --num_gpus 1 -m RHF | grep 'Total Energy'
+# 期待: (a) の 4 行 energy が互いに一致、かつ (b)(c) と ~1e-10 で一致。
+#       [RI-Distributed] 4 MPI rank(s) x 1 GPU, naux=... (~.../rank)
+```
+**注**: 内部 print（`[RI-Dist] Building B_local on 1 GPUs ...` 等）は num_gpus_=1 を参照するため各 rank で
+出る（4× noisy、grep 推奨）。energy が一致すれば Step 2 完了。大分子は OutOfCore 自動切替に注意（Step 2b 範囲）。
+
+### Step 3 以降 — 未着手
 - Step 3: stage-1 DLPNO-CCSD の pair を world rank 分配。Step 4: STEOM rank0=IP/rank1=EA。Step 5: multi-node。
 
 ---
