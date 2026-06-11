@@ -83,11 +83,20 @@ public:
      */
     void finalize();
 
-    /// Number of active GPU devices.
+    /// Number of active GPU devices (per-process; 1 per rank in MPI mode).
     int num_devices() const { return num_devices_; }
 
-    /// Whether multi-GPU mode is active (num_devices > 1).
+    /// Whether intra-process multi-GPU mode is active (num_devices > 1).
+    /// NOTE: false in MPI mode (each rank owns a single GPU) — use is_mpi()
+    /// to detect cross-rank distribution.
     bool is_distributed() const { return num_devices_ > 1; }
+
+    /// This process's rank in MPI_COMM_WORLD (0 in non-MPI / single-rank runs).
+    int world_rank() const { return world_rank_; }
+    /// Total number of MPI ranks (1 in non-MPI / single-rank runs).
+    int world_size() const { return world_size_; }
+    /// Whether running under MPI with more than one rank (cross-rank NCCL world).
+    bool is_mpi() const { return world_size_ > 1; }
 
     /// cuBLAS handle for device d.
     cublasHandle_t cublas(int d) const { return cublas_handles_[d]; }
@@ -141,6 +150,8 @@ private:
 
     bool initialized_ = false;
     int num_devices_ = 0;
+    int world_rank_ = 0;   ///< MPI world rank (0 if not under MPI).
+    int world_size_ = 1;   ///< MPI world size (1 if not under MPI).
 
     std::vector<cublasHandle_t> cublas_handles_;
     std::vector<cusolverDnHandle_t> cusolver_handles_;

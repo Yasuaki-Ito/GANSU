@@ -23,6 +23,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <memory>
@@ -36,6 +37,7 @@
 #include "spherical_transform.hpp"
 #include "builder.hpp"
 #include "gpu_manager.hpp"
+#include "mpi_env.hpp"
 #ifdef GANSU_MULTI_GPU
 #include "multi_gpu_manager.hpp"
 #endif
@@ -87,6 +89,25 @@ static std::string resolve_basis_path(const std::string& name_or_path, const cha
  * @details This function reads the command line arguments and calls the RHF or UHF class.
  */
 int main(int argc, char* argv[]){
+  // MPI runtime (MPI + NCCL hybrid scale-out, Step 0 — see MPI_DESIGN.md).
+  // RAII: MPI_Init here, MPI_Finalize on any return path out of main().
+  // In a non-MPI build this is an empty single-rank stub. GPU pinning is left
+  // to the launcher (CUDA_VISIBLE_DEVICES=$LOCAL_RANK), so each rank sees its
+  // GPU as device 0 and existing device-0 code runs per-rank unchanged.
+  MpiEnv mpi(argc, argv);
+#ifdef GANSU_MPI
+  // Rank banner — only when genuinely multi-rank, so -np 1 (and non-MPI
+  // builds) keep byte-identical stdout. Goes to stderr to avoid perturbing
+  // parsed stdout. CUDA_VISIBLE_DEVICES is set by the launcher per local rank.
+  if (mpi.is_mpi()) {
+      const char* vis = std::getenv("CUDA_VISIBLE_DEVICES");
+      std::cerr << "[MPI] rank " << mpi.world_rank() << "/" << mpi.world_size()
+                << " (local " << mpi.local_rank() << "/" << mpi.local_size()
+                << ", CUDA_VISIBLE_DEVICES=" << (vis ? vis : "<unset>") << ")"
+                << std::endl;
+  }
+#endif
+
   // Force line-buffered stdout (subprocess pipes default to full-buffered,
   // which delays progress output to the UI)
   setvbuf(stdout, NULL, _IOLBF, 0);
@@ -97,6 +118,7 @@ int main(int argc, char* argv[]){
     bool list_basis = false;
     bool dump_overlap_diag = false;
     bool test_spherical_transform = false;
+    bool mpi_selftest = false;
     std::string save_density_path, load_density_path;
     std::vector<char*> filtered_argv;
     filtered_argv.push_back(argv[0]);
@@ -104,6 +126,11 @@ int main(int argc, char* argv[]){
         std::string arg(argv[i]);
         if (arg == "--cpu") {
             force_cpu = true;
+        } else if (arg == "--mpi_selftest") {
+            // Force MultiGpuManager init early (MPI mode) so the cross-rank NCCL
+            // AllReduce self-test runs even for calc paths that never init
+            // multi-GPU (e.g. stored-ERI RHF). Step 1 validation hook.
+            mpi_selftest = true;
         } else if (arg == "--list-basis") {
             list_basis = true;
         } else if (arg == "--test_spherical_transform") {
@@ -129,6 +156,16 @@ int main(int argc, char* argv[]){
         }
     }
     int filtered_argc = (int)filtered_argv.size();
+
+#ifdef GANSU_MULTI_GPU
+    // Step 1 validation hook: force MultiGpuManager init so the MPI-mode
+    // cross-rank NCCL AllReduce self-test runs deterministically.
+    if (mpi_selftest) {
+        MultiGpuManager::instance().initialize();
+    }
+#else
+    (void)mpi_selftest;
+#endif
 
     // --test_spherical_transform: standalone verification of U_d S_cart U_d^T = I_5.
     if (test_spherical_transform) {
