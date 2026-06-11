@@ -53,6 +53,15 @@
 #ifdef GANSU_MPI
 #include <mpi.h>
 #endif
+#if defined(GANSU_MPI) && defined(GANSU_MULTI_GPU)
+#include "nccl_comm.hpp"          // also pulls in multi_gpu_manager.hpp
+#include "steom_barh_cache.hpp"
+#endif
+#if defined(GANSU_MPI) && defined(_OPENMP)
+#include <omp.h>
+// OpenBLAS thread cap (weak: no-op if not linked against OpenBLAS).
+extern "C" void openblas_set_num_threads(int) __attribute__((weak));
+#endif
 
 namespace gansu {
 
@@ -195,6 +204,58 @@ void recv_cis_nto(CISNTOResult& cis, int src) {
     cis.report.resize((size_t)std::max(0, rlen));
     if (rlen > 0) MPI_Recv(&cis.report[0], rlen, MPI_CHAR, src, STEOM_CIS_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 }
+
+#ifdef GANSU_MULTI_GPU
+// --- Step 4b: EA bar-H device-tensor hand-off (rank 1 → rank 0, NCCL) ---------
+// Ships the 2 EA-side dressed bar-H tensors (Wvovv, Wvvvo; each [nvir³·nocc])
+// from rank 1's cache to rank 0 so rank 0's STEOM borrows all 11 and skips its
+// bar-H rebuild — restoring the share-barH fast path under the IP||EA split.
+// Wvvvv is nullptr under canonical-skip (the DLPNO-STEOM production path) and is
+// not transferred. dims go over MPI (host), the tensors over the NCCL world comm.
+constexpr int STEOM_BARH_TAG = 0x57B6;
+
+// Handshake: dims are sent UNCONDITIONALLY (nvir==0 signals "no EA bar-H", e.g.
+// build_dressed was skipped); the NCCL tensor transfer happens only when both
+// ranks agree nvir>0. This keeps send/recv matched and deadlock-free.
+void send_ea_barh(const SteomBarHCache& cache, int dest) {
+    const bool ok = cache.has_ea && cache.d_Wvovv && cache.d_Wvvvo && cache.nvir > 0;
+    int dims[3] = { ok ? cache.nocc : 0, ok ? cache.nvir : 0,
+                    cache.canonical_skip_wvvvv ? 1 : 0 };
+    MPI_Send(dims, 3, MPI_INT, dest, STEOM_BARH_TAG, MPI_COMM_WORLD);
+    if (!ok) return;
+    const size_t n = (size_t)cache.nvir * cache.nvir * cache.nvir * cache.nocc;
+    auto& mgr = MultiGpuManager::instance();
+    nccl::group_start();
+    nccl::send(cache.d_Wvovv, n, dest, 0, mgr.comm_stream(0));
+    nccl::send(cache.d_Wvvvo, n, dest, 0, mgr.comm_stream(0));
+    nccl::group_end();
+    cudaStreamSynchronize(mgr.comm_stream(0));
+}
+
+void recv_ea_barh(SteomBarHCache& cache, int src) {
+    int dims[3];
+    MPI_Recv(dims, 3, MPI_INT, src, STEOM_BARH_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    const int nocc = dims[0], nvir = dims[1];
+    const bool skip = dims[2] != 0;
+    if (nvir == 0) return;   // sender had no EA bar-H → cache stays incomplete (STEOM rebuilds)
+    const size_t n = (size_t)nvir * nvir * nvir * nocc;
+    real_t* d_Wvovv = nullptr; real_t* d_Wvvvo = nullptr;
+    tracked_cudaMalloc(&d_Wvovv, n * sizeof(real_t));
+    tracked_cudaMalloc(&d_Wvvvo, n * sizeof(real_t));
+    auto& mgr = MultiGpuManager::instance();
+    nccl::group_start();
+    nccl::recv(d_Wvovv, n, src, 0, mgr.comm_stream(0));
+    nccl::recv(d_Wvvvo, n, src, 0, mgr.comm_stream(0));
+    nccl::group_end();
+    cudaStreamSynchronize(mgr.comm_stream(0));
+    cache.d_Wvovv = d_Wvovv;
+    cache.d_Wvvvo = d_Wvvvo;
+    cache.d_Wvvvv = nullptr;   // canonical-skip
+    cache.canonical_skip_wvvvv = skip;
+    if (cache.nocc == 0) { cache.nocc = nocc; cache.nvir = nvir; }
+    cache.has_ea = true;
+}
+#endif // GANSU_MULTI_GPU
 
 }  // anonymous namespace
 #endif // GANSU_MPI
@@ -373,25 +434,36 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         mpi_steom = (e && e[0] == '1');
     }
 #endif
+    // Step 4b: with NCCL available, rank 1 ships its EA bar-H to rank 0 so
+    // share-barH stays ON (rank 0 borrows, no ~30s rebuild). Without NCCL we
+    // fall back to Step 4a Option A (share OFF, rank 0 rebuilds).
+    bool mpi_barh_xfer = false;
+#if defined(GANSU_MPI) && defined(GANSU_MULTI_GPU)
+    mpi_barh_xfer = mpi_steom;
+#endif
 
     {
         const char* env     = std::getenv("GANSU_STEOM_SHARE_BARH");
         const char* env_bal = std::getenv("GANSU_STEOM_OPERATOR_DEVICE_BALANCING");
         const bool balancing = (env_bal && env_bal[0] == '1');
-        // Step 4a (Option A): under MPI the IP and EA operators run on DIFFERENT
-        // ranks, so rank 0's STEOM cannot borrow rank 1's EA bar-H (it lives in a
-        // separate process). Force share-barH OFF → rank 0 rebuilds all 11 bar-H
-        // itself (it has the CCSD ground + active space + received EA result).
-        // Step 4b will NCCL-transfer the EA bar-H to re-enable the share.
-        const bool share = (!env || env[0] != '0') && !balancing && !mpi_steom;
+        // Under MPI the IP and EA operators run on DIFFERENT ranks. Step 4b: when
+        // NCCL is available, rank 1 ships its EA bar-H to rank 0 (recv_ea_barh
+        // below) so share-barH stays ON and rank 0 borrows all 11 — no rebuild.
+        // Without NCCL (mpi_barh_xfer false) we fall back to Option A: share OFF,
+        // rank 0 rebuilds its bar-H from the CCSD ground + active space.
+        const bool share = (!env || env[0] != '0') && !balancing
+                           && (!mpi_steom || mpi_barh_xfer);
         rhf.set_steom_share_barh(share);
-        if (share)
+        if (share && mpi_steom)
+            std::cout << "  [STEOM share-barH] ON (MPI IP||EA split + Step 4b: rank 1 "
+                         "NCCL-transfers EA bar-H to rank 0, which borrows all 11)." << std::endl;
+        else if (share)
             std::cout << "  [STEOM share-barH] ON (default; GANSU_STEOM_SHARE_BARH=0 to "
                          "disable) — IP/EA publish dressed bar-H, STEOM borrows "
                          "(skips its build_dressed)." << std::endl;
         else if (mpi_steom)
-            std::cout << "  [STEOM share-barH] OFF (MPI IP||EA split → EA bar-H lives on "
-                         "rank 1; rank 0 rebuilds. Step 4b will NCCL-transfer it)." << std::endl;
+            std::cout << "  [STEOM share-barH] OFF (MPI IP||EA split, no NCCL → rank 0 "
+                         "rebuilds bar-H locally; Option A)." << std::endl;
         else if (balancing)
             std::cout << "  [STEOM share-barH] OFF (device-balancing on → cross-device "
                          "bar-H borrow unverified; per-operator build retained)." << std::endl;
@@ -464,6 +536,16 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     if (mpi_steom) {
         if (mpi_rank == 1) {
             send_ea_result(rhf.get_ea_eom_result(), 0);
+#ifdef GANSU_MULTI_GPU
+            // Step 4b: ship EA bar-H so rank 0 borrows (no rebuild), then free
+            // this rank's cache (it owns the published EA tensors; rank 0 keeps
+            // its own received copies).
+            if (mpi_barh_xfer) {
+                send_ea_barh(rhf.steom_barh_cache(), 0);
+                std::cout << "  [STEOM MPI] rank 1 sent EA bar-H (Wvovv/Wvvvo) to rank 0." << std::endl;
+                rhf.steom_barh_cache().free();
+            }
+#endif
             std::cout << "  [STEOM MPI] rank 1 sent EA result ("
                       << rhf.get_ea_eom_result().per_active.size()
                       << " active roots) to rank 0; stage-2 done." << std::endl;
@@ -474,6 +556,30 @@ static void compute_steom_ccsd_impl(RHF& rhf,
             std::cout << "  [STEOM MPI] rank 0 received EA result ("
                       << ea.per_active.size() << " active roots) from rank 1." << std::endl;
             rhf.set_ea_eom_result(std::move(ea));
+#ifdef GANSU_MULTI_GPU
+            // Step 4b: receive rank 1's EA bar-H into rank 0's cache so STEOM
+            // borrows all 11 (rank 0's IP already published its 8) — no rebuild.
+            if (mpi_barh_xfer) {
+                recv_ea_barh(rhf.steom_barh_cache(), 1);
+                std::cout << "  [STEOM MPI] rank 0 received EA bar-H from rank 1"
+                          << (rhf.steom_barh_cache().complete()
+                                  ? " → cache complete, STEOM borrows (no rebuild)."
+                                  : " (incomplete → STEOM rebuilds).") << std::endl;
+            }
+#endif
+#if defined(_OPENMP)
+            // rank 1 has returned (sent its results) — its CPU share is now free.
+            // The STEOM build (G^{1h1p} dressing + geev) is host-heavy; bump rank 0
+            // back to the full node so it isn't starved by the per-rank thread cap
+            // used during the IP||EA overlap (launcher sets OMP=ncores/local_size).
+            {
+                const int full = omp_get_num_procs();
+                omp_set_num_threads(full);
+                if (openblas_set_num_threads) openblas_set_num_threads(full);
+                std::cout << "  [STEOM MPI] rank 0 solo phase — threads bumped to "
+                          << full << " for the STEOM build." << std::endl;
+            }
+#endif
         }
     }
 #endif
