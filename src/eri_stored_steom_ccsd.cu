@@ -804,6 +804,21 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         ++e_eff;
     }
 
+    // Diagnostic — deterministic checksums of the raw IP/EA amplitudes the STEOM
+    // build consumes. Run twice: if these differ, the IP/EA eigenVECTORS are non-
+    // deterministic (disease upstream, in the EOM solve); if they are identical but
+    // ||G|| still differs, the non-determinism is in the STEOM build GEMMs.
+    {
+        auto nrm = [](const std::vector<real_t>& v){
+            long double s = 0.0L; for (real_t x : v) s += (long double)x * x;
+            return (double)std::sqrt(s); };
+        std::cout << "  [STEOM R] ||R1_IP||=" << std::setprecision(12) << nrm(h_R1_IP)
+                  << " ||R2_IP||=" << nrm(h_R2_IP)
+                  << " ||R1_EA||=" << nrm(h_R1_EA)
+                  << " ||R2_EA||=" << nrm(h_R2_EA)
+                  << std::defaultfloat << std::endl;
+    }
+
     // Primary assignment = per-root argmax|R1| (the validated path; bit-identical
     // to 0b/0c for non-degenerate cases). Only if argmax collides (two roots →
     // same MO → singular active R1) do we fall back to the collision-free greedy
@@ -1188,6 +1203,12 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     const int  dense_auto_max = 12000;  // total_dim threshold for auto dense (~5.8 GB at 12000)
     const bool force_dense    = (std::getenv("GANSU_STEOM_DENSE_DIAG") != nullptr);
     const bool force_davidson = (std::getenv("GANSU_STEOM_DAVIDSON")  != nullptr);
+    // Final non-Hermitian geev: GPU cusolverXgeev by default (fast). Eigen CPU geev
+    // is deterministic but O(n^3) single-threaded — far too slow at total_dim≈3500+
+    // to be a default. Opt into the deterministic CPU path with GANSU_STEOM_GEEV_HOST=1
+    // (only viable for small total_dim).
+    const char* geev_host_env = std::getenv("GANSU_STEOM_GEEV_HOST");
+    const bool  geev_host = (geev_host_env != nullptr) && (std::atoi(geev_host_env) != 0);
     const bool dense_diag = (steom_op.get_G_device() != nullptr)
                             && !force_davidson
                             && (force_dense || total_dim <= dense_auto_max);
@@ -1197,6 +1218,20 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 
     if (dense_diag) {
         const real_t min_eigenvalue = 0.0;  // STEOM excitation energies are positive
+
+        // Diagnostic — ‖G‖_F via a deterministic sequential host reduction. This
+        // checksum discriminates the two non-determinism sources: if ‖G‖ is bit-
+        // identical run-to-run but the roots differ, the geev (cusolverXgeev) is the
+        // culprit; if ‖G‖ itself differs, the G-build is non-deterministic.
+        {
+            std::vector<real_t> h_G((size_t)total_dim * total_dim);
+            cudaMemcpy(h_G.data(), steom_op.get_G_device(),
+                       h_G.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+            long double ss = 0.0L;
+            for (real_t v : h_G) ss += (long double)v * (long double)v;
+            std::cout << "  [STEOM diag] ||G||_F = " << std::setprecision(15)
+                      << (double)std::sqrt(ss) << std::defaultfloat << std::endl;
+        }
         // eigenDecompositionNonSymmetric expects column-major input. d_G_ is
         // row-major [total_dim × total_dim]; its linear buffer is exactly the
         // column-major storage of Gᵀ. eig(Gᵀ) == eig(G), so passing the buffer
@@ -1214,7 +1249,7 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         tracked_cudaMalloc(&d_all_evals, (size_t)total_dim * sizeof(real_t));
         tracked_cudaMalloc(&d_all_evecs, (size_t)total_dim * total_dim * sizeof(real_t));
 
-        int info = gpu::eigenDecompositionNonSymmetric(d_G_cm, d_all_evals, d_all_evecs, total_dim);
+        int info = gpu::eigenDecompositionNonSymmetric(d_G_cm, d_all_evals, d_all_evecs, total_dim, geev_host);
         if (info != 0) {
             std::cout << "Warning: STEOM dense diagonalization (geev) returned info="
                       << info << "." << std::endl;
@@ -1262,7 +1297,9 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 
         std::cout << "  STEOM-CCSD solve time: " << std::fixed << std::setprecision(3)
                   << solve_timer.elapsed_seconds() << " s "
-                  << "(dense non-Hermitian geev, deterministic; "
+                  << "(dense non-Hermitian geev on "
+                  << (geev_host ? "CPU/Eigen [deterministic]" : "GPU/cusolverXgeev")
+                  << "; "
                   << (force_dense ? "forced via GANSU_STEOM_DENSE_DIAG"
                                   : "auto: total_dim=" + std::to_string(total_dim)
                                     + " ≤ " + std::to_string(dense_auto_max))

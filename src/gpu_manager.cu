@@ -266,11 +266,11 @@ static void sort_eigenvalues_and_eigenvectors(
     }
 }
 
-int eigenDecompositionNonSymmetric(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size) {
+int eigenDecompositionNonSymmetric(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size, [[maybe_unused]] bool force_host) {
 #ifndef GANSU_CPU_ONLY
-    if (!gpu_available()) {
+    if (force_host || !gpu_available()) {
 #endif
-        // === Eigen CPU path ===
+        // === Eigen CPU path (deterministic; forced via force_host) ===
         std::vector<real_t> h_A((size_t)size * size);
         cudaMemcpy(h_A.data(), d_matrix, (size_t)size * size * sizeof(real_t), cudaMemcpyDeviceToHost);
 

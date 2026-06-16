@@ -45,9 +45,12 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <ostream>
 #include <stdexcept>
 #include <vector>
+
+#include <Eigen/Dense>   // Layer 2: SVD pseudo-inverse + conditioning of active R1 (U)
 
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
@@ -3199,47 +3202,49 @@ void STEOMCCSDOperator::build_dressed_intermediates() {
 // ==================================================================
 namespace {
 
-void invert_small_matrix_inplace(real_t* A, int n) {
-    // Gauss-Jordan elimination with partial pivoting on the augmented
-    // [A | I] system. Operates in row-major layout. n is expected ≤ ~32.
-    std::vector<real_t> aug((size_t)n * 2 * n, 0.0);
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) aug[(size_t)i * 2 * n + j] = A[(size_t)i * n + j];
-        aug[(size_t)i * 2 * n + (n + i)] = real_t(1.0);
-    }
-    for (int col = 0; col < n; ++col) {
-        // Pivot: find row with max |aug[row, col]| at row ≥ col.
-        int piv = col;
-        real_t best = std::fabs(aug[(size_t)col * 2 * n + col]);
-        for (int row = col + 1; row < n; ++row) {
-            real_t v = std::fabs(aug[(size_t)row * 2 * n + col]);
-            if (v > best) { best = v; piv = row; }
-        }
-        if (best < 1e-14) {
-            throw std::runtime_error(
-                "STEOMCCSDOperator::build_x_matrices: active R1 matrix is "
-                "singular (likely degenerate roots or pathological NTO mixing)");
-        }
-        if (piv != col) {
-            for (int j = 0; j < 2 * n; ++j)
-                std::swap(aug[(size_t)col * 2 * n + j], aug[(size_t)piv * 2 * n + j]);
-        }
-        // Normalize pivot row.
-        real_t inv_pivot = real_t(1.0) / aug[(size_t)col * 2 * n + col];
-        for (int j = 0; j < 2 * n; ++j) aug[(size_t)col * 2 * n + j] *= inv_pivot;
-        // Eliminate other rows.
-        for (int row = 0; row < n; ++row) {
-            if (row == col) continue;
-            real_t factor = aug[(size_t)row * 2 * n + col];
-            if (factor == 0.0) continue;
-            for (int j = 0; j < 2 * n; ++j)
-                aug[(size_t)row * 2 * n + j] -= factor * aug[(size_t)col * 2 * n + j];
-        }
-    }
-    // Copy inverse out of augmented [A | A^{-1}].
+// Layer 2 — Moore-Penrose (pseudo)inverse of a small n×n matrix via SVD, written
+// back in place (row-major). Returns the 2-norm condition number and numerical
+// rank so the caller can flag an ill-conditioned / rank-deficient active R1 block.
+//
+// Rationale: the STEOM "signed unit matrix" renormalisation builds U = active R1
+// (U[m,μ] = r^(μ)_m) and X = U^{-1}; it is only well posed when the selected IP/EA
+// roots SPAN the active space (U full rank, modest condition number). The former
+// Gauss-Jordan inverse threw on |pivot|<1e-14 and otherwise returned an exploding
+// inverse for near-degenerate (D2h) roots → corrupt Ŝ → spurious low STEOM roots.
+// The SVD pinv (a) never throws, (b) truncates genuine null directions instead of
+// dividing by ~0, and (c) exposes cond(U)/rank so a deficient active space (the
+// real defect, fixed by span-based root selection in Layer 1) is visible, not silent.
+// n is small (≤ ~32) so the O(n^3) SVD is negligible.
+struct InvReport { double cond; int rank; };
+InvReport invert_small_matrix_inplace(real_t* A, int n) {
+    Eigen::MatrixXd M(n, n);
     for (int i = 0; i < n; ++i)
         for (int j = 0; j < n; ++j)
-            A[(size_t)i * n + j] = aug[(size_t)i * 2 * n + (n + j)];
+            M(i, j) = static_cast<double>(A[(size_t)i * n + j]);
+
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd(M, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    const Eigen::VectorXd& s = svd.singularValues();          // descending order
+    const double smax = (s.size() > 0) ? s(0)            : 0.0;
+    const double smin = (s.size() > 0) ? s(s.size() - 1) : 0.0;
+    const double tol  = smax * n * std::numeric_limits<double>::epsilon();
+
+    Eigen::VectorXd sinv(s.size());
+    int rank = 0;
+    for (int k = 0; k < s.size(); ++k) {
+        if (s(k) > tol) { sinv(k) = 1.0 / s(k); ++rank; }     // keep
+        else            { sinv(k) = 0.0;        }             // truncate null direction
+    }
+    const Eigen::MatrixXd pinv =
+        svd.matrixV() * sinv.asDiagonal() * svd.matrixU().transpose();
+
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j)
+            A[(size_t)i * n + j] = static_cast<real_t>(pinv(i, j));
+
+    InvReport rep;
+    rep.cond = (smin > 0.0) ? (smax / smin) : std::numeric_limits<double>::infinity();
+    rep.rank = rank;
+    return rep;
 }
 
 }  // namespace
@@ -3256,7 +3261,7 @@ void STEOMCCSDOperator::build_x_matrices(const real_t* h_R1_IP_amplitudes,
             h_X_IP[(size_t)m_NTO * n_act_occ_ + n_root] = r1[m_idx];
         }
     }
-    invert_small_matrix_inplace(h_X_IP.data(), n_act_occ_);
+    const InvReport rep_ip = invert_small_matrix_inplace(h_X_IP.data(), n_act_occ_);
     tracked_cudaMalloc(&d_X_IP_, (size_t)n_act_occ_ * n_act_occ_ * sizeof(real_t));
     if (!gpu::gpu_available()) {
         for (size_t i = 0; i < h_X_IP.size(); ++i) d_X_IP_[i] = h_X_IP[i];
@@ -3276,7 +3281,7 @@ void STEOMCCSDOperator::build_x_matrices(const real_t* h_R1_IP_amplitudes,
             h_X_EA[(size_t)e_NTO * n_act_vir_ + e_root] = r1[a_idx];
         }
     }
-    invert_small_matrix_inplace(h_X_EA.data(), n_act_vir_);
+    const InvReport rep_ea = invert_small_matrix_inplace(h_X_EA.data(), n_act_vir_);
     tracked_cudaMalloc(&d_X_EA_, (size_t)n_act_vir_ * n_act_vir_ * sizeof(real_t));
     if (!gpu::gpu_available()) {
         for (size_t i = 0; i < h_X_EA.size(); ++i) d_X_EA_[i] = h_X_EA[i];
@@ -3290,6 +3295,23 @@ void STEOMCCSDOperator::build_x_matrices(const real_t* h_R1_IP_amplitudes,
     std::cout << "  STEOM-CCSD X(MI)/X(EA) matrices built (CFOUR `renormalize`, "
               << "active R1 inverse, " << n_act_occ_ << "×" << n_act_occ_
               << " and " << n_act_vir_ << "×" << n_act_vir_ << ")." << std::endl;
+    std::cout << std::scientific << std::setprecision(2)
+              << "  [STEOM cond] active R1 (U): IP cond=" << rep_ip.cond
+              << " rank=" << rep_ip.rank << "/" << n_act_occ_
+              << " | EA cond=" << rep_ea.cond
+              << " rank=" << rep_ea.rank << "/" << n_act_vir_
+              << std::defaultfloat << std::endl;
+    if (rep_ip.rank < n_act_occ_ || rep_ea.rank < n_act_vir_ ||
+        rep_ip.cond > 1e8 || rep_ea.cond > 1e8) {
+        std::cout << "  [STEOM cond] WARNING: active R1 is "
+                  << ((rep_ip.rank < n_act_occ_ || rep_ea.rank < n_act_vir_)
+                          ? "RANK-DEFICIENT" : "ill-conditioned")
+                  << " — the selected IP/EA roots do not cleanly span the active "
+                     "space (near-degenerate D2h roots / dropped active root). "
+                     "STEOM roots from this run are unreliable; span-based root "
+                     "selection (Layer 1) is required for a correct active space."
+                  << std::endl;
+    }
 }
 
 
@@ -3611,6 +3633,30 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     std::vector<real_t> R2EA  = pull(d_R2_EA_, (size_t)NMv*NO*NV*NV);
     std::vector<real_t> XIP   = pull(d_X_IP_,  (size_t)NMo*NMo);
     std::vector<real_t> XEA   = pull(d_X_EA_,  (size_t)NMv*NMv);
+
+    // Diagnostic — checksums of every build input (bar-H + R2 + X). Run twice: any
+    // that differs pins its producer as the non-deterministic source; if ALL match
+    // but the outputs still differ, the non-determinism is in the build arithmetic.
+    {
+        auto nrm = [](const std::vector<real_t>& v){
+            long double s = 0.0L; for (real_t x : v) s += (long double)x * x;
+            return (double)std::sqrt(s); };
+        // Signed sum: sensitive to per-root sign/phase flips that the (sign-invariant)
+        // norm cannot see. If ssum differs run-to-run but nrm matches, the IP/EA
+        // eigenVECTOR phase is non-deterministic (the disease), not the magnitude.
+        auto ssum = [](const std::vector<real_t>& v){
+            long double s = 0.0L; for (real_t x : v) s += (long double)x; return (double)s; };
+        std::cout << std::setprecision(12)
+          << "  [STEOM barH] Fov=" << nrm(Fov) << " Loo=" << nrm(Loo) << " Lvv=" << nrm(Lvv)
+          << " Wooov=" << nrm(Wooov) << " Wvovv=" << nrm(Wvovv) << " Wovoo=" << nrm(Wovoo)
+          << " Wovov=" << nrm(Wovov) << " Wovvo=" << nrm(Wovvo) << " ERIov=" << nrm(ERIov) << "\n"
+          << "  [STEOM barH] R2IP=" << nrm(R2IP) << " R2EA=" << nrm(R2EA)
+          << " XIP=" << nrm(XIP) << " XEA=" << nrm(XEA) << "\n"
+          << "  [STEOM Rsgn] sumR2IP=" << ssum(R2IP) << " sumR2EA=" << ssum(R2EA)
+          << " sumXIP=" << ssum(XIP) << " sumXEA=" << ssum(XEA)
+          << " sumWovov=" << ssum(Wovov) << " sumWovvo=" << ssum(Wovvo)
+          << std::defaultfloat << std::endl;
+    }
 
     // ---- bar-H accessors (row-major natural order; see build_dressed_intermediates) ----
     auto fov  = [&](int k,int c){ return Fov[(size_t)k*NV+c]; };
@@ -4551,6 +4597,21 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         }
 
     bmark("phhp (UBMJC/UBKJE/UBMJE)");
+
+    // Diagnostic — checksums of the W^eff dressing arrays (the only non-bar-H part
+    // of g_phph/g_phhp). Run twice: if these differ, the dressing GEMMs/contractions
+    // are the non-deterministic step (their bar-H/R2 inputs are already deterministic).
+    {
+        auto nrm = [](const std::vector<real_t>& v){
+            long double s = 0.0L; for (real_t x : v) s += (long double)x * x;
+            return (double)std::sqrt(s); };
+        std::cout << std::setprecision(12)
+          << "  [STEOM U*] u_amci=" << nrm(u_amci) << " u_akei=" << nrm(u_akei)
+          << " u_amei=" << nrm(u_amei) << " u_bmjc=" << nrm(u_bmjc)
+          << " u_bkje=" << nrm(u_bkje) << " u_bmje=" << nrm(u_bmje)
+          << std::defaultfloat << std::endl;
+    }
+
     // ---- assemble g_phph[a,k,c,i] (Eq.59) and g_phhp[b,k,j,c] (Eq.63) ----
     std::vector<real_t> g_phph((size_t)NV*NO*NV*NO, 0.0);
     std::vector<real_t> g_phhp((size_t)NV*NO*NO*NV, 0.0);
@@ -4580,6 +4641,23 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
             GPHHP(b,kf,j,cf)+=UBMJE(b,m,j,e); }
 
     bmark("assemble g_phph/g_phhp");
+
+    // Diagnostic — deterministic checksums of the four G inputs. Run twice and
+    // compare: the input whose norm differs pins which producer is non-deterministic
+    // (Fvv/Foo ← build_F_eff; g_phph/g_phhp ← wovov/wovvo bar-H + W^eff dressing GEMMs).
+    {
+        auto nrm_vec = [](const std::vector<real_t>& v){
+            long double s = 0.0L; for (real_t x : v) s += (long double)x * x;
+            return (double)std::sqrt(s); };
+        long double sf = 0.0L; for (int i = 0; i < NV*NV; ++i) sf += (long double)Fvv[i]*Fvv[i];
+        long double so = 0.0L; for (int i = 0; i < NO*NO; ++i) so += (long double)Foo[i]*Foo[i];
+        std::cout << "  [STEOM build] ||Fvv||=" << std::setprecision(12) << (double)std::sqrt(sf)
+                  << " ||Foo||=" << (double)std::sqrt(so)
+                  << " ||g_phph||=" << nrm_vec(g_phph)
+                  << " ||g_phhp||=" << nrm_vec(g_phhp)
+                  << std::defaultfloat << std::endl;
+    }
+
     // ---- G^{1h1p} singlet: row=i*NV+a, col=j*NV+b ----
     //  G = F_eff_vv δ_ij − F_eff_oo δ_ab + 2 g_phhp[b,j,i,a] − g_phph[a,j,b,i]
     std::vector<real_t> Gmat((size_t)total_dim_*total_dim_, 0.0);

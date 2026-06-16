@@ -88,6 +88,15 @@ PNOResult build_pno_from_T(
     for (int kk = 0; kk < n_kept; ++kk) {
         const int src = n_pao - 1 - kk;
         d.col(kk) = V.col(src);
+        // Deterministic sign convention: force the largest-magnitude component of
+        // each PNO positive. The eigensolver leaves the eigenvector sign arbitrary;
+        // without this the PNO basis (and every quantity expressed in it — bar-H,
+        // EOM R2, ...) carries a run-to-run sign gauge that breaks STEOM
+        // reproducibility. Matches cis_nto_active_space.cu; math-inert for
+        // sign-covariant observables. (Does NOT address near-degenerate rotation.)
+        Eigen::Index rmax = 0;
+        d.col(kk).cwiseAbs().maxCoeff(&rmax);
+        if (d(rmax, kk) < 0.0) d.col(kk) *= -1.0;
         sum_occ += res.occupations[kk];
     }
     res.sum_occupations = sum_occ;

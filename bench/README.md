@@ -50,7 +50,7 @@ ORCA=/opt/orca6 bash bench/run_orca.sh rimp2       240
 Headers used (cc-pVDZ; frozen core = ORCA default = matches GANSU `--frozen_core auto`):
 `RHF RIJCOSX` / `RI-MP2 cc-pVDZ/C` / `DLPNO-CCSD cc-pVDZ/C` / `STEOM-DLPNO-CCSD cc-pVDZ/C nroots 5`.
 
-## 3. Comparison table
+## 3. Comparison table (wall time)
 
 ```bash
 python3 bench/parse_orca.py                         > bench/orca_bench.csv
@@ -58,6 +58,23 @@ python3 bench/parse_orca.py bench/gansu_bench.csv    > bench/compare.csv
 ```
 `compare.csv`: method, molecule, natoms, gansu_wall_s, orca_wall_s, speedup (orca/gansu),
 and status of each — so the **max size** per package = last `OK` row before OOM.
+
+## 4. STEOM accuracy table (excitation energies, eV)
+
+The *accuracy* counterpart to the wall-time table: pairs the STEOM excited-state
+energies GANSU and ORCA print for the same molecule, root by root. Run the same
+`dlpno_steom` jobs as above (§1, §2) so both `bench/logs/dlpno_steom_g*_*.log` and
+`bench/orca/inp/dlpno_steom__*.out` exist, then:
+```bash
+python3 bench/compare_steom_roots.py > bench/steom_roots.csv   # MAD/MAX summary → stderr
+```
+`steom_roots.csv`: molecule, natoms, state, gansu_k, gansu_eV, orca_iroot, orca_eV,
+diff_eV, abs_diff_meV. Roots are paired by ascending-energy position (state 1 = lowest).
+**Caveat**: near-degenerate states (D2h acenes — see the known STEOM root jitter) can
+reorder between packages, so an index pairing may misalign one pair; eyeball the table
+before trusting a single large `diff`. For deterministic GANSU roots add
+`GANSU_STEOM_DENSE_DIAG=1` (see §Notes). Keep thresholds aligned (GANSU `normal` preset
+vs ORCA default) for a fair accuracy comparison.
 
 ## SCF initial guess (important for fair SCF timing)
 GANSU defaults to the `core` guess → many, run-dependent SCF iterations, so the total

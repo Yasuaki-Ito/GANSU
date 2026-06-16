@@ -133,6 +133,16 @@ PAODomainResult orthogonalize_pao_domain(
     // Final orthonormal PAOs in global AO basis: C^{orth} = C_dom · M.
     RowMatXd Corth = Cdom * M;  // (nao × n_kept)
 
+    // Deterministic sign convention on each orthonormal PAO (largest-magnitude AO
+    // coefficient positive) — removes the arbitrary eigenvector sign gauge so the
+    // PAO (and downstream PNO/bar-H) basis is reproducible run-to-run. Math-inert
+    // for sign-covariant observables.
+    for (int k = 0; k < n_kept; ++k) {
+        Eigen::Index rmax = 0;
+        Corth.col(k).cwiseAbs().maxCoeff(&rmax);
+        if (Corth(rmax, k) < 0.0) Corth.col(k) *= -1.0;
+    }
+
     res.C_pao_orth.assign(static_cast<size_t>(nao) * n_kept, 0.0);
     Eigen::Map<RowMatXd>(res.C_pao_orth.data(), nao, n_kept) = Corth;
     return res;
