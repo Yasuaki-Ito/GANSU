@@ -804,21 +804,6 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         ++e_eff;
     }
 
-    // Diagnostic — deterministic checksums of the raw IP/EA amplitudes the STEOM
-    // build consumes. Run twice: if these differ, the IP/EA eigenVECTORS are non-
-    // deterministic (disease upstream, in the EOM solve); if they are identical but
-    // ||G|| still differs, the non-determinism is in the STEOM build GEMMs.
-    {
-        auto nrm = [](const std::vector<real_t>& v){
-            long double s = 0.0L; for (real_t x : v) s += (long double)x * x;
-            return (double)std::sqrt(s); };
-        std::cout << "  [STEOM R] ||R1_IP||=" << std::setprecision(12) << nrm(h_R1_IP)
-                  << " ||R2_IP||=" << nrm(h_R2_IP)
-                  << " ||R1_EA||=" << nrm(h_R1_EA)
-                  << " ||R2_EA||=" << nrm(h_R2_EA)
-                  << std::defaultfloat << std::endl;
-    }
-
     // Primary assignment = per-root argmax|R1| (the validated path; bit-identical
     // to 0b/0c for non-degenerate cases). Only if argmax collides (two roots →
     // same MO → singular active R1) do we fall back to the collision-free greedy
@@ -1218,20 +1203,6 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 
     if (dense_diag) {
         const real_t min_eigenvalue = 0.0;  // STEOM excitation energies are positive
-
-        // Diagnostic — ‖G‖_F via a deterministic sequential host reduction. This
-        // checksum discriminates the two non-determinism sources: if ‖G‖ is bit-
-        // identical run-to-run but the roots differ, the geev (cusolverXgeev) is the
-        // culprit; if ‖G‖ itself differs, the G-build is non-deterministic.
-        {
-            std::vector<real_t> h_G((size_t)total_dim * total_dim);
-            cudaMemcpy(h_G.data(), steom_op.get_G_device(),
-                       h_G.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
-            long double ss = 0.0L;
-            for (real_t v : h_G) ss += (long double)v * (long double)v;
-            std::cout << "  [STEOM diag] ||G||_F = " << std::setprecision(15)
-                      << (double)std::sqrt(ss) << std::defaultfloat << std::endl;
-        }
         // eigenDecompositionNonSymmetric expects column-major input. d_G_ is
         // row-major [total_dim × total_dim]; its linear buffer is exactly the
         // column-major storage of Gᵀ. eig(Gᵀ) == eig(G), so passing the buffer

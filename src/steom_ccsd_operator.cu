@@ -3634,30 +3634,6 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     std::vector<real_t> XIP   = pull(d_X_IP_,  (size_t)NMo*NMo);
     std::vector<real_t> XEA   = pull(d_X_EA_,  (size_t)NMv*NMv);
 
-    // Diagnostic — checksums of every build input (bar-H + R2 + X). Run twice: any
-    // that differs pins its producer as the non-deterministic source; if ALL match
-    // but the outputs still differ, the non-determinism is in the build arithmetic.
-    {
-        auto nrm = [](const std::vector<real_t>& v){
-            long double s = 0.0L; for (real_t x : v) s += (long double)x * x;
-            return (double)std::sqrt(s); };
-        // Signed sum: sensitive to per-root sign/phase flips that the (sign-invariant)
-        // norm cannot see. If ssum differs run-to-run but nrm matches, the IP/EA
-        // eigenVECTOR phase is non-deterministic (the disease), not the magnitude.
-        auto ssum = [](const std::vector<real_t>& v){
-            long double s = 0.0L; for (real_t x : v) s += (long double)x; return (double)s; };
-        std::cout << std::setprecision(12)
-          << "  [STEOM barH] Fov=" << nrm(Fov) << " Loo=" << nrm(Loo) << " Lvv=" << nrm(Lvv)
-          << " Wooov=" << nrm(Wooov) << " Wvovv=" << nrm(Wvovv) << " Wovoo=" << nrm(Wovoo)
-          << " Wovov=" << nrm(Wovov) << " Wovvo=" << nrm(Wovvo) << " ERIov=" << nrm(ERIov) << "\n"
-          << "  [STEOM barH] R2IP=" << nrm(R2IP) << " R2EA=" << nrm(R2EA)
-          << " XIP=" << nrm(XIP) << " XEA=" << nrm(XEA) << "\n"
-          << "  [STEOM Rsgn] sumR2IP=" << ssum(R2IP) << " sumR2EA=" << ssum(R2EA)
-          << " sumXIP=" << ssum(XIP) << " sumXEA=" << ssum(XEA)
-          << " sumWovov=" << ssum(Wovov) << " sumWovvo=" << ssum(Wovvo)
-          << std::defaultfloat << std::endl;
-    }
-
     // ---- bar-H accessors (row-major natural order; see build_dressed_intermediates) ----
     auto fov  = [&](int k,int c){ return Fov[(size_t)k*NV+c]; };
     auto loo  = [&](int i,int j){ return Loo[(size_t)i*NO+j]; };
@@ -4597,21 +4573,6 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         }
 
     bmark("phhp (UBMJC/UBKJE/UBMJE)");
-
-    // Diagnostic — checksums of the W^eff dressing arrays (the only non-bar-H part
-    // of g_phph/g_phhp). Run twice: if these differ, the dressing GEMMs/contractions
-    // are the non-deterministic step (their bar-H/R2 inputs are already deterministic).
-    {
-        auto nrm = [](const std::vector<real_t>& v){
-            long double s = 0.0L; for (real_t x : v) s += (long double)x * x;
-            return (double)std::sqrt(s); };
-        std::cout << std::setprecision(12)
-          << "  [STEOM U*] u_amci=" << nrm(u_amci) << " u_akei=" << nrm(u_akei)
-          << " u_amei=" << nrm(u_amei) << " u_bmjc=" << nrm(u_bmjc)
-          << " u_bkje=" << nrm(u_bkje) << " u_bmje=" << nrm(u_bmje)
-          << std::defaultfloat << std::endl;
-    }
-
     // ---- assemble g_phph[a,k,c,i] (Eq.59) and g_phhp[b,k,j,c] (Eq.63) ----
     std::vector<real_t> g_phph((size_t)NV*NO*NV*NO, 0.0);
     std::vector<real_t> g_phhp((size_t)NV*NO*NO*NV, 0.0);
@@ -4641,23 +4602,6 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
             GPHHP(b,kf,j,cf)+=UBMJE(b,m,j,e); }
 
     bmark("assemble g_phph/g_phhp");
-
-    // Diagnostic — deterministic checksums of the four G inputs. Run twice and
-    // compare: the input whose norm differs pins which producer is non-deterministic
-    // (Fvv/Foo ← build_F_eff; g_phph/g_phhp ← wovov/wovvo bar-H + W^eff dressing GEMMs).
-    {
-        auto nrm_vec = [](const std::vector<real_t>& v){
-            long double s = 0.0L; for (real_t x : v) s += (long double)x * x;
-            return (double)std::sqrt(s); };
-        long double sf = 0.0L; for (int i = 0; i < NV*NV; ++i) sf += (long double)Fvv[i]*Fvv[i];
-        long double so = 0.0L; for (int i = 0; i < NO*NO; ++i) so += (long double)Foo[i]*Foo[i];
-        std::cout << "  [STEOM build] ||Fvv||=" << std::setprecision(12) << (double)std::sqrt(sf)
-                  << " ||Foo||=" << (double)std::sqrt(so)
-                  << " ||g_phph||=" << nrm_vec(g_phph)
-                  << " ||g_phhp||=" << nrm_vec(g_phhp)
-                  << std::defaultfloat << std::endl;
-    }
-
     // ---- G^{1h1p} singlet: row=i*NV+a, col=j*NV+b ----
     //  G = F_eff_vv δ_ij − F_eff_oo δ_ab + 2 g_phhp[b,j,i,a] − g_phph[a,j,b,i]
     std::vector<real_t> Gmat((size_t)total_dim_*total_dim_, 0.0);

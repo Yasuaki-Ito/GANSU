@@ -663,6 +663,21 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
         std::cout << "Warning: EA-EOM-CCSD Davidson did not converge for all roots." << std::endl;
     }
 
+    // Deterministic phase convention per root: force the largest-magnitude
+    // component of each full Davidson eigenvector (R1+R2 contiguous in
+    // h_eigenvectors) positive — removes the arbitrary Davidson sign gauge on
+    // R2/X. Math-inert for sign-covariant observables (mirror of the IP path).
+    for (int k = 0; k < n_roots_to_compute; ++k) {
+        real_t* ev = &h_eigenvectors[(size_t)k * total_dim];
+        int imax = 0; real_t amax = -1.0;
+        for (int i = 0; i < total_dim; ++i) {
+            const real_t a = std::fabs(ev[i]);
+            if (a > amax) { amax = a; imax = i; }
+        }
+        if (ev[imax] < 0.0)
+            for (int i = 0; i < total_dim; ++i) ev[i] = -ev[i];
+    }
+
     std::cout << "  EA-EOM-CCSD solve time: " << std::fixed << std::setprecision(3)
               << solve_timer.elapsed_seconds() << " s" << std::endl;
 
