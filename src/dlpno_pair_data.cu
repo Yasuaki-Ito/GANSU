@@ -618,7 +618,8 @@ LMP2Status iterate_dlpno_ccsd_t2(
     const Phase24Integrals* phase24,
     int num_gpus,
     bool user_explicit_n_gpus,
-    const real_t* lmo_centroids)
+    const real_t* lmo_centroids,
+    const std::vector<std::vector<real_t>>* T1_pao)
 {
     if (!enable_dressing) {
         return iterate_lmp2(
@@ -1364,6 +1365,26 @@ LMP2Status iterate_dlpno_ccsd_t2(
     }
 #endif
 
+    // ---- Increment 2 (full singles): per-LMO T1 in pair-(k,k) PNO basis. ----
+    // Iteration-invariant (T1_pao is fixed for this T2 solve). t1_in_pno[k] =
+    // M^(kk)^T · T1_pao[k]  (PAO(kk) → PNO(kk)). Used by the T1→T2 back-coupling
+    // terms in the per-pair residual (projected into each pair's PNO via barS).
+    std::vector<Eigen::VectorXd> t1_in_pno;
+    if (T1_pao != nullptr) {
+        t1_in_pno.assign(nocc, Eigen::VectorXd());
+        for (int k = 0; k < nocc; ++k) {
+            const int idx_kk = pair_lookup[static_cast<size_t>(k) * nocc + k];
+            if (idx_kk < 0) continue;
+            const PairData&  pkk = pairs[idx_kk];
+            const PairSetup& skk = setups[idx_kk];
+            if (pkk.n_pno == 0 || skk.n_pao == 0) continue;
+            if ((int)(*T1_pao)[k].size() != skk.n_pao) continue;
+            Eigen::Map<const RowMatXd> Mkk(pkk.M.data(), skk.n_pao, pkk.n_pno);
+            Eigen::Map<const Eigen::VectorXd> tpao((*T1_pao)[k].data(), skk.n_pao);
+            t1_in_pno[k].noalias() = Mkk.transpose() * tpao;   // length n_pno_kk
+        }
+    }
+
     for (int iter = 0; iter < max_iter; ++iter) {
         {
             const auto t_yold_0 = prof_clock::now();
@@ -1842,6 +1863,32 @@ LMP2Status iterate_dlpno_ccsd_t2(
                     Eigen::Map<Eigen::Matrix<real_t, Eigen::Dynamic, 1>>
                         R_flat(R.data(), n * n);
                     R_flat.noalias() += W_flat * Y_flat;
+
+                    // Increment 2 (S1): the t1·t1 part of tau in the 4-virtual
+                    // ladder. Canonical CCSD contracts Wabcd with tau=t2+t1·t1;
+                    // the CCD path used Y(=t2) only. Add Σ_cd Wabcd·(t1_i[c]·t1_j[d]),
+                    // with t1 projected into THIS pair's PNO basis:
+                    //   t1_i_pno = barS^(ij,ii)·t1_in_pno[i]  (a/c index, occ i)
+                    //   t1_j_pno = barS^(ij,jj)·t1_in_pno[j]  (b/d index, occ j)
+                    if (T1_pao != nullptr) {
+                        const int idx_ii = pair_lookup[(size_t)sij.i * nocc + sij.i];
+                        const int idx_jj = pair_lookup[(size_t)sij.j * nocc + sij.j];
+                        if (idx_ii >= 0 && idx_jj >= 0
+                            && (int)t1_in_pno[sij.i].size() > 0
+                            && (int)t1_in_pno[sij.j].size() > 0
+                            && (int)barS_cache[idx][idx_ii].rows() == n
+                            && (int)barS_cache[idx][idx_jj].rows() == n) {
+                            const Eigen::VectorXd t1i =
+                                barS_cache[idx][idx_ii] * t1_in_pno[sij.i];   // [n]
+                            const Eigen::VectorXd t1j =
+                                barS_cache[idx][idx_jj] * t1_in_pno[sij.j];   // [n]
+                            Eigen::VectorXd t1t1(n * n);                      // [a·n+b]
+                            for (int a = 0; a < n; ++a)
+                                for (int b = 0; b < n; ++b)
+                                    t1t1[a * n + b] = t1i[a] * t1j[b];
+                            R_flat.noalias() += W_flat * t1t1;
+                        }
+                    }
                 }
                 prof_slot.t_w4virt += std::chrono::duration<double>(
                     prof_clock::now() - t_w4virt_0).count();

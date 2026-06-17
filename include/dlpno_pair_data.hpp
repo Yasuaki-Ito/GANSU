@@ -349,6 +349,13 @@ LMP2Status iterate_dlpno_ccsd_t2(
     // Bohr) for the distance-based coupling screen. nullptr = no distance
     // screen (keep all active = bit-exact). Used only when
     // GANSU_DLPNO_CCSD_BARS_SPARSE is on with GANSU_DLPNO_CCSD_BARS_DIST > 0.
-    const real_t* lmo_centroids = nullptr);
+    const real_t* lmo_centroids = nullptr,
+    // Increment 2 (full singles, T1↔T2 coupling). T1_pao[i] = singles amplitude
+    // of LMO i in pair (i,i)'s PAO basis (length n_pao_ii). nullptr (default) =
+    // pure CCD, byte-identical to the legacy path. When non-null, the T2 residual
+    // picks up the T1→T2 back-coupling (currently: the 4-virtual tau=t2+t1·t1
+    // ladder piece; more terms added incrementally). The caller drives the
+    // coupled macro-iteration (T2 sweep with current T1, then T1 sweep).
+    const std::vector<std::vector<real_t>>* T1_pao = nullptr);
 
 } // namespace gansu

@@ -994,6 +994,9 @@ real_t DLPNOCCSD::compute_energy()
         return e && e[0] == '1';
     }();
     if (ccsd_singles_inc1) {
+        // Increment 2 (full singles, coupled T1↔T2). Factor the T1 Jacobi solve
+        // into a lambda reused for the first T1 and inside the coupled macro loop.
+        auto solve_t1 = [&]() {
         for (int iter = 0; iter < max_iter; ++iter) {
             T1_old = T1;
             real_t r_max = 0.0;
@@ -1067,16 +1070,69 @@ real_t DLPNOCCSD::compute_energy()
             }
             if (r_max < conv_tol) { t1_converged = true; break; }
         }
+        };  // end lambda solve_t1
+
+        // Correlation energy from the current per-pair Y (doubles part), used to
+        // detect macro-iteration convergence.
+        auto e_corr_doubles = [&]() -> real_t {
+            real_t E = 0.0;
+            for (size_t idx = 0; idx < res.setups.size(); ++idx) {
+                const PairData& p = res.pairs[idx];
+                if (p.n_pno == 0) continue;
+                real_t e_in = 0.0;
+                for (int a = 0; a < p.n_pno; ++a)
+                    for (int b = 0; b < p.n_pno; ++b)
+                        e_in += p.L[(size_t)a * p.n_pno + b]
+                              * (2.0 * p.Y[(size_t)a * p.n_pno + b]
+                                 - p.Y[(size_t)b * p.n_pno + a]);
+                E += res.setups[idx].pair_factor * e_in;
+            }
+            return E;
+        };
+
+        // First T1 from the CCD Y above, then coupled macro-iteration: a full T2
+        // sweep WITH the current T1 (engages the T1→T2 back-coupling inside
+        // iterate_dlpno_ccsd_t2) alternated with a T1 sweep, until the doubles
+        // correlation energy stops changing. (Increment 2 / S1: currently only
+        // the 4-virtual tau=t2+t1·t1 ladder back-coupling is active; further
+        // T1→T2 terms — vvov/vooo, ooov, ring t1 — are added in later sub-steps.)
+        solve_t1();
+        real_t E_prev_macro = e_corr_doubles();
+        const int n_macro_max = 12;
+        for (int macro = 1; macro <= n_macro_max; ++macro) {
+            t2_status = iterate_dlpno_ccsd_t2(
+                res.setups, res.pairs, res.pair_lookup, res.F_LMO, h_S,
+                nocc_, nao_, std::max(1, params_.lmp2_max_iter), params_.lmp2_conv,
+                /*enable_dressing=*/true,
+                params_.verbose >= 2 ? params_.verbose : 0,
+                "CCSD T2 (singles-coupled)",
+                &phase24, t2_num_gpus, user_explicit_n_gpus,
+                lmo_centroids.empty() ? nullptr : lmo_centroids.data(),
+                &T1);
+            solve_t1();
+            const real_t E_now_macro = e_corr_doubles();
+            if (params_.verbose >= 1) {
+                std::cout << "[DLPNO-CCSD] singles macro " << macro
+                          << "  E_corr(doubles)=" << std::fixed << std::setprecision(10)
+                          << E_now_macro << "  dE=" << std::scientific
+                          << std::setprecision(2) << (E_now_macro - E_prev_macro)
+                          << std::endl;
+            }
+            if (std::fabs(E_now_macro - E_prev_macro) < params_.lmp2_conv) {
+                E_prev_macro = E_now_macro; break;
+            }
+            E_prev_macro = E_now_macro;
+        }
+
         // Refresh the reported T1 norm with the singles-refined amplitudes.
         t1_norm_max = 0.0;
         for (int i = 0; i < nocc_; ++i)
             for (real_t v : T1[i])
                 t1_norm_max = std::max(t1_norm_max, std::fabs(v));
         if (params_.verbose >= 1) {
-            std::cout << "[DLPNO-CCSD] singles inc1 ON — T1 refined with "
-                         "diagonal ovvv T2 source; max|T1|="
+            std::cout << "[DLPNO-CCSD] singles (increment 2, coupled T1↔T2) max|T1|="
                       << std::scientific << std::setprecision(3) << t1_norm_max
-                      << " (energy unchanged; increment 1 of 3)" << std::endl;
+                      << std::endl;
         }
     }
 
