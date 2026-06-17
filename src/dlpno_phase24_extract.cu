@@ -419,6 +419,77 @@ __global__ void extract_vooo_kernel(
     d_vooo[tid] = d_eri_mo[e];
 }
 
+/// Increment 2 / S2: OOOV + OOVO extracts in one launch (over n_lmo · n_pno):
+///   W_ooov_pq[i,c] = eri[si, sj, i, n_lmo+c] = (kl|ic)   layout i·n_pno + c
+///   W_oovo_pq[c,i] = eri[si, sj, n_lmo+c, i] = (kl|ci)   layout c·n_lmo + i
+__global__ void extract_ooov_oovo_kernel(
+    const real_t* __restrict__ d_eri_mo,
+    real_t*       __restrict__ d_ooov,
+    real_t*       __restrict__ d_oovo,
+    int n_emb, int n_lmo, int n_pno, int si, int sj)
+{
+    const std::size_t total =
+        static_cast<std::size_t>(n_lmo) * n_pno;
+    const std::size_t tid =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+
+    const std::size_t n_emb2 = static_cast<std::size_t>(n_emb) * n_emb;
+    const std::size_t n_emb3 = n_emb2 * n_emb;
+
+    const int c = static_cast<int>(tid % n_pno);
+    const int i = static_cast<int>(tid / n_pno);
+
+    const std::size_t base =
+        static_cast<std::size_t>(si) * n_emb3 +
+        static_cast<std::size_t>(sj) * n_emb2;
+    const std::size_t e_ooov =
+        base + static_cast<std::size_t>(i) * n_emb +
+        static_cast<std::size_t>(n_lmo + c);
+    const std::size_t e_oovo =
+        base + static_cast<std::size_t>(n_lmo + c) * n_emb +
+        static_cast<std::size_t>(i);
+    d_ooov[static_cast<std::size_t>(i) * n_pno + c] = d_eri_mo[e_ooov];
+    d_oovo[static_cast<std::size_t>(c) * n_lmo + i] = d_eri_mo[e_oovo];
+}
+
+/// Increment 2 / S4: VOOV + VOVO extracts in one launch (over n_pno·n_lmo·n_pno):
+///   W_voov_diag[a,k,c] = eri[n_lmo+a, k, si, n_lmo+c] = (ak|ic)
+///   W_vovo_diag[a,k,c] = eri[n_lmo+a, k, n_lmo+c, si] = (ak|ci)
+/// Output layout: (a·n_lmo + k)·n_pno + c.  Diagonal pair only (occ = si).
+__global__ void extract_voov_vovo_kernel(
+    const real_t* __restrict__ d_eri_mo,
+    real_t*       __restrict__ d_voov,
+    real_t*       __restrict__ d_vovo,
+    int n_emb, int n_lmo, int n_pno, int si)
+{
+    const std::size_t total =
+        static_cast<std::size_t>(n_pno) * n_lmo * n_pno;
+    const std::size_t tid =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+
+    const std::size_t n_emb2 = static_cast<std::size_t>(n_emb) * n_emb;
+    const std::size_t n_emb3 = n_emb2 * n_emb;
+
+    const int c = static_cast<int>(tid % n_pno);
+    const std::size_t t1 = tid / n_pno;
+    const int k = static_cast<int>(t1 % n_lmo);
+    const int a = static_cast<int>(t1 / n_lmo);
+
+    const std::size_t base =
+        static_cast<std::size_t>(n_lmo + a) * n_emb3 +
+        static_cast<std::size_t>(k) * n_emb2;
+    const std::size_t e_voov =
+        base + static_cast<std::size_t>(si) * n_emb +
+        static_cast<std::size_t>(n_lmo + c);
+    const std::size_t e_vovo =
+        base + static_cast<std::size_t>(n_lmo + c) * n_emb +
+        static_cast<std::size_t>(si);
+    d_voov[tid] = d_eri_mo[e_voov];
+    d_vovo[tid] = d_eri_mo[e_vovo];
+}
+
 // ---------------------------------------------------------------------------
 // S7c relayout kernels (block-wise build path). These operate on the small
 // per-block buffers produced by mo_eri_block_into, never the n_emb⁴ tensor.
@@ -503,6 +574,12 @@ Phase24ExtractLayout compute_phase24_extract_layout(
                        ? static_cast<std::size_t>(n_pno) * n_pno * n_pno : 0;
     L.sz_vooo        = include_singles
                        ? static_cast<std::size_t>(n_pno) * n_lmo : 0;
+    L.sz_ovvv        = include_singles
+                       ? static_cast<std::size_t>(n_pno) * n_pno * n_pno : 0;
+    L.sz_ooov        = include_singles
+                       ? static_cast<std::size_t>(n_lmo) * n_pno : 0;
+    L.sz_voov        = (include_singles && is_diag)
+                       ? static_cast<std::size_t>(n_pno) * n_lmo * n_pno : 0;
 
     std::size_t off = 0;
     L.off_T_pair             = off; off += L.sz_T_pair;
@@ -528,6 +605,14 @@ Phase24ExtractLayout compute_phase24_extract_layout(
     L.off_W_vvov_i           = off; off += L.sz_vvov;
     L.off_W_vvov_j           = off; off += L.sz_vvov;
     L.off_W_vooo_i           = off; off += L.sz_vooo;
+    // Increment 2 / S2: off-diag ovvv (occ i/j) + ooov/oovo.
+    L.off_W_ovvv_pi          = off; off += L.sz_ovvv;
+    L.off_W_ovvv_pj          = off; off += L.sz_ovvv;
+    L.off_W_ooov_pq          = off; off += L.sz_ooov;
+    L.off_W_oovo_pq          = off; off += L.sz_ooov;
+    // Increment 2 / S4: w_voov·t1 blocks (diagonal pair only).
+    L.off_W_voov_diag        = off; off += L.sz_voov;
+    L.off_W_vovo_diag        = off; off += L.sz_voov;
     L.total = off;
     return L;
 }
@@ -668,6 +753,40 @@ void launch_phase24_extract(
             extract_vooo_kernel<<<grid_for(n), kBlock, 0, stream>>>(
                 d_eri_mo, d_packed_out + layout.off_W_vooo_i,
                 n_emb, n_lmo, n_pno, si, sj);
+        }
+    }
+    // Increment 2 / S2: off-diag ovvv (occ si / sj) reuse the ovvv_diag kernel.
+    {
+        const std::size_t n = layout.sz_ovvv;
+        if (n > 0) {
+            extract_W_ovvv_diag_kernel<<<grid_for(n), kBlock, 0, stream>>>(
+                d_eri_mo, d_packed_out + layout.off_W_ovvv_pi,
+                n_emb, n_lmo, n_pno, si);
+            extract_W_ovvv_diag_kernel<<<grid_for(n), kBlock, 0, stream>>>(
+                d_eri_mo, d_packed_out + layout.off_W_ovvv_pj,
+                n_emb, n_lmo, n_pno, sj);
+        }
+    }
+    // Increment 2 / S2: ooov + oovo.
+    {
+        const std::size_t n = layout.sz_ooov;
+        if (n > 0) {
+            extract_ooov_oovo_kernel<<<grid_for(n), kBlock, 0, stream>>>(
+                d_eri_mo,
+                d_packed_out + layout.off_W_ooov_pq,
+                d_packed_out + layout.off_W_oovo_pq,
+                n_emb, n_lmo, n_pno, si, sj);
+        }
+    }
+    // Increment 2 / S4: w_voov·t1 blocks (diagonal pair only, occ = si).
+    {
+        const std::size_t n = layout.sz_voov;
+        if (n > 0) {
+            extract_voov_vovo_kernel<<<grid_for(n), kBlock, 0, stream>>>(
+                d_eri_mo,
+                d_packed_out + layout.off_W_voov_diag,
+                d_packed_out + layout.off_W_vovo_diag,
+                n_emb, n_lmo, n_pno, si);
         }
     }
 }

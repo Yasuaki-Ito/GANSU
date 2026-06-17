@@ -293,6 +293,40 @@ struct Phase24Integrals {
     std::vector<std::vector<real_t>> W_vvov_i;   ///< [n_pairs] of [n_pno³]
     std::vector<std::vector<real_t>> W_vvov_j;   ///< [n_pairs] of [n_pno³]
     std::vector<std::vector<real_t>> W_vooo_i;   ///< [n_pairs] of [n_pno · n_lmo]
+
+    /// Increment 2 / S2: the two T2-driven T1 sources that complete the
+    /// canonical T1 equation (eri_stored.cu:8002-8034), feeding back into the
+    /// coupled T1 solve so the doubles relax toward canonical CCSD.
+    ///
+    /// (a) off-diagonal ovvv·t2 (k≠i piece of the full-k ovvv source; k=i is the
+    ///     diagonal W_ovvv_diag handled in solve_t1). For pair (i,j):
+    ///       W_ovvv_pi[idx][a,b,c] = (s.i a'|b' c') = (ia|bc)   (occ = s.i)
+    ///       W_ovvv_pj[idx][a,b,c] = (s.j a'|b' c') = (ja|bc)   (occ = s.j)
+    ///     a,b,c PNO of pair (i,j). Layout (a·n_pno+b)·n_pno+c.
+    ///     Source for T1[i] uses occ=j (W_ovvv_pj), for T1[j] uses occ=i.
+    ///
+    /// (b) ooov·t2 (the large balancing −source). For pair (k,l):
+    ///       W_ooov_pq[idx][i,c] = (s.i s.j|i_lmo c') = (kl|ic)   layout i·n_pno+c
+    ///       W_oovo_pq[idx][c,i] = (s.i s.j|c' i_lmo) = (kl|ci)   layout c·n_lmo+i
+    ///     i an LMO (all), c PNO of pair (k,l). w_ooov = 2(kl|ic)−(kl|ci).
+    ///
+    /// All four only built/consumed when CCSD singles (T1_pao) are active.
+    std::vector<std::vector<real_t>> W_ovvv_pi;  ///< [n_pairs] of [n_pno³]
+    std::vector<std::vector<real_t>> W_ovvv_pj;  ///< [n_pairs] of [n_pno³]
+    std::vector<std::vector<real_t>> W_ooov_pq;  ///< [n_pairs] of [n_lmo · n_pno]
+    std::vector<std::vector<real_t>> W_oovo_pq;  ///< [n_pairs] of [n_pno · n_lmo]
+
+    /// Increment 2 / S4: w_voov·t1 ring restoring blocks for diagonal pair (i,i).
+    ///   W_voov_diag[i][a,k,c] = (n_lmo+a, k | i, n_lmo+c) = (ak|ic)
+    ///   W_vovo_diag[i][a,k,c] = (n_lmo+a, k | n_lmo+c, i) = (ak|ci)
+    /// a,c PNO of pair (i,i); k an LMO. Layout (a·n_lmo+k)·n_pno+c.
+    /// w_voov = 2(ak|ic)−(ak|ci); the T1 source is Σ_kc w_voov·t1_proj[k,c]
+    /// with t1[k] projected into pair(ii)'s PNO. Stored per LMO (diagonal pairs
+    /// only), like W_ovvv_diag. (The existing W_ovov_i/W_ovvo_i are the DIFFERENT
+    /// pairings (ai|kc)/(ac|ki) and cannot be reused here.)
+    /// Only built/consumed when CCSD singles (T1_pao) are active.
+    std::vector<std::vector<real_t>> W_voov_diag;  ///< [nocc] of [n_pno·n_lmo·n_pno]
+    std::vector<std::vector<real_t>> W_vovo_diag;  ///< [nocc] of [n_pno·n_lmo·n_pno]
 };
 
 /**

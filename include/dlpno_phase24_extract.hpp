@@ -72,6 +72,17 @@ struct Phase24ExtractLayout {
     std::size_t off_W_vvov_i           = 0;
     std::size_t off_W_vvov_j           = 0;
     std::size_t off_W_vooo_i           = 0;
+    /// Increment 2 / S2: off-diag ovvv (occ s.i / s.j) + ooov/oovo for the
+    /// T2-driven T1 sources. ovvv layout (a·n_pno+b)·n_pno+c (n_pno³); ooov
+    /// layout i·n_pno+c, oovo layout c·n_lmo+i (each n_lmo·n_pno).
+    std::size_t off_W_ovvv_pi          = 0;
+    std::size_t off_W_ovvv_pj          = 0;
+    std::size_t off_W_ooov_pq          = 0;
+    std::size_t off_W_oovo_pq          = 0;
+    /// Increment 2 / S4: w_voov·t1 blocks (ak|ic)/(ak|ci), diagonal pair only.
+    /// Layout (a·n_lmo+k)·n_pno+c; size n_pno·n_lmo·n_pno (== sz_W_ovov).
+    std::size_t off_W_voov_diag        = 0;
+    std::size_t off_W_vovo_diag        = 0;
 
     std::size_t sz_T_pair       = 0;  ///< n_lmo² · n_pno²
     std::size_t sz_W_pair       = 0;  ///< n_pno⁴
@@ -83,6 +94,9 @@ struct Phase24ExtractLayout {
     std::size_t sz_ovoo         = 0;  ///< n_pno · n_lmo (W_ovoo_lambda etc.)
     std::size_t sz_vvov         = 0;  ///< n_pno³ (W_vvov_i/j)
     std::size_t sz_vooo         = 0;  ///< n_pno · n_lmo (W_vooo_i; == sz_ovoo)
+    std::size_t sz_ovvv         = 0;  ///< n_pno³ (W_ovvv_pi/pj; == sz_vvov)
+    std::size_t sz_ooov         = 0;  ///< n_lmo · n_pno (W_ooov_pq / W_oovo_pq)
+    std::size_t sz_voov         = 0;  ///< n_pno·n_lmo·n_pno (diag only; == sz_W_ovov)
 };
 
 /// Compute byte offsets / sizes for the packed output buffer.

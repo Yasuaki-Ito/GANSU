@@ -224,6 +224,16 @@ inline Phase24Integrals precompute_phase24_integrals(
     out.W_vvov_i.assign(n_pairs, {});
     out.W_vvov_j.assign(n_pairs, {});
     out.W_vooo_i.assign(n_pairs, {});
+    // Increment 2 / S2: off-diag ovvv (occ i/j) + ooov/oovo per strong pair for
+    // the T2-driven T1 sources that complete the coupled singles. Filled below.
+    out.W_ovvv_pi.assign(n_pairs, {});
+    out.W_ovvv_pj.assign(n_pairs, {});
+    out.W_ooov_pq.assign(n_pairs, {});
+    out.W_oovo_pq.assign(n_pairs, {});
+    // Increment 2 / S4: w_voov·t1 blocks, stored per LMO (diagonal pairs only),
+    // like W_ovvv_diag. Filled below when is_diag.
+    out.W_voov_diag.assign(res.nocc, {});
+    out.W_vovo_diag.assign(res.nocc, {});
 
     // Phase B — multi-GPU pair-parallel integral build.
     //   Detect distributed RI back-end with replicated B; if available,
@@ -404,6 +414,24 @@ inline Phase24Integrals precompute_phase24_integrals(
                    P + layout.off_W_vvov_j);
                 BI(n_lmo, n_pno, 0, n_lmo, si, 1, sj, 1,
                    P + layout.off_W_vooo_i);
+                // S2 — off-diag ovvv: W_ovvv_pi[a,b,c]=(si a'|b' c'); _pj with sj.
+                //   W_ooov_pq[i,c]=(si sj|i c'); W_oovo_pq[c,i]=(si sj|c' i).
+                BI(si, 1, n_lmo, n_pno, n_lmo, n_pno, n_lmo, n_pno,
+                   P + layout.off_W_ovvv_pi);
+                BI(sj, 1, n_lmo, n_pno, n_lmo, n_pno, n_lmo, n_pno,
+                   P + layout.off_W_ovvv_pj);
+                BI(si, 1, sj, 1, 0, n_lmo, n_lmo, n_pno,
+                   P + layout.off_W_ooov_pq);
+                BI(si, 1, sj, 1, n_lmo, n_pno, 0, n_lmo,
+                   P + layout.off_W_oovo_pq);
+                // S4 — w_voov·t1 blocks, diagonal pair only (occ = si).
+                //   W_voov_diag[a,k,c]=(a' k|si c'); W_vovo_diag[a,k,c]=(a' k|c' si).
+                if (is_diag) {
+                    BI(n_lmo, n_pno, 0, n_lmo, si, 1, n_lmo, n_pno,
+                       P + layout.off_W_voov_diag);
+                    BI(n_lmo, n_pno, 0, n_lmo, n_lmo, n_pno, si, 1,
+                       P + layout.off_W_vovo_diag);
+                }
             }
 
             // --- Relayout blocks (build into scratch, transpose mid → dest) ---
@@ -494,6 +522,16 @@ inline Phase24Integrals precompute_phase24_integrals(
         copy_block(out.W_vvov_i[idx], layout.off_W_vvov_i, layout.sz_vvov);
         copy_block(out.W_vvov_j[idx], layout.off_W_vvov_j, layout.sz_vvov);
         copy_block(out.W_vooo_i[idx], layout.off_W_vooo_i, layout.sz_vooo);
+        // Increment 2 / S2: off-diag ovvv (i/j) + ooov/oovo.
+        copy_block(out.W_ovvv_pi[idx], layout.off_W_ovvv_pi, layout.sz_ovvv);
+        copy_block(out.W_ovvv_pj[idx], layout.off_W_ovvv_pj, layout.sz_ovvv);
+        copy_block(out.W_ooov_pq[idx], layout.off_W_ooov_pq, layout.sz_ooov);
+        copy_block(out.W_oovo_pq[idx], layout.off_W_oovo_pq, layout.sz_ooov);
+        // Increment 2 / S4: w_voov·t1 blocks (diagonal pairs, per LMO).
+        if (is_diag) {
+            copy_block(out.W_voov_diag[s.i], layout.off_W_voov_diag, layout.sz_voov);
+            copy_block(out.W_vovo_diag[s.i], layout.off_W_vovo_diag, layout.sz_voov);
+        }
 
         (void)s;  // s used above; suppress -Wunused if conditional.
     }
@@ -1027,9 +1065,119 @@ real_t DLPNOCCSD::compute_energy()
         // Increment 2 (full singles, coupled T1↔T2). Factor the T1 Jacobi solve
         // into a lambda reused for the first T1 and inside the coupled macro loop.
         auto solve_t1 = [&]() {
+        // ---- Increment 2 / S2: T2-driven T1 sources, precomputed once per
+        // solve_t1 call (Y is fixed here; the Jacobi sweeps below only relax T1).
+        //   (a) off-diag ovvv·t2 (k≠i):  +Σ_cd (2(ka|dc)−(ka|cd)) t2_ik^cd
+        //   (b) ooov·t2:                 −Σ_klc (2(kl|ic)−(kl|ci)) t2_kl^ac
+        // Each pair accumulates an AO-space source per target LMO; the result is
+        // projected to covariant PAO(ii) (C_can_pair S-orthonormal ⇒ this equals
+        // the M-projection of the inc-1 diagonal source). canonical val sign.
+        std::vector<std::vector<real_t>> t1_src2(nocc_);
+        {
+            RowMatXd src_ao_all = RowMatXd::Zero(nao_, nocc_);
+            for (size_t idx = 0; idx < res.setups.size(); ++idx) {
+                const PairSetup& s = res.setups[idx];
+                const PairData&  p = res.pairs[idx];
+                const int n = p.n_pno;
+                if (n == 0) continue;
+                const int pi = s.i, pj = s.j;
+                Eigen::Map<const RowMatXd> bQ(p.bar_Q.data(), nao_, n);
+                Eigen::Map<const RowMatXd> Y(p.Y.data(), n, n);
+
+                // (b) ooov·t2 — contributes to ALL LMO i.
+                if (idx < phase24.W_ooov_pq.size()
+                    && phase24.W_ooov_pq[idx].size() == (size_t)nocc_ * n
+                    && phase24.W_oovo_pq[idx].size() == (size_t)n * nocc_) {
+                    const real_t* WO = phase24.W_ooov_pq[idx].data();  // [i·n + c]
+                    const real_t* WV = phase24.W_oovo_pq[idx].data();  // [c·nocc + i]
+                    RowMatXd W2(nocc_, n);   // 2(kl|ic) − (kl|ci)
+                    for (int i2 = 0; i2 < nocc_; ++i2)
+                        for (int c = 0; c < n; ++c)
+                            W2(i2, c) = 2.0 * WO[(size_t)i2 * n + c]
+                                      -       WV[(size_t)c * nocc_ + i2];
+                    const RowMatXd Yeff = (pi == pj)
+                        ? RowMatXd(Y) : RowMatXd(Y + Y.transpose());
+                    // S[i,a] = −Σ_c W2[i,c]·Yeff[a,c] = −(W2·Yeffᵀ)[i,a]
+                    const RowMatXd S = -(W2 * Yeff.transpose());   // nocc × n
+                    src_ao_all.noalias() += bQ * S.transpose();    // nao × nocc
+                }
+
+                // (a) off-diag ovvv·t2 — T1[pi] (occ pj) and T1[pj] (occ pi).
+                if (pi != pj
+                    && idx < phase24.W_ovvv_pi.size()
+                    && phase24.W_ovvv_pi[idx].size() == (size_t)n * n * n
+                    && phase24.W_ovvv_pj[idx].size() == (size_t)n * n * n) {
+                    const real_t* Wpi = phase24.W_ovvv_pi[idx].data();  // (pi a|b c)
+                    const real_t* Wpj = phase24.W_ovvv_pj[idx].data();  // (pj a|b c)
+                    // ovvv[a] = Σ_cd (2 W[a,d,c] − W[a,c,d])·Ym[c,d]
+                    auto ovvv_contract =
+                        [&](const real_t* W, const RowMatXd& Ym) {
+                            Eigen::VectorXd sv(n);
+                            for (int a = 0; a < n; ++a) {
+                                real_t acc = 0.0;
+                                for (int c = 0; c < n; ++c)
+                                    for (int d = 0; d < n; ++d)
+                                        acc += (2.0 * W[((size_t)a*n+d)*n+c]
+                                              -       W[((size_t)a*n+c)*n+d])
+                                             * Ym(c, d);
+                                sv(a) = acc;
+                            }
+                            return sv;
+                        };
+                    // T1[pi]: occ=pj, tau_{pi,pj}^{cd} = Y[c,d].
+                    const Eigen::VectorXd src_i = ovvv_contract(Wpj, Y);
+                    src_ao_all.col(pi).noalias() += bQ * src_i;
+                    // T1[pj]: occ=pi, tau_{pj,pi}^{cd} = Y[d,c] = Yᵀ[c,d].
+                    const RowMatXd Yt = Y.transpose();
+                    const Eigen::VectorXd src_j = ovvv_contract(Wpi, Yt);
+                    src_ao_all.col(pj).noalias() += bQ * src_j;
+                }
+            }
+
+            // Project to each PAO(ii): t1_src2[i] = C_pao_iiᵀ · S_AO · src_ao[:,i].
+            Eigen::Map<const RowMatXd> Smat(h_S, nao_, nao_);
+            const RowMatXd Ssrc = Smat * src_ao_all;   // nao × nocc
+            for (int i = 0; i < nocc_; ++i) {
+                const int idx_ii = res.pair_lookup[i * nocc_ + i];
+                const PairSetup& s_ii = res.setups[idx_ii];
+                const int n_pao_i = s_ii.n_pao;
+                t1_src2[i].assign(n_pao_i, 0.0);
+                if (n_pao_i == 0) continue;
+                Eigen::Map<const RowMatXd> Cii(
+                    s_ii.C_can_pair.data(), nao_, n_pao_i);
+                Eigen::Map<Eigen::VectorXd>(t1_src2[i].data(), n_pao_i)
+                    = Cii.transpose() * Ssrc.col(i);
+            }
+        }
+
         for (int iter = 0; iter < max_iter; ++iter) {
             T1_old = T1;
             real_t r_max = 0.0;
+
+            // ---- Increment 2 / S4: w_voov·t1 ring restoring source ----
+            // Canonical T1 (eri_stored.cu:8024-8027) val += Σ_kc w_voov[a,k,i,c]
+            // ·t1[k,c], w_voov = 2(ak|ic)−(ak|ci) = 2·W_ovov_i − W_ovvo_i for the
+            // diagonal pair (I=i). This LINEAR-in-t1 term is the restoring force
+            // missing so far (T1 blew up). It needs t1[k] projected into each
+            // pair(ii) PNO; precompute the AO column St1ao[:,k] = S·bar_Q_kk·
+            // (M_kkᵀ·T1_old[k]) once per sweep (T1_old fixed within the loop).
+            RowMatXd wv_St1ao = RowMatXd::Zero(nao_, nocc_);
+            {
+                Eigen::Map<const RowMatXd> Smat(h_S, nao_, nao_);
+                for (int k = 0; k < nocc_; ++k) {
+                    const int idx_kk = res.pair_lookup[k * nocc_ + k];
+                    const PairData&  pkk = res.pairs[idx_kk];
+                    const PairSetup& skk = res.setups[idx_kk];
+                    if (pkk.n_pno == 0 || skk.n_pao == 0) continue;
+                    if (static_cast<int>(T1_old[k].size()) != skk.n_pao) continue;
+                    Eigen::Map<const RowMatXd> Mkk(pkk.M.data(), skk.n_pao, pkk.n_pno);
+                    Eigen::Map<const Eigen::VectorXd> tk(T1_old[k].data(), skk.n_pao);
+                    const Eigen::VectorXd t1pno = Mkk.transpose() * tk;   // PNO(kk)
+                    Eigen::Map<const RowMatXd> bQkk(pkk.bar_Q.data(), nao_, pkk.n_pno);
+                    wv_St1ao.col(k).noalias() = Smat * (bQkk * t1pno);
+                }
+            }
+
             #pragma omp parallel for schedule(dynamic) reduction(max:r_max)
             for (int i = 0; i < nocc_; ++i) {
                 const int idx_ii = res.pair_lookup[i * nocc_ + i];
@@ -1095,6 +1243,54 @@ real_t DLPNOCCSD::compute_energy()
                         R[a] += R1_pao(a);   // canonical val += source ⇒ R += source
                 }
 
+                // INCREMENT-2 / S2 source (off-diag ovvv·t2 + ooov·t2),
+                // precomputed in t1_src2 above (covariant PAO(ii), canonical val
+                // sign). R += it, same convention as the inc-1 diagonal source.
+                if (i < static_cast<int>(t1_src2.size())
+                    && static_cast<int>(t1_src2[i].size()) == n_pao_i)
+                    for (int a = 0; a < n_pao_i; ++a)
+                        R[a] += t1_src2[i][a];
+
+                // INCREMENT-2 / S4: w_voov·t1 ring restoring.
+                //   R[i,a] += Σ_kc (2·(ak|ic) − (ak|ci))·t1_proj[k,c]
+                // with W_voov_diag[i][a,k,c]=(ak|ic), W_vovo_diag[i][a,k,c]=(ak|ci)
+                // the pair(ii) blocks (occ=i) and t1_proj[k,c] =
+                // (bar_Q_iiᵀ·St1ao[:,k])[c] (t1[k] in PNO(ii)). NOTE: the
+                // pre-existing W_ovov_i/W_ovvo_i are (ai|kc)/(ac|ki) — a DIFFERENT
+                // pairing — so dedicated blocks are required. Source built in
+                // PNO(ii) then M·source → PAO(ii). canonical val + sign.
+                {
+                    if (npno > 0
+                        && i < static_cast<int>(phase24.W_voov_diag.size())
+                        && phase24.W_voov_diag[i].size()
+                               == static_cast<size_t>(npno) * nocc_ * npno
+                        && phase24.W_vovo_diag[i].size()
+                               == static_cast<size_t>(npno) * nocc_ * npno
+                        && static_cast<int>(p_ii.M.size()) == n_pao_i * npno) {
+                        Eigen::Map<const RowMatXd> bQii(
+                            p_ii.bar_Q.data(), nao_, npno);
+                        const RowMatXd Pii = bQii.transpose() * wv_St1ao;  // npno×nocc
+                        const real_t* WOV = phase24.W_voov_diag[i].data();
+                        const real_t* WVO = phase24.W_vovo_diag[i].data();
+                        std::vector<real_t> src_pno(npno, 0.0);
+                        for (int a = 0; a < npno; ++a) {
+                            real_t acc = 0.0;
+                            for (int k = 0; k < nocc_; ++k)
+                                for (int c = 0; c < npno; ++c) {
+                                    const size_t w =
+                                        ((size_t)a * nocc_ + k) * npno + c;
+                                    acc += (2.0 * WOV[w] - WVO[w]) * Pii(c, k);
+                                }
+                            src_pno[a] = acc;
+                        }
+                        Eigen::Map<const RowMatXd> M(p_ii.M.data(), n_pao_i, npno);
+                        Eigen::Map<const Eigen::VectorXd> sp(src_pno.data(), npno);
+                        const Eigen::VectorXd src_pao = M * sp;
+                        for (int a = 0; a < n_pao_i; ++a)
+                            R[a] += src_pao(a);   // canonical val += w_voov·t1
+                    }
+                }
+
                 for (int a = 0; a < n_pao_i; ++a) {
                     const real_t denom = s_ii.eps_a[a] - F_ii;
                     T1[i][a] -= R[a] / denom;
@@ -1139,7 +1335,7 @@ real_t DLPNOCCSD::compute_energy()
         // T1→T2 terms — vvov/vooo, ooov, ring t1 — are added in later sub-steps.)
         solve_t1();
         real_t E_prev_macro = e_corr_doubles();
-        const int n_macro_max = 12;
+        const int n_macro_max = 30;
         for (int macro = 1; macro <= n_macro_max; ++macro) {
             t2_status = iterate_dlpno_ccsd_t2(
                 res.setups, res.pairs, res.pair_lookup, res.F_LMO, h_S,
