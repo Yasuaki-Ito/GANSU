@@ -59,7 +59,13 @@ int eigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_
 // force_host=true runs the deterministic Eigen CPU geev even when a GPU is present.
 // The GPU path (cusolverDnXgeev) is not bit-reproducible run-to-run for near-defective
 // non-symmetric matrices (e.g. STEOM G at D2h near-degeneracies); the CPU path is.
-int eigenDecompositionNonSymmetric(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size, bool force_host = false);
+// d_eigenvalues_imag (optional): when non-null, ALL eigenvalues are kept and
+// sorted ascending by real part (complex roots NOT dropped); d_eigenvalues gets
+// the real parts and d_eigenvalues_imag the imaginary parts (aligned). When null
+// (default) the legacy behaviour applies: complex roots (|imag| ≥ tol) are
+// discarded and the tail of d_eigenvalues is filled with 1e30. Used by the STEOM
+// complex-root recovery (collapse c.c. pairs to one real state).
+int eigenDecompositionNonSymmetric(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size, bool force_host = false, real_t* d_eigenvalues_imag = nullptr);
 int partialEigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size, const int num_eigenvalues);
 void matrixMatrixProduct(const double* d_matrix_A, const double* d_matrix_B, double* d_matrix_C, const int size, const bool transpose_A = false, const bool transpose_B = false, const bool accumulate=false);
 void matrixMatrixProductRect(const double* d_A, const double* d_B, double* d_C, const int M, const int N, const int K, const bool transpose_A = false, const bool transpose_B = false, const bool accumulate = false, const double alpha = 1.0);

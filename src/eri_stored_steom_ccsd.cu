@@ -1216,34 +1216,83 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         gpu::transposeMatrixInPlace(d_G_cm, total_dim);  // row-major G → column-major G
 
         real_t* d_all_evals = nullptr;
+        real_t* d_all_evals_imag = nullptr;
         real_t* d_all_evecs = nullptr;
         tracked_cudaMalloc(&d_all_evals, (size_t)total_dim * sizeof(real_t));
+        tracked_cudaMalloc(&d_all_evals_imag, (size_t)total_dim * sizeof(real_t));
         tracked_cudaMalloc(&d_all_evecs, (size_t)total_dim * total_dim * sizeof(real_t));
 
-        int info = gpu::eigenDecompositionNonSymmetric(d_G_cm, d_all_evals, d_all_evecs, total_dim, geev_host);
+        // Complex-root recovery (default ON; opt out with GANSU_STEOM_DROP_COMPLEX=1).
+        // The non-Hermitian STEOM G is near-defective at D2h near-degeneracies, so
+        // genuine low valence states (La/Lb) emerge as complex-CONJUGATE eigenvalue
+        // pairs. The legacy path silently dropped them (the P2 "low states missing"
+        // bug → root0 jumped to a higher real root). Now that the doubles bug is
+        // fixed the real parts are physical, so we keep the FULL spectrum and
+        // collapse each c.c. pair to one real state (its real part = the physical
+        // excitation energy), with a "handle with care" warning.
+        const bool drop_complex = (std::getenv("GANSU_STEOM_DROP_COMPLEX") != nullptr);
+        int info = gpu::eigenDecompositionNonSymmetric(
+            d_G_cm, d_all_evals, d_all_evecs, total_dim, geev_host,
+            drop_complex ? nullptr : d_all_evals_imag);
         if (info != 0) {
             std::cout << "Warning: STEOM dense diagonalization (geev) returned info="
                       << info << "." << std::endl;
         }
 
-        // eigenvalues are sorted ascending by real part; complex/missing slots
-        // were filled with 1e30 at the tail. Eigenvectors are in transposed
-        // layout (eigenvector i = row i, stride = total_dim).
+        // Eigenvalues sorted ascending by real part. In recovery mode the FULL
+        // spectrum is kept and h_all_evals_imag holds the imag parts; in legacy
+        // (drop) mode complex roots were filled with 1e30 and imag stays 0.
         std::vector<real_t> h_all_evals(total_dim);
+        std::vector<real_t> h_all_evals_imag(total_dim, 0.0);
         cudaMemcpy(h_all_evals.data(), d_all_evals,
                    (size_t)total_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
+        if (!drop_complex)
+            cudaMemcpy(h_all_evals_imag.data(), d_all_evals_imag,
+                       (size_t)total_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
 
-        // Select the lowest n_states real roots ≥ min_eigenvalue.
-        std::vector<int> sel;
+        // Select the lowest n_states roots ≥ min_eigenvalue by real part,
+        // collapsing each complex-conjugate pair to a single state (skip the
+        // partner with the same real part and opposite imag).
+        const real_t kImagTol = 1e-6;   // |Im| ≥ this ⇒ complex root
+        const real_t kPairTol = 1e-6;   // c.c.-partner match tolerance (Ha)
+        std::vector<int>  sel;
+        std::vector<bool> sel_complex;
         sel.reserve(n_states_to_compute);
         for (int i = 0; i < total_dim && (int)sel.size() < n_states_to_compute; ++i) {
-            if (h_all_evals[i] >= min_eigenvalue && h_all_evals[i] < 1e29)
-                sel.push_back(i);
+            if (!(h_all_evals[i] >= min_eigenvalue && h_all_evals[i] < 1e29)) continue;
+            const bool cplx = std::abs(h_all_evals_imag[i]) >= kImagTol;
+            if (cplx) {
+                bool partner_already = false;
+                for (int s : sel) {
+                    if (std::abs(h_all_evals[s]      - h_all_evals[i])      < kPairTol &&
+                        std::abs(h_all_evals_imag[s] + h_all_evals_imag[i]) < kPairTol) {
+                        partner_already = true; break;   // c.c. partner already counted
+                    }
+                }
+                if (partner_already) continue;
+            }
+            sel.push_back(i);
+            sel_complex.push_back(cplx);
         }
         if ((int)sel.size() < n_states_to_compute) {
             std::cout << "Warning: STEOM dense diagonalization found only " << sel.size()
-                      << " real roots ≥ " << min_eigenvalue << " (requested "
+                      << " states ≥ " << min_eigenvalue << " (requested "
                       << n_states_to_compute << ")." << std::endl;
+        }
+        {
+            int n_cplx = 0; real_t max_imag = 0.0;
+            for (size_t n = 0; n < sel.size(); ++n)
+                if (sel_complex[n]) {
+                    ++n_cplx;
+                    max_imag = std::max(max_imag, std::abs(h_all_evals_imag[sel[n]]));
+                }
+            if (n_cplx > 0)
+                std::cout << "  [STEOM complex-root recovery] " << n_cplx << "/" << sel.size()
+                          << " reported states are complex-conjugate pairs collapsed to their "
+                             "real part (near-defective G — handle with care; max|Im|="
+                          << std::scientific << std::setprecision(2) << max_imag << " Ha = "
+                          << std::fixed << std::setprecision(3) << (max_imag * 27.2114)
+                          << " eV)." << std::endl;
         }
 
         eigenvalues.assign(n_states_to_compute, 1e30);
@@ -1251,6 +1300,8 @@ static void compute_steom_ccsd_impl(RHF& rhf,
             eigenvalues[n] = h_all_evals[sel[n]];
         // Strided D2H copy of the selected eigenvectors (transposed layout:
         // element j of eigenvector idx is at d_all_evecs[idx + j*total_dim]).
+        // For a recovered complex root this is the real part of the (complex)
+        // right eigenvector — exact for the energy; approximate for %active.
         {
             std::vector<real_t> h_all_evecs((size_t)total_dim * total_dim);
             cudaMemcpy(h_all_evecs.data(), d_all_evecs,
@@ -1264,6 +1315,7 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 
         tracked_cudaFree(d_G_cm);
         tracked_cudaFree(d_all_evals);
+        tracked_cudaFree(d_all_evals_imag);
         tracked_cudaFree(d_all_evecs);
 
         std::cout << "  STEOM-CCSD solve time: " << std::fixed << std::setprecision(3)

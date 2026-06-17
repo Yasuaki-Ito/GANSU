@@ -241,7 +241,8 @@ int eigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_
 // Helper: sort eigenvalues (real parts) ascending and reorder eigenvectors
 static void sort_eigenvalues_and_eigenvectors(
     real_t* h_evals_real, real_t* h_evals_imag, real_t* h_evecs,
-    int size, real_t* h_sorted_evals, real_t* h_sorted_evecs)
+    int size, real_t* h_sorted_evals, real_t* h_sorted_evecs,
+    real_t* h_sorted_imag = nullptr)
 {
     // Default: discard any eigenvalue whose |imag| ≥ 1e-6 (keep only real roots).
     // Override the cutoff with GANSU_STEOM_IMAG_TOL (e.g. 1e30 keeps *every*
@@ -293,6 +294,24 @@ static void sort_eigenvalues_and_eigenvectors(
     }
     // ------------------------------------------------------------------------
 
+    // FULL mode: keep EVERY eigenvalue, sorted ascending by real part (complex
+    // roots NOT dropped), and output the imag parts aligned. The caller (STEOM
+    // complex-root recovery) collapses complex-conjugate pairs to one real state.
+    if (h_sorted_imag != nullptr) {
+        std::vector<int> idx(size);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::sort(idx.begin(), idx.end(),
+                  [&](int a, int b) { return h_evals_real[a] < h_evals_real[b]; });
+        for (int i = 0; i < size; i++) {
+            const int orig = idx[i];
+            h_sorted_evals[i] = h_evals_real[orig];
+            h_sorted_imag [i] = h_evals_imag[orig];
+            for (int j = 0; j < size; j++)
+                h_sorted_evecs[i + j * size] = h_evecs[j + orig * size];
+        }
+        return;
+    }
+
     std::vector<int> real_indices;
     real_indices.reserve(size);
     for (int i = 0; i < size; i++) {
@@ -316,7 +335,7 @@ static void sort_eigenvalues_and_eigenvectors(
     }
 }
 
-int eigenDecompositionNonSymmetric(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size, [[maybe_unused]] bool force_host) {
+int eigenDecompositionNonSymmetric(const real_t* d_matrix, real_t* d_eigenvalues, real_t* d_eigenvectors, const int size, [[maybe_unused]] bool force_host, real_t* d_eigenvalues_imag) {
 #ifndef GANSU_CPU_ONLY
     if (force_host || !gpu_available()) {
 #endif
@@ -342,12 +361,16 @@ int eigenDecompositionNonSymmetric(const real_t* d_matrix, real_t* d_eigenvalues
 
         std::vector<real_t> h_sorted_evals(size);
         std::vector<real_t> h_sorted_evecs((size_t)size * size);
+        std::vector<real_t> h_sorted_imag(d_eigenvalues_imag ? size : 0);
         sort_eigenvalues_and_eigenvectors(
             h_evals_real.data(), h_evals_imag.data(), h_evecs.data(),
-            size, h_sorted_evals.data(), h_sorted_evecs.data());
+            size, h_sorted_evals.data(), h_sorted_evecs.data(),
+            d_eigenvalues_imag ? h_sorted_imag.data() : nullptr);
 
         cudaMemcpy(d_eigenvalues, h_sorted_evals.data(), size * sizeof(real_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_eigenvectors, h_sorted_evecs.data(), (size_t)size * size * sizeof(real_t), cudaMemcpyHostToDevice);
+        if (d_eigenvalues_imag)
+            cudaMemcpy(d_eigenvalues_imag, h_sorted_imag.data(), size * sizeof(real_t), cudaMemcpyHostToDevice);
         return 0;
 #ifndef GANSU_CPU_ONLY
     }
@@ -434,15 +457,20 @@ int eigenDecompositionNonSymmetric(const real_t* d_matrix, real_t* d_eigenvalues
         h_evals_imag[i] = h_W[i].y;
     }
 
-    // Sort by real part ascending, filter imaginary, transpose
+    // Sort by real part ascending, transpose. With d_eigenvalues_imag the FULL
+    // spectrum is kept (complex roots retained) and imag parts returned.
     std::vector<real_t> h_sorted_evals(size);
     std::vector<real_t> h_sorted_evecs((size_t)size * size);
+    std::vector<real_t> h_sorted_imag(d_eigenvalues_imag ? size : 0);
     sort_eigenvalues_and_eigenvectors(
         h_evals_real.data(), h_evals_imag.data(), h_evecs.data(),
-        size, h_sorted_evals.data(), h_sorted_evecs.data());
+        size, h_sorted_evals.data(), h_sorted_evecs.data(),
+        d_eigenvalues_imag ? h_sorted_imag.data() : nullptr);
 
     cudaMemcpy(d_eigenvalues, h_sorted_evals.data(), size * sizeof(real_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_eigenvectors, h_sorted_evecs.data(), (size_t)size * size * sizeof(real_t), cudaMemcpyHostToDevice);
+    if (d_eigenvalues_imag)
+        cudaMemcpy(d_eigenvalues_imag, h_sorted_imag.data(), size * sizeof(real_t), cudaMemcpyHostToDevice);
 
     tracked_cudaFree(d_A);
     tracked_cudaFree(d_W);
