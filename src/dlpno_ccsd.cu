@@ -179,6 +179,14 @@ inline Phase24Integrals precompute_phase24_integrals(
     out.nocc = res.nocc;
     const size_t n_pairs = res.setups.size();
     out.n_pno_per_pair.assign(n_pairs, 0);
+
+    // Increment 2 / S1: only build the VVOV/VOOO blocks when CCSD singles are
+    // active. Default OFF ⇒ zero extra extract/copy/memory and byte-identical
+    // to the legacy DLPNO-CCD path.
+    const bool singles_want = []() {
+        const char* e = std::getenv("GANSU_DLPNO_CCSD_SINGLES");
+        return e && e[0] == '1';
+    }();
     out.T_pair.assign(n_pairs, {});
     out.W_pair.assign(n_pairs, {});
     out.W_oooo.assign(n_pairs, {});
@@ -211,6 +219,11 @@ inline Phase24Integrals precompute_phase24_integrals(
     out.W_ovvo_bare_j.assign(n_pairs, {});
     out.W_oovv_bare_i.assign(n_pairs, {});
     out.W_oovv_bare_j.assign(n_pairs, {});
+    // Increment 2 / S1: VVOV (i/j orientations) + VOOO per strong pair for the
+    // linear T1→T2 back-coupling in the CCSD T2 residual. Filled below per pair.
+    out.W_vvov_i.assign(n_pairs, {});
+    out.W_vvov_j.assign(n_pairs, {});
+    out.W_vooo_i.assign(n_pairs, {});
 
     // Phase B — multi-GPU pair-parallel integral build.
     //   Detect distributed RI back-end with replicated B; if available,
@@ -323,7 +336,7 @@ inline Phase24Integrals precompute_phase24_integrals(
         // unpacking below is unchanged regardless of which path produced it.
         const bool is_diag = (s.i == s.j);
         const Phase24ExtractLayout layout =
-            compute_phase24_extract_layout(n_lmo, n_pno, is_diag);
+            compute_phase24_extract_layout(n_lmo, n_pno, is_diag, singles_want);
 
         if (layout.total > ws_packed_capacity) {
             if (d_packed_ws) tracked_cudaFree(d_packed_ws);
@@ -378,6 +391,19 @@ inline Phase24Integrals precompute_phase24_integrals(
             if (is_diag) {
                 BI(si, 1, n_lmo, n_pno, n_lmo, n_pno, n_lmo, n_pno,
                    P + layout.off_W_ovvv_diag);
+            }
+            // Increment 2 / S1 — VVOV + VOOO (T1→T2 linear back-coupling).
+            //   W_vvov_i[a,b,c] = (a' b' | si c') = (ab|ic); _j with sj.
+            //   W_vooo_i[a,k]   = (a' k  | si sj) = (ak|ij).
+            // All natural mo_eri_block_into layout == dest (no relayout).
+            // Gated: layout reserves these blocks only when singles_want.
+            if (singles_want) {
+                BI(n_lmo, n_pno, n_lmo, n_pno, si, 1, n_lmo, n_pno,
+                   P + layout.off_W_vvov_i);
+                BI(n_lmo, n_pno, n_lmo, n_pno, sj, 1, n_lmo, n_pno,
+                   P + layout.off_W_vvov_j);
+                BI(n_lmo, n_pno, 0, n_lmo, si, 1, sj, 1,
+                   P + layout.off_W_vooo_i);
             }
 
             // --- Relayout blocks (build into scratch, transpose mid → dest) ---
@@ -464,6 +490,10 @@ inline Phase24Integrals precompute_phase24_integrals(
         copy_block(out.W_ovvo_bare_j[idx], layout.off_W_ovvo_bare_j, layout.sz_W_ovov);
         copy_block(out.W_oovv_bare_i[idx], layout.off_W_oovv_bare_i, layout.sz_W_ovov);
         copy_block(out.W_oovv_bare_j[idx], layout.off_W_oovv_bare_j, layout.sz_W_ovov);
+        // Increment 2 / S1: VVOV (i/j) + VOOO.
+        copy_block(out.W_vvov_i[idx], layout.off_W_vvov_i, layout.sz_vvov);
+        copy_block(out.W_vvov_j[idx], layout.off_W_vvov_j, layout.sz_vvov);
+        copy_block(out.W_vooo_i[idx], layout.off_W_vooo_i, layout.sz_vooo);
 
         (void)s;  // s used above; suppress -Wunused if conditional.
     }
@@ -1029,6 +1059,16 @@ real_t DLPNOCCSD::compute_energy()
                 }
 
                 // INCREMENT-1 source: diagonal (m=i) ovvv T2→T1 coupling.
+                // Canonical T1 (eri_stored.cu:8002-8029) source[i,a] =
+                //   Σ_kcd (2(ka|dc) − (ka|cd))·tau_ik^cd, the m=i (k=i) piece is
+                //   Σ_cd (2(ia|dc) − (ia|cd))·Y_ii[c,d]
+                //   = Σ_cd (2·W[a,d,c] − W[a,c,d])·Y[c,d],
+                // with W[a,b,c] = W_ovvv_diag[i][a,b,c] = (ia|bc) and the TARGET
+                // virtual a adjacent to occ i (NOT (if|ae) — the old W[f,a,e]
+                // slice had a in the wrong slot). Canonical adds this to `val`
+                // with + and newT1=val/Dia, Dia=eps_i−eps_a<0 ⇒ the DLPNO
+                // residual (Jacobi −R/denom, denom=eps_a−F_ii>0) carries it with
+                // the SAME sign as the validated T2 4-vir anchor ⇒ R += source.
                 const int npno = p_ii.n_pno;
                 if (npno > 0 && !p_ii.Y.empty()
                     && i < static_cast<int>(phase24.W_ovvv_diag.size())
@@ -1040,10 +1080,11 @@ real_t DLPNOCCSD::compute_energy()
                     std::vector<real_t> R1_pno(npno, 0.0);
                     for (int a = 0; a < npno; ++a) {
                         real_t acc = 0.0;
-                        for (int e = 0; e < npno; ++e)
-                            for (int f = 0; f < npno; ++f)
-                                acc += (2.0 * Y[e * npno + f] - Y[f * npno + e])
-                                     * W[(static_cast<size_t>(f) * npno + a) * npno + e];
+                        for (int c = 0; c < npno; ++c)
+                            for (int d = 0; d < npno; ++d)
+                                acc += (2.0 * W[(static_cast<size_t>(a) * npno + d) * npno + c]
+                                      -       W[(static_cast<size_t>(a) * npno + c) * npno + d])
+                                     * Y[c * npno + d];
                         R1_pno[a] = acc;
                     }
                     // PNO(ii) → PAO(ii):  R1_pao = M · R1_pno   (M: n_pao × n_pno)
@@ -1051,7 +1092,7 @@ real_t DLPNOCCSD::compute_energy()
                     Eigen::Map<const Eigen::VectorXd> rp(R1_pno.data(), npno);
                     const Eigen::VectorXd R1_pao = M * rp;
                     for (int a = 0; a < n_pao_i; ++a)
-                        R[a] -= R1_pao(a);   // canonical RHS (+source) ⇒ R −= source
+                        R[a] += R1_pao(a);   // canonical val += source ⇒ R += source
                 }
 
                 for (int a = 0; a < n_pao_i; ++a) {

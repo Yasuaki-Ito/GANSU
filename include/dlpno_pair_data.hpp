@@ -272,6 +272,27 @@ struct Phase24Integrals {
     std::vector<std::vector<real_t>> W_ovvo_bare_j;
     std::vector<std::vector<real_t>> W_oovv_bare_i;     ///< [n_pairs] of [nocc · n_pno²]
     std::vector<std::vector<real_t>> W_oovv_bare_j;
+
+    /// Increment 2 / S1: VVOV + VOOO blocks per strong pair (i,j) for the
+    /// linear T1→T2 back-coupling in the CCSD T2 residual (the spin-adapted,
+    /// symmetrised reduction of the canonical raw(i,a,j,b) terms
+    ///   + Σ_c (ab|ic) t1(j,c)   − Σ_k (ak|ij) t1(k,b)).
+    ///
+    /// Per pair (i,j) with PNO indices a,b,c and LMO index k:
+    ///   W_vvov_i[idx][a,b,c] = (n_lmo+a, n_lmo+b | s.i,    n_lmo+c) = (ab|ic)
+    ///   W_vvov_j[idx][a,b,c] = (n_lmo+a, n_lmo+b | s.j,    n_lmo+c) = (ab|jc)
+    ///   W_vooo_i[idx][a,k]   = (n_lmo+a, k        | s.i,    s.j)    = (ak|ij)
+    /// (no 8-fold symmetry relates the i/j orientations of vvov; vooo needs
+    /// only the (i,j) ket since the j-role contraction reuses the same block
+    /// with the virtual roles swapped — see the residual sweep).
+    ///
+    /// Layout (row-major): vvov ((a·n_pno + b)·n_pno + c); vooo (a·n_lmo + k).
+    /// Scaling: vvov is n_pair_strong · n_pno³ · 16 B (two blocks); vooo is
+    /// n_pair_strong · n_pno · n_lmo · 8 B (both ≲ the existing W_pair n_pno⁴).
+    /// Only built/consumed when CCSD singles (T1_pao) are active.
+    std::vector<std::vector<real_t>> W_vvov_i;   ///< [n_pairs] of [n_pno³]
+    std::vector<std::vector<real_t>> W_vvov_j;   ///< [n_pairs] of [n_pno³]
+    std::vector<std::vector<real_t>> W_vooo_i;   ///< [n_pairs] of [n_pno · n_lmo]
 };
 
 /**

@@ -354,6 +354,71 @@ __global__ void extract_lambda_ovoo_kernel(
     d_ovoo_alt[tid] = d_eri_mo[e_j];
 }
 
+/// Increment 2 / S1: two VVOV extracts in one launch (over n_pno³):
+///   W_vvov_i[a,b,c] = eri[n_lmo+a, n_lmo+b, si, n_lmo+c] = (ab|ic)
+///   W_vvov_j[a,b,c] = eri[n_lmo+a, n_lmo+b, sj, n_lmo+c] = (ab|jc)
+/// Output layout: (a · n_pno + b) · n_pno + c.
+__global__ void extract_vvov_kernel(
+    const real_t* __restrict__ d_eri_mo,
+    real_t*       __restrict__ d_vvov_i,
+    real_t*       __restrict__ d_vvov_j,
+    int n_emb, int n_lmo, int n_pno, int si, int sj)
+{
+    const std::size_t total =
+        static_cast<std::size_t>(n_pno) * n_pno * n_pno;
+    const std::size_t tid =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+
+    const std::size_t n_emb2 = static_cast<std::size_t>(n_emb) * n_emb;
+    const std::size_t n_emb3 = n_emb2 * n_emb;
+
+    const int c = static_cast<int>(tid % n_pno);
+    const std::size_t t1 = tid / n_pno;
+    const int b = static_cast<int>(t1 % n_pno);
+    const int a = static_cast<int>(t1 / n_pno);
+
+    const std::size_t base =
+        static_cast<std::size_t>(n_lmo + a) * n_emb3 +
+        static_cast<std::size_t>(n_lmo + b) * n_emb2;
+    const std::size_t e_i =
+        base + static_cast<std::size_t>(si) * n_emb +
+        static_cast<std::size_t>(n_lmo + c);
+    const std::size_t e_j =
+        base + static_cast<std::size_t>(sj) * n_emb +
+        static_cast<std::size_t>(n_lmo + c);
+    d_vvov_i[tid] = d_eri_mo[e_i];
+    d_vvov_j[tid] = d_eri_mo[e_j];
+}
+
+/// Increment 2 / S1: VOOO extract (over n_pno · n_lmo):
+///   W_vooo_i[a,k] = eri[n_lmo+a, k, si, sj] = (ak|ij)
+/// Output layout: a · n_lmo + k.
+__global__ void extract_vooo_kernel(
+    const real_t* __restrict__ d_eri_mo,
+    real_t*       __restrict__ d_vooo,
+    int n_emb, int n_lmo, int n_pno, int si, int sj)
+{
+    const std::size_t total =
+        static_cast<std::size_t>(n_pno) * n_lmo;
+    const std::size_t tid =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+
+    const std::size_t n_emb2 = static_cast<std::size_t>(n_emb) * n_emb;
+    const std::size_t n_emb3 = n_emb2 * n_emb;
+
+    const int k = static_cast<int>(tid % n_lmo);
+    const int a = static_cast<int>(tid / n_lmo);
+
+    const std::size_t e =
+        static_cast<std::size_t>(n_lmo + a) * n_emb3 +
+        static_cast<std::size_t>(k) * n_emb2 +
+        static_cast<std::size_t>(si) * n_emb +
+        static_cast<std::size_t>(sj);
+    d_vooo[tid] = d_eri_mo[e];
+}
+
 // ---------------------------------------------------------------------------
 // S7c relayout kernels (block-wise build path). These operate on the small
 // per-block buffers produced by mo_eri_block_into, never the n_emb⁴ tensor.
@@ -421,7 +486,7 @@ __global__ void fuse_T_from_A_kernel(
 } // anonymous namespace
 
 Phase24ExtractLayout compute_phase24_extract_layout(
-    int n_lmo, int n_pno, bool is_diag)
+    int n_lmo, int n_pno, bool is_diag, bool include_singles)
 {
     Phase24ExtractLayout L;
     L.sz_T_pair      = static_cast<std::size_t>(n_lmo) * n_lmo * n_pno * n_pno;
@@ -434,6 +499,10 @@ Phase24ExtractLayout compute_phase24_extract_layout(
                        : 0;
     L.sz_pno2        = static_cast<std::size_t>(n_pno) * n_pno;
     L.sz_ovoo        = static_cast<std::size_t>(n_pno) * n_lmo;
+    L.sz_vvov        = include_singles
+                       ? static_cast<std::size_t>(n_pno) * n_pno * n_pno : 0;
+    L.sz_vooo        = include_singles
+                       ? static_cast<std::size_t>(n_pno) * n_lmo : 0;
 
     std::size_t off = 0;
     L.off_T_pair             = off; off += L.sz_T_pair;
@@ -455,6 +524,10 @@ Phase24ExtractLayout compute_phase24_extract_layout(
     L.off_W_ovvo_bare_j      = off; off += L.sz_W_ovov;
     L.off_W_oovv_bare_i      = off; off += L.sz_W_ovov;
     L.off_W_oovv_bare_j      = off; off += L.sz_W_ovov;
+    // Increment 2 / S1: VVOV (two orientations) + VOOO.
+    L.off_W_vvov_i           = off; off += L.sz_vvov;
+    L.off_W_vvov_j           = off; off += L.sz_vvov;
+    L.off_W_vooo_i           = off; off += L.sz_vooo;
     L.total = off;
     return L;
 }
@@ -576,6 +649,25 @@ void launch_phase24_extract(
             extract_ip_bare_kernel<<<grid_for(n), kBlock, 0, stream>>>(
                 d_eri_mo, d_packed_out + layout.off_W_oovv_bare_j,
                 n_emb, n_lmo, n_pno, sj, /*mode=*/1);
+        }
+    }
+    // Increment 2 / S1: VVOV (i/j orientations) + VOOO.
+    {
+        const std::size_t n = layout.sz_vvov;
+        if (n > 0) {
+            extract_vvov_kernel<<<grid_for(n), kBlock, 0, stream>>>(
+                d_eri_mo,
+                d_packed_out + layout.off_W_vvov_i,
+                d_packed_out + layout.off_W_vvov_j,
+                n_emb, n_lmo, n_pno, si, sj);
+        }
+    }
+    {
+        const std::size_t n = layout.sz_vooo;
+        if (n > 0) {
+            extract_vooo_kernel<<<grid_for(n), kBlock, 0, stream>>>(
+                d_eri_mo, d_packed_out + layout.off_W_vooo_i,
+                n_emb, n_lmo, n_pno, si, sj);
         }
     }
 }

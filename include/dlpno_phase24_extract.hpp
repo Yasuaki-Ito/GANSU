@@ -66,6 +66,12 @@ struct Phase24ExtractLayout {
     std::size_t off_W_ovvo_bare_j      = 0;
     std::size_t off_W_oovv_bare_i      = 0;
     std::size_t off_W_oovv_bare_j      = 0;
+    /// Increment 2 / S1: VVOV (ab|ic)/(ab|jc) + VOOO (ak|ij) for the linear
+    /// T1→T2 back-coupling. vvov layout (a·n_pno+b)·n_pno+c (size n_pno³);
+    /// vooo layout a·n_lmo+k (size n_pno·n_lmo).
+    std::size_t off_W_vvov_i           = 0;
+    std::size_t off_W_vvov_j           = 0;
+    std::size_t off_W_vooo_i           = 0;
 
     std::size_t sz_T_pair       = 0;  ///< n_lmo² · n_pno²
     std::size_t sz_W_pair       = 0;  ///< n_pno⁴
@@ -75,11 +81,15 @@ struct Phase24ExtractLayout {
     std::size_t sz_W_ovvv_diag  = 0;  ///< n_pno³ (0 when !is_diag)
     std::size_t sz_pno2         = 0;  ///< n_pno² (W_ovvo_lambda etc.)
     std::size_t sz_ovoo         = 0;  ///< n_pno · n_lmo (W_ovoo_lambda etc.)
+    std::size_t sz_vvov         = 0;  ///< n_pno³ (W_vvov_i/j)
+    std::size_t sz_vooo         = 0;  ///< n_pno · n_lmo (W_vooo_i; == sz_ovoo)
 };
 
 /// Compute byte offsets / sizes for the packed output buffer.
+/// `include_singles` (Increment 2 / S1) reserves space for the VVOV/VOOO
+/// blocks; when false those sizes are 0 (no allocation / extraction).
 Phase24ExtractLayout compute_phase24_extract_layout(
-    int n_lmo, int n_pno, bool is_diag);
+    int n_lmo, int n_pno, bool is_diag, bool include_singles = false);
 
 /// Launch all 14 extract kernels on `stream`. `d_packed_out` must be at
 /// least `layout.total * sizeof(real_t)` bytes. Synchronisation is the

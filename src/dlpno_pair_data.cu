@@ -1385,6 +1385,31 @@ LMP2Status iterate_dlpno_ccsd_t2(
         }
     }
 
+    // ---- Increment 2 / S1: AO-basis singles for the VOOO t1(k) projection. ----
+    // The VOOO term (−Σ_k (ak|ij) t1(k,b)) needs t1[k] projected into an
+    // arbitrary pair (i,j)'s PNO basis. With bar_Q the pair's S_AO-orthonormal
+    // PNO coefficients,
+    //   barS^(ij,kk)·t1_in_pno[k] = bar_Q_ij^T · S_AO · bar_Q_kk · t1_in_pno[k]
+    //                             = bar_Q_ij^T · St1ao[:,k]
+    // so precompute the AO column  St1ao[:,k] = S_AO · bar_Q_kk · t1_in_pno[k]
+    // once (T1 is fixed for this T2 solve); each pair then forms its own
+    // projection with a single bar_Q_ij^T · St1ao GEMM.
+    RowMatXd St1ao_mat;   // [nao × nocc], empty unless singles active
+    if (T1_pao != nullptr && h_S != nullptr) {
+        St1ao_mat = RowMatXd::Zero(nao, nocc);
+        Eigen::Map<const RowMatXd> Smat(h_S, nao, nao);
+        for (int k = 0; k < nocc; ++k) {
+            if (t1_in_pno[k].size() == 0) continue;
+            const int idx_kk = pair_lookup[static_cast<size_t>(k) * nocc + k];
+            if (idx_kk < 0) continue;
+            const PairData& pkk = pairs[idx_kk];
+            if (pkk.n_pno == 0) continue;
+            Eigen::Map<const RowMatXd> bQkk(pkk.bar_Q.data(), nao, pkk.n_pno);
+            const Eigen::VectorXd t1ao = bQkk * t1_in_pno[k];   // [nao]
+            St1ao_mat.col(k).noalias() = Smat * t1ao;           // [nao]
+        }
+    }
+
     for (int iter = 0; iter < max_iter; ++iter) {
         {
             const auto t_yold_0 = prof_clock::now();
@@ -1892,6 +1917,65 @@ LMP2Status iterate_dlpno_ccsd_t2(
                 }
                 prof_slot.t_w4virt += std::chrono::duration<double>(
                     prof_clock::now() - t_w4virt_0).count();
+
+                // ---- Increment 2 / S1: VVOV + VOOO linear T1→T2 coupling ----
+                // Symmetrised canonical raw(i,a,j,b) singles terms in pair
+                // (i,j)'s PNO (a,b PNO; c PNO; k LMO):
+                //   R[a,b] += Σ_c (ab|ic) t1_j[c] + Σ_c (ab|jc) t1_i[c]   (vvov)
+                //   R[a,b] −= Σ_k (ak|ij) t1_k[b] + Σ_k (bk|ij) t1_k[a]   (vooo)
+                // t1_i = barS^(ij,ii)·t1_in_pno[i], t1_j = barS^(ij,jj)·…[j];
+                // t1_k[·] = (bar_Q_ij^T · St1ao[:,k]) projects LMO k's singles
+                // into this pair's PNO. Same signs as the canonical raw (the
+                // DLPNO residual carries raw's coupling terms verbatim — Jacobi
+                // divides by −denom). CPU-only, mirrors the t1·t1 4-vir piece.
+                if (T1_pao != nullptr
+                    && idx < static_cast<long long>(phase24->W_vvov_i.size())
+                    && phase24->W_vvov_i[idx].size()
+                           == static_cast<size_t>(n) * n * n
+                    && phase24->W_vvov_j[idx].size()
+                           == static_cast<size_t>(n) * n * n
+                    && phase24->W_vooo_i[idx].size()
+                           == static_cast<size_t>(n) * nocc) {
+                    const auto t_s1_0 = prof_clock::now();
+                    const int idx_ii = pair_lookup[(size_t)sij.i * nocc + sij.i];
+                    const int idx_jj = pair_lookup[(size_t)sij.j * nocc + sij.j];
+                    if (idx_ii >= 0 && idx_jj >= 0
+                        && (int)t1_in_pno[sij.i].size() > 0
+                        && (int)t1_in_pno[sij.j].size() > 0
+                        && (int)barS_cache[idx][idx_ii].rows() == n
+                        && (int)barS_cache[idx][idx_jj].rows() == n) {
+                        const Eigen::VectorXd t1i =
+                            barS_cache[idx][idx_ii] * t1_in_pno[sij.i];   // [n]
+                        const Eigen::VectorXd t1j =
+                            barS_cache[idx][idx_jj] * t1_in_pno[sij.j];   // [n]
+
+                        // VVOV: reshape (a·n+b, c); contract over c with t1.
+                        Eigen::Map<const RowMatXd> VVOV_i(
+                            phase24->W_vvov_i[idx].data(), n * n, n);
+                        Eigen::Map<const RowMatXd> VVOV_j(
+                            phase24->W_vvov_j[idx].data(), n * n, n);
+                        Eigen::Map<Eigen::VectorXd> Rvec(R.data(), n * n);
+                        Rvec.noalias() += VVOV_i * t1j;   // + Σ_c (ab|ic) t1_j
+                        Rvec.noalias() += VVOV_j * t1i;   // + Σ_c (ab|jc) t1_i
+
+                        // VOOO: P_ij[b,k] = bar_Q_ij^T · St1ao[:,k] (k-th col).
+                        if (St1ao_mat.size() > 0) {
+                            Eigen::Map<const RowMatXd> bQ_ij(
+                                pij.bar_Q.data(), nao, n);
+                            const RowMatXd P_ij =
+                                bQ_ij.transpose() * St1ao_mat;   // [n × nocc]
+                            Eigen::Map<const RowMatXd> G(
+                                phase24->W_vooo_i[idx].data(), n, nocc);
+                            // O1: −Σ_k (ak|ij) t1_k[b] = −(G·P_ij^T)
+                            // O2: −Σ_k (bk|ij) t1_k[a] = −(P_ij·G^T)
+                            R.noalias() -= G * P_ij.transpose();
+                            R.noalias() -= P_ij * G.transpose();
+                        }
+                    }
+                    prof_slot.t_w4virt += std::chrono::duration<double>(
+                        prof_clock::now() - t_s1_0).count();
+                }
+
                 const auto t_oooo_0 = prof_clock::now();
 
                 // (b) oooo ladder, batched (Step 3).
