@@ -2175,16 +2175,22 @@ void ResidGpu::compute_async_phladder_only_()
             s.d_R_ph_packed + base_R, n_b, stride_R_b,
             cnt_b), "R -= PI_ki_TT·W_j^T (bucket)");
 
-        // Op 8: R_packed -= W_block_j2 · PI_ki_stack
+        // Op 8: R_packed -= W_block_j2 · PI_ki_TT^T
+        //   BUGFIX (2026-06-17): was "W_block_j2 · PI_ki_stack" (wrong outer-stack
+        //   orientation, OP_N/OP_N with PI_ki_stack). Must be the (i↔j,a↔b)
+        //   transpose mirror of Op4 (PI_kj_TT·W_i2^T) → −W_block_j2·PI_ki_TT^T.
+        //   R[a,b] -= Σ_kc W_block_j2[a,kc]·PI_ki_TT[b,kc]; same OP_T,OP_N idiom
+        //   as Op4 with A=PI_ki_TT_packed (lda=nn_b), B=W_block_j2_packed (ldb=nn_b).
+        //   The ring-symmetry-breaking ~100 mHa wrong-sign CCD−MP2 doubles defect.
         check_cublas_(cublasDgemmStridedBatched(
-            s.cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+            s.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
             n_b, n_b, nn_b,
             &neg_one,
-            s.d_PI_ki_stack_packed + base_stack, n_b,  stride_stack_b,
-            s.d_W_block_j2_packed  + base_block, nn_b, stride_block_b,
+            s.d_PI_ki_TT_packed   + base_block, nn_b, stride_block_b,
+            s.d_W_block_j2_packed + base_block, nn_b, stride_block_b,
             &one,
             s.d_R_ph_packed + base_R, n_b, stride_R_b,
-            cnt_b), "R -= W_j2·PI_ki (bucket)");
+            cnt_b), "R -= W_j2·PI_ki_TT^T (bucket)");
     }
     if (s.e_after_R) cudaEventRecord(s.e_after_R, /*stream=*/0);
 

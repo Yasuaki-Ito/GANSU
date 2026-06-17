@@ -39,6 +39,7 @@
 #include <numeric>   // std::iota
 #include <fstream>
 #include <sstream>
+#include <cstdlib>   // std::getenv, std::atoi, std::atof
 
 #ifndef GANSU_CPU_ONLY
 #include <cuda_runtime.h> // for int2 type
@@ -242,7 +243,56 @@ static void sort_eigenvalues_and_eigenvectors(
     real_t* h_evals_real, real_t* h_evals_imag, real_t* h_evecs,
     int size, real_t* h_sorted_evals, real_t* h_sorted_evecs)
 {
+    // Default: discard any eigenvalue whose |imag| ≥ 1e-6 (keep only real roots).
+    // Override the cutoff with GANSU_STEOM_IMAG_TOL (e.g. 1e30 keeps *every*
+    // eigenvalue by its real part — the candidate P2 fix where near-defective G
+    // produces complex valence roots that were silently dropped).
     double imag_threshold = 1e-6;
+    if (const char* tol_env = std::getenv("GANSU_STEOM_IMAG_TOL")) {
+        const double v = std::atof(tol_env);
+        if (v > 0.0) imag_threshold = v;
+    }
+
+    // --- P2 probe: dump the low end of the FULL complex spectrum -------------
+    // GANSU_STEOM_SPECTRUM=N prints the N eigenvalues with smallest real part
+    // (over ALL eigenvalues, complex included) with their imag part and a
+    // REAL/COMPLEX-DROP tag, so we can see whether the missing low STEOM states
+    // are complex roots being discarded near ~4-6 eV.
+    if (const char* dump_env = std::getenv("GANSU_STEOM_SPECTRUM")) {
+        int ndump = std::atoi(dump_env);
+        // Only dump large matrices: the final STEOM G is dim≈3500, whereas the
+        // IP/EA-EOM Davidson SUBSPACE geev calls (dim ≲ 300) also route through
+        // here and would otherwise flood the log. Override the floor with
+        // GANSU_STEOM_SPECTRUM_MINDIM (default 500).
+        int min_dim = 500;
+        if (const char* md = std::getenv("GANSU_STEOM_SPECTRUM_MINDIM")) {
+            const int v = std::atoi(md);
+            if (v > 0) min_dim = v;
+        }
+        if (ndump > 0 && size >= min_dim) {
+            ndump = std::min(ndump, size);
+            std::vector<int> all_idx(size);
+            std::iota(all_idx.begin(), all_idx.end(), 0);
+            std::sort(all_idx.begin(), all_idx.end(),
+                      [&](int a, int b) { return h_evals_real[a] < h_evals_real[b]; });
+            std::cout << "[STEOM spectrum] lowest " << ndump << " eigenvalues by Re "
+                      << "(imag_tol=" << imag_threshold << ", dim=" << size << "):\n"
+                      << "   k     Re(Ha)        Re(eV)       Im            status\n";
+            for (int k = 0; k < ndump; k++) {
+                int o = all_idx[k];
+                const bool dropped = std::abs(h_evals_imag[o]) >= imag_threshold;
+                std::cout << "  " << std::setw(3) << k
+                          << "  " << std::setw(12) << std::setprecision(8) << std::fixed << h_evals_real[o]
+                          << "  " << std::setw(10) << std::setprecision(4) << (h_evals_real[o] * 27.2114)
+                          << "  " << std::setw(13) << std::scientific << std::setprecision(3) << h_evals_imag[o]
+                          << std::fixed << "   " << (dropped ? "COMPLEX-DROP" : "real")
+                          << "\n";
+            }
+            std::cout.unsetf(std::ios::floatfield);
+        }
+    }
+    // ------------------------------------------------------------------------
+
     std::vector<int> real_indices;
     real_indices.reserve(size);
     for (int i = 0; i < size; i++) {

@@ -967,6 +967,119 @@ real_t DLPNOCCSD::compute_energy()
                   << t2_status.iters << " iter)" << std::endl;
     }
 
+    // -----------------------------------------------------------------------
+    // DLPNO-CCSD singles — INCREMENT 1 (env GANSU_DLPNO_CCSD_SINGLES=1, default
+    // OFF). The pre-T2 T1 solve above is purely linear ⇒ T1≈0 at the RHF
+    // reference (Brillouin), so GANSU's "DLPNO-CCSD" is currently DLPNO-CCD.
+    // Now that the doubles Y and the phase24 integrals exist, refine T1 with the
+    // leading T2→T1 coupling term of canonical CCSD (the spin-adapted reduction
+    // of the spin-orbital  −½ Σ_mef ⟨ma‖ef⟩ t_im^ef , Stanton-1991), restricted
+    // to the diagonal pair m=i (the only piece available from W_ovvv_diag):
+    //
+    //   R1_pno[a] += Σ_ef (2·Y_ii[e,f] − Y_ii[f,e]) · (a e | i f)
+    //   (a e | i f) = (i f | a e) = W_ovvv_diag[i][f,a,e]   (chemist; PNO(ii))
+    //
+    // then rotate PNO(ii)→PAO(ii) via M and enter the Jacobi residual as
+    // (R −= source) — the canonical RHS sign with GANSU's denom = eps_a − F_ii.
+    //
+    // Increment 1 only turns T1 ON (validation: max|T1| rises from ~4e-5 to
+    // ~1e-2; sign/magnitude checkable vs canonical T1 with GANSU_DLPNO_BT_VALIDATE).
+    // It does NOT change the correlation energy (E_T1 ∝ f_ia ≈ 0; the T1→T2
+    // back-coupling + the off-diagonal/ooov terms are increments 2-3). Default
+    // OFF so production runs and bt-PNO-STEOM (which consume T1) stay unchanged
+    // until the full singles are validated.
+    // -----------------------------------------------------------------------
+    const bool ccsd_singles_inc1 = []() {
+        const char* e = std::getenv("GANSU_DLPNO_CCSD_SINGLES");
+        return e && e[0] == '1';
+    }();
+    if (ccsd_singles_inc1) {
+        for (int iter = 0; iter < max_iter; ++iter) {
+            T1_old = T1;
+            real_t r_max = 0.0;
+            #pragma omp parallel for schedule(dynamic) reduction(max:r_max)
+            for (int i = 0; i < nocc_; ++i) {
+                const int idx_ii = res.pair_lookup[i * nocc_ + i];
+                const PairSetup& s_ii = res.setups[idx_ii];
+                const PairData&  p_ii = res.pairs[idx_ii];
+                const int n_pao_i = s_ii.n_pao;
+                if (n_pao_i == 0) continue;
+                const real_t F_ii = res.F_LMO[i * nocc_ + i];
+
+                // Linear part (identical to the pre-T2 T1 residual).
+                std::vector<real_t> R = f_ia[i];
+                for (int a = 0; a < n_pao_i; ++a)
+                    R[a] += (s_ii.eps_a[a] - F_ii) * T1_old[i][a];
+                for (int k = 0; k < nocc_; ++k) {
+                    if (k == i) continue;
+                    const real_t F_ik = res.F_LMO[i * nocc_ + k];
+                    if (std::fabs(F_ik) < kFLMOThresh) continue;
+                    const int idx_kk = res.pair_lookup[k * nocc_ + k];
+                    const PairSetup& s_kk = res.setups[idx_kk];
+                    if (s_kk.n_pao == 0) continue;
+                    const auto proj = project_t1(
+                        s_ii.C_can_pair.data(), n_pao_i,
+                        s_kk.C_can_pair.data(), s_kk.n_pao,
+                        T1_old[k], h_S, nao_);
+                    for (int a = 0; a < n_pao_i; ++a)
+                        R[a] -= F_ik * proj[a];
+                }
+
+                // INCREMENT-1 source: diagonal (m=i) ovvv T2→T1 coupling.
+                const int npno = p_ii.n_pno;
+                if (npno > 0 && !p_ii.Y.empty()
+                    && i < static_cast<int>(phase24.W_ovvv_diag.size())
+                    && phase24.W_ovvv_diag[i].size() ==
+                           static_cast<size_t>(npno) * npno * npno
+                    && static_cast<int>(p_ii.M.size()) == n_pao_i * npno) {
+                    const real_t* Y = p_ii.Y.data();
+                    const real_t* W = phase24.W_ovvv_diag[i].data();
+                    std::vector<real_t> R1_pno(npno, 0.0);
+                    for (int a = 0; a < npno; ++a) {
+                        real_t acc = 0.0;
+                        for (int e = 0; e < npno; ++e)
+                            for (int f = 0; f < npno; ++f)
+                                acc += (2.0 * Y[e * npno + f] - Y[f * npno + e])
+                                     * W[(static_cast<size_t>(f) * npno + a) * npno + e];
+                        R1_pno[a] = acc;
+                    }
+                    // PNO(ii) → PAO(ii):  R1_pao = M · R1_pno   (M: n_pao × n_pno)
+                    Eigen::Map<const RowMatXd> M(p_ii.M.data(), n_pao_i, npno);
+                    Eigen::Map<const Eigen::VectorXd> rp(R1_pno.data(), npno);
+                    const Eigen::VectorXd R1_pao = M * rp;
+                    for (int a = 0; a < n_pao_i; ++a)
+                        R[a] -= R1_pao(a);   // canonical RHS (+source) ⇒ R −= source
+                }
+
+                for (int a = 0; a < n_pao_i; ++a) {
+                    const real_t denom = s_ii.eps_a[a] - F_ii;
+                    T1[i][a] -= R[a] / denom;
+                    r_max = std::max(r_max, std::fabs(R[a]));
+                }
+            }
+            r_max_last = r_max;
+            ++t1_iter;
+            if (params_.verbose >= 2) {
+                std::cout << "[DLPNO-CCSD] T1(singles inc1) iter "
+                          << std::setw(3) << t1_iter << "  max|R|="
+                          << std::scientific << std::setprecision(3) << r_max
+                          << std::endl;
+            }
+            if (r_max < conv_tol) { t1_converged = true; break; }
+        }
+        // Refresh the reported T1 norm with the singles-refined amplitudes.
+        t1_norm_max = 0.0;
+        for (int i = 0; i < nocc_; ++i)
+            for (real_t v : T1[i])
+                t1_norm_max = std::max(t1_norm_max, std::fabs(v));
+        if (params_.verbose >= 1) {
+            std::cout << "[DLPNO-CCSD] singles inc1 ON — T1 refined with "
+                         "diagonal ovvv T2 source; max|T1|="
+                      << std::scientific << std::setprecision(3) << t1_norm_max
+                      << " (energy unchanged; increment 1 of 3)" << std::endl;
+        }
+    }
+
     // Recompute strong/weak energies from the post-CCSD Y. With dressing on
     // these are NOT equal to the LMP2 values — the difference is the
     // accumulated dressing effect.

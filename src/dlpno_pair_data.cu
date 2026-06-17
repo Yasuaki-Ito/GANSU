@@ -2099,8 +2099,15 @@ LMP2Status iterate_dlpno_ccsd_t2(
                              PI_ki_stack.transpose() * W_block_j2.transpose();
                         R.noalias() -=
                              PI_ki_TT                * W_block_j .transpose();
+                        // BUGFIX (2026-06-17): Op8 must be the (i↔j,a↔b) transpose
+                        // mirror of i-side Op4 (−PI_kj_TT·W_block_i2^T), i.e.
+                        // −W_block_j2·PI_ki_TT^T. It previously used PI_ki_stack
+                        // (leading-c [kc,b]) instead of PI_ki_TT^T (trailing-c),
+                        // breaking the ring symmetry — the ~100 mHa wrong-sign
+                        // CCD−MP2 doubles defect (threshold-invariant). Ops 5-7
+                        // already mirror Ops 1-3 correctly; only this one was off.
                         R.noalias() -=
-                             W_block_j2              * PI_ki_stack;
+                             W_block_j2              * PI_ki_TT.transpose();
                     }
                     prof_slot.t_phladder_cpu += std::chrono::duration<double>(
                         prof_clock::now() - t_phl_0).count();

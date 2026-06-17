@@ -16,6 +16,7 @@
 #include <memory>
 #include <iomanip>
 #include <iostream>
+#include <cstdlib> // std::getenv (GANSU_CCSD_NO_SINGLES diagnostic gate)
 #include <assert.h>
 
 
@@ -5461,6 +5462,39 @@ void compute_t_amplitude(const real_t* __restrict__ d_eri_mo,
         }
         computed_intermediates++;
     }
+    // DIAGNOSTIC (env GANSU_CCSD_NO_SINGLES=1): force the singles to zero every
+    // iteration so the canonical solver runs CCD instead of CCSD. This isolates
+    // the CCSD−CCD (singles) energy contribution, settling whether the 110 mHa
+    // canonical↔DLPNO gap is the missing singles or a doubles defect. Default
+    // unset ⇒ byte-identical canonical CCSD.
+    {
+        static const bool ccsd_no_singles =
+            (std::getenv("GANSU_CCSD_NO_SINGLES") != nullptr);
+        if (ccsd_no_singles) {
+            const size_t n_ia = (size_t)num_spin_occ * num_spin_vir;
+            // One-time marker: proves the gate is compiled in AND report the
+            // pre-zero max|t1| so we know whether canonical T1 is even nonzero.
+            static bool announced = false;
+            if (!announced) {
+                std::vector<real_t> h_t1(n_ia, 0.0);
+                if (gpu::gpu_available())
+                    cudaMemcpy(h_t1.data(), t_ia_new, n_ia * sizeof(real_t),
+                               cudaMemcpyDeviceToHost);
+                else
+                    std::memcpy(h_t1.data(), t_ia_new, n_ia * sizeof(real_t));
+                real_t mx = 0.0;
+                for (real_t v : h_t1) mx = std::max(mx, std::fabs(v));
+                std::cout << "[CCD-GATE] GANSU_CCSD_NO_SINGLES active — zeroing "
+                             "singles each iter (pre-zero max|t1| iter1 = "
+                          << std::scientific << mx << ")" << std::endl;
+                announced = true;
+            }
+            if (gpu::gpu_available())
+                cudaMemset(t_ia_new, 0, n_ia * sizeof(real_t));
+            else
+                std::memset(t_ia_new, 0, n_ia * sizeof(real_t));
+        }
+    }
     { // t_ijab_new
         std::string str = "Computing t_ijab amplitudes... " + std::to_string(computed_intermediates+1) + "/" + std::to_string(num_intermediates);
         PROFILE_ELAPSED_TIME(str);
@@ -7167,6 +7201,26 @@ real_t ccsd_spatial_orbital_naive(const real_t* __restrict__ d_eri_ao,
                     }
 
         // ---- DIIS ----
+        // DIAGNOSTIC (env GANSU_CCSD_NO_SINGLES=1): zero singles BEFORE the DIIS
+        // push so the error vector stays consistent (true CCD). If zeroed AFTER
+        // DIIS, the singles residual is permanently nonzero and DIIS oscillates.
+        // Isolates the CCSD−CCD (singles) energy. Default unset ⇒ byte-identical CCSD.
+        {
+            static const bool ccd_gate =
+                (std::getenv("GANSU_CCSD_NO_SINGLES") != nullptr);
+            if (ccd_gate) {
+                static bool announced = false;
+                if (!announced) {
+                    real_t mx = 0.0;
+                    for (real_t v : newT1) mx = std::max(mx, std::fabs(v));
+                    std::cout << "[CCD-GATE] GANSU_CCSD_NO_SINGLES active (spatial CCSD) "
+                                 "— zeroing singles each iter (max|t1| = "
+                              << std::scientific << mx << ")" << std::endl;
+                    announced = true;
+                }
+                std::fill(newT1.begin(), newT1.end(), 0.0);
+            }
+        }
         std::vector<real_t> ampVec(num_amps);
         std::vector<real_t> errVec(num_amps);
         for (size_t k = 0; k < t1Size; k++) { ampVec[k] = newT1[k]; errVec[k] = newT1[k] - t1[k]; }
@@ -8190,6 +8244,26 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                     }
 
         // ---- DIIS ----
+        // DIAGNOSTIC (env GANSU_CCSD_NO_SINGLES=1): zero singles BEFORE the DIIS
+        // push so the error vector stays consistent (true CCD). If zeroed AFTER
+        // DIIS, the singles residual is permanently nonzero and DIIS oscillates.
+        // Isolates the CCSD−CCD (singles) energy. Default unset ⇒ byte-identical CCSD.
+        {
+            static const bool ccd_gate =
+                (std::getenv("GANSU_CCSD_NO_SINGLES") != nullptr);
+            if (ccd_gate) {
+                static bool announced = false;
+                if (!announced) {
+                    real_t mx = 0.0;
+                    for (real_t v : newT1) mx = std::max(mx, std::fabs(v));
+                    std::cout << "[CCD-GATE] GANSU_CCSD_NO_SINGLES active (spatial CCSD) "
+                                 "— zeroing singles each iter (max|t1| = "
+                              << std::scientific << mx << ")" << std::endl;
+                    announced = true;
+                }
+                std::fill(newT1.begin(), newT1.end(), 0.0);
+            }
+        }
         std::vector<real_t> ampVec(num_amps);
         std::vector<real_t> errVec(num_amps);
         for (size_t k = 0; k < t1Size; k++) {
