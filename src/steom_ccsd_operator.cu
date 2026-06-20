@@ -3941,7 +3941,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
 #endif
     // GPU GEMM port of UAMCI T4 (Σ_{k,l} wovoo(k,c,l,i)·siP(m,l,k,a), O(NV²·NMo·NO³)):
     //   C[(c,i),(m,a)] = Σ_{(k,l)} A[(c,i),(k,l)]·B[(m,a),(k,l)]  (= A·Bᵀ, contract (k,l))
-    //   A[(c,i),(k,l)] = wovoo(k,c,l,i),  B[(m,a),(k,l)] = siP(m,l,k,a)
+    //   FIX 2026-06-20 Wovoo->Wooov: A[(c,i),(k,l)] = wooov(k,l,i,c),  B[(m,a),(k,l)] = siP(m,k,l,a)
     // Result scattered (in the assembly loop) into UAMCI(a,m,c,i).
     const int CI_M4 = NV*NO, MA_N4 = NMo*NV, KL_K4 = NO*NO;
     std::vector<real_t> ct_uamci_t4;
@@ -3953,11 +3953,11 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         #pragma omp parallel for collapse(2)
         for (int c=0;c<NV;++c) for (int i=0;i<NO;++i)
             for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
-                hA[(size_t)(c*NO+i)*KL_K4+(k*NO+l)] = wovoo(k,c,l,i);
+                hA[(size_t)(c*NO+i)*KL_K4+(k*NO+l)] = wooov(k,l,i,c);   // FIX Wooov
         #pragma omp parallel for collapse(2)
         for (int m=0;m<NMo;++m) for (int a=0;a<NV;++a)
             for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
-                hB[(size_t)(m*NV+a)*KL_K4+(k*NO+l)] = siP(m,l,k,a);
+                hB[(size_t)(m*NV+a)*KL_K4+(k*NO+l)] = siP(m,k,l,a);     // FIX s_IP[m][k,l,a]
         real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
         tracked_cudaMalloc(&dA,(size_t)CI_M4*KL_K4*sizeof(real_t));
         tracked_cudaMalloc(&dB,(size_t)MA_N4*KL_K4*sizeof(real_t));
@@ -3976,7 +3976,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                 for (int m=0;m<NMo;++m) for (int a=0;a<NV;a+=(NV/2>0?NV/2:1)) {
                     real_t t=0.0;
                     for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
-                        t += wovoo(k,c,l,i)*siP(m,l,k,a);
+                        t += wooov(k,l,i,c)*siP(m,k,l,a);
                     dmax=std::max(dmax,std::fabs(t-ct_uamci_t4[(size_t)(c*NO+i)*MA_N4+(m*NV+a)]));
                 }
             std::cout << "[W_eff_and_G self-check] UAMCI T4 GEMM vs host: max|Δ| = "
@@ -3998,13 +3998,13 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                     t -= wvovv(a,l,d,c)*siP(m,i,l,d);                              // T3
                 }
             }
-            // T4 FIX 2026-06-20 (Wovoo->Wooov; matches Python build_g_canonical_full u_amci):
-            //   was + Wovoo[k,c,l,i] s_IP[m][l,k,a]  ->  + Wooov[k,l,i,c] s_IP[m][k,l,a]
-            // The GPU GEMM ct_uamci_t4 is the OLD Wovoo form; bypass it (TODO re-port GEMM
-            // to Wooov for speed after ORCA validation).
-            (void)uamci_t4_gpu;
-            for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
-                t += wooov(k,l,i,c)*siP(m,k,l,a);                                // T4 (Wooov)
+            // T4 (Wovoo->Wooov fix 2026-06-20): + Wooov[k,l,i,c] s_IP[m][k,l,a]. GEMM re-ported.
+            if (uamci_t4_gpu) {
+                t += ct_uamci_t4[(size_t)(c*NO+i)*MA_N4+(m*NV+a)];               // T4 (GEMM, Wooov)
+            } else {
+                for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
+                    t += wooov(k,l,i,c)*siP(m,k,l,a);                            // T4 (host, Wooov)
+            }
             UAMCI(a,m,c,i)=t;
         }
     // UAKEI T4 (Σ_cd wvovv(a,k,c,d)·seA(e,i,c,d), the largest phph sub-term) as a single
@@ -4256,9 +4256,9 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     auto UBMJC=[&](int b,int m,int j,int c)->real_t&{ return u_bmjc[(((size_t)b*NMo+m)*NO+j)*NV+c]; };
     auto UBKJE=[&](int b,int k,int j,int e)->real_t&{ return u_bkje[(((size_t)b*NO+k)*NO+j)*NMv+e]; };
     auto UBMJE=[&](int b,int m,int j,int e)->real_t&{ return u_bmje[(((size_t)b*NMo+m)*NO+j)*NMv+e]; };
-    // GPU GEMM port of UBMJC T3 (O(NO³·NV³)):
-    //   ct[b,c,m,j] = Σ_{k,d} wvovv(b,k,d,c)·siP(m,k,j,d)   (subtracted below)
-    // A[(b,c),(k,d)] = wvovv(b,k,d,c), B[(m,j),(k,d)] = siP(m,k,j,d), contract (k,d).
+    // GPU GEMM port of UBMJC Term1 (FIX 2026-06-20, g_phhp IP SO route -Wvovv·s):
+    //   ct[b,c,m,j] = Σ_{k,d} wvovv(c,k,d,b)·siP(m,j,k,d)   (subtracted below)
+    // A[(b,c),(k,d)] = wvovv(c,k,d,b), B[(m,j),(k,d)] = siP(m,j,k,d), contract (k,d).
     const int BC_M = NV*NV, MJ_N = NMo*NO, KD_K = NO*NV;
     std::vector<real_t> ct_ubmjc;
     bool ubmjc_gpu = false;
@@ -4269,11 +4269,11 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         #pragma omp parallel for collapse(2)
         for (int b=0;b<NV;++b) for (int c=0;c<NV;++c)
             for (int k=0;k<NO;++k) for (int d=0;d<NV;++d)
-                hA[(size_t)(b*NV+c)*KD_K+(k*NV+d)] = wvovv(b,k,d,c);
+                hA[(size_t)(b*NV+c)*KD_K+(k*NV+d)] = wvovv(c,k,d,b);   // FIX
         #pragma omp parallel for collapse(2)
         for (int m=0;m<NMo;++m) for (int j=0;j<NO;++j)
             for (int k=0;k<NO;++k) for (int d=0;d<NV;++d)
-                hB[(size_t)(m*NO+j)*KD_K+(k*NV+d)] = siP(m,k,j,d);
+                hB[(size_t)(m*NO+j)*KD_K+(k*NV+d)] = siP(m,j,k,d);     // FIX
         real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
         tracked_cudaMalloc(&dA,(size_t)BC_M*KD_K*sizeof(real_t));
         tracked_cudaMalloc(&dB,(size_t)MJ_N*KD_K*sizeof(real_t));
@@ -4290,17 +4290,17 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
             real_t dmax=0.0;
             for (int b=0;b<NV;b+=(NV/2>0?NV/2:1)) for (int c=0;c<NV;c+=(NV/2>0?NV/2:1))
                 for (int m=0;m<NMo;++m) for (int j=0;j<NO;++j) {
-                    real_t t=0.0; for (int k=0;k<NO;++k) for (int d=0;d<NV;++d) t += wvovv(b,k,d,c)*siP(m,k,j,d);
+                    real_t t=0.0; for (int k=0;k<NO;++k) for (int d=0;d<NV;++d) t += wvovv(c,k,d,b)*siP(m,j,k,d);
                     dmax=std::max(dmax,std::fabs(t-ct_ubmjc[(size_t)(b*NV+c)*MJ_N+(m*NO+j)]));
                 }
-            std::cout << "[W_eff_and_G self-check] UBMJC T3 GEMM vs host: max|Δ| = "
+            std::cout << "[W_eff_and_G self-check] UBMJC Term1 GEMM vs host: max|Δ| = "
                       << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
         }
     }
 #endif
-    // GPU GEMM port of UBMJC T2 (Σ_{kl} wovoo(k,c,l,j)·siP(m,k,l,b), mirror of UAMCI T4):
-    //   C[(c,j),(m,b)] = Σ_{(k,l)} A[(c,j),(k,l)]·B[(m,b),(k,l)]  (= A·Bᵀ, contract (k,l))
-    //   A[(c,j),(k,l)] = wovoo(k,c,l,j),  B[(m,b),(k,l)] = siP(m,k,l,b)
+    // GPU GEMM port of UBMJC Term2 (FIX 2026-06-20, g_phhp IP SO route +0.5 Wooov·s):
+    //   C[(b,j),(m,c)] = Σ_{(k,l)} A[(b,j),(k,l)]·B[(m,c),(k,l)]  (= A·Bᵀ, contract (k,l))
+    //   A[(b,j),(k,l)] = wooov(k,l,j,b),  B[(m,c),(k,l)] = siP(m,k,l,c)   (×0.5 applied below)
     const int CJ_M2 = NV*NO, MB_N2 = NMo*NV, KL_K2 = NO*NO;
     std::vector<real_t> ct_ubmjc_t2;
     bool ubmjc_t2_gpu = false;
@@ -4309,13 +4309,13 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
         std::vector<real_t> hA((size_t)CJ_M2*KL_K2), hB((size_t)MB_N2*KL_K2);
         #pragma omp parallel for collapse(2)
-        for (int c=0;c<NV;++c) for (int j=0;j<NO;++j)
+        for (int b=0;b<NV;++b) for (int j=0;j<NO;++j)
             for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
-                hA[(size_t)(c*NO+j)*KL_K2+(k*NO+l)] = wovoo(k,c,l,j);
+                hA[(size_t)(b*NO+j)*KL_K2+(k*NO+l)] = wooov(k,l,j,b);   // FIX
         #pragma omp parallel for collapse(2)
-        for (int m=0;m<NMo;++m) for (int b=0;b<NV;++b)
+        for (int m=0;m<NMo;++m) for (int c=0;c<NV;++c)
             for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
-                hB[(size_t)(m*NV+b)*KL_K2+(k*NO+l)] = siP(m,k,l,b);
+                hB[(size_t)(m*NV+c)*KL_K2+(k*NO+l)] = siP(m,k,l,c);     // FIX
         real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
         tracked_cudaMalloc(&dA,(size_t)CJ_M2*KL_K2*sizeof(real_t));
         tracked_cudaMalloc(&dB,(size_t)MB_N2*KL_K2*sizeof(real_t));
@@ -4330,13 +4330,13 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         ubmjc_t2_gpu = true;
         if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
             real_t dmax=0.0;
-            for (int c=0;c<NV;c+=(NV/2>0?NV/2:1)) for (int j=0;j<NO;++j)
-                for (int m=0;m<NMo;++m) for (int b=0;b<NV;b+=(NV/2>0?NV/2:1)) {
+            for (int b=0;b<NV;b+=(NV/2>0?NV/2:1)) for (int j=0;j<NO;++j)
+                for (int m=0;m<NMo;++m) for (int c=0;c<NV;c+=(NV/2>0?NV/2:1)) {
                     real_t t=0.0;
-                    for (int k=0;k<NO;++k) for (int l=0;l<NO;++l) t += wovoo(k,c,l,j)*siP(m,k,l,b);
-                    dmax=std::max(dmax,std::fabs(t-ct_ubmjc_t2[(size_t)(c*NO+j)*MB_N2+(m*NV+b)]));
+                    for (int k=0;k<NO;++k) for (int l=0;l<NO;++l) t += wooov(k,l,j,b)*siP(m,k,l,c);
+                    dmax=std::max(dmax,std::fabs(t-ct_ubmjc_t2[(size_t)(b*NO+j)*MB_N2+(m*NV+c)]));
                 }
-            std::cout << "[W_eff_and_G self-check] UBMJC T2 GEMM vs host: max|Δ| = "
+            std::cout << "[W_eff_and_G self-check] UBMJC Term2 GEMM vs host: max|Δ| = "
                       << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
         }
     }
@@ -4346,16 +4346,21 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     //   g_phhp[b,j,i,a] += -Σ_kc Wvovv[a,k,c,b] s_IP[m][i,k,c] + 0.5 Σ_kl Wooov[k,l,i,b] s_IP[m][k,l,a]
     // GANSU layout g_phhp[b,k,j,c], root m -> k=occ_idx[m]; UBMJC loop vars (b,m,j,c) map to the
     // Python block as j=Python-i, c=Python-a (NO Fov term here - Fov lives in F_eff_oo).
-    // Bypass the old GPU GEMMs (ct_ubmjc_t2/ct_ubmjc were the Wovoo/Wvovv-T3 old form).
-    (void)ubmjc_t2_gpu; (void)ubmjc_gpu;
+    // GEMMs ct_ubmjc (Term1 -Wvovv·s) and ct_ubmjc_t2 (Term2 +0.5 Wooov·s) re-ported above.
     #pragma omp parallel for collapse(2)
     for (int m=0;m<NMo;++m)
         for (int b=0;b<NV;++b) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c){
             real_t t=0.0;
-            for (int k=0;k<NO;++k) for(int d=0;d<NV;++d)
-                t -= wvovv(c,k,d,b)*siP(m,j,k,d);                                  // Term1 -Wvovv·s
-            for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
-                t += 0.5*wooov(k,l,j,b)*siP(m,k,l,c);                              // Term2 +0.5 Wooov·s
+            if (ubmjc_gpu)                                                          // Term1 -Wvovv·s
+                t -= ct_ubmjc[(size_t)(b*NV+c)*MJ_N+(m*NO+j)];
+            else
+                for (int k=0;k<NO;++k) for(int d=0;d<NV;++d)
+                    t -= wvovv(c,k,d,b)*siP(m,j,k,d);
+            if (ubmjc_t2_gpu)                                                       // Term2 +0.5 Wooov·s
+                t += 0.5*ct_ubmjc_t2[(size_t)(b*NO+j)*MB_N2+(m*NV+c)];
+            else
+                for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
+                    t += 0.5*wooov(k,l,j,b)*siP(m,k,l,c);
             UBMJC(b,m,j,c)=t;
         }
     // GPU GEMM port of UBKJE T2 (the largest phhp sub-term, mirror of UAKEI T4):
