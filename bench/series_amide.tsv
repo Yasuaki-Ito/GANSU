@@ -1,0 +1,8 @@
+# amide local-chromophore size series (xyz/bench_steom). Columns: name  xyz_relpath  natoms  tags
+formamide	../xyz/bench_steom/formamide.xyz	6	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+acetamide	../xyz/bench_steom/acetamide.xyz	9	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+propanamide	../xyz/bench_steom/propanamide.xyz	12	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+pentanamide	../xyz/bench_steom/pentanamide.xyz	18	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+heptanamide	../xyz/bench_steom/heptanamide.xyz	24	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+nonanamide	../xyz/bench_steom/nonanamide.xyz	30	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+undecanamide	../xyz/bench_steom/undecanamide.xyz	36	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom

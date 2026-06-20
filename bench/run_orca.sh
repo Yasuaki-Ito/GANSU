@@ -14,8 +14,14 @@ METHOD="${1:?method: rihf|rimp2|dlpno_ccsd|dlpno_steom}"
 TIMEOUT_MIN="${2:-240}"
 : "${ORCA:?set ORCA=/path/to/orca_root (dir with the orca binary)}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+SERIES="${SERIES:-$HERE/series.tsv}"        # override e.g. SERIES=bench/series_aldehyde.tsv
+SERIES_TAG="$(basename "$SERIES" .tsv)"
 INP="$HERE/orca/inp"
-RES="$HERE/orca/results_${METHOD}.tsv"
+if [ "$SERIES_TAG" = "series" ]; then
+  RES="$HERE/orca/results_${METHOD}.tsv"
+else
+  RES="$HERE/orca/results_${METHOD}_${SERIES_TAG}.tsv"
+fi
 mkdir -p "$HERE/orca"
 printf 'name\tnatoms\tstatus\twall_s\torca_runtime\n' > "$RES"
 
@@ -63,5 +69,5 @@ while IFS=$'\t' read -r NAME XYZ NAT TAGS; do
     echo "  ↳ ORCA ceiling reached for $METHOD at $NAME ($NAT atoms); stopping (no larger tries)."
     break
   fi
-done < <(grep -v '^#' "$HERE/series.tsv")
+done < <(grep -v '^#' "$SERIES")
 echo "done. results: $RES"

@@ -1,0 +1,21 @@
+! STEOM-CCSD STO-3G TightSCF
+# High print level to dump dressed STEOM intermediates / full CI eigenvectors,
+# so the Python g_phph can be diffed element-wise with NO reconstruction noise.
+%mdci
+  nroots 8
+  DoSTEOM true
+  DoTriplet true
+  DoCISNat false
+  NActIP 6
+  NActEA 4
+  PrintLevel 4
+end
+%output
+  PrintLevel 4
+end
+* xyz 0 1
+O    0.000000000000     0.000000000000     0.683000000000
+C    0.000000000000     0.000000000000    -0.534000000000
+H    0.000000000000     0.926000000000    -1.129000000000
+H    0.000000000000    -0.926000000000    -1.129000000000
+*

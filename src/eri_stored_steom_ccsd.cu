@@ -334,6 +334,7 @@ void recv_ea_barh(SteomBarHCache& cache, int src) {
 void transform_ao_eri_to_mo_eri_full(
     const double* d_eri_ao, const double* d_C, int nao, double* d_eri_mo);
 
+class ERI_RI;  // RI-CCSD B-native block source
 real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             const real_t* __restrict__ d_coefficient_matrix,
                             const real_t* __restrict__ d_orbital_energies,
@@ -342,7 +343,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             real_t** d_t1_out, real_t** d_t2_out,
                             real_t* d_eri_mo_precomputed = nullptr,
                             int num_frozen = 0,
-                            const real_t* h_fov_active = nullptr);
+                            const real_t* h_fov_active = nullptr,
+                            const ERI_RI* eri_ri = nullptr);
 
 extern __global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ eri_full,
                                                     real_t* __restrict__ eri_trimmed,
@@ -1250,6 +1252,26 @@ static void compute_steom_ccsd_impl(RHF& rhf,
             cudaMemcpy(h_all_evals_imag.data(), d_all_evals_imag,
                        (size_t)total_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
 
+        // (diagnostic) Dump the lowest G eigenvalues (real + imag parts) so we can
+        // see where the physical low states (e.g. azobenzene n→π* ≈ 0.103 Ha) sit
+        // and which roots are complex / near-defective. Gated by env, behaviour-inert.
+        if (std::getenv("GANSU_STEOM_DUMP_SPECTRUM")) {
+            const int ndump = std::min(total_dim, 30);
+            std::cout << "  [STEOM spectrum dump] lowest " << ndump
+                      << " G eigenvalues (real-sorted; |Im|>0 ⇒ near-defective complex root):\n"
+                      << "      k      Re(Ha)        Re(eV)        Im(Ha)        Im(eV)" << std::endl;
+            for (int i = 0; i < ndump; ++i) {
+                std::cout << "    " << std::setw(4) << i
+                          << "  " << std::fixed << std::setprecision(8) << std::setw(12) << h_all_evals[i]
+                          << "  " << std::setprecision(4) << std::setw(10) << (h_all_evals[i] * 27.2114)
+                          << "  " << std::scientific << std::setprecision(3) << std::setw(11) << h_all_evals_imag[i]
+                          << "  " << std::fixed << std::setprecision(4) << std::setw(10)
+                          << (h_all_evals_imag[i] * 27.2114)
+                          << std::endl;
+            }
+            std::cout << std::defaultfloat;
+        }
+
         // Select the lowest n_states roots ≥ min_eigenvalue by real part,
         // collapsing each complex-conjugate pair to a single state (skip the
         // partner with the same real part and opposite imag).
@@ -1383,8 +1405,9 @@ static void compute_steom_ccsd_impl(RHF& rhf,
           "diagonalized by "
        << (dense_diag ? "dense non-Hermitian geev (deterministic)"
                       : "non-Hermitian Davidson")
-       << ". Validated vs Python reference: "
-          "lowest two roots bit-exact (H2O sto-3g 0.392886 / 0.449061).\n"
+       << ". Validated vs Python reference (W^eff routes corrected 2026-06-20): "
+          "H2O sto-3g FC1 lowest two roots 0.432663 / 0.496991 Ha "
+          "(11.773 / 13.524 eV; ORCA 11.849 / 13.60).\n"
        << "  STEOM excited-state energies:\n"
        << "   k   omega (Ha)        omega (eV)\n";
     for (int n = 0; n < n_states_to_compute; ++n) {
@@ -1458,6 +1481,24 @@ void ERI_RI_RHF::compute_steom_ccsd(int n_states) {
 // scaling. Like RI-STEOM, requires --num_gpus 1 (RI CIS-NTO is single-GPU).
 void ERI_RI_RHF::compute_dlpno_steom_ccsd(int n_states) {
     std::cout << "\n==== DLPNO-STEOM-CCSD (hybrid bt-PNO-STEOM P5b) ====" << std::endl;
+
+    // Default the native DLPNO-IP/EA-EOM operator path ON (the validated
+    // production-fast path: per-pair σ + share-barH + GPU rotations + f5b; ~1.3-2×
+    // faster than the dense canonical σ). Set the env here — BEFORE the master
+    // switch (below) and every sub-optimisation read in compute_steom_ccsd_impl /
+    // the operator ctors — so they all see it consistently, exactly replicating an
+    // explicit GANSU_DLPNO_NATIVE_EOM=1. Opt out with GANSU_DLPNO_NATIVE_EOM=0.
+    // Scoped to this DLPNO-STEOM run: standalone IP/EA-EOM use a different entry
+    // and are unaffected.
+    if (std::getenv("GANSU_DLPNO_NATIVE_EOM") == nullptr) {
+#ifdef _WIN32
+        _putenv_s("GANSU_DLPNO_NATIVE_EOM", "1");
+#else
+        setenv("GANSU_DLPNO_NATIVE_EOM", "1", /*overwrite=*/0);
+#endif
+        std::cout << "  [DLPNO-STEOM] native EOM path defaulted ON "
+                     "(set GANSU_DLPNO_NATIVE_EOM=0 to disable)" << std::endl;
+    }
 
     // MPI Step 4 stage-1 broadcast (OPT-IN, GANSU_STEOM_STAGE1_BCAST=1): rank 0
     // alone computes the DLPNO-CCSD ground at full node threads while rank 1

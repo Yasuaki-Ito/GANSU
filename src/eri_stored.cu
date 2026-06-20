@@ -7330,6 +7330,104 @@ real_t ccsd_spatial_orbital_naive(const real_t* __restrict__ d_eri_ao,
 // v^{pq}_{rs} = (pr|qs),  w^{pq}_{rs} = 2*(pr|qs) - (ps|qr)
 // P(ia,jb) f = f(i,a,j,b) + f(j,b,i,a)
 
+// ============================================================
+// (RI-CCSD B-native) Build MO-ERI sub-blocks directly from B_mo (density-fitting
+// factors) WITHOUT materializing the full nmo⁴ tensor, in the SAME layout that
+// gpu_extract_subblock produces: out[i0,i1,i2,i3] = (idx0 idx2 | idx1 idx3) — the
+// chemist middle-index swap (see v^{pq}_{rs}=(pr|qs) above). mo_eri_block_into
+// emits the natural (pq|rs) layout, so we call it with the q/r ranges swapped and
+// transpose the middle two axes back.
+// ============================================================
+__global__ void ccsd_transpose_mid2_kernel(const double* __restrict__ src,
+                                            double* __restrict__ dst,
+                                            int n0, int n1, int n2, int n3) {
+    // dst[i0,i1,i2,i3] (dims n0,n1,n2,n3) = src[i0,i2,i1,i3] (src dims n0,n2,n1,n3)
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)n0 * n1 * n2 * n3;
+    if (gid >= total) return;
+    int i3 = (int)(gid % n3); size_t r = gid / n3;
+    int i2 = (int)(r % n2); r /= n2;
+    int i1 = (int)(r % n1); r /= n1;
+    int i0 = (int)r;
+    size_t s = (((size_t)i0 * n2 + i2) * (size_t)n1 + i1) * n3 + i3;
+    dst[gid] = src[s];
+}
+
+__global__ void ccsd_w_oovv_from_ovov_kernel(const double* __restrict__ ovov,
+                                             double* __restrict__ w_oovv,
+                                             int nocc, int nvir) {
+    // ovov[k,c,l,d] = (kc|ld);  w_oovv[k,l,c,d] = 2(kc|ld) - (kd|lc)
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)nocc * nocc * nvir * nvir;
+    if (gid >= total) return;
+    int d = (int)(gid % nvir); size_t r = gid / nvir;
+    int c = (int)(r % nvir); r /= nvir;
+    int l = (int)(r % nocc); int k = (int)(r / nocc);
+    size_t i_cd = (((size_t)k * nvir + c) * nocc + l) * nvir + d;
+    size_t i_dc = (((size_t)k * nvir + d) * nocc + l) * nvir + c;
+    w_oovv[gid] = 2.0 * ovov[i_cd] - ovov[i_dc];
+}
+
+#ifndef GANSU_CPU_ONLY
+// Build sub-block (idx0 idx2 | idx1 idx3) into d_out (gpu_extract_subblock layout)
+// from B_mo. Allocates its own transpose scratch (built once, not per CCSD iter).
+static void ccsd_block_chem_from_B(const ERI_RI* eri_ri, const real_t* B_mo, int N,
+                                   int off0,int sz0, int off1,int sz1,
+                                   int off2,int sz2, int off3,int sz3,
+                                   double* d_out) {
+    size_t total = (size_t)sz0 * sz1 * sz2 * sz3;
+    double* d_tmp = nullptr;
+    tracked_cudaMalloc((void**)&d_tmp, total * sizeof(double));
+    // natural (pq|rs) with q/r swapped → tmp[i0,i2,i1,i3]=(off0+i0,off2+i2|off1+i1,off3+i3)
+    eri_ri->mo_eri_block_into(B_mo, N, off0,sz0, off2,sz2, off1,sz1, off3,sz3, d_tmp);
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    ccsd_transpose_mid2_kernel<<<blocks, threads>>>(d_tmp, d_out, sz0, sz1, sz2, sz3);
+    cudaDeviceSynchronize();
+    tracked_cudaFree(d_tmp);
+}
+#endif
+
+// (RI-CCSD B-native, Increment 2) Tiled particle-particle ladder: build Wabcd
+// for an a-tile [a0, a0+ta) without materializing any nvir⁴ buffer.
+//   W_tile[(a',b),(c,d)] = vvvv_tile[(a'b),(cd)]                       // = (ac|bd), a=a0+a'
+//                          - ot1_tile1[(a'·vv + d·nvir + c)·nvir + b]  // Σ_k v_ovvv[k,a,d,c]·t1[k,b]
+//                          - ot1_tile2[(b·vv + c·nvir + d)·ta + a']    // Σ_k v_ovvv[k,b,c,d]·t1[k,a]
+// Mirrors build_Wabcd_kernel with a→a0+a'; ot1_tile2 has column-stride ta.
+__global__ void build_Wabcd_tile_kernel(const double* __restrict__ vvvv_tile,
+                                        const double* __restrict__ ot1_tile1,
+                                        const double* __restrict__ ot1_tile2,
+                                        double* __restrict__ W_tile,
+                                        int nvir, int ta) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir;
+    size_t total = (size_t)ta * vv * nvir;
+    if (gid >= total) return;
+    int d = (int)(gid % nvir); size_t rem = gid / nvir;
+    int c = (int)(rem % nvir); rem /= nvir;
+    int b = (int)(rem % nvir);
+    int ap = (int)(rem / nvir);
+    W_tile[gid] = vvvv_tile[gid]
+        - ot1_tile1[((size_t)ap*vv + (size_t)d*nvir + c)*nvir + b]
+        - ot1_tile2[((size_t)b*vv + (size_t)c*nvir + d)*(size_t)ta + ap];
+}
+
+// Scatter-add a (oo × ta·nvir) ladder tile into the full raw[oo × vv]:
+//   raw[ij, (a0+a')·nvir + b] += raw_tile[ij, a'·nvir + b]
+__global__ void scatter_add_abtile_kernel(const double* __restrict__ raw_tile,
+                                          double* __restrict__ raw,
+                                          int nocc, int nvir, int a0, int ta) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir;
+    size_t cols = (size_t)ta * nvir;
+    size_t total = (size_t)nocc * nocc * cols;
+    if (gid >= total) return;
+    int b = (int)(gid % nvir); size_t rem = gid / nvir;
+    int ap = (int)(rem % ta); rem /= ta;
+    size_t ij = rem;
+    raw[ij*vv + (size_t)(a0+ap)*nvir + b] += raw_tile[ij*cols + (size_t)ap*nvir + b];
+}
+
 real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             const real_t* __restrict__ d_coefficient_matrix,
                             const real_t* __restrict__ d_orbital_energies,
@@ -7338,7 +7436,13 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             real_t** d_t1_out, real_t** d_t2_out,
                             real_t* d_eri_mo_precomputed = nullptr,
                             int num_frozen = 0,
-                            const real_t* h_fov_active = nullptr)
+                            const real_t* h_fov_active = nullptr,
+                            const ERI_RI* eri_ri = nullptr)
+//
+// eri_ri (optional, RI-CCSD B-native): when non-null and a GPU is available,
+//   the MO-ERI sub-blocks are built on the fly from the half-transformed B_mo
+//   (density-fitting factors) via ccsd_block_chem_from_B — the full nmo⁴ tensor
+//   is never materialized. d_eri_ao / d_eri_mo_precomputed are then ignored.
 //
 // h_fov_active (optional): off-diagonal Fock f_ov[i, a] in canonical basis,
 //   shape [nocc_active × nvir]. When non-null, the Brillouin condition is
@@ -7358,13 +7462,27 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
 
 
     // AO->MO transform on GPU (4-stage half-transform, O(N^5))
-    real_t* d_eri_mo;
-    bool free_eri_mo;
-    if (d_eri_mo_precomputed) {
+    // (RI-CCSD B-native) When an ERI_RI block source is supplied and a GPU is
+    // available, build MO-ERI sub-blocks on the fly from B_mo — never the nmo⁴
+    // tensor. Otherwise fall back to the legacy full-N⁴ path (byte-identical).
+    const bool ri_bnative = (eri_ri != nullptr) && gpu::gpu_available();
+    // (Inc2) The per-iter tiled ladder removes the nvir⁴ buffers but REBUILDS the
+    // (t1-independent) vvvv integrals from B every CCSD iteration — expensive at
+    // scale. So it is OPT-IN (GANSU_CCSD_RI_LADDER_TILE=1), only for systems too
+    // large to hold nvir⁴. Default B-native keeps the Inc1 behavior: build
+    // d_v_vvvv ONCE from B (resident) and dress it per-iter — same cost profile
+    // as the legacy path, minus the AO-N⁴ transient.
+    const char* e_tile = std::getenv("GANSU_CCSD_RI_LADDER_TILE");
+    const bool use_tiled_ladder = ri_bnative && (e_tile && e_tile[0] == '1');
+    const real_t* B_mo = nullptr;
+    real_t* d_eri_mo = nullptr;
+    bool free_eri_mo = false;
+    if (ri_bnative) {
+        B_mo = eri_ri->build_B_mo(d_coefficient_matrix, N);   // naux×N² half-transform
+    } else if (d_eri_mo_precomputed) {
         d_eri_mo = d_eri_mo_precomputed;
         free_eri_mo = false;
     } else {
-        d_eri_mo = nullptr;
         tracked_cudaMalloc((void**)&d_eri_mo, N4 * sizeof(real_t));
         {
             std::string str = "Computing AO -> MO 4-stage integral transformation... ";
@@ -7374,6 +7492,22 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         }
         free_eri_mo = true;
     }
+
+    // Unified sub-block extractor: B-native (from B_mo, gpu_extract_subblock
+    // layout via ccsd_block_chem_from_B) or legacy (from full-N⁴ d_eri_mo). The
+    // second int arg (N) is accepted for call-site compatibility and ignored in
+    // the B-native branch.
+    auto extract_block = [&](double* dst, int /*N*/,
+                             int o0,int s0, int o1,int s1,
+                             int o2,int s2, int o3,int s3) {
+#ifndef GANSU_CPU_ONLY
+        if (ri_bnative) {
+            ccsd_block_chem_from_B(eri_ri, B_mo, N, o0,s0, o1,s1, o2,s2, o3,s3, dst);
+            return;
+        }
+#endif
+        gpu_extract_subblock(d_eri_mo, dst, N, o0,s0, o1,s1, o2,s2, o3,s3);
+    };
 
     std::cout << "CCSD spatial-orbital: N=" << N << " nocc=" << nocc
               << " nvir=" << nvir;
@@ -7440,10 +7574,19 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         PROFILE_ELAPSED_TIME(str);
 
     // --- GPU-extract CPU-needed sub-blocks → download ---
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, O,nocc, O,nocc, V,nvir, V,nvir);
+    extract_block(d_extract_tmp, N, O,nocc, O,nocc, V,nvir, V,nvir);
     cudaMemcpy(v_oovv.data(), d_extract_tmp, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
 
-    if (!gpu::gpu_available()) {
+    if (ri_bnative) {
+        // (kc|ld) natural ovov block → w_oovv[k,l,c,d] = 2(kc|ld) - (kd|lc)
+        double* d_ovov_w = nullptr;
+        tracked_cudaMalloc((void**)&d_ovov_w, (size_t)nocc*nvir*nocc*nvir * sizeof(double));
+        eri_ri->mo_eri_block_into(B_mo, N, O,nocc, V,nvir, O,nocc, V,nvir, d_ovov_w);
+        int threads = 256;
+        int blocks = (int)((oo*vv + threads - 1) / threads);
+        ccsd_w_oovv_from_ovov_kernel<<<blocks, threads>>>(d_ovov_w, d_extract_tmp, nocc, nvir);
+        tracked_cudaFree(d_ovov_w);
+    } else if (!gpu::gpu_available()) {
         // CPU fallback: w_oovv[k,l,c,d] = 2*(kc|ld) - (kd|lc)
         const size_t N3 = (size_t)N * N * N;
         const size_t N2 = (size_t)N * N;
@@ -7466,31 +7609,31 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     }
     cudaMemcpy(w_oovv.data(), d_extract_tmp, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, O,nocc, V,nvir, V,nvir, V,nvir);
+    extract_block(d_extract_tmp, N, O,nocc, V,nvir, V,nvir, V,nvir);
     cudaMemcpy(v_ovvv.data(), d_extract_tmp, (size_t)nocc*vvv*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, V,nvir, O,nocc, O,nocc, V,nvir);
+    extract_block(d_extract_tmp, N, V,nvir, O,nocc, O,nocc, V,nvir);
     cudaMemcpy(v_voov.data(), d_extract_tmp, (size_t)nvir*nocc*nocc*nvir*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, O,nocc, O,nocc, V,nvir, O,nocc);
+    extract_block(d_extract_tmp, N, O,nocc, O,nocc, V,nvir, O,nocc);
     cudaMemcpy(v_oovo.data(), d_extract_tmp, (size_t)nocc*nocc*nvir*nocc*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, O,nocc, O,nocc, O,nocc, O,nocc);
+    extract_block(d_extract_tmp, N, O,nocc, O,nocc, O,nocc, O,nocc);
     cudaMemcpy(v_oooo.data(), d_extract_tmp, oooo*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, V,nvir, O,nocc, V,nvir, O,nocc);
+    extract_block(d_extract_tmp, N, V,nvir, O,nocc, V,nvir, O,nocc);
     cudaMemcpy(v_vovo.data(), d_extract_tmp, vo*vo*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, V,nvir, V,nvir, O,nocc, V,nvir);
+    extract_block(d_extract_tmp, N, V,nvir, V,nvir, O,nocc, V,nvir);
     cudaMemcpy(v_vvov.data(), d_extract_tmp, vv*ov*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, O,nocc, V,nvir, O,nocc, V,nvir);
+    extract_block(d_extract_tmp, N, O,nocc, V,nvir, O,nocc, V,nvir);
     cudaMemcpy(v_ovov.data(), d_extract_tmp, ov*ov*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, V,nvir, O,nocc, O,nocc, O,nocc);
+    extract_block(d_extract_tmp, N, V,nvir, O,nocc, O,nocc, O,nocc);
     cudaMemcpy(v_vooo.data(), d_extract_tmp, vo*oo*sizeof(double), cudaMemcpyDeviceToHost);
 
-    gpu_extract_subblock(d_eri_mo, d_extract_tmp, N, O,nocc, O,nocc, O,nocc, V,nvir);
+    extract_block(d_extract_tmp, N, O,nocc, O,nocc, O,nocc, V,nvir);
     cudaMemcpy(v_ooov.data(), d_extract_tmp, oo*ov*sizeof(double), cudaMemcpyDeviceToHost);
 
     cudaDeviceSynchronize();
@@ -7552,10 +7695,13 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
 
     // Pre-allocate all GPU buffers in a single allocation to reduce cudaMalloc overhead
     const size_t OV2 = ov * ov;
-    const size_t sz_tau = t2Size, sz_Wabcd = vv*vv, sz_Wklij = oo*oo, sz_raw = t2Size;
+    // (B-native Inc2) the three nvir⁴ ladder buffers (d_v_vvvv, d_Wabcd, the ladder
+    // part of d_ovvv_t1) are not needed when the ladder is evaluated tile-by-tile
+    // from B_mo: shrink their carve to 1 / the non-ladder scratch need (oo·vv).
+    const size_t sz_tau = t2Size, sz_Wabcd = use_tiled_ladder ? (size_t)1 : vv*vv, sz_Wklij = oo*oo, sz_raw = t2Size;
     const size_t sz_w_oovv = oo*vv, sz_v_oovv = oo*vv, sz_Fki = oo;
-    const size_t sz_v_ovvv_T = vvv*nocc, sz_t1 = t1Size, sz_ovvv_t1 = std::max(vvv*std::max((size_t)nvir,(size_t)nocc), t2Size);
-    const size_t sz_v_vvvv = vv*vv, sz_Fac = vv, sz_Fkc = ov;
+    const size_t sz_v_ovvv_T = vvv*nocc, sz_t1 = t1Size, sz_ovvv_t1 = use_tiled_ladder ? t2Size : std::max(vvv*std::max((size_t)nvir,(size_t)nocc), t2Size);
+    const size_t sz_v_vvvv = use_tiled_ladder ? (size_t)1 : vv*vv, sz_Fac = vv, sz_Fkc = ov;
     const size_t sz_t2v = t2Size, sz_Lac = vv, sz_Z = vv*ov;
     const size_t sz_Wex = OV2;  // each of A, B, C1, C2, V_R, W_R, V_R2
     const size_t sz_v_ovvv = (size_t)nocc * vvv;       // persistent v_ovvv
@@ -7622,10 +7768,22 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
 
     // GPU-direct extraction for GPU-resident sub-blocks (no CPU round-trip)
     // v_vvvv: v(V+a, V+b, V+c, V+d) → d_v_vvvv (largest: nvir⁴)
-    gpu_extract_subblock(d_eri_mo, d_v_vvvv, N, V,nvir, V,nvir, V,nvir, V,nvir);
+    // (B-native) build d_v_vvvv ONCE from B_mo (resident). Skipped only when the
+    // opt-in tiled ladder rebuilds vvvv per-iter (huge systems that can't hold nvir⁴).
+    if (!use_tiled_ladder)
+        extract_block(d_v_vvvv, N, V,nvir, V,nvir, V,nvir, V,nvir);
     // v_oovv and w_oovv → d_v_oovv, d_w_oovv
-    gpu_extract_subblock(d_eri_mo, d_v_oovv, N, O,nocc, O,nocc, V,nvir, V,nvir);
-    if (!gpu::gpu_available()) {
+    extract_block(d_v_oovv, N, O,nocc, O,nocc, V,nvir, V,nvir);
+    if (ri_bnative) {
+        // (kc|ld) natural ovov block → w_oovv[k,l,c,d] = 2(kc|ld) - (kd|lc)
+        double* d_ovov_w = nullptr;
+        tracked_cudaMalloc((void**)&d_ovov_w, (size_t)nocc*nvir*nocc*nvir * sizeof(double));
+        eri_ri->mo_eri_block_into(B_mo, N, O,nocc, V,nvir, O,nocc, V,nvir, d_ovov_w);
+        int threads = 256;
+        int blocks_w = (int)((oo*vv + threads - 1) / threads);
+        ccsd_w_oovv_from_ovov_kernel<<<blocks_w, threads>>>(d_ovov_w, d_w_oovv, nocc, nvir);
+        tracked_cudaFree(d_ovov_w);
+    } else if (!gpu::gpu_available()) {
         // CPU fallback: w_oovv[k,l,c,d] = 2*(kc|ld) - (kd|lc)
         const size_t N3 = (size_t)N * N * N;
         const size_t N2 = (size_t)N * N;
@@ -7862,6 +8020,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                     }
 
         // ---- W^{ab}_{cd} ---- (fully on GPU: DGEMM + kernel, no host transfer)
+        // (B-native Inc2) only when the opt-in tiled ladder is active is this
+        // legacy full-nvir⁴ Wabcd build skipped (the ladder is evaluated tile-by-
+        // tile at the Wabcd×tau DGEMM site below). Default B-native uses it.
+        if (!use_tiled_ladder) {
         // GPU DGEMM: d_ovvv_t1[nvir³, nvir] = v_ovvv_T[nvir³, nocc] × t1[nocc, nvir]
         // d_t1 already uploaded at top of iteration
         gpu::matrixMatrixProductRect(d_v_ovvv_T, d_t1, d_ovvv_t1,
@@ -7888,6 +8050,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             int blocks = (int)((vv2 + threads - 1) / threads);
             build_Wabcd_kernel<<<blocks, threads>>>(d_v_vvvv, d_ovvv_t1, d_Wabcd, nvir);
         }
+        } // if (!use_tiled_ladder) — legacy full-nvir⁴ Wabcd build
 
         // ---- W^{ak}_{ic} and W^{ak}_{ci} (two exchange intermediates) ----
         // d-sum via DGEMM: ovvv_t1_ic[(k*vv + a*nvir+c), i] = sum_d v_ovvv[k,a,c,d] * t1[i,d]
@@ -8072,9 +8235,53 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         cudaMemset(d_raw, 0, t2Size * sizeof(double));
 
         // raw[ij,ab] += 0.5 * tau[ij,cd] * Wabcd[ab,cd]^T
-        gpu::matrixMatrixProductRect(d_tau, d_Wabcd, d_raw,
-                                (int)oo, (int)vv, (int)vv,
-                                false, true, true, 0.5);
+        if (!use_tiled_ladder) {
+            gpu::matrixMatrixProductRect(d_tau, d_Wabcd, d_raw,
+                                    (int)oo, (int)vv, (int)vv,
+                                    false, true, true, 0.5);
+        } else {
+            // (B-native Inc2) tiled particle-particle ladder — build Wabcd one
+            // a-tile at a time from B_mo, contract with tau, scatter into d_raw.
+            // No nvir⁴ buffer is ever allocated (peak ≈ TA·nvir³ per tile).
+            const int TA = 16;  // a-tile width (memory/throughput knob)
+            double *d_vvvv_tile=nullptr, *d_ot1_tile1=nullptr, *d_ot1_tile2=nullptr;
+            double *d_Wtile=nullptr, *d_raw_tile=nullptr, *d_t1_slice=nullptr;
+            tracked_cudaMalloc((void**)&d_vvvv_tile, (size_t)TA*vvv*sizeof(double));
+            tracked_cudaMalloc((void**)&d_ot1_tile1, (size_t)TA*vv*nvir*sizeof(double));
+            tracked_cudaMalloc((void**)&d_ot1_tile2, (size_t)vvv*TA*sizeof(double));
+            tracked_cudaMalloc((void**)&d_Wtile,     (size_t)TA*vvv*sizeof(double));
+            tracked_cudaMalloc((void**)&d_raw_tile,  (size_t)oo*TA*nvir*sizeof(double));
+            tracked_cudaMalloc((void**)&d_t1_slice,  (size_t)nocc*TA*sizeof(double));
+            for (int a0 = 0; a0 < nvir; a0 += TA) {
+                int ta = std::min(TA, nvir - a0);
+                // 1. vvvv_tile[(a'b),(cd)] = (a c|b d), a=a0+a'  (Inc1-validated helper)
+                ccsd_block_chem_from_B(eri_ri, B_mo, N, V+a0,ta, V,nvir, V,nvir, V,nvir, d_vvvv_tile);
+                // 2. ot1_tile1[ta·vv, nvir] = v_ovvv_T[a0·vv:, :] × t1   (term1 dressing)
+                gpu::matrixMatrixProductRect(d_v_ovvv_T + (size_t)a0*vv*nocc, d_t1, d_ot1_tile1,
+                                        (int)((size_t)ta*vv), nvir, nocc, false, false, false, 1.0);
+                // 3. ot1_tile2[nvir³, ta] = v_ovvv_T × t1[:, a0:a0+ta]   (term2 dressing)
+                cudaMemcpy2D(d_t1_slice, (size_t)ta*sizeof(double),
+                             d_t1 + a0, (size_t)nvir*sizeof(double),
+                             (size_t)ta*sizeof(double), nocc, cudaMemcpyDeviceToDevice);
+                gpu::matrixMatrixProductRect(d_v_ovvv_T, d_t1_slice, d_ot1_tile2,
+                                        (int)vvv, ta, nocc, false, false, false, 1.0);
+                // 4. Wabcd tile = vvvv_tile - dressing
+                {
+                    size_t tot = (size_t)ta*vvv; int th=256; int bl=(int)((tot+th-1)/th);
+                    build_Wabcd_tile_kernel<<<bl,th>>>(d_vvvv_tile, d_ot1_tile1, d_ot1_tile2, d_Wtile, nvir, ta);
+                }
+                // 5. raw_tile[oo, ta·nvir] = 0.5 · tau[oo,vv] × Wtile[ta·nvir, vv]^T
+                gpu::matrixMatrixProductRect(d_tau, d_Wtile, d_raw_tile,
+                                        (int)oo, (int)((size_t)ta*nvir), (int)vv, false, true, false, 0.5);
+                // 6. scatter-add tile into the full raw[oo, vv]
+                {
+                    size_t tot = oo*(size_t)ta*nvir; int th=256; int bl=(int)((tot+th-1)/th);
+                    scatter_add_abtile_kernel<<<bl,th>>>(d_raw_tile, d_raw, nocc, nvir, a0, ta);
+                }
+            }
+            tracked_cudaFree(d_vvvv_tile); tracked_cudaFree(d_ot1_tile1); tracked_cudaFree(d_ot1_tile2);
+            tracked_cudaFree(d_Wtile); tracked_cudaFree(d_raw_tile); tracked_cudaFree(d_t1_slice);
+        }
 
         // raw[ij,ab] += 0.5 * Wklij^T[ij,kl] * tau[kl,ab]
         gpu::matrixMatrixProductRect(d_Wklij, d_tau, d_raw,
@@ -8893,7 +9100,7 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
 //                 1 = spatial-orbital naive (pure CPU)
 //                 2 = spin-orbital (legacy)
 
-static real_t compute_ccsd_energy_impl(RHF& rhf, const real_t* d_eri, int ccsd_algorithm, real_t* d_eri_mo_precomputed = nullptr) {
+static real_t compute_ccsd_energy_impl(RHF& rhf, const real_t* d_eri, int ccsd_algorithm, real_t* d_eri_mo_precomputed = nullptr, const ERI_RI* eri_ri = nullptr) {
     PROFILE_FUNCTION();
 
     const int num_frozen = rhf.get_num_frozen_core();
@@ -8903,6 +9110,17 @@ static real_t compute_ccsd_energy_impl(RHF& rhf, const real_t* d_eri, int ccsd_a
     const real_t* d_eps = rhf.get_orbital_energies().device_ptr();
 
     real_t E_CCSD;
+
+    // (RI-CCSD B-native) When an ERI_RI block source is supplied, ccsd_spatial_orbital
+    // builds MO-ERI sub-blocks on the fly from B_mo — the full-N⁴ algorithm dispatch
+    // (and its d_eri_mo_precomputed) is bypassed.
+    if (eri_ri != nullptr) {
+        E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ,
+                                      false, nullptr, nullptr, nullptr,
+                                      d_eri_mo_precomputed, num_frozen, nullptr, eri_ri);
+        std::cout << "CCSD energy: " << E_CCSD << " Hartree (RI B-native)" << std::endl;
+        return E_CCSD;
+    }
     // Frozen core only supported by ccsd_spatial_orbital (algorithm 0)
     if (num_frozen > 0) {
         E_CCSD = ccsd_spatial_orbital(d_eri, d_C, d_eps, num_basis, num_occ, false, nullptr, nullptr, nullptr, d_eri_mo_precomputed, num_frozen);
@@ -9148,6 +9366,13 @@ void ERI_Stored_RHF::compute_ccsd_density() {
 }
 
 real_t ERI_RI_RHF::compute_ccsd_energy() {
+    // (RI-CCSD B-native, opt-in) GANSU_CCSD_RI_BNATIVE=1 → build MO-ERI sub-blocks
+    // on the fly from B_mo, never the full N⁴ tensor. Default (unset/0) is the
+    // legacy build_mo_eri + N⁴ path (byte-identical to before).
+    const char* e = std::getenv("GANSU_CCSD_RI_BNATIVE");
+    if (e && e[0] == '1' && gpu::gpu_available()) {
+        return compute_ccsd_energy_impl(rhf_, nullptr, 0, nullptr, /*eri_ri=*/this);
+    }
     real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), rhf_.get_num_basis());
     real_t result = compute_ccsd_energy_impl(rhf_, nullptr, 0, d_mo_eri);
     tracked_cudaFree(d_mo_eri);

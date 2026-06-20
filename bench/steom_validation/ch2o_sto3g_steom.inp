@@ -1,0 +1,22 @@
+! STEOM-CCSD STO-3G TightSCF
+# DECISIVE formula-correctness test vs my Python complete-active STEOM.
+# Formaldehyde sto-3g, frozen core = 2 (O1s+C1s = ORCA default; verify in output),
+# COMPLETE active space (DoCISNat false, NActIP = all 6 corr. occ, NActEA = all 4 vir).
+# Compare ORCA singlet excitation energies to:
+#   Python STEOM (eV): [2.625, 7.374, 12.666, 13.906, 14.814, 17.391, 18.017, 18.263]
+#   EOM-EE-CCSD  (eV): [4.034, 9.992, 12.744, 13.513, 14.652, 15.334, 17.610, 17.679]
+# If ORCA ~= EOM (4.0 eV lowest) -> Python formula is BUGGED (under-corrects ~1.4 eV).
+# If ORCA ~= Python (2.6 eV lowest) -> inherent STEOM!=EOM, Python formula is correct.
+%mdci
+  nroots 20
+  DoSTEOM true
+  DoCISNat false
+  NActIP 6
+  NActEA 4
+end
+* xyz 0 1
+O    0.000000000000     0.000000000000     0.683000000000
+C    0.000000000000     0.000000000000    -0.534000000000
+H    0.000000000000     0.926000000000    -1.129000000000
+H    0.000000000000    -0.926000000000    -1.129000000000
+*

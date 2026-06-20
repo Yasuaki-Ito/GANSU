@@ -55,7 +55,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             real_t** d_t1_out, real_t** d_t2_out,
                             real_t* d_eri_mo_precomputed,
                             int num_frozen,
-                            const real_t* h_fov_active = nullptr);
+                            const real_t* h_fov_active = nullptr,
+                            const ERI_RI* eri_ri = nullptr);
 
 // RAII guard: redirect std::cout to a discarded sink for the lifetime of the
 // object. Used to silence ccsd_spatial_orbital's per-iteration output during

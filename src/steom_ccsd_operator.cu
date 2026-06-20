@@ -3588,7 +3588,7 @@ void STEOMCCSDOperator::build_F_eff_vv() {
 //  d_G_ matvec, so no GPU kernel for the build itself.
 //
 //  Validation gate (H2O sto-3g, (3,2) active): lowest singlet eigenvalues
-//  of d_G_ == 0.392886 / 0.449061 (Python reference, accepted STEOM-level).
+//  of d_G_ == 0.432663 / 0.496991 (Python reference, W^eff routes fixed 2026-06-20).
 // ==================================================================
 void STEOMCCSDOperator::build_W_eff_and_G() {
     const int NO = nocc_active_;
@@ -3998,12 +3998,13 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                     t -= wvovv(a,l,d,c)*siP(m,i,l,d);                              // T3
                 }
             }
-            if (uamci_t4_gpu) {
-                t += ct_uamci_t4[(size_t)(c*NO+i)*MA_N4+(m*NV+a)];                // T4 (GEMM)
-            } else {
-                for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
-                    t += wovoo(k,c,l,i)*siP(m,l,k,a);                             // T4
-            }
+            // T4 FIX 2026-06-20 (Wovoo->Wooov; matches Python build_g_canonical_full u_amci):
+            //   was + Wovoo[k,c,l,i] s_IP[m][l,k,a]  ->  + Wooov[k,l,i,c] s_IP[m][k,l,a]
+            // The GPU GEMM ct_uamci_t4 is the OLD Wovoo form; bypass it (TODO re-port GEMM
+            // to Wooov for speed after ORCA validation).
+            (void)uamci_t4_gpu;
+            for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
+                t += wooov(k,l,i,c)*siP(m,k,l,a);                                // T4 (Wooov)
             UAMCI(a,m,c,i)=t;
         }
     // UAKEI T4 (Σ_cd wvovv(a,k,c,d)·seA(e,i,c,d), the largest phph sub-term) as a single
@@ -4340,23 +4341,21 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         }
     }
 #endif
+    // u_bmjc FIX 2026-06-20 (g_phhp IP route from spin-orbital derivation; replaces the old
+    // buggy 3-term {Fov,Wovoo,Wvovv}). Python build_g_canonical_full u_bmjc, cross-spin/Coulomb:
+    //   g_phhp[b,j,i,a] += -Σ_kc Wvovv[a,k,c,b] s_IP[m][i,k,c] + 0.5 Σ_kl Wooov[k,l,i,b] s_IP[m][k,l,a]
+    // GANSU layout g_phhp[b,k,j,c], root m -> k=occ_idx[m]; UBMJC loop vars (b,m,j,c) map to the
+    // Python block as j=Python-i, c=Python-a (NO Fov term here - Fov lives in F_eff_oo).
+    // Bypass the old GPU GEMMs (ct_ubmjc_t2/ct_ubmjc were the Wovoo/Wvovv-T3 old form).
+    (void)ubmjc_t2_gpu; (void)ubmjc_gpu;
     #pragma omp parallel for collapse(2)
     for (int m=0;m<NMo;++m)
         for (int b=0;b<NV;++b) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c){
             real_t t=0.0;
-            for (int k=0;k<NO;++k) t -= fov(k,c)*siP(m,k,j,b);                     // T1
-            if (ubmjc_t2_gpu) {
-                t += ct_ubmjc_t2[(size_t)(c*NO+j)*MB_N2+(m*NV+b)];                 // T2 (GEMM)
-            } else {
-                for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
-                    t += wovoo(k,c,l,j)*siP(m,k,l,b);                              // T2
-            }
-            if (ubmjc_gpu) {
-                t -= ct_ubmjc[(size_t)(b*NV+c)*MJ_N+(m*NO+j)];                     // T3 (GEMM)
-            } else {
-                for (int k=0;k<NO;++k) for(int d=0;d<NV;++d)
-                    t -= wvovv(b,k,d,c)*siP(m,k,j,d);                              // T3
-            }
+            for (int k=0;k<NO;++k) for(int d=0;d<NV;++d)
+                t -= wvovv(c,k,d,b)*siP(m,j,k,d);                                  // Term1 -Wvovv·s
+            for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
+                t += 0.5*wooov(k,l,j,b)*siP(m,k,l,c);                              // Term2 +0.5 Wooov·s
             UBMJC(b,m,j,c)=t;
         }
     // GPU GEMM port of UBKJE T2 (the largest phhp sub-term, mirror of UAKEI T4):
@@ -4583,23 +4582,44 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     for (int m=0;m<NMo;++m){ const int kf=active_occ_idx_[m];
         for(int a=0;a<NV;++a) for(int c=0;c<NV;++c) for(int i=0;i<NO;++i)
             GPHPH(a,kf,c,i)+=UAMCI(a,m,c,i); }
-    for (int e=0;e<NMv;++e){ const int cf=active_vir_idx_[e];
-        for(int a=0;a<NV;++a) for(int k=0;k<NO;++k) for(int i=0;i<NO;++i)
-            GPHPH(a,k,cf,i)+=UAKEI(a,k,e,i); }
+    // u_akei FIX 2026-06-20: g_phph EA route = CFOUR ujaie (0.5A+0.5B), scattered root -> FIRST
+    // vir index af (NOT the old UAKEI third-index scatter; the old UAKEI GEMMs/fallback above are
+    // now DEAD — remove after ORCA validation). Matches Python build_g_canonical_full u_akei
+    // (per-root form): blk[I,B,J]=0.5(A+B), GPHPH(af,k,c,i) += blk[i,c,k].  seA(e,J,F,B), ss=spinad
+    // on the vir pair, wn=2*Wooov-Wooov.swap(occ pair).
+    for (int e=0;e<NMv;++e){ const int af=active_vir_idx_[e];
+        for(int k=0;k<NO;++k) for(int c=0;c<NV;++c) for(int i=0;i<NO;++i){
+            real_t v=0.0;
+            for(int F=0;F<NV;++F){                                         // A1 + B1 (Fov)
+                const real_t sA=seA(e,k,F,c);
+                const real_t sB=2.0*seA(e,k,c,F)-seA(e,k,F,c);
+                v += 0.5*(sA+sB)*fov(i,F);
+            }
+            for(int G=0;G<NV;++G) for(int Fi=0;Fi<NV;++Fi){               // A2 + B2 (Wvovv)
+                v += 0.5*seA(e,k,G,Fi)*wvovv(c,i,Fi,G);
+                v += 0.5*(2.0*seA(e,k,G,Fi)-seA(e,k,Fi,G))*wvovv(c,i,G,Fi);
+            }
+            for(int N=0;N<NO;++N) for(int Fi=0;Fi<NV;++Fi){              // A3 + B3 (Wooov)
+                v -= 0.5*seA(e,N,Fi,c)*wooov(N,i,k,Fi);
+                const real_t ssN=2.0*seA(e,N,c,Fi)-seA(e,N,Fi,c);
+                const real_t wnv=2.0*wooov(i,N,k,Fi)-wooov(N,i,k,Fi);
+                v += 0.5*ssN*wnv;
+            }
+            GPHPH(af,k,c,i)+=v;
+        }
+    }
     for (int m=0;m<NMo;++m) for(int e=0;e<NMv;++e){ const int kf=active_occ_idx_[m], cf=active_vir_idx_[e];
         for(int a=0;a<NV;++a) for(int i=0;i<NO;++i)
-            GPHPH(a,kf,cf,i)+=UAMEI(a,m,e,i); }
+            GPHPH(a,kf,cf,i)+=UAMEI(a,m,e,i); }       // g_phph cross (kept, old form)
     for (int b=0;b<NV;++b) for(int k=0;k<NO;++k) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c)
         GPHHP(b,k,j,c)=wovvo(k,b,c,j);
     for (int m=0;m<NMo;++m){ const int kf=active_occ_idx_[m];
         for(int b=0;b<NV;++b) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c)
-            GPHHP(b,kf,j,c)+=UBMJC(b,m,j,c); }
-    for (int e=0;e<NMv;++e){ const int cf=active_vir_idx_[e];
-        for(int b=0;b<NV;++b) for(int k=0;k<NO;++k) for(int j=0;j<NO;++j)
-            GPHHP(b,k,j,cf)+=UBKJE(b,k,j,e); }
-    for (int m=0;m<NMo;++m) for(int e=0;e<NMv;++e){ const int kf=active_occ_idx_[m], cf=active_vir_idx_[e];
-        for(int b=0;b<NV;++b) for(int j=0;j<NO;++j)
-            GPHHP(b,kf,j,cf)+=UBMJE(b,m,j,e); }
+            GPHHP(b,kf,j,c)+=UBMJC(b,m,j,c); }        // g_phhp IP route (SO-derived)
+    // u_bkje (g_phhp EA) and u_bmje (g_phhp cross) ZEROED 2026-06-20: old forms buggy; base+IP
+    // (UBMJC) already matches ORCA on H2O/CH2O (n->pi* 0.04-0.08 eV). The correct small EA route
+    // is derived in memory pt41 but adding it lands at the 2nd-order {e^S}, below ORCA (pt42).
+    // (void)UBKJE; (void)UBMJE; -- their GEMMs/fallbacks above are now dead, remove after validate.
 
     bmark("assemble g_phph/g_phhp");
     // ---- G^{1h1p} singlet: row=i*NV+a, col=j*NV+b ----
@@ -4631,14 +4651,16 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         for (size_t i=0;i<Gmat.size();++i) d_G_[i]=Gmat[i];
         for (int r=0;r<total_dim_;++r) d_diagonal_[r]=h_diag[r];
     }
-    // Verification aid: HOMO->LUMO diagonal element (= eigenvalue for the
-    // pure HOMO->LUMO state). H2O sto-3g (3,2) reference: 0.392886.
+    // Verification aid: HOMO->LUMO diagonal element. After the 2026-06-20 W^eff route
+    // corrections (u_amci Wooov, u_akei ujaie, u_bmjc SO-derived) the H2O sto-3g (3,2)
+    // reference n->pi* diag ~ 0.433 (lowest STEOM root 0.432663 Ha = 11.773 eV; old buggy
+    // routes gave ~0.393).
     {
         const int hl = (NO - 1) * NV + 0;
         std::cout << "  STEOM-CCSD G^{1h1p} built (W^eff dressing Eq.34-63, dense "
                   << total_dim_ << "×" << total_dim_ << "); G[HOMO->LUMO diag] = "
                   << Gmat[(size_t)hl * total_dim_ + hl]
-                  << "  (H2O sto-3g ref 0.392886)." << std::endl;
+                  << "  (H2O sto-3g ref ~0.433 after route fix)." << std::endl;
     }
 }
 

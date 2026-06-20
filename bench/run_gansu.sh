@@ -16,11 +16,16 @@ METHOD="${1:?method: rihf|rimp2|dlpno_ccsd|dlpno_ccsd_t|dlpno_steom}"
 NG="${2:?num_gpus}"
 TIMEOUT_MIN="${3:-120}"
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
-SERIES="$BENCH_DIR/series.tsv"
+SERIES="${SERIES:-$BENCH_DIR/series.tsv}"   # override e.g. SERIES=../bench/series_aldehyde.tsv
+SERIES_TAG="$(basename "$SERIES" .tsv)"     # appended to result file so series don't clobber
 LOGDIR="$BENCH_DIR/logs"; mkdir -p "$LOGDIR"
 AUX="../auxiliary_basis/cc-pvdz-rifit.gbs"
 BASIS="cc-pvdz"
-RES="$BENCH_DIR/results_${METHOD}_g${NG}.tsv"
+if [ "$SERIES_TAG" = "series" ]; then
+  RES="$BENCH_DIR/results_${METHOD}_g${NG}.tsv"
+else
+  RES="$BENCH_DIR/results_${METHOD}_g${NG}_${SERIES_TAG}.tsv"
+fi
 
 # Common env for the native EOM / large-system paths (auto-scale handles the rest).
 export GANSU_DLPNO_NATIVE_EOM=1

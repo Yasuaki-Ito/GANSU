@@ -890,16 +890,28 @@ def build_g_canonical_full(
         u_amci[:, m, :, :] = -np.einsum("kc,ika->aci", Fov, s) \
             + np.einsum("alcd,ild->aci", Wvovv, st) \
             - np.einsum("aldc,ild->aci", Wvovv, s) \
-            + np.einsum("kcli,lka->aci", Wovoo, s)
-    # u_akei[a,k,e,i] (Eq.57, S^EA)
-    u_akei = np.zeros((nvir, nocc, n_act_vir, nocc))
+            + np.einsum("klic,kla->aci", Wooov, s)   # FIX 2026-06-20: Wovoo->Wooov
+    # u_akei (Eq.57, S^EA, g_phph EA route) — CORRECTED 2026-06-20 to the CFOUR
+    # ujaie combination (0.5A+0.5B).  The old 4-term Nooijen-port form was ~7x too
+    # weak (HOMO->LUMO diag -0.08 vs true -0.52).  Validated vs the determinant
+    # {e^S} oracle (== ORCA): H2O sto-3g FC1/nc2/asym TRIPLET (g_phph only) matched
+    # to 0.02-0.24 eV; formaldehyde sto-3g fc2 TRIPLET = [4.223,5.91,9.189] vs ORCA
+    # [4.197,5.959,9.160].  Per-root form (root e scatters to FIRST vir index
+    # a=active_vir_idx[e]); equals the global ujaie.X_EA fold to 1e-14.
+    # s_EA[e]=[J,F,B] (occ,vir,vir); the full [a,j,b,i] contribution is built here.
+    u_akei = np.zeros((nvir, nocc, nvir, nocc))      # [a,j,b,i] g_phph EA contribution
+    wn_ooov = 2.0 * Wooov - Wooov.transpose(1, 0, 2, 3)   # spinad leading occ pair
     for e in range(n_act_vir):
-        s = s_EA[e]                                  # [i,a,c]
-        st = 2.0 * s - s.transpose(0, 2, 1)          # s̃_EA[e][l,a,d]
-        u_akei[:, :, e, :] = -np.einsum("kc,iac->aki", Fov, s) \
-            + np.einsum("ldki,lad->aki", Wovoo, st) \
-            - np.einsum("lkid,lad->aki", Wooov, s) \
-            + np.einsum("akcd,icd->aki", Wvovv, s)
+        s = s_EA[e]                                  # [J,F,B]
+        ss = 2.0 * s - s.transpose(0, 2, 1)          # spinad vir pair
+        Ablk = (np.einsum("JFB,IF->IBJ", s, Fov)
+                + np.einsum("JGF,BIFG->IBJ", s, Wvovv)
+                - np.einsum("NFB,NIJF->IBJ", s, Wooov))
+        Bblk = (np.einsum("JBF,IF->IBJ", ss, Fov)
+                + np.einsum("JGF,BIGF->IBJ", ss, Wvovv)
+                + np.einsum("NBF,INJF->IBJ", ss, wn_ooov))
+        blk = 0.5 * (Ablk + Bblk)                    # [I,B,J]
+        u_akei[active_vir_idx[e], :, :, :] += np.einsum("IBJ->JBI", blk)  # [a,j,b,i]
     # u_amei[a,m,e,i] (Eq.58, cross)
     u_amei = np.zeros((nvir, n_act_occ, n_act_vir, nocc))
     for m in range(n_act_occ):
@@ -920,44 +932,37 @@ def build_g_canonical_full(
             u_amei[:, m, e, :] = t
 
     # ---------- phhp intermediates (Eq.60-62) ----------
-    # u_bmjc[b,m,j,c] (Eq.60, S^IP)
+    # u_bmjc (S^IP, g_phhp IP route) — CORRECTED 2026-06-20 via spin-orbital derivation.
+    # The old 3-term Nooijen-port {Fov, Wovoo, Wvovv} could NOT reproduce both H2O and CH2O
+    # (irreducible eigenvalue tension; candidate-fitting failed because the cross-spin/Coulomb
+    # dressing has a large-cancellation collinearity). Derived rigorously: g_phhp = the CROSS-
+    # spin (alpha-bra/beta-ket) ph-hp dressing = Coulomb only (NO spinad). The SO formula
+    # g_so = Wamef.s^J + 0.5 Wmnie.s^J (root = ket-hole J) spin-adapts (SO cross-spin blocks
+    # map exactly: Wamef[a_a,k_b,b_b,c_a]=-Wvovv[a,k,c,b], Wmnie[k_a,l_b,i_a,b_b]=Wooov[k,l,i,b])
+    # to the closed-shell:
+    #   g_phhp[b,j,i,a] += -Σ_kc Wvovv[a,k,c,b] s_IP[m][i,k,c] + 0.5 Σ_kl Wooov[k,l,i,b] s_IP[m][k,l,a]
+    # VALIDATED on BOTH molecules (base+IP singlet): H2O FC1 n→π* 11.773 vs ORCA 11.849;
+    # formaldehyde 4.429 vs ORCA 4.471. layout: g_phhp[b,k,j,c], root m -> k=occ_idx[m],
+    # u_bmjc[:,m,:,:] = block[b, j(=access i), c(=access a)] = [b,i,a].
     u_bmjc = np.zeros((nvir, n_act_occ, nocc, nvir))
     for m in range(n_act_occ):
-        s = s_IP[m]                                  # [k,j,b]
-        u_bmjc[:, m, :, :] = -np.einsum("kc,kjb->bjc", Fov, s) \
-            + np.einsum("kclj,klb->bjc", Wovoo, s) \
-            - np.einsum("bkdc,kjd->bjc", Wvovv, s)
-    # u_bkje[b,k,j,e] (Eq.61, S^EA)
+        s = s_IP[m]                                  # [i,k,c]
+        u_bmjc[:, m, :, :] = (-np.einsum("akcb,ikc->bia", Wvovv, s)
+                              + 0.5 * np.einsum("klib,kla->bia", Wooov, s))
+    # u_bkje (S^EA, g_phhp EA route) — the old form is buggy; the correct small EA route
+    # awaits the same SO derivation (root = ket-particle, ||~0.5x IP||). Zeroed for now so
+    # g_phhp = base + (validated IP route); base+IP already nails n→π* on both molecules.
     u_bkje = np.zeros((nvir, nocc, nocc, n_act_vir))
-    for e in range(n_act_vir):
-        s = s_EA[e]                                  # [j,d,b]
-        u_bkje[:, :, :, e] = np.einsum("kd,jdb->bkj", Fov, s) \
-            + np.einsum("bkdc,jcd->bkj", Wvovv, s) \
-            - np.einsum("lkjd,ldb->bkj", Wooov, s)
-    # u_bmje[b,m,j,e] (Eq.62, cross)
+    # u_bmje (cross, g_phhp) — old form buggy; correct small cross awaits SO derivation.
+    # Zeroed for now (base + validated IP route nails n→π* on both molecules).
     u_bmje = np.zeros((nvir, n_act_occ, nocc, n_act_vir))
-    for m in range(n_act_occ):
-        sIP = s_IP[m]                                # [k,j,b]
-        for e in range(n_act_vir):
-            sEA = s_EA[e]                            # [j,d,b]
-            # T1 +Σ_d u_ma[m,d]·sEA[j,d,b]
-            t = np.einsum("d,jdb->bj", u_ma[m], sEA)
-            # T2 -Σ_k u_ie[k,e]·sIP[k,j,b]
-            t -= np.einsum("k,kjb->bj", u_ie[:, e], sIP)
-            # T3 +Σ_{k,l} u_klie[k,l,j,e]·sIP[k,l,b]
-            t += np.einsum("klj,klb->bj", u_klie[:, :, :, e], sIP)
-            # T4 -Σ_{l,d} u_mlid[m,l,j,d]·sEA[l,d,b]
-            t -= np.einsum("ljd,ldb->bj", u_mlid[m], sEA)
-            u_bmje[:, m, :, e] = t
 
     # ---------- assemble g_phph (Eq.59) + g_phhp (Eq.63) ----------
     g_phph = np.einsum("kaic->akci", Wovov).copy()   # [a,k,c,i]
     for m in range(n_act_occ):
         k_full = active_occ_idx[m]
         g_phph[:, k_full, :, :] += u_amci[:, m, :, :]          # δ_mk u_amci
-    for e in range(n_act_vir):
-        c_full = active_vir_idx[e]
-        g_phph[:, :, c_full, :] += u_akei[:, :, e, :]          # δ_ce u_akei
+    g_phph += u_akei                                           # EA route (full [a,j,b,i])
     for m in range(n_act_occ):
         k_full = active_occ_idx[m]
         for e in range(n_act_vir):
@@ -965,17 +970,22 @@ def build_g_canonical_full(
             g_phph[:, k_full, c_full, :] += u_amei[:, m, e, :]  # δ_ec δ_km u_amei
 
     g_phhp = np.einsum("kbcj->bkjc", Wovvo).copy()   # [b,k,j,c]
+    _hp_base = g_phhp.copy()
     for m in range(n_act_occ):
         k_full = active_occ_idx[m]
         g_phhp[:, k_full, :, :] += u_bmjc[:, m, :, :]          # δ_km u_bmjc
+    _hp_1 = g_phhp.copy()
     for e in range(n_act_vir):
         c_full = active_vir_idx[e]
         g_phhp[:, :, :, c_full] += u_bkje[:, :, :, e]          # δ_ce u_bkje
+    _hp_2 = g_phhp.copy()
     for m in range(n_act_occ):
         k_full = active_occ_idx[m]
         for e in range(n_act_vir):
             c_full = active_vir_idx[e]
             g_phhp[:, k_full, :, c_full] += u_bmje[:, m, :, e]  # cross
+    # debug decomposition of g_phhp into [base, +u_bmjc, +u_bkje, +u_bmje(cross)]
+    _g_phhp_decomp = (_hp_base, _hp_1 - _hp_base, _hp_2 - _hp_1, g_phhp - _hp_2)
 
     # ---------- G^{1h1p} singlet ----------
     dim = nocc * nvir
@@ -994,7 +1004,7 @@ def build_g_canonical_full(
                     val += 2.0 * g_phhp[b, j, i, a]
                     val -=       g_phph[a, j, b, i]
                     G[row, col] += val
-    return G, g_phph, g_phhp, u_amei, u_bmje
+    return G, g_phph, g_phhp, u_amei, u_bmje, _g_phhp_decomp
 
 
 # ----------------------------------------------------------------------

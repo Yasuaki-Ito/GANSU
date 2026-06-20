@@ -37,7 +37,8 @@ EXTRA = {  # method-specific blocks
 }
 
 count = 0
-with open(os.path.join(HERE, "series.tsv")) as fh:
+SERIES = os.environ.get("SERIES", os.path.join(HERE, "series.tsv"))  # override series file
+with open(SERIES) as fh:
     for line in fh:
         if line.startswith("#") or not line.strip():
             continue

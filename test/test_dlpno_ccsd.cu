@@ -169,6 +169,82 @@ TEST(DLPNOCCSD, Phase2_7b_StrictMode_DLPNOCCSD_vs_RICCSD)
 // the canonical magnitude. Tight bound is locked once a PySCF reference
 // dataset for DLPNO-CCSD(T) is generated.
 // =========================================================================
+// =========================================================================
+// RI-CCSD B-native (storage-free): with GANSU_CCSD_RI_BNATIVE=1 the MO-ERI
+// sub-blocks are built on the fly from the half-transformed B_mo (density-
+// fitting factors) instead of materializing the full nmo⁴ tensor. Same B
+// factors, same contractions — only the integral-sourcing path differs (and
+// the chemist middle-index-swap layout is reproduced via the transpose helper),
+// so the correlation energy must match the legacy full-N⁴ RI-CCSD to ~machine
+// precision. On a CPU-only test run the env is ignored (B-native needs a GPU),
+// so both runs take the legacy path and the diff is exactly 0.
+// =========================================================================
+TEST(RICCSDBNative, BNativeMatchesFullN4_H2O)
+{
+    const std::string xyz   = "../xyz/H2O.xyz";
+    const std::string basis = "../basis/cc-pvdz.gbs";
+    const std::string aux   = "../auxiliary_basis/cc-pvdz-rifit.gbs";
+
+    RunResult r_n4, r_bn;
+    try {
+        unsetenv("GANSU_CCSD_RI_BNATIVE");
+        r_n4 = run_post_hf(xyz, basis, aux, "ccsd", {{"eri_method", "ri"}});
+        setenv("GANSU_CCSD_RI_BNATIVE", "1", /*overwrite=*/1);
+        r_bn = run_post_hf(xyz, basis, aux, "ccsd", {{"eri_method", "ri"}});
+        unsetenv("GANSU_CCSD_RI_BNATIVE");
+    } catch (const std::exception& e) {
+        unsetenv("GANSU_CCSD_RI_BNATIVE");
+        GTEST_SKIP() << "Cannot run RI-CCSD for H2O/cc-pVDZ: " << e.what();
+        return;
+    }
+
+    const real_t diff = std::fabs(r_bn.post_hf - r_n4.post_hf);
+    std::cout << std::setprecision(12) << std::fixed
+              << "  RI-CCSD (full N^4)  corr = " << r_n4.post_hf << "\n"
+              << "  RI-CCSD (B-native)  corr = " << r_bn.post_hf << "\n"
+              << "  |diff|                   = " << std::scientific << diff << " Ha"
+              << std::endl;
+
+    // Only the sub-block sourcing path differs; allow a small machine-eps
+    // multiple for reduction-order differences in the B contractions.
+    EXPECT_LT(diff, 1.0e-9);
+}
+
+// Increment 2: the opt-in tiled particle-particle ladder (GANSU_CCSD_RI_LADDER_TILE=1)
+// rebuilds Wabcd a-tile-by-a-tile from B_mo (no nvir⁴ buffer). Must still reproduce
+// the full-N⁴ correlation energy to ~machine precision.
+TEST(RICCSDBNative, TiledLadderMatchesFullN4_H2O)
+{
+    const std::string xyz   = "../xyz/H2O.xyz";
+    const std::string basis = "../basis/cc-pvdz.gbs";
+    const std::string aux   = "../auxiliary_basis/cc-pvdz-rifit.gbs";
+
+    RunResult r_n4, r_tile;
+    try {
+        unsetenv("GANSU_CCSD_RI_BNATIVE");
+        unsetenv("GANSU_CCSD_RI_LADDER_TILE");
+        r_n4 = run_post_hf(xyz, basis, aux, "ccsd", {{"eri_method", "ri"}});
+        setenv("GANSU_CCSD_RI_BNATIVE", "1", 1);
+        setenv("GANSU_CCSD_RI_LADDER_TILE", "1", 1);
+        r_tile = run_post_hf(xyz, basis, aux, "ccsd", {{"eri_method", "ri"}});
+        unsetenv("GANSU_CCSD_RI_BNATIVE");
+        unsetenv("GANSU_CCSD_RI_LADDER_TILE");
+    } catch (const std::exception& e) {
+        unsetenv("GANSU_CCSD_RI_BNATIVE");
+        unsetenv("GANSU_CCSD_RI_LADDER_TILE");
+        GTEST_SKIP() << "Cannot run RI-CCSD for H2O/cc-pVDZ: " << e.what();
+        return;
+    }
+
+    const real_t diff = std::fabs(r_tile.post_hf - r_n4.post_hf);
+    std::cout << std::setprecision(12) << std::fixed
+              << "  RI-CCSD (full N^4)      corr = " << r_n4.post_hf << "\n"
+              << "  RI-CCSD (tiled ladder)  corr = " << r_tile.post_hf << "\n"
+              << "  |diff|                       = " << std::scientific << diff << " Ha"
+              << std::endl;
+    EXPECT_LT(diff, 1.0e-9);
+}
+
 TEST(DLPNOCCSD, Phase3_2_DLPNOCCSDT_TripleCorrection_Magnitude)
 {
     const std::string xyz   = "../xyz/H2O.xyz";

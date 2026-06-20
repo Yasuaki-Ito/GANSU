@@ -55,6 +55,7 @@ namespace gansu {
 void transform_ao_eri_to_mo_eri_full(
     const double* d_eri_ao, const double* d_C, int nao, double* d_eri_mo);
 
+class ERI_RI;  // RI-CCSD B-native block source
 real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             const real_t* __restrict__ d_coefficient_matrix,
                             const real_t* __restrict__ d_orbital_energies,
@@ -63,7 +64,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             real_t** d_t1_out, real_t** d_t2_out,
                             real_t* d_eri_mo_precomputed = nullptr,
                             int num_frozen = 0,
-                            const real_t* h_fov_active = nullptr);
+                            const real_t* h_fov_active = nullptr,
+                            const ERI_RI* eri_ri = nullptr);
 
 extern __global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ eri_full,
                                                     real_t* __restrict__ eri_trimmed,

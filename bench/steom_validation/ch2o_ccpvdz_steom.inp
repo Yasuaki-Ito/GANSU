@@ -1,0 +1,15 @@
+! STEOM-CCSD cc-pVDZ TightSCF
+# Realistic reference: formaldehyde n->pi* should be ~3.9-4.0 eV (canonical STEOM,
+# close to EOM-CCSD/experiment ~3.94 eV). Default automatic active space.
+# This is the production-setting number to compare GANSU STEOM against
+# (GANSU reportedly gives ~1.48 eV here = the real bug).
+%mdci
+  nroots 6
+  DoSTEOM true
+end
+* xyz 0 1
+O    0.000000000000     0.000000000000     0.683000000000
+C    0.000000000000     0.000000000000    -0.534000000000
+H    0.000000000000     0.926000000000    -1.129000000000
+H    0.000000000000    -0.926000000000    -1.129000000000
+*

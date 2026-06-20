@@ -1,0 +1,15 @@
+# alkylbenzene local-chromophore size series (xyz/bench_steom). Columns: name  xyz_relpath  natoms  tags
+benzene	../xyz/bench_steom/benzene.xyz	12	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+toluene	../xyz/bench_steom/toluene.xyz	15	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+ethylbenzene	../xyz/bench_steom/ethylbenzene.xyz	18	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+propylbenzene	../xyz/bench_steom/propylbenzene.xyz	21	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+butylbenzene	../xyz/bench_steom/butylbenzene.xyz	24	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+pentylbenzene	../xyz/bench_steom/pentylbenzene.xyz	27	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+hexylbenzene	../xyz/bench_steom/hexylbenzene.xyz	30	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+heptylbenzene	../xyz/bench_steom/heptylbenzene.xyz	33	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+octylbenzene	../xyz/bench_steom/octylbenzene.xyz	36	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+nonylbenzene	../xyz/bench_steom/nonylbenzene.xyz	39	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+decylbenzene	../xyz/bench_steom/decylbenzene.xyz	42	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+dodecylbenzene	../xyz/bench_steom/dodecylbenzene.xyz	48	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+tetradecylbenzene	../xyz/bench_steom/tetradecylbenzene.xyz	54	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+hexadecylbenzene	../xyz/bench_steom/hexadecylbenzene.xyz	60	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom

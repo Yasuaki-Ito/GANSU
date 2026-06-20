@@ -95,3 +95,34 @@ creates it if missing.)
   pentacene+); at total_dim>12000 the STEOM final diag uses iterative Davidson — add
   `GANSU_STEOM_DENSE_DIAG=1` for deterministic roots if a size shows spurious values.
 - `series.tsv` order = increasing size; trim/extend the per-method `tags` to control reach.
+
+---
+
+## Python driver (recommended) — `bench.py`
+
+One script replaces `run_gansu.sh` + `run_orca.sh` + `make_orca_inputs.py` +
+`parse_*.py`. Each (molecule, method) is an isolated subprocess (clean GPU memory,
+OOM/crash isolation), wall-timed and parsed into one CSV + a live table.
+
+```bash
+# generate the local-chromophore size series (xyz/bench_steom) once:
+python3 ../bench/make_local_series.py        # -> series_{aldehyde,ketone,amide,nitrile,alkylbenzene}.tsv
+
+cd build
+# GANSU-only timing/scaling:
+python3 ../bench/bench.py --family aldehyde --methods dlpno_ccsd,dlpno_steom --num_gpus 4
+
+# GANSU vs ORCA (adds orca subprocess + speedup column):
+python3 ../bench/bench.py --family aldehyde --methods dlpno_ccsd \
+    --num_gpus 4 --orca /opt/orca6/orca --orca-nprocs 64 --timeout 240
+
+# any series file / explicit molecules:
+python3 ../bench/bench.py --series ../bench/series_alkylbenzene.tsv --methods dlpno_steom --num_gpus 4
+python3 ../bench/bench.py --xyz ../xyz/Naphthalene.xyz ../xyz/Pentacene.xyz --methods dlpno_ccsd
+```
+
+Output: `bench/bench_<seriestag>.csv` (method, molecule, natoms, gansu_s, gansu_status,
+gansu_E, orca_s, orca_rt, orca_status, speedup=orca/gansu). Processes increasing size;
+stops at the first OOM/timeout/crash per package (`--no-stop` to run all). `dlpno_steom`
+GANSU energy column = lowest excitation (eV); others = correlation/total energy (Ha).
+Native EOM is default-ON in GANSU now, so no env is needed.

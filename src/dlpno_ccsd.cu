@@ -67,7 +67,8 @@ real_t ccsd_spatial_orbital(const real_t* d_eri_ao,
                             real_t** d_t1_out, real_t** d_t2_out,
                             real_t* d_eri_mo_precomputed,
                             int num_frozen,
-                            const real_t* h_fov_active);
+                            const real_t* h_fov_active,
+                            const ERI_RI* eri_ri = nullptr);
 
 namespace {
 using RowMatXd = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;

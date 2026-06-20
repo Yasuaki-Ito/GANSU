@@ -1,0 +1,18 @@
+! STEOM-CCSD STO-3G TightSCF
+# TRIPLET STEOM to isolate the g_phph block (triplet uses g_phph only, no g_phhp).
+# Same geometry/basis/frozen=2/complete-active as the singlet run.
+# Compare ORCA triplet excitation energies to the Python g_phph-only formula.
+%mdci
+  nroots 20
+  DoSTEOM true
+  DoTriplet true
+  DoCISNat false
+  NActIP 6
+  NActEA 4
+end
+* xyz 0 1
+O    0.000000000000     0.000000000000     0.683000000000
+C    0.000000000000     0.000000000000    -0.534000000000
+H    0.000000000000     0.926000000000    -1.129000000000
+H    0.000000000000    -0.926000000000    -1.129000000000
+*

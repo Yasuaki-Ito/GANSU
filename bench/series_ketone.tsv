@@ -1,0 +1,8 @@
+# ketone local-chromophore size series (xyz/bench_steom). Columns: name  xyz_relpath  natoms  tags
+acetone	../xyz/bench_steom/acetone.xyz	10	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+2-butanone	../xyz/bench_steom/2-butanone.xyz	13	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+2-pentanone	../xyz/bench_steom/2-pentanone.xyz	16	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+2-hexanone	../xyz/bench_steom/2-hexanone.xyz	19	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+2-octanone	../xyz/bench_steom/2-octanone.xyz	25	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+2-decanone	../xyz/bench_steom/2-decanone.xyz	31	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom
+2-dodecanone	../xyz/bench_steom/2-dodecanone.xyz	37	rihf,rimp2,dlpno_ccsd,dlpno_ccsd_t,dlpno_steom

@@ -1,0 +1,22 @@
+! STEOM-CCSD STO-3G TightSCF
+# H2O sto-3g, DEFAULT frozen core (= O1s = 1 orbital; avoids EWin syntax).
+# COMPLETE active space (NActIP 4 = all active occ, NActEA 2 = all active vir).
+# Decisive validation of the determinant-Fock-space STEOM ground truth.
+# Candidates for lowest singlet (eV), frozen=1, complete active:
+#   determinant STEOM (plain expm): 11.847
+#   analytic build_g_canonical_full: 10.691
+#   EOM-EE-CCSD                     : 11.714
+# If ORCA ~= 11.85 -> determinant is the correct oracle ({e^S} unneeded).
+# If ORCA ~= 10.69 -> analytic right / determinant needs {e^S}.
+%mdci
+  nroots 6
+  DoSTEOM true
+  DoCISNat false
+  NActIP 4
+  NActEA 2
+end
+* xyz 0 1
+O    0.000     0.000     0.127
+H    0.000     0.758    -0.509
+H    0.000    -0.758    -0.509
+*

@@ -1,0 +1,23 @@
+! STEOM-CCSD STO-3G TightSCF
+# Secondary formula test. H2O sto-3g, frozen core = 2 via energy window
+# (O1s -20.25 + 2a1 -1.258 frozen; valence -0.594/-0.460/-0.393 active).
+# Verify "2 frozen orbitals" in output. COMPLETE active (NActIP 3, NActEA 2).
+# Compare ORCA singlet excitation energies to:
+#   Python STEOM (eV): [10.804, 12.473, 16.105, 16.478, 22.352, 26.533]
+#   EOM-EE-CCSD  (eV): [11.727, 13.761, 16.192, 18.285, 21.171, 27.565]
+%method
+  FrozenCore FC_EWIN
+  EWin -1.0, 10000.0
+end
+%mdci
+  nroots 6
+  DoSTEOM true
+  DoCISNat false
+  NActIP 3
+  NActEA 2
+end
+* xyz 0 1
+O    0.000     0.000     0.127
+H    0.000     0.758    -0.509
+H    0.000    -0.758    -0.509
+*

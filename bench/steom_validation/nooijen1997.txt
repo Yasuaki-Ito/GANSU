@@ -1,0 +1,1846 @@
+Similarity transformed equation-of-motion
+coupled-cluster theory: Details, examples,
+and comparisons
+Cite as: J. Chem. Phys. 107, 6812 (1997); https://doi.org/10.1063/1.474922
+Submitted: 15 May 1997 . Accepted: 28 July 1997 . Published Online: 31 August 1998
+
+Marcel Nooijen, and Rodney J. Bartlett
+
+
+
+
+ARTICLES YOU MAY BE INTERESTED IN
+
+The equation of motion coupled-cluster method. A systematic biorthogonal approach to
+molecular excitation energies, transition probabilities, and excited state properties
+The Journal of Chemical Physics 98, 7029 (1993); https://doi.org/10.1063/1.464746
+
+A new method for excited states: Similarity transformed equation-of-motion coupled-cluster
+theory
+The Journal of Chemical Physics 106, 6441 (1997); https://doi.org/10.1063/1.474000
+
+Equation of motion coupled cluster method for electron attachment
+The Journal of Chemical Physics 102, 3629 (1995); https://doi.org/10.1063/1.468592
+
+
+
+
+J. Chem. Phys. 107, 6812 (1997); https://doi.org/10.1063/1.474922                    107, 6812
+
+© 1997 American Institute of Physics.
+Similarity transformed equation-of-motion coupled-cluster theory: Details,
+examples, and comparisons
+          Marcel Nooijen and Rodney J. Bartlett
+          Quantum Theory Project, University of Florida, Gainesville, Florida 32611-8435
+          ~Received 15 May 1997; accepted 28 July 1997!
+          The similarity transformed equation-of-motion coupled-cluster ~STEOM-CC! method is presented
+          in full detail. Comparisons are made with the Fock space coupled-cluster ~FSCC! method and the
+          equation-of-motion coupled-cluster ~EOM-CC! scheme. The role of implicit triple excitations and,
+          relatedly, charge transfer separability in STEOM is discussed. The dependence on the choice of
+          active space in STEOM is addressed and criteria for the selection of the active space are given. The
+          evaluation of properties within STEOM is outlined and a large number of illustrative examples of
+          STEOM is presented. © 1997 American Institute of Physics. @S0021-9606~97!02841-9#
+
+
+
+I. INTRODUCTION                                                      a STEOM calculation for excitation energies amounts to a CI
+                                                                     singles calculation with modified matrix elements. This step
+     Recently we developed an alternative strategy to obtain a       is almost trivial and gives the scheme enormous computa-
+manifold of electronic eigenstates at a given nuclear geom-          tional and conceptual appeal: A large number of electronic
+etry that proved particularly effective, yet accurate.1,2 The        states can be calculated at virtually no cost.
+idea behind the approach is rather different from the conven-
+                                                                          Moreover, since the transformed Hamiltonian is given in
+tional wave function optimization approaches. In the similar-
+                                                                     second quantization the convenient block form holds for all
+ity    transformed     equation-of-motion        coupled-cluster
+                                                                     sectors in Fock space, corresponding to N, N61, N62 par-
+~STEOM-CC! method1,2 a sequence of two similarity trans-
+                                                                     ticles and so forth. Principal ionization energies are obtained
+formations of the second quantized Hamiltonian is per-
+                                                                     by diagonalizing over the one hole configurations, electron
+formed, such that the one- and ~a selection of most impor-
+                                                                     affinities derive from diagonalization over the one particle
+tant! two-body components of the new Hamiltonian that net
+                                                                     configurations, while double ionization potentials ~for ex-
+increase the excitation level are transformed to zero. The first
+                                                                     ample to interpret Auger spectra! are obtained by diagonal-
+transformation in STEOM uses the singles and doubles con-
+                                                                     izing over two hole determinants and so forth.
+nected excitation operator T̂5T̂ 1 1T̂ 2 that is obtained from a
+                                                                          In the first applications of the STEOM-CC scheme we
+standard CCSD calculation.3 The transformed Hamiltonian
+                                                                     considered the excitation spectra of the pyridine molecule1
+    C 5e 2T̂ Ĥe Tˆ ,
+    H                                                        ~1!     and free base porphin.2 The accuracy of the STEOM results
+                                                                     were found to be comparable to state-of-the-art methods like
+is familiar from equation-of-motion coupled-cluster ~EOM-            MRCI,30 CASPT2,31,32 EOM-CC33 and SAC-CI,34,35 while
+CC! theory4–7 @or coupled-cluster linear response                    the computational requirements are much reduced compared
+~CCLR!8–10# and has the property that one- and two-particle          to the above methods. We also introduced the so-called
+pure excitation operators ~the 1h1 p22h2 p operators! in H    C      STEOM-PT method in which the CCSD coefficients were
+vanish. In the second transformation we use a normal or-             replaced by their first-order analogs, and which yielded very
+                                    ˆ
+dered exponential operator $ e S % 11 as introduced by               satisfactory results for the pyridine molecule. The results for
+Lindgren,12 and which is familiar from Fock space coupled-           free base porphin were less accurate, due to higher order
+cluster theory.12–29 The operator Ŝ is determined such that a       correlation effects needed for the description of the ground
+selection of the most important remaining excitation opera-          state. In STEOM-PT the most expensive CCSD step is elimi-
+tors of hhhp and h ppp form that net increase the excitation         nated, which scales with the sixth power of the basis set. The
+level by one, but which give a vanishing result when acting          calculation of H C matrix-elements also scales with the sixth
+on the reference determinant, are transformed to zero. In this       power of the basis set, but contrary to CCSD, this step is
+step we introduce a set of active orbitals. Only integrals that      noniterative. The formation of H   C for larger systems is the
+have an active quasi-particle annihilation operator are trans-       most expensive step in a STEOM-PT calculation. The calcu-
+formed to zero.                                                      lation of the S-amplitudes and the second similarity trans-
+     To a good approximation the final transformed Hamil-            form scale with the fifth power of the basis set and this step
+tonian Ĝ attains a block form that makes it very easy to            scales linearly with the size of the active space. The final
+extract a subset of its eigenvalues: Each subblock of the            diagonalization step in STEOM scales with only the fourth
+transformed Hamiltonian corresponding to a definite excita-          power of the basis set. This favorable scaling was demon-
+tion level can be diagonalized separately. It follows that ex-       strated in our calculations on pyridine and free base porphin.
+citation energies corresponding to dominantly singly excited              In STEOM many elements are combined that have their
+states can be obtained by diagonalizing Ĝ over the subspace         roots in various developments in open-shell coupled-cluster
+of singly excited determinants. Operationally the final step in      theory. The concept of many-body similarity transformations
+
+6812      J. Chem. Phys. 107 (17), 1 November 1997      0021-9606/97/107(17)/6812/19/$10.00      © 1997 American Institute of Physics
+                                  M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory                         6813
+
+
+and a subsequent diagonalization of the transformed Hamil-              to describe systems that have two electrons in two active
+tonian over small subspaces goes back to Stolarczyk and                 spatial orbitals, or four electrons in three orbitals, i.e., two
+Monkhorst.21–24 In a recent paper the use of many-body                  holes in a closed-shell configuration. Similarly the DEA
+similarity transformations were revived and a number of                 method can be used to describe systems that have two elec-
+problems with the original formulation of Stolarczyk and                trons on top of a closed shell. This includes a surprising
+Monkhorst were resolved.11 Specifically, it was shown that              number of difficult transition states, bi-radicals etc. As an
+the transformed Hamiltonian could be obtained without ex-               example we will discuss the vibrational frequencies of
+plicit use of the cumbersome inverse of the transformation              ozone, a notorious multireference problem.41,42
+             ˆ
+operator $ e S % . In addition we allowed for the use of a subset             In Sec. IV we further discuss the relation of FSCC and
+of active orbitals which is necessary to make the approach              STEOM with particular emphasis on the rôle of the active
+practical. Furthermore, the intimate relation between the               space. If the active space is exhaustive the two methods will
+Stolarczyk–Monkhorst approach and the Fock space                        give identical results, although the numerical convergence
+coupled–cluster method developed by Lindgren, Mukherjee,                behavior of the two schemes will be different. We provide a
+and others12,14,15,19,25 was demonstrated.11 The idea of many-          direct comparison of the two methods by considering the
+body similarity transformations has also been the basis for a           s-tetrazine molecule using the same computational param-
+simple and general formulation of spin-adapted open-shell               eters as in an earlier FSCC calculation.43 The dependence of
+coupled-cluster theory,36 which is yet to be implemented.               STEOM results on the size and character of the active space
+     Another important aspect of STEOM derives from the                 is illustrated with a calculation of the excitation spectrum of
+relations between STEOM and FSCC on the one hand, and                   the CO molecule.
+EOM-CC theory for the IP- and EA-sectors on the other.37,38                   In Sec. V we compare the STEOM-CC and EOM-CC
+This allows us to formulate all steps in a STEOM calcula-               methods for excitation energies. In STEOM there is an im-
+tion, except for the initial solution of the CCSD equations, as         plicit contribution from ‘‘disconnected’’ triple excitations if
+eigenvalue problems. This is stable numerically and has im-             we transform back to the EOM picture. This triple contribu-
+portant advantages over the solution of nonlinear equations             tion has been considered by Meissner and Bartlett44 in a
+as in FSCC.                                                             comparison of FSCC and EOM-CC, and they suggested a
+     In this paper we give a detailed exposition of the                 dressing of the EOM-CC method to incorporate this effect.45
+STEOM method for excitation energies, doubly ionized and                Interestingly, STEOM and EOM-CC can be viewed as dif-
+doubly attached states. A number of subtleties in the formu-            ferent approximations to this dressed EOM-CC method. An
+lation of STEOM will be addressed. The relationship with                important motivation to consider the triples correction was
+other developments in open-shell coupled-cluster theory will            that FSCC ~and also STEOM! eigenvalues and right-hand
+be clarified and illustrated with numerical results. The out-           eigenvectors satisfy the proper separability conditions, since
+line of this paper is as follows.                                       they are fully linked, extension theories, EOM-CC ~or its
+     In Sec. II A we present a derivation of the amplitude              CCLR twin! does not. In particular the excitation energies in
+equations. We start from the point of view of the many-body             FSCC/STEOM are charge transfer separable. By this we
+similarity transformation, and provide the connection with              mean that in the limit of a system consisting of two nonin-
+amplitude equations in FSCC and the eigenvalue problems                 teracting closed shell subsystems, the excitation energy of a
+of the IP-EOM-CC and EA-EOM-CC methods. We also dis-                    charge transfer excitation ~from one subsystem to the other!
+cuss the rôle of active orbitals in this section. In Sec. II B we      is precisely equal to the sum of the relevant electro-affinity
+present detailed formulas for the matrix elements of the                on one subsystem and the ionization potential on the other.
+transformed Hamiltonian at the orbital level.                           Due to the truncated CI structure this charge transfer separa-
+     In Sec. III we present the first applications of STEOM to          bility is not satisfied in EOM-CC. We illustrate these con-
+doubly ionized and doubly attached states. The DIP-STEOM                cepts by considering the charge transfer excitation from Be
+scheme can straightforwardly be used to interpret Auger                 to C2 at large separation of the Be and C2 moieties. Triple
+spectra, and we discuss an elementary application to the HF             corrections to EOM-CC46–51 have been shown to be impor-
+molecule. DIP-STEOM also provides a means to obtain the                 tant also for less exotic systems, in particular, for valence
+ionized states of doublet radicals. In this case we start from          excited states. To gauge the effect of triples we make a com-
+the closed shell anion and delete two electrons to arrive at            parison between STEOM and EOM-CC for the N2, H2O,
+the cation states. As an example we discuss the ionized states          and C2 molecules for which full CI results have recently
+of the F-atom which are obtained as the doubly ionized states           been presented.51 We also discard the triples correction from
+of the closed shell F2 anion. The double attachment scheme              STEOM and compare results from the resulting ‘‘STEOM-
+can be used to calculate excitation spectra of open-shell sys-          no-T’’ model to EOM-CCSD results.
+tems like oxygen or the carbon atom, which in their ground                    In Sec. VI we discuss the evaluation of properties and
+state have two open-shell electrons out of a closed shell con-          transition moments in the STEOM framework, using the
+figuration.                                                             convenient biorthogonal expectation value approach that has
+     Both the DIP- and DEA-STEOM method show great                      been used in the equation-of-motion coupled-cluster
+promise to be applicable to systems that require a traditional          method.6 We compare STEOM results with EOM-CC results
+multireference description.39,40 The DIP method can be used             for the CO molecule, and also consider excited-state proper-
+
+                                           J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+6814                                         M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory
+
+
+ties calculated as energy derivatives through finite difference                      one- and two-body pure excitation operators in H                 C to zero,
+techniques.                                                                          and this leads to the familiar CCSD equations
+     Our findings are summarized in the final section.                                                    C u F & 5 ^ F a u e 2T̂ Ĥe Tˆ u F & 50,
+                                                                                         h̄ ai 5 ^ F ai u H     0         i                 0
+                                                                                                                                                             ~5!
+                                                                                                          ab C                ab 2T̂        ˆ
+                                                                                         h̄ abi j 5 ^ F i j u H u F 0 & 5 ^ F i j u e Ĥe u F 0 & 50.
+                                                                                                                                            T
+
+II. SIMILARITY TRANSFORMED                                                           The constant term h̄ 0 in the normal ordered representation of
+EQUATION-OF-MOTION COUPLED-CLUSTER                                                   C equals the coupled-cluster energy
+                                                                                     H
+THEORY (STEOM-CC)
+                                                                                                          C u F & 5 ^ F u e 2T̂ Ĥe Tˆ u F & 5E .
+                                                                                           h̄ 0 5 ^ F 0 u H                                                                    ~6!
+     In this section we will discuss and derive the STEOM                                                      0       0                  0    CC
+
+equations at various levels. In the first subsection we will                         In equation-of-motion coupled-cluster theory the trans-
+discuss the ideas behind the approach and the amplitude                              formed Hamiltonian is diagonalized over a suitable set of
+equations in general terms. We will also show how the am-                            configurations to obtain ionized,55–58 attached52 or excited
+plitudes for the second transformation can be obtained from                          states.6 The transformation serves two purposes. First the
+IP-EOM-CC and EA-EOM-CC eigenvalue problems and a                                    diagonalization space can be more compact than in a corre-
+suitable normalization. In the second subsection we provide                          sponding CI calculation: Only one excitation level beyond
+detailed equations for the transformed matrix elements at the                        the states of interest needs to be included in the diagonaliza-
+orbital level.                                                                       tion space. Second the method yields size-intensive results
+     Some remarks about notation are in order. The orbitals                          for energy differences like excitation energies and ionization
+are partitioned into occupied orbitals, i, j, k, l, unoccupied                       potentials. Both properties ultimately derive from the fact
+orbitals a, b, c, d, while general orbitals are denoted p, q,                        that
+r, s. In addition active occupied orbitals will be labeled m,                              C 2E ! q̂ exu 0 & 5 @ H
+                                                                                          ~H                     C ,q̂ ex# u 0 & ,               ~7!
+                                                                                                 CC
+n, while active virtual orbitals are indicated by e, f . Finally
+                                                                                     which in turn can be attributed to the vanishing pure excita-
+we will use a prime to indicate orbitals that are explicitly                                       C . The commutator form provides the relation
+inactive, i.e., i 8 , j 8 and a 8 , b 8 .                                            tion parts in H
+                                                                                     with propagator and equation-of-motion formulations, and a
+A. Amplitude equations                                                               possible representation of the theory in terms of connected
+    In STEOM-CCSD theory we perform a sequence of two                                diagrams.55,56 This statement refers to the one- and two-
+many-body similarity transformations, such that the most im-                         particle Green’s functions or propagators associated with
+portant one- and two-body net-excitation operators in the                            EOM-CC, not to the perturbation series for the excitation
+resulting transformed Hamiltonian Ĝ vanish. The first trans-                        energies themselves, which do contain disconnected
+formation is familiar from equation-of-motion coupled-                               diagrams.44,45 The latter, unlinked, terms do not violate the
+cluster theory and is given by                                                       extensivity of second-order properties for extended systems59
+                                                                                     within EOM-CC theory in the so-called quadratic model,60
+    C 5e 2T̂ Ĥe Tˆ .
+    H                                                                          ~2!   or CCLRT, but do violate charge-transfer superability for
+                                                                                     excited states.10
+The operator T̂ consists of single and double pure excitation                             In similarity transformed equation-of-motion coupled-
+operators                                                                            cluster theory ~STEOM-CC! we perform a second similarity
+    T̂5T̂ 1 1T̂ 2 5     (
+                        i,a
+                            t ai $ â † î % 1 ( t ab
+                                             1
+                                             4
+                                               i, j,a,b
+                                                        i j $ â ı̂b̂ ĵ % ,
+                                                                † †
+                                                                               ~3!   transform
+                                                                                                    ˆ           ˆ
+                                                                                                          C $ e S% ,
+                                                                                           Ĝ5 $ e S % 21 H                                                                    ~8!
+where the brackets indicate normal order with respect to a
+predetermined reference determinant u F 0 & . Given the ampli-                       where the transformation operator consists of two parts Ŝ
+tudes of the operator T̂ the transformed Hamiltonian can be                          5Ŝ 1 1Ŝ 2
+expressed in normal ordered, second quantized form using
+new matrix elements
+                                                                                           Ŝ 1 5Ŝ 1     1
+                                                                                                    1 1Ŝ 2 5    ( s ae 8$ â 8†ê % 1 a,b,(j,e S abe j $ â † êb̂ † ̂ % ,
+                                                                                                                a 8 ,e
+                                                                                                                                          1
+                                                                                                                                          2
+
+                                                                                                                                                                               ~9!
+    C 5h̄ 1
+    H    0       (
+                 p,q
+                     h̄ pq $ p̂ † q̂ % 1 ( h̄ pqrs $ p̂ † r̂q̂ † ŝ %
+                                         1
+                                         4
+                                         p,q,r,s                                     and
+
+         1 361      ( h̄ pqrstu$ p̂ † ŝq̂ † t̂r̂ † û % 1••• .                ~4!
+                                                                                           Ŝ 2 5Ŝ 2     2
+                                                                                                    1 1Ŝ 2 5    (   S i 8 $ m̂ † ı̂ 8 % 1 ( S mb
+                                                                                                                       m                  1
+                                                                                                                                          2         i j $ m̂ ı̂b̂ ̂ % .
+                                                                                                                                                            † †
+
+                 p,q,r,s,t,u                                                                                    i ,m8                      i,m,b, j
+                                                                                                                                                                          ~10!
+The matrix elements of H    C consist of products of amplitudes
+                                                                                     As mentioned before the indices m and e denote active in-
+of the operator T̂ and matrix-elements of the original Hamil-                        dices of the hole and particle type respectively, while a prime
+tonian Ĥ. The so-called EOM Hamiltonian H        C 6,52 contains                    denotes a restriction to orbitals that are not active. The cor-
+three- and higher-body operators ~up to six-body components                          responding operators m̂ † and ê give zero when acting upon
+in the singles and doubles approximation!, and the one- and                          the reference determinant @they are called quasiparticle ~or
+two-particle components of H     C are well documented in the                        q-! annihilation operators#. The presence of q-annihilation
+            53,54
+literature.       The operator T̂ is determined by equating the                      operators in Ŝ implies that different components of Ŝ in gen-
+
+                                                         J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+                                        M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory                                  6815
+
+
+                                                                              obtained by solving EA-EOM-CC52 eigenvalue problems
+                                                                              ~corresponding to states with N11 electrons!, while simi-
+                                                                              larly, the amplitudes that define Ŝ 2 are obtained by solving
+                                                                              for a number of eigenstates of the IP-EOM-CC
+                                                                              Hamiltonian,56,61 corresponding to states with N21 elec-
+                                                                              trons.
+                                                                                                                       ˆ
+                                                                                   Rather than using the inverse $ e S % 21 the transformed
+FIG. 1. STEOM-CC: Diagonalize doubly similarity transformed Hamil-
+                                                                              Hamiltonian Ĝ is solved from the linear equations
+tonian Ĝ over excited determinants. X’s indicate matrix-elements of normal
+magnitude, while the blocks indicated by a ˜ correspond to small three-                ˆ                ˆ
+particle interactions in Ĝ, or ‘‘inactive’’ two-body operators.                   $ e S % Ĝ5HC $ e S % ,                                        ~13!
+
+                                                                              which has been shown11 to be equivalent to
+                                                                                         ˆ
+eral do not commute, and for this reason we use a normal                                                C $ e Sˆ % !
+                                                                                   ~ $ e S % Ĝ ! C 5 ~ H                                         ~14!
+                                                                                                                     C
+ordered exponential, in which all q-annihilation operators by
+definition are moved to the right. The basic bookkeeping                      or
+mechanism in many-body theory amounts to writing prod-
+                                                                                                  ˆ                ˆ
+ucts of operators in normal order and starting from normal                               C $ e S % ! 2 ~ $ e S 21 % Ĝ ! ,
+                                                                                   Ĝ5 ~ H                                                        ~15!
+                                                                                                    C                   C
+ordered operators therefore generally simplifies equations.
+Once the amplitudes of the operator Ŝ are determined one                     where the subscript C denotes a restriction to connected con-
+can obtain the transformed Hamiltonian Ĝ in second quanti-                   tributions. The components of Ĝ that are required to vanish
+zation ~and as always, normal order!                                          can be extracted by projecting against a suitable set of Slater
+                                                                              determinants
+     Ĝ5g 0 1   (
+                p,q
+                    g pq $ p̂ † q̂ % 1 ( g pqrs $ p̂ † r̂q̂ † ŝ % 1••• ,
+                                    1
+                                    4
+                                       p,q,r,s                                     g mi 8 5 ^ F i 8 u Ĝ u F m & 50,
+                                                                       ~11!
+                                                                                   g mbi j 5 ^ F bji u Ĝ u F m & 50,
+where now the matrix-elements of Ĝ are ~connected! prod-                                                                                         ~16!
+ucts of matrix elements of H  C and amplitudes of Ŝ. The trans-
+                                                                                                  a8
+                                   ˆ                                               g a 8 e 5 ^ F u Ĝ u F & 50,
+                                                                                                              e
+formation with the operator $ e S % preserves the zeros for the
+pure excitation components g ai 5g abi j 50, independent of                        g abe j 5 ^ F ba
+                                                                                                 j u Ĝ u F & 50,
+                                                                                                           e
+the coefficients of Ŝ. 11 In addition g 0 5h̄ 0 5E CC .
+    The equations that determine the amplitudes of Ŝ are                     where in defining the two-particle components we used that
+obtained by equating the corresponding elements of Ĝ to                      contributions from the pure creation parts of Ĝ vanish, due to
+zero, hence                                                                   the solution of the CCSD equations. The first two equations
+                                                                              involve projecting onto a space of inactive 1h and 2h1p
+     g mi 8 5g a 8 e 50,   g abe j 5g mbi j 50.                        ~12!
+                                                                              configurations on the left and active 1h determinants on the
+Obviously, the number of coefficients to be determined                        right. The third and fourth equation involve the 1 p and 2p1h
+equals the number of equations. The vanishing of the two-                     spaces. These equations can be summarized as
+particle components of Ĝ, having one ~active! q-annihilation
+operator is very useful, as thereby the coupling of an excited                     ^ Q 6 u Ĝ u P 6 & 50,                                         ~17!
+determinant to more highly excited determinants is strongly
+reduced. The transformed Hamiltonian assumes a block form                     where the projection manifolds are implicitly defined. Let us
+as indicated in Fig. 1.                                                       emphasize that due to the 1h/1p character of the manifold
+     The transformed Hamiltonian is evidently non-                            P 6 only ~normal ordered! components of Ĝ contribute that
+Hermitean, and simplifications only occur in the lower trian-                 have precisely one q-annihilation operator of hole or particle
+gular block of the Hamiltonian matrix. Neglecting the                         type respectively. Substituting Eq. ~15! for Ĝ, the right-hand
+matrix-elements in the lower triangle allows us to extract a                  exponential (H C $ e Sˆ % ) can immediately be linearized, and
+                                                                                                         C
+subset of the eigenvalues of Ĝ to good approximation by                      split according to components.
+diagonalizing over a subspace corresponding to one particu-
+                                                                                                                         ˆ
+lar excitation level.                                                              ^ Q 6 u HC 1 ~ HC Ŝ 6 ! C 2 ~ $ e S 21 % Ĝ ! C u P 6 & 50.   ~18!
+     The vanishing of the one-particle components in Eq.
+                                                                                                                             ˆ
+~12! is of no particular relevance, since they do not provide a               The left-hand exponential ( $ e S 21 % Ĝ) C u P 6 & requires some
+coupling to more highly excited determinants anyway. The                      further manipulation. We know that only components of Ĝ
+reason for the inclusion of the one-particle operator in Ŝ, is               can contribute that have one active q-annihilation operator.
+that the nonlinear Eq. ~12! can then be cast into an eigen-                   But all of these operator components are equated to zero,
+value problem, which tends to be more stable numerically.                     except those that excite within the P-space. Hence we can
+We will show below that the amplitudes that define Ŝ 1 are                   write
+
+                                                  J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+6816                                             M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory
+
+
+                                                                                              U6        6 6                 6
+     ˆ                               ˆ
+~ $ e S 21 % Ĝ ! C u P 6 & 5 $ e S 21 % u P 6 &^ P 6 u Ĝ2g 0 u P 6 &                         pl 5 ^ F p u R̂ l u F 0 & 5r pl .                                        ~27!
+
+                              5Ŝ 6 u P 6 &^ P 6 u Ĝ2E CCu P 6 &                       The amplitudes of the operators Ŝ 6 are then obtained as
+                                                   C 1~ H
+                                                        C Ŝ 6 ! 2E u P 6 & .
+                                                                                                k u Ŝ u F p & 5 ( ^ F k u R̂ l u F 0 & U lp .
+                              5Ŝ 6 u P 6 &^ P 6 u H               CC                         ^F6     6    6           6 6                621
+                                                                                                                                                                        ~28!
+                                                                                                                        l
+                                                                               ~19!
+                                                                                        Writing explicit equations for the IP and EA amplitudes we
+The constant g 0 5E CC has to be subtracted to ensure the
+                                                                                        find
+connectivity of the expression. In the final line we use that
+                     ˆ
+         ^ P 6 u ~ $ e S 21 % Ĝ ! C u P 6 & 50,                               ~20!
+                                                                                                m
+                                                                                              S i 8 52     (l r i 8~ l ! r lm
+                                                                                                                           21
+                                                                                                                              ,       ji 52
+                                                                                                                                    s bm         (l r bji~ l ! r lm
+                                                                                                                                                                 21
+                                                                                                                                                                    ,   ~29!
+since Ŝ always excites out of the active space. Collecting
+                                                                                        and
+terms we find
+
+^ Q 6 u HC 1 ~ HC Ŝ 6 ! C u P 6 & 2 ^ Q 6 u Ŝ 6 u P 6 &                                     s ae 8 5   (l r a 8~ l ! r 21
+                                                                                                                         le ,       je 5
+                                                                                                                                  s ba     (l r baj ~ l ! r 21
+                                                                                                                                                            le .        ~30!
+                   C 1~ H
+         3 ^ P 6u~ H    C Ŝ 6 ! 2E ! u P 6 & 50.                              ~21!
+                                C  CC                                                   The extra minus sign for the IP-coefficients derives from the
+The above equation is identical to the Fock Space coupled-                              extra contraction over the hole line in evaluating the left-
+                                                                                                                                21
+cluster ~FSCC! equations for the IP- and EA-sectors that                                hand side of Eq. ~28!. The matrices r lp   are to be interpreted
+have been derived by Mukherjee and Lindgren et al.12,14,15,19                           as the coefficients of the inverse of the matrix constructed
+The relation between the many-body similarity transforma-                               from the principal, active components of the eigenvectors
+tions and FSCC theory has been addressed in general in a                                r p (l).
+previous paper.11 Sinha et al.37 on the other hand, showed                                    The question arises to what extent the approach depends
+the relation between FSCC for the IP and EA sectors and                                 on the choice of active orbitals, and to what extent the ap-
+coupled-cluster linear response theory ~CCLRT! or equiva-                               proach is unique. In the above derivation we showed that the
+lently equation-of-motion coupled-cluster ~EOM-CC! for                                  transformation operator Ŝ that satisfies Eqs. ~15! and ~16!
+these sectors. This relation is most easily obtained by multi-                          can be obtained by solving for a number of eigenvectors of
+plying Eq. ~21! on the right with a matrix U 6 in the P-space                           the IP- and EA-EOM-CC problems and a normalization con-
+that diagonalizes the effective Hamiltonian                                             dition. Surprisingly, any selection of eigenvectors is pos-
+                                                                                        sible. They do not need even correspond to principal IP’s and
+         H eff5 ^ P 6 u Ĝ2E CCu P 6 &                                                  EA’s. This arbitrariness is directly related to the nonlinearity
+                       C 1~ H
+              5 ^ P 6u H    C Ŝ 6 ! 2E u P 6 & .                              ~22!     of the defining Eq. ~16!, which allows for multiple solutions.
+                                    C  CC
+                                                                                        This issue has been discussed in detail by Meissner.62 How-
+Hence                                                                                   ever, for the STEOM approach to be useful the three-particle
+                                                                                        components of Ĝ should be small, and therefore so should
+^ P 6 u HC 1 ~ HC Ŝ 6 ! C 2E CCu P 6 & U 6
+                                                                                        the amplitudes Ŝ 2 . This implies that we will want to use
+                          C 1~ H
+         5U 6 E 6 ^ Q 6 u H    C Ŝ 6 ! u P 6 & U 6                                     eigenvectors of the EOM-CC eigenvalue problems that cor-
+                                       C
+                                                                                        respond to principal IP’s and EA’s. The notion of principal
+         5 ^ Q 6 u Ŝ 6 u P 6 & U 6 E 6 .                                      ~23!     eigenvectors is related to the validity of Koopmans’ theorem.
+Defining                                                                                If the MO picture of ionization or attachment breaks down,
+                                                                                        we expect also a breakdown of the STEOM concepts. In
+         u P 6& U 6    6   6    6     6
+                  l 1Ŝ u P & U l 5R̂ l u F 0 & .                              ~24!     practice the selection of a definite set of principal EOM-CC
+                                                                                        eigenvectors is fairly straightforward, and we note that the
+We obtain the EOM-CC eigenvalue equations
+                                                                                        EOM-CC results only ~slightly! depend on the choice of ref-
+         ^ F k6 u ~ HC R̂ 6                   6 6                6                      erence state. They are invariant under a rotation of virtual ~or
+                          l ! C u F 0 & 5 ^ F k u R̂ l u F 0 & E l             ~25!
+                                                                                        occupied! orbitals among each other.
+or                                                                                            The second freedom in the definition of the transforma-
+                                                                                        tion concerns the normalization condition and this depends
+         ^ F k6 u @ HC ,R̂ 6                 6 6                6
+                           l # u F 0 & 5 ^ F k u R̂ l u F 0 & E l .            ~26!
+                                                                                        on the selected active space. Let us emphasize that this
+The energy eigenvalues in these equations correspond di-                                choice is independent of the selection of EOM-CC eigenvec-
+rectly to the energy differences, i.e., ionization potentials and                       tors. The choice of active orbitals is a delicate subject. They
+electron affinities. The EOM-CC eigenvalue equations for                                determine the matrix inverse in Eqs. ~29! and ~30! and in
+the EA and IP sectors are well documented.52,55–57,61 To ob-                            order to minimize the magnitude of Ŝ 2 it is advantageous to
+tain the amplitudes of the operator Ŝ we solve for a number                            select a space of active orbitals that has maximum overlap
+of principal ionization potentials and electron affinities and                          with the selected EOM-CC eigenvectors. Canonical Hartree–
+the corresponding eigenvectors R 6   l . The matrices U
+                                                           6
+                                                               are                      Fock ~HF! orbitals are an excellent choice in this respect. On
+defined as the model components ~corresponding to the ac-                               the other hand the active orbitals, or better, the active space,
+tive orbitals! of the vectors R 6
+                                l , hence                                               determines precisely which transformed two-electron matrix
+
+                                                              J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+                                                    M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory                                6817
+
+
+elements are transformed to zero. This determines ~to some                                                                                                  ˆ
+                                                                                                we will work with the transformation generated by $ e S 2 % .
+extent! the remaining coupling that is not taken into account                                   The transformed Hamiltonian will henceforth simply be
+when diagonalizing Ĝ over a small subspace. In this context                                    called Ĝ.
+one would like to define an active space such that the final                                         The matrix-elements that are needed in STEOM only
+STEOM eigenvectors can be well represented within the ac-                                       require one and two-body components of Ĝ, having at most
+tive space and contain only a very small component outside                                      two lines at the top. This further simplifies our equations
+the active space. In this sense canonical Hartree–Fock virtual                                  since there are no contributions from the second, so-called
+orbitals are often a poor choice to describe excited states, as                                 renormalization term in Eq. ~15!. The equations ~except the
+the Hartree–Fock virtual orbitals are often too diffuse.                                        amplitude equations for Ŝ, included below! are based upon
+     It is clear that there is some tension between the two                                                ˆ
+requirements, and we have not found a convenient solution                                       Ĝ→(H̄ $ e S 2 % ) C .
+for this potential problem yet. Presently, we usually define                                         Below we give detailed expressions for the second quan-
+the active space as a selection of canonical Hartree–Fock                                       tized matrix-elements of Ĝ. Because the reference determi-
+orbitals. The computational expense of STEOM depends                                            nant is assumed to be closed shell, the labels in these equa-
+only slightly on the magnitude of the active space, and this                                    tions correspond to spatial orbitals, and the spin-integration
+allows us to use rather extensive active spaces, such that the                                  is already carried out. All two-electron matrix-elements are
+active component of the STEOM eigenvectors usually ex-                                          given in ‘1212’ notation. One and two-particle matrix ele-
+ceeds 95%. In Sec. IV we will return to the issue of active                                     ments of the EOM-Hamiltonian are denoted as w, and the
+orbitals and present numerical examples.                                                        expression for the matrix-element depends on the particle-
+     To summarize this section the s-amplitudes can be ob-                                      hole character of the labels. The matrix elements in spin free
+tained from the EOM-CC eigenvectors for the IP and EA                                           format, precisely as they are used here, are documented in
+sectors corresponding to principal ionization potentials and                                    Ref. 54. Occasionally also the bare Hamiltonian matrix ele-
+electron affinities. The S 2 components can be obtained by                                      ments v are used. Matrix-elements of Ĝ, denoted g, are
+writing the IP-EOM-CC eigenvectors in anti-intermediate                                         defined over the complete set of orbitals. In addition we de-
+normalization w.r.t. to the active space, while the S 1 ampli-                                  fine intermediates u that will always contain one or more
+tudes are obtained by writing the EA-EOM-CC eigenvectors                                        active labels. The matrix-elements of Ĝ are most easily con-
+in intermediate normalization.                                                                  structed in terms of these intermediates. In addition to the
+                                                                                                s-amplitudes defined before in terms of the EOM-CC eigen-
+                                                                                                vectors we use symmetrized s-coefficients.
+B. Matrix elements of the transformed Hamiltonian
+                                                                                                       i j 52s i j 2s ji ,
+                                                                                                    s̃ mb                            e j 52s e j 2s e j .   ~33!
+                                                                                                               mb     mb
+                                                                                                                                  s̃ ab      ab     ba
+    We will show first that we will not need to consider the
+one-particle components of Ŝ. To this end we note that                                         The equations below were obtained using diagrammatic
+        ˆ        ˆ            ˆ
+                                                                                                techniques based on the Goldstone convention.
+    $ e S 2 %$ e S 1 % 5 $ e S 1 1Ŝ 2 % .                                               ~31!       One-particle elements:
+This follows from Wick’s theorem which states that the                                          hh elements
+product of two normal ordered operators is the normal or-
+dered product of the two operators plus all possible contrac-                                       u mi 5   (
+                                                                                                             k,c
+                                                                                                                         ik 2 ( w klid s̃ kl ,
+                                                                                                                 w kc s̃ mc
+                                                                                                                             k,l,d
+                                                                                                                                          md
+                                                                                                                                                            ~34!
+tions. It is impossible to contract Ŝ 2 to Ŝ 1 , since the lines at
+the bottom of Ŝ 2 correspond to active orbitals, while the lines
+at the top of Ŝ 1 correspond to inactive labels. Therefore only                                    g ki 5w ki 1     (m d km u mi ,                         ~35!
+the uncontracted term in Wick’s theorem remains, which is
+the content of Eq. ~31!. It follows that the total similarity                                   p p elements
+transform can be written as a sequence of two similarity
+transforms                                                                                          u ae 5   (
+                                                                                                             k,c
+                                                                                                                         ek 1 ( w alcd s̃ el ,
+                                                                                                                 w kc s̃ ac
+                                                                                                                             c,d,l
+                                                                                                                                          cd
+                                                                                                                                                            ~36!
+                Sˆ 1 21      Sˆ 2 21 C       Sˆ 2      Sˆ 1     Sˆ 1 21          Sˆ 1
+    Ĝ t 5 $ e %          $e %         H $ e %$ E % 5 $ e %               Ĝ 2 $ e % .
+                                                                                         ~32!       g ac 5w ac 1     (e d ce u ae ,                         ~37!
+Of course Ĝ t and Ĝ 2 have the same eigenvalue spectrum.
+                                            ˆ                                                   h p elements
+Moreover the transformation with $ e S 1 % cannot change the
+particle-rank of an operator. This follows immediately be-
+cause contracting Ŝ 1 to any operator does not change the                                          u ma 52      ( w klad s̃ md
+                                                                                                                 k,l,d
+                                                                                                                             kl ,                           ~38!
+particle rank. It does change the matrix elements, of course.
+The conclusion of the above is, however, that diagonalizing
+Ĝ t or Ĝ 2 over a subspace that contains all excitations ~irre-
+                                                                                                    u ie 5   ( w ilcd s̃ cdel ,
+                                                                                                             c,d,l
+                                                                                                                                                            ~39!
+spective of active or inactive labels! up to a certain excitation
+level will lead to identical results. It is easier to calculate Ĝ 2 ,
+and also subsequent manipulations are easier, and therefore
+                                                                                                    g ia 5w ia 1     (m d im u ma 1 (e u ie d ea ,          ~40!
+
+
+                                                              J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+6818                                         M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory
+
+
+ph elements
+                                                                                            u abe f 52      (l u l f s abel 2 (l u le s baf l 1 (   u bk f c s̃ ac
+                                                                                                                                                                ek
+    g ai 5w ai 50 ~ CCSD Eqs.!.                                               ~41!                                                              k,c
+
+
+Two-particle matrix elements:
+                                                                                                        2   (
+                                                                                                            k,c
+                                                                                                                            ek 1u akc f s ek ! ,
+                                                                                                                ~ u bkc f s ac            cb
+                                                                                                                                                                     ~54!
+hhhp elements
+
+    u mlid 5    (
+                j,b
+                                i j 2 v l jbd s i j ! ,
+                    ~ v jlbd s̃ mb              mb
+                                                                              ~42!          g abcd 5w abcd 1        (e ~ d ce u abed 1 d de u baec !
+    u kmid 52       (
+                    j,b
+                        v jkdb s mb
+                                 ji ,                                         ~43!                      1   (
+                                                                                                            e, f
+                                                                                                                 d ec d d f u abe f ,                                ~55!
+
+
+    u klie 5   (
+               a,b
+                   v klab s ab
+                            ie ,                                              ~44!
+                                                                                       ph ph elements
+
+                                                                                            u amci 52       (k w kc s ma
+                                                                                                                      ik 1 ( w alcd s̃ il 2 ( w aldc s il
+                                                                                                                                       md              md
+
+    g klid 5w klid 1      (m ~ d km u mlid 1 d lm u kmid ! 1 (e u klie d ed ,                                              l,d              l,d
+
+
+                                                                              ~45!                      1   (
+                                                                                                            k,l
+                                                                                                                w klci s ma
+                                                                                                                         lk ,                                        ~56!
+ph pp elements
+
+    u aled 5    (
+                j,b
+                                e j 2w jldb s e j ! ,
+                    ~ w jlbd s̃ ab            ab
+                                                                              ~46!          u akei 52       (k w kc s acei 1 (
+                                                                                                                             l,d
+                                                                                                                                           el 2 ( w lkid s el
+                                                                                                                                 w lkdi s̃ ad
+                                                                                                                                                l,d
+                                                                                                                                                           ad
+
+
+
+
+    u alce 52       (   w jlcb s ba
+                                 ej ,                                         ~47!                      1   (
+                                                                                                            c,d
+                                                                                                                w akcd s cd
+                                                                                                                         ei                                          ~57!
+                    j,b
+
+
+    u amcd 5     (
+                 i, j
+                      w i jcd s ma
+                                ji ,                                          ~48!          u amei 5    (c u mc s acei 2 (k u ke s ma
+                                                                                                                                   ik 1 ( u lmdi s̃ el
+                                                                                                                                        l,d
+                                                                                                                                                    ad
+
+
+
+
+    g alcd 5w alcd 1       (e ~ u alce d ed 1u aled d ec ! 1 (m d lm u amcd ,                           2   (
+                                                                                                            l,d
+                                                                                                                         el 1 ( u klei s lk ,
+                                                                                                                u lmid s ad
+                                                                                                                              k,l
+                                                                                                                                         ma
+                                                                                                                                                                     ~58!
+                                                                              ~49!
+hhhh elements                                                                               g akci 5w akci 1       (e d ce u akei 1 (m d mk u amci
+    u mli j 5   (b s mb
+                     i j w lb 1 ( w klc j s̃ ik
+                                             mc
+                                k,c                                                                     1   (
+                                                                                                            e,m
+                                                                                                                d ec d km u amei ,                                   ~59!
+
+                2   (
+                    k,c
+                                    ik 1w klic s k j ! ,
+                        ~ w kl jc s mc           mc
+                                                                              ~50!     phh p elements
+
+
+    u mni j 5   (b s mb
+                     i j u nb 1 ( s ji u mb 1 ( u knc j s̃ ik
+                                    nb                     mc                               u bm jc 52      (k w kc s mb
+                                                                                                                      k j 1 ( w klc j s kl 2 ( w kbcd s k j ,
+                                                                                                                            k,l
+                                                                                                                                        mb
+                                                                                                                                             k,d
+                                                                                                                                                        md
+
+                                b             k,c
+                                                                                                                                                                     ~60!
+                2   (                 ik 1u knic s k j ! ,
+                          ~ u kn jc s mc           mc
+                                                                              ~51!
+                    k,c
+                                                                                            u bk je 5   (d w kd s dbe j 1 (
+                                                                                                                          c,d
+                                                                                                                                       e j 2 ( w lk jd s el ,
+                                                                                                                              w bkdc s cd
+                                                                                                                                             l,d
+                                                                                                                                                         db
+                                                                                                                                                                     ~61!
+
+    g kli j 5w kli j 1    (m ~ d km u mli j 1 d lm u mk ji !
+                                                                                            u bm je 5   (d u md s dbe j 2 (k u ke s mb
+                                                                                                                                    k j 1 ( u kle j s kl
+                                                                                                                                          k,l
+                                                                                                                                                      mb
+
+
+               1   (   d km d ln u mni j ,                                    ~52!
+                                                                                                            (
+                   m,n
+                                                                                                        2      u lm jd s db
+                                                                                                                         el ,                                        ~62!
+                                                                                                            ld
+p p pp elements
+
+    u abed 52       (l w lb s abel 1 (
+                                     k,c
+                                         w bkdc s̃ ac
+                                                   ek                                       g bk jc 5w bk jc 1     (e u bk je d ce 1 (m d km u bm jc
+                2   (
+                    k,c
+                                   ek 1w akcd s ek ! ,
+                        ~ w bkcd s ac           cb
+                                                                              ~53!                      1   (
+                                                                                                            e,m
+                                                                                                                d km d ce u bm je .                                  ~63!
+
+
+                                                             J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+                                                      M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory                                                  6819
+
+
+    The following elements can be used to define the ampli-                                               TABLE I. Auger spectrum of the HF molecule.
+tude equations for Ŝ. These equations are equivalent to the                                                        State                    DIP       Excitation energy w.r.t. 3 S 2
+IP-EOM-CC and EA-EOM-CC equations, respectively.
+                                                                                                          Sym.          Char.        TDA      STEOM    TDA      STEOM         MRCIa
+hhph elements
+                                                                                                          3
+                                                                                                           S2           1 p 22       55.72     47.82    •••        •••           •••
+
+                                 (                          (c              (                                D          1 p 22
+                                                                                                              1
+                                                                                                                                     58.07     51.00    2.35       3.18          3.0
+    g jidm 5w jibm 1                              kl 2
+                                       w lbd j s̃ md                 t cb
+                                                                       ij           w klcd s̃ md
+                                                                                              kl           3
+                                                                                                             P        3 s 21 p 21    57.67     51.27    1.95       3.46          3.4
+                                 l,d                                        k,l,d
+                                                                                                          1 1
+                                                                                                           S            1 p 22       59.30     52.44    3.58       4.62          4.6
+                                                                                                           1
+                                                                                                             P       3 s 21 1 p 21   59.92     54.30    4.20       6.48          6.3
+                2        (            il 2 ( w kbid s k j 1 ( w kli j s kl
+                            w lb jd s md              md                mb                                1 1
+                                                                                                           S             3 s 22      63.33     59.08    7.71      11.26         11.2
+                         ld                kd               k,l                                            3
+                                                                                                             P       2 s 21 1 p 21   79.64     70.01   23.92      22.19         22.1
+                                                                                                          3 1
+                                                                                                           S         2 s 21 3 s 21   81.55     73.38   25.83      25.56         25.5
+
+                         (k w ki s mb
+                                   k j 2 ( w l j s il 1 ( w bd s i j
+                                                                                                             P       2 s 21 1 p 21
+                                                                                                           1
+                                                                                                                                     88.55     79.72   32.84      31.90         31.4
+                2                                  mb            md
+                                         l              d
+                                                                                                          a
+                                                                                                              From Ref. 68.
+
+                2        (n g mn s ndi j .                                                         ~64!
+                                                                                                          ourselves to the calculation of energies of the doubly ionized
+In terms of the transformed matrix elements of g, the ampli-                                              states but we note that in assignments of Auger spectra the
+tude equations ~which involve the transformation with Ŝ 1 !                                              intensities of the transitions play a crucial rôle and depend on
+read                                                                                                      the particular site where the core-ionization takes place. This
+
+
+                                                 S                                    D
+                                                                                                          provides very useful information and Tarantelli et al.64,65 in-
+    g mi 8 2   ( w k 8 i 8 s k 8 1 ( g mn 2 ( w k 8 n s k 8 s i 8 50,
+                             m                          m     n                                           troduced the concept of foreign imaging to explain these
+               k 8                 n        k                    8                                        phenomena. To illustrate the DIP-STEOM-CC method we
+                                                                                                   ~65!   consider the HF molecule. In the calculations we used a
+    g jidm 2    (                     m
+                           w jidk 8 s k 8 2   (                       m
+                                                        i j w k 8 n s k 8 50,
+                                                      s nd                                                TZ2P basis set66,67 and the HF internuclear distance is taken
+                                                                                                          to be 1.7329 a.u. To make the second transformation in
+                k    8                        n,k 8
+
+p php elements                                                                                            STEOM-CC we first calculate the ionization potentials cor-
+                                                                                                          responding to the 2s ~39.14 eV!, 3s ~19.82 eV!, and 1p
+                                                                                                          ~15.84 eV! states. In Table I we show the results of a DIP-
+    g ba je 5w ba je 1          (
+                                ld
+                                              el 2 ( t k j ( w klcd s̃ el
+                                   w lbd j s̃ ad
+                                                   k
+                                                       ab
+                                                           c,d,l
+                                                                       cd
+                                                                                                          TDA calculation using the bare Hamiltonian matrix elements
+                                                                                                          and STEOM-CCSD results using the doubly transformed
+                2    (
+                     ld
+                                  el 2 ( w alc j s el 1 ( w abcd s el
+                        w lb jd s ad
+                                       kd
+                                                   cb
+                                                        c,d
+                                                                   cd                                     Hamiltonian. It is seen that STEOM and TDA results differ
+                                                                                                          by 4–10 eV. In a recent paper68 the Auger spectrum of HF
+                                                                                                          was obtained at the MRCI level. The energies of the doubly
+                1    (c w ac s cbe j 1 (d w bd s ade j 2 (l w l j s abel                                  ionized states were given with respect to the core-hole, as
+                                                                                                          actually measured when taking the Auger spectrum. To make
+                                                                                                          the comparison we report the excitation energies w.r.t. to the
+                1    (f s abf j g f e .                                                            ~66!
+                                                                                                          3 2
+                                                                                                           S ground state of the doubly ionized states. Our results
+                                                                                                          compare nicely to the MRCI results. Let us note that the final
+Amplitude equations that are equivalent to the EA-EOM-CC                                                  diagonalization in STEOM is over the 2h configurations in
+equations                                                                                                 HF, and this leads to diagonalization problems of very small
+                                                                                                          dimensions of the order of 1–10 determinants, for example.
+    g a8e1     ( w a 8 c 8 s ce 8 2 ( ~ g f e 1w f b 8 s be 8 ! s af 8 50,                                     Another possible application of DIP-STEOM-CC is the
+                                                                                                          calculation of ionization spectra of doublet radicals. In this
+               c 8                  f
+                                                                                                   ~67!
+                                                                                                          case we start from the closed-shell anion. The ground state of
+    g ba je 1   ( w ba jc 8 s ce 8 2 ( s ab             c8
+                                          f j w f c 8 s e 50.
+                                                                                                          the radical corresponds to the first ionized state of the anion,
+                c    8               f ,c        8                                                        of course, and from the double ionization potentials of the
+Finally the pphh elements of Ĝ vanish due to satisfaction of                                             anion we can obtain the ionization potentials of the neutral
+the CCSD equations                                                                                        radical. Doubly ionized states with at least one vacancy in
+                                                                                                          the HOMO correspond to principal ionized states of the neu-
+    g aaii 5w aaii 50.                                                                             ~68!   tral, which can be either singlet or triplet states. As an ex-
+This concludes the list of transformed one- and two-particle                                              ample we consider the F atom, using again the TZ2P basis
+matrix elements of Ĝ.                                                                                    set. The 2s and 2 p orbitals were taken to be active. Results
+                                                                                                          are collected in Table II. The ionization potential of F2 ~or
+                                                                                                          electron affinity of F! is calculated to be 2.53 eV, compared
+III. EXAMPLES OF DOUBLE IONIZATION AND
+                                                                                                          to the experimental value of 3.40 eV. The electron affinity of
+DOUBLE ATTACHMENT CALCULATIONS
+                                                                                                          the F atom is notoriously difficult to calculate,69 but we do
+     Calculations of double ionization potentials are immedi-                                             not expect that this influences very much the calculation of
+ately useful to interpret Auger spectra.63 Currently we limit                                             the ionization potentials of the F atom. As seen from Table II
+
+                                                                     J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+6820                                        M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory
+
+TABLE II. Photo-electron spectrum of the fluorine atom.                           TABLE IV. Vibrational frequencies for ozone.
+
+                                                  DIP-STEOM                                                             Harmonic Vibrational frequencies
+                                                                                                            Geometry               (cm21)
+     Excitation                DIP-TDA           PT          CC         Expt.
+                                                                                       Method      Basis    re    Qe     v 1 (a 1 )   v 2 (a 1 )   v 3 (b 2 )
+      2    4 3
+    2s 2 p D                    23.41           17.62       17.55       17.4a
+    2s 2 2 p 4 1 D              25.57           20.64       20.58       20.0b         CCSDa
+                                                                                                  DZP   1.263 117.4        1256         748         1240
+    splitting                    2.16            3.02        3.03        2.6b         2R-MRCIb    DZP   1.261 116.5        1235         761         1338
+    2s 2 2 p 4 1 S              27.61           23.34       23.27       23.0b         2R-AQCCb    DZP   1.292 116.1        1070         694         1070
+    2s2p 5 3 P                  46.34           37.81       37.78       37.9b         CCSDTa      DZP   1.286 116.7        1141         705         1077
+    2s2p 5 1 P                  55.25           47.95       47.92       47.1b         DIP-STEOM   DZP   1.286 115.9        1108         718          932
+    splitting                    8.91           10.14       10.14        9.2b         CCSDTc    cc-PVTZ 1.274 116.8        1163         717         1117
+    s 2 2p 5 2 P ~EA!            4.19            2.46        2.53        3.40b        DIP-STEOM cc-PVTZ 1.274 116.0        1135         715         1013
+                                                                                      Expt.d            1.272 116.8        1135         716         1089
+a
+    Reference 74.
+b                                                                                 a
+    Extracted from data in Refs. 68 and 74.                                         Reference 41.
+                                                                                  b
+                                                                                    Reference 42.
+                                                                                  c
+                                                                                    Reference 75.
+                                                                                  d
+                                                                                    References 76 and 77.
+STEOM-PT and STEOM-CC results are found to be in ex-
+cellent agreement, while agreement with experiment appears
+better for the triplet states than the singlet states. The im-
+provement of DIP-STEOM over DIP-TDA results, which are                            ground state of the doubly charged cation contains signifi-
+consistently too high is significant. Let us emphasize here                       cant double excitation character. At the CCSD level we find
+that the ionized states of the F atom are described in the                        a coefficient of 20.156 for the 2s 2 →2 p 2 excitation while at
+current scheme using orbitals for the closed-shell F2 atom.                       the MBPT2 level this coefficient has the value 20.079. Re-
+This means that large relaxation effects will be present that                     latedly, the CCSD correlation energy is 20.08639 a.u. while
+have to be described by correlation. This in general is not a                     the second-order correlation energy is 20.053 74. This be-
+very efficient strategy. Taking into account the very small                       havior seems to be typical of doubly charged cations. The
+configuration space in the final diagonalization step we ex-                      empty valence orbitals are low in energy and quite compact.
+pect the results to be rather sensitive to the choice of refer-                   This leads to large correlation effects, and second-order per-
+ence state.                                                                       turbation theory is certainly not adequate to describe the dou-
+     Double electron attachment calculations can be used to                       bly charged cation, while CCSD seems questionable. On the
+conveniently calculate excitation spectra of open-shell mol-                      other hand in the low-lying excited states the p-orbitals will
+ecules like oxygen, or atomic excitation spectra of, for ex-                      be doubly occupied and the troublesome excitation is absent
+ample, carbon or silicon which have two electrons out of a                        from the neutral states. It seems, therefore, that our scheme
+closed shell structure. Adding two electrons to the Be con-                       introduces some artificial correlation in the treatment of the
+figuration of C 21 yields all low-lying excited states of car-                    excited states, making the problem harder than it needs to be.
+bon as illustrated in Table III. Let us emphasize that incor-                     In addition, as in the DIP scheme we use orbitals that are
+poration of both spin and spatial symmetry is trivial in this                     optimized for a state that differs by two electrons from the
+scheme starting from a closed-shell parent state. In the                          state we are interested in.
+STEOM calculations we used Sadlej’s POL1 basis set,70 and                              Both the DIP- and DEA-STEOM methods can be used
+the 2p, 3s, 3 p, 3d, 4s, and 4 p orbitals were selected as                        to obtain very economical descriptions of traditional multi-
+active orbitals. From Table III we find a significant differ-                     reference situations. In the DIP scheme the parent state is a
+ence between STEOM-CC and STEOM-PT results. The                                   closed-shell determinant, but the acutal states of interest con-
+                                                                                  tain two fewer electrons. This allows one to study cases that
+                                                                                  qualitatively require a linear combination of determinants in
+TABLE III. Carbon excitation spectrum.                                            which in addition to a closed-shell ‘‘core’’ one has two elec-
+                                Double attachment schemes                         tron in two spatial orbitals, or four electrons in three orbitals,
+                                                                                  etc. At first, the partially occupied orbitals are filled com-
+     Excitation         TDA         STEOM-PT            STEOM-CC         Expt.a   pletely, creating a di-anion~!! and the dynamical correlation
+    2p2 3P              0.0              0.0                0.0          0.0      contributions are evaluated. In the final step an effective
+    2 p 2 1D            1.35             1.35               1.34         1.26     Hamiltonian is diagonalized over the two-hole configurations
+    2 p 2 1S            2.81             3.36               2.77         2.68     with respect to the di-anion to obtain a qualitatively and
+    2 p3s 3 P 0         6.32             7.77               7.55         7.48
+                                                                                  quantitatively correct nondynamical correlated description of
+    2 p3s 1 P 0         6.45             7.92               7.70         7.68
+    2 p3p 1 P           7.57             8.60               8.40         8.54     the neutral system. The DEA method can similarly be used
+    2 p3 p 3 D          7.69             8.86               8.66         8.64     for cases that require distributing two-electrons on top of a
+    2 p3p 3 S           7.88             9.08               8.86         8.77     closed-shell, hence two electrons in two spatial orbitals, or
+    2 p3p 3 P           8.18             9.12               8.88         8.85     two electrons in three orbitals, etc. This in principle allows
+    2 p3 p 1 D          8.46             9.46               9.23         9.00
+                                                                                  the description of bi-radicals ~singlets and triplets in a bal-
+    2 p3p 1 S           8.88             9.86               9.55         9.17
+                                                                                  anced way! and a surprising number of chemical systems and
+a
+    Reference 74.                                                                 transition states.
+
+                                                        J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+                                 M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory                                               6821
+
+
+     In Table IV the results are presented of the calculation of            UF5GU;
+vibrational frequencies of ozone, a notorious and well stud-                                                                                            ~69!
+ied multireference problem.41,42 The CCSD calculation is                    QF P50→U ~ Q1 P ! F P5U PF P5GU P.
+based on the di-anion, a nonexistant species. This illustrates         The equations that determine the transformation U ~or X! are
+the mathematical nature of the procedure. The essence is that          equivalent to the so-called Bloch equation
+one can access all important configurations by deleting two
+orbitals from the di-anion determinant, and one can base the                UH effP5GU P;                   H eff5 PGU P.                               ~70!
+definition of ‘‘excitations’’ and normal ordering on any state,            In many-body language the transformation operator for
+physical or artificial.                                                                                                           ˆ (1,1)
+                                                                       the excitation energy sector can be defined as Û5 $ e S % ~to
+     The definition of the orbitals that define the di-anion
+                                                                       be precise X52 ^ Q u Ŝ (1,1) u P & , because there is a contraction
+determinant requires special attention since di-anion orbitals
+                                                                       over a hole line, see Sec. II!, where
+are too diffuse to be useful for the neutral. Here we used
+neutral Hartree–Fock orbitals, and defined the extra virtual
+orbital that defines the di-anion using a V̄ N21 potential.71
+                                                                            Ŝ ~ 1,1! 5   (   ( s am
+                                                                                          a,i e,m
+                                                                                                  ei $ â êm̂ ı̂ % .
+                                                                                                         †    †
+                                                                                                                                                        ~71!
+Results do not depend too critically on the precise scheme.
+     As seen from Table IV the DIP-STEOM frequencies and               The restriction in the summation excludes cases in which
+geometry compare very nicely to other highly correlated                both a and i are active. In this alternative Bloch-equation
+methods. The troublesome assymetric stretch frequency v 3              strategy to STEOM the total transformation for the excitation
+is very sensitive to the basis set and improvement of the              sector can therefore be represented as a sequence of similar-
+basis set leads to higher frequencies. All quoted methods will         ity transformations
+eventually overshoot, but the highly efficient DIP-STEOM                      ˆ       ˆ                      ˆ
+                                                                            e T $ e S ~ 0,1! 1Ŝ ~ 1,0! %$ e S ~ 1,1!%.                                 ~72!
+method is likely to be very close in the limit of a large basis
+set.                                                                   This presentation allows a direct comparison to FSCC. In
+     To summarize, relaxation effects will be important in             FSCC the so-called wave operator is represented, not as a
+DEA-STEOM and DIP-STEOM calculations, and it is prob-                  sequence of normal ordered exponentials, but as one single
+ably better to use a set of orbitals that is optimized in some         normal ordered operator
+way for the states of interest. DEA-STEOM in addition ap-                         ˆ                              ˆ        ˆ
+pears to include some artificial correlation effects. We think              $ e T 1Ŝ ~ 0,1! 1Ŝ ~ 1,1! % 5e T $ e S ~ 0,1! 1Ŝ ~ 1,0! 1Ŝ ~ 1,1! % ,   ~73!
+that both methods can be improved by optimizing the parent             and the amplitudes are determined from the Bloch equation
+state ~or closed-shell! cluster coefficients explicitly for the        as above, while eigenvalues are obtained by subsequent di-
+state of interest. The theory behind such an open-shell CC             agonalization of the effective Hamiltonian. If all orbitals are
+scheme has been outlined in a previous paper.36                        active results will be identical, since in both FSCC and
+                                                                       STEOM one simply diagonalizes the full effective Hamil-
+                                                                       tonian. Likewise, if the active space is large enough STEOM
+IV. THE RELATION BETWEEN STEOM-CC AND FSCC:
+THE RÔLE OF THE ACTIVE SPACE                                          and FSCC results will be virtually identical, since we might
+                                                                       as well diagonalize over the active part of the transformed
+     As shown in Sec. II the S-amplitudes in STEOM that                Hamiltonian. However, we note that in practice it may be
+define the second similarity transformation are identical to           difficult to solve the final Bloch equation in FSCC, since it
+the FSCC amplitudes for the EA ~or ~1,0! sector!, and the IP           requires a complete decoupling of the active and comple-
+@or ~0,1! sector#. Here we wish to establish the relation be-          mentary spaces. Some of the higher lying ~and noninterest-
+tween STEOM and FSCC for the subsequent calculation of                 ing! states may well be near-degenerate with states in the
+excitation energies, double ionization potentials or double            complementary space, leading to the so-called intruder state
+electron affinities, corresponding to the ~1,1!, ~0,2!, and ~2,0!      problem. In STEOM we do not proceed via the Bloch equa-
+sectors in Fock space, respectively. Let us focus on the ex-           tion but solve for the eigenvectors of interest directly. This is
+citation energy sector, to facilitate the discussion. In STEOM         numerically a more stable procedure. Let us note here that
+the procedure is straightforward. We simply diagonalize the            recently Meissner62 has shown that the intruder state problem
+transformed Hamiltonian Ĝ over the space of mono-excited              in FSCC can be avoided by reformulating the final step as a
+states ~or 1h1 p configurations!. To make the connection               similarity transformation in Hilbert space, and using the for-
+with FSCC we view this diagonalization process in two                  malism of intermediate Hamiltonians. STEOM and FSCC
+steps.72 We partition the diagonalization space into an active         can also be compared for higher sectors in Fock space. In
+space ~determined by all excitations among active orbitals             this case these methods differ more significantly, and the
+only!, denoted P, and the orthogonal complement within the             STEOM procedure using a sequence of similarity transforms
+restricted diagonalization space Q. Define a transformation            can be expected to converge more quickly.11
+matrix U5e X 511X, where X5QX P. This defines a once                        From the above discussion it is clear that FSCC and
+more transformed Hamiltonian, F5U 21 GU say, and we re-                STEOM are very closely related methods, but we wish to
+quire the QF P components to vanish, such that eigenvalues             emphasize that they are conceptually different. In the deriva-
+can be extracted by diagonalizing PF P5H eff . Hence we                tion of FSCC, one imposes the so-called subsystem embed-
+have                                                                   ding conditions. Hence to calculate an excited state, one has
+
+                                          J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+6822                                 M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory
+
+TABLE V. Excitation spectrum of s-tetrazine: Comparison between FSCC       than the triplet states ~average deviation 0.09 eV!, and this is
+and STEOM-CC.
+                                                                           roughly reflected by the magnitude of the active component,
+    State           FSCCa   STEOM-CC        % active        Expt.a         which tends to be less in the triplet states. However, we note
+    1
+                                                                           there is no clear correlation between the magnitude of the
+      B 3u          2.28      2.35           98.9%        2.25
+    1                                                                      active component and the deviation of the FSCC and
+      Au            3.44      3.48           99.1%
+    1
+      B 1g          4.98      5.02           96.0%                         STEOM-CC results.
+    1
+      B 2u          5.25      5.22           98.3%        4.43–5.40             To investigate further the rôle of the active orbitals in
+    1
+      B 2g          5.77      5.83           97.2%        3.88/4.06        STEOM we consider the CO molecule using Sadlej’s POL1
+    1
+      Au            5.83      5.90           97.9%                         basis set70 at an internuclear distance of 1.1282 Å. The
+    3
+      B 3u          1.48      1.62           97.3%        1.69
+    3
+      Au            3.14      3.22           97.9%                         choice of active occupied orbitals is usually pretty clear from
+    3
+      B 1u          3.97      4.02           92.6%                         the excitations under consideration. For CO the 5s orbital ~at
+    3
+      B 1g          3.99      4.10           91.5%                         14.00 eV! and the 1p orbitals ~at 16.84 eV! are obviously
+    3
+    3
+      B 2u          4.88      4.89           99.6%                         needed in the active space. However, also the 4s orbital ~at
+      B 2g          5.01      5.13           95.1%
+    3                                                                      19.63 eV! plays a part in the dynamical correlation for in
+      Au            5.30      5.41           96.4%
+                                                                           particular the excited states of P symmetry. The numbers in
+a
+    Reference 43.                                                          parentheses are ionization potentials at the IP-EOM-CC
+                                                                           level. The choice of active virtual orbitals is less clear cut.
+                                                                           Canonical Hartree–Fock orbitals make excellent approxima-
+to solve for the ground state and several ionized and attached             tions for electron-attached states, but they are often too dif-
+states to determine all the amplitudes. This procedure is                  fuse for a compact description of excited states. This means
+more or less imposed in order to have the same number of                   that in terms of canonical Hartree–Fock orbitals often many
+equations and parameters. However, the physics or the idea                 determinants are required to describe excited states, and con-
+behind this approach has never been very clear in our opin-                sequently a large active space is needed in the STEOM cal-
+ion. In STEOM, second quantized matrix elements of the                     culation. This can be seen in Table VI, where we gradually
+transformed Hamiltonian are equated to zero, and this very                 increase the active space from 0 to 1 to 2 to 3 virtual orbitals
+clearly reduces the coupling between determinants of differ-               of both s and p symmetry. In the final, almost saturated,
+ent excitation level, and allows one to diagonalize over small             calculation the active space consists of six orbitals of s sym-
+subspaces. The idea behind STEOM is transparent and goes                   metry, four pairs of orbitals of p symmetry and one pair of
+back to papers on Fock space coupled cluster theory by Sto-                orbitals of d symmetry. The effect of correlation and choice
+larzcyk and Monkhorst.21–24                                                of active space on valence excitations, in general, is larger
+     As mentioned above the active space plays a rôle in the              than on Rydberg excited states. In addition, excitations into
+comparison of FSCC and STEOM–CC. In general, the mag-                      the valence p * orbitals only slowly saturate with increase of
+nitude of the active component in the final STEOM excited
+                                                                           the active space. It seems that an active component of over
+states is a good measure for the quality of the active space. In
+                                                                           95% is required in order to be converged within 0.05–0.1
+most calculations we would like an active component of over
+                                                                           eV, in particular for valence excited states.
+98%. This indicates that enlargement of the active space is
+                                                                                An alternative to increasing the active space is a rotation
+not significantly going to change the result. Let us emphasize
+                                                                           of the virtual orbitals, such that they provide a more compact
+that the transformations in STEOM account primarily for
+                                                                           description of excited states. In the last two columns of Table
+dynamical correlation. If the active component drops below
+threshold it means, therefore, that dynamical correlation is               VI we use so-called V̄ N21 virtual orbitals.71 They are defined
+missing. The rôle of the active space in STEOM is different               by diagonalizing the virtual–virtual block of a Fock-matrix
+than in CASPT2 or MCSCF calculations where one often is                    corresponding to the Hartree–Fock density matrix scaled by
+satisfied with an active character that is constant over the               a factor (N el21)/N el . 71 This generates a more attractive po-
+states of interest, but which can be as low as 70% or even                 tential and less diffuse virtual orbitals. The details of this
+50%.                                                                       potential do not seem very important, and we made the
+     To draw a numerical comparison between the STEOM                      above simple choice because the new Fock matrix automati-
+and FSCC methods we consider the s-tetrazine molecule at                   cally has the same symmetry as the old one. Let us note that
+the same geometry and using the same DZP basis set as in                   this definition of the virtual orbitals does not influence the
+the earlier FSCC study.43 The active space, consisting of the              CCSD, IP-EOM-CC, and EA-EOM-CC calculations, as long
+six highest occupied and two lowest virtual orbitals, is also              as the same final states are considered. The precise definition
+chosen to be identical. The ionization spectrum and electron               of the virtuals determines which transformed two-electron
+affinities of s-tetrazine is reproduced exactly in the current             elements g abe j are transformed to zero, and hence it deter-
+STEOM-CC calculation, as should be the case. In Table V                    mines part of the remaining coupling to the doubly excited
+we show the low-lying singlet and triplet states. The average              configurations, which is not included in STEOM. The other
+deviation between the two methods over 14 states is 0.07 eV.               part stems from three-particle interactions in the transformed
+The STEOM-CC results fairly consistently fall a little above               Hamiltonian which are neglected. Operationally the choice
+the FSCC results ~the 1 B 2u state is the sole exception!. The             of orbitals only influences the normalization condition in the
+singlet states agree a little better ~average deviation 0.04 eV!           determination of Ŝ ~see Sec. II!. From Table VI we find that
+
+                                              J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+                                                   M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory                                                                6823
+
+TABLE VI. Excitation energies ~eV! for CO: Comparison of active spaces.
+
+                                                                                                                   Active space
+                                                                a                  b            c
+      State                       Exc.                      0                      1           2                       3d                   Finale                   1f                     2g
+
+    A 1 P(V)                    5 s →2 p                  9.78                  9.33           8.82                  8.61                    8.59                  8.56                   8.64
+    % active                                               0%                   63%            92%                  98.7%                   99.1%                 93.1%                  95.0%
+    I 1 S 2 (V)                 1 p →2 p                 11.43                 11.04          10.33                 10.08                   10.06                  9.87                  10.08
+    % active                                               0%                   47%            86%                  98.7%                   99.1%                 97.8%                  98.2%
+    D 1 D(V)                    1 p →2 p                 11.57                 11.19          10.47                 10.24                   10.21                 10.00                  10.22
+    % active                                               0%                   48%            87%                  98.8%                   99.2%                 97.3%                  97.7%
+    B 1 S 1 (R)                 5 s →6 s                 11.41                 11.20          11.10                 11.08                   11.06                 11.01                  11.06
+    % active                                               0%                   89%            94%                  97.2%                   99.6%                 83.3%                  97.3%
+    C 1 S 1 (R)                 5 s →7 s                 11.79                 11.77          11.61                 11.62                   11.56                 11.71                  11.60
+    % active                                               0%                    1%            94%                  97.4%                   99.9%                 21.4%                  94.5%
+    E 1 P(R)                    5 s →3 p                 12.11                 12.19          11.88                 11.87                   11.81                 11.99                  11.85
+    % active                                               0%                   55%            94%                  95.6%                   99.2%                  2.6%                  96.6%
+    a 3 P(V)                    5 s →2 p                  7.32                  7.06           6.57                  6.37                    6.36                  6.34                   6.41
+    % active                                               0%                   35%            86%                  97.5%                   98.1%                 96.4%                  96.4%
+    a 8 3 S 1 (V)               1 p →2 p                  9.52                  9.23           8.68                  8.42                    8.43                  8.27                   8.44
+    % active                                               0%                   35%            78%                  97.0%                   97.6%                 98.3%                  98.9%
+    d 3 D(V)                    1 p →2 p                 10.50                 10.18           9.58                  9.34                    9.33                  9.18                   9.35
+    % active                                               0%                   40%            82%                  97.7%                   98.4%                 98.1%                  98.4%
+    e 3 S 2 (V)                 1 p →2 p                 11.23                 10.86          10.22                  9.97                    9.96                  9.80                   9.98
+    % active                                               0%                   45%            85%                  98.6%                   99.0%                 97.8%                  98.4%
+a
+  0: No active virtual space.
+b
+  1a: Active virtual space: 6s, 2p ; Canonical HF orbitals.
+c
+  2a: Active virtual space: 6 to 7s, 2 to 3p ; Canonical HF orbitals.
+d
+  3a: Active virtual space: 6–8s, 2–4p ; Canonical HF orbitals.
+e
+  Final a: Active virtual space: 6–11s, 2–5p, 1d ; Canonical HF orbitals.
+f
+  1b: Active virtual space: 6s, 2p; V̄ N21 orbitals.
+g
+  2b: Active virtual space: 6 to 7s, 2 to 3p ; V̄ N21 orbitals.
+
+
+the active component using V̄ N21 virtual orbitals is increased                                     If we substitute this parameterization into the Schrödinger
+appreciably for small active spaces. With two active virtual                                        equation, multiply by e 2T̂ and project on the space of singly
+orbitals of s and p symmetry @column 2~b!# the valence                                              and doubly excited determinants we find
+excited states are close to convergence, and this is reflected
+by the active space component, which is well over 95%.
+                                                                                                          (   ^ F K u HC $ e S % u F ai & r ai ~ l ! 5 ( ^ F K u $ e S % u F ai & r ai ~ l ! E l .
+                                                                                                                               ˆ                                          ˆ
+Interestingly, the excitation energies in column 1~b! usually                                             i,a                                          i,a
+lie below the converged energies. This is a little peculiar                                                                                                                                 ~75!
+because it implies that the total energy of the excited state is
+lower for the less accurate scheme ~the ground state is unaf-                                       Due to the satisfaction of the CCSD equations r 0 does not
+fected!. Evidently STEOM does not adhere even approxi-                                              enter these equations. Expanding the normal ordered expo-
+mately to a variational principle. In addition the active space                                     nential
+component in column 1~b! is usually only slightly smaller
+than in column 2~b!, while the difference in excitation en-
+ergy can be as large as 0.2 eV. Whereas the behavior using                                          (
+                                                                                                    i,a
+                                                                                                        ^ F K u HC ~ 11S ! u F ai & r ai ~ l !
+Hartree–Fock orbitals is very smooth, but rather slowly con-
+vergent, the behavior using V̄ N21 appears more erratic, and
+the active space component appears not to be a good mea-                                                  1   (
+                                                                                                              i,a
+                                                                                                                  ^ F K u HC $ Ŝ 2 % u F ai & r ai ~ l !
+                                                                                                                                   1
+                                                                                                                                   2
+sure for convergence. Evidently, more work needs to be done
+to select the active space in STEOM. For now we recom-
+mend using Hartree–Fock orbitals and the active-space diag-
+nostic.
+                                                                                                          5   (
+                                                                                                              i,a
+                                                                                                                  ^ F K u 11Ŝ u F ai & r ai ~ l ! E l .                                    ~76!
+
+
+V. THE RELATION BETWEEN STEOM-CC AND EOM-                                                           If we define
+CC: THE RÔLE OF IMPLICIT TRIPLE
+EXCITATIONS
+         The final wave function in STEOM can be written
+                                                                                                          (
+                                                                                                          i,a
+                                                                                                              ^ F cd
+                                                                                                                  kl u Ŝ u F i & r i ~ l ! 5r kl ~ l ! ,
+                                                                                                                              a a              cd
+                                                                                                                                                                                            ~77!
+
+
+                    (
+                            ˆ     ˆ                         ˆ                                       and introduce a short-hand notation r L (l) for the combined
+        u C l& 5        e T $ e S % u F ai & r ai ~ l ! 1e T u F 0 & r 0 ~ l ! .       ~74!
+                    i,a                                                                             expansion coefficients the equation reads
+
+                                                                    J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+6824                                         M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory
+
+                          TABLE VII. Behavior of charge transfer excitation in Be•••C2 with increasing interunit distance.
+
+                                                                                      EE-~IP1EA! ~in eV!
+                              R ~A!           2e 2 /R ~eV!               CIS            STEOM-CCSD                    EOM-CCSD              D
+
+                                 5.0          22.880                22.868                   22.931                     22.937            20.006
+                                 8.0          21.800                21.793                   21.797                     21.736             0.061
+                                10.0          21.440                21.436                   21.438                     21.375             0.063
+                               100.0          20.144 0              20.144 0                 20.144 0                   20.0799            0.064
+                             1 000.0          20.01 440             20.014 40                20.014 40                   0.0496            0.064
+                            10 000.0          20.001 440            20.001 440               20.001 440                  0.0626            0.064
+
+
+
+
+                                                                                         zero. Excitations into x 0 then correspond to ionizations, and
+(L ^ F Ku HC u F L & r L~ l ! 1 (
+                                i,a
+                                    ^ F K u HC $ Ŝ 2 % u F ai & r ai ~ l !
+                                                     1
+                                                     2                                   separate off from the eigenvalue problem. Similarly, to cal-
+                                                                                         culate EA’s using an excitation energy code one adds one
+      5r K ~ l ! E l .                                                         ~78!      occupied MO that is identically zero. Excitations from this
+                                                                                         MO into the virtual space amount to electron attachment. It
+If we now assume that the coefficients r L (l) are independent
+                                                                                         is clear that this scheme can be used for most excitation
+parameters, to be determined, this equation is equivalent to
+                                                                                         energy methods. In case of the EE-EOM-CC method the
+the EE-EOM-CCSD equations except for a triples correction
+                                                                                         above trick yields precisely the IP-EOM-CC and EA-
+given by the second term. This triples correction leads to a
+                                                                                         EOM-CC results. EE-EOM-CCSD or CCSDLR ~linear re-
+modification ~or dressing! of the EOM-CCSD matrix-
+                                                                                         sponse! theory does not satisfy charge transfer separability
+elements and was proposed by Meissner and Bartlett.44,45
+                                                                                         however, due to the absence of triples. The dressing pro-
+STEOM and EOM can both be related to the above dressed
+                                                                                         posed by Meissner and Bartlett44,45 restores charge transfer
+EOM equation. In EOM-CCSD the triple correction is ab-
+                                                                                         separability. The dressed EOM method reduces to the
+sent, in STEOM the doubles part of the eigenvector is ob-
+                                                                                         STEOM method for the charge transfer excitations in the
+tained from Eq. ~77!, where Ŝ is obtained from the IP-EOM
+                                                                                         case of large separation and STEOM is charge transfer sepa-
+and EA-EOM equations, and the eigenvalue problem is re-
+                                                                                         rable. Interestingly CIS is also charge transfer separable. The
+stricted to the space of single excitations.
+                                                                                         relevant IP’s and EA’s in this case are the Koopmans’ val-
+     The relevance of the triple excitations becomes most evi-
+                                                                                         ues, obtained by diagonalizing the Fock-matrix.
+dent if one considers a model charge transfer excitation be-
+                                                                                              Let us consider an example of a charge transfer excita-
+tween two separated fragments. In the limit that the frag-
+                                                                                         tion for which the effect of triples can be expected to be
+ments are at infinite separation the excitation energy reduces
+                                                                                         important. We consider the Be•••C2 system in C 2 v symmetry
+to the sum of the ionization potential (IP5E N21 2E N ) on
+                                                                                         where the C2 unit is placed perpendicular to the axis connect-
+one subsystem and the electron affinity (EA5E N11 2E N ) at
+                                                                                         ing Be and the midpoint X of C2. The C2 internuclear dis-
+the other. The wave function becomes the ~antisymmetrized!
+                                                                                         tance is kept fixed at 1.268 Å and we use a VDZP basis73 on
+product of the fragment wave functions. If the ionized state
+                                                                                         both C and Be. The ionization potential of Be is calculated as
+is described by 1h and 2h1p determinants and the attached
+                                                                                         9.279 413 97 eV at the IP-EOM-CC level, while the electron
+state is described by 1 p and 2p1h determinants it follows
+                                                                                         affinity of C2 is 22.752 260 97 eV at the EA-EOM-CC
+that the analogous description of the charge transfer excited
+                                                                                         level. In Table VII we present the results from STEOM-
+state requires up to 3h3p or triple excitations. We will refer
+                                                                                         CCSD and EE-EOM-CCSD calculations for a variety of dis-
+to the above property as charge transfer separability. This
+                                                                                         tances R5BeX. The quantity of interest is the difference
+property is assured by the fully linked nature of the diagrams
+representing the excitation energy. Operationally it requires
+that excited states, ionized states and electron attached states
+                                                                                         TABLE VIII. Excitation energies ~eV! for CO.
+are all calculated by precisely the same method. The charge
+transfer excitation energy should satisfy                                                                                         STEOM
+                               2
+                             e                                                                 State           Exc.       PT       CC      CC no T   EOMCC   Expt.a
+      EE5IP1EA2                ,                                               ~79!
+                             R                                                               A 1 P(V)        5 s →2 p     8.55     8.59      8.71     8.76    8.51
+for large separation R. The correction term accounts for the                                 I 1 S 2 (V)     1 p →2 p     9.91    10.06     10.24    10.19    9.88
+                                                                                             D 1 D(V)        1 p →2 p    10.05    10.21     10.34    10.31   10.23
+long range Coulombic interaction between two charged frag-
+                                                                                             B 1 S 1 (R)     5 s →6 s    11.01    11.06     11.13    11.16   10.78
+ments. In practice it may seem difficult to calculate all rel-                               C 1 S 1 (R)     5 s →7 s    11.55    11.56     11.58    11.64   11.40
+evant quantities at precisely the same level of approximation.                               E 1 P(R)        5 s →3 p    11.78    11.81     11.82    11.84   11.53
+However for methods based on second quantization, IP’s and                                   a 3 P(V)        5 s →2 p     6.27     6.36      6.55     6.41    6.32
+EA’s can be calculated using a program to calculate excita-                                  a 8 3 S 1 (V)   1 p →2 p     8.45     8.43      8.61     8.47    8.51
+                                                                                             d 3 D(V)        1 p →2 p     9.25     9.33      9.52     9.46    9.36
+tion energies. To calculate IP’s using the EE code, one adds
+                                                                                             e 3 S 2 (V)     1 p →2 p     9.84     9.96     10.09             9.88
+one ‘‘virtual molecular orbital’’ x 0 , which is identically
+                                                                                         a
+zero. So all transformed integrals involving this orbital are                                As reported in Ref. 7.
+
+                                                          J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+                                    M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory                         6825
+
+                   TABLE IX. Excitation energies ~in eV! for H2O. Comparison with full CI.
+
+                                                                                        STEOM
+                                                             EOM-
+                       State                       EOM      CCSDT-                                     CCSD no
+                       Sym.         Char.          CCSD        3        CC3a       PT        CCSD         T      FCIa
+
+                       2 1A 1    2a 1 →3a 1        9.806      9.855      9.855     9.645      9.772      9.821    9.874
+                       1 1B 1    1b 1 →3a 1        7.375      7.426      7.427     7.243      7.343      7.391    7.447
+                       1 1B 2    2a 1 →2b 2       11.525     11.587     11.591    11.400     11.520     11.546   11.612
+                       1 1A 2    1b 1 →2b 2        9.122      9.185      9.187     9.036      9.132      9.164    9.211
+                                Average error      0.081      0.023      0.021     0.179      0.097      0.056
+                   a
+                    From Ref. 51.
+
+
+
+between the excitation energy and the sum of the IP and the               triples is of the same order of magnitude as the replacement
+EA. It is seen that the STEOM-CCSD result attains the lim-                of CCSD coefficients with their first-order analogs. For
+iting 21/R behavior very quickly. The same is true for                    Rydberg states the effect of triples is much less, and this can
+EOM-CCSD, except that the asymptotic EOM-CCSD exci-                       be attributed to the fact that the EA-EOM-CC amplitudes for
+tation energy lies about 0.064 eV above the                               the corresponding attached orbitals have very little 2 p1h
+STEOM-CCSD5IP1EA limit. This is the charge transfer                       character. This immediately reduces the effect of triple exci-
+separability error of EOM-CCSD in this particular case. We                tations for Rydberg states.
+also included the CIS results, which show similar behavior                     Above we addressed the rôle of implicit triple excita-
+as STEOM-CC.                                                              tions in STEOM-CC and this appears to be a nice feature that
+     In order to obtain a further estimate on the effect of               is important for the description of, in particular, valence ex-
+implicit triple excitations in STEOM for ‘‘normal’’ excita-               cited states.33,48 Let us note that in comparison to EOM-CC
+tions we can discard the relevant terms ~quadratic in Ŝ! from            or dressed EOM-CC other important effects are not consid-
+the matrix elements of Ĝ. We label these results ‘‘STEOM-                ered in STEOM-CC. As mentioned before we neglect the
+CC-no-T’’. One would expect the results from this approxi-                three-body terms in the transformed Hamiltonian Ĝ that is
+mate STEOM treatment to be closer to EOM-CC results than                  responsible for a remaining coupling between the singly ex-
+STEOM results themselves. ~Let us note that discarding the                cited determinants and double excitations. In the EOM-
+triples does not have an effect on charge transfer separability,          picture this means that certain interactions in the doubles-
+because in STEOM-CC-no-T we are still diagonalizing a                     doubles block that ‘‘couple the hole and particle’’ are absent.
+connected Hamiltonian Ĝ over the space of single excita-                 In STEOM one might say the hole is correlated separately,
+tions. Only the one-particle operators in Ĝ contribute to the            and the particle is correlated separately. Interactions between
+asymptotic limit, and these are not affected by the approxi-              the two are absent in the doubles–doubles block of the ma-
+mation.!                                                                  trix. Full coupling is present in the other blocks. This will of
+     As an example we consider again the CO molecule using                course have an effect on the accuracy of STEOM-CC results.
+Sadlej’s polarized basis set70 at an internuclear distance of             An estimate of the importance of full particle-hole coupling
+1.1282 Å. In Table VIII we compare STEOM-CC, STEOM-                       can be obtained from results from the dressed EOM scheme
+CC-no-T, and EOM-CC results. It is seen that for the valence              as proposed by Meissner and Bartlett, but is not considered
+excited states the inclusion of triples reduces the excitation            here.
+energy by 0.1 to 0.2 eV. For the singlet states the STEOM-                     It is interesting to compare the relative accuracy of the
+CC-no-T results are consistently closer to EOM-CC, and we                 EOM-CC and STEOM-CC methods. At first glance EOM-
+think this very clearly shows the effect of implicit triples in           CCSD appears to be the more complete treatment, but the
+the STEOM-CC method. For comparison we have also in-                      implicit inclusion of triples favors the STEOM approach. In
+cluded STEOM-PT results, and it is seen that the effect of                order to eliminate basis set effects, experimental uncertain-
+
+
+                   TABLE X. Excitation energies ~in eV! for N2. Comparison with full CI.
+
+                                                                                        STEOM
+                                                             EOM-
+                       State                      EOM       CCSDT-                                     CCSD no
+                       Sym.         Char.         CCSD         3        CC3a       PT        CCSD         T      FCIa
+                       1
+                         Pg      3 s g →1 p g      9.665      9.624     9.618     9.544       9.446      9.596    9.584
+                       1
+                         S2
+                          u      1 p u →1 p g     10.465     10.345    10.336    10.373      10.368     10.581   10.329
+                       1
+                         Du      1 p u →1 p g     10.898     10.752    10.727    10.839      10.833     11.008   10.718
+                       1
+                         Pu      2 s u →1 p g     14.009     13.826    13.786    14.026      13.981     14.083   13.608
+                                Average error      0.200      0.077     0.057     0.156       0.166      0.232
+                   a
+                    From Ref. 51.
+
+                                                J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+6826                             M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory
+
+
+ties and the issue of nuclear vibrations it is best to compare         agree a little better with experiment. For Rydberg states the
+with full CI calculations. We consider the H2O, N2, and C2             STEOM-CCSD and EOM-CCSD methods are usually very
+molecules for which full CI results for the excited states have        close and triple excitation effects are less important. These
+recently been reported.51 In this paper Christiansen et al.51          conclusions are in agreement with work that has been done
+compared the CC3 method that includes a triple correction to           to include triple excitation effects in EOM-CC and CCLR
+CCLR ~or EOM-CCSD! excitation energies to FCI results                  methods, e.g., EOM-CCSD (T̃) studies49 and CC3.50,51
+and these provide very useful benchmark results for our
+present purpose. Here we include EOM-CCSDT-349 results
+as well. Of course, precisely the same geometry and basis set
+                                                                       VI. THE CALCULATION OF PROPERTIES AND
+is used and results for the excitation energies are reported in        TRANSITION MOMENTS IN STEOM
+Tables IX–XI. The excited states for the water molecule are
+all Rydberg like, and as before there is relatively little dif-             The transformed Hamiltonian in STEOM is nonsymmet-
+ference between EOM-CCSD and STEOM-CC while also                       ric, as in EOM-CC, and therefore properties and transition
+the effect of triples is moderate ~compare CC3 or EOM-                 moments require both the left- and right-hand
+CCSDT-3 results and STEOM-CC-no-T!. Replacing the                      eigenstates6,55,56 Alternatively properties may be calculated
+CCSD coefficients with their first-order MBPT analogs tends            as energy derivatives. The latter is more complicated com-
+to lower the excitation energy by ;0.1 eV.                             putationally, however, and demanding, if a large set of ex-
+     The excited states in N2 are all valence like and conse-          cited states is considered. Here we will limit ourselves to a
+quently inclusion of triples lowers the STEOM excitation               biorthogonal expectation value approach. Due to the ~ap-
+energies considerably. This is also true for CC3 or EOM-               proximate! blockform of Ĝ the right-hand eigenstates and
+CCSDT-3 compared to EOM-CCSD. The description of the                   energies can be extracted easily. However, this is not true for
+ground state has only a minor effect on the excitation ener-           the left-hand eigenstates. These states can be obtained ap-
+gies. The 1 P u state of N2 has substantial double excitation          proximately as follows. If we neglect three-body operators in
+character51 and is not very well described by either method.           Ĝ, the matrix representation of Ĝ over the space containing
+Even CC3 has an error of 0.18 eV. A little surprisingly,               the reference determinant and single and double excitations
+STEOM-CC and EOM-CC are in close agreement, implying                   takes the block form
+some kind of cancellation between the extra terms included
+in EOM-CCSD and the missing triples correction.
+     The ground state of the C2 molecule suffers from near
+                                                                            G5   S D
+                                                                                  A B
+                                                                                  0 D
+                                                                                          .                                      ~80!
+
+degeneracy problems and is difficult to describe. Neverthe-            The partitioning is assumed to be into a primary space
+less excitation energies for both EOM-CCSD and STEOM-                  (5reference determinant plus single excitations! and a sec-
+CCSD are in fair agreement with the full CI results.                   ondary space that consists of doubly excited determinants. It
+STEOM-PT fails completely due to its erroneous description             is easily seen that the right-hand vectors corresponding to the
+of the ground state. Again triple excitation effects are con-          primary space can be obtained as the right hand vectors of A
+siderable. Let us note that in Ref. 51 in addition two doubly          ~this is the reason to do the transformation!. The left-hand
+excited states are described which cannot be obtained in               eigenvectors satisfy
+STEOM which is restricted to predominantly singly excited                   l1A5El1,
+states. Triple excitation EOM-methods were developed ini-                                                                         ~81!
+tially to describe precisely such doubly excited states,46 and              l1B1l2D5El2→l25 ~ E2D! 21 ~ l1B! .
+provide dramatically improved results.                                 We make the additional approximation that the doubles–
+     The overall error in comparison to the full CI results is         doubles block is diagonal, where the diagonal consists of
+0.14 eV for EOM-CCSD, 0.19 eV for STEOM-PT, 0.12 eV                    Hartree–Fock orbital energies, as in second-order perturba-
+for STEOM-CC, and 0.40 eV for STEOM-CC-no-T. Inclu-                    tion theory. In this way we obtain an approximation for the
+sion of triples on top of EOM-CCSD as in the EOM-                      left hand STEOM states. Explicitly the left-hand doubles co-
+CCSDT-3 method reduces the average error substantially to              efficients for state l are given by
+0.049 eV, while the average error for CC3 is 0.043 eV. From
+these comparisons a coherent picture emerges. The implicit
+triple correction in STEOM-CC is quite important for va-
+                                                                              i j ~ l !5
+                                                                            l ab
+                                                                                         11 P ~ a,i↔b, j !
+                                                                                         e i1 e j2 e a2 e b c
+                                                                                                                S(
+                                                                                                              l ci ~ l ! g c jab
+
+lence excited states. Compared to our model STEOM-CC-
+no-T approach excitation energies are often lowered by 0.1–
+0.2 eV. Relatedly, for valence states EOM-CCSD excitation
+                                                                                      2                                        D
+                                                                                          (k l ak ~ l ! g i jkb 1l ai ~ l ! g jb .   ~82!
+
+energies are often a little higher than STEOM-CCSD ener-               Let us mention here that due to the last term in Eq. ~82! the
+gies. In fact they are often quite close to the STEOM-CC-              left-hand STEOM vectors are not explicitly connected. As a
+no-T results which tend to lie a little higher still. Compared         consequence STEOM properties calculated as biorthogonal
+to experiment, excitation energies in EOM-CCSD ~and even               expectation values are not fully connected either.
+full CI! are often a little high, and this is partly due to basis           The matrix A has a further blockform A5( 00 bd). The
+sets that are usually optimized for the ground state. STEOM-           single excitation component of the left-hand excited-state
+CCSD excitation energies for valence states therefore tend to          eigenvectors therefore can be written as
+
+                                          J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+                                                          M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory                                                              6827
+
+                               TABLE XI. Excitation energies ~in eV! for C2. Comparison with full CI.
+
+                                                                                                                         STEOM
+                                                                                      EOM-
+                                   State                                EOM          CCSDT-                                                       CCSD no
+                                   Sym.                Char.            CCSD            3          CC3a             PT            CCSD               T                   FCIa
+                                   1
+                                       Pu            1 p u →3 s g       1.474          1.338       1.316           1.079            1.422            1.596              1.385
+                                   1
+                                       S1
+                                        u            2 s u →3 s g       5.799          5.650       5.555           5.312            5.726            5.817              5.602
+                                                    Average error       0.143           .048       0.058           0.298            0.081            0.213
+                               a
+                                From Ref. 51.
+
+
+
+
+     ~ 0 l1!   S D 0
+                   0
+                        b
+                        d
+                              5 ~ 0 l1d! 5 ~ 0 El1! ,                                       ~83!
+                                                                                                               ˆ                     ˆ
+                                                                                                           $ e S 2 % Q̂5OC $ e S 2 % ,
+
+                                                                                                              C $ e Sˆ 2 % 2Ŝ Q̂2•••5O
+                                                                                                           Q̂5O                       C 1O
+                                                                                                                                         C Ŝ 1O
+                                                                                                                                               C $ 1 Ŝ 2 % 1•••
+and contain no component along the reference determinant.                                                                     2              2     2    2
+The left-hand STEOM ground state is obtained from                                                                                                                 C 1O
+                                                                                                                                                                     C Ŝ ! 2••• .
+                                                                                                                                                          2Ŝ 2 ~ O      2                      ~90!
+
+     ~ 1,l1!   S D 0
+                   0
+                        b
+                        d
+                              5 ~ 0,b1l1d! 5 ~ 0,0! →l152bd21,                              ~84!
+                                                                                                    Here we restricted ourselves explicitly to those contributions
+                                                                                                    to Q̂ that enter the matrix element ^ L u Q̂ u R & . Let us note that
+                                                                                                    although Q̂ as expressed above is not explicitly a connected
+while the doubles component of the left-hand ground state is                                        operator, all disconnected contributions cancel precisely. If
+given by Eq. ~82! in addition to the standard first-order con-                                      we write
+tribution
+                                                                                                           ^ L̃ u 5 ^ L u ~ 12Ŝ 2 ! ,
+
+                                                       S
+                  11 P ~ a,i↔b, j ! 1                                                                                                                                                           ~91!
+       i j ~ 0 !5
+     l ab                                v 1      l c ~ 0 ! g c jab
+                  e i 1 e j 2 e a 2 e b 2 abi j c i                     (                                  u R̃ & 5 ~ 11Ŝ 2 1 $ 21 Ŝ 22 % ! u R & .
+
+                       2   (k l ak ~ 0 ! g i jkb 1l ai ~ 0 ! g jb . D                       ~85!
+                                                                                                    The property can be evaluated as
+                                                                                                           ^ L̃ u OC u R̃ & .                                                                   ~92!
+     The right-hand vectors satisfy                                                                 This formulation allows us to obtain properties as in the
+                                                                                                    CI-like approximation to EE-EOM-CCSD,6 except for a
+
+     S DS D S D S D
+       0
+       0
+             b
+             d
+                       r0
+                       r1
+                             5
+                                       br1
+                                       dr1
+                                                5
+                                                     r0
+                                                     r1
+                                                           E.                               ~86!
+                                                                                                    triples correction given by
+
+                                                                                                           ^ L 2 u OC $ 21 Ŝ 22 % u R 1 & .                                                    ~93!
+The singles component and the excitation energy are deter-                                          Let us note that the above analysis is strictly valid for one-
+mined from the eigenvalue problem in the singles space,                                             particle operators only. Explicitly the equations for the
+while the right-hand reference component is subsequently                                            singles and doubles amplitudes in the EOM picture read
+determined as r 0 5br1 /E, or explicitly ~for singlet states!
+                                                                                                           r̃ ai 5r ai ,
+
+     r 0 52    (
+               i,a
+                   g ia r ai /E.                                                            ~87!
+                                                                                                              i j 5 ~ 11 P ~ ai↔b j !!
+                                                                                                           r̃ ab                                      F(  e
+                                                                                                                                                                      ej 2
+                                                                                                                                                               r ei s ab     (m r am s mb
+                                                                                                                                                                                       ij , G   ~94!
+
+Expectation values ^ Ô & are determined in the STEOM pic-
+ture as                                                                                                    l̃ ai 5l ai 2    ( l cbi j s̃ cba j 1 k,(j,b l abk j s̃ ibk j ,
+                                                                                                                           c, j,b
+                                                                                                                                                                                 i j 5l i j .
+                                                                                                                                                                              l̃ ab     ab
+                                                                                                                                                                                                ~95!
+
+               ˆ                            ˆ   ˆ                   ˆ            ˆ
+     ^ L u $ e S 2 % 21 e 2T̂ Ôe T $ e S 2 % u R & 5 ^ L u $ e S 2 % 21 OC $ e S 2 % u R & .       The triple correction may be evaluated through similar inter-
+                                                                                            ~88!    mediates that are used to calculate the effective interactions
+                                                                                                    ~see Sec. II B!. Hence in the equations that determine the
+In Ref. 11 a general prescription was given to calculate the                                        contributions to the ph ph and phh p integrals with two ac-
+similarity transform of an arbitrary operator. Here we will                                         tive indices ~u amei and u bm je ! and the intermediates therein
+make a connection with biorthogonal expectation values in                                           we replace w i jab with l ab
+                                                                                                                              i j to define two-particle quantities
+the EOM picture. To this end we define                                                              d amei and d bm je and evaluate the triples contribution to the
+                                                                                                    property as
+                   ˆ                   ˆ
+                      C $ e S 2%
+     Q̂5 $ e S 2 % 21 O                                                                     ~89!
+                                                                                                           ^ o & t 5 ( r em ō ia ~ 4d amie 22d amei ! .                                        ~96!
+or                                                                                                                     e,m,a,i
+
+
+                                                                    J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+6828                             M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory
+
+                  TABLE XII. Transition moments ~in a.u.! of allowed singlet excited states of CO.
+
+                                                                   STEOM
+                                                        a
+                       State        PT             CC            CCb              CC no Tc            CC no Td            EOMCC
+
+                      A P
+                        1
+                                   0.0867        0.0863         0.0898                0.0861           0.0886             0.0867
+                      B 1S 1       0.0761        0.0436         0.0381                0.0436           0.0124             0.0059
+                      C 1S 1       0.1928        0.2230         0.2483                0.2237           0.2404             0.2069
+                      E 1P         0.0458        0.0532         0.0623                0.0534           0.0504             0.0494
+                  a
+                   Standard approximation: The right-hand ground state is obtained from CCSD. The left-hand ground state is
+                   obtained from EOM ~Lambda equations!. STEOM left- and right-hand vectors. Triples correction included in
+                   evaluation of transition moment.
+                  b
+                    As a except left hand ground state is obtained from STEOM.
+                  c
+                   As a triplets correction to transition moment is not included.
+                  d
+                    As c but triples contribution to G is not included → different STEOM eigenstates.
+
+
+
+Unless explicitly stated we do not include the triples correc-           ing the EOM ground state with the more approximate
+tion to excited state expectation values, since it is rather             STEOM ground state has some effect, but overall the results
+costly, while it cannot be expected to add much to the accu-             are fairly close. Comparing the results with EOM-CC transi-
+racy considering our rather crude treatment of the left-hand             tion moments we find fair agreement except for the first
+eigenstates.                                                             Rydberg state of S 1 symmetry. The precise nature of the
+     The evaluation of transition moments follows similar                single excitation components depends strongly on the ap-
+lines. We can define a STEOM left- and right-hand ground                 proximations used and this has a large influence on the tran-
+state. The right-hand ground state is simply the reference               sition moment.
+determinant, while the STEOM left-hand ground state is dis-                   In Table XIII we present the dipole moments along the
+cussed above. These states can be transformed to the EOM-                molecular axis for the excited states of CO. In general, dipole
+picture and transition moments are calculated as in                      moments are very sensitive to the degree of correlation and
+EOM-CC. Preferably, however, we describe the left-hand                   this is reflected in Table XIII. The column labeled CC1T
+ground state at the full EOM-CCSD level, and in our stan-                includes the triples correction to the dipole moment. As ex-
+dard approximation we solve for the so-called Lambda state.6             pected this contribution is negligible, and therefore, we do
+In addition we add the triples correction to the transition              not consider this computationally expensive contribution in
+moments, since the intermediates only have to be calculated              our standard approximation. Excluding the triples correction
+once.                                                                    from the similarity transformation modifies the STEOM
+     The CO molecule discussed before is taken as an illus-              eigenvectors and the dipole moments of the Rydberg states
+tration of the calculation of properties and transition mo-              appear to be very sensitive to this inclusion of triples. Inter-
+ments in the STEOM framework. To estimate the effect of                  estingly, the dipole moments in the CC-no-T approximation
+the various approximations we consider the following                     agree very well with the EOM-CCSD dipole moments.
+schemes for transition moments. The ground-state ampli-                  STEOM-PT dipole moments are in good agreement with
+tudes that enter the transformation can be obtained by first-            STEOM-CC results except for the Rydberg states of S 1
+order perturbation theory or by solving the CCSD equations.              symmetry.
+The excited states are obtained by solving the respective                     In order to gain a better insight in the validity of the
+STEOM equations for the left- and right-hand side. The left              approximations made, we compare the dipole moments ob-
+hand ground state is either the EOM ground state ~Lambda!
+~a! or it is the approximated STEOM ground state ~b!. Fi-
+nally we estimate the effect of triples. In CC no T ~c! we               TABLE XIII. Dipole moments of singlet excited states of CO.
+exclude the triples contribution to the transition moment.
+                                                                                                                      STEOM
+This is the direct effect from triples. In CC no T ~d! we in
+                                                                                                                      a
+addition discard the triple contributions from the transforma-                State            Exc.     PT       CC        CC1Tb CC no Tc EOMCC
+tion ~as in Sec. V!. This changes the STEOM eigenvectors                     X 1S 1                  0.048 20.071
+and has an indirect effect on the transition moment. The                     A 1 P(V)      5 s →2 p  0.155  0.079  0.078            0.070    0.059
+results are collected in Table XII and a comparison is made                  I 1 S 2 (V)   1 p →2 p 20.793 20.810 20.805           20.821   20.727
+with the EOM-CC transition moments. From Table XII we                        D 1 D(V)      1 p →2 p 20.731 20.745 20.739           20.754   20.658
+                                                                             B 1 S 1 (R)   5 s →6 s  0.026  0.451  0.451            1.221    1.226
+conclude that STEOM-PT and STEOM-CC are in fair agree-
+                                                                             C 1 S 1 (R)   5 s →7 s 20.799 21.302 21.301           21.900   21.938
+ment. The direct contribution of triples to the transition mo-               E 1 P(R)      5 s →3 p  0.269  0.271  0.270            0.379    0.398
+ment is negligible @compare ~c! and ~a!#. There may be an
+appreciable indirect effect from triples ~d! if the STEOM
+                                                                         a
+                                                                           Standard approximation: STEOM left- and right-hand vectors. Triples cor-
+                                                                           rection not included in evaluation of transition moment.
+eigenvectors change appreciably if triples contributions are             b
+                                                                           As footnote a triples correction to expectation value is included.
+discarded from the similarity transformation. This is most               c
+                                                                           As footnote a but triples contribution to G is not included → different
+noticeable for the Rydberg states of S 1 symmetry. Replac-                 STEOM eigenstates.
+
+
+                                            J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+                                            M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory                               6829
+
+TABLE XIV. Dipole moments ~in a.u.! of singlet excited states of CO:                    the left-hand excited states are evaluated perturbatively. To
+Comparison of biorthogonal expectation values with finite field derivatives.            calculate transition moments we include the triples compo-
+                                    STEOM                         EOMCC                 nent of the right-hand states ~in the EOM picture!, however
+                                                                                        in evaluating diagonal properties this triples correction is ne-
+ State         Exc.          Expectation   Derivative   Expectation     Derivative      glected. In STEOM-PT the ground-state amplitudes ~right
+ A P
+   1
+            5 s →2 p           0.079         0.036         0.059           0.038        and left! are defined by first-order Mo” ller–Plesset perturba-
+ I 1S 2     1 p →2 p          20.810        20.670        20.727          20.679        tion theory. All else is the same as in STEOM-CCSD.
+ D 1D       1 p →2 p          20.745        20.586        20.658          20.607
+ B 1S 1     5 s →6 s           0.451         0.385         1.226           1.165
+ C 1S 1     5 s →7 s          21.302        21.286        21.938          21.996
+ E 1P       5 s →3 p           0.271         0.165         0.398           0.341        VII. SUMMARY
+
+                                                                                             We have presented a detailed exposition of the similarity
+                                                                                        transformed equation-of-motion coupled-cluster method for
+tained in the biorthogonal expectation value framework with                             excited, doubly ionized, and doubly attached electronic
+finite field derivatives. The field in these calculations was                           states, relative to a closed-shell parent state. In STEOM-CC
+added after the SCF calculations, so the orbital response to                            we achieve an approximate decoupling of the relevant eigen-
+the field is not included. From Table XIV we find that                                  value problems by performing many-body similarity trans-
+EOM-CC dipole moments in the derivative and expectation                                 formations of the Hamiltonian. The first transformation re-
+forms agree somewhat better ~average absolute deviation is                              quires the solution of the CCSD equations and results in
+0.05 a.u.! than in the STEOM-CC approximation ~average                                  vanishing pure excitation ~ph and 2 p2h! operators of the
+absolute deviation is 0.09 a.u.!. This is presumably due to the                         so-called EOM Hamiltonian. The second transformation re-
+perturbative approximation made for the doubles component                               quires selected solutions of the IP-EOM-CC and EA-
+of the STEOM left-hand eigenvector. The significant differ-                             EOM-CC eigenvalue problems, and results in selected van-
+ence for the dipole moments of the Rydberg states in                                    ishing hhh p and h p p p components in the final transformed
+STEOM and EOM persists also at the derivative level, how-
+                                                                                        STEOM Hamiltonian Ĝ. Due to the vanishing of the most
+ever. From the previous table it is clear that effects from
+                                                                                        relevant net excitation operators the transformed Hamil-
+triple excitations must be held responsible, indicating the
+                                                                                        tonian can subsequently be diagonalized over very small
+sensitivity of dipole moments, especially in view of the rela-
+                                                                                        subspaces.
+tive insensitivity of the excitation energies of the Rydberg
+                                                                                             STEOM is closely related to Fock space coupled-cluster
+states to the inclusion of triple excitation effects ~see Table
+                                                                                        theory. From a practical point of view the most important
+VIII!.
+                                                                                        difference is that in the final step in STEOM we solve an
+     Second moments are much less sensitive. In Table XV
+                                                                                        eigenvalue problem, which is stable numerically, while in
+we report the average extension 31 ( ^ x 2 & 1 ^ y 2 & 1 ^ z 2 & ) for the
+                                                                                        FSCC one needs to solve a set of nonlinear equations which
+excited states of CO. The results are almost independent of
+                                                                                        is prone to the infamous intruder state problem. In addition
+the approximations made. In fact neglecting the doubles
+                                                                                        STEOM is conceptually straightforward and this is a major
+component of the STEOM left-hand eigenvectors leaves
+                                                                                        advantage over the FSCC framework. We view STEOM as a
+these results largely unchanged. The spatial extent is an im-
+                                                                                        starting point for further developments in open-shell
+portant characteristic of the Rydberg character of the excited
+                                                                                        coupled-cluster theory.
+state, and it is useful that this is not sensitive to the details of
+                                                                                             We also compared the STEOM approach with EOM-CC.
+the calculation.
+                                                                                        Due to the implicit inclusion of triple excitation effects in
+     Let us summarize here, for future reference, the standard
+                                                                                        STEOM the method is fully linked and charge transfer sepa-
+approach to STEOM transition moments and properties in
+                                                                                        rable, contrary to EOM-CC/CCLR. Discarding the triples
+excited states. In STEOM-CCSD the ground state is evalu-
+                                                                                        contribution from STEOM was shown to have a large effect
+ated as in EOM-CCSD, requiring the solution of the CCSD
+                                                                                        for valence excited states, and often brings the results closer
+and so-called Lambda equations. The doubles components of
+                                                                                        to results from EOM-CC calculations. Comparison of
+                                                                                        STEOM and EOM-CC results with FCI slightly favored the
+TABLE XV. 1/3( ^ x 2 & 1 ^ y 2 & 1 ^ z 2 & ) in a.u. for ground and excited states of   more economical STEOM method.
+CO.                                                                                          The calculation of properties and transition moments in
+                                              STEOM
+                                                                                        STEOM requires some additional approximations, but results
+                                                                                        agree fairly well with results from EOM-CC calculations and
+  State               Exc.           PT        CC        CC no T         EOMCC          also with finite difference derivative results, which are for-
+ Ground state                       13.4                                   13.4         mally more satisfactory.
+  A 1P           5 s →2 p           14.1      14.1         14.2            14.0              We have also established some limitations of the
+  I 1S 2         1 p →2 p           14.4      14.4         14.4            14.2         STEOM method.
+  D 1D           1 p →2 p           14.3      14.4         14.4            14.2              ~1! Not all states can be obtained in the STEOM scheme.
+  B 1S 1         5 s →6 s           20.5      20.4         20.1            20.2
+  C 1S 1         5 s →7 s           24.2      24.5         24.9            24.9
+                                                                                        For example we are only able to obtain excited states that are
+  E 1P           5 s →3 p           23.4      23.4         23.3            23.1         predominantly described as single excitations from a closed
+                                                                                        shell reference determinant.
+
+                                                        J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+6830                                   M. Nooijen and R. J. Bartlett: Equation-of-motion coupled-cluster theory
+
+
+     ~2! The scheme is built upon a closed shell reference                      29
+                                                                                   J. F. Stanton, R. J. Bartlett, and C. M. L. Rittby, J. Chem. Phys. 97, 5560
+determinant, that needs to be reasonably described at the                          ~1992!.
+                                                                                30
+                                                                                   Y. Yamamoto, T. Noro, and K. Ohno, Int. J. Quantum Chem. 42, 1563
+Hartree–Fock level. Let us note, however, that coupled-                            ~1992!.
+cluster theory is quite capable of stretching the notion of                     31
+                                                                                   B. O. Roos, M. Fülscher, P. Malmqvist, M. Merchán, and L. Serrano-
+‘‘reasonable’’ as demonstrated on a calculation on the ex-                         Andrés, Quantum Chemical Calculations with Chemical Accuracy ~Klu-
+cited states of C 2 .                                                              wer, Dordrecht, 1994!.
+                                                                                32
+                                                                                   M. Merchán, E. Orti, and B. O. Roos, Chem. Phys. Lett. 226, 27 ~1994!.
+     ~3! STEOM results are sensitive to the selection of ac-                    33
+                                                                                   J. E. Del Bene, J. D. Watts, and R. J. Bartlett, J. Chem. Phys. 106, 6051
+tive orbitals. The magnitude of the active component of the                        ~1997!.
+final STEOM eigenvector appears to be a reliable criterium                      34
+                                                                                   O. Kitao and H. Nakatsuji, J. Chem. Phys. 88, 4913 ~1988!.
+                                                                                35
+that allows us to judge the quality of the active space. How-                      H. Nakatsuji, J. Hasegawa, and M. Hada, J. Chem. Phys. 104, 2321
+                                                                                   ~1996!.
+ever, particularly if the basis set contains many diffuse orbit-                36
+                                                                                   M. Nooijen and R. J. Bartlett, J. Chem. Phys. 104, 2652 ~1996!.
+als, it may be hard to improve the active space for the de-                     37
+                                                                                   D. Sinha, S. K. Mukhopadhyay, R. Chaudhuri, and D. Mukherjee, Chem.
+scription of valence excited states. For the sake of                               Phys. Lett. 154, 544 ~1989!.
+                                                                                38
+convergence of the attached states described by the EA-                            D. Mukhopadhyay, S. Mukhopadhyay, R. Chaudhuri, and D. Mukherjee,
+                                                                                   Theor. Chim. Acta 80, 483 ~1991!.
+EOM-CC equations one would like to use canonical                                39
+                                                                                   A. A. Korkin, M. Nooijen, R. J. Bartlett, and K. O. Christe, J. Phys. Chem.
+Hartree–Fock orbitals, while a compact description of the                          ~submitted!.
+excited state requires a different type of orbital, e.g., natural               40
+                                                                                   A. A. Korkin, M. Nooijen, and R. J. Bartlett ~to be published!.
+                                                                                41
+orbitals averaged over a number of excited states or V̄ N21                        J. D. Watts, J. F. Stanton, and R. J. Bartlett, Chem. Phys. Lett. 178, 471
+                                                                                   ~1991!.
+orbitals. In this latter case the active-space diagnostic ap-                   42
+                                                                                   P. G. Szalay and R. J. Bartlett, Chem. Phys. Lett. 214, 481 ~1993!.
+pears less reliable. The dependence on active orbitals may                      43
+                                                                                   C. L. M. Rittby and R. J. Bartlett, Theor. Chim. Acta 80, 469 ~1991!.
+also lead to complications when investigating potential en-                     44
+                                                                                   L. Meissner and R. J. Bartlett, J. Chem. Phys. 94, 6670 ~1991!.
+ergy surfaces for excited states.
+                                                                                45
+                                                                                   L. Meissner and R. J. Bartlett, J. Chem. Phys. 102, 7490 ~1994!.
+                                                                                46
+                                                                                   J. D. Watts and R. J. Bartlett, J. Chem. Phys. 101, 3073 ~1994!.
+                                                                                47
+                                                                                   J. D. Watts and R. J. Bartlett, Chem. Phys. Lett. 233, 81 ~1995!.
+ACKNOWLEDGMENTS                                                                 48
+                                                                                   J. D. Watts, S. R. Gwaltney, and R. J. Bartlett, J. Chem. Phys. 105, 6979
+                                                                                   ~1996!.
+    We would like to thank Dr. John Watts for providing the                     49
+                                                                                   J. D. Watts and R. J. Bartlett, Chem. Phys. Lett. 258, 581 ~1996!.
+EOM-CCSDT-3 results for comparison with FCI. This work                          50
+                                                                                   O. Christiansen, H. Koch, and P. Jo” rgensen, J. Chem. Phys. 103, 7429
+has been supported by the United States Air Force Scientific                       ~1995!.
+                                                                                51
+                                                                                   O. Christiansen, H. Koch, P. Jo” rgensen, and J. Olsen, Chem. Phys. Lett.
+Research under Grant F49620-95-1-0130.                                             256, 185 ~1996!.
+                                                                                52
+                                                                                   M. Nooijen and R. J. Bartlett, J. Chem. Phys. 102, 3629 ~1995!.
+1
+   M. Nooijen and R. J. Bartlett, J. Chem. Phys. 106, 6441 ~1997!.              53
+                                                                                   J. Gauss, J. F. Stanton, and R. J. Bartlett, J. Chem. Phys. 95, 2623
+2
+   M. Nooijen and R. J. Bartlett, J. Chem. Phys. 106, 6449 ~1997!.                 ~1991!.
+ 3
+   G. D. Purvis III and R. J. Bartlett, J. Chem. Phys. 76, 1910 ~1982!.         54
+                                                                                   M. Nooijen and J. G. Snijders, Int. J. Quantum Chem. 47, 3 ~1993!.
+ 4
+   H. Sekino and R. J. Bartlett, Int. J. Quantum Chem. Symp. 18, 255 ~1984!.    55
+                                                                                   M. Nooijen and J. G. Snijders, Int. J. Quantum Chem. Symp. 26, 55
+ 5
+   J. Geertsen, M. Rittby, and R. J. Bartlett, Chem. Phys. Lett. 164, 57           ~1992!.
+   ~1989!.                                                                      56
+                                                                                   M. Nooijen and J. G. Snijders, Int. J. Quantum Chem. 48, 15 ~1993!.
+ 6
+   J. F. Stanton and R. J. Bartlett, J. Chem. Phys. 98, 7029 ~1993!.            57
+                                                                                   R. J. Bartlett and J. F. Stanton, Rev. Comp. Chem. 5, 65 ~1994!.
+ 7
+   D. C. Comeau and R. J. Bartlett, Chem. Phys. Lett. 207, 414 ~1993!.          58
+                                                                                   J. F. Stanton and J. Gauss, J. Chem. Phys. 101, 8938 ~1994!.
+ 8
+   H. Monkhorst, Int. J. Quantum Chem. Symp. 11, 421 ~1977!.                    59
+                                                                                   M. Nooijen and R. J. Bartlett, Int. J. Quantum Chem. 63, 601 ~1997!.
+ 9
+   D. Mukherjee and P. Mukherjee, Chem. Phys. 39, 325 ~1979!.                   60
+                                                                                   H. Sekino and R. J. Bartlett, Chem. Phys. Lett. 225, 486 ~1994!.
+10
+   H. Koch and P. Jo” rgensen, J. Chem. Phys. 93, 3333 ~1990!.                  61
+                                                                                   J. F. Stanton and J. Gauss, J. Chem. Phys. 103, 1064 ~1995!.
+11
+   M. Nooijen, J. Chem. Phys. 104, 2638 ~1996!.                                 62
+                                                                                   L. Meissner, J. Chem. Phys. 255, 244 ~1995!.
+12
+   I. Lindgren, Int. J. Quantum Chem. Symp. 12, 33 ~1978!.                      63
+                                                                                   H. Agren, A. Cesar, and M. Liegener, Adv. Quantum Chem. 23, 1 ~1992!.
+13
+   W. Kutzelnigg, J. Chem. Phys. 77, 3081 ~1981!.                               64
+                                                                                   F. Tarantelli and L. S. Cederbaum, Phys. Rev. A 71, 649 ~1993!.
+14
+   I. Lindgren and D. Mukherjee, Phys. Rep. 151, 93 ~1987!.                     65
+                                                                                   F. O. Gottfried, L. S. Cederbaum, and F. Tarantelli, J. Chem. Phys. 104,
+15
+   D. Mukherjee and S. Pal, Adv. Quantum Chem. 20, 292 ~1989!.                     9754 ~1996!.
+16
+   B. Jeziorski and J. Paldus, J. Chem. Phys. 90, 2714 ~1989!.                  66
+                                                                                   T. H. Dunning, J. Chem. Phys. 55, 716 ~1971!.
+17                                                                              67
+   D. Mukherjee, R. K. Moitra, and A. Mukhopadhyay, Mol. Phys. 33, 955             Polarization functions of the TZ2P basis set can be found in the standard
+   ~1977!.                                                                         Aces2 basis set.
+18                                                                              68
+   A. Mukhopadhyay, R. K. Moitra, and D. Mukherjee, J. Phys. B 12, 1               B. Schimmelpfennig, B. Nestmann, and S. D. Peyerimhoff, J. Electron
+   ~1979!.                                                                         Spectrosc. Relat. Phenom. 74, 173 ~1995!.
+19
+   M. Haque and D. Mukherjee, J. Chem. Phys. 80, 5058 ~1984!.                   69
+                                                                                   M. Urban, R. J. Bartlett, and S. A. Alexander, Int. J. Quantum Chem.
+20
+   I. Lindgren and J. Morrison, Atomic Many-Body Theory ~Springer, Berlin,         Symp. 26, 271 ~1992!.
+   1982!.                                                                       70
+                                                                                   A. Sadlej, Theor. Chim. Acta 79, 123 ~1991!.
+21
+   L. Stolarczyk and H. J. Monkhorst, Phys. Rev. A 32, 725 ~1985!.              71
+                                                                                   D. M. Silver and R. J. Bartlett, Phys. Rev. A 13, 1 ~1976!.
+22
+   L. Stolarczyk and H. J. Monkhorst, Phys. Rev. A 32, 743 ~1985!.              72
+                                                                                   L. Meissner and M. Nooijen, J. Chem. Phys. 102, 9604 ~1995!.
+23
+   L. Stolarczyk and H. J. Monkhorst, Phys. Rev. A 37, 1908 ~1988!.             73
+                                                                                   T. H. Dunning and P. J. Hay, Methods of Electronic Structure Theory
+24
+   L. Stolarczyk and H. J. Monkhorst, Phys. Rev. A 37, 1926 ~1988!.                ~Plenum, New York, 1977!.
+25
+   S. Pal, M. Rittby, R. J. Bartlett, D. Sinha, and D. Mukherjee, Chem. Phys.   74
+                                                                                   C. E. Moore, Atomic Energy Levels, Natl. Bur. Stand. ~U.S.!, Circ. 467,
+   Lett. 137, 273 ~1987!; J. Chem. Phys. 88 4357 ~1988!.                           1949.
+26
+   U. Kaldor, Chem. Phys. Lett. 166, 599 ~1990!.                                75
+                                                                                   J. D. Watts and R. J. Bartlett, J. Chem. Phys. ~submitted!.
+27
+   U. Kaldor, Chem. Phys. Lett. 170, 17 ~1990!.                                 76
+                                                                                   A. Barbe, C. Secroun, and P. Jouve, J. Mol. Spectrosc. 49, 171 ~1974!.
+28
+   U. Kaldor, Theor. Chim. Acta 80, 427 ~1991!.                                 77
+                                                                                   T. Tanake and Y. Morino, J. Mol. Spectrosc. 33, 538 ~1970!.
+
+
+
+
+                                                  J. Chem. Phys., Vol. 107, No. 17, 1 November 1997
+
