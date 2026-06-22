@@ -896,6 +896,129 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
                   << " n_frozen=" << n_frozen << std::endl;
     }
 
+    // ------------------------------------------------------------------------
+    // Phase 2 (DMET_STEOM.md §4.2): NTO-augmented bath. The standard Schmidt
+    // bath spans the GROUND-state fragment↔environment entanglement; an
+    // excitation whose particle delocalises into the environment is not
+    // captured. Add the environment-leaking active VIRTUAL NTOs of the
+    // full-system state-averaged CIS-NTO as extra cluster virtuals (the hole /
+    // occupied NTO is assumed chromophore-local; occupied augmentation is a
+    // follow-up). n_emb_occ is unchanged → the cluster electron count is fixed;
+    // the added orthonormal directions only expand the excited-state space.
+    //
+    // Control (experimental knob, codebase env-flag convention): set
+    //   GANSU_DMET_STEOM_NTO_BATH = τ   (Löwdin environment fraction, 0<τ<1)
+    // unset / ≤0 → OFF = Phase 1 (single Schmidt bath). Lowering τ admits more
+    // NTOs → the cluster grows toward the full molecule and the excitation
+    // error vs full STEOM shrinks monotonically (validation story).
+    // ------------------------------------------------------------------------
+    real_t leak_thresh = 0.0;
+    if (const char* e = std::getenv("GANSU_DMET_STEOM_NTO_BATH")) leak_thresh = std::atof(e);
+    if (leak_thresh > 0.0 && !C_emb.empty()) {
+        const int full_occ  = nocc;
+        const int nvir_full = nao - full_occ;
+
+        // Full-system state-averaged CIS-NTO (whole molecule). Stored on rhf_;
+        // does NOT collide with the cluster CIS-NTO (which lives in the isolated
+        // EOMChainContext) — see eom_chain_context.hpp.
+        int n_cis = rhf_.get_steom_n_root_cis();
+        if (n_cis <= 0) n_cis = n_states + 4;
+        std::cout << "  [DMET-STEOM bath aug] full-system CIS-NTO (n_cis=" << n_cis
+                  << ", leak τ=" << std::scientific << std::setprecision(2) << leak_thresh
+                  << std::defaultfloat << ") for environment-leakage analysis..." << std::endl;
+        eri_method.compute_cis_nto(n_cis);
+        const CISNTOResult& nto = rhf_.get_cis_nto_result();
+
+        // Embedding in Löwdin basis (orthonormal columns): C_emb_lo = S^{1/2} C_emb.
+        std::vector<real_t> C_emb_lo(nao * n_emb, 0.0);
+        for (int mu = 0; mu < nao; ++mu)
+            for (int p = 0; p < n_emb; ++p) {
+                real_t v = 0.0;
+                for (int nu = 0; nu < nao; ++nu) v += S_half[mu * nao + nu] * C_emb[nu * n_emb + p];
+                C_emb_lo[mu * n_emb + p] = v;
+            }
+        std::vector<char> is_frag_ao(nao, 0);
+        for (int p : chromo.ao_indices) is_frag_ao[p] = 1;
+
+        // Löwdin virtual MOs: C_lo_vir = S^{1/2} C_vir  [nao × nvir_full].
+        std::vector<real_t> C_lo_vir(nao * nvir_full, 0.0);
+        for (int mu = 0; mu < nao; ++mu)
+            for (int a = 0; a < nvir_full; ++a) {
+                real_t v = 0.0;
+                for (int nu = 0; nu < nao; ++nu) v += S_half[mu * nao + nu] * h_C[nu * nao + (full_occ + a)];
+                C_lo_vir[mu * nvir_full + a] = v;
+            }
+
+        // For each active virtual NTO: build it in Löwdin AO, project onto the
+        // environment, drop if it barely leaks, else Gram-Schmidt against the
+        // existing embedding + accepted bath and keep the new direction.
+        std::vector<std::vector<real_t>> added;
+        const real_t ortho_thresh = 1e-6;
+        const int n_nto = std::min(nto.n_act_vir, (nto.nvir > 0 ? nto.nvir : nvir_full));
+        for (int k = 0; k < n_nto; ++k) {
+            std::vector<real_t> phi(nao, 0.0);
+            for (int mu = 0; mu < nao; ++mu) {
+                real_t v = 0.0;
+                for (int a = 0; a < nvir_full; ++a) v += C_lo_vir[mu * nvir_full + a] * nto.U_vir[(size_t)a * nto.nvir + k];
+                phi[mu] = v;
+            }
+            // Environment projection (zero fragment Löwdin AOs); env fraction ∈ [0,1].
+            real_t env_norm2 = 0.0;
+            for (int mu = 0; mu < nao; ++mu) {
+                if (is_frag_ao[mu]) phi[mu] = 0.0;
+                else env_norm2 += phi[mu] * phi[mu];
+            }
+            if (env_norm2 < leak_thresh) continue;
+            // Modified Gram-Schmidt vs existing embedding columns ...
+            for (int p = 0; p < n_emb; ++p) {
+                real_t dot = 0.0;
+                for (int mu = 0; mu < nao; ++mu) dot += C_emb_lo[mu * n_emb + p] * phi[mu];
+                for (int mu = 0; mu < nao; ++mu) phi[mu] -= dot * C_emb_lo[mu * n_emb + p];
+            }
+            // ... and vs previously accepted NTO-bath columns.
+            for (const auto& q : added) {
+                real_t dot = 0.0;
+                for (int mu = 0; mu < nao; ++mu) dot += q[mu] * phi[mu];
+                for (int mu = 0; mu < nao; ++mu) phi[mu] -= dot * q[mu];
+            }
+            real_t nrm = 0.0;
+            for (real_t v : phi) nrm += v * v;
+            nrm = std::sqrt(nrm);
+            if (nrm < ortho_thresh) continue;  // already spanned by the cluster
+            for (real_t& v : phi) v /= nrm;
+            added.push_back(std::move(phi));
+        }
+
+        if (!added.empty()) {
+            const int n_added = (int)added.size();
+            const int n_emb_aug = n_emb + n_added;
+            // Rebuild C_emb_lo_aug then convert to AO: C_emb = S^{-1/2} C_emb_lo_aug.
+            std::vector<real_t> C_lo_aug((size_t)nao * n_emb_aug, 0.0);
+            for (int mu = 0; mu < nao; ++mu) {
+                for (int p = 0; p < n_emb; ++p)
+                    C_lo_aug[(size_t)mu * n_emb_aug + p] = C_emb_lo[mu * n_emb + p];
+                for (int j = 0; j < n_added; ++j)
+                    C_lo_aug[(size_t)mu * n_emb_aug + (n_emb + j)] = added[j][mu];
+            }
+            std::vector<real_t> C_emb_aug((size_t)nao * n_emb_aug, 0.0);
+            for (int mu = 0; mu < nao; ++mu)
+                for (int p = 0; p < n_emb_aug; ++p) {
+                    real_t v = 0.0;
+                    for (int nu = 0; nu < nao; ++nu) v += S_inv_half[mu * nao + nu] * C_lo_aug[(size_t)nu * n_emb_aug + p];
+                    C_emb_aug[(size_t)mu * n_emb_aug + p] = v;
+                }
+            C_emb = std::move(C_emb_aug);
+            n_emb = n_emb_aug;
+            std::cout << "  [DMET-STEOM bath aug] added " << n_added
+                      << " environment-leaking virtual NTO bath orbital(s) "
+                      << "(of " << nto.n_act_vir << " active vir NTOs) → n_emb="
+                      << n_emb << " (n_emb_occ=" << n_emb_occ << " unchanged)" << std::endl;
+        } else {
+            std::cout << "  [DMET-STEOM bath aug] no virtual NTO leaked above τ "
+                      << "(or all already spanned) → bath unchanged." << std::endl;
+        }
+    }
+
     return solve_fragment_steom(eri_method,
                                 C_emb.empty() ? nullptr : C_emb.data(),
                                 n_emb, n_emb_occ, n_frozen,
