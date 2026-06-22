@@ -1413,13 +1413,60 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     result.num_frozen  = num_frozen;
     result.n_states    = n_states_to_compute;
     result.per_root.resize(n_states_to_compute);
+
+    // sub-phase 3.10 — per-root % active character η. Project each STEOM right
+    // eigenvector R1[i,a] (i∈nocc_active, a∈nvir) onto the active CIS-NTO
+    // subspace: the first cis_nto.n_act_occ columns of U_occ (occ side) and the
+    // first n_act_vir columns of U_vir (vir side). η = the JOINT active-active
+    // weight fraction; percent_active_occ / _vir are the per-side marginals. A
+    // low η flags a root the active space (≡ the DMET cluster / bath, §4.3) does
+    // not describe — its STEOM energy is then untrustworthy. Computed only when
+    // the CIS-NTO basis matches the STEOM (nocc_active, nvir); else sentinels.
+    const bool can_eta = (cis_nto.nocc_active == nocc_active) && (cis_nto.nvir == nvir)
+                         && !cis_nto.U_occ.empty() && !cis_nto.U_vir.empty()
+                         && cis_nto.n_act_occ > 0 && cis_nto.n_act_vir > 0;
+    const int nao_occ = can_eta ? cis_nto.n_act_occ : 0;   // # active occ NTOs
+    const int nav_vir = can_eta ? cis_nto.n_act_vir : 0;   // # active vir NTOs
     for (int n = 0; n < n_states_to_compute; ++n) {
         auto& pr = result.per_root[n];
         pr.omega = eigenvalues[n];
         pr.R1.assign(&h_eigenvectors[(size_t)n * total_dim],
                      &h_eigenvectors[(size_t)n * total_dim + total_dim]);
-        // η / percent_active_occ / percent_active_vir stay at sentinel -1.0
-        // (sub-phase 3.10 populates them).
+        if (!can_eta) continue;
+        const real_t* R1 = pr.R1.data();
+        double norm2 = 0.0;
+        for (int x = 0; x < total_dim; ++x) norm2 += (double)R1[x] * R1[x];
+        if (!(norm2 > 0.0)) continue;
+        // T[ã,a] = Σ_i U_occ[i,ã] R1[i,a]  (occ index → active occ NTO basis)
+        std::vector<double> T((size_t)nao_occ * nvir, 0.0);
+        for (int am = 0; am < nao_occ; ++am)
+            for (int i = 0; i < nocc_active; ++i) {
+                const double u = (double)cis_nto.U_occ[(size_t)i * nocc_active + am];
+                if (u == 0.0) continue;
+                for (int a = 0; a < nvir; ++a)
+                    T[(size_t)am * nvir + a] += u * (double)R1[(size_t)i * nvir + a];
+            }
+        double p_occ = 0.0;      // Σ_{active ã, all a} T²  (occ-side active fraction)
+        for (size_t x = 0; x < T.size(); ++x) p_occ += T[x] * T[x];
+        double joint = 0.0;      // Σ_{active ã, active ẽ} (Σ_a T[ã,a] U_vir[a,ẽ])²
+        for (int am = 0; am < nao_occ; ++am)
+            for (int em = 0; em < nav_vir; ++em) {
+                double s = 0.0;
+                for (int a = 0; a < nvir; ++a)
+                    s += T[(size_t)am * nvir + a] * (double)cis_nto.U_vir[(size_t)a * nvir + em];
+                joint += s * s;
+            }
+        double p_vir = 0.0;      // Σ_{active ẽ, all i} (Σ_a R1[i,a] U_vir[a,ẽ])²  (vir-side)
+        for (int em = 0; em < nav_vir; ++em)
+            for (int i = 0; i < nocc_active; ++i) {
+                double s = 0.0;
+                for (int a = 0; a < nvir; ++a)
+                    s += (double)R1[(size_t)i * nvir + a] * (double)cis_nto.U_vir[(size_t)a * nvir + em];
+                p_vir += s * s;
+            }
+        pr.percent_active_occ = (real_t)(p_occ / norm2);
+        pr.percent_active_vir = (real_t)(p_vir / norm2);
+        pr.eta                = (real_t)(joint / norm2);
     }
 
     // ----------------------------------------------------------------------
@@ -1434,16 +1481,26 @@ static void compute_steom_ccsd_impl(RHF& rhf,
        << ". Validated vs Python reference (W^eff routes corrected 2026-06-20): "
           "H2O sto-3g FC1 lowest two roots 0.432663 / 0.496991 Ha "
           "(11.773 / 13.524 eV; ORCA 11.849 / 13.60).\n"
-       << "  STEOM excited-state energies:\n"
-       << "   k   omega (Ha)        omega (eV)\n";
+       << "  STEOM excited-state energies"
+       << (can_eta ? "  (η = % active character; low η ⇒ active space / DMET bath "
+                     "under-describes this root, energy untrustworthy)" : "")
+       << ":\n"
+       << "   k   omega (Ha)        omega (eV)"
+       << (can_eta ? "      η        %act_o   %act_v" : "") << "\n";
     for (int n = 0; n < n_states_to_compute; ++n) {
         const auto& pr = result.per_root[n];
         os << "  " << std::setw(2) << n
            << "   " << std::setw(12) << std::setprecision(8) << std::fixed << pr.omega
-           << "   " << std::setw(10) << std::setprecision(4) << (pr.omega * 27.2114)
-           << "\n";
+           << "   " << std::setw(10) << std::setprecision(4) << (pr.omega * 27.2114);
+        if (can_eta && pr.eta >= 0.0)
+            os << "   " << std::setw(7) << std::setprecision(4) << pr.eta
+               << "  " << std::setw(7) << std::setprecision(4) << pr.percent_active_occ
+               << "  " << std::setw(7) << std::setprecision(4) << pr.percent_active_vir;
+        os << "\n";
     }
-    os << "  (η = % active character lands in sub-phase 3.10.)\n";
+    if (!can_eta)
+        os << "  (η = % active character: not computed — CIS-NTO basis "
+              "dimensions did not match the STEOM active space.)\n";
 
     result.report = os.str();
     std::cout << result.report;
