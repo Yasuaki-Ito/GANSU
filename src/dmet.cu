@@ -915,7 +915,11 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
     real_t leak_vir = 0.0, leak_occ = 0.0;
     if (const char* e = std::getenv("GANSU_DMET_STEOM_NTO_BATH"))     leak_vir = std::atof(e);
     if (const char* e = std::getenv("GANSU_DMET_STEOM_NTO_BATH_OCC")) leak_occ = std::atof(e);
-    if ((leak_vir > 0.0 || leak_occ > 0.0) && !C_emb.empty()) {
+    // §4.3 bath-sufficiency diagnostic (self-contained: no full STEOM needed).
+    // Auto-on whenever augmentation runs; force standalone with GANSU_DMET_STEOM_BATH_DIAG=1.
+    bool bath_diag = (leak_vir > 0.0 || leak_occ > 0.0);
+    if (const char* e = std::getenv("GANSU_DMET_STEOM_BATH_DIAG")) bath_diag = bath_diag || (e[0] != '0');
+    if (bath_diag && !C_emb.empty()) {
         const int full_occ      = nocc;
         const int nvir_full     = nao - full_occ;
 
@@ -924,7 +928,7 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
         // EOMChainContext) — see eom_chain_context.hpp.
         int n_cis = rhf_.get_steom_n_root_cis();
         if (n_cis <= 0) n_cis = n_states + 4;
-        std::cout << "  [DMET-STEOM bath aug] full-system CIS-NTO (n_cis=" << n_cis
+        std::cout << "  [DMET-STEOM bath] full-system CIS-NTO (n_cis=" << n_cis
                   << ", leak τ_vir=" << std::scientific << std::setprecision(2) << leak_vir
                   << " τ_occ=" << leak_occ << std::defaultfloat
                   << ") for environment-leakage analysis..." << std::endl;
@@ -943,6 +947,95 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
             }
         std::vector<char> is_frag_ao(nao, 0);
         for (int p : chromo.ao_indices) is_frag_ao[p] = 1;
+
+        // Löwdin active occupied / virtual MO blocks (built once; shared by the
+        // diagnostic and the augmentation). C_lo_occ = S^{1/2} C_occ(active),
+        // C_lo_vir = S^{1/2} C_vir.
+        std::vector<real_t> C_lo_occ((size_t)nao * nocc_act_full, 0.0);
+        std::vector<real_t> C_lo_vir((size_t)nao * nvir_full, 0.0);
+        for (int mu = 0; mu < nao; ++mu) {
+            for (int i = 0; i < nocc_act_full; ++i) {
+                real_t v = 0.0;
+                for (int nu = 0; nu < nao; ++nu) v += S_half[mu * nao + nu] * h_C[nu * nao + (nfz_full + i)];
+                C_lo_occ[(size_t)mu * nocc_act_full + i] = v;
+            }
+            for (int a = 0; a < nvir_full; ++a) {
+                real_t v = 0.0;
+                for (int nu = 0; nu < nao; ++nu) v += S_half[mu * nao + nu] * h_C[nu * nao + (full_occ + a)];
+                C_lo_vir[(size_t)mu * nvir_full + a] = v;
+            }
+        }
+
+        // Build active NTO k (full-system, Löwdin AO, unit norm). occ=true → use
+        // U_occ over the active-occupied block; else U_vir over the virtual block.
+        auto build_nto = [&](bool occ, int k) {
+            std::vector<real_t> phi(nao, 0.0);
+            if (occ) for (int mu = 0; mu < nao; ++mu) {
+                real_t v = 0.0;
+                for (int i = 0; i < nocc_act_full; ++i) v += C_lo_occ[(size_t)mu * nocc_act_full + i] * nto.U_occ[(size_t)i * nocc_act_full + k];
+                phi[mu] = v;
+            } else for (int mu = 0; mu < nao; ++mu) {
+                real_t v = 0.0;
+                for (int a = 0; a < nvir_full; ++a) v += C_lo_vir[(size_t)mu * nvir_full + a] * nto.U_vir[(size_t)a * nto.nvir + k];
+                phi[mu] = v;
+            }
+            return phi;
+        };
+        // Environment fraction of a Löwdin orbital (NTO is unit-norm) ∈ [0,1].
+        auto env_frac = [&](const std::vector<real_t>& phi) {
+            real_t e = 0.0;
+            for (int mu = 0; mu < nao; ++mu) if (!is_frag_ao[mu]) e += phi[mu] * phi[mu];
+            return e;
+        };
+        // Fraction of φ captured by the current cluster space (Σ_p ⟨col_p|φ⟩²).
+        // Includes the always-captured fragment part → 1 − captured = the
+        // excitation-relevant ENVIRONMENT character the cluster does NOT span.
+        auto cluster_capture = [&](const std::vector<real_t>& phi) {
+            double cap = 0.0;
+            for (int p = 0; p < n_emb; ++p) {
+                double d = 0.0;
+                for (int mu = 0; mu < nao; ++mu) d += (double)C_emb_lo[mu * n_emb + p] * phi[mu];
+                cap += d * d;
+            }
+            return cap;
+        };
+
+        // ----------------------------------------------------------------------
+        // §4.3 bath-sufficiency gauge. For each full-system ACTIVE NTO (the
+        // excitation-relevant orbital directions), how much of it does the
+        // current (bare) cluster span? uncaptured = 1 − capture is the missing
+        // excitation character. Unlike the STEOM per-root η (which measures
+        // active-vs-inactive WITHIN the cluster and stays high even for spurious
+        // states of a deficient cluster), this is a cluster-vs-FULL measure and
+        // directly flags an insufficient bath — WITHOUT needing a full STEOM.
+        // ----------------------------------------------------------------------
+        {
+            std::cout << "  [DMET-STEOM bath] §4.3 sufficiency — full-system active NTO coverage by the cluster:\n"
+                      << "      kind  k   occupation   env_leak   uncaptured" << std::endl;
+            double worst_unc = 0.0; const char* worst_kind = "-"; int worst_k = -1;
+            auto scan = [&](bool occ, int n_act, const std::vector<real_t>& occs) {
+                for (int k = 0; k < n_act; ++k) {
+                    std::vector<real_t> phi = build_nto(occ, k);
+                    const real_t el  = env_frac(phi);
+                    const double unc = 1.0 - cluster_capture(phi);
+                    std::cout << "      " << (occ ? "occ" : "vir") << "  " << std::setw(2) << k
+                              << "   " << std::fixed << std::setprecision(6) << std::setw(10)
+                              << (k < (int)occs.size() ? occs[k] : real_t(0))
+                              << "   " << std::setprecision(4) << std::setw(8) << el
+                              << "   " << std::setw(8) << unc << std::defaultfloat << std::endl;
+                    if (unc > worst_unc) { worst_unc = unc; worst_kind = occ ? "occ" : "vir"; worst_k = k; }
+                }
+            };
+            scan(false, nto.n_act_vir, nto.nto_vir_occupations);
+            scan(true,  nto.n_act_occ, nto.nto_occ_occupations);
+            const char* verdict = worst_unc < 0.02 ? "SUFFICIENT"
+                                : worst_unc < 0.10 ? "MARGINAL" : "INSUFFICIENT";
+            std::cout << "  [DMET-STEOM bath] worst uncaptured = " << std::fixed << std::setprecision(4)
+                      << worst_unc << " (" << worst_kind << " NTO " << worst_k << ") → bath "
+                      << verdict << " for the active excitation space"
+                      << (leak_vir > 0.0 || leak_occ > 0.0 ? " (before augmentation)" : "")
+                      << "." << std::defaultfloat << std::endl;
+        }
 
         std::vector<std::vector<real_t>> added;   // accepted env-NTO bath columns (Löwdin)
         int n_occ_added = 0;
@@ -978,20 +1071,8 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
 
         // --- VIRTUAL NTOs (particle leak) → extra cluster virtuals ---------------
         if (leak_vir > 0.0) {
-            std::vector<real_t> C_lo_vir(nao * nvir_full, 0.0);   // S^{1/2} C_vir
-            for (int mu = 0; mu < nao; ++mu)
-                for (int a = 0; a < nvir_full; ++a) {
-                    real_t v = 0.0;
-                    for (int nu = 0; nu < nao; ++nu) v += S_half[mu * nao + nu] * h_C[nu * nao + (full_occ + a)];
-                    C_lo_vir[mu * nvir_full + a] = v;
-                }
             for (int k = 0; k < nto.n_act_vir; ++k) {
-                std::vector<real_t> phi(nao, 0.0);
-                for (int mu = 0; mu < nao; ++mu) {
-                    real_t v = 0.0;
-                    for (int a = 0; a < nvir_full; ++a) v += C_lo_vir[mu * nvir_full + a] * nto.U_vir[(size_t)a * nto.nvir + k];
-                    phi[mu] = v;
-                }
+                std::vector<real_t> phi = build_nto(/*occ=*/false, k);
                 if (env_project(phi) < leak_vir) continue;
                 real_t nrm = mgs_residual(phi);
                 if (nrm < ortho_thresh) continue;
@@ -1003,20 +1084,8 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
 
         // --- OCCUPIED NTOs (hole leak) → extra cluster occupieds (n_emb_occ += k) -
         if (leak_occ > 0.0) {
-            std::vector<real_t> C_lo_occ(nao * nocc_act_full, 0.0);   // S^{1/2} C_occ(active)
-            for (int mu = 0; mu < nao; ++mu)
-                for (int i = 0; i < nocc_act_full; ++i) {
-                    real_t v = 0.0;
-                    for (int nu = 0; nu < nao; ++nu) v += S_half[mu * nao + nu] * h_C[nu * nao + (nfz_full + i)];
-                    C_lo_occ[mu * nocc_act_full + i] = v;
-                }
             for (int k = 0; k < nto.n_act_occ; ++k) {
-                std::vector<real_t> phi(nao, 0.0);
-                for (int mu = 0; mu < nao; ++mu) {
-                    real_t v = 0.0;
-                    for (int i = 0; i < nocc_act_full; ++i) v += C_lo_occ[mu * nocc_act_full + i] * nto.U_occ[(size_t)i * nocc_act_full + k];
-                    phi[mu] = v;
-                }
+                std::vector<real_t> phi = build_nto(/*occ=*/true, k);
                 if (env_project(phi) < leak_occ) continue;
                 real_t nrm = mgs_residual(phi);
                 if (nrm < ortho_thresh) continue;
@@ -1052,10 +1121,11 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
             std::cout << "  [DMET-STEOM bath aug] added " << n_vir_added << " virtual + "
                       << n_occ_added << " occupied environment-leaking NTO bath orbital(s) → n_emb="
                       << n_emb << " n_emb_occ=" << n_emb_occ << std::endl;
-        } else {
+        } else if (leak_vir > 0.0 || leak_occ > 0.0) {
             std::cout << "  [DMET-STEOM bath aug] no NTO leaked above τ "
                       << "(or all already spanned) → bath unchanged." << std::endl;
         }
+        // (pure diagnostic with no augmentation flags → nothing added, no message)
     }
 
     return solve_fragment_steom(eri_method,
