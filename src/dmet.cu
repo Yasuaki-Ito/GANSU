@@ -39,6 +39,7 @@
 #include "dmet.hpp"
 #include "rhf.hpp"
 #include "eri.hpp"
+#include "eom_chain_context.hpp"   // steom_spatial_orbital (DMET-STEOM, Phase 1)
 #include "gpu_manager.hpp"
 #include "multi_gpu_manager.hpp"
 #include "ccsd_lambda.hpp"
@@ -705,6 +706,200 @@ FragmentResult DMET::solve_fragment_ccsd(
     real_t N_frag = 2.0 * (n_emb_occ - n_frozen);  // approximate
 
     return {E_CCSD, N_frag};
+}
+
+// ============================================================================
+//  DMET-STEOM: single-fragment cluster STEOM (μ = 0 single-shot)
+// ============================================================================
+STEOMResult DMET::solve_fragment_steom(
+    ERI& eri_method,
+    const real_t* h_C_emb, int n_emb, int n_emb_occ,
+    int n_frozen,
+    const real_t* h_fock, const DMETFragment& frag,
+    int n_states) const
+{
+    const int nao = num_basis_;
+
+    // ---- Full-system reduction (no bath): cluster = whole molecule. Use the
+    //      full RHF canonical C / ε directly so the result is plain STEOM
+    //      bit-exact (Phase 0 anchor; level shift NOT applied). ----
+    if (h_C_emb == nullptr || frag.n_frag == nao) {
+        const int full_occ = num_occ_;
+        const int nfz       = rhf_.get_num_frozen_core();
+        const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
+        const real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+        real_t* d_eri_mo = eri_method.build_mo_eri(d_C, nao);
+        std::cout << "  [DMET-STEOM] full-system cluster (n_emb = nao = " << nao
+                  << ") → plain STEOM reduction." << std::endl;
+        STEOMResult r = steom_spatial_orbital(rhf_, eri_method, d_C, d_eps, d_eri_mo,
+                                              /*nao=*/nao, /*n_emb=*/nao,
+                                              /*n_emb_occ=*/full_occ, n_states, nfz);
+        tracked_cudaFree(d_eri_mo);
+        return r;
+    }
+
+    if (n_emb_occ <= n_frozen || n_emb_occ >= n_emb)
+        throw std::runtime_error("DMET-STEOM: invalid cluster occupation "
+            "(need n_frozen < n_emb_occ < n_emb).");
+
+    const int n_frag = frag.n_frag;
+
+    // 1. h_emb = C_emb^T F C_emb  (μ = 0 single-shot → no fragment-diagonal shift)
+    std::vector<real_t> tmp(nao * n_emb, 0.0);
+    std::vector<real_t> h_emb(n_emb * n_emb, 0.0);
+    for (int mu_idx = 0; mu_idx < nao; mu_idx++)
+        for (int p = 0; p < n_emb; p++) {
+            real_t val = 0.0;
+            for (int nu = 0; nu < nao; nu++)
+                val += h_fock[mu_idx * nao + nu] * h_C_emb[nu * n_emb + p];
+            tmp[mu_idx * n_emb + p] = val;
+        }
+    for (int p = 0; p < n_emb; p++)
+        for (int q = 0; q < n_emb; q++) {
+            real_t val = 0.0;
+            for (int mu_idx = 0; mu_idx < nao; mu_idx++)
+                val += h_C_emb[mu_idx * n_emb + p] * tmp[mu_idx * n_emb + q];
+            h_emb[p * n_emb + q] = val;
+        }
+    (void)n_frag;  // μ=0: fragment-diagonal shift omitted (single-shot embedding)
+
+    // 2. Diagonalize h_emb → ε, U  (+ level shift to stabilize the cluster CCSD,
+    //    matching solve_fragment_ccsd; this is part of the embedding definition).
+    real_t *d_h_emb = nullptr, *d_eigvals = nullptr, *d_eigvecs = nullptr;
+    tracked_cudaMalloc(&d_h_emb, n_emb * n_emb * sizeof(real_t));
+    tracked_cudaMalloc(&d_eigvals, n_emb * sizeof(real_t));
+    tracked_cudaMalloc(&d_eigvecs, n_emb * n_emb * sizeof(real_t));
+    cudaMemcpy(d_h_emb, h_emb.data(), n_emb * n_emb * sizeof(real_t), cudaMemcpyHostToDevice);
+    gpu::eigenDecomposition(d_h_emb, d_eigvals, d_eigvecs, n_emb);
+    tracked_cudaFree(d_h_emb);
+
+    {
+        std::vector<real_t> h_eps(n_emb);
+        cudaMemcpy(h_eps.data(), d_eigvals, n_emb * sizeof(real_t), cudaMemcpyDeviceToHost);
+        real_t gap = h_eps[n_emb_occ] - h_eps[n_emb_occ - 1];
+        const real_t target_gap = 0.5;  // Hartree
+        if (gap < target_gap) {
+            real_t shift = target_gap - gap;
+            for (int i = n_emb_occ; i < n_emb; i++) h_eps[i] += shift;
+            cudaMemcpy(d_eigvals, h_eps.data(), n_emb * sizeof(real_t), cudaMemcpyHostToDevice);
+            std::cout << "  [DMET-STEOM] HOMO-LUMO gap " << std::fixed << std::setprecision(4)
+                      << gap << " → " << target_gap << " Ha (level shift +" << shift << ")"
+                      << std::defaultfloat << std::endl;
+        }
+    }
+
+    // 3. C_canonical = C_emb × U   [nao × n_emb]
+    std::vector<real_t> h_eigvecs(n_emb * n_emb);
+    cudaMemcpy(h_eigvecs.data(), d_eigvecs, n_emb * n_emb * sizeof(real_t), cudaMemcpyDeviceToHost);
+    std::vector<real_t> h_C_can(nao * n_emb, 0.0);
+    for (int mu_idx = 0; mu_idx < nao; mu_idx++)
+        for (int i = 0; i < n_emb; i++) {
+            real_t val = 0.0;
+            for (int p = 0; p < n_emb; p++)
+                val += h_C_emb[mu_idx * n_emb + p] * h_eigvecs[p * n_emb + i];
+            h_C_can[mu_idx * n_emb + i] = val;
+        }
+    real_t* d_C_can = nullptr;
+    tracked_cudaMalloc(&d_C_can, nao * n_emb * sizeof(real_t));
+    cudaMemcpy(d_C_can, h_C_can.data(), nao * n_emb * sizeof(real_t), cudaMemcpyHostToDevice);
+
+    // 4. Cluster MO-ERI (rectangular AO→cluster-MO transform) + 5. cluster STEOM.
+    real_t* d_eri_mo = eri_method.build_mo_eri(d_C_can, n_emb);
+    STEOMResult r = steom_spatial_orbital(rhf_, eri_method, d_C_can, d_eigvals, d_eri_mo,
+                                          /*nao=*/nao, /*n_emb=*/n_emb,
+                                          /*n_emb_occ=*/n_emb_occ, n_states, n_frozen);
+
+    tracked_cudaFree(d_eigvals); tracked_cudaFree(d_eigvecs);
+    tracked_cudaFree(d_C_can);   tracked_cudaFree(d_eri_mo);
+    return r;
+}
+
+STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
+    const int nao  = num_basis_;
+    const int nocc = num_occ_;
+
+    std::cout << "\n==== DMET-STEOM-CCSD (Phase 1: single-shot μ=0 embedding) ====" << std::endl;
+    std::cout << "  nao=" << nao << " nocc=" << nocc << " num_atoms=" << num_atoms_ << std::endl;
+
+    // Chromophore fragment selection. With explicit --dmet_fragments, fragment 0
+    // is the chromophore (the rest enters via its Schmidt bath; only fragment 0 is
+    // solved). With no fragments, use the whole molecule → full-system reduction.
+    DMETFragment chromo;
+    const std::string& spec = rhf_.get_dmet_fragments_str();
+    if (spec.empty() || fragments_.empty()) {
+        std::cout << "  No --dmet_fragments given → whole-molecule cluster "
+                     "(plain STEOM reduction)." << std::endl;
+        chromo.atom_indices.resize(num_atoms_);
+        for (int a = 0; a < num_atoms_; ++a) chromo.atom_indices[a] = a;
+        const auto& a2b = rhf_.get_atom_to_basis_range();
+        for (int a = 0; a < num_atoms_; ++a)
+            for (size_t mu = a2b[a].start_index; mu < a2b[a].end_index; ++mu)
+                chromo.ao_indices.push_back((int)mu);
+        chromo.n_frag = (int)chromo.ao_indices.size();
+    } else {
+        if (fragments_.size() > 1)
+            std::cout << "  [DMET-STEOM] " << fragments_.size() << " fragments parsed; "
+                         "STEOM runs on fragment 0 (chromophore), the rest form its bath."
+                      << std::endl;
+        chromo = fragments_[0];
+    }
+    std::cout << "  Chromophore fragment: n_frag_ao=" << chromo.n_frag
+              << " (atoms:";
+    for (int a : chromo.atom_indices) std::cout << " " << a;
+    std::cout << ")" << std::endl;
+
+    rhf_.get_coefficient_matrix().toHost();
+    rhf_.get_fock_matrix().toHost();
+    rhf_.get_overlap_matrix().toHost();
+    const real_t* h_C = rhf_.get_coefficient_matrix().host_ptr();
+    const real_t* h_F = rhf_.get_fock_matrix().host_ptr();
+    const real_t* h_S = rhf_.get_overlap_matrix().host_ptr();
+
+    // Löwdin S^{1/2} / S^{-1/2} (same construction as compute_energy Phase A).
+    std::vector<real_t> S_half(nao * nao, 0.0), S_inv_half(nao * nao, 0.0);
+    {
+        std::vector<real_t> s_eigvals(nao), s_eigvecs(nao * nao);
+        real_t *d_S = nullptr, *d_sv = nullptr, *d_se = nullptr;
+        tracked_cudaMalloc(&d_S, nao * nao * sizeof(real_t));
+        tracked_cudaMalloc(&d_sv, nao * sizeof(real_t));
+        tracked_cudaMalloc(&d_se, nao * nao * sizeof(real_t));
+        cudaMemcpy(d_S, h_S, nao * nao * sizeof(real_t), cudaMemcpyHostToDevice);
+        gpu::eigenDecomposition(d_S, d_sv, d_se, nao);
+        cudaMemcpy(s_eigvals.data(), d_sv, nao * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(s_eigvecs.data(), d_se, nao * nao * sizeof(real_t), cudaMemcpyDeviceToHost);
+        tracked_cudaFree(d_S); tracked_cudaFree(d_sv); tracked_cudaFree(d_se);
+        for (int mu = 0; mu < nao; mu++)
+            for (int nu = 0; nu <= mu; nu++) {
+                real_t vh = 0.0, vi = 0.0;
+                for (int i = 0; i < nao; i++) {
+                    if (s_eigvals[i] > 1e-10) {
+                        real_t u = s_eigvecs[mu * nao + i] * s_eigvecs[nu * nao + i];
+                        vh += u * std::sqrt(s_eigvals[i]);
+                        vi += u / std::sqrt(s_eigvals[i]);
+                    }
+                }
+                S_half[mu * nao + nu] = vh; S_half[nu * nao + mu] = vh;
+                S_inv_half[mu * nao + nu] = vi; S_inv_half[nu * nao + mu] = vi;
+            }
+    }
+
+    // Schmidt bath for the chromophore (μ-independent).
+    auto [C_emb, n_emb_occ, n_frozen, n_core] = build_bath_orbitals(
+        chromo, h_C, S_inv_half.data(), S_half.data(), nao, nocc);
+    (void)n_core;
+
+    int n_emb = C_emb.empty() ? nao : (int)(C_emb.size() / nao);
+    if (!C_emb.empty()) {
+        int n_bath = n_emb - chromo.n_frag;
+        std::cout << "  n_frag=" << chromo.n_frag << " n_bath=" << n_bath
+                  << " n_emb=" << n_emb << " n_emb_occ=" << n_emb_occ
+                  << " n_frozen=" << n_frozen << std::endl;
+    }
+
+    return solve_fragment_steom(eri_method,
+                                C_emb.empty() ? nullptr : C_emb.data(),
+                                n_emb, n_emb_occ, n_frozen,
+                                h_F, chromo, n_states);
 }
 
 // ============================================================================

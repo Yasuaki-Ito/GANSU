@@ -17,6 +17,7 @@
 #include <string>
 #include <tuple>
 #include "types.hpp"
+#include "steom_result.hpp"   // STEOMResult (DMET-STEOM)
 
 namespace gansu {
 
@@ -46,6 +47,17 @@ public:
     /// @param with_triples When true, evaluate (T) perturbative correction per fragment
     ///                     at the final μ_DMET and add it to the returned correlation energy.
     real_t compute_energy(bool with_triples = false);
+
+    /// DMET-STEOM driver (AQUA/DMET_STEOM.md, Phase 1). Builds the ground-state
+    /// Schmidt bath (single-shot, μ=0) for the chromophore fragment and runs the
+    /// canonical cluster STEOM chain on it (steom_spatial_orbital). The chromophore
+    /// is fragment 0 of --dmet_fragments; if no fragments are given the cluster is
+    /// the whole molecule (build_bath_orbitals → is_full_system) and the result
+    /// reduces to plain STEOM bit-exact (Phase 0 anchor).
+    /// @param eri_method  non-const integral engine (the caller's ERI; used for
+    ///                    build_mo_eri + carried into steom_spatial_orbital).
+    /// @param n_states    number of excited states.
+    STEOMResult compute_steom(ERI& eri_method, int n_states);
 
 private:
     RHF& rhf_;
@@ -84,6 +96,20 @@ private:
         const real_t* h_fock,      // [nao × nao]
         const DMETFragment& frag,
         real_t mu = 0.0) const;
+
+    /// Solve cluster STEOM for one fragment (DMET-STEOM, μ=0 single-shot). Builds
+    /// the canonical cluster (C_emb → level-shift → C_can, ε) and the cluster
+    /// MO-ERI, then runs steom_spatial_orbital. When h_C_emb is empty (n_frag ==
+    /// nao ⇒ is_full_system) the cluster is the whole molecule (full RHF C/ε) and
+    /// the result equals plain STEOM bit-exact.
+    STEOMResult solve_fragment_steom(
+        ERI& eri_method,
+        const real_t* h_C_emb,     // [nao × n_emb], or empty for the full system
+        int n_emb, int n_emb_occ,
+        int n_frozen,
+        const real_t* h_fock,      // [nao × nao]
+        const DMETFragment& frag,
+        int n_states) const;
 
     // TODO: evaluate_at_mu for chemical potential optimization (requires stable Lambda/1-RDM)
 };

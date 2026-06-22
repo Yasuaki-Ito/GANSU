@@ -328,8 +328,8 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     }else if(post_hf_method_str == "dmet_steom" || post_hf_method_str == "dmet-steom"
              || post_hf_method_str == "dmet_steom_ccsd" || post_hf_method_str == "dmet-steom-ccsd"){
         std::cout << "Message: Post-HF method is DMET-STEOM-CCSD (AQUA/DMET_STEOM.md). "
-                     "Phase 0 = reduction test (cluster = whole molecule → must match STEOM-CCSD "
-                     "bit-exact); real fragmentation is Phase 1+." << std::endl;
+                     "Chromophore = fragment 0 of --dmet_fragments (rest = Schmidt bath, μ=0 "
+                     "single-shot); no fragments → whole-molecule cluster = plain STEOM." << std::endl;
         post_hf_method_ = PostHFMethod::DMET_STEOM;
     }else{
         throw std::runtime_error("Error: Unknown post-HF method: " + post_hf_method_str);

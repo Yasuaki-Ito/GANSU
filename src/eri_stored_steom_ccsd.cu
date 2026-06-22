@@ -45,6 +45,7 @@
 #include "rhf.hpp"
 #include "steom_ccsd_operator.hpp"
 #include "eom_chain_context.hpp"   // DMET-STEOM: standalone cluster electronic state
+#include "dmet.hpp"                // DMET-STEOM Phase 1: cluster embedding driver
 #include "steom_result.hpp"
 #include "davidson_solver.hpp"
 #include "device_host_memory.hpp"
@@ -1538,28 +1539,13 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
     return std::move(ctx.steom_result);
 }
 
-// DMET-STEOM driver (RI path). Phase 0 = REDUCTION TEST: the "cluster" is the
-// whole molecule (C_can = full canonical C, ε = full ε, n_emb = nao, MO-ERI =
-// full RI MO-ERI), so the standalone steom_spatial_orbital path must reproduce
-// ERI_RI_RHF::compute_steom_ccsd bit-exact — validating the entire
-// EOMChainContext plumbing. Real per-fragment embedding (build bath → cluster →
-// steom_spatial_orbital inside the DMET fragment loop) is Phase 1 (DMET_STEOM.md
-// §5); this entry establishes the bit-exact anchor first.
+// DMET-STEOM driver (RI path). Phase 1: build the chromophore fragment's
+// ground-state Schmidt bath (single-shot, μ=0) → canonical cluster → cluster
+// STEOM via steom_spatial_orbital (DMET::compute_steom). With no --dmet_fragments
+// the cluster is the whole molecule → plain STEOM bit-exact (Phase 0 anchor).
 void ERI_RI_RHF::compute_dmet_steom_ccsd(int n_states) {
-    std::cout << "\n==== DMET-STEOM-CCSD — Phase 0 reduction (cluster = whole molecule) ===="
-              << std::endl;
-    const int nao      = rhf_.get_num_basis();
-    const int full_occ = rhf_.get_num_electrons() / 2;
-    const int n_frozen = rhf_.get_num_frozen_core();
-    const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
-    const real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
-
-    real_t* d_eri_mo = build_mo_eri(d_C, nao);   // full RI MO-ERI = the cluster MO-ERI
-    STEOMResult r = steom_spatial_orbital(rhf_, *this, d_C, d_eps, d_eri_mo,
-                                          /*nao=*/nao, /*n_emb=*/nao,
-                                          /*n_emb_occ=*/full_occ, n_states, n_frozen);
-    tracked_cudaFree(d_eri_mo);
-
+    DMET dmet(rhf_, *this);
+    STEOMResult r = dmet.compute_steom(*this, n_states);
     rhf_.append_excited_state_report(r.report);
     rhf_.set_steom_result(std::move(r));
 }
