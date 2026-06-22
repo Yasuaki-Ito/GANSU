@@ -50,7 +50,8 @@ enum class PostHFMethod {
     IP_EOM_CCSD,  // Ionization-potential EOM-CCSD (bt-PNO-STEOM Phase P1, building block for ̂S^IP)
     EA_EOM_CCSD,  // Electron-affinity EOM-CCSD (bt-PNO-STEOM Phase P2, building block for ̂S^EA)
     STEOM_CCSD,   // Similarity Transformed EOM-CCSD (bt-PNO-STEOM Phase P3; auto-runs CIS_NTO + IP-EOM + EA-EOM as prerequisites)
-    DLPNO_STEOM_CCSD // Hybrid bt-PNO-STEOM (Phase P5b): DLPNO-CCSD ground state back-transformed to canonical, fed to canonical IP/EA/STEOM
+    DLPNO_STEOM_CCSD, // Hybrid bt-PNO-STEOM (Phase P5b): DLPNO-CCSD ground state back-transformed to canonical, fed to canonical IP/EA/STEOM
+    DMET_STEOM        // DMET-embedded cluster STEOM-CCSD (AQUA/DMET_STEOM.md). Phase 0 = reduction (cluster = whole molecule → bit-exact vs STEOM_CCSD)
 };
 
 } // namespace gansu

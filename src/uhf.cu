@@ -667,6 +667,7 @@ std::vector<double> UHF::compute_Energy_Gradient() {
             case PostHFMethod::EA_EOM_CCSD:   method_name = "EA-EOM-CCSD (RHF-only; not supported for UHF)"; break;
             case PostHFMethod::STEOM_CCSD:    method_name = "STEOM-CCSD (RHF-only; not supported for UHF)"; break;
             case PostHFMethod::DLPNO_STEOM_CCSD: method_name = "DLPNO-STEOM-CCSD (RHF-only; not supported for UHF)"; break;
+            case PostHFMethod::DMET_STEOM:    method_name = "DMET-STEOM-CCSD (RHF-only; not supported for UHF)"; break;
             case PostHFMethod::None:          method_name = "(none)"; break;
         }
         std::cout << "Post-HF method: " << method_name << std::endl;

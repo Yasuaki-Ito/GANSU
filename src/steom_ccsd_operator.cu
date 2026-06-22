@@ -3876,10 +3876,10 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     bmark("hhhp");
     // ---- phph (Eq.56-58) ----
     std::vector<real_t> u_amci((size_t)NV*NMo*NV*NO, 0.0); // [a][m][c][i]
-    std::vector<real_t> u_akei((size_t)NV*NO*NMv*NO, 0.0); // [a][k][e][i]
     std::vector<real_t> u_amei((size_t)NV*NMo*NMv*NO, 0.0);// [a][m][e][i]
+    // (u_akei[a][k][e][i] removed 2026-06-20: the g_phph EA route is now the simplified CFOUR-ujaie
+    //  assembled directly below, reusing the uakei_t4 GEMM. Saves an NV·NO·NMv·NO (~20 GB) alloc.)
     auto UAMCI=[&](int a,int m,int c,int i)->real_t&{ return u_amci[(((size_t)a*NMo+m)*NV+c)*NO+i]; };
-    auto UAKEI=[&](int a,int k,int e,int i)->real_t&{ return u_akei[(((size_t)a*NO+k)*NMv+e)*NO+i]; };
     auto UAMEI=[&](int a,int m,int e,int i)->real_t&{ return u_amei[(((size_t)a*NMo+m)*NMv+e)*NO+i]; };
     // GPU GEMM port of UAMCI T2+T3 (the largest phph host term, O(NO³·NV³)):
     //   ct[a,c,m,i] = Σ_{l,d}[ (2·wvovv(a,l,c,d)−wvovv(a,l,d,c))·siP(m,i,l,d)
@@ -4045,85 +4045,9 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         }
     }
 #endif
-    // GPU GEMM port of UAKEI T2+T3 (Σ_{l,d} over two seA index orders, O(NMv·NV²·NO³)):
-    //   T2a+T3: Σ_{ld}[2 wovoo(l,d,k,i) − wooov(l,k,i,d)]·seA(e,l,a,d)
-    //   T2b:   −Σ_{ld} wovoo(l,d,k,i)·seA(e,l,d,a)
-    //   C[(k,i),(e,a)] = A_comb·Bᵀ − A2·B2ᵀ, contract (l,d). Scattered into UAKEI(a,k,e,i).
-    const int KI_M23 = NO*NO, EA_N23 = NMv*NV, LD_K23 = NO*NV;
-    std::vector<real_t> ct_uakei_t23;
-    bool uakei_t23_gpu = false;
-#ifndef GANSU_CPU_ONLY
-    if (gpu::gpu_available()) {
-        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
-        std::vector<real_t> hAc((size_t)KI_M23*LD_K23), hA2((size_t)KI_M23*LD_K23),
-                            hB((size_t)EA_N23*LD_K23), hB2((size_t)EA_N23*LD_K23);
-        #pragma omp parallel for collapse(2)
-        for (int k=0;k<NO;++k) for (int i=0;i<NO;++i)
-            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) {
-                const size_t o=(size_t)(k*NO+i)*LD_K23+(l*NV+d);
-                hAc[o]=2.0*wovoo(l,d,k,i)-wooov(l,k,i,d); hA2[o]=wovoo(l,d,k,i);
-            }
-        #pragma omp parallel for collapse(2)
-        for (int e=0;e<NMv;++e) for (int a=0;a<NV;++a)
-            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) {
-                const size_t o=(size_t)(e*NV+a)*LD_K23+(l*NV+d);
-                hB[o]=seA(e,l,a,d); hB2[o]=seA(e,l,d,a);
-            }
-        real_t *dAc=nullptr,*dA2=nullptr,*dB=nullptr,*dB2=nullptr,*dC=nullptr;
-        tracked_cudaMalloc(&dAc,(size_t)KI_M23*LD_K23*sizeof(real_t));
-        tracked_cudaMalloc(&dA2,(size_t)KI_M23*LD_K23*sizeof(real_t));
-        tracked_cudaMalloc(&dB, (size_t)EA_N23*LD_K23*sizeof(real_t));
-        tracked_cudaMalloc(&dB2,(size_t)EA_N23*LD_K23*sizeof(real_t));
-        tracked_cudaMalloc(&dC, (size_t)KI_M23*EA_N23*sizeof(real_t));
-        cudaMemcpy(dAc,hAc.data(),(size_t)KI_M23*LD_K23*sizeof(real_t),cudaMemcpyHostToDevice);
-        cudaMemcpy(dA2,hA2.data(),(size_t)KI_M23*LD_K23*sizeof(real_t),cudaMemcpyHostToDevice);
-        cudaMemcpy(dB, hB.data(), (size_t)EA_N23*LD_K23*sizeof(real_t),cudaMemcpyHostToDevice);
-        cudaMemcpy(dB2,hB2.data(),(size_t)EA_N23*LD_K23*sizeof(real_t),cudaMemcpyHostToDevice);
-        const real_t one=1.0,negone=-1.0,zero=0.0;
-        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,EA_N23,KI_M23,LD_K23,&one,   dB, LD_K23,dAc,LD_K23,&zero,dC,EA_N23);
-        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,EA_N23,KI_M23,LD_K23,&negone,dB2,LD_K23,dA2,LD_K23,&one, dC,EA_N23);
-        ct_uakei_t23.assign((size_t)KI_M23*EA_N23,0.0);
-        cudaMemcpy(ct_uakei_t23.data(),dC,(size_t)KI_M23*EA_N23*sizeof(real_t),cudaMemcpyDeviceToHost);
-        tracked_cudaFree(dAc);tracked_cudaFree(dA2);tracked_cudaFree(dB);tracked_cudaFree(dB2);tracked_cudaFree(dC);
-        uakei_t23_gpu = true;
-        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
-            real_t dmax=0.0;
-            for (int e=0;e<NMv;e+=(NMv/2>0?NMv/2:1)) for (int a=0;a<NV;a+=(NV/2>0?NV/2:1))
-                for (int k=0;k<NO;++k) for (int i=0;i<NO;++i) {
-                    real_t t=0.0;
-                    for (int l=0;l<NO;++l) for(int d=0;d<NV;++d){
-                        const real_t st=2.0*seA(e,l,a,d)-seA(e,l,d,a);
-                        t += wovoo(l,d,k,i)*st - wooov(l,k,i,d)*seA(e,l,a,d);
-                    }
-                    dmax=std::max(dmax,std::fabs(t-ct_uakei_t23[(size_t)(k*NO+i)*EA_N23+(e*NV+a)]));
-                }
-            std::cout << "[W_eff_and_G self-check] UAKEI T2+T3 GEMM vs host: max|Δ| = "
-                      << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
-        }
-    }
-#endif
-    #pragma omp parallel for collapse(2)
-    for (int e=0;e<NMv;++e)
-        for (int a=0;a<NV;++a) for(int k=0;k<NO;++k) for(int i=0;i<NO;++i){
-            real_t t=0.0;
-            for (int c=0;c<NV;++c) t -= fov(k,c)*seA(e,i,a,c);                     // T1
-            if (uakei_t23_gpu) {
-                t += ct_uakei_t23[(size_t)(k*NO+i)*EA_N23+(e*NV+a)];              // T2+T3 (GEMM)
-            } else {
-                for (int l=0;l<NO;++l) for(int d=0;d<NV;++d){
-                    const real_t st = 2.0*seA(e,l,a,d)-seA(e,l,d,a);
-                    t += wovoo(l,d,k,i)*st;                                        // T2
-                    t -= wooov(l,k,i,d)*seA(e,l,a,d);                              // T3
-                }
-            }
-            if (uakei_t4_gpu) {
-                t += uakei_t4[(((size_t)a*NO+k)*NMv+e)*NO+i];                      // T4 (GEMM)
-            } else {
-                for (int c=0;c<NV;++c) for(int d=0;d<NV;++d)
-                    t += wvovv(a,k,c,d)*seA(e,i,c,d);                              // T4
-            }
-            UAKEI(a,k,e,i)=t;
-        }
+    // (old UAKEI T2+T3 GEMM + 4-term fallback removed 2026-06-20: the g_phph EA route is now
+    // the simplified CFOUR-ujaie computed directly in the assembly below, reusing the uakei_t4
+    // GEMM for its Wvovv term. u_akei[]/UAKEI() are now unused.)
     // GPU GEMM port of UAMEI T3+T4 (the last fully-host phph block, O(NMo·NMv·NV²·NO²)):
     //   T3:  Σ_{l,d} UMLID(m,l,i,d)·(2·seA(e,l,a,d)−seA(e,l,d,a))
     //   T4: −Σ_{l,d} UKMID(l,m,i,d)·seA(e,l,a,d)
@@ -4251,11 +4175,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     bmark("phph (UAMCI/UAKEI/UAMEI)");
     // ---- phhp (Eq.60-62) ----
     std::vector<real_t> u_bmjc((size_t)NV*NMo*NO*NV, 0.0); // [b][m][j][c]
-    std::vector<real_t> u_bkje((size_t)NV*NO*NO*NMv, 0.0); // [b][k][j][e]
-    std::vector<real_t> u_bmje((size_t)NV*NMo*NO*NMv, 0.0);// [b][m][j][e]
     auto UBMJC=[&](int b,int m,int j,int c)->real_t&{ return u_bmjc[(((size_t)b*NMo+m)*NO+j)*NV+c]; };
-    auto UBKJE=[&](int b,int k,int j,int e)->real_t&{ return u_bkje[(((size_t)b*NO+k)*NO+j)*NMv+e]; };
-    auto UBMJE=[&](int b,int m,int j,int e)->real_t&{ return u_bmje[(((size_t)b*NMo+m)*NO+j)*NMv+e]; };
     // GPU GEMM port of UBMJC Term1 (FIX 2026-06-20, g_phhp IP SO route -Wvovv·s):
     //   ct[b,c,m,j] = Σ_{k,d} wvovv(c,k,d,b)·siP(m,j,k,d)   (subtracted below)
     // A[(b,c),(k,d)] = wvovv(c,k,d,b), B[(m,j),(k,d)] = siP(m,j,k,d), contract (k,d).
@@ -4363,220 +4283,11 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                     t += 0.5*wooov(k,l,j,b)*siP(m,k,l,c);
             UBMJC(b,m,j,c)=t;
         }
-    // GPU GEMM port of UBKJE T2 (the largest phhp sub-term, mirror of UAKEI T4):
-    //   ct[b,k,j,e] = Σ_{c,d} wvovv(b,k,d,c)·seA(e,j,c,d)
-    // A[(b,k),(c,d)] = wvovv(b,k,d,c) (last-two transpose), B[(j,e),(c,d)] = seA(e,j,c,d).
-    // C[(b,k),(j,e)] = A·Bᵀ lands exactly in UBKJE layout (j*NMv+e), no scatter.
-    const int BK_M = NV*NO, JE_N = NO*NMv, CD_K = NV*NV;
-    std::vector<real_t> ct_ubkje;
-    bool ubkje_t2_gpu = false;
-#ifndef GANSU_CPU_ONLY
-    if (gpu::gpu_available()) {
-        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
-        std::vector<real_t> hA((size_t)BK_M*CD_K), hB((size_t)JE_N*CD_K);
-        #pragma omp parallel for collapse(2)
-        for (int b=0;b<NV;++b) for (int k=0;k<NO;++k)
-            for (int c=0;c<NV;++c) for (int d=0;d<NV;++d)
-                hA[(size_t)(b*NO+k)*CD_K+(c*NV+d)] = wvovv(b,k,d,c);
-        #pragma omp parallel for collapse(2)
-        for (int j=0;j<NO;++j) for (int e=0;e<NMv;++e)
-            for (int c=0;c<NV;++c) for (int d=0;d<NV;++d)
-                hB[(size_t)(j*NMv+e)*CD_K+(c*NV+d)] = seA(e,j,c,d);
-        real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
-        tracked_cudaMalloc(&dA,(size_t)BK_M*CD_K*sizeof(real_t));
-        tracked_cudaMalloc(&dB,(size_t)JE_N*CD_K*sizeof(real_t));
-        tracked_cudaMalloc(&dC,(size_t)BK_M*JE_N*sizeof(real_t));
-        cudaMemcpy(dA,hA.data(),(size_t)BK_M*CD_K*sizeof(real_t),cudaMemcpyHostToDevice);
-        cudaMemcpy(dB,hB.data(),(size_t)JE_N*CD_K*sizeof(real_t),cudaMemcpyHostToDevice);
-        const real_t one=1.0,zero=0.0;
-        // C_rm[M×N]=A·Bᵀ: cuBLAS(OP_T,OP_N, N, M, K, B, K, A, K, C, N).
-        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,JE_N,BK_M,CD_K,&one,dB,CD_K,dA,CD_K,&zero,dC,JE_N);
-        ct_ubkje.assign((size_t)BK_M*JE_N,0.0);
-        cudaMemcpy(ct_ubkje.data(),dC,(size_t)BK_M*JE_N*sizeof(real_t),cudaMemcpyDeviceToHost);
-        tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
-        ubkje_t2_gpu = true;
-        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
-            real_t dmax=0.0;
-            for (int b=0;b<NV;b+=(NV/2>0?NV/2:1)) for (int k=0;k<NO;++k)
-                for (int j=0;j<NO;++j) for (int e=0;e<NMv;e+=(NMv/2>0?NMv/2:1)) {
-                    real_t t=0.0; for (int d=0;d<NV;++d) for (int c=0;c<NV;++c) t += wvovv(b,k,d,c)*seA(e,j,c,d);
-                    dmax=std::max(dmax,std::fabs(t-ct_ubkje[(size_t)(b*NO+k)*JE_N+(j*NMv+e)]));
-                }
-            std::cout << "[W_eff_and_G self-check] UBKJE T2 GEMM vs host: max|Δ| = "
-                      << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
-        }
-    }
-#endif
-    // GPU GEMM port of UBKJE T3 (−Σ_{ld} wooov(l,k,j,d)·seA(e,l,d,b), mirror of UAKEI T3):
-    //   C[(k,j),(e,b)] = −Σ_{(l,d)} A[(k,j),(l,d)]·B[(e,b),(l,d)]  (= −A·Bᵀ, contract (l,d))
-    //   A[(k,j),(l,d)] = wooov(l,k,j,d),  B[(e,b),(l,d)] = seA(e,l,d,b)
-    const int KJ_M3 = NO*NO, EB_N3 = NMv*NV, LD_K3 = NO*NV;
-    std::vector<real_t> ct_ubkje_t3;
-    bool ubkje_t3_gpu = false;
-#ifndef GANSU_CPU_ONLY
-    if (gpu::gpu_available()) {
-        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
-        std::vector<real_t> hA((size_t)KJ_M3*LD_K3), hB((size_t)EB_N3*LD_K3);
-        #pragma omp parallel for collapse(2)
-        for (int k=0;k<NO;++k) for (int j=0;j<NO;++j)
-            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
-                hA[(size_t)(k*NO+j)*LD_K3+(l*NV+d)] = wooov(l,k,j,d);
-        #pragma omp parallel for collapse(2)
-        for (int e=0;e<NMv;++e) for (int b=0;b<NV;++b)
-            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
-                hB[(size_t)(e*NV+b)*LD_K3+(l*NV+d)] = seA(e,l,d,b);
-        real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
-        tracked_cudaMalloc(&dA,(size_t)KJ_M3*LD_K3*sizeof(real_t));
-        tracked_cudaMalloc(&dB,(size_t)EB_N3*LD_K3*sizeof(real_t));
-        tracked_cudaMalloc(&dC,(size_t)KJ_M3*EB_N3*sizeof(real_t));
-        cudaMemcpy(dA,hA.data(),(size_t)KJ_M3*LD_K3*sizeof(real_t),cudaMemcpyHostToDevice);
-        cudaMemcpy(dB,hB.data(),(size_t)EB_N3*LD_K3*sizeof(real_t),cudaMemcpyHostToDevice);
-        const real_t negone=-1.0,zero=0.0;
-        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,EB_N3,KJ_M3,LD_K3,&negone,dB,LD_K3,dA,LD_K3,&zero,dC,EB_N3);
-        ct_ubkje_t3.assign((size_t)KJ_M3*EB_N3,0.0);
-        cudaMemcpy(ct_ubkje_t3.data(),dC,(size_t)KJ_M3*EB_N3*sizeof(real_t),cudaMemcpyDeviceToHost);
-        tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
-        ubkje_t3_gpu = true;
-        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
-            real_t dmax=0.0;
-            for (int k=0;k<NO;++k) for (int j=0;j<NO;++j)
-                for (int e=0;e<NMv;e+=(NMv/2>0?NMv/2:1)) for (int b=0;b<NV;b+=(NV/2>0?NV/2:1)) {
-                    real_t t=0.0;
-                    for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) t -= wooov(l,k,j,d)*seA(e,l,d,b);
-                    dmax=std::max(dmax,std::fabs(t-ct_ubkje_t3[(size_t)(k*NO+j)*EB_N3+(e*NV+b)]));
-                }
-            std::cout << "[W_eff_and_G self-check] UBKJE T3 GEMM vs host: max|Δ| = "
-                      << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
-        }
-    }
-#endif
-    #pragma omp parallel for collapse(2)
-    for (int e=0;e<NMv;++e)
-        for (int b=0;b<NV;++b) for(int k=0;k<NO;++k) for(int j=0;j<NO;++j){
-            real_t t=0.0;
-            for (int d=0;d<NV;++d) t += fov(k,d)*seA(e,j,d,b);                     // T1
-            if (ubkje_t2_gpu) {
-                t += ct_ubkje[(size_t)(b*NO+k)*JE_N+(j*NMv+e)];                    // T2 (GEMM)
-            } else {
-                for (int d=0;d<NV;++d) for(int c=0;c<NV;++c)
-                    t += wvovv(b,k,d,c)*seA(e,j,c,d);                              // T2
-            }
-            if (ubkje_t3_gpu) {
-                t += ct_ubkje_t3[(size_t)(k*NO+j)*EB_N3+(e*NV+b)];                 // T3 (GEMM)
-            } else {
-                for (int l=0;l<NO;++l) for(int d=0;d<NV;++d)
-                    t -= wooov(l,k,j,d)*seA(e,l,d,b);                              // T3
-            }
-            UBKJE(b,k,j,e)=t;
-        }
-    // GPU GEMM port of UBMJE T3 (Σ_{k,l} UKLIE(k,l,j,e)·siP(m,k,l,b), contract (k,l)):
-    //   C[(e,j),(m,b)] = A·Bᵀ; A[(e,j),(k,l)]=UKLIE(k,l,j,e), B[(m,b),(k,l)]=siP(m,k,l,b).
-    std::vector<real_t> ct_ubmje_t3;
-    bool ubmje_t3_gpu = false;
-#ifndef GANSU_CPU_ONLY
-    if (gpu::gpu_available()) {
-        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
-        const int EJ=NMv*NO, MB=NMo*NV, KL=NO*NO;
-        std::vector<real_t> hA((size_t)EJ*KL), hB((size_t)MB*KL);
-        #pragma omp parallel for collapse(2)
-        for (int e=0;e<NMv;++e) for (int j=0;j<NO;++j)
-            for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
-                hA[(size_t)(e*NO+j)*KL+(k*NO+l)] = UKLIE(k,l,j,e);
-        #pragma omp parallel for collapse(2)
-        for (int m=0;m<NMo;++m) for (int b=0;b<NV;++b)
-            for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
-                hB[(size_t)(m*NV+b)*KL+(k*NO+l)] = siP(m,k,l,b);
-        real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
-        tracked_cudaMalloc(&dA,(size_t)EJ*KL*sizeof(real_t));
-        tracked_cudaMalloc(&dB,(size_t)MB*KL*sizeof(real_t));
-        tracked_cudaMalloc(&dC,(size_t)EJ*MB*sizeof(real_t));
-        cudaMemcpy(dA,hA.data(),(size_t)EJ*KL*sizeof(real_t),cudaMemcpyHostToDevice);
-        cudaMemcpy(dB,hB.data(),(size_t)MB*KL*sizeof(real_t),cudaMemcpyHostToDevice);
-        const real_t one=1.0,zero=0.0;
-        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,MB,EJ,KL,&one,dB,KL,dA,KL,&zero,dC,MB);
-        ct_ubmje_t3.assign((size_t)EJ*MB,0.0);
-        cudaMemcpy(ct_ubmje_t3.data(),dC,(size_t)EJ*MB*sizeof(real_t),cudaMemcpyDeviceToHost);
-        tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
-        ubmje_t3_gpu=true;
-        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
-            real_t dmax=0.0;
-            for (int e=0;e<NMv;e+=(NMv/2>0?NMv/2:1)) for (int j=0;j<NO;++j)
-                for (int m=0;m<NMo;++m) for (int b=0;b<NV;b+=(NV/2>0?NV/2:1)) {
-                    real_t t=0.0;
-                    for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
-                        t += UKLIE(k,l,j,e)*siP(m,k,l,b);
-                    dmax=std::max(dmax,std::fabs(t-ct_ubmje_t3[(size_t)(e*NO+j)*MB+(m*NV+b)]));
-                }
-            std::cout << "[W_eff_and_G self-check] UBMJE T3 GEMM vs host: max|Δ| = "
-                      << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
-        }
-    }
-#endif
-    // GPU GEMM port of UBMJE T4 (−Σ_{l,d} UMLID(m,l,j,d)·seA(e,l,d,b), contract (l,d)):
-    //   C[(m,j),(e,b)] = A·Bᵀ; A[(m,j),(l,d)]=UMLID(m,l,j,d), B[(e,b),(l,d)]=seA(e,l,d,b).
-    std::vector<real_t> ct_ubmje_t4;
-    bool ubmje_t4_gpu = false;
-#ifndef GANSU_CPU_ONLY
-    if (gpu::gpu_available()) {
-        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
-        const int MJ=NMo*NO, EB=NMv*NV, LD=NO*NV;
-        std::vector<real_t> hA((size_t)MJ*LD), hB((size_t)EB*LD);
-        #pragma omp parallel for collapse(2)
-        for (int m=0;m<NMo;++m) for (int j=0;j<NO;++j)
-            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
-                hA[(size_t)(m*NO+j)*LD+(l*NV+d)] = UMLID(m,l,j,d);
-        #pragma omp parallel for collapse(2)
-        for (int e=0;e<NMv;++e) for (int b=0;b<NV;++b)
-            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
-                hB[(size_t)(e*NV+b)*LD+(l*NV+d)] = seA(e,l,d,b);
-        real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
-        tracked_cudaMalloc(&dA,(size_t)MJ*LD*sizeof(real_t));
-        tracked_cudaMalloc(&dB,(size_t)EB*LD*sizeof(real_t));
-        tracked_cudaMalloc(&dC,(size_t)MJ*EB*sizeof(real_t));
-        cudaMemcpy(dA,hA.data(),(size_t)MJ*LD*sizeof(real_t),cudaMemcpyHostToDevice);
-        cudaMemcpy(dB,hB.data(),(size_t)EB*LD*sizeof(real_t),cudaMemcpyHostToDevice);
-        const real_t one=1.0,zero=0.0;
-        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,EB,MJ,LD,&one,dB,LD,dA,LD,&zero,dC,EB);
-        ct_ubmje_t4.assign((size_t)MJ*EB,0.0);
-        cudaMemcpy(ct_ubmje_t4.data(),dC,(size_t)MJ*EB*sizeof(real_t),cudaMemcpyDeviceToHost);
-        tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
-        ubmje_t4_gpu=true;
-        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
-            real_t dmax=0.0;
-            for (int m=0;m<NMo;++m) for (int j=0;j<NO;++j)
-                for (int e=0;e<NMv;e+=(NMv/2>0?NMv/2:1)) for (int b=0;b<NV;b+=(NV/2>0?NV/2:1)) {
-                    real_t t=0.0;
-                    for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
-                        t += UMLID(m,l,j,d)*seA(e,l,d,b);
-                    dmax=std::max(dmax,std::fabs(t-ct_ubmje_t4[(size_t)(m*NO+j)*EB+(e*NV+b)]));
-                }
-            std::cout << "[W_eff_and_G self-check] UBMJE T4 GEMM vs host: max|Δ| = "
-                      << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
-        }
-    }
-#endif
-    #pragma omp parallel for collapse(2)
-    for (int m=0;m<NMo;++m) for(int e=0;e<NMv;++e)
-        for (int b=0;b<NV;++b) for(int j=0;j<NO;++j){
-            real_t t=0.0;
-            for (int d=0;d<NV;++d) t += u_ma[(size_t)m*NV+d]*seA(e,j,d,b);         // T1
-            for (int k=0;k<NO;++k) t -= u_ie[(size_t)k*NMv+e]*siP(m,k,j,b);        // T2
-            if (ubmje_t3_gpu) {
-                t += ct_ubmje_t3[(size_t)(e*NO+j)*(NMo*NV)+(m*NV+b)];              // T3 (GEMM)
-            } else {
-                for (int k=0;k<NO;++k) for(int l=0;l<NO;++l)
-                    t += UKLIE(k,l,j,e)*siP(m,k,l,b);                              // T3
-            }
-            if (ubmje_t4_gpu) {
-                t -= ct_ubmje_t4[(size_t)(m*NO+j)*(NMv*NV)+(e*NV+b)];              // T4 (GEMM)
-            } else {
-                for (int l=0;l<NO;++l) for(int d=0;d<NV;++d)
-                    t -= UMLID(m,l,j,d)*seA(e,l,d,b);                              // T4
-            }
-            UBMJE(b,m,j,e)=t;
-        }
+    // (UBKJE T2/T3 + UBMJE T3/T4 GEMMs and fallbacks removed 2026-06-20: their u_bkje/u_bmje
+    //  outputs were the g_phhp EA + cross routes, both ZEROED in the assembly below since the
+    //  base wovvo + UBMJC IP route already matches ORCA. UKLIE/UMLID/u_ma/u_ie stay for UAMEI.)
 
-    bmark("phhp (UBMJC/UBKJE/UBMJE)");
+    bmark("phhp (UBMJC)");
     // ---- assemble g_phph[a,k,c,i] (Eq.59) and g_phhp[b,k,j,c] (Eq.63) ----
     std::vector<real_t> g_phph((size_t)NV*NO*NV*NO, 0.0);
     std::vector<real_t> g_phhp((size_t)NV*NO*NO*NV, 0.0);
@@ -4587,28 +4298,26 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     for (int m=0;m<NMo;++m){ const int kf=active_occ_idx_[m];
         for(int a=0;a<NV;++a) for(int c=0;c<NV;++c) for(int i=0;i<NO;++i)
             GPHPH(a,kf,c,i)+=UAMCI(a,m,c,i); }
-    // u_akei FIX 2026-06-20: g_phph EA route = CFOUR ujaie (0.5A+0.5B), scattered root -> FIRST
-    // vir index af (NOT the old UAKEI third-index scatter; the old UAKEI GEMMs/fallback above are
-    // now DEAD — remove after ORCA validation). Matches Python build_g_canonical_full u_akei
-    // (per-root form): blk[I,B,J]=0.5(A+B), GPHPH(af,k,c,i) += blk[i,c,k].  seA(e,J,F,B), ss=spinad
-    // on the vir pair, wn=2*Wooov-Wooov.swap(occ pair).
+    // u_akei (g_phph EA route = CFOUR ujaie), scattered root -> FIRST vir index af. The 6-term
+    // 0.5(A+B) collapses algebraically (spinad cancellation, verified vs Python 1e-14) to 4 clean
+    // contractions: GPHPH(af,k,c,i) += Σ_F seA(e,k,c,F)·fov(i,F)            [Fov]
+    //   + Σ_{G,F} seA(e,k,G,F)·wvovv(c,i,G,F)                                [Wvovv, = UAKEI-T4 GEMM]
+    //   + Σ_{N,F}(2seA(e,N,c,F)-seA(e,N,F,c))·wooov(i,N,k,F) - Σ_{N,F} seA(e,N,c,F)·wooov(N,i,k,F) [Wooov]
+    // The Wvovv term reuses the existing uakei_t4 GEMM (Σ_cd wvovv(a,k,c,d)·seA(e,i,c,d)); with
+    // (a,k,e,i)->(c,i,e,k) it equals the Wvovv contraction here.
     for (int e=0;e<NMv;++e){ const int af=active_vir_idx_[e];
         for(int k=0;k<NO;++k) for(int c=0;c<NV;++c) for(int i=0;i<NO;++i){
             real_t v=0.0;
-            for(int F=0;F<NV;++F){                                         // A1 + B1 (Fov)
-                const real_t sA=seA(e,k,F,c);
-                const real_t sB=2.0*seA(e,k,c,F)-seA(e,k,F,c);
-                v += 0.5*(sA+sB)*fov(i,F);
+            for(int F=0;F<NV;++F) v += seA(e,k,c,F)*fov(i,F);              // Fov
+            if (uakei_t4_gpu) {                                            // Wvovv (GEMM reuse)
+                v += uakei_t4[(((size_t)c*NO+i)*NMv+e)*NO+k];
+            } else {
+                for(int G=0;G<NV;++G) for(int F=0;F<NV;++F)
+                    v += seA(e,k,G,F)*wvovv(c,i,G,F);
             }
-            for(int G=0;G<NV;++G) for(int Fi=0;Fi<NV;++Fi){               // A2 + B2 (Wvovv)
-                v += 0.5*seA(e,k,G,Fi)*wvovv(c,i,Fi,G);
-                v += 0.5*(2.0*seA(e,k,G,Fi)-seA(e,k,Fi,G))*wvovv(c,i,G,Fi);
-            }
-            for(int N=0;N<NO;++N) for(int Fi=0;Fi<NV;++Fi){              // A3 + B3 (Wooov)
-                v -= 0.5*seA(e,N,Fi,c)*wooov(N,i,k,Fi);
-                const real_t ssN=2.0*seA(e,N,c,Fi)-seA(e,N,Fi,c);
-                const real_t wnv=2.0*wooov(i,N,k,Fi)-wooov(N,i,k,Fi);
-                v += 0.5*ssN*wnv;
+            for(int N=0;N<NO;++N) for(int F=0;F<NV;++F){                   // Wooov (2 terms)
+                v += (2.0*seA(e,N,c,F)-seA(e,N,F,c))*wooov(i,N,k,F);
+                v -= seA(e,N,c,F)*wooov(N,i,k,F);
             }
             GPHPH(af,k,c,i)+=v;
         }
@@ -4624,7 +4333,6 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     // u_bkje (g_phhp EA) and u_bmje (g_phhp cross) ZEROED 2026-06-20: old forms buggy; base+IP
     // (UBMJC) already matches ORCA on H2O/CH2O (n->pi* 0.04-0.08 eV). The correct small EA route
     // is derived in memory pt41 but adding it lands at the 2nd-order {e^S}, below ORCA (pt42).
-    // (void)UBKJE; (void)UBMJE; -- their GEMMs/fallbacks above are now dead, remove after validate.
 
     bmark("assemble g_phph/g_phhp");
     // ---- G^{1h1p} singlet: row=i*NV+a, col=j*NV+b ----

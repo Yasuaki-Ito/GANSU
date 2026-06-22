@@ -1002,6 +1002,7 @@ private:
     void compute_ea_eom_ccsd(int n_states) override;   // bt-PNO-STEOM P4 (RI path)
     void compute_steom_ccsd(int n_states) override;    // bt-PNO-STEOM P4 (RI path, auto-runs P0/P1/P2)
     void compute_dlpno_steom_ccsd(int n_states) override;  // hybrid bt-PNO-STEOM P5b
+    void compute_dmet_steom_ccsd(int n_states) override;   // DMET-STEOM (Phase 0 reduction = whole-molecule cluster)
     void compute_adc2(int n_states) override;
     void compute_sos_adc2(int n_states) override;
     void compute_sos_laplace_adc2(int n_states) override;

@@ -325,6 +325,12 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
                      "DLPNO-CCSD ground state back-transformed to canonical, fed to canonical "
                      "CIS-NTO + IP-EOM + EA-EOM + STEOM." << std::endl;
         post_hf_method_ = PostHFMethod::DLPNO_STEOM_CCSD;
+    }else if(post_hf_method_str == "dmet_steom" || post_hf_method_str == "dmet-steom"
+             || post_hf_method_str == "dmet_steom_ccsd" || post_hf_method_str == "dmet-steom-ccsd"){
+        std::cout << "Message: Post-HF method is DMET-STEOM-CCSD (AQUA/DMET_STEOM.md). "
+                     "Phase 0 = reduction test (cluster = whole molecule → must match STEOM-CCSD "
+                     "bit-exact); real fragmentation is Phase 1+." << std::endl;
+        post_hf_method_ = PostHFMethod::DMET_STEOM;
     }else{
         throw std::runtime_error("Error: Unknown post-HF method: " + post_hf_method_str);
     }

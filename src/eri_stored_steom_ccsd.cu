@@ -44,6 +44,7 @@
 
 #include "rhf.hpp"
 #include "steom_ccsd_operator.hpp"
+#include "eom_chain_context.hpp"   // DMET-STEOM: standalone cluster electronic state
 #include "steom_result.hpp"
 #include "davidson_solver.hpp"
 #include "device_host_memory.hpp"
@@ -397,10 +398,19 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                                     ERI& eri_method,
                                     const real_t* d_eri_ao,
                                     int n_states_requested,
-                                    real_t* d_eri_mo_precomputed = nullptr)
+                                    real_t* d_eri_mo_precomputed = nullptr,
+                                    EOMChainContext* ctx = nullptr)
 {
     PROFILE_FUNCTION();
 
+    // DMET-STEOM: when ctx is non-null this is a standalone CLUSTER STEOM run.
+    // The composite chain (CIS-NTO → IP-EOM → EA-EOM) is driven via the
+    // ctx-aware cluster-stage free functions over the precomputed cluster MO-ERI
+    // (`d_eri_mo_precomputed`) instead of the polymorphic eri_method dispatch;
+    // the cluster electronic state + inter-stage results live in `ctx`, while
+    // `rhf` supplies read-only config. The multi-GPU auto-scale / device-balance
+    // / MPI-split / share-barH machinery is bypassed (a cluster is small and
+    // single-GPU). `ctx == nullptr` ⇒ byte-identical legacy plain-STEOM path.
     const int verbose = rhf.get_steom_verbose();
 
     // Sub-phase 3.12 (early stub): spin warn-and-ignore.
@@ -426,7 +436,7 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // tetracene 30 GB single-GPU); A100 80GB ⇒ 32 GB (anthracene 28 GB single-GPU,
     // keeping the share-barH fast path).
 #ifndef GANSU_CPU_ONLY
-    if (gpu::gpu_available() && rhf.get_num_gpus() > 1) {
+    if (!ctx && gpu::gpu_available() && rhf.get_num_gpus() > 1) {   // cluster: small, single-GPU → no auto-scale
         const int full_occ = rhf.get_num_electrons() / 2;
         const size_t nv = static_cast<size_t>(rhf.get_num_basis() - full_occ);
         const size_t vvvv_bytes = nv * nv * nv * nv * sizeof(real_t);
@@ -514,7 +524,12 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     mpi_barh_xfer = mpi_steom;
 #endif
 
-    {
+    // DMET-STEOM cluster: run a single self-contained STEOM (no MPI IP||EA split,
+    // no cross-operator bar-H sharing — ctx->share_barh stays false). Fragment-
+    // parallelism is handled one level up (DMET fragment loop / MPI rank=fragment).
+    if (ctx) { mpi_steom = false; mpi_barh_xfer = false; }
+
+    if (!ctx) {
         const char* env     = std::getenv("GANSU_STEOM_SHARE_BARH");
         const char* env_bal = std::getenv("GANSU_STEOM_OPERATOR_DEVICE_BALANCING");
         const bool balancing = (env_bal && env_bal[0] == '1');
@@ -562,11 +577,14 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 
     // Stage 1/3 — CIS-NTO active space.
     if (!mpi_steom) {
-        if (rhf.get_cis_nto_result().n_act_occ == 0) {
+        const bool need_cis = ctx ? (ctx->cis_nto_result.n_act_occ == 0)
+                                   : (rhf.get_cis_nto_result().n_act_occ == 0);
+        if (need_cis) {
             int n_cis = rhf.get_steom_n_root_cis();
             if (n_cis <= 0) n_cis = n_states_requested + 4;  // STEOM.md §7.3 default
             std::cout << "\n---- STEOM-CCSD composite dispatch: stage 1/3 = CIS-NTO active space ----" << std::endl;
-            eri_method.compute_cis_nto(n_cis);
+            if (ctx) compute_cluster_cis_nto(rhf, *ctx, d_eri_mo_precomputed, n_cis);
+            else     eri_method.compute_cis_nto(n_cis);
         }
     }
 #ifdef GANSU_MPI
@@ -592,15 +610,21 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     const bool do_ip = (!mpi_steom) || (mpi_rank == 0);
     const bool do_ea = (!mpi_steom) || (mpi_rank == 1);
 
-    if (do_ip && rhf.get_ip_eom_result().per_active.empty()) {
+    const bool need_ip = ctx ? ctx->ip_eom_result.per_active.empty()
+                              : rhf.get_ip_eom_result().per_active.empty();
+    if (do_ip && need_ip) {
         std::cout << "\n---- STEOM-CCSD composite dispatch: stage 2/3 = IP-EOM-CCSD (per active occ NTO)"
                   << (mpi_steom ? " [rank 0]" : "") << " ----" << std::endl;
-        eri_method.compute_ip_eom_ccsd(n_states_requested);
+        if (ctx) compute_cluster_ip_eom_ccsd(rhf, *ctx, d_eri_mo_precomputed, n_states_requested);
+        else     eri_method.compute_ip_eom_ccsd(n_states_requested);
     }
-    if (do_ea && rhf.get_ea_eom_result().per_active.empty()) {
+    const bool need_ea = ctx ? ctx->ea_eom_result.per_active.empty()
+                              : rhf.get_ea_eom_result().per_active.empty();
+    if (do_ea && need_ea) {
         std::cout << "\n---- STEOM-CCSD composite dispatch: stage 3/3 = EA-EOM-CCSD (per active vir NTO)"
                   << (mpi_steom ? " [rank 1]" : "") << " ----" << std::endl;
-        eri_method.compute_ea_eom_ccsd(n_states_requested);
+        if (ctx) compute_cluster_ea_eom_ccsd(rhf, *ctx, d_eri_mo_precomputed, n_states_requested);
+        else     eri_method.compute_ea_eom_ccsd(n_states_requested);
     }
 
 #ifdef GANSU_MPI
@@ -657,9 +681,9 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 #endif
 
     // Sanity check — both per_active vectors must now have entries.
-    const IPEOMResult& ip_result = rhf.get_ip_eom_result();
-    const EAEOMResult& ea_result = rhf.get_ea_eom_result();
-    const CISNTOResult& cis_nto  = rhf.get_cis_nto_result();
+    const IPEOMResult& ip_result = ctx ? ctx->ip_eom_result : rhf.get_ip_eom_result();
+    const EAEOMResult& ea_result = ctx ? ctx->ea_eom_result : rhf.get_ea_eom_result();
+    const CISNTOResult& cis_nto  = ctx ? ctx->cis_nto_result : rhf.get_cis_nto_result();
     if (ip_result.per_active.empty() || ea_result.per_active.empty()) {
         throw std::runtime_error(
             "STEOM-CCSD: P1 IP-EOM and/or P2 EA-EOM did not populate per_active "
@@ -668,7 +692,7 @@ static void compute_steom_ccsd_impl(RHF& rhf,
             "--cis_nto_o_thresh / --cis_nto_v_thresh.");
     }
 
-    const int num_frozen   = rhf.get_num_frozen_core();
+    const int num_frozen   = ctx ? ctx->get_num_frozen_core() : rhf.get_num_frozen_core();
     const int nocc_active  = ip_result.nocc_active;
     const int nvir         = ip_result.nvir;
     const int nao_active   = nocc_active + nvir;
@@ -870,16 +894,16 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // optimization can pipe T1/T2 between phases to avoid the triple solve.
     // ----------------------------------------------------------------------
     Timer ccsd_timer;
-    const int full_occ = rhf.get_num_electrons() / 2;
-    const int num_basis = rhf.get_num_basis();
-    DeviceHostMatrix<real_t>& coefficient_matrix = rhf.get_coefficient_matrix();
-    DeviceHostMemory<real_t>& orbital_energies   = rhf.get_orbital_energies();
+    const int full_occ = (ctx ? ctx->get_num_electrons() : rhf.get_num_electrons()) / 2;
+    const int num_basis = ctx ? ctx->get_num_basis() : rhf.get_num_basis();
+    DeviceHostMatrix<real_t>& coefficient_matrix = ctx ? *ctx->C   : rhf.get_coefficient_matrix();
+    DeviceHostMemory<real_t>& orbital_energies   = ctx ? *ctx->eps : rhf.get_orbital_energies();
     const real_t* d_C   = coefficient_matrix.device_ptr();
     const real_t* d_eps = orbital_energies.device_ptr();
 
     real_t* d_t1 = nullptr;
     real_t* d_t2 = nullptr;
-    if (rhf.use_dlpno_amplitudes()) {
+    if (ctx ? ctx->use_dlpno_amplitudes : rhf.use_dlpno_amplitudes()) {
         // Hybrid DLPNO-STEOM (P5b): inject DLPNO-CCSD T1/T2 (canonical, own copy).
         const BTAmplitudes& bt = rhf.get_dlpno_bt_amplitudes();
         if (bt.nocc != nocc_active || bt.nvir != nvir)
@@ -915,7 +939,7 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // block path is no longer gated on num_frozen==0 (avoids the nao⁴ tensor).
     const ERI_RI* eri_ri_block = nullptr;
     const real_t* d_B_mo_blocks = nullptr;
-    if (rhf.use_dlpno_amplitudes() && gpu::gpu_available()) {
+    if ((ctx ? ctx->use_dlpno_amplitudes : rhf.use_dlpno_amplitudes()) && gpu::gpu_available()) {
         eri_ri_block = dynamic_cast<const ERI_RI*>(&eri_method);
         if (eri_ri_block) {
             d_B_mo_blocks = eri_ri_block->build_B_mo(d_C, num_basis);
@@ -982,7 +1006,7 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     int  steom_dev_balance_restore = 0;
     int  steom_dev_balance_target  = 0;
 #ifndef GANSU_CPU_ONLY
-    if (gpu::gpu_available()) {
+    if (!ctx && gpu::gpu_available()) {   // cluster: small, single-GPU → no device audit/balance
         const size_t tracked_global = GlobalGpuMemoryTracker::get_current();
         const size_t tracked_peak   = GlobalGpuMemoryTracker::get_peak();
         const size_t nvir_sz = (size_t)nvir * nvir * nvir * nvir * sizeof(real_t);
@@ -1151,7 +1175,8 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                                steom_d_eri_vvvv_slabs.empty()
                                    ? nullptr : &steom_d_eri_vvvv_slabs,
                                // (A) shared bar-H: borrow all 11, skip build_dressed
-                               rhf.steom_share_barh() ? &rhf.steom_barh_cache() : nullptr,
+                               (ctx ? ctx->share_barh : rhf.steom_share_barh())
+                                   ? (ctx ? &ctx->barh : &rhf.steom_barh_cache()) : nullptr,
                                // Frozen core: block ranges read [num_frozen, num_basis)
                                // of the full-C B_mo (only used on the block path).
                                num_frozen);
@@ -1422,8 +1447,10 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     result.report = os.str();
     std::cout << result.report;
 
-    rhf.append_excited_state_report(result.report);
-    rhf.set_steom_result(std::move(result));
+    if (ctx) { ctx->excited_state_report += result.report;
+               ctx->steom_result = std::move(result); }
+    else     { rhf.append_excited_state_report(result.report);
+               rhf.set_steom_result(std::move(result)); }
 
     // (A) shared bar-H: release the cache device buffers. Safe here — the STEOM
     // operator only reads bar-H during its build (build_F_eff_*/build_W_eff_and_G);
@@ -1431,7 +1458,9 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // the borrowed bar-H pointers are no longer referenced. steom_op (still in
     // scope) borrowed them and its dtor skips freeing (barh_borrowed_), so this is
     // the single owner-side release with no double-free.
-    if (rhf.steom_share_barh()) {
+    if (ctx) {
+        if (ctx->share_barh) { ctx->barh.free(); ctx->share_barh = false; }
+    } else if (rhf.steom_share_barh()) {
         rhf.steom_barh_cache().free();
         rhf.set_steom_share_barh(false);
     }
@@ -1468,6 +1497,71 @@ void ERI_RI_RHF::compute_steom_ccsd(int n_states) {
     real_t* d_eri_mo = build_mo_eri(d_C, num_basis);
     compute_steom_ccsd_impl(rhf_, *this, /*d_eri_ao=*/nullptr, n_states, d_eri_mo);
     tracked_cudaFree(d_eri_mo);
+}
+
+// DMET-STEOM standalone cluster entry (declared in eom_chain_context.hpp). Wraps
+// the raw cluster arrays in an EOMChainContext + DeviceHostMatrix views and runs
+// the canonical STEOM chain over the precomputed cluster MO-ERI. The full chain
+// (CIS-NTO/IP/EA/STEOM) reads its electronic state from ctx, never from `cfg`
+// (which supplies only config + AO basis). Mirrors ccsd_spatial_orbital (dmet.cu).
+STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
+                                  const real_t* d_C_can,
+                                  const real_t* d_eps,
+                                  real_t* d_eri_mo,
+                                  int nao, int n_emb, int n_emb_occ,
+                                  int n_states, int n_frozen)
+{
+    PROFILE_FUNCTION();
+    if (n_emb_occ <= n_frozen || n_emb_occ >= n_emb)
+        throw std::runtime_error("steom_spatial_orbital: invalid cluster occupation "
+            "(need n_frozen < n_emb_occ < n_emb).");
+
+    // Own the cluster C / ε in DeviceHostMatrix views (the chain calls
+    // .device_ptr()/.toHost()/.host_ptr() on them). Device→device copy from the
+    // caller's buffers; the views free on scope exit, after the chain returns.
+    DeviceHostMatrix<real_t> C(static_cast<size_t>(nao), static_cast<size_t>(n_emb));
+    DeviceHostMemory<real_t> eps(static_cast<size_t>(n_emb));
+    cudaMemcpy(C.device_ptr(),  d_C_can, (size_t)nao * n_emb * sizeof(real_t), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(eps.device_ptr(), d_eps,  (size_t)n_emb        * sizeof(real_t), cudaMemcpyDeviceToDevice);
+
+    EOMChainContext ctx;
+    ctx.C        = &C;
+    ctx.eps      = &eps;
+    ctx.nmo      = n_emb;
+    ctx.n_elec   = 2 * n_emb_occ;
+    ctx.n_frozen = n_frozen;
+    ctx.nao_ao   = nao;   // == n_emb on the Phase-0 reduction test (square cluster C)
+
+    compute_steom_ccsd_impl(cfg, eri_method, /*d_eri_ao=*/nullptr, n_states,
+                            /*d_eri_mo_precomputed=*/d_eri_mo, &ctx);
+
+    return std::move(ctx.steom_result);
+}
+
+// DMET-STEOM driver (RI path). Phase 0 = REDUCTION TEST: the "cluster" is the
+// whole molecule (C_can = full canonical C, ε = full ε, n_emb = nao, MO-ERI =
+// full RI MO-ERI), so the standalone steom_spatial_orbital path must reproduce
+// ERI_RI_RHF::compute_steom_ccsd bit-exact — validating the entire
+// EOMChainContext plumbing. Real per-fragment embedding (build bath → cluster →
+// steom_spatial_orbital inside the DMET fragment loop) is Phase 1 (DMET_STEOM.md
+// §5); this entry establishes the bit-exact anchor first.
+void ERI_RI_RHF::compute_dmet_steom_ccsd(int n_states) {
+    std::cout << "\n==== DMET-STEOM-CCSD — Phase 0 reduction (cluster = whole molecule) ===="
+              << std::endl;
+    const int nao      = rhf_.get_num_basis();
+    const int full_occ = rhf_.get_num_electrons() / 2;
+    const int n_frozen = rhf_.get_num_frozen_core();
+    const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
+    const real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
+
+    real_t* d_eri_mo = build_mo_eri(d_C, nao);   // full RI MO-ERI = the cluster MO-ERI
+    STEOMResult r = steom_spatial_orbital(rhf_, *this, d_C, d_eps, d_eri_mo,
+                                          /*nao=*/nao, /*n_emb=*/nao,
+                                          /*n_emb_occ=*/full_occ, n_states, n_frozen);
+    tracked_cudaFree(d_eri_mo);
+
+    rhf_.append_excited_state_report(r.report);
+    rhf_.set_steom_result(std::move(r));
 }
 
 // Hybrid DLPNO-STEOM-CCSD (bt-PNO-STEOM Phase P5b). Stage 1: DLPNO-CCSD ground

@@ -11,8 +11,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <vector>
 
 namespace gansu {
 
@@ -53,6 +55,17 @@ std::vector<DLPNODomain> build_lmo_domains(
     const int n_atoms = static_cast<int>(atom_ao_ranges.size());
     const real_t target_completeness = 1.0 - t_cut_mkn;
 
+    // Domain construction levers (mode-2 fix, opt-in; default = legacy Mulliken-greedy).
+    //   GANSU_DLPNO_FULL_DOMAIN=1     : every LMO domain = all atoms (= canonical;
+    //                                   diagnostic to confirm the domain is the limiter).
+    //   GANSU_DLPNO_DOMAIN_OVERLAP_EXT=<thr> : after the Mulliken-greedy domain, extend by
+    //                                   spatial connectivity — add any atom whose AOs overlap
+    //                                   (max|S| ≥ thr) the domain AOs. Captures the correlation
+    //                                   tail (ORCA-style extended domain); typical thr 1e-3..1e-2.
+    const bool  full_domain   = (std::getenv("GANSU_DLPNO_FULL_DOMAIN") != nullptr);
+    const char* ext_env       = std::getenv("GANSU_DLPNO_DOMAIN_OVERLAP_EXT");
+    const real_t overlap_ext  = (ext_env != nullptr) ? std::atof(ext_env) : 0.0;
+
     for (int i = 0; i < nocc; i++) {
         // Mulliken population per atom for LMO i.
         std::vector<real_t> q(n_atoms, 0.0);
@@ -72,19 +85,40 @@ std::vector<DLPNODomain> build_lmo_domains(
         std::sort(order.begin(), order.end(),
                   [&](int x, int y) { return std::fabs(q[x]) > std::fabs(q[y]); });
 
-        // Greedy accumulate atoms.
+        // Build the LMO domain atom set.
         DLPNODomain& dom = domains[i];
         dom.lmo_index = i;
         real_t cum = 0.0;
-        for (int idx = 0; idx < n_atoms; idx++) {
-            const int a = order[idx];
-            dom.atom_indices.push_back(a);
-            cum += q[a];
-            // Stop once we are within 1 − t_cut_mkn of unity. We require
-            // both the cumulative population to reach the target *and* at
-            // least one atom in the domain (always satisfied after first
-            // iteration).
-            if (cum >= target_completeness) break;
+        if (full_domain) {
+            for (int a = 0; a < n_atoms; a++) { dom.atom_indices.push_back(a); cum += q[a]; }
+        } else {
+            // Greedy accumulate atoms by |Mulliken population| until the cumulative
+            // population reaches 1 − t_cut_mkn (≥ at least one atom).
+            for (int idx = 0; idx < n_atoms; idx++) {
+                const int a = order[idx];
+                dom.atom_indices.push_back(a);
+                cum += q[a];
+                if (cum >= target_completeness) break;
+            }
+            // Spatial-connectivity extension (opt-in): add any atom whose AOs overlap the
+            // current domain AOs above `overlap_ext`. Recovers the diffuse correlation tail
+            // the charge-based domain drops (ORCA-style extended domain). One connectivity
+            // shell; scan is O(n_dom_ao · n_b_ao) per added atom, cheap for the domain sizes.
+            if (overlap_ext > 0.0) {
+                std::vector<char> in_dom(n_atoms, 0);
+                for (int a : dom.atom_indices) in_dom[a] = 1;
+                std::vector<int> added;
+                for (int b = 0; b < n_atoms; b++) {
+                    if (in_dom[b]) continue;
+                    real_t maxs = 0.0;
+                    for (int a : dom.atom_indices)
+                        for (int mu = atom_ao_ranges[a].first; mu < atom_ao_ranges[a].second; mu++)
+                            for (int nu = atom_ao_ranges[b].first; nu < atom_ao_ranges[b].second; nu++)
+                                maxs = std::max(maxs, std::fabs(S[(size_t)mu * nao + nu]));
+                    if (maxs >= overlap_ext) added.push_back(b);
+                }
+                for (int b : added) dom.atom_indices.push_back(b);
+            }
         }
         dom.mulliken_completeness = cum;
 

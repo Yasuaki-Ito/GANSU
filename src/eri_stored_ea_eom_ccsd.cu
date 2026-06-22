@@ -43,6 +43,7 @@
 #include <memory>
 #include "ea_eom_ccsd_operator.hpp"
 #include "ea_eom_result.hpp"
+#include "eom_chain_context.hpp"   // DMET-STEOM: standalone cluster electronic state
 #include "davidson_solver.hpp"
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
@@ -77,13 +78,17 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
                                      int n_roots_requested,
                                      real_t* d_eri_mo_precomputed = nullptr,
                                      const ERI_RI* eri_block_src = nullptr,
-                                     const real_t* d_B_mo_blocks = nullptr)
+                                     const real_t* d_B_mo_blocks = nullptr,
+                                     EOMChainContext* ctx = nullptr)
 {
     PROFILE_FUNCTION();
 
-    const int num_frozen  = rhf.get_num_frozen_core();
-    const int num_basis   = rhf.get_num_basis();
-    const int full_occ    = rhf.get_num_electrons() / 2;
+    // DMET-STEOM: ctx (when non-null) supplies the cluster electronic state +
+    // owns the inter-stage results; rhf supplies read-only config. ctx forces
+    // the canonical (non-DLPNO) path. ctx==nullptr ⇒ byte-identical legacy path.
+    const int num_frozen  = ctx ? ctx->get_num_frozen_core() : rhf.get_num_frozen_core();
+    const int num_basis   = ctx ? ctx->get_num_basis()       : rhf.get_num_basis();
+    const int full_occ    = (ctx ? ctx->get_num_electrons()  : rhf.get_num_electrons()) / 2;
     const int nocc_active = full_occ - num_frozen;
     const int nvir        = num_basis - full_occ;
     const int nao_active  = nocc_active + nvir;
@@ -112,7 +117,7 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
     }
 
     // CIS-NTO hand-off (active mode). If absent, fall through to passive mode.
-    const CISNTOResult& cis_nto = rhf.get_cis_nto_result();
+    const CISNTOResult& cis_nto = ctx ? ctx->cis_nto_result : rhf.get_cis_nto_result();
     const bool active_mode = (cis_nto.n_act_vir > 0) && rhf.get_ea_eom_followcis();
     const int safety_margin = rhf.get_ea_eom_safety_margin();
     int n_roots_to_compute = active_mode
@@ -253,15 +258,15 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
 
     // Step 1: CCSD ground state → T1, T2
     Timer ccsd_timer;
-    DeviceHostMatrix<real_t>& coefficient_matrix = rhf.get_coefficient_matrix();
-    DeviceHostMemory<real_t>& orbital_energies   = rhf.get_orbital_energies();
+    DeviceHostMatrix<real_t>& coefficient_matrix = ctx ? *ctx->C   : rhf.get_coefficient_matrix();
+    DeviceHostMemory<real_t>& orbital_energies   = ctx ? *ctx->eps : rhf.get_orbital_energies();
     const real_t* d_C   = coefficient_matrix.device_ptr();
     const real_t* d_eps = orbital_energies.device_ptr();
 
     real_t* d_t1 = nullptr;
     real_t* d_t2 = nullptr;
     real_t E_CCSD = 0.0;
-    if (rhf.use_dlpno_amplitudes()) {
+    if (ctx ? ctx->use_dlpno_amplitudes : rhf.use_dlpno_amplitudes()) {
         // Hybrid DLPNO-STEOM (P5b): inject DLPNO-CCSD T1/T2 (canonical, own copy).
         const BTAmplitudes& bt = rhf.get_dlpno_bt_amplitudes();
         if (bt.nocc != nocc_active || bt.nvir != nvir)
@@ -288,7 +293,8 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
         std::cout << "  CCSD correlation energy: " << std::fixed << std::setprecision(10)
                   << E_CCSD << " Ha   (in " << std::setprecision(3)
                   << ccsd_timer.elapsed_seconds() << " s)" << std::endl;
-        rhf.set_post_hf_energy(E_CCSD);
+        if (ctx) ctx->post_hf_energy = E_CCSD;
+        else     rhf.set_post_hf_energy(E_CCSD);
     }
 
     // Step 2: Build MO ERI (matches EE-EOM pattern) and trim for frozen core.
@@ -445,7 +451,8 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
                             eri_block_src, d_B_mo_blocks, num_basis, eom_gpus,
                             d_eri_vvvv_slabs.empty() ? nullptr : &d_eri_vvvv_slabs,
                             // (A) shared bar-H: publish 3 EA-unique intermediates
-                            rhf.steom_share_barh() ? &rhf.steom_barh_cache() : nullptr,
+                            (ctx ? ctx->share_barh : rhf.steom_share_barh())
+                                ? (ctx ? &ctx->barh : &rhf.steom_barh_cache()) : nullptr,
                             // Frozen core: block ranges read [num_frozen, num_basis)
                             // of the full-C B_mo (only used on the block path).
                             num_frozen);
@@ -476,13 +483,15 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
     std::vector<real_t> h_eigenvectors((size_t)n_roots_to_compute * total_dim, 0.0);
     bool converged = false;
 
-    if (rhf.use_dlpno_projected_eom() || rhf.use_dlpno_native_eom()) {
+    const bool use_projected_eom = ctx ? ctx->use_dlpno_projected_eom : rhf.use_dlpno_projected_eom();
+    const bool use_native_eom     = ctx ? ctx->use_dlpno_native_eom    : rhf.use_dlpno_native_eom();
+    if (use_projected_eom || use_native_eom) {
         // bt-PNO-STEOM stage B: DLPNO-EA-EOM in the per-i PNO(i,i) 2p1h space,
         // via the project-up reference (B1b) or the NATIVE per-pair σ operator
         // (B-EA, env GANSU_DLPNO_NATIVE_EOM). Both wrap ea_op and produce packed
         // roots, back-transformed to canonical (downstream selection unchanged).
         // Native σ == projected σ to machine epsilon (GANSU_DLPNO_EA_NATIVE_VALIDATE).
-        const bool native = rhf.use_dlpno_native_eom();
+        const bool native = use_native_eom;
         // Frozen core (validated naphthalene cc-pVDZ, num_frozen=10): the EA path
         // is built entirely in the active space. The virtual columns / energies use
         // the [full_occ, nao) offset (full_occ_ea below), and build_ea_packing is
@@ -793,8 +802,10 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
     result.report = os.str();
     std::cout << result.report;
 
-    rhf.append_excited_state_report(result.report);
-    rhf.set_ea_eom_result(std::move(result));
+    if (ctx) { ctx->excited_state_report += result.report;
+               ctx->ea_eom_result = std::move(result); }
+    else     { rhf.append_excited_state_report(result.report);
+               rhf.set_ea_eom_result(std::move(result)); }
 
     // Ship 11 — operator device-redirect: restore caller's device so that
     // any downstream code (STEOM dispatch, output, gansu_api) sees the same
@@ -839,6 +850,18 @@ void ERI_RI_RHF::compute_ea_eom_ccsd(int n_states) {
     compute_ea_eom_ccsd_impl(rhf_, /*d_eri_ao=*/nullptr, n_states, d_eri_mo,
                              block ? this : nullptr, d_B_mo);
     if (d_eri_mo) tracked_cudaFree(d_eri_mo);
+}
+
+// DMET-STEOM cluster EA-EOM-CCSD (declared in eom_chain_context.hpp). Canonical
+// per-cluster EA-EOM over the precomputed cluster MO-ERI: no ERI engine, no RI
+// B-blocks, no DLPNO (ctx forces those off). `cfg` = full-molecule RHF (config
+// only); cluster state + result live in `ctx`.
+void compute_cluster_ea_eom_ccsd(RHF& cfg, EOMChainContext& ctx,
+                                 real_t* d_eri_mo, int n_states) {
+    compute_ea_eom_ccsd_impl(cfg, /*d_eri_ao=*/nullptr, n_states,
+                             /*d_eri_mo_precomputed=*/d_eri_mo,
+                             /*eri_block_src=*/nullptr, /*d_B_mo_blocks=*/nullptr,
+                             &ctx);
 }
 
 } // namespace gansu

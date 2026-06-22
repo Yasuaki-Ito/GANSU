@@ -39,6 +39,7 @@
 #include "profiler.hpp"
 #include "oscillator_strength.hpp"
 #include "cis_nto_active_space.hpp"
+#include "eom_chain_context.hpp"   // DMET-STEOM: standalone cluster electronic state
 
 namespace gansu {
 
@@ -48,17 +49,22 @@ void transform_ao_eri_to_mo_eri_full(
 
 
 static void compute_cis_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, real_t* d_eri_mo_precomputed = nullptr,
-                             std::vector<real_t>* out_eigenvectors = nullptr) {
+                             std::vector<real_t>* out_eigenvectors = nullptr,
+                             EOMChainContext* ctx = nullptr) {
     PROFILE_FUNCTION();
 
-    const int num_frozen = rhf.get_num_frozen_core();
-    const int num_basis = rhf.get_num_basis();
-    const int full_occ = rhf.get_num_electrons() / 2;
+    // DMET-STEOM: when ctx is non-null the reference electronic state (dims, C, ε)
+    // comes from the embedded cluster context, not the full-molecule RHF. The RHF
+    // still supplies read-only config (spin) and the AO-basis metadata used for
+    // oscillator strengths (the cluster MOs are LCAO over the same AO basis).
+    const int num_frozen = ctx ? ctx->get_num_frozen_core() : rhf.get_num_frozen_core();
+    const int num_basis  = ctx ? ctx->get_num_basis()       : rhf.get_num_basis();
+    const int full_occ   = (ctx ? ctx->get_num_electrons()  : rhf.get_num_electrons()) / 2;
     const int num_occ = full_occ - num_frozen;  // active occupied
     const int num_vir = num_basis - full_occ;    // virtual (unchanged)
     const int cis_dim = num_occ * num_vir;
 
-    DeviceHostMatrix<real_t>& coefficient_matrix = rhf.get_coefficient_matrix();
+    DeviceHostMatrix<real_t>& coefficient_matrix = ctx ? *ctx->C : rhf.get_coefficient_matrix();
     const real_t* d_C = coefficient_matrix.device_ptr();
 
     bool is_triplet = rhf.is_triplet();
@@ -93,7 +99,7 @@ static void compute_cis_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, rea
     // ------------------------------------------------------------------
     // Step 2: Get orbital energies
     // ------------------------------------------------------------------
-    DeviceHostMemory<real_t>& orbital_energies = rhf.get_orbital_energies();
+    DeviceHostMemory<real_t>& orbital_energies = ctx ? *ctx->eps : rhf.get_orbital_energies();
     const real_t* d_orbital_energies = orbital_energies.device_ptr();
 
     // ------------------------------------------------------------------
@@ -195,35 +201,47 @@ static void compute_cis_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, rea
         solver.copy_eigenvectors_to_host(h_eigenvectors.data());
     }
 
-    // Store excitation energies for external access
-    rhf.set_excitation_energies(excitation_energies);
+    // Store excitation energies for external access (cluster: into the context).
+    if (ctx) ctx->excitation_energies = excitation_energies;
+    else     rhf.set_excitation_energies(excitation_energies);
 
     // ------------------------------------------------------------------
     // Step 4: Analyze and print results with oscillator strengths
     // ------------------------------------------------------------------
-    // Get host data for oscillator strength computation
-    coefficient_matrix.toHost();
-    const auto& prim_shells = rhf.get_primitive_shells();
-    const auto& cgto_norms = rhf.get_cgto_normalization_factors();
-    const_cast<DeviceHostMemory<PrimitiveShell>&>(prim_shells).toHost();
-    const_cast<DeviceHostMemory<real_t>&>(cgto_norms).toHost();
+    // Oscillator strengths need AO dipole integrals contracted with C. The
+    // helper assumes C is num_basis-square (AO dim == MO dim). On the cluster
+    // path that holds only when the cluster spans the full AO basis (nao_ao ==
+    // nmo, i.e. the Phase-0 reduction test); for a true rectangular-C cluster
+    // the rectangular dipole transform is a Phase-1 item, so skip it (the NTO
+    // active space — what STEOM needs — does not depend on oscillator strengths).
+    const bool can_oscillator = !ctx || (ctx->nao_ao == ctx->nmo);
+    if (can_oscillator) {
+        // Get host data for oscillator strength computation
+        coefficient_matrix.toHost();
+        const auto& prim_shells = rhf.get_primitive_shells();
+        const auto& cgto_norms = rhf.get_cgto_normalization_factors();
+        const_cast<DeviceHostMemory<PrimitiveShell>&>(prim_shells).toHost();
+        const_cast<DeviceHostMemory<real_t>&>(cgto_norms).toHost();
 
-    std::string method_name = is_triplet ? "CIS (triplet)" : "CIS";
-    try {
-        auto es_result = compute_excited_state_properties(
-            method_name,
-            prim_shells.host_ptr(), prim_shells.size(),
-            cgto_norms.host_ptr(),
-            rhf.get_shell_type_infos(),
-            coefficient_matrix.host_ptr(),
-            excitation_energies, h_eigenvectors.data(),
-            n_states, num_basis, num_occ, num_vir,
-            num_frozen, full_occ);
-        rhf.set_oscillator_strengths(es_result.oscillator_strengths);
-        rhf.set_excited_state_report(es_result.report);
-    } catch (const std::exception& e) {
-        std::cerr << "[CIS] compute_excited_state_properties FAILED: " << e.what() << std::endl;
-        // Still set excitation energies even if oscillator strengths fail
+        std::string method_name = is_triplet ? "CIS (triplet)" : "CIS";
+        try {
+            auto es_result = compute_excited_state_properties(
+                method_name,
+                prim_shells.host_ptr(), prim_shells.size(),
+                cgto_norms.host_ptr(),
+                rhf.get_shell_type_infos(),
+                coefficient_matrix.host_ptr(),
+                excitation_energies, h_eigenvectors.data(),
+                n_states, num_basis, num_occ, num_vir,
+                num_frozen, full_occ);
+            if (ctx) { ctx->oscillator_strengths = es_result.oscillator_strengths;
+                       ctx->excited_state_report = es_result.report; }
+            else     { rhf.set_oscillator_strengths(es_result.oscillator_strengths);
+                       rhf.set_excited_state_report(es_result.report); }
+        } catch (const std::exception& e) {
+            std::cerr << "[CIS] compute_excited_state_properties FAILED: " << e.what() << std::endl;
+            // Still set excitation energies even if oscillator strengths fail
+        }
     }
 
     // Hand the host-side CIS amplitudes back to the caller if requested
@@ -574,6 +592,46 @@ void ERI_RI_RHF::compute_cis_nto(int n_states_cis) {
     std::cout << result.report;
     rhf_.append_excited_state_report(result.report);
     rhf_.set_cis_nto_result(std::move(result));
+}
+
+// DMET-STEOM cluster CIS-NTO (declared in eom_chain_context.hpp). Runs the
+// canonical (stored-core) CIS over the precomputed cluster MO-ERI and builds the
+// state-averaged NTO active space into `ctx`. Independent of stored-vs-RI: the
+// cluster integrals are always supplied as a full MO-ERI tensor, so this routes
+// through compute_cis_impl (which consumes d_eri_mo_precomputed) rather than the
+// RI B-block path. `cfg` (full-molecule RHF) supplies spin + AO basis only.
+void compute_cluster_cis_nto(RHF& cfg, EOMChainContext& ctx,
+                             real_t* d_eri_mo, int n_states_cis) {
+    PROFILE_FUNCTION();
+
+    const int num_frozen  = ctx.get_num_frozen_core();
+    const int full_occ    = ctx.get_num_electrons() / 2;
+    const int nocc_active = full_occ - num_frozen;
+    const int nvir        = ctx.get_num_basis() - full_occ;
+
+    if (nocc_active <= 0 || nvir <= 0) {
+        throw std::runtime_error(
+            "compute_cluster_cis_nto: invalid cluster orbital partition "
+            "(nocc_active or nvir <= 0)");
+    }
+
+    std::vector<real_t> cis_amplitudes;
+    compute_cis_impl(cfg, /*d_eri_ao=*/nullptr, n_states_cis, d_eri_mo,
+                     /*out_eigenvectors=*/&cis_amplitudes, &ctx);
+
+    // State-averaged NTO active space (config thresholds come from the full RHF).
+    CISNTOActiveSpace::Params p;
+    p.o_thresh = static_cast<real_t>(cfg.get_cis_nto_o_thresh());
+    p.v_thresh = static_cast<real_t>(cfg.get_cis_nto_v_thresh());
+    p.verbose  = cfg.get_cis_nto_verbose();
+
+    CISNTOResult result = CISNTOActiveSpace::compute(
+        cis_amplitudes.data(), n_states_cis,
+        nocc_active, nvir, num_frozen, p);
+
+    std::cout << result.report;
+    ctx.excited_state_report += result.report;
+    ctx.cis_nto_result = std::move(result);
 }
 
 // Forward declarations (defined in half_transform_mp3.cu)

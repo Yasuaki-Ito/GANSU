@@ -359,6 +359,18 @@ public:
         THROW_EXCEPTION("DLPNO-STEOM-CCSD is not supported for the selected ERI method (RI required).");
     }
 
+    /**
+     * @brief DMET-embedded cluster STEOM-CCSD (AQUA/DMET_STEOM.md).
+     * @param n_states Number of excited states
+     *
+     * Phase 0 reduction: cluster = whole molecule → routes the full canonical
+     * STEOM chain through the standalone `steom_spatial_orbital` cluster entry
+     * (EOMChainContext) and must match compute_steom_ccsd bit-exact.
+     */
+    virtual void compute_dmet_steom_ccsd(int /*n_states*/){
+        THROW_EXCEPTION("DMET-STEOM-CCSD is not supported for the selected ERI method (RI required).");
+    }
+
 };
 
 /**
@@ -644,6 +656,7 @@ public:
          || method == PostHFMethod::EA_EOM_CCSD  // bt-PNO-STEOM P4 (RI path)
          || method == PostHFMethod::STEOM_CCSD   // bt-PNO-STEOM P4 (RI path, auto-runs P0/P1/P2)
          || method == PostHFMethod::DLPNO_STEOM_CCSD  // hybrid bt-PNO-STEOM P5b (RI required)
+         || method == PostHFMethod::DMET_STEOM   // DMET-STEOM (RI required; Phase 0 = whole-molecule reduction)
           ){
             return true;
         }
