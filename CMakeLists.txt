@@ -241,6 +241,7 @@ set(SOURCES
     src/eri_stored_ump.cu
     src/davidson_solver.cu
     src/fci.cu
+    src/fci_mpi.cu
     src/test_operators.cu
     src/utils.cpp
     src/ecp_integrals.cpp
@@ -364,6 +365,19 @@ if(ENABLE_GPU)
         target_compile_definitions(gansu PUBLIC GANSU_MPI)
         target_link_libraries(gansu MPI::MPI_CXX)
         message(STATUS "MPI scale-out enabled: ${MPIEXEC_EXECUTABLE}")
+
+        # The distributed FCI solver (src/fci_mpi.cu) uses NCCL directly, so an
+        # MPI build needs NCCL even when ENABLE_MULTI_GPU is OFF. Reuse the cache
+        # variable if ENABLE_MULTI_GPU already located it.
+        find_library(NCCL_LIBRARY nccl
+            HINTS ${CUDAToolkit_LIBRARY_DIR} ${CUDA_TOOLKIT_ROOT_DIR}/lib64)
+        if(NCCL_LIBRARY)
+            target_link_libraries(gansu ${NCCL_LIBRARY})
+            message(STATUS "MPI-FCI: NCCL found at ${NCCL_LIBRARY}")
+        else()
+            message(FATAL_ERROR "ENABLE_MPI is ON but NCCL was not found "
+                                "(required by src/fci_mpi.cu).")
+        endif()
     endif()
 endif()
 

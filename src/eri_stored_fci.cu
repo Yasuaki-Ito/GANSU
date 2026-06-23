@@ -28,6 +28,9 @@
 #include "gpu_manager.hpp"
 #include "utils.hpp"
 #include "fci.hpp"
+#ifdef GANSU_MPI
+#include <mpi.h>
+#endif
 
 namespace gansu {
 
@@ -736,7 +739,20 @@ static real_t compute_fci_energy_impl(RHF& rhf, const real_t* d_eri_ao, real_t* 
     
     double E_fci_electronic = 0.0;
     real_t nuclearE = rhf.get_nuclear_repulsion_energy();
-    E_fci_electronic = fci(d_h1_mo, d_eri_mo, num_basis, num_occ*2, num_alpha_det, num_det, nuclearE);
+#ifdef GANSU_MPI
+    // On >1 rank, use the MPI + NCCL distributed solver (src/fci_mpi.cu). On a
+    // single rank fall through to the proven single-GPU solver so that -np 1 and
+    // non-MPI builds stay byte-identical.
+    int fci_world_size = 1;
+    { int mpi_on = 0; MPI_Initialized(&mpi_on);
+      if (mpi_on) MPI_Comm_size(MPI_COMM_WORLD, &fci_world_size); }
+    if (fci_world_size > 1) {
+        E_fci_electronic = fci_mpi(d_h1_mo, d_eri_mo, num_basis, num_occ*2, num_alpha_det, num_det, nuclearE);
+    } else
+#endif
+    {
+        E_fci_electronic = fci(d_h1_mo, d_eri_mo, num_basis, num_occ*2, num_alpha_det, num_det, nuclearE);
+    }
 
     real_t E_hf_electronic  = rhf.get_energy();
     real_t E_corr = E_fci_electronic - E_hf_electronic;

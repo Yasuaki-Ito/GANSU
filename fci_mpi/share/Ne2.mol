@@ -1,0 +1,8 @@
+Ne2 Neon diatomic 12185056  1SGg D*H
+##CCCBDB 2172301:27
+Geometry Optimized at CBS-Q version=G09A.02 E=-257.667439
+  2  1  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    1.4980 Ne  0  0  0  0  0  0  0  0  0  0  0  0
+    0.0000    0.0000   -1.4980 Ne  0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0
+M  END

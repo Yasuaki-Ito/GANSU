@@ -1,0 +1,8 @@
+NaF sodium fluoride 7681494
+##CCCBDB 8152220:32
+Geometry Optimized at CBS-Q
+  2  1  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.8515 Na  0  0  0  0  0  0  0  0  0  0  0  0
+    0.0000    0.0000   -1.0408 F   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0
+M  END

@@ -1,0 +1,8 @@
+F2 Fluorine diatomic 7782414  1SGg D*H
+##CCCBDB 2172301:25
+Geometry Optimized at CBS-Q version=G98A.6 E=-199.344252
+  2  1  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.6710 F   0  0  0  0  0  0  0  0  0  0  0  0
+    0.0000    0.0000   -0.6710 F   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0
+M  END

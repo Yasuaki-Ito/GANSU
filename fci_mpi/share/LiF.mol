@@ -1,0 +1,8 @@
+LiF lithium fluoride 7789244
+##CCCBDB 8152220:34
+Geometry Optimized at CBS-Q
+  2  1  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.3913 F   0  0  0  0  0  0  0  0  0  0  0  0
+    0.0000    0.0000   -1.1738 Li  0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0
+M  END

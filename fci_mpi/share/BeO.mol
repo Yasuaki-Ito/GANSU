@@ -1,0 +1,8 @@
+BeO beryllium oxide 1304569
+##CCCBDB 8152220:14
+Geometry Optimized at CBS-Q
+  2  1  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000   -0.8643 Be  0  0  0  0  0  0  0  0  0  0  0  0
+    0.0000    0.0000    0.4322 O   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  2  0  0  0
+M  END

@@ -17,3 +17,10 @@
 
 
 double fci(double* h_Gmo1e, double* h_Gmo, int nao, int nelec, int na, long long np, double E_hf);
+
+#ifdef GANSU_MPI
+// Multi-node / multi-GPU FCI (MPI + NCCL hybrid). Same contract as fci() — all
+// pointers are device pointers and the GPU is pinned per rank before the call.
+// Defined in src/fci_mpi.cu, dispatched from eri_stored_fci.cu on >1 rank.
+double fci_mpi(double* d_Gmo1e, double* d_Gmo, int norb, int nelec, int na, long long np, double E_rhf);
+#endif

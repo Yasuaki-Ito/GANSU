@@ -1,0 +1,12 @@
+cuda-pathfinder==1.5.5
+cupy-cuda12x==14.1.1
+h5py==3.16.0
+mpi4py==4.1.2
+numpy==2.2.6
+pandas==2.3.3
+pyscf==2.13.1
+python-dateutil==2.9.0.post0
+pytz==2026.2
+scipy==1.15.3
+six==1.17.0
+tzdata==2026.2

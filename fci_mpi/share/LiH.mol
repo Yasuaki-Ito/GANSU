@@ -1,0 +1,9 @@
+LiH Lithium Hydride 7580678
+##CCCBDB 8 22208:15
+Geometry Optimized at CBS-Q
+  2  1  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.4089 Li  0  0  0  0  0  0  0  0  0  0  0  0
+    0.0000    0.0000   -1.2267 H   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0
+M  END
+

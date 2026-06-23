@@ -1,0 +1,1253 @@
+{
+  "H2": {
+    "distance_start": 0.4,
+    "distance_end": 2.5,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "None",
+    "bond_type": "single",
+    "angle": null,
+    "target": "H-H",
+    "file": "H2.mol"
+  },
+
+  "LiH": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": null,
+    "target": "Li-H",
+    "file": "LiH.mol"
+  },
+
+  "Hchain3": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 1,
+    "active_space": "None",
+    "bond_type": "single",
+    "angle": null,
+    "target": "H-H",
+    "file": null
+  },
+
+  "Hchain4": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "None",
+    "bond_type": "single",
+    "angle": null,
+    "target": "H-H",
+    "file": null
+  },
+
+  "Hchain6": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "None",
+    "bond_type": "single",
+    "angle": null,
+    "target": "H-H",
+    "file": null
+  },
+
+  "Hchain8": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "None",
+    "bond_type": "single",
+    "angle": null,
+    "target": "H-H",
+    "file": null
+  },
+
+  "C2H2": {
+    "distance_start": 0.6,
+    "distance_end": 2.0,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "triple",
+    "angle": [180, 180],
+    "target": "C-C",
+    "file": "C2H2.mol"
+  },
+
+  "CO2": {
+    "distance_start": 0.8,
+    "distance_end": 2.5,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "double",
+    "angle": [180, 180],
+    "target": "C-O",
+    "file": "CO2.mol"
+  },
+
+  "C2H4": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "double",
+    "angle": [180, 180],
+    "target": "C-C",
+    "file": "C2H4.mol"
+  },
+
+  "CH4": {
+    "file": "CH4.mol",
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "C-C",
+    "file": "CH4.mol"
+  },
+  "CH2": {
+    "file": "CH2.mol",
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "C-C",
+    "file": "CH2.mol"
+  },
+  "Li2O": {
+    "file": "Li2O.mol",
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "C-C",
+    "file": "Li2O.mol"
+  },
+
+  "C2H6": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "C-C",
+    "file": "C2H6.mol"
+  },
+
+  "H2O": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "O-H",
+    "file": "H2O.mol"
+  },
+
+  "O2": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 2,
+    "active_space": "freeze",
+    "bond_type": "double",
+    "angle": null,
+    "target": "C-C",
+    "file": "O2.mol"
+  },
+
+  "CO": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "triple",
+    "angle": [180, 180],
+    "target": "C-O",
+    "file": "CO.mol"
+  },
+
+  "H2O2": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "O-O",
+    "file": "H2O2.mol"
+  },
+
+  "CH4O": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": null,
+    "target": "C-O",
+    "file": "CH4O.mol"
+  },
+
+  "C3H4": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "triple",
+    "angle": [180, 180],
+    "target": "C-C",
+    "file": "C3H4.mol"
+  },
+
+  "C2H4O": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "double",
+    "angle": [180, 180],
+    "target": "C-O",
+    "file": "C2H4O.mol"
+  },
+
+  "C2H6O": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "C-C",
+    "file": "C2H6O.mol"
+  },
+
+  "C3H8": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "C-C",
+    "file": "C3H8.mol"
+  },
+
+  "C3H6": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "double",
+    "angle": [180, 180],
+    "target": "C-C",
+    "file": "C3H6.mol"
+  },
+
+  "C4H6": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "triple",
+    "angle": null,
+    "target": "C-C",
+    "file": "C4H6.mol"
+  },
+
+  "C4H8": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "double",
+    "angle": null,
+    "target": "C-C",
+    "file": "C4H8.mol"
+  },
+
+  "C4H10": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": null,
+    "target": "C-C",
+    "file": "C4H10.mol"
+  },
+
+  "C4H6O2": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "double",
+    "angle": [180, 180],
+    "target": "C-C",
+    "file": "C4H6O2.mol"
+  },
+
+  "HF": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "H-F",
+    "file": "HF.mol"
+  },
+
+  "BeH2": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Be-H",
+    "file": "BeH2.mol"
+  },
+
+  "NH3": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "N-H",
+    "file": "NH3.mol"
+  },
+
+  "HCl": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "H-Cl",
+    "file": "HCl.mol"
+  },
+
+  "NH2OH": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "N-O",
+    "file": "NH2OH.mol"
+  },
+
+  "LiBH4": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Li-B",
+    "file": "LiBH4.mol"
+  },
+
+  "SiO": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "double",
+    "angle": [180, 180],
+    "target": "Si-O",
+    "file": "SiO.mol"
+  },
+
+  "LiCl": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "file": "LiCl.mol"
+  },
+
+  "NaOH": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Na-O",
+    "file": "NaOH.mol"
+  },
+
+  "SO2": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "double",
+    "angle": [180, 180],
+    "target": "S-O",
+    "file": "SO2.mol"
+  },
+
+  "NaBH4": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Na-B",
+    "file": "NaBH4.mol"
+  },
+
+  "HNO3": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "double",
+    "angle": [180, 180],
+    "target": "N-O",
+    "file": "HNO3.mol"
+  },
+
+  "NaCl": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Na-Cl",
+    "file": "NaCl.mol"
+  },
+
+  "N2": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "triple",
+    "angle": [180, 180],
+    "target": "N-N",
+    "file": "N2.mol"
+  },
+
+  "CaH2": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Ca-H",
+    "file": "CaH2.mol"
+  },
+
+  "KF": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "K-F",
+    "file": "KF.mol"
+  },
+
+  "KOH": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "K-O",
+    "file": "KOH.mol"
+  },
+
+  "NaClO": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Na-O",
+    "file": "NaClO.mol"
+  },
+
+  "CaC2": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "triple",
+    "angle": [180, 180],
+    "target": "C-C",
+    "file": "CaC2.mol"
+  },
+
+  "BH4K": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "B-K",
+    "file": "BH4K.mol"
+  },
+
+  "KCl": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "K-Cl",
+    "file": "KCl.mol"
+  },
+
+  "CaO": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Ca-O",
+    "file": "CaO.mol"
+  },
+
+  "BeO": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Be-O",
+    "file": "BeO.mol"
+  },
+
+  "MgO": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Mg-O",
+    "file": "MgO.mol"
+  },
+
+  "SiC": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Si-C",
+    "file": "SiC.mol"
+  },
+
+  "BN": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "B-N",
+    "file": "BN.mol"
+  },
+
+  "NaF": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Na-F",
+    "file": "NaF.mol"
+  },
+
+  "LiF": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Li-F",
+    "file": "LiF.mol"
+  },
+
+  "B2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "B-B",
+    "file": "B2.mol"
+  },
+
+  "BH3": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "B-H",
+    "file": null
+  },
+
+  "C2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "triple",
+    "angle": [180, 180],
+    "target": "C-C",
+    "file": "C2.mol"
+  },
+
+  "F2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "F-F",
+    "file": "F2.mol"
+  },
+
+  "Ne2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Ne-Ne",
+    "file": "Ne2.mol"
+  },
+
+  "Li2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "Li-Li",
+    "file": "Li2.mol"
+  },
+
+  "B2H6": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "B2H6.mol"
+  },
+  "BeH2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "BeH2.mol"
+  },
+  "BCl3": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "BCl3.mol"
+  },
+  "BF3": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "BF3.mol"
+  },
+  "BH3": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "BH3.mol"
+  },
+  "C2F6": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "C2F6.mol"
+  },
+  "C2H5NO": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "C2H5NO.mol"
+  },
+  "C2H6O2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "C2H6O2.mol"
+  },
+  "C2NH7": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "C2NH7.mol"
+  },
+  "C2O2F3H": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "C2O2F3H.mol"
+  },
+  "C3H3NO": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "C3H3NO.mol"
+  },
+  "C3H3NS": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "C3H3NS.mol"
+  },
+  "CF4": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "CF4.mol"
+  },
+  "CH2Cl2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "CH2Cl2.mol"
+  },
+  "CH3CN": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "CH3CN.mol"
+  },
+  "C2H4O2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "C2H4O2.mol"
+  },
+  "CNH5": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "CNH5.mol"
+  },
+  "CS2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "CS2.mol"
+  },
+  "CSH4": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "CSH4.mol"
+  },
+  "H2CO3": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "H2CO3.mol"
+  },
+  "H2S": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "H2S.mol"
+  },
+  "HCN": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "HCN.mol"
+  },
+  "N2CH4O": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "N2CH4O.mol"
+  },
+  "N2O": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "N2O.mol"
+  },
+  "O3": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "O3.mol"
+  },
+  "SiH3Cl": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "SiH3Cl.mol"
+  },
+  "SiO2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "SiO2.mol"
+  },
+  "SO2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "SO2.mol"
+  },
+  "C2H5Br": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "C2H5Br.mol"
+  },
+  "C2H5F": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "C2H5F.mol"
+  },
+  "ClF3": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "ClF3.mol"
+  },
+  "H2CO": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "H2CO.mol"
+  },
+  "H2Se": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "H2Se.mol"
+  },
+  "C2N2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "C2N2.mol"
+  },
+  "NF3": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "NF3.mol"
+  },
+  "OCS": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "OCS.mol"
+  },
+  "SO3": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "SO3.mol"
+  },
+  "SOF2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "SOF2.mol"
+  },
+  "Si2H6": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "Si2H6.mol"
+  },
+  "SiF4": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "SiF4.mol"
+  },
+  "SiCl4": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "SiCl4.mol"
+  },
+  "SiH2Cl2": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "SiH2Cl2.mol"
+  },
+  "SiHCl3": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "SiHCl3.mol"
+  },
+  "CHF3": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "CHF3.mol"
+  },
+  "PH3": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "PH3.mol"
+  },
+  "SF6": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "SF6.mol"
+  },
+  "P4": {
+    "distance_start": 0.5,
+    "distance_end": 2.8,
+    "distance_step": 0.1,
+    "spin": 0,
+    "active_space": "freeze",
+    "bond_type": "single",
+    "angle": [180, 180],
+    "target": "null",
+    "file": "P4.mol"
+  }
+
+
+}

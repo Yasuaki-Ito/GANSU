@@ -1,0 +1,8 @@
+Li2 Lithium diatomic 14452596  1SGg D*H
+##CCCBDB11 82200:33
+Geometry Optimized at CBS-Q version=G09B.01 E=-14.902167
+  2  1  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    1.3835 Li  0  0  0  0  0  0  0  0  0  0  0  0
+    0.0000    0.0000   -1.3835 Li  0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0
+M  END
