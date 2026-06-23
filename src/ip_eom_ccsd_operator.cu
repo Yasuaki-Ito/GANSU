@@ -1127,10 +1127,14 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
         cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
         const real_t one = 1.0, zero = 0.0;
         real_t *dB=nullptr,*dB2=nullptr,*dAo=nullptr,*dAv=nullptr,*dCo=nullptr,*dCv=nullptr;
+        // Inc4(b): in block mode the dAv reorder (OVkb_M·VV_K = NO·NV³ = 46 GB, a
+        // copy of ovvv) is built per-k slice (NV³) instead of materialised whole —
+        // see the Wovoo GEMM below. Dense mode keeps the single full reorder.
+        const bool tile_av = (eri_block_src_ != nullptr);
         tracked_cudaMalloc(&dB,(size_t)VV_K*OO_N*sizeof(real_t));
         tracked_cudaMalloc(&dB2,(size_t)VV_K*OO_N*sizeof(real_t));
         tracked_cudaMalloc(&dAo,(size_t)OOkl_M*VV_K*sizeof(real_t));
-        tracked_cudaMalloc(&dAv,(size_t)OVkb_M*VV_K*sizeof(real_t));
+        if (!tile_av) tracked_cudaMalloc(&dAv,(size_t)OVkb_M*VV_K*sizeof(real_t));
         tracked_cudaMalloc(&dCo,(size_t)OOkl_M*OO_N*sizeof(real_t));
         tracked_cudaMalloc(&dCv,(size_t)OVkb_M*OO_N*sizeof(real_t));
         blap("  Woooo Σcd cudaMalloc");
@@ -1140,18 +1144,41 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
             const int TPB = 256;
             auto NB = [&](size_t n){ return (unsigned)((n + TPB - 1) / TPB); };
             ip_woooo_build_Ao<<<NB((size_t)OOkl_M*VV_K), TPB>>>(dAo, d_eri_ovov_, NO, NV);
-            ip_woooo_build_Av<<<NB((size_t)OVkb_M*VV_K), TPB>>>(dAv, d_eri_ovvv_, NO, NV);
+            if (!tile_av)
+                ip_woooo_build_Av<<<NB((size_t)OVkb_M*VV_K), TPB>>>(dAv, d_eri_ovvv_, NO, NV);
             ip_woooo_build_B <<<NB((size_t)VV_K*OO_N),   TPB>>>(dB,  d_t2_, d_t1_, NO, NV, false);
             ip_woooo_build_B <<<NB((size_t)VV_K*OO_N),   TPB>>>(dB2, d_t2_, d_t1_, NO, NV, true);
             cudaDeviceSynchronize();
         }
         blap("  Woooo Σcd device-build inputs (Ao/Av/B/B2)");
         cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,OO_N,OOkl_M,VV_K,&one,dB, OO_N,dAo,VV_K,&zero,dCo,OO_N);
-        cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,OO_N,OVkb_M,VV_K,&one,dB2,OO_N,dAv,VV_K,&zero,dCv,OO_N);
+        if (!tile_av) {
+            cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,OO_N,OVkb_M,VV_K,&one,dB2,OO_N,dAv,VV_K,&zero,dCv,OO_N);
+        } else {
+            // Inc4(b) per-k Wovoo: build ovvv[k] (NV³) from B, reorder to dAv_k
+            // (build_Av with NO=1 + per-k pointer), then dCv[:,(k,·)] = dB2·dAv_k.
+            // k is a spectator (output column block); slice layout matches the
+            // dense path so the result is byte-identical.
+            const int M = nmo_full_, O = frozen_off_, TPB = 256;
+            const unsigned nb = (unsigned)(((size_t)NV*NV*NV + TPB - 1)/TPB);
+            real_t *d_ovvv_k=nullptr,*dAv_k=nullptr;
+            tracked_cudaMalloc(&d_ovvv_k,(size_t)NV*NV*NV*sizeof(real_t));
+            tracked_cudaMalloc(&dAv_k,   (size_t)NV*NV*NV*sizeof(real_t));
+            for (int k=0;k<NO;++k) {
+                eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M,
+                    O+k,1, NO+O,NV, NO+O,NV, NO+O,NV, d_ovvv_k);
+                ip_woooo_build_Av<<<nb,TPB>>>(dAv_k, d_ovvv_k, 1, NV);
+                cudaDeviceSynchronize();
+                cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,
+                    OO_N,NV,VV_K,&one, dB2,OO_N, dAv_k,VV_K, &zero,
+                    dCv + (size_t)k*NV*OO_N, OO_N);
+            }
+            tracked_cudaFree(d_ovvv_k); tracked_cudaFree(dAv_k);
+        }
         ct_woooo.assign((size_t)OOkl_M*OO_N,0.0); ct_wovoo.assign((size_t)OVkb_M*OO_N,0.0);
         cudaMemcpy(ct_woooo.data(),dCo,(size_t)OOkl_M*OO_N*sizeof(real_t),cudaMemcpyDeviceToHost);
         cudaMemcpy(ct_wovoo.data(),dCv,(size_t)OVkb_M*OO_N*sizeof(real_t),cudaMemcpyDeviceToHost);
-        tracked_cudaFree(dB);tracked_cudaFree(dB2);tracked_cudaFree(dAo);tracked_cudaFree(dAv);tracked_cudaFree(dCv);
+        tracked_cudaFree(dB);tracked_cudaFree(dB2);tracked_cudaFree(dAo);if(!tile_av)tracked_cudaFree(dAv);tracked_cudaFree(dCv);
         d_ct_woooo = dCo;   // keep Σcd output on device for ip_woooo_assemble
         blap("  Woooo Σcd GEMM+D2H+malloc/free");
         oooo_wovoo_gpu = true;
@@ -1381,11 +1408,33 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
         const size_t cw_sz = (size_t)NO*NO*NV*NV;   // [k,i,(b,d)]
         real_t* dC=nullptr; tracked_cudaMalloc(&dC, cw_sz*sizeof(real_t));
         const real_t one=1.0, zero=0.0;
-        cublasDgemmStridedBatched(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-            NV*NV, NO, NV, &one,
-            d_eri_ovvv_, NV*NV, (long long)NV*NV*NV,
-            d_t1_,       NV,    0LL,
-            &zero, dC, NV*NV, (long long)NO*NV*NV, NO);
+        if (eri_block_src_ != nullptr) {
+            // Inc4(b) ovvv storage-free: build each occupied slice ovvv[k] (nvir³,
+            // 0.3 GB at nvir=334 vs the dense nocc·nvir³ = 46 GB) on the fly from
+            // the cluster B, then one GEMM per k. k is a spectator in this Wovov-W2
+            // contraction. The slice layout (mo_eri_block_into over occ range
+            // [O+k,O+k+1)) is byte-identical to d_eri_ovvv_[k·nvir³], so the result
+            // matches the dense batched GEMM exactly.
+            const int M = nmo_full_, O = frozen_off_;
+            real_t* d_ovvv_k = nullptr;
+            tracked_cudaMalloc(&d_ovvv_k, (size_t)NV*NV*NV*sizeof(real_t));
+            for (int k = 0; k < NO; ++k) {
+                eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M,
+                    O+k, 1, NO+O, NV, NO+O, NV, NO+O, NV, d_ovvv_k);
+                cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                    NV*NV, NO, NV, &one,
+                    d_ovvv_k, NV*NV,
+                    d_t1_,    NV,
+                    &zero, dC + (size_t)k*NO*NV*NV, NV*NV);
+            }
+            tracked_cudaFree(d_ovvv_k);
+        } else {
+            cublasDgemmStridedBatched(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                NV*NV, NO, NV, &one,
+                d_eri_ovvv_, NV*NV, (long long)NV*NV*NV,
+                d_t1_,       NV,    0LL,
+                &zero, dC, NV*NV, (long long)NO*NV*NV, NO);
+        }
         ct_wovov.assign(cw_sz, 0.0);
         cudaMemcpy(ct_wovov.data(), dC, cw_sz*sizeof(real_t), cudaMemcpyDeviceToHost);
         tracked_cudaFree(dC);
@@ -1454,9 +1503,26 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
         tracked_cudaMalloc(&dC, cw_sz*sizeof(real_t));
         cudaMemcpy(dT,hT.data(),(size_t)NV*NO*sizeof(real_t),cudaMemcpyHostToDevice);
         const real_t one=1.0, zero=0.0;
-        cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-            NO, NO*NV*NV, NV, &one,
-            dT, NO, d_eri_ovvv_, NV, &zero, dC, NO);
+        if (eri_block_src_ != nullptr) {
+            // Inc4(b) ovvv storage-free: per-k slice ovvv[k] (nvir³) from B, one
+            // GEMM per k (k spectator). Contracts the trailing vir axis; the slice
+            // layout matches d_eri_ovvv_[k·nvir³] so the result is byte-identical.
+            const int M = nmo_full_, O = frozen_off_;
+            real_t* d_ovvv_k = nullptr;
+            tracked_cudaMalloc(&d_ovvv_k, (size_t)NV*NV*NV*sizeof(real_t));
+            for (int k = 0; k < NO; ++k) {
+                eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M,
+                    O+k, 1, NO+O, NV, NO+O, NV, NO+O, NV, d_ovvv_k);
+                cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                    NO, NV*NV, NV, &one,
+                    dT, NO, d_ovvv_k, NV, &zero, dC + (size_t)k*NO*NV*NV, NO);
+            }
+            tracked_cudaFree(d_ovvv_k);
+        } else {
+            cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                NO, NO*NV*NV, NV, &one,
+                dT, NO, d_eri_ovvv_, NV, &zero, dC, NO);
+        }
         ct_wovvo.assign(cw_sz, 0.0);
         cudaMemcpy(ct_wovvo.data(), dC, cw_sz*sizeof(real_t), cudaMemcpyDeviceToHost);
         tracked_cudaFree(dT); tracked_cudaFree(dC);
