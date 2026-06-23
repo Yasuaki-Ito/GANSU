@@ -579,6 +579,10 @@ void ERI_RI_RHF::compute_cis_nto(int n_states_cis) {
     std::vector<real_t> cis_amplitudes;
     compute_cis_ri_impl(n_states_cis, &cis_amplitudes);
 
+    // DMET-STEOM root-targeting: stash the raw per-root amplitudes so the DMET
+    // driver can re-weight the state-averaged NTO by fragment localization.
+    rhf_.set_last_cis_amplitudes(cis_amplitudes);
+
     // Build state-averaged NTO active space from the CIS amplitudes.
     CISNTOActiveSpace::Params p;
     p.o_thresh = static_cast<real_t>(rhf_.get_cis_nto_o_thresh());

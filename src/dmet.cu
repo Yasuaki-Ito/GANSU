@@ -40,6 +40,7 @@
 #include "rhf.hpp"
 #include "eri.hpp"
 #include "eom_chain_context.hpp"   // steom_spatial_orbital (DMET-STEOM, Phase 1)
+#include "cis_nto_active_space.hpp" // CISNTOActiveSpace::compute (root-targeting)
 #include "gpu_manager.hpp"
 #include "multi_gpu_manager.hpp"
 #include "ccsd_lambda.hpp"
@@ -963,6 +964,79 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
                 real_t v = 0.0;
                 for (int nu = 0; nu < nao; ++nu) v += S_half[mu * nao + nu] * h_C[nu * nao + (full_occ + a)];
                 C_lo_vir[(size_t)mu * nvir_full + a] = v;
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Root-targeting (§Step B): re-weight the state-averaged NTO so the
+        // active space targets the chromophore FRAGMENT, not all low-lying
+        // excitations. For a MULTI-chromophore molecule the uniform state-
+        // average mixes spatially-separate excitations (e.g. an alkene and a
+        // carboxyl) so no single fragment spans the active space. Here each
+        // full-system CIS root n is weighted by its fragment localization
+        // loc(n) = Σ_ia |C^n_ia|² fhole(i) fpart(a) (BOTH hole and particle on
+        // the fragment); off-fragment roots drop out of the averaged density.
+        // Opt-in: GANSU_DMET_STEOM_ROOT_TARGET=1.
+        // --------------------------------------------------------------------
+        if (std::getenv("GANSU_DMET_STEOM_ROOT_TARGET")) {
+            const std::vector<real_t>& amp = rhf_.get_last_cis_amplitudes();
+            const size_t per = (size_t)nocc_act_full * nvir_full;
+            const int n_cis_have = (per > 0) ? (int)(amp.size() / per) : 0;
+            if (n_cis_have <= 0) {
+                std::cout << "  [DMET-STEOM root-target] no stashed CIS amplitudes "
+                             "(non-RI path?) → keeping state-averaged NTO." << std::endl;
+            } else {
+                // Fragment Löwdin fraction of each active-occ (hole) / virtual (particle).
+                std::vector<real_t> fhole(nocc_act_full, 0.0), fpart(nvir_full, 0.0);
+                for (int i = 0; i < nocc_act_full; ++i) {
+                    double f = 0.0;
+                    for (int mu = 0; mu < nao; ++mu) if (is_frag_ao[mu]) {
+                        const double c = C_lo_occ[(size_t)mu * nocc_act_full + i]; f += c * c;
+                    }
+                    fhole[i] = (real_t)f;
+                }
+                for (int a = 0; a < nvir_full; ++a) {
+                    double f = 0.0;
+                    for (int mu = 0; mu < nao; ++mu) if (is_frag_ao[mu]) {
+                        const double c = C_lo_vir[(size_t)mu * nvir_full + a]; f += c * c;
+                    }
+                    fpart[a] = (real_t)f;
+                }
+                std::vector<real_t> w(n_cis_have, 0.0);
+                double wsum = 0.0;
+                for (int n = 0; n < n_cis_have; ++n) {
+                    const real_t* C = amp.data() + (size_t)n * per;
+                    double num = 0.0, den = 0.0;
+                    for (int i = 0; i < nocc_act_full; ++i)
+                        for (int a = 0; a < nvir_full; ++a) {
+                            const double c2 = (double)C[(size_t)i * nvir_full + a] * C[(size_t)i * nvir_full + a];
+                            den += c2;
+                            num += c2 * (double)fhole[i] * (double)fpart[a];
+                        }
+                    w[n] = (den > 0.0) ? (real_t)(num / den) : 0.0;
+                    wsum += w[n];
+                }
+                std::cout << "  [DMET-STEOM root-target] fragment localization per CIS root:";
+                for (int n = 0; n < n_cis_have; ++n)
+                    std::cout << " " << std::fixed << std::setprecision(2) << w[n];
+                std::cout << std::defaultfloat << std::endl;
+                if (wsum > 1e-6) {
+                    CISNTOActiveSpace::Params p;
+                    p.o_thresh = (real_t)rhf_.get_cis_nto_o_thresh();
+                    p.v_thresh = (real_t)rhf_.get_cis_nto_v_thresh();
+                    p.verbose  = 0;
+                    p.weights  = w;
+                    CISNTOResult tgt = CISNTOActiveSpace::compute(
+                        amp.data(), n_cis_have, nocc_act_full, nvir_full, nfz_full, p);
+                    std::cout << "  [DMET-STEOM root-target] localization-weighted NTO: n_act_occ "
+                              << nto.n_act_occ << "→" << tgt.n_act_occ << ", n_act_vir "
+                              << nto.n_act_vir << "→" << tgt.n_act_vir
+                              << " (fragment-targeted active space)." << std::endl;
+                    rhf_.set_cis_nto_result(std::move(tgt));   // `nto` (ref to member) now sees the targeted result
+                } else {
+                    std::cout << "  [DMET-STEOM root-target] WARNING: no CIS root localizes on "
+                                 "the fragment (Σ loc ≈ 0) → keeping state-averaged NTO." << std::endl;
+                }
             }
         }
 

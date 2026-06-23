@@ -501,6 +501,12 @@ public:
     CISNTOResult&       get_cis_nto_result()       { return cis_nto_result_; }
     void set_cis_nto_result(CISNTOResult result) { cis_nto_result_ = std::move(result); }
 
+    /// Raw per-root CIS amplitudes [n_states × nocc_active × nvir] stashed by
+    /// compute_cis_nto (RI path) so DMET-STEOM can re-weight the state-averaged
+    /// NTO by fragment localization (root-targeting, AQUA/DMET_STEOM.md §Step B).
+    const std::vector<real_t>& get_last_cis_amplitudes() const { return last_cis_amplitudes_; }
+    void set_last_cis_amplitudes(std::vector<real_t> a) { last_cis_amplitudes_ = std::move(a); }
+
     /**
      * @brief IP-EOM-CCSD result (bt-PNO-STEOM Phase P1).
      *
@@ -768,6 +774,7 @@ protected:
     std::vector<real_t> oscillator_strengths_; ///< Oscillator strengths (CIS/EOM)
     std::string excited_state_report_; ///< Formatted excited state report for final summary
     CISNTOResult cis_nto_result_;      ///< bt-PNO-STEOM Phase P0: state-averaged CIS NTO active space (empty unless post_hf_method=cis_nto)
+    std::vector<real_t> last_cis_amplitudes_;  ///< DMET-STEOM root-targeting: raw CIS amplitudes from the last compute_cis_nto (RI)
     IPEOMResult  ip_eom_result_;       ///< bt-PNO-STEOM Phase P1: IP-EOM-CCSD roots per active occupied NTO (empty unless post_hf_method=ip_eom_ccsd)
     EAEOMResult  ea_eom_result_;       ///< bt-PNO-STEOM Phase P2: EA-EOM-CCSD roots per active virtual NTO (empty unless post_hf_method=ea_eom_ccsd)
     STEOMResult  steom_result_;        ///< bt-PNO-STEOM Phase P3: STEOM-CCSD excited states (empty unless post_hf_method=steom_ccsd)
