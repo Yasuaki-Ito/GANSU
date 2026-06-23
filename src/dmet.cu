@@ -1093,11 +1093,27 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
             std::cout << "  [DMET-STEOM bath] §4.3 sufficiency — full-system active NTO coverage by the cluster:\n"
                       << "      kind  k   occupation   env_leak   uncaptured" << std::endl;
             double worst_unc = 0.0; const char* worst_kind = "-"; int worst_k = -1;
-            auto scan = [&](bool occ, int n_act, const std::vector<real_t>& occs) {
+            // Occupation-weighted uncaptured per kind. The raw worst-uncaptured is
+            // dominated by micro-weight NTOs (occupation≈0 noise directions) and is
+            // false-pessimistic: it flags INSUFFICIENT even when the dominant,
+            // high-occupation excitation character IS captured (verified: 2-octanone
+            // money-shot was right within 0.02 eV yet raw worst said 0.95). Weighting
+            // by NTO occupation (the excitation contribution of each direction) gives
+            // an η-aligned measure — Σ_k occ_k·unc_k / Σ_k occ_k — that reflects how
+            // much of the ACTUAL excitation the cluster misses. Hole(occ) and
+            // particle(vir) are weighted separately: CIS-NTO hole/particle share the
+            // same singular value, and the hole side is essentially always captured
+            // by the ground Schmidt bath, so combining would dilute the particle
+            // (env-leak) signal that actually matters with a constant ~0. Verdict is
+            // driven by the worse of the two (typically the particle/vir side).
+            auto scan = [&](bool occ, int n_act, const std::vector<real_t>& occs,
+                            double& sumw, double& sumw_unc) {
                 for (int k = 0; k < n_act; ++k) {
                     std::vector<real_t> phi = build_nto(occ, k);
                     const real_t el  = env_frac(phi);
                     const double unc = 1.0 - cluster_capture(phi);
+                    const double w   = std::max(0.0, (double)(k < (int)occs.size() ? occs[k] : real_t(0)));
+                    sumw += w; sumw_unc += w * unc;
                     std::cout << "      " << (occ ? "occ" : "vir") << "  " << std::setw(2) << k
                               << "   " << std::fixed << std::setprecision(6) << std::setw(10)
                               << (k < (int)occs.size() ? occs[k] : real_t(0))
@@ -1106,15 +1122,25 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
                     if (unc > worst_unc) { worst_unc = unc; worst_kind = occ ? "occ" : "vir"; worst_k = k; }
                 }
             };
-            scan(false, nto.n_act_vir, nto.nto_vir_occupations);
-            scan(true,  nto.n_act_occ, nto.nto_occ_occupations);
-            const char* verdict = worst_unc < 0.02 ? "SUFFICIENT"
-                                : worst_unc < 0.10 ? "MARGINAL" : "INSUFFICIENT";
-            std::cout << "  [DMET-STEOM bath] worst uncaptured = " << std::fixed << std::setprecision(4)
-                      << worst_unc << " (" << worst_kind << " NTO " << worst_k << ") → bath "
+            double sw_vir = 0.0, swu_vir = 0.0, sw_occ = 0.0, swu_occ = 0.0;
+            scan(false, nto.n_act_vir, nto.nto_vir_occupations, sw_vir, swu_vir);
+            scan(true,  nto.n_act_occ, nto.nto_occ_occupations, sw_occ, swu_occ);
+            const double wunc_vir = sw_vir > 0.0 ? swu_vir / sw_vir : 0.0;
+            const double wunc_occ = sw_occ > 0.0 ? swu_occ / sw_occ : 0.0;
+            const bool   vir_worse = wunc_vir >= wunc_occ;
+            const double wunc      = vir_worse ? wunc_vir : wunc_occ;   // η-aligned gauge
+            const char* verdict = wunc < 0.02 ? "SUFFICIENT"
+                                : wunc < 0.10 ? "MARGINAL" : "INSUFFICIENT";
+            std::cout << "  [DMET-STEOM bath] occupation-weighted uncaptured = "
+                      << std::fixed << std::setprecision(4) << wunc
+                      << " (" << (vir_worse ? "vir" : "occ") << " side; vir " << wunc_vir
+                      << " / occ " << wunc_occ << ") → bath "
                       << verdict << " for the active excitation space"
                       << (leak_vir > 0.0 || leak_occ > 0.0 ? " (before augmentation)" : "")
                       << "." << std::defaultfloat << std::endl;
+            std::cout << "  [DMET-STEOM bath] (raw worst uncaptured = " << std::setprecision(4)
+                      << worst_unc << " at " << worst_kind << " NTO " << worst_k
+                      << " — micro-weight NTO, diagnostic only)" << std::defaultfloat << std::endl;
         }
 
         std::vector<std::vector<real_t>> added;   // accepted env-NTO bath columns (Löwdin)
