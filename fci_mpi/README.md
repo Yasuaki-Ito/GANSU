@@ -1,10 +1,6 @@
-# Source Code for
-
 # GPU-Accelerated Full Configuration Interaction for 1.7 Trillion Determinants
 
-This repository contains the source code accompanying the manuscript:
-
-**"GPU-Accelerated Full Configuration Interaction for 1.7 Trillion Determinants"**
+This directory contains the implementation accompanying the manuscript.
 
 The implementation provides a distributed-memory Full Configuration Interaction (FCI) solver accelerated by NVIDIA GPUs using CUDA, cuBLAS, NCCL, and MPI.
 
@@ -139,28 +135,6 @@ The main driver supports the following command-line arguments:
 | `--incpu`     | Memory mode (`0=GPU`, `1=hybrid`)               | 0       |
 | `--debugmode` | Debug level (`0=none`, `1=basic`, `2=detailed`) | 1       |
 | `--chunksize` | Tile size used in σ = Hc evaluation             | 256     |
-
----
-
-# Repository Contents
-
-The repository includes the source code and example files used to run and validate the GPU-accelerated FCI calculations described in the manuscript.
-
-Content	Location
-Source code for the GPU-accelerated FCI implementation	Root directory
-Example molecular input files	./share
-Example FCIDUMP integral files	./share/sqd_data_repository/integrals
-Example execution scripts	Root directory
-Example output logs	./logs/examples
-
----
-
-# Reproducibility
-
-The example inputs provided in ./share and ./share/sqd_data_repository/integrals can be used to reproduce representative calculations and verify the functionality of the implementation.
-
-Numerical results may exhibit minor variations across different GPU architectures, CUDA toolchains, MPI implementations, and NCCL versions. In all tested environments, the observed deviations were below 10⁻¹¹ Hartree.
-
 
 ---
 
