@@ -26,6 +26,7 @@
 #include <cstring>   // memcpy
 #include <cmath> // sqrt
 #include <iomanip> // std::setprecision
+#include <fstream> // std::ofstream (optimized geometry .xyz export)
 
 #include "hf.hpp"
 #include "spherical_transform.hpp"
@@ -885,6 +886,60 @@ real_t HF::solve(const real_t* density_matrix_alpha, const real_t* density_matri
         optimizer->initialize(coords, grad);
         project_out_tr(grad, coords);
 
+        // --- Finalize: print the optimization summary, the optimized geometry,
+        //     and write a standard .xyz file (Angstrom) so the relaxed structure
+        //     can be fed straight into a follow-up calculation. Called from every
+        //     exit (gradient-converged / energy+disp-converged / not-converged).
+        auto finalize_opt = [&](const std::string& status, int n_iter, double e){
+            double mg = 0.0, rg = 0.0;
+            for(int i = 0; i < ndim; i++){ double g = std::abs(grad[i]); if(g > mg) mg = g; rg += grad[i]*grad[i]; }
+            rg = std::sqrt(rg / ndim);
+
+            std::cout << std::endl;
+            std::cout << "============================================================" << std::endl;
+            std::cout << "         Geometry Optimization Summary                      " << std::endl;
+            std::cout << "============================================================" << std::endl;
+            std::cout << "  Status:        " << status << std::endl;
+            std::cout << "  Optimizer:     " << optimizer_ << std::endl;
+            std::cout << "  Iterations:    " << n_iter << " / " << max_iter << std::endl;
+            std::cout << std::fixed << std::setprecision(12);
+            std::cout << "  Final energy:  " << e << " Hartree" << std::endl;
+            std::cout << std::scientific << std::setprecision(6);
+            std::cout << "  Max gradient:  " << mg << " Hartree/Bohr  (threshold " << grad_threshold << ")" << std::endl;
+            std::cout << "  RMS gradient:  " << rg << " Hartree/Bohr  (threshold " << rms_grad_threshold << ")" << std::endl;
+            std::cout << std::defaultfloat;
+
+            std::cout << std::endl << "Optimized Geometry (Bohr):" << std::endl;
+            for(int i = 0; i < num_atoms_val; i++){
+                std::cout << std::setw(4) << atomic_number_to_element_name(current_atoms[i].atomic_number)
+                          << std::setw(16) << std::setprecision(10) << std::fixed << coords[3*i+0]
+                          << std::setw(16) << coords[3*i+1]
+                          << std::setw(16) << coords[3*i+2] << std::endl;
+            }
+            std::cout << std::defaultfloat;
+
+            // Standard .xyz (Angstrom) for direct reuse as -x input.
+            const std::string xyz_path = "optimized.xyz";
+            std::ofstream ofs(xyz_path);
+            if(ofs){
+                ofs << num_atoms_val << "\n";
+                ofs << "GANSU optimized geometry  E = " << std::fixed << std::setprecision(10) << e
+                    << " Hartree  [" << status << "]\n";
+                for(int i = 0; i < num_atoms_val; i++){
+                    ofs << std::left << std::setw(2)
+                        << atomic_number_to_element_name(current_atoms[i].atomic_number)
+                        << std::right << std::fixed << std::setprecision(10)
+                        << std::setw(18) << bohr_to_angstrom(coords[3*i+0])
+                        << std::setw(18) << bohr_to_angstrom(coords[3*i+1])
+                        << std::setw(18) << bohr_to_angstrom(coords[3*i+2]) << "\n";
+                }
+                std::cout << "  Optimized geometry written to " << xyz_path
+                          << " (Angstrom, standard .xyz)." << std::endl;
+            } else {
+                std::cout << "  WARNING: could not write " << xyz_path << std::endl;
+            }
+        };
+
         for(int iter = 0; iter < max_iter; iter++){
             // --- Print status ---
             double max_grad = 0.0, rms_grad = 0.0;
@@ -923,18 +978,7 @@ real_t HF::solve(const real_t* density_matrix_alpha, const real_t* density_matri
                 std::cout << "============================================================" << std::endl;
                 std::cout << "         Geometry Optimization Converged!                   " << std::endl;
                 std::cout << "============================================================" << std::endl;
-                std::cout << std::fixed << std::setprecision(12);
-                std::cout << "Final energy: " << energy << " Hartree" << std::endl;
-                std::cout << "Iterations: " << iter << std::endl;
-                std::cout << std::endl;
-                std::cout << "Optimized Geometry (Bohr):" << std::endl;
-                for(int i = 0; i < num_atoms_val; i++){
-                    std::cout << std::setw(4) << atomic_number_to_element_name(current_atoms[i].atomic_number)
-                              << std::setw(16) << std::setprecision(10) << std::fixed << coords[3*i+0]
-                              << std::setw(16) << coords[3*i+1]
-                              << std::setw(16) << coords[3*i+2] << std::endl;
-                }
-                std::cout << std::defaultfloat;
+                finalize_opt("CONVERGED (gradient: max & RMS below threshold)", iter, energy);
                 return energy;
             }
 
@@ -1059,27 +1103,19 @@ real_t HF::solve(const real_t* density_matrix_alpha, const real_t* density_matri
                 std::cout << "============================================================" << std::endl;
                 std::cout << "         Geometry Optimization Converged!                   " << std::endl;
                 std::cout << "============================================================" << std::endl;
-                std::cout << std::fixed << std::setprecision(12);
-                std::cout << "Final energy: " << energy << " Hartree" << std::endl;
-                std::cout << "Iterations: " << iter + 1 << std::endl;
-                std::cout << std::endl;
-                std::cout << "Optimized Geometry (Bohr):" << std::endl;
-                for(int i = 0; i < num_atoms_val; i++){
-                    std::cout << std::setw(4) << atomic_number_to_element_name(current_atoms[i].atomic_number)
-                              << std::setw(16) << std::setprecision(10) << std::fixed << coords[3*i+0]
-                              << std::setw(16) << coords[3*i+1]
-                              << std::setw(16) << coords[3*i+2] << std::endl;
-                }
+                std::cout << std::scientific << std::setprecision(6);
+                std::cout << "  (energy change " << std::abs(delta_e) << " < " << energy_threshold
+                          << " Hartree, max displacement " << max_disp << " < " << disp_threshold
+                          << " Bohr)" << std::endl;
                 std::cout << std::defaultfloat;
+                finalize_opt("CONVERGED (energy change & max displacement below threshold)", iter + 1, energy);
                 return energy;
             }
         }
 
         std::cout << std::endl;
         std::cout << "WARNING: Geometry optimization did not converge in " << max_iter << " iterations." << std::endl;
-        std::cout << std::fixed << std::setprecision(12);
-        std::cout << "Current energy: " << energy << " Hartree" << std::endl;
-        std::cout << std::defaultfloat;
+        finalize_opt("NOT CONVERGED (max iterations reached)", max_iter, energy);
         return energy;
     } else {
         // energy or gradient mode

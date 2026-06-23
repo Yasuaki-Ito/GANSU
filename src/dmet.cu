@@ -920,6 +920,12 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
     // Auto-on whenever augmentation runs; force standalone with GANSU_DMET_STEOM_BATH_DIAG=1.
     bool bath_diag = (leak_vir > 0.0 || leak_occ > 0.0);
     if (const char* e = std::getenv("GANSU_DMET_STEOM_BATH_DIAG")) bath_diag = bath_diag || (e[0] != '0');
+    // Root-targeting (§Step B) lives inside this block — it re-weights the
+    // full-system CIS-NTO consumed by the augmentation + gauge below. It must run
+    // whenever ROOT_TARGET is set, even with no NTO-bath leak threshold; otherwise
+    // it silently no-ops and the "[DMET-STEOM root-target] ..." log never appears
+    // (the log63 symptom: ROOT_TARGET=1 set but bath_diag stayed false).
+    if (std::getenv("GANSU_DMET_STEOM_ROOT_TARGET")) bath_diag = true;
     if (bath_diag && !C_emb.empty()) {
         const int full_occ      = nocc;
         const int nvir_full     = nao - full_occ;
