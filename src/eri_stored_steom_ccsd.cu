@@ -576,6 +576,19 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     }
 #endif
 
+    // Inc3: resolve the cluster B source up front so every stage (CIS, IP, EA,
+    // STEOM build) can pull MO-ERI blocks from the cluster B instead of a dense
+    // n_emb⁴ tensor. Only the stable engine pointer is cached here — each stage
+    // rebuilds the transient B_mo workspace right before it consumes it (build_B_mo
+    // shares one thread-local buffer that a stage's internal CCSD re-solve would
+    // otherwise clobber; the rebuilds live in the CIS helper + IP/EA operators).
+    if (ctx && ctx->prefer_ri_block && gpu::gpu_available() && !ctx->eri_block_src) {
+        ctx->eri_block_src = dynamic_cast<const ERI_RI*>(&eri_method);
+        if (!ctx->eri_block_src)
+            std::cout << "  [DMET-STEOM] GANSU_DMET_STEOM_RI_BLOCK set but eri_method "
+                         "is not RI — falling back to the dense cluster MO-ERI." << std::endl;
+    }
+
     // Stage 1/3 — CIS-NTO active space.
     if (!mpi_steom) {
         const bool need_cis = ctx ? (ctx->cis_nto_result.n_act_occ == 0)
@@ -920,12 +933,20 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         cudaMemcpy(d_t2, bt.T2.data(), t2n * sizeof(real_t), cudaMemcpyHostToDevice);
         std::cout << "  STEOM using DLPNO back-transformed canonical T1/T2 (hybrid bt-PNO-STEOM P5b)." << std::endl;
     } else {
+        // Inc3: cluster storage-free ground CCSD — when the cluster MO-ERI is NOT
+        // precomputed (block mode) hand the RI engine to ccsd_spatial_orbital so it
+        // builds its own cluster B (build_B_mo over d_C = C_can) and runs the
+        // B-native residual (Inc1/2) instead of needing a dense n_emb⁴ tensor.
+        const ERI_RI* ccsd_eri_ri =
+            (ctx && ctx->prefer_ri_block && d_eri_mo_precomputed == nullptr)
+                ? dynamic_cast<const ERI_RI*>(&eri_method) : nullptr;
         real_t E_CCSD = ccsd_spatial_orbital(
             d_eri_ao, d_C, d_eps, num_basis, full_occ,
             /*computing_ccsd_t=*/false, /*ccsd_t_energy=*/nullptr,
             &d_t1, &d_t2,
             d_eri_mo_precomputed,
-            num_frozen);
+            num_frozen,
+            /*h_fov_active=*/nullptr, /*eri_ri=*/ccsd_eri_ri);
         std::cout << "  STEOM CCSD ground-state re-solve: " << std::fixed << std::setprecision(10)
                   << E_CCSD << " Ha   (in " << std::setprecision(3)
                   << ccsd_timer.elapsed_seconds() << " s)" << std::endl;
@@ -940,13 +961,24 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // block path is no longer gated on num_frozen==0 (avoids the nao⁴ tensor).
     const ERI_RI* eri_ri_block = nullptr;
     const real_t* d_B_mo_blocks = nullptr;
-    if ((ctx ? ctx->use_dlpno_amplitudes : rhf.use_dlpno_amplitudes()) && gpu::gpu_available()) {
+    // Inc3: the cluster (ctx) path also takes the block source when
+    // GANSU_DMET_STEOM_RI_BLOCK is set (ctx->prefer_ri_block) — d_C = ctx->C
+    // (cluster C_can, [nao_ao × n_emb]) and num_basis = n_emb, so build_B_mo
+    // produces the cluster B_mo (naux × n_emb²), never the n_emb⁴ tensor.
+    const bool want_block = ((ctx ? ctx->use_dlpno_amplitudes : rhf.use_dlpno_amplitudes())
+                             || (ctx && ctx->prefer_ri_block))
+                            && gpu::gpu_available();
+    if (want_block) {
         eri_ri_block = dynamic_cast<const ERI_RI*>(&eri_method);
         if (eri_ri_block) {
             d_B_mo_blocks = eri_ri_block->build_B_mo(d_C, num_basis);
             if (!d_B_mo_blocks) eri_ri_block = nullptr;  // CPU / budget fail
         }
     }
+    // Inc3: publish the cluster B so the cluster-stage free functions
+    // (compute_cluster_cis_nto / ip / ea) hand it to their B-source-capable
+    // operators instead of the dense d_eri_mo (which the driver no longer built).
+    if (ctx) { ctx->eri_block_src = eri_ri_block; ctx->d_B_mo_blocks = d_B_mo_blocks; }
 
     Timer mo_timer;
     real_t* d_eri_mo = nullptr;
@@ -954,6 +986,13 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     if (!eri_ri_block) {
         if (d_eri_mo_precomputed) {
             d_eri_mo = d_eri_mo_precomputed;  // RI path — caller owns / frees it
+        } else if (ctx) {
+            // Inc3 cluster fallback: block requested but build_B_mo refused (CPU /
+            // budget). There is no d_eri_ao to AO→MO transform here — build the
+            // dense cluster MO-ERI from B instead. Small clusters only; large ones
+            // are exactly why the block path exists (so this should not be reached).
+            d_eri_mo = eri_method.build_mo_eri(d_C, num_basis);
+            free_eri_mo = true;
         } else {
             tracked_cudaMalloc(&d_eri_mo,
                                (size_t)num_basis * num_basis * num_basis * num_basis * sizeof(real_t));
@@ -1589,6 +1628,10 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
     ctx.n_elec   = 2 * n_emb_occ;
     ctx.n_frozen = n_frozen;
     ctx.nao_ao   = nao;   // == n_emb on the Phase-0 reduction test (square cluster C)
+    // Inc3: storage-free cluster integrals (opt-in). When set, the chain pulls
+    // MO-ERI blocks from the cluster B (build_B_mo) instead of the dense n_emb⁴
+    // tensor — the caller (dmet.cu) correspondingly passes d_eri_mo == nullptr.
+    ctx.prefer_ri_block = (std::getenv("GANSU_DMET_STEOM_RI_BLOCK") != nullptr);
 
     compute_steom_ccsd_impl(cfg, eri_method, /*d_eri_ao=*/nullptr, n_states,
                             /*d_eri_mo_precomputed=*/d_eri_mo, &ctx);

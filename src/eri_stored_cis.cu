@@ -608,12 +608,100 @@ void ERI_RI_RHF::compute_cis_nto(int n_states_cis) {
     rhf_.set_cis_nto_result(std::move(result));
 }
 
+// Inc3: storage-free cluster CIS. Build the CIS B_ov/B_oo/B_vv half-transformed
+// blocks from the cluster B_mo (build_B_mo over the cluster C_can; naux·n_emb²)
+// and solve with the B-based CISOperator_RI — instead of the dense CISOperator
+// over an n_emb⁴ tensor (461 GB at n_emb=490). The cluster B_mo is already in
+// cluster-MO basis (Q,p,q row-major, same layout mo_eri_block_into gathers), so
+// the AO→MO transform of compute_cis_ri_impl is skipped; the extraction mirrors
+// compute_cis_ri_impl's. Returns the singlet CIS amplitudes (n_states ×
+// nocc_active × nvir) for the NTO active-space builder; oscillator strengths are
+// skipped (rectangular cluster C, like the dense cluster CIS).
+static void cluster_cis_ri_from_block(const ERI_RI* eri_block_src,
+                                      const real_t* d_C, const real_t* d_eps, int nmo,
+                                      int num_frozen, int full_occ,
+                                      bool is_triplet, int n_states,
+                                      std::vector<real_t>* out_amplitudes) {
+#ifndef GANSU_CPU_ONLY
+    const int naux    = eri_block_src->get_num_auxiliary_basis();
+    const int nocc    = full_occ - num_frozen;
+    const int nvir    = nmo - full_occ;
+    const int cis_dim = nocc * nvir;
+    if (n_states > cis_dim) n_states = cis_dim;
+
+    // build_B_mo returns a SHARED thread-local workspace valid until the next
+    // build_B_mo call — extract immediately (no intervening build_B_mo here).
+    const real_t* d_B_mo = eri_block_src->build_B_mo(d_C, nmo);
+    if (!d_B_mo)
+        throw std::runtime_error("cluster_cis_ri_from_block: build_B_mo returned null");
+
+    real_t *d_B_ov = nullptr, *d_B_oo = nullptr, *d_B_vv = nullptr;
+    tracked_cudaMalloc(&d_B_ov, (size_t)naux * nocc * nvir * sizeof(real_t));
+    tracked_cudaMalloc(&d_B_oo, (size_t)naux * nocc * nocc * sizeof(real_t));
+    tracked_cudaMalloc(&d_B_vv, (size_t)naux * nvir * nvir * sizeof(real_t));
+    {
+        // Extract active occ/vir blocks on host. All Q-strides size_t (naux·nmo²
+        // overflows int at large basis — same fix as compute_cis_ri_impl).
+        std::vector<real_t> h_B_mo((size_t)naux * nmo * nmo);
+        cudaMemcpy(h_B_mo.data(), d_B_mo, h_B_mo.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+        std::vector<real_t> h_B_ov((size_t)naux * nocc * nvir);
+        std::vector<real_t> h_B_oo((size_t)naux * nocc * nocc);
+        std::vector<real_t> h_B_vv((size_t)naux * nvir * nvir);
+        for (int Q = 0; Q < naux; ++Q) {
+            const size_t qmo = (size_t)Q * nmo  * nmo;
+            const size_t qov = (size_t)Q * nocc * nvir;
+            const size_t qoo = (size_t)Q * nocc * nocc;
+            const size_t qvv = (size_t)Q * nvir * nvir;
+            for (int i = 0; i < nocc; ++i)
+                for (int a = 0; a < nvir; ++a)
+                    h_B_ov[qov + (size_t)i * nvir + a] =
+                        h_B_mo[qmo + (size_t)(num_frozen + i) * nmo + (full_occ + a)];
+            for (int i = 0; i < nocc; ++i)
+                for (int j = 0; j < nocc; ++j)
+                    h_B_oo[qoo + (size_t)i * nocc + j] =
+                        h_B_mo[qmo + (size_t)(num_frozen + i) * nmo + (num_frozen + j)];
+            for (int a = 0; a < nvir; ++a)
+                for (int b = 0; b < nvir; ++b)
+                    h_B_vv[qvv + (size_t)a * nvir + b] =
+                        h_B_mo[qmo + (size_t)(full_occ + a) * nmo + (full_occ + b)];
+        }
+        cudaMemcpy(d_B_ov, h_B_ov.data(), h_B_ov.size() * sizeof(real_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_B_oo, h_B_oo.data(), h_B_oo.size() * sizeof(real_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_B_vv, h_B_vv.data(), h_B_vv.size() * sizeof(real_t), cudaMemcpyHostToDevice);
+    }
+
+    CISOperator_RI cis_op(d_B_ov, d_B_oo, d_B_vv, d_eps + num_frozen,
+                          nocc, nvir, naux, is_triplet);
+    DavidsonConfig config;
+    config.num_eigenvalues       = n_states;
+    config.max_subspace_size     = std::min(cis_dim, std::max(30, 4 * n_states));
+    config.convergence_threshold = 1e-6;
+    config.max_iterations        = 100;
+    config.use_preconditioner    = true;
+    config.verbose               = 2;
+    DavidsonSolver solver(cis_op, config);
+    if (!solver.solve())
+        std::cout << "Warning: cluster CIS (RI block) Davidson did not converge." << std::endl;
+
+    out_amplitudes->resize((size_t)cis_dim * n_states);
+    solver.copy_eigenvectors_to_host(out_amplitudes->data());
+
+    tracked_cudaFree(d_B_ov);
+    tracked_cudaFree(d_B_oo);
+    tracked_cudaFree(d_B_vv);
+#else
+    (void)eri_block_src; (void)d_C; (void)d_eps; (void)nmo; (void)num_frozen;
+    (void)full_occ; (void)is_triplet; (void)n_states; (void)out_amplitudes;
+    throw std::runtime_error("cluster_cis_ri_from_block requires a GPU build");
+#endif
+}
+
 // DMET-STEOM cluster CIS-NTO (declared in eom_chain_context.hpp). Runs the
-// canonical (stored-core) CIS over the precomputed cluster MO-ERI and builds the
-// state-averaged NTO active space into `ctx`. Independent of stored-vs-RI: the
-// cluster integrals are always supplied as a full MO-ERI tensor, so this routes
-// through compute_cis_impl (which consumes d_eri_mo_precomputed) rather than the
-// RI B-block path. `cfg` (full-molecule RHF) supplies spin + AO basis only.
+// canonical (stored-core) CIS and builds the state-averaged NTO active space into
+// `ctx`. With the Inc3 cluster block source (ctx.eri_block_src, set when
+// GANSU_DMET_STEOM_RI_BLOCK) the CIS is solved storage-free from the cluster B;
+// otherwise it routes through compute_cis_impl over the dense cluster MO-ERI.
+// `cfg` (full-molecule RHF) supplies spin + AO basis only.
 void compute_cluster_cis_nto(RHF& cfg, EOMChainContext& ctx,
                              real_t* d_eri_mo, int n_states_cis) {
     PROFILE_FUNCTION();
@@ -630,8 +718,21 @@ void compute_cluster_cis_nto(RHF& cfg, EOMChainContext& ctx,
     }
 
     std::vector<real_t> cis_amplitudes;
-    compute_cis_impl(cfg, /*d_eri_ao=*/nullptr, n_states_cis, d_eri_mo,
-                     /*out_eigenvectors=*/&cis_amplitudes, &ctx);
+    if (ctx.eri_block_src != nullptr) {
+        std::cout << "\n---- cluster CIS (RI block) "
+                  << (cfg.is_triplet() ? "triplet" : "singlet")
+                  << " ---- nocc=" << nocc_active << ", nvir=" << nvir
+                  << ", naux=" << ctx.eri_block_src->get_num_auxiliary_basis()
+                  << ", dim=" << (nocc_active * nvir)
+                  << ", nstates=" << n_states_cis << std::endl;
+        cluster_cis_ri_from_block(ctx.eri_block_src, ctx.C->device_ptr(),
+                                  ctx.eps->device_ptr(), ctx.get_num_basis(),
+                                  num_frozen, full_occ, cfg.is_triplet(),
+                                  n_states_cis, &cis_amplitudes);
+    } else {
+        compute_cis_impl(cfg, /*d_eri_ao=*/nullptr, n_states_cis, d_eri_mo,
+                         /*out_eigenvectors=*/&cis_amplitudes, &ctx);
+    }
 
     // State-averaged NTO active space (config thresholds come from the full RHF).
     CISNTOActiveSpace::Params p;

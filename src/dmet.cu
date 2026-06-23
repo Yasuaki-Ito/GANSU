@@ -804,14 +804,24 @@ STEOMResult DMET::solve_fragment_steom(
     tracked_cudaMalloc(&d_C_can, nao * n_emb * sizeof(real_t));
     cudaMemcpy(d_C_can, h_C_can.data(), nao * n_emb * sizeof(real_t), cudaMemcpyHostToDevice);
 
-    // 4. Cluster MO-ERI (rectangular AO→cluster-MO transform) + 5. cluster STEOM.
-    real_t* d_eri_mo = eri_method.build_mo_eri(d_C_can, n_emb);
+    // 4. Cluster integrals + 5. cluster STEOM. With GANSU_DMET_STEOM_RI_BLOCK the
+    //    chain pulls MO-ERI blocks on the fly from the cluster B (build_B_mo,
+    //    naux·n_emb²) — the dense n_emb⁴ tensor (OOM for large fragments: the
+    //    30-atom TXO2 acceptor gives n_emb=490 ⇒ 461 GB) is never built.
+    //    steom_spatial_orbital reads the same env into ctx.prefer_ri_block, so
+    //    passing d_eri_mo == nullptr routes the whole chain through the cluster B.
+    //    Default off ⇒ dense build_mo_eri ⇒ byte-identical.
+    const bool ri_block = (std::getenv("GANSU_DMET_STEOM_RI_BLOCK") != nullptr)
+                          && gpu::gpu_available()
+                          && (dynamic_cast<ERI_RI*>(&eri_method) != nullptr);
+    real_t* d_eri_mo = ri_block ? nullptr : eri_method.build_mo_eri(d_C_can, n_emb);
     STEOMResult r = steom_spatial_orbital(rhf_, eri_method, d_C_can, d_eigvals, d_eri_mo,
                                           /*nao=*/nao, /*n_emb=*/n_emb,
                                           /*n_emb_occ=*/n_emb_occ, n_states, n_frozen);
 
     tracked_cudaFree(d_eigvals); tracked_cudaFree(d_eigvecs);
-    tracked_cudaFree(d_C_can);   tracked_cudaFree(d_eri_mo);
+    tracked_cudaFree(d_C_can);
+    if (d_eri_mo) tracked_cudaFree(d_eri_mo);
     return r;
 }
 

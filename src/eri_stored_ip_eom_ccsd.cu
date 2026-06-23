@@ -185,12 +185,18 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
         E_CCSD = rhf.get_post_hf_energy();  // DLPNO-CCSD energy (set by stage 1)
         std::cout << "  Using DLPNO back-transformed canonical T1/T2 (hybrid bt-PNO-STEOM P5b)." << std::endl;
     } else {
+        // Inc3: cluster block mode (eri_block_src set, no dense precomputed) hands
+        // the RI engine to the ground-CCSD re-solve so it builds its own cluster B
+        // (build_B_mo over d_C = C_can) and runs B-native (Inc1/2) — no n_emb⁴.
+        const ERI_RI* ccsd_eri_ri =
+            (eri_block_src && d_eri_mo_precomputed == nullptr) ? eri_block_src : nullptr;
         E_CCSD = ccsd_spatial_orbital(
             d_eri_ao, d_C, d_eps, num_basis, full_occ,
             /*computing_ccsd_t=*/false, /*ccsd_t_energy=*/nullptr,
             &d_t1, &d_t2,
             d_eri_mo_precomputed,
-            num_frozen);
+            num_frozen,
+            /*h_fov_active=*/nullptr, /*eri_ri=*/ccsd_eri_ri);
 
         std::cout << "  CCSD correlation energy: " << std::fixed << std::setprecision(10)
                   << E_CCSD << " Ha   (in " << std::setprecision(3)
@@ -258,10 +264,19 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
     int eom_gpus = 1;
     if (const char* e = std::getenv("GANSU_STEOM_EOM_GPUS"))
         if (e[0]) eom_gpus = std::max(1, std::atoi(e));
+    // Inc3: build_B_mo returns a SHARED thread-local workspace that the ground-CCSD
+    // re-solve above overwrites in block mode. Rebuild the operator's cluster B_mo
+    // fresh right before constructing the operator (build_B_mo is deterministic;
+    // a no-op cost when nothing clobbered it). Without eri_block_src this is null.
+    const real_t* d_B_for_op = d_B_mo_blocks;
+    if (eri_block_src) {
+        const real_t* Br = eri_block_src->build_B_mo(d_C, num_basis);
+        if (Br) d_B_for_op = Br;
+    }
     IPEOMCCSDOperator ip_op(d_eri_for_op, d_eps_for_op,
                             d_t1, d_t2,
                             nocc_active, nvir, nao_active,
-                            eri_block_src, d_B_mo_blocks, num_basis, eom_gpus,
+                            eri_block_src, d_B_for_op, num_basis, eom_gpus,
                             // (A) shared bar-H: publish 8 IP-side intermediates
                             (ctx ? ctx->share_barh : rhf.steom_share_barh())
                                 ? (ctx ? &ctx->barh : &rhf.steom_barh_cache()) : nullptr,
@@ -585,9 +600,13 @@ void ERI_RI_RHF::compute_ip_eom_ccsd(int n_states) {
 // only); cluster state + result live in `ctx`.
 void compute_cluster_ip_eom_ccsd(RHF& cfg, EOMChainContext& ctx,
                                  real_t* d_eri_mo, int n_states) {
+    // Inc3: with the cluster block source set (GANSU_DMET_STEOM_RI_BLOCK) the IP
+    // operator pulls its MO-ERI blocks on the fly from the cluster B (no n_emb⁴);
+    // d_eri_mo is then null. Default (no block) ⇒ ctx fields null ⇒ dense path.
     compute_ip_eom_ccsd_impl(cfg, /*d_eri_ao=*/nullptr, n_states,
                              /*d_eri_mo_precomputed=*/d_eri_mo,
-                             /*eri_block_src=*/nullptr, /*d_B_mo_blocks=*/nullptr,
+                             /*eri_block_src=*/ctx.eri_block_src,
+                             /*d_B_mo_blocks=*/ctx.d_B_mo_blocks,
                              &ctx);
 }
 

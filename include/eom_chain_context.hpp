@@ -28,6 +28,8 @@
 
 namespace gansu {
 
+class ERI_RI;  // RI integral engine — cluster B-source for storage-free STEOM (Inc3).
+
 /**
  * @brief Standalone electronic state + inter-stage scratch for the
  *        CIS-NTO → IP-EOM → EA-EOM → STEOM composite chain (DMET-STEOM, §3 of
@@ -103,6 +105,20 @@ struct EOMChainContext {
     bool use_dlpno_amplitudes = false;
     bool use_dlpno_native_eom = false;
     bool use_dlpno_projected_eom = false;
+
+    // -------------------------------------------------------------------------
+    // Storage-free RI cluster integrals (Inc3, env GANSU_DMET_STEOM_RI_BLOCK).
+    // When prefer_ri_block is set the STEOM chain pulls MO-ERI sub-blocks on the
+    // fly from the cluster B (build_B_mo, naux·n_emb²) instead of a precomputed
+    // dense n_emb⁴ tensor — which OOMs for large fragments (30-atom TXO2 acceptor:
+    // n_emb=490 ⇒ 461 GB). The driver builds the cluster B once and publishes it
+    // here so the cluster-stage free functions (IP/EA/STEOM-build) hand it to the
+    // already-B-source-capable operators (eri_block_src + mo_eri_block_into).
+    // Default false ⇒ dense path ⇒ byte-identical legacy behaviour.
+    // -------------------------------------------------------------------------
+    bool          prefer_ri_block = false;   ///< env-requested; only honoured when eri_method is ERI_RI + GPU
+    const ERI_RI* eri_block_src   = nullptr; ///< set by the driver once build_B_mo succeeds (else stays null ⇒ dense)
+    const real_t* d_B_mo_blocks   = nullptr; ///< cluster B_mo [naux × nmo²] on device (owned by the ERI_RI workspace)
 
     // ----- convenience accessors mirroring the RHF getters used by the chain ---
     int get_num_basis()        const { return nmo; }
