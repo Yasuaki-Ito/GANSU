@@ -214,6 +214,43 @@ vibrational frequencies, and Molden export. Direct-SCF/Hash ERIs and the
 ./gansu -x h2o.xyz -g sto-3g --post_hf_method fci
 ```
 
+#### Multi-node / multi-GPU Full-CI
+
+The Full-CI vector grows factorially and quickly exceeds a single GPU's memory
+(e.g. C₂/6-31g has ~3.4×10⁸ determinants and does not fit one GPU). GANSU ships a
+distributed solver (`fci_mpi`) that shards the FCI vector across MPI ranks — one
+GPU per rank — using NCCL collectives for the Davidson sigma builds (alpha-string
+row-block partitioning, with AllGather/ReduceScatter overlapped against compute).
+
+Build with MPI enabled (requires the MPI dev headers and NCCL):
+
+```bash
+cd build
+cmake .. -DENABLE_MPI=ON
+make
+```
+
+Launch with `mpirun` through the `script/gansu_mpi.sh` wrapper, which pins each
+rank to exactly one GPU (`CUDA_VISIBLE_DEVICES=$LOCAL_RANK`) so every rank sees
+its GPU as device 0:
+
+```bash
+# 2 ranks → 2 GPUs
+mpirun -np 2 --bind-to none ../script/gansu_mpi.sh \
+       ./gansu -x ../xyz/C2.xyz -g 6-31g --post_hf_method fci
+```
+
+The dispatch is automatic: with more than one rank the distributed `fci_mpi`
+solver runs; with `-np 1` (or a non-MPI build) the single-GPU `fci()` path is
+used and results are byte-identical to before. The two paths agree to machine
+precision (H₂O/sto-3g cross-check: single-GPU vs. 2-rank FCI energy differ by
+~1×10⁻¹³ Ha).
+
+> [!NOTE]
+> `script/gansu_mpi.sh` resolves the node-local rank from Open MPI, MVAPICH2,
+> Slurm (`srun`), or MPICH/Intel MPI environment variables, so the same wrapper
+> works across launchers and scales to multiple nodes unchanged (one GPU per rank).
+
 ### 4. Excited State Calculations
 
 ```bash

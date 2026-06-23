@@ -224,7 +224,7 @@ Method names are case-insensitive. Hyphen variants are accepted (`scs-mp2` ≡ `
 | Value | Description |
 | --- | --- |
 | none | No post-HF method applied (HF only) |
-| FCI | Full Configuration Interaction. Exact within the basis. Cost grows factorially — only feasible for very small systems |
+| FCI | Full Configuration Interaction. Exact within the basis. Cost grows factorially — only feasible for very small systems. Runs single-GPU by default; when GANSU is built with `-DENABLE_MPI=ON` and launched under `mpirun` on more than one rank, the FCI vector is sharded across ranks/GPUs by the distributed solver (`fci_mpi`), making determinant spaces that exceed a single GPU's memory reachable (see [Multi-node / multi-GPU Full-CI](usage_cli.md#multi-node--multi-gpu-full-ci)) |
 | MP2 | Møller–Plesset perturbation theory of 2nd order. Spin-orbital form: $E_{\mathrm{MP2}} = \tfrac{1}{4}\sum_{ijab} \frac{\|\langle ij\|\|ab\rangle\|^2}{\varepsilon_i+\varepsilon_j-\varepsilon_a-\varepsilon_b}$ with antisymmetrized $\langle ij\|\|ab\rangle = (ia\|jb) - (ib\|ja)$. Closed-shell (RMP2) reduces to $\sum_{ijab}\frac{(ia\|jb)\,[2(ia\|jb)-(ib\|ja)]}{\varepsilon_i+\varepsilon_j-\varepsilon_a-\varepsilon_b}$. Splits into opposite-spin (OS) and same-spin (SS) components |
 | SCS_MP2 | Spin-Component-Scaled MP2 (Grimme 2003). $E = c_{\mathrm{OS}} E_{\mathrm{OS}} + c_{\mathrm{SS}} E_{\mathrm{SS}}$ with $c_{\mathrm{OS}} = 6/5$, $c_{\mathrm{SS}} = 1/3$. More accurate than MP2 at the same cost |
 | SOS_MP2 | Scaled Opposite-Spin MP2 (Jung & Head-Gordon 2004). Drops the same-spin term and rescales: $E = 1.3 \cdot E_{\mathrm{OS}}$. Same-spin omission removes the exchange integral path, enabling cheaper algorithms |

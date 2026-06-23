@@ -57,7 +57,7 @@ GANSU (GPU Accelerated Numerical Simulation Utility) is an open-source quantum c
 * Direct SCF
 * Post-Hartree-Fock methods
   * Integral Transformation (AO -> MO)
-  * Configuration Interaction (CI)
+  * Configuration Interaction (CI), including Full-CI (single-GPU, and distributed multi-node / multi-GPU via MPI + NCCL with `-DENABLE_MPI=ON`)
   * Coupled Cluster (CC)
   * Moller-Plesset Perturbation Theory (MP)
 * Density Functional Theory (DFT)

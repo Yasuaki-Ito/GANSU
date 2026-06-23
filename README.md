@@ -39,7 +39,7 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
     * CCSD Lambda equations and 1-RDM (relaxed correlation density)
     * Density Matrix Embedding Theory with CCSD solver (DMET-CCSD, DMET-CCSD(T)) — fragment-based correlation, semi-canonical CCSD with f_ov support, μ-bisection density consistency, multi-GPU fragment parallelism, automatic X-H bond fragment detection, optional perturbative triples per fragment
     * Domain-based Local Pair Natural Orbital Coupled Cluster (DLPNO-CCSD, DLPNO-CCSD(T)) — Pipek-Mezey occupied localization, PAO + per-LMO domain, pair natural orbitals with PNO truncation, weak-pair MP2 reduction, multi-GPU per-triple parallelism with batched cuBLAS DGEMM kernels (RHF closed-shell, requires RI)
-    * Full Configuration Interaction (RFCI)
+    * Full Configuration Interaction (RFCI) — single-GPU, plus a distributed multi-node / multi-GPU solver (MPI + NCCL hybrid; alpha-string row-block sharding with overlapped AllGather/ReduceScatter Davidson sigma builds) enabled with `cmake -DENABLE_MPI=ON` and launched under `mpirun`
     * RI support for all post-HF methods (AO ERI reconstructed from B matrix, nao⁴ intermediate skipped via direct MO ERI construction)
     * Semi-Direct RI and Direct-RI MP2 (B matrix built on-the-fly, no persistent naux×nao² storage)
     * RI CIS with B-matrix based sigma vector (no nmo⁴ MO ERI, O(naux×nmo²) memory)
@@ -303,6 +303,11 @@ To enable multi-GPU support (requires NCCL):
 cmake .. -DENABLE_MULTI_GPU=ON
 ```
 
+To enable MPI multi-process scale-out (MPI + NCCL hybrid; required for the distributed multi-node / multi-GPU Full-CI solver). Requires the MPI dev headers (e.g. `sudo apt install libopenmpi-dev`) and NCCL:
+``` bash
+cmake .. -DENABLE_MPI=ON
+```
+
 3. Build the software using the generated Makefile:
 ``` bash
 make
@@ -344,6 +349,15 @@ make
 # DLPNO-CCSD / DLPNO-CCSD(T) — local correlation, scales to ~100 atoms with RI
 ./gansu -x ../xyz/large_molecular/water_hexamer.xyz -g cc-pvdz --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method dlpno_ccsd --dlpno_preset normal
 ./gansu -x ../xyz/large_molecular/water_hexamer.xyz -g cc-pvdz --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method dlpno_ccsd_t --dlpno_preset normal
+
+# Full CI — single GPU (exact within the basis; small systems only)
+./gansu -x ../xyz/H2O.xyz -g sto-3g --post_hf_method fci
+
+# Multi-node / multi-GPU Full CI (MPI + NCCL; requires a -DENABLE_MPI=ON build).
+# The launcher pins each rank to one GPU (CUDA_VISIBLE_DEVICES=$LOCAL_RANK); >1 rank
+# uses the distributed solver, -np 1 falls back to the single-GPU path.
+mpirun -np 2 --bind-to none ./script/gansu_mpi.sh \
+       ./gansu -x ../xyz/C2.xyz -g 6-31g --post_hf_method fci
 
 # Spherical-harmonic basis (5D/7F/9G) — match ORCA/PySCF cc-pVDZ references
 ./gansu -x ../xyz/Benzene.xyz -g cc-pvdz --use_spherical 1
