@@ -180,14 +180,17 @@ void CISOperator_RI::apply(const real_t* d_input, real_t* d_output) const {
         //   R_cm(nvir,nocc) is R^T_rm.
         //   tmp_cm = B_vv_cm × R_cm = (nvir,nvir)×(nvir,nocc) → (nvir,nocc)
         //   In row-major: this gives tmp(nocc,nvir) = R × B_vv^T. Correct!
+        // Q-strided offsets are size_t: at large basis Q·nvir² (and Q·nao² in the
+        // CIS driver) overflows int → negative pointer offset → segfault. Keep all
+        // per-Q strides in size_t so the operator scales past ~800 virtuals.
         for (int Q = 0; Q < naux_; Q++) {
             cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                         nvir_, nocc_, nvir_,
                         &one,
-                        &d_B_vv_[Q * vv], nvir_,  // B_vv_Q col-major = B_vv_Q^T row-major
+                        &d_B_vv_[(size_t)Q * vv], nvir_,  // B_vv_Q col-major = B_vv_Q^T row-major
                         d_input, nvir_,            // R col-major = R^T row-major
                         &zero,
-                        &d_tmp[Q * ov], nvir_);    // tmp_Q col-major (nvir, nocc)
+                        &d_tmp[(size_t)Q * ov], nvir_);    // tmp_Q col-major (nvir, nocc)
         }
         // Now d_tmp[Q*ov + a*nocc + j] in col-major = tmp(Q,j,a) in the math sense
         // Actually in col-major output: d_tmp[Q*ov + a + j*nvir]?
@@ -230,8 +233,8 @@ void CISOperator_RI::apply(const real_t* d_input, real_t* d_output) const {
             cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
                         nvir_, nocc_, nocc_,
                         &minus_one,
-                        &d_tmp[Q * ov], nvir_,
-                        &d_B_oo_[Q * oo], nocc_,
+                        &d_tmp[(size_t)Q * ov], nvir_,
+                        &d_B_oo_[(size_t)Q * oo], nocc_,
                         &one,
                         d_output, nvir_);
         }

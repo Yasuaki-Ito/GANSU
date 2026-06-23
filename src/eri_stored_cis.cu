@@ -475,24 +475,34 @@ void ERI_RI_RHF::compute_cis_ri_impl(int n_states, std::vector<real_t>* out_eige
         std::vector<real_t> h_B_mo((size_t)naux * nao * nao);
         cudaMemcpy(h_B_mo.data(), d_B_mo, h_B_mo.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
 
-        std::vector<real_t> h_B_ov(naux * nocc * nvir);
-        std::vector<real_t> h_B_oo(naux * nocc * nocc);
-        std::vector<real_t> h_B_vv(naux * nvir * nvir);
+        std::vector<real_t> h_B_ov((size_t)naux * nocc * nvir);
+        std::vector<real_t> h_B_oo((size_t)naux * nocc * nocc);
+        std::vector<real_t> h_B_vv((size_t)naux * nvir * nvir);
 
         // Active-occ MO index = num_frozen + i; virtual MO index = full_occ + a.
+        // All Q-strided offsets MUST be size_t: at large basis the per-Q B_mo
+        // stride nao² (e.g. 824²=678976) times naux (3408) exceeds INT_MAX, so an
+        // int `Q*nao*nao` overflows to a negative index → out-of-bounds host read
+        // → segfault. (Triggers when Q·nao² > 2³¹, i.e. nao≳800 here; smaller RI
+        // systems like ≤470 bf stayed under the limit, which is why this only
+        // surfaced at 824 bf.)
         for (int Q = 0; Q < naux; Q++) {
+            const size_t qmo = (size_t)Q * nao  * nao;
+            const size_t qov = (size_t)Q * nocc * nvir;
+            const size_t qoo = (size_t)Q * nocc * nocc;
+            const size_t qvv = (size_t)Q * nvir * nvir;
             for (int i = 0; i < nocc; i++)
                 for (int a = 0; a < nvir; a++)
-                    h_B_ov[Q * nocc * nvir + i * nvir + a] =
-                        h_B_mo[Q * nao * nao + (num_frozen + i) * nao + (full_occ + a)];
+                    h_B_ov[qov + (size_t)i * nvir + a] =
+                        h_B_mo[qmo + (size_t)(num_frozen + i) * nao + (full_occ + a)];
             for (int i = 0; i < nocc; i++)
                 for (int j = 0; j < nocc; j++)
-                    h_B_oo[Q * nocc * nocc + i * nocc + j] =
-                        h_B_mo[Q * nao * nao + (num_frozen + i) * nao + (num_frozen + j)];
+                    h_B_oo[qoo + (size_t)i * nocc + j] =
+                        h_B_mo[qmo + (size_t)(num_frozen + i) * nao + (num_frozen + j)];
             for (int a = 0; a < nvir; a++)
                 for (int b = 0; b < nvir; b++)
-                    h_B_vv[Q * nvir * nvir + a * nvir + b] =
-                        h_B_mo[Q * nao * nao + (full_occ + a) * nao + (full_occ + b)];
+                    h_B_vv[qvv + (size_t)a * nvir + b] =
+                        h_B_mo[qmo + (size_t)(full_occ + a) * nao + (full_occ + b)];
         }
 
         cudaMemcpy(d_B_ov, h_B_ov.data(), h_B_ov.size() * sizeof(real_t), cudaMemcpyHostToDevice);
