@@ -102,7 +102,7 @@ Successful compilation generates the shared library required by the distributed 
 ```bash
 mpirun -n <nprocs> python fci.py --mol C2 --basis sto3g
 ```
-where <nprocs> is the number of MPI processes (GPUs) used for the calculation.
+where \<nprocs\> is the number of MPI processes (GPUs) used for the calculation.
 
 A convenience script providing the same functionality is also included:
 ```bash
