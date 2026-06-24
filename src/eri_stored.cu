@@ -33,6 +33,8 @@
 #include "thc_mp2.hpp"
 #include "thc_sos_adc2_operator.hpp"
 #include "davidson_solver.hpp"
+#include "multi_gpu_manager.hpp"  // (Phase 1) MultiGpuManager / DeviceGuard for distributed CCSD ladder
+#include "nccl_comm.hpp"          // (Phase 1) nccl::all_reduce (GANSU_MULTI_GPU-gated)
 
 #include "ao2mo.cuh"
 
@@ -7757,6 +7759,42 @@ __global__ void ccsd_Lac_kernel(double* __restrict__ Lac,
     Lac[gid] = val;
 }
 
+// (③ Lac, per-a-tile) Same math as ccsd_Lac_kernel but reads ONE a-tile of
+// w_ovvv_R built on the fly from B (d_wovvvR_tile[a'·nocc·vv + k·vv + c·nvir + d]
+// = w_ovvv_R[a0+a', k, c, d], the exact Inc-G2 tile). a is the OUTPUT index ∴
+// each thread still does the full (k,d) sum internally → byte-identical to host
+// (only the output a is partitioned, never the summed index). Lets d_w_ovvv_R
+// (nocc·nvir³) be dropped from the tiled residual.
+//   wR_tile [a'·nocc·vv + k·vv + c·nvir + d]  (this a-tile only)
+//   a = a0 + a'  (global virtual index)
+__global__ void ccsd_Lac_tile_kernel(double* __restrict__ Lac,
+                                     const double* __restrict__ Fac,
+                                     const double* __restrict__ wR_tile,
+                                     const double* __restrict__ t1,
+                                     const double* __restrict__ fov,
+                                     int a0, int ta, int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t vv = (size_t)nvir * nvir;
+    const size_t cols = (size_t)ta * nvir;   // (a' , c)
+    if (gid >= cols) return;
+    const int c  = (int)(gid % nvir);
+    const int ap = (int)(gid / nvir);        // a' within the tile
+    const int a  = a0 + ap;                  // global a
+
+    const size_t ap_base = (size_t)ap * nocc * vv;
+    double val = Fac[(size_t)a*nvir + c];    // pure cc_Fvv (no fov)
+    for (int k = 0; k < nocc; k++)
+        for (int d = 0; d < nvir; d++)
+            val += wR_tile[ap_base + (size_t)k*vv + (size_t)c*nvir + d] * t1[(size_t)k*nvir + d];
+    if (fov) {
+        double fv = 0.0;
+        for (int k = 0; k < nocc; k++)
+            fv += t1[(size_t)k*nvir + a] * fov[(size_t)k*nvir + c];
+        val -= fv;
+    }
+    Lac[(size_t)a*nvir + c] = val;
+}
+
 // (Z build) Z[ab,ic] = v_vvov[ab,ic] − Σ_k v_ovov[(k,b),(i,c)]·t1[k,a]
 //                                     − Σ_k v_voov[(a,k),(i,c)]·t1[k,b].
 // One thread per (a,b,i,c). d_Z is pre-filled with v_vvov, so each thread reads
@@ -8140,9 +8178,14 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     const size_t sz_v_vvvv = use_tiled_ladder ? (size_t)1 : vv*vv, sz_Fac = vv, sz_Fkc = ov;
     const size_t sz_t2v = t2Size, sz_Lac = vv, sz_Z = vv*ov;
     const size_t sz_Wex = OV2;  // each of A, B, C1, C2, V_R, W_R, V_R2
-    const size_t sz_v_ovvv = (size_t)nocc * vvv;       // persistent v_ovvv
-    const size_t sz_v_ovvv_perm = (size_t)nocc * vvv;   // persistent v_ovvv_perm
-    const size_t sz_w_ovvv_R = (size_t)nvir * nocc * vv; // persistent w_ovvv_R
+    // (ovvv per-tile, Inc-A) d_v_ovvv / d_v_ovvv_perm are read only by the legacy
+    // (non-tiled) ovvv_t1 build; the tiled path builds those per-k from B (Inc-G1).
+    // So shrink their carve to 1 when tiled — frees 2·nocc·nvir³ of device memory.
+    const size_t sz_v_ovvv = use_tiled_ladder ? (size_t)1 : (size_t)nocc * vvv;       // persistent v_ovvv
+    const size_t sz_v_ovvv_perm = use_tiled_ladder ? (size_t)1 : (size_t)nocc * vvv;   // persistent v_ovvv_perm
+    // (Inc-B) d_w_ovvv_R is read by the non-tiled T1 DGEMM; the tiled path now
+    // builds Lac per-a-tile from B (ccsd_Lac_tile_kernel) ∴ shrink to 1 when tiled.
+    const size_t sz_w_ovvv_R = use_tiled_ladder ? (size_t)1 : (size_t)nvir * nocc * vv; // persistent w_ovvv_R
     const size_t total_gpu_doubles = sz_tau + sz_Wabcd + sz_Wklij + sz_raw
         + sz_w_oovv + sz_v_oovv + sz_Fki + sz_v_ovvv_T + sz_t1 + sz_ovvv_t1
         + sz_v_vvvv + sz_Fac + sz_Fkc + sz_t2v + sz_Lac + sz_Z
@@ -8259,18 +8302,27 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // Pre-compute w_ovvv_perm reshaped as [nvir, nocc*vv] for T1 DGEMM
     // w_ovvv_R[a, k*vv+c*nvir+d] = w_ovvv[k*vvv + a*vv + d*nvir+c]
     // This transposes (c,d) in w_ovvv and reshapes for DGEMM: Result[a,i] = w_ovvv_R × tau^T
-    std::vector<real_t> w_ovvv_R((size_t)nvir * nocc * vv);
-    for (int a = 0; a < nvir; a++)
-        for (int k = 0; k < nocc; k++)
-            for (int c = 0; c < nvir; c++)
-                for (int d = 0; d < nvir; d++)
-                    w_ovvv_R[(size_t)a * nocc * vv + (size_t)k * vv + (size_t)c * nvir + d] =
-                        w_ovvv[(size_t)k * vvv + (size_t)a * vv + (size_t)d * nvir + c];
+    // (Inc-B) only the non-tiled path uploads d_w_ovvv_R; the tiled path builds Lac
+    // per-a-tile from B ∴ skip the nocc·nvir³ host reshape + upload when tiled.
+    std::vector<real_t> w_ovvv_R;
+    if (!use_tiled_ladder) {
+        w_ovvv_R.resize((size_t)nvir * nocc * vv);
+        for (int a = 0; a < nvir; a++)
+            for (int k = 0; k < nocc; k++)
+                for (int c = 0; c < nvir; c++)
+                    for (int d = 0; d < nvir; d++)
+                        w_ovvv_R[(size_t)a * nocc * vv + (size_t)k * vv + (size_t)c * nvir + d] =
+                            w_ovvv[(size_t)k * vvv + (size_t)a * vv + (size_t)d * nvir + c];
+    }
 
     // Upload constant integral arrays to persistent GPU buffers (once, not per iteration)
-    cudaMemcpy(d_v_ovvv, v_ovvv.data(), sz_v_ovvv * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v_ovvv_perm, v_ovvv_perm.data(), sz_v_ovvv_perm * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_w_ovvv_R, w_ovvv_R.data(), sz_w_ovvv_R * sizeof(double), cudaMemcpyHostToDevice);
+    // (Inc-A/B) v_ovvv / v_ovvv_perm / w_ovvv_R are only consumed by the non-tiled
+    // path — skip their upload when tiled (carves shrunk to 1, never read).
+    if (!use_tiled_ladder) {
+        cudaMemcpy(d_v_ovvv, v_ovvv.data(), sz_v_ovvv * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_v_ovvv_perm, v_ovvv_perm.data(), sz_v_ovvv_perm * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_w_ovvv_R, w_ovvv_R.data(), sz_w_ovvv_R * sizeof(double), cudaMemcpyHostToDevice);
+    }
 
     // Energy: E = sum_{ijab} w_oovv[ij,ab] * (t2(i,j,a,b) + t1(i,a)*t1(j,b))
     auto energy = [&]() -> real_t {
@@ -8368,6 +8420,41 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             cudaMemcpy(d_fov, h_fov_active, (size_t)ov * sizeof(double), cudaMemcpyHostToDevice);
         }
     }
+
+    // (Phase 1, increment-1) Distributed particle-particle ladder (⑨, the
+    // dominant O(o²v⁴) term). Opt-in: GANSU_CCSD_MULTIGPU=1 + >1 device + tiled
+    // B-native. a-tiles round-robin across GPUs; each builds Wabcd from B and
+    // contracts with tau, results NCCL-AllReduced into device-0 d_raw. The
+    // iter-invariant inputs (B_mo, v_ovvv_T) are broadcast once here; tau/t1 and
+    // tile scratch are per-iter inside the ladder. num_gpus==1 / env unset /
+    // GANSU_MULTI_GPU undefined → existing single-device path (byte-identical).
+    bool ccsd_dist = false;
+#ifdef GANSU_MULTI_GPU
+    int ccsd_NG = 1;
+    std::vector<double*> dBmo, dVT;   // per-device (d>0); device 0 reuses B_mo / d_v_ovvv_T
+    {
+        const char* e_mg = std::getenv("GANSU_CCSD_MULTIGPU");
+        auto& mgr = MultiGpuManager::instance();
+        if (use_tiled_ladder && ri_bnative && e_mg && e_mg[0] == '1' && mgr.num_devices() > 1) {
+            ccsd_dist = true;
+            ccsd_NG = mgr.num_devices();
+            const size_t bmo_sz = (size_t)eri_ri->get_num_auxiliary_basis() * (size_t)N * N;
+            const size_t vt_sz  = (size_t)vvv * nocc;
+            dBmo.assign(ccsd_NG, nullptr);
+            dVT.assign(ccsd_NG, nullptr);
+            for (int d = 1; d < ccsd_NG; d++) {
+                MultiGpuManager::DeviceGuard g(d);
+                tracked_cudaMalloc((void**)&dBmo[d], bmo_sz * sizeof(double));
+                tracked_cudaMalloc((void**)&dVT[d],  vt_sz  * sizeof(double));
+                cudaMemcpyPeer(dBmo[d], d, (const void*)B_mo,  0, bmo_sz * sizeof(double));
+                cudaMemcpyPeer(dVT[d],  d, (const void*)d_v_ovvv_T, 0, vt_sz * sizeof(double));
+            }
+            cudaSetDevice(0);
+            std::cout << "[CCSD MULTIGPU] distributed ladder across " << ccsd_NG
+                      << " GPUs (env GANSU_CCSD_MULTIGPU)" << std::endl;
+        }
+    }
+#endif
 
     for (int iter = 1; iter <= MAX_ITER; iter++) {
 
@@ -8926,6 +9013,73 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                                     (int)oo, (int)vv, (int)vv,
                                     false, true, true, 0.5);
         } else {
+#ifdef GANSU_MULTI_GPU
+        if (ccsd_dist) {
+            // (Phase 1, increment-1) distributed ladder: a-tiles round-robin across
+            // GPUs. Each device builds its Wabcd tiles from (broadcast) B_mo and
+            // contracts with (broadcast) tau into a per-device raw, then NCCL
+            // AllReduce sums them into device-0 d_raw (a-tiles are disjoint ∴ sum =
+            // full ladder). gpu:: helpers run on device d after GPUHandle::reset().
+            auto& mgr = MultiGpuManager::instance();
+            const int TA = 16;
+            std::vector<double*> tau_d(ccsd_NG), t1_d(ccsd_NG), raw_d(ccsd_NG), vt_d(ccsd_NG), bmo_d(ccsd_NG);
+            std::vector<double*> tvvvv(ccsd_NG), tot1(ccsd_NG), tot2(ccsd_NG), tW(ccsd_NG), trawt(ccsd_NG), tt1s(ccsd_NG);
+            for (int d = 0; d < ccsd_NG; d++) {
+                MultiGpuManager::DeviceGuard g(d);
+                gpu::GPUHandle::reset();   // rebind thread-local cuBLAS to device d
+                if (d == 0) {
+                    tau_d[0]=d_tau; t1_d[0]=d_t1; raw_d[0]=d_raw; vt_d[0]=d_v_ovvv_T; bmo_d[0]=(double*)B_mo;
+                } else {
+                    tracked_cudaMalloc((void**)&tau_d[d], t2Size*sizeof(double));
+                    tracked_cudaMalloc((void**)&t1_d[d],  t1Size*sizeof(double));
+                    tracked_cudaMalloc((void**)&raw_d[d], t2Size*sizeof(double));
+                    cudaMemcpyPeer(tau_d[d], d, (const void*)d_tau, 0, t2Size*sizeof(double));
+                    cudaMemcpyPeer(t1_d[d],  d, (const void*)d_t1,  0, t1Size*sizeof(double));
+                    cudaMemset(raw_d[d], 0, t2Size*sizeof(double));
+                    vt_d[d]=dVT[d]; bmo_d[d]=dBmo[d];
+                }
+                tracked_cudaMalloc((void**)&tvvvv[d], (size_t)TA*vvv*sizeof(double));
+                tracked_cudaMalloc((void**)&tot1[d],  (size_t)TA*vv*nvir*sizeof(double));
+                tracked_cudaMalloc((void**)&tot2[d],  (size_t)vvv*TA*sizeof(double));
+                tracked_cudaMalloc((void**)&tW[d],    (size_t)TA*vvv*sizeof(double));
+                tracked_cudaMalloc((void**)&trawt[d], (size_t)oo*TA*nvir*sizeof(double));
+                tracked_cudaMalloc((void**)&tt1s[d],  (size_t)nocc*TA*sizeof(double));
+                for (int a0 = d*TA; a0 < nvir; a0 += ccsd_NG*TA) {
+                    int ta = std::min(TA, nvir - a0);
+                    ccsd_block_chem_from_B(eri_ri, bmo_d[d], N, V+a0,ta, V,nvir, V,nvir, V,nvir, tvvvv[d]);
+                    gpu::matrixMatrixProductRect(vt_d[d] + (size_t)a0*vv*nocc, t1_d[d], tot1[d],
+                                            (int)((size_t)ta*vv), nvir, nocc, false, false, false, 1.0);
+                    cudaMemcpy2D(tt1s[d], (size_t)ta*sizeof(double),
+                                 t1_d[d] + a0, (size_t)nvir*sizeof(double),
+                                 (size_t)ta*sizeof(double), nocc, cudaMemcpyDeviceToDevice);
+                    gpu::matrixMatrixProductRect(vt_d[d], tt1s[d], tot2[d],
+                                            (int)vvv, ta, nocc, false, false, false, 1.0);
+                    { size_t tot=(size_t)ta*vvv; int th=256; int bl=(int)((tot+th-1)/th);
+                      build_Wabcd_tile_kernel<<<bl,th>>>(tvvvv[d], tot1[d], tot2[d], tW[d], nvir, ta); }
+                    gpu::matrixMatrixProductRect(tau_d[d], tW[d], trawt[d],
+                                            (int)oo, (int)((size_t)ta*nvir), (int)vv, false, true, false, 0.5);
+                    { size_t tot=oo*(size_t)ta*nvir; int th=256; int bl=(int)((tot+th-1)/th);
+                      scatter_add_abtile_kernel<<<bl,th>>>(trawt[d], raw_d[d], nocc, nvir, a0, ta); }
+                }
+            }
+            mgr.sync_all();   // all per-device default-stream compute complete
+            nccl::group_start();
+            for (int d = 0; d < ccsd_NG; d++) {
+                MultiGpuManager::DeviceGuard g(d);
+                nccl::all_reduce(raw_d[d], raw_d[d], (size_t)t2Size, ncclSum, d, mgr.comm_stream(d));
+            }
+            nccl::group_end();
+            { MultiGpuManager::DeviceGuard g(0); cudaStreamSynchronize(mgr.comm_stream(0)); }  // d_raw (dev0) now = full ladder
+            for (int d = 0; d < ccsd_NG; d++) {
+                MultiGpuManager::DeviceGuard g(d); gpu::GPUHandle::reset();
+                tracked_cudaFree(tvvvv[d]); tracked_cudaFree(tot1[d]); tracked_cudaFree(tot2[d]);
+                tracked_cudaFree(tW[d]); tracked_cudaFree(trawt[d]); tracked_cudaFree(tt1s[d]);
+                if (d > 0) { tracked_cudaFree(tau_d[d]); tracked_cudaFree(t1_d[d]); tracked_cudaFree(raw_d[d]); }
+            }
+            cudaSetDevice(0); gpu::GPUHandle::reset();   // restore device-0 handle for the rest of the residual
+        } else
+#endif
+        {
             // (B-native Inc2) tiled particle-particle ladder — build Wabcd one
             // a-tile at a time from B_mo, contract with tau, scatter into d_raw.
             // No nvir⁴ buffer is ever allocated (peak ≈ TA·nvir³ per tile).
@@ -8968,6 +9122,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             tracked_cudaFree(d_vvvv_tile); tracked_cudaFree(d_ot1_tile1); tracked_cudaFree(d_ot1_tile2);
             tracked_cudaFree(d_Wtile); tracked_cudaFree(d_raw_tile); tracked_cudaFree(d_t1_slice);
         }
+        }   // close the tiled-ladder else-body (distributed | single-device)
 
         // raw[ij,ab] += 0.5 * Wklij^T[ij,kl] * tau[kl,ab]
         gpu::matrixMatrixProductRect(d_Wklij, d_tau, d_raw,
@@ -8978,12 +9133,22 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // For each ij: raw[ij,ab] += Lac[a,c] × t2v[ij,cb]
         // d_t2v already contains t2v from upload at start of iteration
         if (use_tiled_ladder) {
-            // (③ Lac) build d_Lac on the device here — immediately before the
-            // batched Lac×t2 GEMM that consumes it (no intervening write), from
-            // the resident w_ovvv_R. Replaces the host loop + upload.
-            int thl = 256; int bll = (int)((vv + thl - 1) / thl);
-            ccsd_Lac_kernel<<<bll, thl>>>(d_Lac, d_Fac, d_w_ovvv_R, d_t1,
-                                          (h_fov_active ? d_fov : nullptr), nocc, nvir);
+            // (③ Lac, Inc-B) build d_Lac on the device immediately before the
+            // batched Lac×t2 GEMM that consumes it, one a-tile of w_ovvv_R at a
+            // time from B (Inc-G2 machinery: extract X[k,a',c,d]=(ka|cd) →
+            // wR[a',k,c,d]=2(ka|dc)−(ka|cd) → contract over (k,d)). Output a is
+            // tiled, the (k,d) sum is per-thread ∴ byte-identical to host. Never
+            // materializes the nocc·nvir³ d_w_ovvv_R.
+            for (int a0 = 0; a0 < nvir; a0 += TA_OVVV) {
+                int ta = std::min(TA_OVVV, nvir - a0);
+                extract_block(d_wovvvR_X, N, O,nocc, V+a0,ta, V,nvir, V,nvir);
+                size_t tot = (size_t)ta*nocc*vv; int th=256; int bl=(int)((tot+th-1)/th);
+                ccsd_wovvvR_tile_kernel<<<bl,th>>>(d_wovvvR_X, d_wovvvR_tile, nocc, nvir, ta);
+                size_t lcols = (size_t)ta*nvir; int thl=256; int bll=(int)((lcols+thl-1)/thl);
+                ccsd_Lac_tile_kernel<<<bll, thl>>>(d_Lac, d_Fac, d_wovvvR_tile, d_t1,
+                                                   (h_fov_active ? d_fov : nullptr),
+                                                   a0, ta, nocc, nvir);
+            }
             if (std::getenv("GANSU_CCSD_P0_VALIDATE")) {
                 std::vector<real_t> ref(vv, 0.0), dev(vv, 0.0);
                 host_Lac(ref);
@@ -9317,6 +9482,18 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         tracked_cudaMalloc((void**)d_t2_out, t2Size * sizeof(real_t));
         cudaMemcpy(*d_t2_out, t2v.data(), t2Size * sizeof(real_t), cudaMemcpyHostToDevice);
     }
+
+#ifdef GANSU_MULTI_GPU
+    // (Phase 1) free the per-device broadcast buffers (B_mo / v_ovvv_T copies)
+    if (ccsd_dist) {
+        for (int d = 1; d < ccsd_NG; d++) {
+            MultiGpuManager::DeviceGuard g(d);
+            if (dBmo[d]) tracked_cudaFree(dBmo[d]);
+            if (dVT[d])  tracked_cudaFree(dVT[d]);
+        }
+        cudaSetDevice(0); gpu::GPUHandle::reset();
+    }
+#endif
 
     // Free pre-allocated GPU buffers
     tracked_cudaFree(d_gpu_pool);  // single deallocation for all GPU buffers
