@@ -7353,6 +7353,332 @@ __global__ void ccsd_transpose_mid2_kernel(const double* __restrict__ src,
     dst[gid] = src[s];
 }
 
+// (B-native ovvv storage-free, Inc-G2) Build one a-tile of the reshaped w_ovvv_R
+// from a raw ovvv a-slice X[k,a',c,d] = (k,a0+a'|c,d):
+//   wR[a',k,c,d] = w_ovvv_R[a0+a', k,c,d] = 2*(k a|d c) - (k a|c d)
+//                = 2*X[k,a',d,c] - X[k,a',c,d]
+// X layout (dims nocc,ta,nvir,nvir): k*ta*vv + a'*vv + c*nvir + d
+// wR layout (dims ta,nocc,nvir,nvir): a'*nocc*vv + k*vv + c*nvir + d
+__global__ void ccsd_wovvvR_tile_kernel(const double* __restrict__ X,
+                                        double* __restrict__ wR,
+                                        int nocc, int nvir, int ta) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir;
+    size_t total = (size_t)ta * nocc * vv;
+    if (gid >= total) return;
+    int d = (int)(gid % nvir); size_t r = gid / nvir;
+    int c = (int)(r % nvir); r /= nvir;
+    int k = (int)(r % nocc); r /= nocc;
+    int ap = (int)r;  // a' within the tile
+    size_t base = (size_t)k * ta * vv + (size_t)ap * vv;
+    wR[gid] = 2.0 * X[base + (size_t)d * nvir + c] - X[base + (size_t)c * nvir + d];
+}
+
+// (Phase 0 host-roundtrip removal, P0-1) Scatter the W-exchange DGEMM results
+// (R12 = terms 1+2+3, R4 = term 4) directly into d_raw on the device, removing
+// the 2×ov² host download + host quadruple-loop scatter. gid = T2(i,j,a,b):
+//   raw[i,j,a,b] += R12[(a·nocc+i)·ov + j·nvir+b] + R4[(b·nocc+i)·ov + j·nvir+a]
+__global__ void ccsd_wexchange_scatter_kernel(const double* __restrict__ R12,
+                                              const double* __restrict__ R4,
+                                              double* __restrict__ raw,
+                                              int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir;
+    size_t total = (size_t)nocc * nocc * vv;
+    if (gid >= total) return;
+    int b = (int)(gid % nvir); size_t r = gid / nvir;
+    int a = (int)(r % nvir); r /= nvir;
+    int j = (int)(r % nocc); int i = (int)(r / nocc);
+    size_t ov = (size_t)nocc * nvir;
+    raw[gid] += R12[((size_t)a*nocc + i)*ov + (size_t)j*nvir + b]
+              + R4[((size_t)b*nocc + i)*ov + (size_t)j*nvir + a];
+}
+
+// (Phase 0 host-roundtrip removal, P0-2) The reduced T2 inner loop on the device:
+//   raw[i,j,a,b] += 0.5·v_oovv[ij,ab] − Σ_k Lki[k,i]·t2v[k,j,a,b]
+//                 + Zt1[(ab),(ij)] − Σ_k v_vooo[(a,k),(i,j)]·t1[k,b]
+// The last term (Q) is folded inline so no nvir²·nocc² Q buffer is needed.
+// gid = T2(i,j,a,b) = ((i·nocc+j)·vv + a·nvir+b) (= v_oovv index too).
+__global__ void ccsd_t2_reduced_kernel(double* __restrict__ raw,
+                                       const double* __restrict__ v_oovv,
+                                       const double* __restrict__ Lki,
+                                       const double* __restrict__ t2v,
+                                       const double* __restrict__ Zt1,
+                                       const double* __restrict__ v_vooo,
+                                       const double* __restrict__ t1,
+                                       int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir;
+    size_t oo = (size_t)nocc * nocc;
+    if (gid >= oo * vv) return;
+    int b = (int)(gid % nvir); size_t r = gid / nvir;
+    int a = (int)(r % nvir); r /= nvir;
+    int j = (int)(r % nocc); int i = (int)(r / nocc);
+    double val = 0.5 * v_oovv[gid];
+    for (int k = 0; k < nocc; k++)
+        val -= Lki[(size_t)k*nocc + i] * t2v[((size_t)k*nocc + j)*vv + (size_t)a*nvir + b];
+    val += Zt1[((size_t)a*nvir + b)*oo + (size_t)i*nocc + j];
+    for (int k = 0; k < nocc; k++)
+        val -= v_vooo[((size_t)a*nocc + k)*oo + (size_t)i*nocc + j] * t1[(size_t)k*nvir + b];
+    raw[gid] += val;
+}
+
+// (Phase 0 host-roundtrip removal, P0-3) T2 symmetrize on the device:
+//   newT2[i,j,a,b] = (raw[i,j,a,b] + raw[j,i,b,a]) / Dijab[i,j,a,b]
+// gid = T2(i,j,a,b); raw[j,i,b,a] = raw[T2(j,i,b,a)] = ((j·nocc+i)·vv + b·nvir+a).
+// Removes the host raw download + host symmetrize quadruple loop.
+__global__ void ccsd_t2_symmetrize_kernel(double* __restrict__ newT2,
+                                          const double* __restrict__ raw,
+                                          const double* __restrict__ Dijab,
+                                          int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir;
+    if (gid >= (size_t)nocc * nocc * vv) return;
+    int b = (int)(gid % nvir); size_t r = gid / nvir;
+    int a = (int)(r % nvir); r /= nvir;
+    int j = (int)(r % nocc); int i = (int)(r / nocc);
+    size_t gidP = ((size_t)j*nocc + i)*vv + (size_t)b*nvir + a;
+    newT2[gid] = (raw[gid] + raw[gidP]) / Dijab[gid];
+}
+
+// (Phase 0 host-roundtrip removal, P0-4) W^{kl}_{ij} on the device: add the
+// v_oooo + t1 terms onto the GEMM base (Wklij_base = v_oovv·tau already in
+// d_Wklij), removing the host download + host quadruple loop + re-upload.
+//   Wklij[k,l,i,j] += v_oooo[(k,l),(i,j)]
+//      + Σ_c v_oovo[(l,k),(c,i)]·t1[j,c] + Σ_c v_oovo[(k,l),(c,j)]·t1[i,c]
+// gid = ((k·nocc+l)·nocc+i)·nocc+j.
+__global__ void ccsd_Wklij_kernel(double* __restrict__ Wklij,
+                                  const double* __restrict__ v_oooo,
+                                  const double* __restrict__ v_oovo,
+                                  const double* __restrict__ t1,
+                                  int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t oo = (size_t)nocc * nocc;
+    if (gid >= oo * oo) return;
+    int j = (int)(gid % nocc); size_t r = gid / nocc;
+    int i = (int)(r % nocc); r /= nocc;
+    int l = (int)(r % nocc); int k = (int)(r / nocc);
+    double val = v_oooo[((size_t)k*nocc + l)*oo + (size_t)i*nocc + j];
+    for (int c = 0; c < nvir; c++) {
+        val += v_oovo[((size_t)l*nocc + k)*(size_t)nvir*nocc + (size_t)c*nocc + i] * t1[(size_t)j*nvir + c];
+        val += v_oovo[((size_t)k*nocc + l)*(size_t)nvir*nocc + (size_t)c*nocc + j] * t1[(size_t)i*nvir + c];
+    }
+    Wklij[gid] += val;
+}
+
+// (Phase 0 host-roundtrip removal, ⑦-1) single-index Wakic/Wakci on the device:
+//   Wakic[a,k,i,c] = v_voov[a,k,i,c] − Σ_l v_oovo[(k,l),(c,i)]·t1[l,a] + ovvv_t1_ic[(k,a,c),i]
+//   Wakci[a,k,c,i] = v_vovo[a,k,c,i] − Σ_l v_oovo[(l,k),(c,i)]·t1[l,a] + ovvv_t1_dc[(k,a,c),i]
+__global__ void ccsd_Wakic_kernel(double* __restrict__ Wakic,
+                                  const double* __restrict__ v_voov,
+                                  const double* __restrict__ v_oovo,
+                                  const double* __restrict__ t1,
+                                  const double* __restrict__ ovvv_t1_ic,
+                                  int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir;
+    if (gid >= (size_t)nocc * nocc * vv) return;
+    int c = (int)(gid % nvir); size_t r = gid / nvir;
+    int i = (int)(r % nocc); r /= nocc;
+    int k = (int)(r % nocc); int a = (int)(r / nocc);
+    double val = v_voov[((size_t)a*nocc + k)*(size_t)nocc*nvir + (size_t)i*nvir + c];
+    for (int l = 0; l < nocc; l++)
+        val -= v_oovo[((size_t)k*nocc + l)*(size_t)nvir*nocc + (size_t)c*nocc + i] * t1[(size_t)l*nvir + a];
+    val += ovvv_t1_ic[((size_t)k*vv + (size_t)a*nvir + c)*nocc + i];
+    Wakic[gid] = val;
+}
+
+__global__ void ccsd_Wakci_kernel(double* __restrict__ Wakci,
+                                  const double* __restrict__ v_vovo,
+                                  const double* __restrict__ v_oovo,
+                                  const double* __restrict__ t1,
+                                  const double* __restrict__ ovvv_t1_dc,
+                                  int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir;
+    if (gid >= (size_t)nocc * nocc * vv) return;
+    int i = (int)(gid % nocc); size_t r = gid / nocc;
+    int c = (int)(r % nvir); r /= nvir;
+    int k = (int)(r % nocc); int a = (int)(r / nocc);
+    size_t vo = (size_t)nvir * nocc;
+    double val = v_vovo[((size_t)a*nocc + k)*vo + (size_t)c*nocc + i];
+    for (int l = 0; l < nocc; l++)
+        val -= v_oovo[((size_t)l*nocc + k)*(size_t)nvir*nocc + (size_t)c*nocc + i] * t1[(size_t)l*nvir + a];
+    val += ovvv_t1_dc[((size_t)k*vv + (size_t)a*nvir + c)*nocc + i];
+    Wakci[gid] = val;
+}
+
+// (Phase 0 host-roundtrip removal, ⑦-2) ld-sum reshape on the device:
+//   eff_t2_R[(l,d),(i,a)] = −0.5·t2v[T2(i,l,d,a)] − t1[i,d]·t1[l,a]
+//   t2_C[(l,d),(i,a)]     = t2v[T2(i,l,a,d)]     where T2(i,l,x,y)=((i·nocc+l)·vv+x·nvir+y)
+// gid = (l·nvir+d)·ov + i·nvir+a.
+__global__ void ccsd_ldsum_reshape_kernel(double* __restrict__ eff_t2_R,
+                                          double* __restrict__ t2_C,
+                                          const double* __restrict__ t2v,
+                                          const double* __restrict__ t1, int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t ov = (size_t)nocc * nvir, vv = (size_t)nvir * nvir;
+    if (gid >= ov * ov) return;
+    int a = (int)(gid % nvir); size_t r = gid / nvir;
+    int i = (int)(r % nocc); r /= nocc;
+    int d = (int)(r % nvir); int l = (int)(r / nvir);
+    size_t il = (size_t)i*nocc + l;
+    eff_t2_R[gid] = -0.5 * t2v[il*vv + (size_t)d*nvir + a] - t1[(size_t)i*nvir + d] * t1[(size_t)l*nvir + a];
+    t2_C[gid] = t2v[il*vv + (size_t)a*nvir + d];
+}
+
+// (⑦-2) ld-sum scatter: Wakic[a,k,i,c] += R[(i·nvir+a)·ov + k·nvir+c]
+__global__ void ccsd_wakic_ldsum_scatter_kernel(double* __restrict__ Wakic,
+                                                const double* __restrict__ R, int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir, ov = (size_t)nocc * nvir;
+    if (gid >= (size_t)nocc * nocc * vv) return;
+    int c = (int)(gid % nvir); size_t r = gid / nvir;
+    int i = (int)(r % nocc); r /= nocc;
+    int k = (int)(r % nocc); int a = (int)(r / nocc);
+    Wakic[gid] += R[((size_t)i*nvir + a)*ov + (size_t)k*nvir + c];
+}
+
+// (⑦-2) ld-sum scatter: Wakci[a,k,c,i] += R[(i·nvir+a)·ov + k·nvir+c]
+__global__ void ccsd_wakci_ldsum_scatter_kernel(double* __restrict__ Wakci,
+                                                const double* __restrict__ R, int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir, ov = (size_t)nocc * nvir;
+    if (gid >= (size_t)nocc * nocc * vv) return;
+    int i = (int)(gid % nocc); size_t r = gid / nocc;
+    int c = (int)(r % nvir); r /= nvir;
+    int k = (int)(r % nocc); int a = (int)(r / nocc);
+    Wakci[gid] += R[((size_t)i*nvir + a)*ov + (size_t)k*nvir + c];
+}
+
+// (Phase 0 host-roundtrip removal, ⑦-3) W exchange reshape kernels (gid over OV2):
+//   Weff[(a,i),(k,c)]   = 2·Wakic[a,k,i,c] − Wakci[a,k,c,i]   (mode 0)
+//   Wakic_R[(a,i),(k,c)]= Wakic[a,k,i,c]                       (mode 1, Wakci ptr unused)
+// gid = (a·nocc+i)·ov + k·nvir+c.
+__global__ void ccsd_wex_Wakic_reshape_kernel(double* __restrict__ out,
+                                              const double* __restrict__ Wakic,
+                                              const double* __restrict__ Wakci, int mode,
+                                              int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t ov = (size_t)nocc * nvir;
+    if (gid >= ov * ov) return;
+    int c = (int)(gid % nvir); size_t r = gid / nvir;
+    int k = (int)(r % nocc); r /= nocc;
+    int i = (int)(r % nocc); int a = (int)(r / nocc);
+    double wic = Wakic[((size_t)a*nocc + k)*(size_t)nocc*nvir + (size_t)i*nvir + c];
+    if (mode == 0) {
+        double wci = Wakci[((size_t)a*nocc + k)*(size_t)nvir*nocc + (size_t)c*nocc + i];
+        out[gid] = 2.0*wic - wci;
+    } else {
+        out[gid] = wic;
+    }
+}
+
+// Wakci_R_mat[(b,i),(k,c)] = Wakci[b,k,c,i].  gid = (b·nocc+i)·ov + k·nvir+c.
+__global__ void ccsd_wex_WakciRmat_reshape_kernel(double* __restrict__ out,
+                                                  const double* __restrict__ Wakci, int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t ov = (size_t)nocc * nvir;
+    if (gid >= ov * ov) return;
+    int c = (int)(gid % nvir); size_t r = gid / nvir;
+    int k = (int)(r % nocc); r /= nocc;
+    int i = (int)(r % nocc); int b = (int)(r / nocc);
+    out[gid] = Wakci[((size_t)b*nocc + k)*(size_t)nvir*nocc + (size_t)c*nocc + i];
+}
+
+// t2 reshape for W exchange (gid over OV2). mode selects the layout:
+//   1: t2_R1[(k,c),(j,b)] = t2v[T2(k,j,c,b)] = t2v[(k·nocc+j)·vv + c·nvir+b]
+//   3: t2_R3[(k,c),(j,b)] = t2v[T2(k,j,b,c)] = t2v[(k·nocc+j)·vv + b·nvir+c]
+//   4: t2_R4[(k,c),(j,a)] = t2v[T2(k,j,a,c)] = t2v[(k·nocc+j)·vv + a·nvir+c]
+//   gid = (k·nvir+c)·ov + j·nvir+(b|a).
+__global__ void ccsd_wex_t2_reshape_kernel(double* __restrict__ out,
+                                           const double* __restrict__ t2v, int mode,
+                                           int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t ov = (size_t)nocc * nvir, vv = (size_t)nvir * nvir;
+    if (gid >= ov * ov) return;
+    int x = (int)(gid % nvir); size_t r = gid / nvir;   // x = b (mode 1/3) or a (mode 4)
+    int j = (int)(r % nocc); r /= nocc;
+    int c = (int)(r % nvir); int k = (int)(r / nvir);
+    size_t kj = (size_t)k*nocc + j;
+    if (mode == 1)      out[gid] = t2v[kj*vv + (size_t)c*nvir + x];
+    else if (mode == 3) out[gid] = t2v[kj*vv + (size_t)x*nvir + c];
+    else                out[gid] = t2v[kj*vv + (size_t)x*nvir + c];  // mode 4: a*nvir+c
+}
+
+// (⑦-4) T1 update — one thread per (i,a), mirroring the host loop at the T1
+// update site BYTE-for-BYTE (same term order, same summation nesting) so the
+// device result is bit-identical to the host recompute. Removes the host
+// O(nocc·nvir · nocc²·nvir) w_ooov triple-loop (the dominant T1 cost) and keeps
+// t1_wovvv on the device. Inputs:
+//   Fac   [a·nvir+c]                         (d_Fac; no fov, == host Fac)
+//   Fki   [k·nocc+i]                         (d_Fki; no fov, == host Fki)
+//   Fkc   [k·nvir+c]                         (d_Fkc_t1; host Fkc INCLUDING fov)
+//   t2v, t1                                  (d_t2v, d_t1 — current iter)
+//   w_voov[(a·nocc+k)·nocc·nvir + i·nvir+c]  (constant, uploaded once)
+//   t1wovvv[a·nocc+i]                        (d_Fkc — w_ovvv_R×tau DGEMM result)
+//   w_ooov[(k·nocc+l)·ov + i·nvir+c]         (constant, uploaded once)
+//   fov   [k·nvir+c] or nullptr              (constant; semi-canonical Brillouin)
+//   Dia   [i·nvir+a]                         (constant denominator)
+__global__ void ccsd_t1_update_kernel(double* __restrict__ newT1,
+                                      const double* __restrict__ Fac,
+                                      const double* __restrict__ Fki,
+                                      const double* __restrict__ Fkc,
+                                      const double* __restrict__ t2v,
+                                      const double* __restrict__ t1,
+                                      const double* __restrict__ w_voov,
+                                      const double* __restrict__ t1wovvv,
+                                      const double* __restrict__ w_ooov,
+                                      const double* __restrict__ fov,
+                                      const double* __restrict__ Dia,
+                                      int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t ov = (size_t)nocc * nvir;
+    if (gid >= ov) return;
+    const size_t vv = (size_t)nvir * nvir;
+    const int a = (int)(gid % nvir);
+    const int i = (int)(gid / nvir);
+
+    double val = 0.0;
+    // Fac * t1
+    for (int c = 0; c < nvir; c++)
+        val += Fac[(size_t)a*nvir + c] * t1[(size_t)i*nvir + c];
+    // -Fki * t1
+    for (int k = 0; k < nocc; k++)
+        val -= Fki[(size_t)k*nocc + i] * t1[(size_t)k*nvir + a];
+    // 2*Fkc*t2(ki,ca) - Fkc*t2(ik,ca) + Fkc*t1(i,c)*t1(k,a)
+    for (int k = 0; k < nocc; k++)
+        for (int c = 0; c < nvir; c++) {
+            double fc = Fkc[(size_t)k*nvir + c];
+            val += fc * (2.0 * t2v[((size_t)k*nocc + i)*vv + (size_t)c*nvir + a]
+                             - t2v[((size_t)i*nocc + k)*vv + (size_t)c*nvir + a]
+                             + t1[(size_t)i*nvir + c] * t1[(size_t)k*nvir + a]);
+        }
+    // w_voov[a,k,i,c] * t1(k,c)
+    for (int k = 0; k < nocc; k++)
+        for (int c = 0; c < nvir; c++)
+            val += w_voov[((size_t)a*nocc + k)*ov + (size_t)i*nvir + c] * t1[(size_t)k*nvir + c];
+    // w_ovvv term (DGEMM result)
+    val += t1wovvv[(size_t)a*nocc + i];
+    // -w_ooov[k,l,i,c] * (t2(kl,ac) + t1(k,a)*t1(l,c))
+    for (int k = 0; k < nocc; k++)
+        for (int l = 0; l < nocc; l++)
+            for (int c = 0; c < nvir; c++)
+                val -= w_ooov[((size_t)k*nocc + l)*ov + (size_t)i*nvir + c]
+                     * (t2v[((size_t)k*nocc + l)*vv + (size_t)a*nvir + c]
+                        + t1[(size_t)k*nvir + a] * t1[(size_t)l*nvir + c]);
+    // Semi-canonical f_ov (Brillouin relaxation); no-op when fov == nullptr.
+    if (fov) {
+        val += fov[(size_t)i*nvir + a];
+        double cubic = 0.0;
+        for (int k = 0; k < nocc; k++)
+            for (int c = 0; c < nvir; c++)
+                cubic += fov[(size_t)k*nvir + c] * t1[(size_t)k*nvir + a] * t1[(size_t)i*nvir + c];
+        val -= 2.0 * cubic;
+    }
+    newT1[gid] = val / Dia[gid];
+}
+
 __global__ void ccsd_w_oovv_from_ovov_kernel(const double* __restrict__ ovov,
                                              double* __restrict__ w_oovv,
                                              int nocc, int nvir) {
@@ -7860,6 +8186,71 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     std::cout << "CCSD iter  0: E = " << std::fixed << std::setprecision(12)
               << Ecc << " (MP2 initial guess)" << std::endl;
 
+    // (B-native ovvv storage-free, Inc-G) Per-k ovvv slice scratch built from B
+    // each iteration so the nocc·nvir³ persistent buffers (d_v_ovvv,
+    // d_v_ovvv_perm, …) can eventually be dropped for large clusters. Only the
+    // 0.3 GB-class nvir³ slice lives on the device, never the full nocc·nvir³.
+    // Gated on use_tiled_ladder (the existing "cluster too large to hold nvir⁴"
+    // opt-in); default/Inc1 paths keep the persistent buffers byte-identical.
+    double *d_ovvv_k = nullptr, *d_ovvv_perm_k = nullptr;
+    double *d_wovvvR_X = nullptr, *d_wovvvR_tile = nullptr;
+    double *d_v_vooo = nullptr, *d_Lki = nullptr;
+    double *d_newT2 = nullptr, *d_Dijab = nullptr;
+    double *d_v_oooo = nullptr, *d_v_oovo = nullptr;
+    double *d_ovvv_t1_ic = nullptr, *d_ovvv_t1_dc = nullptr;
+    double *d_Wakic = nullptr, *d_Wakci = nullptr, *d_v_voov = nullptr, *d_v_vovo = nullptr;
+    // (⑦-4) device T1 update: per-iter result + Fkc(with fov) upload + constants.
+    double *d_newT1 = nullptr, *d_Fkc_t1 = nullptr;
+    double *d_w_voov_c = nullptr, *d_w_ooov_c = nullptr, *d_Dia = nullptr, *d_fov = nullptr;
+    const int TA_OVVV = 16;  // a-tile width for w_ovvv_R per-a tiling (Inc-G2)
+    if (use_tiled_ladder) {
+        tracked_cudaMalloc((void**)&d_ovvv_k, vvv * sizeof(double));
+        tracked_cudaMalloc((void**)&d_ovvv_perm_k, vvv * sizeof(double));
+        // (Inc-G2) raw ovvv a-slice X[k,a',c,d] + reshaped wR a-tile (≈ nocc·TA·nvir²)
+        tracked_cudaMalloc((void**)&d_wovvvR_X,    (size_t)nocc*TA_OVVV*vv * sizeof(double));
+        tracked_cudaMalloc((void**)&d_wovvvR_tile, (size_t)TA_OVVV*nocc*vv * sizeof(double));
+        // (P0-2) v_vooo constant (upload once) + Lki scratch (per-iter upload) for
+        // the device reduced-T2 kernel (host-roundtrip removal).
+        tracked_cudaMalloc((void**)&d_v_vooo, (size_t)vo*oo * sizeof(double));
+        tracked_cudaMalloc((void**)&d_Lki,    (size_t)oo * sizeof(double));
+        cudaMemcpy(d_v_vooo, v_vooo.data(), (size_t)vo*oo * sizeof(double), cudaMemcpyHostToDevice);
+        // (P0-3) device symmetrize output + Dijab denominator (const, upload once)
+        tracked_cudaMalloc((void**)&d_newT2, t2Size * sizeof(double));
+        tracked_cudaMalloc((void**)&d_Dijab, t2Size * sizeof(double));
+        cudaMemcpy(d_Dijab, Dijab.data(), t2Size * sizeof(double), cudaMemcpyHostToDevice);
+        // (P0-4) Wklij device build: v_oooo/v_oovo constants (upload once)
+        tracked_cudaMalloc((void**)&d_v_oooo, oo*oo * sizeof(double));
+        tracked_cudaMalloc((void**)&d_v_oovo, (size_t)nocc*nocc*nvir*nocc * sizeof(double));
+        cudaMemcpy(d_v_oooo, v_oooo.data(), oo*oo * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_v_oovo, v_oovo.data(), (size_t)nocc*nocc*nvir*nocc * sizeof(double), cudaMemcpyHostToDevice);
+        // (⑦-1) Wakic/Wakci device single-index: separate ovvv_t1 ic/dc (both survive
+        // for the kernels) + Wakic/Wakci arrays + v_voov/v_vovo constants.
+        tracked_cudaMalloc((void**)&d_ovvv_t1_ic, (size_t)nocc*vv*nocc * sizeof(double));
+        tracked_cudaMalloc((void**)&d_ovvv_t1_dc, (size_t)nocc*vv*nocc * sizeof(double));
+        tracked_cudaMalloc((void**)&d_Wakic, oo*vv * sizeof(double));
+        tracked_cudaMalloc((void**)&d_Wakci, oo*vv * sizeof(double));
+        tracked_cudaMalloc((void**)&d_v_voov, oo*vv * sizeof(double));
+        tracked_cudaMalloc((void**)&d_v_vovo, vo*vo * sizeof(double));
+        cudaMemcpy(d_v_voov, v_voov.data(), oo*vv * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_v_vovo, v_vovo.data(), vo*vo * sizeof(double), cudaMemcpyHostToDevice);
+        // (⑦-4) device T1 update buffers. Constants (w_voov dressed = 2voov−vovo,
+        // w_ooov dressed, Dia denominator, fov) upload once; d_newT1/d_Fkc_t1 reused
+        // per iteration (d_Fkc_t1 carries the fov-corrected Fkc — d_Fkc itself is
+        // overwritten by the w_ovvv_R×tau DGEMM and lacks the host fov add).
+        tracked_cudaMalloc((void**)&d_newT1,    (size_t)ov * sizeof(double));
+        tracked_cudaMalloc((void**)&d_Fkc_t1,   (size_t)ov * sizeof(double));
+        tracked_cudaMalloc((void**)&d_w_voov_c, oo*vv * sizeof(double));
+        tracked_cudaMalloc((void**)&d_w_ooov_c, (size_t)oo*ov * sizeof(double));
+        tracked_cudaMalloc((void**)&d_Dia,      (size_t)ov * sizeof(double));
+        cudaMemcpy(d_w_voov_c, w_voov.data(), oo*vv * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_w_ooov_c, w_ooov.data(), (size_t)oo*ov * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_Dia, Dia.data(), (size_t)ov * sizeof(double), cudaMemcpyHostToDevice);
+        if (h_fov_active) {
+            tracked_cudaMalloc((void**)&d_fov, (size_t)ov * sizeof(double));
+            cudaMemcpy(d_fov, h_fov_active, (size_t)ov * sizeof(double), cudaMemcpyHostToDevice);
+        }
+    }
+
     for (int iter = 1; iter <= MAX_ITER; iter++) {
 
         // Upload t1 and t2v to GPU, build tau on GPU (avoids CPU tau computation + upload)
@@ -8005,19 +8396,47 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         gpu::matrixMatrixProductRect(d_v_oovv, d_tau, d_Wklij,
                                 (int)oo, (int)oo, (int)vv,
                                 false, true, false, 1.0);
-        cudaMemcpy(Wklij.data(), d_Wklij, oo * oo * sizeof(double), cudaMemcpyDeviceToHost);
-        // Add remaining terms on CPU: v_oooo + t1 terms
-        for (int k = 0; k < nocc; k++)
-            for (int l = 0; l < nocc; l++)
-                for (int i = 0; i < nocc; i++)
-                    for (int j = 0; j < nocc; j++) {
-                        real_t val = v_oooo[((size_t)k*nocc+l)*oo + (size_t)i*nocc+j];
-                        for (int c = 0; c < nvir; c++) {
-                            val += v_oovo[((size_t)l*nocc+k)*(size_t)nvir*nocc + (size_t)c*nocc+i] * t1[j*nvir+c];
-                            val += v_oovo[((size_t)k*nocc+l)*(size_t)nvir*nocc + (size_t)c*nocc+j] * t1[i*nvir+c];
+        if (use_tiled_ladder) {
+            // (P0-4) add v_oooo + t1 terms on the device; Wklij stays on the device
+            // (no download, no re-upload before the Wklij×tau GEMM below).
+            const bool p0val = (std::getenv("GANSU_CCSD_P0_VALIDATE") != nullptr);
+            std::vector<real_t> Wklij_base;
+            if (p0val) { Wklij_base.resize(oo*oo); cudaMemcpy(Wklij_base.data(), d_Wklij, oo*oo*sizeof(double), cudaMemcpyDeviceToHost); }
+            int th = 256; int bl = (int)((oo*oo + th - 1) / th);
+            ccsd_Wklij_kernel<<<bl, th>>>(d_Wklij, d_v_oooo, d_v_oovo, d_t1, nocc, nvir);
+            if (p0val) {
+                std::vector<real_t> Wd(oo*oo);
+                cudaMemcpy(Wd.data(), d_Wklij, oo*oo*sizeof(double), cudaMemcpyDeviceToHost);
+                double mx = 0.0;
+                for (int k = 0; k < nocc; k++)
+                    for (int l = 0; l < nocc; l++)
+                        for (int i = 0; i < nocc; i++)
+                            for (int j = 0; j < nocc; j++) {
+                                real_t val = v_oooo[((size_t)k*nocc+l)*oo + (size_t)i*nocc+j];
+                                for (int c = 0; c < nvir; c++) {
+                                    val += v_oovo[((size_t)l*nocc+k)*(size_t)nvir*nocc + (size_t)c*nocc+i] * t1[j*nvir+c];
+                                    val += v_oovo[((size_t)k*nocc+l)*(size_t)nvir*nocc + (size_t)c*nocc+j] * t1[i*nvir+c];
+                                }
+                                size_t idx = ((size_t)k*nocc+l)*oo + (size_t)i*nocc+j;
+                                mx = std::max(mx, std::fabs((Wklij_base[idx] + val) - Wd[idx]));
+                            }
+                std::cout << "[P0-VALIDATE Wklij] max|dev-host| = " << std::scientific << mx << std::endl;
+            }
+        } else {
+            cudaMemcpy(Wklij.data(), d_Wklij, oo * oo * sizeof(double), cudaMemcpyDeviceToHost);
+            // Add remaining terms on CPU: v_oooo + t1 terms
+            for (int k = 0; k < nocc; k++)
+                for (int l = 0; l < nocc; l++)
+                    for (int i = 0; i < nocc; i++)
+                        for (int j = 0; j < nocc; j++) {
+                            real_t val = v_oooo[((size_t)k*nocc+l)*oo + (size_t)i*nocc+j];
+                            for (int c = 0; c < nvir; c++) {
+                                val += v_oovo[((size_t)l*nocc+k)*(size_t)nvir*nocc + (size_t)c*nocc+i] * t1[j*nvir+c];
+                                val += v_oovo[((size_t)k*nocc+l)*(size_t)nvir*nocc + (size_t)c*nocc+j] * t1[i*nvir+c];
+                            }
+                            Wklij[((size_t)k*nocc+l)*oo + (size_t)i*nocc+j] += val;
                         }
-                        Wklij[((size_t)k*nocc+l)*oo + (size_t)i*nocc+j] += val;
-                    }
+        }
 
         // ---- W^{ab}_{cd} ---- (fully on GPU: DGEMM + kernel, no host transfer)
         // (B-native Inc2) only when the opt-in tiled ladder is active is this
@@ -8056,28 +8475,86 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // d-sum via DGEMM: ovvv_t1_ic[(k*vv + a*nvir+c), i] = sum_d v_ovvv[k,a,c,d] * t1[i,d]
         // v_ovvv viewed as [nocc*vv, nvir], t1 as [nocc, nvir]
         // DGEMM: [nocc*vv, nocc] = v_ovvv[nocc*vv, nvir] × t1^T[nvir, nocc]
-        // Use persistent d_v_ovvv buffer (uploaded once before the loop)
         // Result stored in d_ovvv_t1 as scratch (size sz_ovvv_t1 ≥ nocc*vv*nocc = oo*vv) ✓
-        // This avoids overwriting d_t2v which holds t2v data
-        gpu::matrixMatrixProductRect(d_v_ovvv, d_t1, d_ovvv_t1,
-                                (int)(nocc * vv), nocc, nvir,
-                                false, true, false, 1.0);
-        // Download d-sum result: ovvv_t1_ic[k*vv*nocc + ac*nocc + i]
+        // This avoids overwriting d_t2v which holds t2v data.
         std::vector<real_t> ovvv_t1_ic((size_t)nocc * vv * nocc);
-        cudaMemcpy(ovvv_t1_ic.data(), d_ovvv_t1, (size_t)nocc * vv * nocc * sizeof(double), cudaMemcpyDeviceToHost);
-
-        // ovvv_t1_dc for Wakci: sum_d v_ovvv_perm[k,a,c,d] * t1[i,d]
-        // Use persistent d_v_ovvv_perm buffer (uploaded once before the loop)
-        gpu::matrixMatrixProductRect(d_v_ovvv_perm, d_t1, d_ovvv_t1,
-                                (int)(nocc * vv), nocc, nvir,
-                                false, true, false, 1.0);
         std::vector<real_t> ovvv_t1_dc((size_t)nocc * vv * nocc);
-        cudaMemcpy(ovvv_t1_dc.data(), d_ovvv_t1, (size_t)nocc * vv * nocc * sizeof(double), cudaMemcpyDeviceToHost);
+        if (use_tiled_ladder) {
+            // (Inc-G1) Build each k-slice of v_ovvv from B (nvir³) and contract
+            // with t1 — never the nocc·nvir³ buffer. k is a spectator index, so
+            // the per-k output block [(a,c), i] lands contiguously at k·vv·nocc,
+            // byte-identical to the dense single-GEMM layout read at 8090+.
+            // (⑦-1) build ic into d_ovvv_t1_ic, dc into d_ovvv_t1_dc — both kept on
+            // the device for the single-index kernels (no host download).
+            // ic: ovvv_t1_ic[(k,a,c), i] = sum_d (k a|c d) * t1[i,d]
+            for (int k = 0; k < nocc; k++) {
+                extract_block(d_ovvv_k, N, O+k,1, V,nvir, V,nvir, V,nvir);
+                gpu::matrixMatrixProductRect(d_ovvv_k, d_t1, d_ovvv_t1_ic + (size_t)k*vv*nocc,
+                                        (int)vv, nocc, nvir, false, true, false, 1.0);
+            }
+            // dc: ovvv_t1_dc[(k,a,c), i] = sum_d (k a|d c) * t1[i,d]  (perm = swap c,d)
+            // mid-2 transpose turns the [a,c,d] slice into [a,d,c] = v_ovvv_perm.
+            for (int k = 0; k < nocc; k++) {
+                extract_block(d_ovvv_k, N, O+k,1, V,nvir, V,nvir, V,nvir);
+                int th = 256; int bl = (int)((vvv + th - 1) / th);
+                ccsd_transpose_mid2_kernel<<<bl, th>>>(d_ovvv_k, d_ovvv_perm_k, nvir, nvir, nvir, 1);
+                gpu::matrixMatrixProductRect(d_ovvv_perm_k, d_t1, d_ovvv_t1_dc + (size_t)k*vv*nocc,
+                                        (int)vv, nocc, nvir, false, true, false, 1.0);
+            }
+        } else {
+            // Use persistent d_v_ovvv / d_v_ovvv_perm buffers (uploaded once before the loop)
+            gpu::matrixMatrixProductRect(d_v_ovvv, d_t1, d_ovvv_t1,
+                                    (int)(nocc * vv), nocc, nvir,
+                                    false, true, false, 1.0);
+            cudaMemcpy(ovvv_t1_ic.data(), d_ovvv_t1, (size_t)nocc * vv * nocc * sizeof(double), cudaMemcpyDeviceToHost);
+            gpu::matrixMatrixProductRect(d_v_ovvv_perm, d_t1, d_ovvv_t1,
+                                    (int)(nocc * vv), nocc, nvir,
+                                    false, true, false, 1.0);
+            cudaMemcpy(ovvv_t1_dc.data(), d_ovvv_t1, (size_t)nocc * vv * nocc * sizeof(double), cudaMemcpyDeviceToHost);
+        }
 
         // ld-sum terms computed via DGEMM (below)
         std::vector<real_t> Wakic((size_t)nvir*nocc*nocc*nvir, 0.0);
         std::vector<real_t> Wakci((size_t)nvir*nocc*nvir*nocc, 0.0);
 
+        if (use_tiled_ladder) {
+            // (⑦-1) single-index Wakic/Wakci on the device from d_ovvv_t1_ic/dc.
+            // Download for the (still host) ld-sum scatter below (removed in ⑦-2).
+            int th = 256; int bl = (int)((oo*vv + th - 1) / th);
+            ccsd_Wakic_kernel<<<bl, th>>>(d_Wakic, d_v_voov, d_v_oovo, d_t1, d_ovvv_t1_ic, nocc, nvir);
+            ccsd_Wakci_kernel<<<bl, th>>>(d_Wakci, d_v_vovo, d_v_oovo, d_t1, d_ovvv_t1_dc, nocc, nvir);
+            // (⑦-2) Wakic/Wakci stay on the device through the ld-sum scatter;
+            // downloaded once after ld-sum (below) for the still-host T1/W-exchange.
+            if (std::getenv("GANSU_CCSD_P0_VALIDATE")) {
+                std::vector<real_t> Wd(oo*vv), Wcd(oo*vv);
+                cudaMemcpy(Wd.data(), d_Wakic, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpy(Wcd.data(), d_Wakci, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpy(ovvv_t1_ic.data(), d_ovvv_t1_ic, (size_t)nocc*vv*nocc*sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpy(ovvv_t1_dc.data(), d_ovvv_t1_dc, (size_t)nocc*vv*nocc*sizeof(double), cudaMemcpyDeviceToHost);
+                double mxic = 0.0, mxci = 0.0;
+                for (int a = 0; a < nvir; a++)
+                    for (int k = 0; k < nocc; k++) {
+                        for (int i = 0; i < nocc; i++)
+                            for (int c = 0; c < nvir; c++) {
+                                real_t val = v_voov[((size_t)a*nocc+k)*(size_t)nocc*nvir + (size_t)i*nvir+c];
+                                for (int l = 0; l < nocc; l++)
+                                    val -= v_oovo[((size_t)k*nocc+l)*(size_t)nvir*nocc + (size_t)c*nocc+i] * t1[l*nvir+a];
+                                val += ovvv_t1_ic[((size_t)k*vv + (size_t)a*nvir+c)*nocc + i];
+                                mxic = std::max(mxic, std::fabs(val - Wd[((size_t)a*nocc+k)*nocc*nvir + (size_t)i*nvir+c]));
+                            }
+                        for (int c = 0; c < nvir; c++)
+                            for (int i = 0; i < nocc; i++) {
+                                real_t val = v_vovo[((size_t)a*nocc+k)*vo + (size_t)c*nocc+i];
+                                for (int l = 0; l < nocc; l++)
+                                    val -= v_oovo[((size_t)l*nocc+k)*(size_t)nvir*nocc + (size_t)c*nocc+i] * t1[l*nvir+a];
+                                val += ovvv_t1_dc[((size_t)k*vv + (size_t)a*nvir+c)*nocc + i];
+                                mxci = std::max(mxci, std::fabs(val - Wcd[((size_t)a*nocc+k)*nvir*nocc + (size_t)c*nocc+i]));
+                            }
+                    }
+                std::cout << "[P0-VALIDATE Wakic/Wakci single-index] max|dev-host| ic=" << std::scientific << mxic
+                          << " ci=" << mxci << std::endl;
+            }
+        } else {
         // CPU: single-index terms for Wakic and Wakci (d-sum replaced by DGEMM result lookup)
         for (int a = 0; a < nvir; a++)
             for (int k = 0; k < nocc; k++) {
@@ -8100,12 +8577,48 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                         Wakci[((size_t)a*nocc+k)*nvir*nocc + (size_t)c*nocc+i] = val;
                     }
             }
+        }
 
         // DGEMM for Wakic/Wakci ld-sum terms
         // eff_t2[T2(i,l,d,a)] = -0.5*t2[i,l,d,a] - t1[i,d]*t1[l,a]
         // Reshape: eff_t2_R[(l*nvir+d), (i*nvir+a)] = eff_t2[T2(i,l,d,a)]
         //          t2_C[(l*nvir+d), (i*nvir+a)] = t2[T2(i,l,a,d)]
-        {
+        if (use_tiled_ladder) {
+            // (⑦-2) ld-sum fully on device: reshape kernel → 3 GEMM (V_R/W_R/V_R2 are
+            // already on the device) → scatter kernels into d_Wakic/d_Wakci.
+            int th = 256; int blr = (int)((OV2 + th - 1) / th);
+            ccsd_ldsum_reshape_kernel<<<blr, th>>>(d_Wex_B, d_Wex_A, d_t2v, d_t1, nocc, nvir);
+            if (std::getenv("GANSU_CCSD_P0_VALIDATE")) {
+                std::vector<real_t> Bd(OV2), Ad(OV2);
+                cudaMemcpy(Bd.data(), d_Wex_B, OV2*sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpy(Ad.data(), d_Wex_A, OV2*sizeof(double), cudaMemcpyDeviceToHost);
+                double mxe=0.0, mxc=0.0;
+                for (int l = 0; l < nocc; l++)
+                    for (int d = 0; d < nvir; d++)
+                        for (int i = 0; i < nocc; i++)
+                            for (int a = 0; a < nvir; a++) {
+                                size_t idx = ((size_t)l*nvir+d)*ov + (size_t)i*nvir+a;
+                                double eref = -0.5*t2v[T2(i,l,d,a)] - t1[i*nvir+d]*t1[l*nvir+a];
+                                mxe = std::max(mxe, std::fabs(eref - Bd[idx]));
+                                mxc = std::max(mxc, std::fabs(t2v[T2(i,l,a,d)] - Ad[idx]));
+                            }
+                std::cout << "[P0-VALIDATE ldsum-reshape] eff=" << std::scientific << mxe << " t2C=" << mxc << std::endl;
+            }
+            gpu::matrixMatrixProductRect(d_Wex_B, d_V_R, d_Wex_C1, (int)ov, (int)ov, (int)ov, true, false, false, 1.0);
+            gpu::matrixMatrixProductRect(d_Wex_A, d_W_R, d_Wex_C1, (int)ov, (int)ov, (int)ov, true, false, true, 0.5);
+            gpu::matrixMatrixProductRect(d_Wex_B, d_V_R2, d_Wex_C2, (int)ov, (int)ov, (int)ov, true, false, false, 1.0);
+            int bls = (int)((oo*vv + th - 1) / th);
+            ccsd_wakic_ldsum_scatter_kernel<<<bls, th>>>(d_Wakic, d_Wex_C1, nocc, nvir);
+            ccsd_wakci_ldsum_scatter_kernel<<<bls, th>>>(d_Wakci, d_Wex_C2, nocc, nvir);
+            // (⑦-4) Wakic/Wakci stay on the device: T1 update (device kernel, uses
+            // bare w_voov) and the W-exchange reshape (⑦-3, reads d_Wakic/d_Wakci)
+            // no longer touch the host arrays. Only the ⑦-3 P0-VALIDATE chk reads
+            // them — download just for that.
+            if (std::getenv("GANSU_CCSD_P0_VALIDATE")) {
+                cudaMemcpy(Wakic.data(), d_Wakic, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpy(Wakci.data(), d_Wakci, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
+            }
+        } else {
             std::vector<real_t> eff_t2_R(OV2);
             std::vector<real_t> t2_C(OV2);
             for (int l = 0; l < nocc; l++)
@@ -8119,19 +8632,15 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                         }
 
             // Wakic ld-sum: R_AB[ia,kc] = eff_t2_R^T × V_R (terms A+B)
-            // Upload eff_t2_R to d_Wex_B (persists for reuse in Wakci DGEMM below)
             cudaMemcpy(d_Wex_B, eff_t2_R.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
             gpu::matrixMatrixProductRect(d_Wex_B, d_V_R, d_Wex_C1,
                                     (int)ov, (int)ov, (int)ov, true, false, false, 1.0);
-            // Wakic ld-sum: R_C[ia,kc] += 0.5 * t2_C^T × W_R (term C)
             cudaMemcpy(d_Wex_A, t2_C.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
             gpu::matrixMatrixProductRect(d_Wex_A, d_W_R, d_Wex_C1,
                                     (int)ov, (int)ov, (int)ov, true, false, true, 0.5);
-            // Wakci ld-sum: R_Wakci[ia,kc] = eff_t2_R^T × V_R2 (reuse d_Wex_B)
             gpu::matrixMatrixProductRect(d_Wex_B, d_V_R2, d_Wex_C2,
                                     (int)ov, (int)ov, (int)ov, true, false, false, 1.0);
 
-            // Download and scatter into Wakic/Wakci
             std::vector<real_t> R_Wakic(OV2), R_Wakci(OV2);
             cudaMemcpy(R_Wakic.data(), d_Wex_C1, OV2 * sizeof(double), cudaMemcpyDeviceToHost);
             cudaMemcpy(R_Wakci.data(), d_Wex_C2, OV2 * sizeof(double), cudaMemcpyDeviceToHost);
@@ -8160,58 +8669,100 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // The D_i^a denominator is applied at the end, so Ltilde = L.
         // T1 w_ovvv DGEMM: Result[a,i] = w_ovvv_R[nvir, nocc*vv] × tau[nocc, nocc*vv]^T
         // w_ovvv_R[a, k*vv+c*nvir+d] = w_ovvv[k*vvv+a*vv+d*nvir+c] (pre-computed)
-        // Use persistent d_w_ovvv_R buffer (uploaded once before the loop)
         // d_Fkc reuse as result buffer (size ov = nvir*nocc, sufficient)
-        gpu::matrixMatrixProductRect(d_w_ovvv_R, d_tau, d_Fkc,
-                                nvir, nocc, (int)(nocc * vv),
-                                false, true, false, 1.0);
+        if (use_tiled_ladder) {
+            // (Inc-G2) Build w_ovvv_R one a-tile at a time from B — never the
+            // nocc·nvir³ buffer. a is the output row, so each tile writes rows
+            // [a0,a0+ta) of d_Fkc directly. Extract X[k,a',c,d]=(k a|c d), combine
+            // to wR[a',k,c,d]=2(ka|dc)-(ka|cd), contract with tau. Byte-identical
+            // to the single dense GEMM (same a partition of the output rows).
+            for (int a0 = 0; a0 < nvir; a0 += TA_OVVV) {
+                int ta = std::min(TA_OVVV, nvir - a0);
+                extract_block(d_wovvvR_X, N, O,nocc, V+a0,ta, V,nvir, V,nvir);
+                size_t tot = (size_t)ta*nocc*vv; int th=256; int bl=(int)((tot+th-1)/th);
+                ccsd_wovvvR_tile_kernel<<<bl,th>>>(d_wovvvR_X, d_wovvvR_tile, nocc, nvir, ta);
+                gpu::matrixMatrixProductRect(d_wovvvR_tile, d_tau, d_Fkc + (size_t)a0*nocc,
+                                        ta, nocc, (int)(nocc * vv), false, true, false, 1.0);
+            }
+        } else {
+            // Use persistent d_w_ovvv_R buffer (uploaded once before the loop)
+            gpu::matrixMatrixProductRect(d_w_ovvv_R, d_tau, d_Fkc,
+                                    nvir, nocc, (int)(nocc * vv),
+                                    false, true, false, 1.0);
+        }
         std::vector<real_t> t1_wovvv(ov);
         cudaMemcpy(t1_wovvv.data(), d_Fkc, ov * sizeof(double), cudaMemcpyDeviceToHost);
 
         std::vector<real_t> newT1(t1Size, 0.0);
-        for (int i = 0; i < nocc; i++)
-            for (int a = 0; a < nvir; a++) {
-                real_t val = 0.0;
-                // Fac * t1
-                for (int c = 0; c < nvir; c++)
-                    val += Fac[a*nvir+c] * t1[i*nvir+c];
-                // -Fki * t1
-                for (int k = 0; k < nocc; k++)
-                    val -= Fki[k*nocc+i] * t1[k*nvir+a];
-                // 2*F^k_c*t2(ki,ca) - F^k_c*t2(ik,ca) + F^k_c*t1(i,c)*t1(k,a)
-                for (int k = 0; k < nocc; k++)
-                    for (int c = 0; c < nvir; c++) {
-                        real_t fc = Fkc[k*nvir+c];
-                        val += fc * (2.0*t2v[T2(k,i,c,a)] - t2v[T2(i,k,c,a)] + t1[i*nvir+c]*t1[k*nvir+a]);
-                    }
-                // w_voov[a,k,i,c] * t1(k,c)
-                for (int k = 0; k < nocc; k++)
+        // Host T1 update (legacy path + ⑦-4 self-check reference). Mirrored
+        // byte-for-byte by ccsd_t1_update_kernel.
+        auto host_T1 = [&](std::vector<real_t>& out) {
+            for (int i = 0; i < nocc; i++)
+                for (int a = 0; a < nvir; a++) {
+                    real_t val = 0.0;
+                    // Fac * t1
                     for (int c = 0; c < nvir; c++)
-                        val += w_voov[((size_t)a*nocc+k)*(size_t)nocc*nvir + (size_t)i*nvir+c] * t1[k*nvir+c];
-                // w_ovvv term via DGEMM (computed above)
-                val += t1_wovvv[a*nocc+i];
-                // -w_ooov[k,l,i,c] * (t2(kl,ac) + t1(k,a)*t1(l,c))
-                for (int k = 0; k < nocc; k++)
-                    for (int l = 0; l < nocc; l++)
-                        for (int c = 0; c < nvir; c++)
-                            val -= w_ooov[((size_t)k*nocc+l)*ov + (size_t)i*nvir+c] * (t2v[T2(k,l,a,c)] + t1[k*nvir+a]*t1[l*nvir+c]);
-                // Off-diagonal Fock f_ov term (Brillouin condition relaxation).
-                // Active when h_fov_active is supplied (e.g. semi-canonical
-                // DMET cluster orbitals). For canonical Fock (f_ov = 0), no-op.
-                if (h_fov_active) {
-                    // Direct fov term: t1new += fov (Brillouin condition).
-                    val += h_fov_active[(size_t)i * nvir + a];
-                    // Direct cubic:
-                    //   t1new −= 2 · einsum('kc,ka,ic->ia', fov, t1, t1).
-                    real_t cubic = 0.0;
+                        val += Fac[a*nvir+c] * t1[i*nvir+c];
+                    // -Fki * t1
+                    for (int k = 0; k < nocc; k++)
+                        val -= Fki[k*nocc+i] * t1[k*nvir+a];
+                    // 2*F^k_c*t2(ki,ca) - F^k_c*t2(ik,ca) + F^k_c*t1(i,c)*t1(k,a)
+                    for (int k = 0; k < nocc; k++)
+                        for (int c = 0; c < nvir; c++) {
+                            real_t fc = Fkc[k*nvir+c];
+                            val += fc * (2.0*t2v[T2(k,i,c,a)] - t2v[T2(i,k,c,a)] + t1[i*nvir+c]*t1[k*nvir+a]);
+                        }
+                    // w_voov[a,k,i,c] * t1(k,c)
                     for (int k = 0; k < nocc; k++)
                         for (int c = 0; c < nvir; c++)
-                            cubic += h_fov_active[(size_t)k*nvir + c]
-                                   * t1[k*nvir + a] * t1[i*nvir + c];
-                    val -= 2.0 * cubic;
+                            val += w_voov[((size_t)a*nocc+k)*(size_t)nocc*nvir + (size_t)i*nvir+c] * t1[k*nvir+c];
+                    // w_ovvv term via DGEMM (computed above)
+                    val += t1_wovvv[a*nocc+i];
+                    // -w_ooov[k,l,i,c] * (t2(kl,ac) + t1(k,a)*t1(l,c))
+                    for (int k = 0; k < nocc; k++)
+                        for (int l = 0; l < nocc; l++)
+                            for (int c = 0; c < nvir; c++)
+                                val -= w_ooov[((size_t)k*nocc+l)*ov + (size_t)i*nvir+c] * (t2v[T2(k,l,a,c)] + t1[k*nvir+a]*t1[l*nvir+c]);
+                    // Off-diagonal Fock f_ov term (Brillouin condition relaxation).
+                    // Active when h_fov_active is supplied (e.g. semi-canonical
+                    // DMET cluster orbitals). For canonical Fock (f_ov = 0), no-op.
+                    if (h_fov_active) {
+                        // Direct fov term: t1new += fov (Brillouin condition).
+                        val += h_fov_active[(size_t)i * nvir + a];
+                        // Direct cubic:
+                        //   t1new −= 2 · einsum('kc,ka,ic->ia', fov, t1, t1).
+                        real_t cubic = 0.0;
+                        for (int k = 0; k < nocc; k++)
+                            for (int c = 0; c < nvir; c++)
+                                cubic += h_fov_active[(size_t)k*nvir + c]
+                                       * t1[k*nvir + a] * t1[i*nvir + c];
+                        val -= 2.0 * cubic;
+                    }
+                    out[i*nvir+a] = val / Dia[i*nvir+a];
                 }
-                newT1[i*nvir+a] = val / Dia[i*nvir+a];
+        };
+        if (use_tiled_ladder) {
+            // (⑦-4) device T1 update. d_Fac/d_Fki already hold the (fov-free)
+            // intermediates; the fov-corrected Fkc is uploaded into d_Fkc_t1
+            // (d_Fkc now holds the w_ovvv_R×tau DGEMM result = t1_wovvv). newT1 is
+            // downloaded for the (still host) DIIS step.
+            cudaMemcpy(d_Fkc_t1, Fkc.data(), ov * sizeof(double), cudaMemcpyHostToDevice);
+            int th = 256; int bl = (int)((t1Size + th - 1) / th);
+            ccsd_t1_update_kernel<<<bl, th>>>(d_newT1, d_Fac, d_Fki, d_Fkc_t1,
+                                              d_t2v, d_t1, d_w_voov_c, d_Fkc, d_w_ooov_c,
+                                              (h_fov_active ? d_fov : nullptr), d_Dia,
+                                              nocc, nvir);
+            cudaMemcpy(newT1.data(), d_newT1, t1Size * sizeof(double), cudaMemcpyDeviceToHost);
+            if (std::getenv("GANSU_CCSD_P0_VALIDATE")) {
+                std::vector<real_t> ref(t1Size, 0.0);
+                host_T1(ref);
+                double mx = 0.0;
+                for (size_t k = 0; k < t1Size; k++) mx = std::max(mx, std::fabs(ref[k] - newT1[k]));
+                std::cout << "[P0-VALIDATE T1-update] max|dev-host| = " << std::scientific << mx << std::endl;
             }
+        } else {
+            host_T1(newT1);
+        }
 
         // ---- T2 update ----
         // raw(i,a,j,b) computed, then t2_new(i,j,a,b) = [raw(i,a,j,b) + raw(j,b,i,a)] / D
@@ -8231,7 +8782,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
 
         // ---- GPU DGEMM for Wabcd×tau and Wklij×tau ----
         // d_Wabcd already on GPU from build_Wabcd_kernel above
-        cudaMemcpy(d_Wklij, Wklij.data(), oo * oo * sizeof(double), cudaMemcpyHostToDevice);
+        // (P0-4) tiled already has Wklij on the device (built by ccsd_Wklij_kernel).
+        if (!use_tiled_ladder)
+            cudaMemcpy(d_Wklij, Wklij.data(), oo * oo * sizeof(double), cudaMemcpyHostToDevice);
         cudaMemset(d_raw, 0, t2Size * sizeof(double));
 
         // raw[ij,ab] += 0.5 * tau[ij,cd] * Wabcd[ab,cd]^T
@@ -8298,10 +8851,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                                     (int)oo,
                                     false, false, true, 1.0);
 
-        // Download raw (now includes Wabcd×tau + Wklij×tau + Lac×t2)
-        std::vector<real_t> raw(t2Size);
-        cudaMemcpy(raw.data(), d_raw, t2Size * sizeof(double), cudaMemcpyDeviceToHost);
-
+        // (P0-1) raw stays on device through the W-exchange scatter; downloaded
+        // once afterwards (⑨⑩⑫ all accumulated on-device).
         // ---- W exchange terms via DGEMM ----
         // Term 1+2: sum_{kc} (2*Wakic[a,k,i,c] - Wakci[a,k,c,i]) * t2[k,j,c,b]
         //   DGEMM: Weff[ai,kc] × t2_R1[kc,jb]  →  R12[ai,jb]
@@ -8310,6 +8861,49 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // Term 4: -sum_{kc} Wakci[b,k,c,i] * t2[k,j,a,c]
         //   DGEMM: -Wakci_R[bi,kc] × t2_R4[kc,ja]  →  R4[bi,ja]
         {
+        if (use_tiled_ladder) {
+            // (⑦-3) W exchange reshape on the device (from d_Wakic/d_Wakci/d_t2v) —
+            // each GEMM's two operands are built by kernels into d_Wex_A/d_Wex_B,
+            // removing 6 host reshape loops + 6 host uploads.
+            int th = 256; int blo = (int)((OV2 + th - 1) / th);
+            const bool p0val = (std::getenv("GANSU_CCSD_P0_VALIDATE") != nullptr);
+            auto chk = [&](const char* tag, int amode, int tmode) {
+                if (!p0val) return;
+                std::vector<real_t> Ad(OV2), Bd(OV2);
+                cudaMemcpy(Ad.data(), d_Wex_A, OV2*sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpy(Bd.data(), d_Wex_B, OV2*sizeof(double), cudaMemcpyDeviceToHost);
+                double mA=0.0, mB=0.0;
+                for (int a=0;a<nvir;a++) for (int i=0;i<nocc;i++) for (int k=0;k<nocc;k++) for (int c=0;c<nvir;c++) {
+                    size_t idx=((size_t)a*nocc+i)*ov + (size_t)k*nvir+c;
+                    double wic=Wakic[((size_t)a*nocc+k)*nocc*nvir+(size_t)i*nvir+c];
+                    double ref = (amode==0) ? (2.0*wic - Wakci[((size_t)a*nocc+k)*nvir*nocc+(size_t)c*nocc+i])
+                               : (amode==1) ? wic
+                               : Wakci[((size_t)a*nocc+k)*nvir*nocc+(size_t)c*nocc+i];  // amode==2: Wakci_R_mat (a≡b)
+                    mA=std::max(mA,std::fabs(ref-Ad[idx]));
+                }
+                for (int k=0;k<nocc;k++) for (int c=0;c<nvir;c++) for (int j=0;j<nocc;j++) for (int x=0;x<nvir;x++) {
+                    size_t idx=((size_t)k*nvir+c)*ov + (size_t)j*nvir+x;
+                    double ref = (tmode==1) ? t2v[T2(k,j,c,x)] : t2v[T2(k,j,x,c)];  // tmode 3/4: a*nvir+c with x≡b/a
+                    mB=std::max(mB,std::fabs(ref-Bd[idx]));
+                }
+                std::cout << "[P0-VALIDATE wex " << tag << "] A=" << std::scientific << mA << " B=" << mB << std::endl;
+            };
+            // GEMM 1: R12 = Weff × t2_R1
+            ccsd_wex_Wakic_reshape_kernel<<<blo,th>>>(d_Wex_A, d_Wakic, d_Wakci, 0, nocc, nvir);
+            ccsd_wex_t2_reshape_kernel<<<blo,th>>>(d_Wex_B, d_t2v, 1, nocc, nvir);
+            chk("1 Weff/t2R1", 0, 1);
+            gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C1, (int)ov,(int)ov,(int)ov, false,false,false,1.0);
+            // GEMM 2: R12 -= Wakic_R × t2_R3
+            ccsd_wex_Wakic_reshape_kernel<<<blo,th>>>(d_Wex_A, d_Wakic, d_Wakci, 1, nocc, nvir);
+            ccsd_wex_t2_reshape_kernel<<<blo,th>>>(d_Wex_B, d_t2v, 3, nocc, nvir);
+            chk("2 WakicR/t2R3", 1, 3);
+            gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C1, (int)ov,(int)ov,(int)ov, false,false,true,-1.0);
+            // GEMM 3: R4 = -Wakci_R × t2_R4
+            ccsd_wex_WakciRmat_reshape_kernel<<<blo,th>>>(d_Wex_A, d_Wakci, nocc, nvir);
+            ccsd_wex_t2_reshape_kernel<<<blo,th>>>(d_Wex_B, d_t2v, 4, nocc, nvir);
+            chk("3 WakciR/t2R4", 2, 4);
+            gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C2, (int)ov,(int)ov,(int)ov, false,false,false,-1.0);
+        } else {
             std::vector<real_t> Weff(OV2), Wakic_R(OV2), Wakci_R_mat(OV2);
             std::vector<real_t> t2_R1(OV2), t2_R3(OV2), t2_R4(OV2);
 
@@ -8363,20 +8957,21 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             cudaMemcpy(d_Wex_B, t2_R4.data(), OV2 * sizeof(double), cudaMemcpyHostToDevice);
             gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C2,
                                     (int)ov, (int)ov, (int)ov, false, false, false, -1.0);
-
-            // Download results
-            std::vector<real_t> R12(OV2), R4(OV2);
-            cudaMemcpy(R12.data(), d_Wex_C1, OV2 * sizeof(double), cudaMemcpyDeviceToHost);
-            cudaMemcpy(R4.data(), d_Wex_C2, OV2 * sizeof(double), cudaMemcpyDeviceToHost);
-
-            // Scatter W exchange DGEMM results into raw
-            for (int i = 0; i < nocc; i++)
-                for (int j = 0; j < nocc; j++)
-                    for (int a = 0; a < nvir; a++)
-                        for (int b = 0; b < nvir; b++)
-                            raw[T2(i,j,a,b)] += R12[(a*nocc+i)*ov + j*nvir+b]
-                                               + R4[(b*nocc+i)*ov + j*nvir+a];
         }
+
+            // (P0-1) Scatter R12 (d_Wex_C1) + R4 (d_Wex_C2) into d_raw on-device,
+            // removing the 2×ov² host download and the host quadruple-loop scatter.
+            {
+                size_t tot = t2Size; int th = 256; int bl = (int)((tot + th - 1) / th);
+                ccsd_wexchange_scatter_kernel<<<bl, th>>>(d_Wex_C1, d_Wex_C2, d_raw, nocc, nvir);
+            }
+        }
+
+        // Download raw (⑨⑩⑫). When tiled (P0-2), raw stays on device through the
+        // device reduced-T2 kernel and is downloaded after it instead.
+        std::vector<real_t> raw(t2Size);
+        if (!use_tiled_ladder)
+            cudaMemcpy(raw.data(), d_raw, t2Size * sizeof(double), cudaMemcpyDeviceToHost);
 
         // ---- GPU DGEMM for Z×t1 → raw contribution ----
         // Z[(ab)*ov + i*nvir+c] stored as [vv*nocc, nvir] (c is contiguous)
@@ -8402,53 +8997,72 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         gpu::matrixMatrixProductRect(d_Z, d_t1, d_ovvv_t1,
                                 (int)(vv * nocc), nocc, nvir,
                                 false, true, false, 1.0);
-        std::vector<real_t> Zt1_result(vv * oo);
-        cudaMemcpy(Zt1_result.data(), d_ovvv_t1, vv * oo * sizeof(double), cudaMemcpyDeviceToHost);
+        if (use_tiled_ladder) {
+            // (P0-2) reduced T2 terms on device: 0.5·v_oovv − Lki·t2 + Zt1 − Q(inline).
+            // Zt1 is still in d_ovvv_t1 (not downloaded); Q folded into the kernel.
+            // raw stays on device through ⑨⑩⑫⑪, then downloaded for host symmetrize.
+            cudaMemcpy(d_Lki, Lki.data(), (size_t)oo * sizeof(double), cudaMemcpyHostToDevice);
+            int th = 256; size_t tot = t2Size; int bl = (int)((tot + th - 1) / th);
+            ccsd_t2_reduced_kernel<<<bl, th>>>(d_raw, d_v_oovv, d_Lki, d_t2v, d_ovvv_t1,
+                                               d_v_vooo, d_t1, nocc, nvir);
+            // (P0-3) raw stays on device — symmetrized on-device below (no download).
+        } else {
+            std::vector<real_t> Zt1_result(vv * oo);
+            cudaMemcpy(Zt1_result.data(), d_ovvv_t1, vv * oo * sizeof(double), cudaMemcpyDeviceToHost);
 
-        // Build Q (small: O(nocc² × vv))
-        std::vector<real_t> Q(vv * oo);
-        for (int a = 0; a < nvir; a++)
-            for (int b = 0; b < nvir; b++)
-                for (int i = 0; i < nocc; i++)
-                    for (int j = 0; j < nocc; j++) {
-                        real_t val = 0.0;
-                        for (int k = 0; k < nocc; k++)
-                            val += v_vooo[((size_t)a*nocc+k)*oo + (size_t)i*nocc+j] * t1[k*nvir+b];
-                        Q[((size_t)a*nvir+b)*oo + (size_t)i*nocc+j] = val;
-                    }
+            // Build Q (small: O(nocc² × vv))
+            std::vector<real_t> Q(vv * oo);
+            for (int a = 0; a < nvir; a++)
+                for (int b = 0; b < nvir; b++)
+                    for (int i = 0; i < nocc; i++)
+                        for (int j = 0; j < nocc; j++) {
+                            real_t val = 0.0;
+                            for (int k = 0; k < nocc; k++)
+                                val += v_vooo[((size_t)a*nocc+k)*oo + (size_t)i*nocc+j] * t1[k*nvir+b];
+                            Q[((size_t)a*nvir+b)*oo + (size_t)i*nocc+j] = val;
+                        }
 
-        // Reduced inner loop: only O(nocc) per (i,j,a,b) — Lac×t2 and Z×t1 done via DGEMM
-        for (int i = 0; i < nocc; i++)
-            for (int j = 0; j < nocc; j++)
-                for (int a = 0; a < nvir; a++)
-                    for (int b = 0; b < nvir; b++) {
-                        size_t idx = T2(i,j,a,b);
-                        real_t val = 0.5 * v_oovv[((size_t)i*nocc+j)*vv + (size_t)a*nvir+b];
+            // Reduced inner loop: only O(nocc) per (i,j,a,b) — Lac×t2 and Z×t1 done via DGEMM
+            for (int i = 0; i < nocc; i++)
+                for (int j = 0; j < nocc; j++)
+                    for (int a = 0; a < nvir; a++)
+                        for (int b = 0; b < nvir; b++) {
+                            size_t idx = T2(i,j,a,b);
+                            real_t val = 0.5 * v_oovv[((size_t)i*nocc+j)*vv + (size_t)a*nvir+b];
 
-                        // -Lki * t2 (O(nocc) inner loop — small)
-                        for (int k = 0; k < nocc; k++)
-                            val -= Lki[k*nocc+i] * t2v[T2(k,j,a,b)];
+                            // -Lki * t2 (O(nocc) inner loop — small)
+                            for (int k = 0; k < nocc; k++)
+                                val -= Lki[k*nocc+i] * t2v[T2(k,j,a,b)];
 
-                        // Z×t1 DGEMM result scatter
-                        val += Zt1_result[((size_t)a*nvir+b)*oo + (size_t)i*nocc+j];
+                            // Z×t1 DGEMM result scatter
+                            val += Zt1_result[((size_t)a*nvir+b)*oo + (size_t)i*nocc+j];
 
-                        // -Q[ab,ij]
-                        val -= Q[((size_t)a*nvir+b)*oo + (size_t)i*nocc+j];
+                            // -Q[ab,ij]
+                            val -= Q[((size_t)a*nvir+b)*oo + (size_t)i*nocc+j];
 
-                        raw[idx] += val;
-                    }
+                            raw[idx] += val;
+                        }
+        }
 
         // Symmetrize: t2_new(i,j,a,b) = [raw(i,a,j,b) + raw(j,b,i,a)] / D
         // raw is stored as raw[T2(i,j,a,b)] = raw(i,a,j,b)
         // so raw(j,b,i,a) = raw[T2(j,i,b,a)]
         std::vector<real_t> newT2(t2Size);
-        for (int i = 0; i < nocc; i++)
-            for (int j = 0; j < nocc; j++)
-                for (int a = 0; a < nvir; a++)
-                    for (int b = 0; b < nvir; b++) {
-                        size_t idx = T2(i,j,a,b);
-                        newT2[idx] = (raw[idx] + raw[T2(j,i,b,a)]) / Dijab[idx];
-                    }
+        if (use_tiled_ladder) {
+            // (P0-3) device symmetrize: d_newT2 = (d_raw + d_raw^P) / d_Dijab, then
+            // download newT2 once for host DIIS. raw never comes to host (P0-1/2/3).
+            int th = 256; size_t tot = t2Size; int bl = (int)((tot + th - 1) / th);
+            ccsd_t2_symmetrize_kernel<<<bl, th>>>(d_newT2, d_raw, d_Dijab, nocc, nvir);
+            cudaMemcpy(newT2.data(), d_newT2, t2Size * sizeof(double), cudaMemcpyDeviceToHost);
+        } else {
+            for (int i = 0; i < nocc; i++)
+                for (int j = 0; j < nocc; j++)
+                    for (int a = 0; a < nvir; a++)
+                        for (int b = 0; b < nvir; b++) {
+                            size_t idx = T2(i,j,a,b);
+                            newT2[idx] = (raw[idx] + raw[T2(j,i,b,a)]) / Dijab[idx];
+                        }
+        }
 
         // ---- DIIS ----
         // DIAGNOSTIC (env GANSU_CCSD_NO_SINGLES=1): zero singles BEFORE the DIIS
@@ -8520,6 +9134,29 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
 
     // Free pre-allocated GPU buffers
     tracked_cudaFree(d_gpu_pool);  // single deallocation for all GPU buffers
+    // (Inc-G1/G2 + P0-2) per-tile ovvv scratch + reduced-T2 buffers (nullptr-safe)
+    if (d_ovvv_k)      tracked_cudaFree(d_ovvv_k);
+    if (d_ovvv_perm_k) tracked_cudaFree(d_ovvv_perm_k);
+    if (d_wovvvR_X)    tracked_cudaFree(d_wovvvR_X);
+    if (d_wovvvR_tile) tracked_cudaFree(d_wovvvR_tile);
+    if (d_v_vooo)      tracked_cudaFree(d_v_vooo);
+    if (d_Lki)         tracked_cudaFree(d_Lki);
+    if (d_newT2)       tracked_cudaFree(d_newT2);
+    if (d_Dijab)       tracked_cudaFree(d_Dijab);
+    if (d_v_oooo)      tracked_cudaFree(d_v_oooo);
+    if (d_v_oovo)      tracked_cudaFree(d_v_oovo);
+    if (d_ovvv_t1_ic)  tracked_cudaFree(d_ovvv_t1_ic);
+    if (d_ovvv_t1_dc)  tracked_cudaFree(d_ovvv_t1_dc);
+    if (d_Wakic)       tracked_cudaFree(d_Wakic);
+    if (d_Wakci)       tracked_cudaFree(d_Wakci);
+    if (d_v_voov)      tracked_cudaFree(d_v_voov);
+    if (d_v_vovo)      tracked_cudaFree(d_v_vovo);
+    if (d_newT1)       tracked_cudaFree(d_newT1);
+    if (d_Fkc_t1)      tracked_cudaFree(d_Fkc_t1);
+    if (d_w_voov_c)    tracked_cudaFree(d_w_voov_c);
+    if (d_w_ooov_c)    tracked_cudaFree(d_w_ooov_c);
+    if (d_Dia)         tracked_cudaFree(d_Dia);
+    if (d_fov)         tracked_cudaFree(d_fov);
 
     // ---- (T) perturbative triples correction (spatial orbital, DGEMM-accelerated) ----
     // Pre-compute ALL f-sum and m-sum contractions via 2 large DGEMMs:

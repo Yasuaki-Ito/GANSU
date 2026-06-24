@@ -550,7 +550,13 @@ void IPEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
     tracked_cudaMalloc(&d_eri_oooo_, oooo_size * sizeof(real_t));
     tracked_cudaMalloc(&d_eri_oovv_, oovv_size * sizeof(real_t));
     tracked_cudaMalloc(&d_eri_ovvo_, ovvo_size * sizeof(real_t));
-    tracked_cudaMalloc(&d_eri_ovvv_, ovvv_size * sizeof(real_t));
+    // Inc4(b): in block mode every ovvv consumer builds per-k slices from B (the
+    // tiled Wovov/Wovvo/Woooo/Lvv paths), so the dense ovvv block (nocc·nvir³ =
+    // 46 GB at nvir=334) is never read — skip it unless the host self-check needs
+    // it. The other blocks (ovov/oovv/ovvo, ~22 GB) stay dense (not yet tiled).
+    const bool need_ovvv = (eri_block_src_ == nullptr)
+                           || (std::getenv("GANSU_STEOM_BUILD_VALIDATE") != nullptr);
+    if (need_ovvv) tracked_cudaMalloc(&d_eri_ovvv_, ovvv_size * sizeof(real_t));
 
 #ifndef GANSU_CPU_ONLY
     // Phase 0: build the 6 blocks on the fly from B_mo (naux×nmo²), never the
@@ -565,7 +571,8 @@ void IPEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
         eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    O,nocc,nocc+O,nvir,      d_eri_ovov_); // (ia|jb)
         eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         nocc+O,nvir,nocc+O,nvir, d_eri_oovv_); // (ij|ab)
         eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,O,nocc,      d_eri_ovvo_); // (ia|bj)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,nocc+O,nvir, d_eri_ovvv_); // (ia|bc)
+        if (need_ovvv)
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,nocc+O,nvir, d_eri_ovvv_); // (ia|bc)
         cudaDeviceSynchronize();
         return;
     }
@@ -676,6 +683,16 @@ __global__ void ip_woooo_build_Av(real_t* __restrict__ dAv,
         const int b = t % NV; const int k = (int)(t / NV);
         dAv[x] = ovvv[(((size_t)k*NV+c)*NV+b)*NV+d];
     }
+}
+// Inc4(b): combine the two ovvv·t1 partials of bar-Lvv. y1[a,c]=2Σ ovvv[k,d,a,c]t1,
+// z[c,a]=Σ ovvv[k,c,a,d]t1 (both accumulated over k by GEMV); Lvv_ovvv[a,c]=y1[a,c]-z[c,a].
+__global__ void ip_lvv_ovvv_combine(real_t* __restrict__ lvv,
+                                    const real_t* __restrict__ y1,
+                                    const real_t* __restrict__ z, int NV) {
+    int x = blockIdx.x*blockDim.x + threadIdx.x;
+    if (x >= NV*NV) return;
+    int a = x / NV, c = x % NV;
+    lvv[(size_t)a*NV+c] = y1[(size_t)a*NV+c] - z[(size_t)c*NV+a];
 }
 __global__ void ip_woooo_build_B(real_t* __restrict__ dB,
                                  const real_t* __restrict__ t2,
@@ -893,7 +910,11 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
 
     std::vector<real_t> h_t1(t1_sz), h_t2(t2_sz);
     std::vector<real_t> h_ovov(ovov_sz), h_ooov(ooov_sz), h_oovv(oovv_sz);
-    std::vector<real_t> h_ovvo(ovvo_sz), h_ovvv(ovvv_sz), h_oooo(oooo_sz);
+    std::vector<real_t> h_ovvo(ovvo_sz), h_oooo(oooo_sz);
+    // Inc4(b): h_ovvv (nocc·nvir³, 46 GB host) is only materialised when the dense
+    // device ovvv exists — i.e. the dense path or the opt-in build self-check. In
+    // block mode the ovvv consumers are GPU-tiled, so it stays empty.
+    std::vector<real_t> h_ovvv;
 
     cudaMemcpy(h_t1.data(),   d_t1_,        t1_sz   * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_t2.data(),   d_t2_,        t2_sz   * sizeof(real_t), cudaMemcpyDeviceToHost);
@@ -901,7 +922,10 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
     cudaMemcpy(h_ooov.data(), d_eri_ooov_,  ooov_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_oovv.data(), d_eri_oovv_,  oovv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_ovvo.data(), d_eri_ovvo_,  ovvo_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ovvv.data(), d_eri_ovvv_,  ovvv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    if (eri_block_src_ == nullptr || std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+        h_ovvv.resize(ovvv_sz);
+        cudaMemcpy(h_ovvv.data(), d_eri_ovvv_, ovvv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    }
     cudaMemcpy(h_oooo.data(), d_eri_oooo_,  oooo_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
 
     std::vector<real_t> h_f_oo(NO), h_f_vv(NV);
@@ -1070,17 +1094,55 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
     //           -   Σ_{k,d} ovvv[k,c,a,d] t1[k,d]
     // ============================================================
     std::vector<real_t> h_Lvv(NV * NV, 0.0);
+    // Inc4(b): the ovvv·t1 contribution to Lvv is computed storage-free on GPU
+    // (per-k ovvv slice from B + two accumulating GEMVs + transpose-combine),
+    // avoiding the dense ovvv host loop. Falls back to the host loop when no
+    // block source (dense path) or no GPU.
+    std::vector<real_t> h_lvv_ovvv;
+#ifndef GANSU_CPU_ONLY
+    if (eri_block_src_ != nullptr && gpu::gpu_available()) {
+        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+        const int M = nmo_full_, O = frozen_off_;
+        const real_t two=2.0, one=1.0;
+        real_t *d_ovvv_k=nullptr,*dY1=nullptr,*dZ=nullptr,*dLvvO=nullptr;
+        tracked_cudaMalloc(&d_ovvv_k,(size_t)NV*NV*NV*sizeof(real_t));
+        tracked_cudaMalloc(&dY1,(size_t)NV*NV*sizeof(real_t));
+        tracked_cudaMalloc(&dZ, (size_t)NV*NV*sizeof(real_t));
+        tracked_cudaMalloc(&dLvvO,(size_t)NV*NV*sizeof(real_t));
+        cudaMemset(dY1,0,(size_t)NV*NV*sizeof(real_t));
+        cudaMemset(dZ, 0,(size_t)NV*NV*sizeof(real_t));
+        for (int k=0;k<NO;++k) {
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M,
+                O+k,1, NO+O,NV, NO+O,NV, NO+O,NV, d_ovvv_k);
+            const real_t* t1k = d_t1_ + (size_t)k*NV;
+            // y1[a,c] += 2 Σ_d ovvv[k,d,a,c]·t1[k,d]   (ovvv_k col-major [NV²(ac),NV(d)])
+            cublasDgemv(cublas, CUBLAS_OP_N, NV*NV, NV, &two, d_ovvv_k, NV*NV, t1k, 1, &one, dY1, 1);
+            // z[c,a]  +=   Σ_d ovvv[k,c,a,d]·t1[k,d]   (ovvv_k col-major [NV(d),NV²(ca)], op=T)
+            cublasDgemv(cublas, CUBLAS_OP_T, NV, NV*NV, &one, d_ovvv_k, NV, t1k, 1, &one, dZ, 1);
+        }
+        const int TPB=256; const unsigned nb=(unsigned)(((size_t)NV*NV+TPB-1)/TPB);
+        ip_lvv_ovvv_combine<<<nb,TPB>>>(dLvvO, dY1, dZ, NV);
+        cudaDeviceSynchronize();
+        h_lvv_ovvv.assign((size_t)NV*NV,0.0);
+        cudaMemcpy(h_lvv_ovvv.data(), dLvvO, (size_t)NV*NV*sizeof(real_t), cudaMemcpyDeviceToHost);
+        tracked_cudaFree(d_ovvv_k);tracked_cudaFree(dY1);tracked_cudaFree(dZ);tracked_cudaFree(dLvvO);
+    }
+#endif
     #pragma omp parallel for collapse(2)
     for (int a = 0; a < NV; ++a)
         for (int c = 0; c < NV; ++c) {
             real_t v = h_ccFvv[a*NV + c];
             for (int k = 0; k < NO; ++k)
                 v -= h_Fov[k*NV + c] * H_T1(k,a);
-            for (int k = 0; k < NO; ++k)
-                for (int d = 0; d < NV; ++d) {
-                    v += 2.0 * H_OVVV(k,d,a,c) * H_T1(k,d);
-                    v -=       H_OVVV(k,c,a,d) * H_T1(k,d);
-                }
+            if (!h_lvv_ovvv.empty()) {
+                v += h_lvv_ovvv[a*NV + c];
+            } else {
+                for (int k = 0; k < NO; ++k)
+                    for (int d = 0; d < NV; ++d) {
+                        v += 2.0 * H_OVVV(k,d,a,c) * H_T1(k,d);
+                        v -=       H_OVVV(k,c,a,d) * H_T1(k,d);
+                    }
+            }
             h_Lvv[a*NV + c] = v;
         }
 
