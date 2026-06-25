@@ -8494,6 +8494,28 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     }
 #endif
 
+    // (Phase 1 increment-2, occ-i) device loop gate. When on, the T2 raw section's
+    // raw-output ops run once per device over that device's occupied i-block
+    // (occi_split), each writing its i-block region of a per-device raw, then NCCL
+    // AllReduce assembles the full raw on device 0 for the symmetrize. Validatable
+    // at num_gpus==1 (one iteration, I_d = full, existing buffers ⇒ byte-identical
+    // to the in-place path) before the multi-GPU broadcasts matter. Env-gated +
+    // tiled B-native; default off ⇒ in-place single-device path (unchanged).
+    bool ccsd_occi = false;
+    int  occi_NG   = 1;
+#ifdef GANSU_MULTI_GPU
+    {
+        const char* e_oi = std::getenv("GANSU_CCSD_OCCI");
+        if (use_tiled_ladder && ri_bnative && e_oi && e_oi[0]=='1') {
+            ccsd_occi = true;
+            occi_NG   = MultiGpuManager::instance().num_devices();
+            std::cout << "[CCSD OCCI] occ-i raw distribution across " << occi_NG
+                      << " GPU(s) (env GANSU_CCSD_OCCI)" << std::endl;
+        }
+    }
+#endif
+    (void)ccsd_occi; (void)occi_NG;   // (loop body wired next: gate raw ops + device loop)
+
     for (int iter = 1; iter <= MAX_ITER; iter++) {
 
         // (Phase 1 increment-2, occ-i) i-block this device owns. Full range for
@@ -8502,9 +8524,17 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // no-op (byte-identical). The multi-GPU device loop will later set these
         // per device so each computes only its raw rows. ib_off = T2 element offset
         // of the first owned row (= iblk_start·nocc·vv).
-        const int    iblk_start = 0;
-        const int    iblk_n     = nocc;
-        const size_t ib_off     = (size_t)iblk_start * nocc * vv;   // into [ij,ab] arrays
+        int    iblk_start = 0;
+        int    iblk_n     = nocc;
+        // (occ-i) device 0 owns its occ i-block; the in-place i-sliced raw ops below
+        // compute raw[I_0] only. Devices 1..NG-1 compute raw[I_d] in the occ-i device
+        // loop after the raw section, then NCCL AllReduce assembles full raw on device
+        // 0 for the symmetrize. NG==1 ⇒ I_0 = full ⇒ byte-identical to single-device.
+        if (ccsd_occi) {
+            auto sp = occi_split(nocc, occi_NG, 0);
+            iblk_start = sp.first; iblk_n = sp.second;
+        }
+        size_t ib_off     = (size_t)iblk_start * nocc * vv;   // into [ij,ab] arrays
 
         // Upload t1 and t2v to GPU, build tau on GPU (avoids CPU tau computation + upload)
         cudaMemcpy(d_t1, t1.data(), t1Size * sizeof(double), cudaMemcpyHostToDevice);
@@ -9458,6 +9488,132 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             raw[idx] += val;
                         }
         }
+
+        // (Phase 1 increment-2, occ-i) device loop: device 0 already holds raw[I_0]
+        // (in-place i-sliced ops above). Each device d=1..NG-1 recomputes raw[I_d]
+        // from broadcast intermediates (the i-independent builds are full on device
+        // 0), then NCCL AllReduce sums the disjoint i-block raws → full raw on device
+        // 0. NG==1 ⇒ this loop is empty and raw is already full ⇒ byte-identical.
+#ifdef GANSU_MULTI_GPU
+        if (ccsd_occi && occi_NG > 1) {
+            auto& mgr = MultiGpuManager::instance();
+            const int TA = 16;
+            const size_t bmo_sz = (size_t)eri_ri->get_num_auxiliary_basis() * (size_t)N * N;
+            std::vector<double*> raw_d(occi_NG, nullptr); raw_d[0] = d_raw;
+            for (int d = 1; d < occi_NG; d++) {
+                MultiGpuManager::DeviceGuard g(d);
+                gpu::GPUHandle::reset();
+                auto sp = occi_split(nocc, occi_NG, d);
+                const int ib0 = sp.first, ibn = sp.second;
+                const size_t iboff = (size_t)ib0*nocc*vv;
+                // per-device broadcast inputs
+                double *p_tau,*p_t2v,*p_t1,*p_Lac,*p_Lki,*p_Zt1,*p_Wakic,*p_Wakci,*p_Wklij;
+                double *p_Bmo,*p_vovvvT,*p_voovv,*p_vvooo,*p_raw;
+                tracked_cudaMalloc((void**)&p_tau,   t2Size*sizeof(double));
+                tracked_cudaMalloc((void**)&p_t2v,   t2Size*sizeof(double));
+                tracked_cudaMalloc((void**)&p_t1,    t1Size*sizeof(double));
+                tracked_cudaMalloc((void**)&p_Lac,   vv*sizeof(double));
+                tracked_cudaMalloc((void**)&p_Lki,   oo*sizeof(double));
+                tracked_cudaMalloc((void**)&p_Zt1,   t2Size*sizeof(double));
+                tracked_cudaMalloc((void**)&p_Wakic, oo*vv*sizeof(double));
+                tracked_cudaMalloc((void**)&p_Wakci, oo*vv*sizeof(double));
+                tracked_cudaMalloc((void**)&p_Wklij, oo*oo*sizeof(double));
+                tracked_cudaMalloc((void**)&p_Bmo,   bmo_sz*sizeof(double));
+                tracked_cudaMalloc((void**)&p_vovvvT,(size_t)vvv*nocc*sizeof(double));
+                tracked_cudaMalloc((void**)&p_voovv, oo*vv*sizeof(double));
+                tracked_cudaMalloc((void**)&p_vvooo, (size_t)vo*oo*sizeof(double));
+                tracked_cudaMalloc((void**)&p_raw,   t2Size*sizeof(double));
+                cudaMemcpyPeer(p_tau,   d, (const void*)d_tau,      0, t2Size*sizeof(double));
+                cudaMemcpyPeer(p_t2v,   d, (const void*)d_t2v,      0, t2Size*sizeof(double));
+                cudaMemcpyPeer(p_t1,    d, (const void*)d_t1,       0, t1Size*sizeof(double));
+                cudaMemcpyPeer(p_Lac,   d, (const void*)d_Lac,      0, vv*sizeof(double));
+                cudaMemcpyPeer(p_Lki,   d, (const void*)d_Lki,      0, oo*sizeof(double));
+                cudaMemcpyPeer(p_Zt1,   d, (const void*)d_ovvv_t1,  0, t2Size*sizeof(double));
+                cudaMemcpyPeer(p_Wakic, d, (const void*)d_Wakic,    0, oo*vv*sizeof(double));
+                cudaMemcpyPeer(p_Wakci, d, (const void*)d_Wakci,    0, oo*vv*sizeof(double));
+                cudaMemcpyPeer(p_Wklij, d, (const void*)d_Wklij,    0, oo*oo*sizeof(double));
+                cudaMemcpyPeer(p_Bmo,   d, (const void*)B_mo,       0, bmo_sz*sizeof(double));
+                cudaMemcpyPeer(p_vovvvT,d, (const void*)d_v_ovvv_T, 0, (size_t)vvv*nocc*sizeof(double));
+                cudaMemcpyPeer(p_voovv, d, (const void*)d_v_oovv,   0, oo*vv*sizeof(double));
+                cudaMemcpyPeer(p_vvooo, d, (const void*)d_v_vooo,   0, (size_t)vo*oo*sizeof(double));
+                cudaMemset(p_raw, 0, t2Size*sizeof(double));
+                // per-device scratch
+                double *t_vvvv,*t_ot1,*t_ot2,*t_W,*t_rawt,*t_t1s,*t_WklijT,*t_WexA,*t_WexB,*t_WexC1,*t_WexC2;
+                tracked_cudaMalloc((void**)&t_vvvv, (size_t)TA*vvv*sizeof(double));
+                tracked_cudaMalloc((void**)&t_ot1,  (size_t)TA*vv*nvir*sizeof(double));
+                tracked_cudaMalloc((void**)&t_ot2,  (size_t)vvv*TA*sizeof(double));
+                tracked_cudaMalloc((void**)&t_W,    (size_t)TA*vvv*sizeof(double));
+                tracked_cudaMalloc((void**)&t_rawt, (size_t)oo*TA*nvir*sizeof(double));
+                tracked_cudaMalloc((void**)&t_t1s,  (size_t)nocc*TA*sizeof(double));
+                tracked_cudaMalloc((void**)&t_WklijT, oo*oo*sizeof(double));
+                tracked_cudaMalloc((void**)&t_WexA, OV2*sizeof(double));
+                tracked_cudaMalloc((void**)&t_WexB, OV2*sizeof(double));
+                tracked_cudaMalloc((void**)&t_WexC1,OV2*sizeof(double));
+                tracked_cudaMalloc((void**)&t_WexC2,OV2*sizeof(double));
+                // ⑨ ladder (single-device tiled, this device's i-block)
+                for (int a0 = 0; a0 < nvir; a0 += TA) {
+                    int ta = std::min(TA, nvir - a0);
+                    ccsd_block_chem_from_B(eri_ri, p_Bmo, N, V+a0,ta, V,nvir, V,nvir, V,nvir, t_vvvv);
+                    gpu::matrixMatrixProductRect(p_vovvvT + (size_t)a0*vv*nocc, p_t1, t_ot1,
+                                            (int)((size_t)ta*vv), nvir, nocc, false, false, false, 1.0);
+                    cudaMemcpy2D(t_t1s, (size_t)ta*sizeof(double), p_t1 + a0, (size_t)nvir*sizeof(double),
+                                 (size_t)ta*sizeof(double), nocc, cudaMemcpyDeviceToDevice);
+                    gpu::matrixMatrixProductRect(p_vovvvT, t_t1s, t_ot2, (int)vvv, ta, nocc, false, false, false, 1.0);
+                    { size_t tt=(size_t)ta*vvv; int th=256; int bl=(int)((tt+th-1)/th);
+                      build_Wabcd_tile_kernel<<<bl,th>>>(t_vvvv, t_ot1, t_ot2, t_W, nvir, ta); }
+                    gpu::matrixMatrixProductRect(p_tau + iboff, t_W, t_rawt,
+                                            (int)((size_t)ibn*nocc), (int)((size_t)ta*nvir), (int)vv, false, true, false, 0.5);
+                    { size_t tt=(size_t)ibn*nocc*(size_t)ta*nvir; int th=256; int bl=(int)((tt+th-1)/th);
+                      scatter_add_abtile_kernel<<<bl,th>>>(t_rawt, p_raw, nocc, nvir, a0, ta, ib0*nocc, ibn*nocc); }
+                }
+                // ⑨ Wklij×tau
+                { size_t tt=oo*oo; int th=256; int bl=(int)((tt+th-1)/th);
+                  transpose_square_kernel<<<bl,th>>>(p_Wklij, t_WklijT, (int)oo); }
+                gpu::matrixMatrixProductRect(t_WklijT + (size_t)ib0*nocc*oo, p_tau, p_raw + iboff,
+                                        (int)((size_t)ibn*nocc), (int)vv, (int)oo, false, false, true, 0.5);
+                // ⑩ Lac×t2
+                gpu::matrixMatrixProductBatched(p_Lac, p_t2v + iboff, p_raw + iboff,
+                                        nvir, nvir, nvir, 0, (long long)vv, (long long)vv,
+                                        (int)((size_t)ibn*nocc), false, false, true, 1.0);
+                // ⑫ W-exchange (reshape full R12/R4, scatter i-block)
+                { int th=256; int blo=(int)((OV2+th-1)/th);
+                  ccsd_wex_Wakic_reshape_kernel<<<blo,th>>>(t_WexA, p_Wakic, p_Wakci, 0, nocc, nvir);
+                  ccsd_wex_t2_reshape_kernel<<<blo,th>>>(t_WexB, p_t2v, 1, nocc, nvir);
+                  gpu::matrixMatrixProductRect(t_WexA, t_WexB, t_WexC1, (int)ov,(int)ov,(int)ov, false,false,false,1.0);
+                  ccsd_wex_Wakic_reshape_kernel<<<blo,th>>>(t_WexA, p_Wakic, p_Wakci, 1, nocc, nvir);
+                  ccsd_wex_t2_reshape_kernel<<<blo,th>>>(t_WexB, p_t2v, 3, nocc, nvir);
+                  gpu::matrixMatrixProductRect(t_WexA, t_WexB, t_WexC1, (int)ov,(int)ov,(int)ov, false,false,true,-1.0);
+                  ccsd_wex_WakciRmat_reshape_kernel<<<blo,th>>>(t_WexA, p_Wakci, nocc, nvir);
+                  ccsd_wex_t2_reshape_kernel<<<blo,th>>>(t_WexB, p_t2v, 4, nocc, nvir);
+                  gpu::matrixMatrixProductRect(t_WexA, t_WexB, t_WexC2, (int)ov,(int)ov,(int)ov, false,false,false,-1.0);
+                  size_t tt=(size_t)ibn*nocc*vv; int bl=(int)((tt+th-1)/th);
+                  ccsd_wexchange_scatter_kernel<<<bl,th>>>(t_WexC1, t_WexC2, p_raw, nocc, nvir, ib0, ibn); }
+                // ⑪ reduced
+                { int th=256; size_t tt=(size_t)ibn*nocc*vv; int bl=(int)((tt+th-1)/th);
+                  ccsd_t2_reduced_kernel<<<bl,th>>>(p_raw, p_voovv, p_Lki, p_t2v, p_Zt1, p_vvooo, p_t1, nocc, nvir, ib0, ibn); }
+                // free broadcast inputs + scratch (keep p_raw for AllReduce)
+                tracked_cudaFree(p_tau); tracked_cudaFree(p_t2v); tracked_cudaFree(p_t1);
+                tracked_cudaFree(p_Lac); tracked_cudaFree(p_Lki); tracked_cudaFree(p_Zt1);
+                tracked_cudaFree(p_Wakic); tracked_cudaFree(p_Wakci); tracked_cudaFree(p_Wklij);
+                tracked_cudaFree(p_Bmo); tracked_cudaFree(p_vovvvT); tracked_cudaFree(p_voovv); tracked_cudaFree(p_vvooo);
+                tracked_cudaFree(t_vvvv); tracked_cudaFree(t_ot1); tracked_cudaFree(t_ot2);
+                tracked_cudaFree(t_W); tracked_cudaFree(t_rawt); tracked_cudaFree(t_t1s); tracked_cudaFree(t_WklijT);
+                tracked_cudaFree(t_WexA); tracked_cudaFree(t_WexB); tracked_cudaFree(t_WexC1); tracked_cudaFree(t_WexC2);
+                raw_d[d] = p_raw;
+            }
+            mgr.sync_all();
+            nccl::group_start();
+            for (int d = 0; d < occi_NG; d++) {
+                MultiGpuManager::DeviceGuard g(d);
+                nccl::all_reduce(raw_d[d], raw_d[d], (size_t)t2Size, ncclSum, d, mgr.comm_stream(d));
+            }
+            nccl::group_end();
+            { MultiGpuManager::DeviceGuard g(0); cudaStreamSynchronize(mgr.comm_stream(0)); }
+            for (int d = 1; d < occi_NG; d++) { MultiGpuManager::DeviceGuard g(d); tracked_cudaFree(raw_d[d]); }
+            cudaSetDevice(0); gpu::GPUHandle::reset();
+            iblk_start = 0; iblk_n = nocc;   // full raw assembled on device 0 ⇒ symmetrize all i
+        }
+#endif
 
         // Symmetrize: t2_new(i,j,a,b) = [raw(i,a,j,b) + raw(j,b,i,a)] / D
         // raw is stored as raw[T2(i,j,a,b)] = raw(i,a,j,b)
