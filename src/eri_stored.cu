@@ -7542,44 +7542,62 @@ __global__ void ccsd_Wakci_kernel(double* __restrict__ Wakci,
 // (Phase 0 host-roundtrip removal, ⑦-2) ld-sum reshape on the device:
 //   eff_t2_R[(l,d),(i,a)] = −0.5·t2v[T2(i,l,d,a)] − t1[i,d]·t1[l,a]
 //   t2_C[(l,d),(i,a)]     = t2v[T2(i,l,a,d)]     where T2(i,l,x,y)=((i·nocc+l)·vv+x·nvir+y)
-// gid = (l·nvir+d)·ov + i·nvir+a.
+// (occ-i, DS-2 device-0 shard) The (i,a) COLUMN is i-block COMPACT: the output has
+// ov rows (l,d) × nvir·ibn cols (i_local,a), gid = (l·nvir+d)·(nvir·ibn) + i_local
+// ·nvir+a (i = ib0+i_local). t2v/t1 read at the full i. Full range (ib0=0,ibn=nocc)
+// ⇒ gid = (l·nvir+d)·ov + i·nvir+a = old layout ⇒ N=1 no-op.
 __global__ void ccsd_ldsum_reshape_kernel(double* __restrict__ eff_t2_R,
                                           double* __restrict__ t2_C,
                                           const double* __restrict__ t2v,
-                                          const double* __restrict__ t1, int nocc, int nvir) {
+                                          const double* __restrict__ t1, int nocc, int nvir,
+                                          int ib0, int ibn) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t ov = (size_t)nocc * nvir, vv = (size_t)nvir * nvir;
-    if (gid >= ov * ov) return;
+    if (gid >= ov * (size_t)nvir * ibn) return;   // (l,d) × (i_local,a)
     int a = (int)(gid % nvir); size_t r = gid / nvir;
-    int i = (int)(r % nocc); r /= nocc;
+    int i_local = (int)(r % ibn); r /= ibn;
     int d = (int)(r % nvir); int l = (int)(r / nvir);
+    int i = ib0 + i_local;
     size_t il = (size_t)i*nocc + l;
     eff_t2_R[gid] = -0.5 * t2v[il*vv + (size_t)d*nvir + a] - t1[(size_t)i*nvir + d] * t1[(size_t)l*nvir + a];
     t2_C[gid] = t2v[il*vv + (size_t)a*nvir + d];
 }
 
-// (⑦-2) ld-sum scatter: Wakic[a,k,i,c] += R[(i·nvir+a)·ov + k·nvir+c]
+// (⑦-2) ld-sum scatter: Wakic[a,k,i,c] += R[(i_local·nvir+a)·ov + k·nvir+c].
+// (occ-i, DS-2) R (=C1) has its i in the COMPACT row i_local (its M = nvir·ibn when
+// the GEMM is sharded; full range M=ov ⇒ i_local=i). Wakic OUTPUT is full or
+// i-block compact (out_compact, DS-1 layout). Full range ⇒ N=1 no-op.
 __global__ void ccsd_wakic_ldsum_scatter_kernel(double* __restrict__ Wakic,
-                                                const double* __restrict__ R, int nocc, int nvir) {
+                                                const double* __restrict__ R, int nocc, int nvir,
+                                                int ib0, int ibn, int out_compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir, ov = (size_t)nocc * nvir;
-    if (gid >= (size_t)nocc * nocc * vv) return;
+    if (gid >= (size_t)nvir * nocc * ibn * nvir) return;
     int c = (int)(gid % nvir); size_t r = gid / nvir;
-    int i = (int)(r % nocc); r /= nocc;
+    int i_local = (int)(r % ibn); r /= ibn;
     int k = (int)(r % nocc); int a = (int)(r / nocc);
-    Wakic[gid] += R[((size_t)i*nvir + a)*ov + (size_t)k*nvir + c];
+    int i = ib0 + i_local;
+    size_t out_idx = out_compact
+        ? ((size_t)(a*nocc + k)*ibn + i_local)*nvir + c
+        : ((size_t)(a*nocc + k)*nocc + i)*nvir + c;
+    Wakic[out_idx] += R[((size_t)i_local*nvir + a)*ov + (size_t)k*nvir + c];
 }
 
-// (⑦-2) ld-sum scatter: Wakci[a,k,c,i] += R[(i·nvir+a)·ov + k·nvir+c]
+// (⑦-2) ld-sum scatter: Wakci[a,k,c,i] += R[(i_local·nvir+a)·ov + k·nvir+c] (i innermost).
 __global__ void ccsd_wakci_ldsum_scatter_kernel(double* __restrict__ Wakci,
-                                                const double* __restrict__ R, int nocc, int nvir) {
+                                                const double* __restrict__ R, int nocc, int nvir,
+                                                int ib0, int ibn, int out_compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir, ov = (size_t)nocc * nvir;
-    if (gid >= (size_t)nocc * nocc * vv) return;
-    int i = (int)(gid % nocc); size_t r = gid / nocc;
+    if (gid >= (size_t)nvir * nocc * nvir * ibn) return;
+    int i_local = (int)(gid % ibn); size_t r = gid / ibn;
     int c = (int)(r % nvir); r /= nvir;
     int k = (int)(r % nocc); int a = (int)(r / nocc);
-    Wakci[gid] += R[((size_t)i*nvir + a)*ov + (size_t)k*nvir + c];
+    int i = ib0 + i_local;
+    size_t out_idx = out_compact
+        ? ((size_t)(a*nocc + k)*nvir + c)*ibn + i_local
+        : ((size_t)(a*nocc + k)*nvir + c)*nocc + i;
+    Wakci[out_idx] += R[((size_t)i_local*nvir + a)*ov + (size_t)k*nvir + c];
 }
 
 // (Phase 0 host-roundtrip removal, ⑦-3) W exchange reshape kernels:
@@ -8937,7 +8955,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             // (⑦-2) ld-sum fully on device: reshape kernel → 3 GEMM (V_R/W_R/V_R2 are
             // already on the device) → scatter kernels into d_Wakic/d_Wakci.
             int th = 256; int blr = (int)((OV2 + th - 1) / th);
-            ccsd_ldsum_reshape_kernel<<<blr, th>>>(d_Wex_B, d_Wex_A, d_t2v, d_t1, nocc, nvir);
+            // (DS-2) full-range no-op (ib0=0, ibn=nocc); device-0 I_0 shard is DS-3.
+            ccsd_ldsum_reshape_kernel<<<blr, th>>>(d_Wex_B, d_Wex_A, d_t2v, d_t1, nocc, nvir, 0, nocc);
             if (std::getenv("GANSU_CCSD_P0_VALIDATE")) {
                 std::vector<real_t> Bd(OV2), Ad(OV2);
                 cudaMemcpy(Bd.data(), d_Wex_B, OV2*sizeof(double), cudaMemcpyDeviceToHost);
@@ -8958,8 +8977,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             gpu::matrixMatrixProductRect(d_Wex_A, d_W_R, d_Wex_C1, (int)ov, (int)ov, (int)ov, true, false, true, 0.5);
             gpu::matrixMatrixProductRect(d_Wex_B, d_V_R2, d_Wex_C2, (int)ov, (int)ov, (int)ov, true, false, false, 1.0);
             int bls = (int)((oo*vv + th - 1) / th);
-            ccsd_wakic_ldsum_scatter_kernel<<<bls, th>>>(d_Wakic, d_Wex_C1, nocc, nvir);
-            ccsd_wakci_ldsum_scatter_kernel<<<bls, th>>>(d_Wakci, d_Wex_C2, nocc, nvir);
+            ccsd_wakic_ldsum_scatter_kernel<<<bls, th>>>(d_Wakic, d_Wex_C1, nocc, nvir, 0, nocc, 0);
+            ccsd_wakci_ldsum_scatter_kernel<<<bls, th>>>(d_Wakci, d_Wex_C2, nocc, nvir, 0, nocc, 0);
             // (⑦-4) Wakic/Wakci stay on the device: T1 update (device kernel, uses
             // bare w_voov) and the W-exchange reshape (⑦-3, reads d_Wakic/d_Wakci)
             // no longer touch the host arrays. Only the ⑦-3 P0-VALIDATE chk reads
