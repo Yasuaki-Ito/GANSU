@@ -7392,11 +7392,14 @@ __global__ void ccsd_wexchange_scatter_kernel(const double* __restrict__ R12,
     if (gid >= total) return;
     int b = (int)(gid % nvir); size_t r = gid / nvir;
     int a = (int)(r % nvir); r /= nvir;
-    int j = (int)(r % nocc); int i = ib0 + (int)(r / nocc);
+    int j = (int)(r % nocc); int i_local = (int)(r / nocc);
+    int i = ib0 + i_local;
     size_t ov = (size_t)nocc * nvir;
     size_t gout = ((size_t)i*nocc + j)*vv + (size_t)a*nvir + b;
-    raw[gout] += R12[((size_t)a*nocc + i)*ov + (size_t)j*nvir + b]
-               + R4[((size_t)b*nocc + i)*ov + (size_t)j*nvir + a];
+    // (occ-i) R12/R4 are i-block COMPACT (nvir·ibn rows, row = a·ibn + i_local);
+    // full range (ib0=0, ibn=nocc) ⇒ a·nocc+i = the old layout ⇒ N=1 no-op.
+    raw[gout] += R12[((size_t)a*ibn + i_local)*ov + (size_t)j*nvir + b]
+               + R4[((size_t)b*ibn + i_local)*ov + (size_t)j*nvir + a];
 }
 
 // (Phase 0 host-roundtrip removal, P0-2) The reduced T2 inner loop on the device:
@@ -7480,43 +7483,60 @@ __global__ void ccsd_Wklij_kernel(double* __restrict__ Wklij,
 // (Phase 0 host-roundtrip removal, ⑦-1) single-index Wakic/Wakci on the device:
 //   Wakic[a,k,i,c] = v_voov[a,k,i,c] − Σ_l v_oovo[(k,l),(c,i)]·t1[l,a] + ovvv_t1_ic[(k,a,c),i]
 //   Wakci[a,k,c,i] = v_vovo[a,k,c,i] − Σ_l v_oovo[(l,k),(c,i)]·t1[l,a] + ovvv_t1_dc[(k,a,c),i]
+// (occ-i, DS-1 device-0 shard) The Wakic OUTPUT is either full ((a·nocc+k)·nocc+i)
+// ·nvir+c over all nocc i's, or i-block COMPACT ((a·nocc+k)·ibn+i_local)·nvir+c
+// holding only this device's I_d. gid covers nvir·nocc·ibn·nvir (a,k,i_local,c).
+// Inputs (v_voov/v_oovo/ovvv_t1_ic) are read at i = ib0+i_local (still full arrays
+// here; ovvv_t1_ic shard is a later increment). Full range (ib0=0, ibn=nocc,
+// out_compact=0) ⇒ gid = old layout ⇒ N=1 no-op.
 __global__ void ccsd_Wakic_kernel(double* __restrict__ Wakic,
                                   const double* __restrict__ v_voov,
                                   const double* __restrict__ v_oovo,
                                   const double* __restrict__ t1,
                                   const double* __restrict__ ovvv_t1_ic,
-                                  int nocc, int nvir) {
+                                  int nocc, int nvir, int ib0, int ibn, int out_compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
-    if (gid >= (size_t)nocc * nocc * vv) return;
+    if (gid >= (size_t)nvir * nocc * ibn * nvir) return;
     int c = (int)(gid % nvir); size_t r = gid / nvir;
-    int i = (int)(r % nocc); r /= nocc;
+    int i_local = (int)(r % ibn); r /= ibn;
     int k = (int)(r % nocc); int a = (int)(r / nocc);
+    int i = ib0 + i_local;
     double val = v_voov[((size_t)a*nocc + k)*(size_t)nocc*nvir + (size_t)i*nvir + c];
     for (int l = 0; l < nocc; l++)
         val -= v_oovo[((size_t)k*nocc + l)*(size_t)nvir*nocc + (size_t)c*nocc + i] * t1[(size_t)l*nvir + a];
     val += ovvv_t1_ic[((size_t)k*vv + (size_t)a*nvir + c)*nocc + i];
-    Wakic[gid] = val;
+    size_t out_idx = out_compact
+        ? ((size_t)(a*nocc + k)*ibn + i_local)*nvir + c
+        : ((size_t)(a*nocc + k)*nocc + i)*nvir + c;
+    Wakic[out_idx] = val;
 }
 
+// Wakci OUTPUT: full ((a·nocc+k)·nvir+c)·nocc+i / compact ((a·nocc+k)·nvir+c)·ibn
+// +i_local (i innermost). gid covers nvir·nocc·nvir·ibn (a,k,c,i_local). Full
+// range ⇒ N=1 no-op (DS-1).
 __global__ void ccsd_Wakci_kernel(double* __restrict__ Wakci,
                                   const double* __restrict__ v_vovo,
                                   const double* __restrict__ v_oovo,
                                   const double* __restrict__ t1,
                                   const double* __restrict__ ovvv_t1_dc,
-                                  int nocc, int nvir) {
+                                  int nocc, int nvir, int ib0, int ibn, int out_compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
-    if (gid >= (size_t)nocc * nocc * vv) return;
-    int i = (int)(gid % nocc); size_t r = gid / nocc;
+    if (gid >= (size_t)nvir * nocc * nvir * ibn) return;
+    int i_local = (int)(gid % ibn); size_t r = gid / ibn;
     int c = (int)(r % nvir); r /= nvir;
     int k = (int)(r % nocc); int a = (int)(r / nocc);
+    int i = ib0 + i_local;
     size_t vo = (size_t)nvir * nocc;
     double val = v_vovo[((size_t)a*nocc + k)*vo + (size_t)c*nocc + i];
     for (int l = 0; l < nocc; l++)
         val -= v_oovo[((size_t)l*nocc + k)*(size_t)nvir*nocc + (size_t)c*nocc + i] * t1[(size_t)l*nvir + a];
     val += ovvv_t1_dc[((size_t)k*vv + (size_t)a*nvir + c)*nocc + i];
-    Wakci[gid] = val;
+    size_t out_idx = out_compact
+        ? ((size_t)(a*nocc + k)*nvir + c)*ibn + i_local
+        : ((size_t)(a*nocc + k)*nvir + c)*nocc + i;
+    Wakci[out_idx] = val;
 }
 
 // (Phase 0 host-roundtrip removal, ⑦-2) ld-sum reshape on the device:
@@ -7562,39 +7582,68 @@ __global__ void ccsd_wakci_ldsum_scatter_kernel(double* __restrict__ Wakci,
     Wakci[gid] += R[((size_t)i*nvir + a)*ov + (size_t)k*nvir + c];
 }
 
-// (Phase 0 host-roundtrip removal, ⑦-3) W exchange reshape kernels (gid over OV2):
+// (Phase 0 host-roundtrip removal, ⑦-3) W exchange reshape kernels:
 //   Weff[(a,i),(k,c)]   = 2·Wakic[a,k,i,c] − Wakci[a,k,c,i]   (mode 0)
 //   Wakic_R[(a,i),(k,c)]= Wakic[a,k,i,c]                       (mode 1, Wakci ptr unused)
-// gid = (a·nocc+i)·ov + k·nvir+c.
+// (occ-i, Phase-1 increment-2) The output row index is i-block COMPACT: the
+// matrix has nvir·ibn rows laid out as row = a·ibn + i_local (i = ib0 + i_local),
+// so only the device's owned i-block is materialized (Wex transient shard). The
+// (k,c) columns and the full Wakic/Wakci read are unchanged. Full range
+// (ib0=0, ibn=nocc) ⇒ row = a·nocc+i = the old (a·nocc+i)·ov+k·nvir+c layout
+// byte-for-byte ⇒ N=1 no-op. gid = ((a·ibn+i_local)·nocc + k)·nvir + c.
+// (occ-i, M3-a) The Wakic/Wakci READ is either FULL (the source array spans all
+// nocc i's, i = ib0+i_local indexes the nocc-strided layout) or i-block COMPACT
+// (the source holds only this device's I_d, i_local indexes an ibn-strided
+// layout). Full ⇒ device 0 (byte-identical, N=1 no-op); compact ⇒ device d≥1
+// (p_Wakic/p_Wakci shrunk to ibn·vv via a packed broadcast). wakic_compact=0
+// reproduces the old full read exactly.
+//   Wakic[a,k,i,c]: full ((a·nocc+k)·nocc + i)·nvir + c / compact ((a·nocc+k)·ibn + i_local)·nvir + c
+//   Wakci[a,k,c,i]: full ((a·nocc+k)·nvir + c)·nocc + i / compact ((a·nocc+k)·nvir + c)·ibn + i_local
 __global__ void ccsd_wex_Wakic_reshape_kernel(double* __restrict__ out,
                                               const double* __restrict__ Wakic,
                                               const double* __restrict__ Wakci, int mode,
-                                              int nocc, int nvir) {
+                                              int nocc, int nvir, int ib0, int ibn,
+                                              int wakic_compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t ov = (size_t)nocc * nvir;
-    if (gid >= ov * ov) return;
+    if (gid >= (size_t)nvir * ibn * ov) return;   // compact: nvir·ibn rows
     int c = (int)(gid % nvir); size_t r = gid / nvir;
     int k = (int)(r % nocc); r /= nocc;
-    int i = (int)(r % nocc); int a = (int)(r / nocc);
-    double wic = Wakic[((size_t)a*nocc + k)*(size_t)nocc*nvir + (size_t)i*nvir + c];
+    int i_local = (int)(r % ibn); int a = (int)(r / ibn);
+    int i = ib0 + i_local;
+    size_t wic_idx = wakic_compact
+        ? ((size_t)(a*nocc + k)*ibn + i_local)*nvir + c
+        : ((size_t)(a*nocc + k)*nocc + i)*nvir + c;
+    double wic = Wakic[wic_idx];
     if (mode == 0) {
-        double wci = Wakci[((size_t)a*nocc + k)*(size_t)nvir*nocc + (size_t)c*nocc + i];
+        size_t wci_idx = wakic_compact
+            ? ((size_t)(a*nocc + k)*nvir + c)*ibn + i_local
+            : ((size_t)(a*nocc + k)*nvir + c)*nocc + i;
+        double wci = Wakci[wci_idx];
         out[gid] = 2.0*wic - wci;
     } else {
         out[gid] = wic;
     }
 }
 
-// Wakci_R_mat[(b,i),(k,c)] = Wakci[b,k,c,i].  gid = (b·nocc+i)·ov + k·nvir+c.
+// Wakci_R_mat[(b,i),(k,c)] = Wakci[b,k,c,i].  (occ-i) compact row = b·ibn+i_local
+// (i = ib0+i_local); full range ⇒ b·nocc+i ⇒ N=1 no-op. wakic_compact selects the
+// Wakci source layout (full nocc-strided vs i-block compact ibn-strided, M3-a).
+// gid = ((b·ibn+i_local)·nocc + k)·nvir + c.
 __global__ void ccsd_wex_WakciRmat_reshape_kernel(double* __restrict__ out,
-                                                  const double* __restrict__ Wakci, int nocc, int nvir) {
+                                                  const double* __restrict__ Wakci, int nocc, int nvir,
+                                                  int ib0, int ibn, int wakic_compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t ov = (size_t)nocc * nvir;
-    if (gid >= ov * ov) return;
+    if (gid >= (size_t)nvir * ibn * ov) return;   // compact: nvir·ibn rows
     int c = (int)(gid % nvir); size_t r = gid / nvir;
     int k = (int)(r % nocc); r /= nocc;
-    int i = (int)(r % nocc); int b = (int)(r / nocc);
-    out[gid] = Wakci[((size_t)b*nocc + k)*(size_t)nvir*nocc + (size_t)c*nocc + i];
+    int i_local = (int)(r % ibn); int b = (int)(r / ibn);
+    int i = ib0 + i_local;
+    size_t wci_idx = wakic_compact
+        ? ((size_t)(b*nocc + k)*nvir + c)*ibn + i_local
+        : ((size_t)(b*nocc + k)*nvir + c)*nocc + i;
+    out[gid] = Wakci[wci_idx];
 }
 
 // t2 reshape for W exchange (gid over OV2). mode selects the layout:
@@ -8819,8 +8868,11 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             // (⑦-1) single-index Wakic/Wakci on the device from d_ovvv_t1_ic/dc.
             // Download for the (still host) ld-sum scatter below (removed in ⑦-2).
             int th = 256; int bl = (int)((oo*vv + th - 1) / th);
-            ccsd_Wakic_kernel<<<bl, th>>>(d_Wakic, d_v_voov, d_v_oovo, d_t1, d_ovvv_t1_ic, nocc, nvir);
-            ccsd_Wakci_kernel<<<bl, th>>>(d_Wakci, d_v_vovo, d_v_oovo, d_t1, d_ovvv_t1_dc, nocc, nvir);
+            // (DS-1) full-range no-op (ib0=0, ibn=nocc, out_compact=0) ⇒ device-0
+            // builds full Wakic/Wakci as before. The I_0 compact build is switched on
+            // in the device-0 shard increment.
+            ccsd_Wakic_kernel<<<bl, th>>>(d_Wakic, d_v_voov, d_v_oovo, d_t1, d_ovvv_t1_ic, nocc, nvir, 0, nocc, 0);
+            ccsd_Wakci_kernel<<<bl, th>>>(d_Wakci, d_v_vovo, d_v_oovo, d_t1, d_ovvv_t1_dc, nocc, nvir, 0, nocc, 0);
             // (⑦-2) Wakic/Wakci stay on the device through the ld-sum scatter;
             // downloaded once after ld-sum (below) for the still-host T1/W-exchange.
             if (std::getenv("GANSU_CCSD_P0_VALIDATE")) {
@@ -9274,16 +9326,26 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             // (⑦-3) W exchange reshape on the device (from d_Wakic/d_Wakci/d_t2v) —
             // each GEMM's two operands are built by kernels into d_Wex_A/d_Wex_B,
             // removing 6 host reshape loops + 6 host uploads.
-            int th = 256; int blo = (int)((OV2 + th - 1) / th);
+            // (occ-i) WexA (and C1/C2) are i-block COMPACT: nvir·iblk_n rows
+            // (row = a·iblk_n + i_local). WexB (t2 reshape) is i-independent ⇒ full
+            // OV2. Full range (iblk_start=0, iblk_n=nocc) ⇒ compact rows = nvir·nocc
+            // = ov ⇒ byte-identical to the old full layout ⇒ N=1 no-op.
+            int th = 256;
+            const size_t wexA_rows = (size_t)nvir * iblk_n;          // compact A/C1/C2 rows
+            int blo_A = (int)((wexA_rows*ov + th - 1) / th);          // WexA reshape (compact)
+            int blo_B = (int)((OV2 + th - 1) / th);                   // t2 reshape (full, i-indep)
+            const int wexM = (int)wexA_rows;                          // GEMM M (compact)
             const bool p0val = (std::getenv("GANSU_CCSD_P0_VALIDATE") != nullptr);
             auto chk = [&](const char* tag, int amode, int tmode) {
                 if (!p0val) return;
-                std::vector<real_t> Ad(OV2), Bd(OV2);
-                cudaMemcpy(Ad.data(), d_Wex_A, OV2*sizeof(double), cudaMemcpyDeviceToHost);
+                size_t Asz = (size_t)wexA_rows*ov;
+                std::vector<real_t> Ad(Asz), Bd(OV2);
+                cudaMemcpy(Ad.data(), d_Wex_A, Asz*sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpy(Bd.data(), d_Wex_B, OV2*sizeof(double), cudaMemcpyDeviceToHost);
                 double mA=0.0, mB=0.0;
-                for (int a=0;a<nvir;a++) for (int i=0;i<nocc;i++) for (int k=0;k<nocc;k++) for (int c=0;c<nvir;c++) {
-                    size_t idx=((size_t)a*nocc+i)*ov + (size_t)k*nvir+c;
+                for (int a=0;a<nvir;a++) for (int il=0;il<iblk_n;il++) for (int k=0;k<nocc;k++) for (int c=0;c<nvir;c++) {
+                    int i = iblk_start + il;
+                    size_t idx=((size_t)a*iblk_n+il)*ov + (size_t)k*nvir+c;   // compact row
                     double wic=Wakic[((size_t)a*nocc+k)*nocc*nvir+(size_t)i*nvir+c];
                     double ref = (amode==0) ? (2.0*wic - Wakci[((size_t)a*nocc+k)*nvir*nocc+(size_t)c*nocc+i])
                                : (amode==1) ? wic
@@ -9297,21 +9359,21 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 }
                 std::cout << "[P0-VALIDATE wex " << tag << "] A=" << std::scientific << mA << " B=" << mB << std::endl;
             };
-            // GEMM 1: R12 = Weff × t2_R1
-            ccsd_wex_Wakic_reshape_kernel<<<blo,th>>>(d_Wex_A, d_Wakic, d_Wakci, 0, nocc, nvir);
-            ccsd_wex_t2_reshape_kernel<<<blo,th>>>(d_Wex_B, d_t2v, 1, nocc, nvir);
+            // GEMM 1: R12 = Weff × t2_R1   (M = nvir·iblk_n compact rows)
+            ccsd_wex_Wakic_reshape_kernel<<<blo_A,th>>>(d_Wex_A, d_Wakic, d_Wakci, 0, nocc, nvir, iblk_start, iblk_n, 0);
+            ccsd_wex_t2_reshape_kernel<<<blo_B,th>>>(d_Wex_B, d_t2v, 1, nocc, nvir);
             chk("1 Weff/t2R1", 0, 1);
-            gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C1, (int)ov,(int)ov,(int)ov, false,false,false,1.0);
+            gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C1, wexM,(int)ov,(int)ov, false,false,false,1.0);
             // GEMM 2: R12 -= Wakic_R × t2_R3
-            ccsd_wex_Wakic_reshape_kernel<<<blo,th>>>(d_Wex_A, d_Wakic, d_Wakci, 1, nocc, nvir);
-            ccsd_wex_t2_reshape_kernel<<<blo,th>>>(d_Wex_B, d_t2v, 3, nocc, nvir);
+            ccsd_wex_Wakic_reshape_kernel<<<blo_A,th>>>(d_Wex_A, d_Wakic, d_Wakci, 1, nocc, nvir, iblk_start, iblk_n, 0);
+            ccsd_wex_t2_reshape_kernel<<<blo_B,th>>>(d_Wex_B, d_t2v, 3, nocc, nvir);
             chk("2 WakicR/t2R3", 1, 3);
-            gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C1, (int)ov,(int)ov,(int)ov, false,false,true,-1.0);
+            gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C1, wexM,(int)ov,(int)ov, false,false,true,-1.0);
             // GEMM 3: R4 = -Wakci_R × t2_R4
-            ccsd_wex_WakciRmat_reshape_kernel<<<blo,th>>>(d_Wex_A, d_Wakci, nocc, nvir);
-            ccsd_wex_t2_reshape_kernel<<<blo,th>>>(d_Wex_B, d_t2v, 4, nocc, nvir);
+            ccsd_wex_WakciRmat_reshape_kernel<<<blo_A,th>>>(d_Wex_A, d_Wakci, nocc, nvir, iblk_start, iblk_n, 0);
+            ccsd_wex_t2_reshape_kernel<<<blo_B,th>>>(d_Wex_B, d_t2v, 4, nocc, nvir);
             chk("3 WakciR/t2R4", 2, 4);
-            gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C2, (int)ov,(int)ov,(int)ov, false,false,false,-1.0);
+            gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C2, wexM,(int)ov,(int)ov, false,false,false,-1.0);
         } else {
             std::vector<real_t> Weff(OV2), Wakic_R(OV2), Wakci_R_mat(OV2);
             std::vector<real_t> t2_R1(OV2), t2_R3(OV2), t2_R4(OV2);
@@ -9546,10 +9608,14 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 tracked_cudaMalloc((void**)&t_rawt, (size_t)oo*TA*nvir*sizeof(double));
                 tracked_cudaMalloc((void**)&t_t1s,  (size_t)nocc*TA*sizeof(double));
                 tracked_cudaMalloc((void**)&t_WklijT, oo*oo*sizeof(double));
-                tracked_cudaMalloc((void**)&t_WexA, OV2*sizeof(double));
+                // (occ-i Wex shard) A/C1/C2 are i-block COMPACT (nvir·ibn rows);
+                // B (t2 reshape) is i-independent ⇒ full OV2. This is where the
+                // per-device Wex memory actually shrinks to ≈ /NG.
+                const size_t wexAsz = (size_t)nvir*ibn*ov;
+                tracked_cudaMalloc((void**)&t_WexA, wexAsz*sizeof(double));
                 tracked_cudaMalloc((void**)&t_WexB, OV2*sizeof(double));
-                tracked_cudaMalloc((void**)&t_WexC1,OV2*sizeof(double));
-                tracked_cudaMalloc((void**)&t_WexC2,OV2*sizeof(double));
+                tracked_cudaMalloc((void**)&t_WexC1,wexAsz*sizeof(double));
+                tracked_cudaMalloc((void**)&t_WexC2,wexAsz*sizeof(double));
                 // ⑨ ladder (single-device tiled, this device's i-block)
                 for (int a0 = 0; a0 < nvir; a0 += TA) {
                     int ta = std::min(TA, nvir - a0);
@@ -9575,17 +9641,23 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 gpu::matrixMatrixProductBatched(p_Lac, p_t2v + iboff, p_raw + iboff,
                                         nvir, nvir, nvir, 0, (long long)vv, (long long)vv,
                                         (int)((size_t)ibn*nocc), false, false, true, 1.0);
-                // ⑫ W-exchange (reshape full R12/R4, scatter i-block)
-                { int th=256; int blo=(int)((OV2+th-1)/th);
-                  ccsd_wex_Wakic_reshape_kernel<<<blo,th>>>(t_WexA, p_Wakic, p_Wakci, 0, nocc, nvir);
-                  ccsd_wex_t2_reshape_kernel<<<blo,th>>>(t_WexB, p_t2v, 1, nocc, nvir);
-                  gpu::matrixMatrixProductRect(t_WexA, t_WexB, t_WexC1, (int)ov,(int)ov,(int)ov, false,false,false,1.0);
-                  ccsd_wex_Wakic_reshape_kernel<<<blo,th>>>(t_WexA, p_Wakic, p_Wakci, 1, nocc, nvir);
-                  ccsd_wex_t2_reshape_kernel<<<blo,th>>>(t_WexB, p_t2v, 3, nocc, nvir);
-                  gpu::matrixMatrixProductRect(t_WexA, t_WexB, t_WexC1, (int)ov,(int)ov,(int)ov, false,false,true,-1.0);
-                  ccsd_wex_WakciRmat_reshape_kernel<<<blo,th>>>(t_WexA, p_Wakci, nocc, nvir);
-                  ccsd_wex_t2_reshape_kernel<<<blo,th>>>(t_WexB, p_t2v, 4, nocc, nvir);
-                  gpu::matrixMatrixProductRect(t_WexA, t_WexB, t_WexC2, (int)ov,(int)ov,(int)ov, false,false,false,-1.0);
+                // ⑫ W-exchange (compact i-block reshape R12/R4, scatter i-block)
+                { int th=256;
+                  const int wexM = (int)((size_t)nvir*ibn);            // compact A/C1/C2 rows
+                  int blo_A=(int)(((size_t)wexM*ov+th-1)/th);          // WexA reshape (compact)
+                  int blo_B=(int)((OV2+th-1)/th);                      // t2 reshape (full)
+                  // (M3-a foundation) p_Wakic/p_Wakci are still full-broadcast here
+                  // ⇒ wakic_compact=0 (full read), identical to M1. The compact path
+                  // (wakic_compact=1) is reserved for device-0 I_0 shard (next).
+                  ccsd_wex_Wakic_reshape_kernel<<<blo_A,th>>>(t_WexA, p_Wakic, p_Wakci, 0, nocc, nvir, ib0, ibn, 0);
+                  ccsd_wex_t2_reshape_kernel<<<blo_B,th>>>(t_WexB, p_t2v, 1, nocc, nvir);
+                  gpu::matrixMatrixProductRect(t_WexA, t_WexB, t_WexC1, wexM,(int)ov,(int)ov, false,false,false,1.0);
+                  ccsd_wex_Wakic_reshape_kernel<<<blo_A,th>>>(t_WexA, p_Wakic, p_Wakci, 1, nocc, nvir, ib0, ibn, 0);
+                  ccsd_wex_t2_reshape_kernel<<<blo_B,th>>>(t_WexB, p_t2v, 3, nocc, nvir);
+                  gpu::matrixMatrixProductRect(t_WexA, t_WexB, t_WexC1, wexM,(int)ov,(int)ov, false,false,true,-1.0);
+                  ccsd_wex_WakciRmat_reshape_kernel<<<blo_A,th>>>(t_WexA, p_Wakci, nocc, nvir, ib0, ibn, 0);
+                  ccsd_wex_t2_reshape_kernel<<<blo_B,th>>>(t_WexB, p_t2v, 4, nocc, nvir);
+                  gpu::matrixMatrixProductRect(t_WexA, t_WexB, t_WexC2, wexM,(int)ov,(int)ov, false,false,false,-1.0);
                   size_t tt=(size_t)ibn*nocc*vv; int bl=(int)((tt+th-1)/th);
                   ccsd_wexchange_scatter_kernel<<<bl,th>>>(t_WexC1, t_WexC2, p_raw, nocc, nvir, ib0, ibn); }
                 // ⑪ reduced
