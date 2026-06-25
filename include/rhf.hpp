@@ -1210,6 +1210,11 @@ public:
     /// Free the replicated full-B copies, returning to the distributed-only state.
     void free_replicated_B();
 
+    /// (ERI_RI hook) Release the AO-B replica after build_B_mo; the next
+    /// build_B_mo lazily re-replicates. Lets the DMET cluster CCSD ground reclaim
+    /// ~naux·nao² per GPU once the MO-basis B is built (block consumers only need B_mo).
+    void release_bmo_ao_replica() const override;
+
     /// Whether replicate_B_to_all_gpus() has been called and not freed.
     bool b_is_replicated() const { return b_replicated_; }
 

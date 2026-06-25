@@ -493,6 +493,13 @@ public:
     /// Virtual so distributed RI can override the source-B lookup (P4b).
     virtual const real_t* build_B_mo(const real_t* d_C, int nmo) const;
 
+    /// Release any cached full AO-basis B replica held for build_B_mo (e.g. the
+    /// distributed-RI per-GPU full-B copies). After build_B_mo has produced the
+    /// MO-basis B (which is what block consumers use), the AO replica is idle and
+    /// can be freed to reclaim ~naux·nao² per GPU; the next build_B_mo lazily
+    /// rebuilds it. Default no-op (non-distributed RI keeps B resident anyway).
+    virtual void release_bmo_ao_replica() const {}
+
     /// Phase P4b — workhorse for build_B_mo: takes the AO-basis source B
     /// pointer explicitly so distributed RI (where intermediate_matrix_B_ is
     /// empty) can hand in its replicated d_B_full_per_gpu_[curr_dev]. The

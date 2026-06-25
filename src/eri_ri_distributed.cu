@@ -2934,6 +2934,17 @@ void ERI_RI_Distributed_RHF::free_replicated_B() {
     cudaSetDevice(0);
 }
 
+// (ERI_RI hook) Free the AO-B replica after build_B_mo. const_cast mirrors
+// build_B_mo: this only touches the lazy-replication cache, not logical state.
+// The next build_B_mo re-replicates. Used by the DMET cluster CCSD ground to
+// reclaim ~naux·nao² per GPU before allocating its residual pool.
+void ERI_RI_Distributed_RHF::release_bmo_ao_replica() const {
+#ifndef GANSU_CPU_ONLY
+    if (b_replicated_)
+        const_cast<ERI_RI_Distributed_RHF*>(this)->free_replicated_B();
+#endif
+}
+
 // DMET-CCSD entry point. Forwards to DMET; the multi-GPU optimization is
 // applied inside DMET::compute_energy() when it detects this ERI subclass.
 real_t ERI_RI_Distributed_RHF::compute_dmet_ccsd() {

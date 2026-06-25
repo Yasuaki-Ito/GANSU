@@ -7615,6 +7615,44 @@ __global__ void ccsd_wakci_ldsum_scatter_kernel(double* __restrict__ Wakci,
     Wakci[out_idx] += R[((size_t)i_local*nvir + a)*ov + (size_t)k*nvir + c];
 }
 
+// (V_R floor reduction) Build a k-block of the ld-sum reshape V_R/W_R/V_R2 directly
+// from the stored v_oovv/w_oovv, so the full ov² reshapes never need to be
+// materialized. The ld-sum contraction is over (l,d) (= ov, the GEMM K), the output
+// columns are (k,c); tiling the OUTPUT k-block does NOT split the contraction ⇒
+// bit-exact. block layout [(l,d),(k_local,c)] = ((l·nvir+d)·ktile + k_local)·nvir+c.
+//   V_R/W_R[(l,d),(k,c)] = oovv[(l·nocc+k)·vv + d·nvir+c]   (mode 0)
+//   V_R2  [(l,d),(k,c)] = v_oovv[(l·nocc+k)·vv + c·nvir+d]  (mode 1, c,d swapped)
+__global__ void ccsd_vr_block_kernel(const double* __restrict__ oovv,
+                                     double* __restrict__ block,
+                                     int k0, int ktile, int nocc, int nvir, int mode) {
+    size_t gid = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir*nvir;
+    size_t total = (size_t)nocc*nvir*(size_t)ktile*nvir;   // ov·ktile·nvir
+    if (gid >= total) return;
+    int c = (int)(gid % nvir); size_t r = gid / nvir;
+    int kl = (int)(r % ktile); r /= ktile;
+    int d = (int)(r % nvir); int l = (int)(r / nvir);
+    int k = k0 + kl;
+    block[gid] = oovv[((size_t)l*nocc + k)*vv + (mode ? (size_t)c*nvir+d : (size_t)d*nvir+c)];
+}
+
+// (V_R floor reduction) Scatter a k-block GEMM result C_blk[Mrows, ktile·nvir] into
+// the full C[Mrows, ov] at column block k0 (matrixMatrixProductRect has no ldC, so
+// the GEMM writes a contiguous block which this kernel places at the strided cols):
+//   C[m·ov + (k0+kl)·nvir+c] = C_blk[m·(ktile·nvir) + kl·nvir + c].
+__global__ void ccsd_scatter_cols_kernel(double* __restrict__ C,
+                                         const double* __restrict__ C_blk,
+                                         int k0, int ktile, int Mrows, int nocc, int nvir) {
+    size_t gid = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
+    size_t ov = (size_t)nocc*nvir;
+    size_t kw = (size_t)ktile*nvir;
+    size_t total = (size_t)Mrows*kw;
+    if (gid >= total) return;
+    int c = (int)(gid % nvir); size_t r = gid / nvir;
+    int kl = (int)(r % ktile); size_t m = r / ktile;
+    C[m*ov + (size_t)(k0+kl)*nvir + c] = C_blk[m*kw + (size_t)kl*nvir + c];
+}
+
 // (Phase 0 host-roundtrip removal, ⑦-3) W exchange reshape kernels:
 //   Weff[(a,i),(k,c)]   = 2·Wakic[a,k,i,c] − Wakci[a,k,c,i]   (mode 0)
 //   Wakic_R[(a,i),(k,c)]= Wakic[a,k,i,c]                       (mode 1, Wakci ptr unused)
@@ -8085,6 +8123,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // loop below. NG==1 (incl. num_gpus 1) ⇒ iblk_n0 = nocc ⇒ compact == full ⇒
     // byte-identical anchor.
     bool ccsd_occi = false; int occi_NG = 1; int iblk_n0 = nocc;
+    // (V_R floor reduction) opt-in: build the ld-sum V_R/W_R/V_R2 reshapes per k-block
+    // from v_oovv/w_oovv instead of storing the three full ov² buffers. Stage 1 keeps
+    // the full carve (for the self-check); stage 2 drops it. Default off = byte-identical.
+    const bool vr_tile = use_tiled_ladder && (std::getenv("GANSU_CCSD_VR_TILE") != nullptr);
 #ifdef GANSU_MULTI_GPU
     {
         const char* e_oi = std::getenv("GANSU_CCSD_OCCI");
@@ -8102,6 +8144,15 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     bool free_eri_mo = false;
     if (ri_bnative) {
         B_mo = eri_ri->build_B_mo(d_coefficient_matrix, N);   // naux×N² half-transform
+        // (AO-B reclaim) The MO-basis B_mo is now built; the AO-basis B replica
+        // (distributed-RI full per-GPU B, ~naux·nao²) is idle for the rest of the
+        // CCSD ground — block consumers (ccsd_block_chem_from_B / mo_eri_block_into)
+        // and the OCCI device loop use B_mo only. Release it to free ~naux·nao² per
+        // GPU before the residual pool (the dominant device-0/d≥1 baseline at cluster
+        // scale); the next stage's build_B_mo lazily re-replicates. Opt-out via
+        // GANSU_CCSD_KEEP_AO_B=1 (keeps the legacy resident replica).
+        if (!std::getenv("GANSU_CCSD_KEEP_AO_B"))
+            eri_ri->release_bmo_ao_replica();
     } else if (d_eri_mo_precomputed) {
         d_eri_mo = d_eri_mo_precomputed;
         free_eri_mo = false;
@@ -8336,6 +8387,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // iblk_n0 = nocc when not occi ⇒ = OV2 (byte-identical). WexB (t2 reshape) is
     // i-independent ⇒ stays full OV2.
     const size_t sz_WexAC = ccsd_occi ? (size_t)nvir*iblk_n0*ov : OV2;
+    // (VR-tile floor reduction, Stage 2) V_R/W_R/V_R2 (3×OV2 reshapes of v_oovv/w_oovv)
+    // are built per-k-block from v_oovv/w_oovv when vr_tile ⇒ no full carve needed.
+    const size_t sz_VR = vr_tile ? (size_t)1 : OV2;
     // (ovvv per-tile, Inc-A) d_v_ovvv / d_v_ovvv_perm are read only by the legacy
     // (non-tiled) ovvv_t1 build; the tiled path builds those per-k from B (Inc-G1).
     // So shrink their carve to 1 when tiled — frees 2·nocc·nvir³ of device memory.
@@ -8347,7 +8401,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     const size_t total_gpu_doubles = sz_tau + sz_Wabcd + sz_Wklij + sz_raw
         + sz_w_oovv + sz_v_oovv + sz_Fki + sz_v_ovvv_T + sz_t1 + sz_ovvv_t1
         + sz_v_vvvv + sz_Fac + sz_Fkc + sz_t2v + sz_Lac + sz_Z
-        + 4 * sz_Wex + 3 * sz_WexAC  // Wex_B/V_R/W_R/V_R2 (OV2) + Wex_A/C1/C2 (compact)
+        + sz_Wex + 3 * sz_VR + 3 * sz_WexAC  // Wex_B (OV2) + V_R/W_R/V_R2 (=1 when vr_tile) + Wex_A/C1/C2 (compact)
         + sz_v_ovvv + sz_v_ovvv_perm + sz_w_ovvv_R;
 
     double *d_gpu_pool = nullptr;
@@ -8375,9 +8429,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     double *d_Wex_B     = carve(sz_Wex);
     double *d_Wex_C1    = carve(sz_WexAC);
     double *d_Wex_C2    = carve(sz_WexAC);
-    double *d_V_R       = carve(sz_Wex);
-    double *d_W_R       = carve(sz_Wex);
-    double *d_V_R2      = carve(sz_Wex);
+    double *d_V_R       = carve(sz_VR);   // (VR-tile) =1 when vr_tile (built per-block)
+    double *d_W_R       = carve(sz_VR);
+    double *d_V_R2      = carve(sz_VR);
     double *d_v_ovvv    = carve(sz_v_ovvv);       // persistent v_ovvv
     double *d_v_ovvv_perm = carve(sz_v_ovvv_perm); // persistent v_ovvv_perm
     double *d_w_ovvv_R  = carve(sz_w_ovvv_R);     // persistent w_ovvv_R
@@ -8386,7 +8440,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // V_R[(l*nvir+d), (k*nvir+c)] = v_oovv[(l*nocc+k)*vv + d*nvir+c]
     // W_R[(l*nvir+d), (k*nvir+c)] = w_oovv[(l*nocc+k)*vv + d*nvir+c]
     // V_R2[(l*nvir+d), (k*nvir+c)] = v_oovv[(l*nocc+k)*vv + c*nvir+d]  (c,d swapped for Wakci)
-    {
+    // (VR-tile floor reduction, Stage 2) skip the full build when vr_tile — the
+    // ld-sum builds these per-k-block from v_oovv/w_oovv (d_V_R/W_R/V_R2 are size-1 stubs).
+    if (!vr_tile) {
         std::vector<real_t> V_R(OV2), W_R(OV2), V_R2(OV2);
         for (int l = 0; l < nocc; l++)
             for (int d = 0; d < nvir; d++)
@@ -8519,6 +8575,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     double *d_v_oooo = nullptr, *d_v_oovo = nullptr;
     double *d_ovvv_t1_ic = nullptr, *d_ovvv_t1_dc = nullptr;
     double *d_Wakic = nullptr, *d_Wakci = nullptr, *d_v_voov = nullptr, *d_v_vovo = nullptr;
+    // (V_R floor reduction) per-k-block ld-sum: V_R/W_R/V_R2 reshape block (ov·KT·nvir)
+    // built from d_v_oovv/d_w_oovv + contiguous GEMM result block (Mia·KT·nvir).
+    double *d_vr_blk = nullptr, *d_c_blk = nullptr;
+    const int VR_KT = 16;   // k-block width for the ld-sum reshape tiling
     // (⑦-4) device T1 update: per-iter result + Fkc(with fov) upload + constants.
     double *d_newT1 = nullptr, *d_Fkc_t1 = nullptr;
     double *d_w_voov_c = nullptr, *d_w_ooov_c = nullptr, *d_Dia = nullptr, *d_fov = nullptr;
@@ -8580,6 +8640,12 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // (Z build) bare v_ovov (constant) for the device Z build.
         tracked_cudaMalloc((void**)&d_v_ovov_c, (size_t)ov*ov * sizeof(double));
         cudaMemcpy(d_v_ovov_c, v_ovov.data(), (size_t)ov*ov * sizeof(double), cudaMemcpyHostToDevice);
+        // (V_R floor reduction) per-k-block scratch (only when opt-in). block = ov·KT·nvir
+        // (V_R/W_R/V_R2 reshape), C block = (nvir·iblk_n0)·KT·nvir (device-0 GEMM result).
+        if (vr_tile) {
+            tracked_cudaMalloc((void**)&d_vr_blk, (size_t)ov*VR_KT*nvir * sizeof(double));
+            tracked_cudaMalloc((void**)&d_c_blk,  (size_t)nvir*iblk_n0*VR_KT*nvir * sizeof(double));
+        }
         if (h_fov_active) {
             tracked_cudaMalloc((void**)&d_fov, (size_t)ov * sizeof(double));
             cudaMemcpy(d_fov, h_fov_active, (size_t)ov * sizeof(double), cudaMemcpyHostToDevice);
@@ -9033,9 +9099,35 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             }
             // (DS-3) C1/C2 have nvir·iblk_n compact (i,a) rows (= ov when full).
             int Mia = (int)((size_t)nvir*iblk_n);
-            gpu::matrixMatrixProductRect(d_Wex_B, d_V_R, d_Wex_C1, Mia, (int)ov, (int)ov, true, false, false, 1.0);
-            gpu::matrixMatrixProductRect(d_Wex_A, d_W_R, d_Wex_C1, Mia, (int)ov, (int)ov, true, false, true, 0.5);
-            gpu::matrixMatrixProductRect(d_Wex_B, d_V_R2, d_Wex_C2, Mia, (int)ov, (int)ov, true, false, false, 1.0);
+            if (vr_tile) {
+                // (V_R floor reduction) build V_R/W_R/V_R2 per k-block from v_oovv/w_oovv
+                // (no full ov² reshapes). N(=k)-block tiling ⇒ bit-exact. GEMM writes a
+                // contiguous Mia×(kt·nvir) block, scattered into the strided C1/C2 cols.
+                int th2 = 256;
+                for (int k0 = 0; k0 < nocc; k0 += VR_KT) {
+                    int kt = std::min(VR_KT, nocc - k0);
+                    size_t blk_n = (size_t)kt * nvir;
+                    int blb = (int)((ov*blk_n + th2 - 1) / th2);
+                    int blc = (int)(((size_t)Mia*blk_n + th2 - 1) / th2);
+                    // C1 block = eff_t2_R^T·V_R_blk + 0.5·t2_C^T·W_R_blk
+                    ccsd_vr_block_kernel<<<blb,th2>>>(d_v_oovv, d_vr_blk, k0, kt, nocc, nvir, 0);
+                    gpu::matrixMatrixProductRect(d_Wex_B, d_vr_blk, d_c_blk, Mia, (int)blk_n, (int)ov, true, false, false, 1.0);
+                    ccsd_vr_block_kernel<<<blb,th2>>>(d_w_oovv, d_vr_blk, k0, kt, nocc, nvir, 0);
+                    gpu::matrixMatrixProductRect(d_Wex_A, d_vr_blk, d_c_blk, Mia, (int)blk_n, (int)ov, true, false, true, 0.5);
+                    ccsd_scatter_cols_kernel<<<blc,th2>>>(d_Wex_C1, d_c_blk, k0, kt, Mia, nocc, nvir);
+                    // C2 block = eff_t2_R^T·V_R2_blk
+                    ccsd_vr_block_kernel<<<blb,th2>>>(d_v_oovv, d_vr_blk, k0, kt, nocc, nvir, 1);
+                    gpu::matrixMatrixProductRect(d_Wex_B, d_vr_blk, d_c_blk, Mia, (int)blk_n, (int)ov, true, false, false, 1.0);
+                    ccsd_scatter_cols_kernel<<<blc,th2>>>(d_Wex_C2, d_c_blk, k0, kt, Mia, nocc, nvir);
+                }
+                // (Stage 2) self-check removed — Stage 1 (log106) proved the per-block
+                // build is byte-identical (C1=C2=0.0). d_V_R/W_R/V_R2 are now size-1 stubs
+                // (full carve dropped) ∴ no full-GEMM reference to compare against.
+            } else {
+                gpu::matrixMatrixProductRect(d_Wex_B, d_V_R, d_Wex_C1, Mia, (int)ov, (int)ov, true, false, false, 1.0);
+                gpu::matrixMatrixProductRect(d_Wex_A, d_W_R, d_Wex_C1, Mia, (int)ov, (int)ov, true, false, true, 0.5);
+                gpu::matrixMatrixProductRect(d_Wex_B, d_V_R2, d_Wex_C2, Mia, (int)ov, (int)ov, true, false, false, 1.0);
+            }
             int bls = (int)(((size_t)nocc*iblk_n*vv + th - 1) / th);
             ccsd_wakic_ldsum_scatter_kernel<<<bls, th>>>(d_Wakic, d_Wex_C1, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
             ccsd_wakci_ldsum_scatter_kernel<<<bls, th>>>(d_Wakci, d_Wex_C2, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
@@ -9674,6 +9766,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 // build from p_Bmo) and Z[I_d]/Zt1[I_d] — device 0 now holds only I_0.
                 // p_v_ovov is broadcast for the Z build; v_vvov is loaded from host.
                 double *p_Z,*p_ovvv_k,*p_ovvv_perm_k,*p_v_ovov;
+                // (VR-tile Stage 3) device d builds V_R/W_R/V_R2 per-block from p_voovv/
+                // p_w_oovv (no full broadcast). p_w_oovv added; p_vr_blk/p_c_blk scratch.
+                double *p_w_oovv=nullptr,*p_vr_blk=nullptr,*p_c_blk=nullptr;
                 const size_t p_oovo = (size_t)nocc*nocc*nvir*nocc;   // v_oovo size
                 const size_t p_ot1  = (size_t)nocc*vv*ibn;           // ovvv_t1_ic/dc COMPACT (I_d)
                 tracked_cudaMalloc((void**)&p_tau,   t2Size*sizeof(double));
@@ -9695,9 +9790,17 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 tracked_cudaMalloc((void**)&p_v_oovo, p_oovo*sizeof(double));
                 tracked_cudaMalloc((void**)&p_ot1ic,  p_ot1*sizeof(double));   // compact I_d
                 tracked_cudaMalloc((void**)&p_ot1dc,  p_ot1*sizeof(double));
-                tracked_cudaMalloc((void**)&p_V_R,    OV2*sizeof(double));
-                tracked_cudaMalloc((void**)&p_W_R,    OV2*sizeof(double));
-                tracked_cudaMalloc((void**)&p_V_R2,   OV2*sizeof(double));
+                // (VR-tile Stage 3) p_V_R/W_R/V_R2 are size-1 stubs when vr_tile (built
+                // per-block from p_voovv/p_w_oovv); p_w_oovv + per-block scratch allocated.
+                const size_t pvr = vr_tile ? (size_t)1 : OV2;
+                tracked_cudaMalloc((void**)&p_V_R,    pvr*sizeof(double));
+                tracked_cudaMalloc((void**)&p_W_R,    pvr*sizeof(double));
+                tracked_cudaMalloc((void**)&p_V_R2,   pvr*sizeof(double));
+                if (vr_tile) {
+                    tracked_cudaMalloc((void**)&p_w_oovv, oo*vv*sizeof(double));
+                    tracked_cudaMalloc((void**)&p_vr_blk, (size_t)ov*VR_KT*nvir*sizeof(double));
+                    tracked_cudaMalloc((void**)&p_c_blk,  (size_t)nvir*ibn*VR_KT*nvir*sizeof(double));
+                }
                 // (DS-4 C) Z[I_d] (compact) + ovvv k-slice scratch + p_v_ovov for Z build
                 tracked_cudaMalloc((void**)&p_Z,           vv*(size_t)ibn*nvir*sizeof(double));
                 tracked_cudaMalloc((void**)&p_ovvv_k,      (size_t)vvv*sizeof(double));
@@ -9719,9 +9822,15 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 cudaMemcpyPeer(p_v_oovo,d, (const void*)d_v_oovo,   0, p_oovo*sizeof(double));
                 // (DS-4 C) p_ot1ic/dc are NOT broadcast — device d builds them (⑥) itself.
                 cudaMemcpyPeer(p_v_ovov,d, (const void*)d_v_ovov_c, 0, OV2*sizeof(double));
-                cudaMemcpyPeer(p_V_R,   d, (const void*)d_V_R,      0, OV2*sizeof(double));
-                cudaMemcpyPeer(p_W_R,   d, (const void*)d_W_R,      0, OV2*sizeof(double));
-                cudaMemcpyPeer(p_V_R2,  d, (const void*)d_V_R2,     0, OV2*sizeof(double));
+                // (VR-tile Stage 3) broadcast p_w_oovv (for per-block W_R build) instead
+                // of the 3 full V_R/W_R/V_R2; v_oovv is already in p_voovv.
+                if (vr_tile) {
+                    cudaMemcpyPeer(p_w_oovv, d, (const void*)d_w_oovv, 0, oo*vv*sizeof(double));
+                } else {
+                    cudaMemcpyPeer(p_V_R,   d, (const void*)d_V_R,      0, OV2*sizeof(double));
+                    cudaMemcpyPeer(p_W_R,   d, (const void*)d_W_R,      0, OV2*sizeof(double));
+                    cudaMemcpyPeer(p_V_R2,  d, (const void*)d_V_R2,     0, OV2*sizeof(double));
+                }
                 cudaMemset(p_raw, 0, t2Size*sizeof(double));
                 // per-device scratch
                 double *t_vvvv,*t_ot1,*t_ot2,*t_W,*t_rawt,*t_t1s,*t_WklijT,*t_WexA,*t_WexB,*t_WexC1,*t_WexC2;
@@ -9768,9 +9877,26 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                   int blr=(int)(((size_t)ov*nvir*ibn+th-1)/th);
                   ccsd_ldsum_reshape_kernel<<<blr,th>>>(t_WexB, t_WexA, p_t2v, p_t1, nocc, nvir, ib0, ibn);
                   int Mia=(int)((size_t)nvir*ibn);
-                  gpu::matrixMatrixProductRect(t_WexB, p_V_R, t_WexC1, Mia,(int)ov,(int)ov, true,false,false,1.0);
-                  gpu::matrixMatrixProductRect(t_WexA, p_W_R, t_WexC1, Mia,(int)ov,(int)ov, true,false,true,0.5);
-                  gpu::matrixMatrixProductRect(t_WexB, p_V_R2,t_WexC2, Mia,(int)ov,(int)ov, true,false,false,1.0);
+                  if (vr_tile) {
+                      // (VR-tile Stage 3) per-k-block V_R/W_R/V_R2 from p_voovv/p_w_oovv
+                      // (mirrors device-0). t_WexC1/C2 are compact (Mia rows). Bit-exact.
+                      for (int k0=0; k0<nocc; k0+=VR_KT) {
+                          int kt=std::min(VR_KT, nocc-k0); size_t blk_n=(size_t)kt*nvir;
+                          int blb=(int)((ov*blk_n+th-1)/th); int blc=(int)(((size_t)Mia*blk_n+th-1)/th);
+                          ccsd_vr_block_kernel<<<blb,th>>>(p_voovv, p_vr_blk, k0, kt, nocc, nvir, 0);
+                          gpu::matrixMatrixProductRect(t_WexB, p_vr_blk, p_c_blk, Mia,(int)blk_n,(int)ov, true,false,false,1.0);
+                          ccsd_vr_block_kernel<<<blb,th>>>(p_w_oovv, p_vr_blk, k0, kt, nocc, nvir, 0);
+                          gpu::matrixMatrixProductRect(t_WexA, p_vr_blk, p_c_blk, Mia,(int)blk_n,(int)ov, true,false,true,0.5);
+                          ccsd_scatter_cols_kernel<<<blc,th>>>(t_WexC1, p_c_blk, k0, kt, Mia, nocc, nvir);
+                          ccsd_vr_block_kernel<<<blb,th>>>(p_voovv, p_vr_blk, k0, kt, nocc, nvir, 1);
+                          gpu::matrixMatrixProductRect(t_WexB, p_vr_blk, p_c_blk, Mia,(int)blk_n,(int)ov, true,false,false,1.0);
+                          ccsd_scatter_cols_kernel<<<blc,th>>>(t_WexC2, p_c_blk, k0, kt, Mia, nocc, nvir);
+                      }
+                  } else {
+                      gpu::matrixMatrixProductRect(t_WexB, p_V_R, t_WexC1, Mia,(int)ov,(int)ov, true,false,false,1.0);
+                      gpu::matrixMatrixProductRect(t_WexA, p_W_R, t_WexC1, Mia,(int)ov,(int)ov, true,false,true,0.5);
+                      gpu::matrixMatrixProductRect(t_WexB, p_V_R2,t_WexC2, Mia,(int)ov,(int)ov, true,false,false,1.0);
+                  }
                   int bls=(int)(((size_t)nocc*ibn*vv+th-1)/th);
                   ccsd_wakic_ldsum_scatter_kernel<<<bls,th>>>(p_Wakic, t_WexC1, nocc, nvir, ib0, ibn, 1);
                   ccsd_wakci_ldsum_scatter_kernel<<<bls,th>>>(p_Wakci, t_WexC2, nocc, nvir, ib0, ibn, 1); }
@@ -9840,6 +9966,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 tracked_cudaFree(p_ot1ic); tracked_cudaFree(p_ot1dc);
                 tracked_cudaFree(p_Z); tracked_cudaFree(p_ovvv_k); tracked_cudaFree(p_ovvv_perm_k); tracked_cudaFree(p_v_ovov);
                 tracked_cudaFree(p_V_R); tracked_cudaFree(p_W_R); tracked_cudaFree(p_V_R2);
+                if (p_w_oovv) tracked_cudaFree(p_w_oovv);
+                if (p_vr_blk) tracked_cudaFree(p_vr_blk);
+                if (p_c_blk)  tracked_cudaFree(p_c_blk);
                 tracked_cudaFree(t_vvvv); tracked_cudaFree(t_ot1); tracked_cudaFree(t_ot2);
                 tracked_cudaFree(t_W); tracked_cudaFree(t_rawt); tracked_cudaFree(t_t1s); tracked_cudaFree(t_WklijT);
                 tracked_cudaFree(t_WexA); tracked_cudaFree(t_WexB); tracked_cudaFree(t_WexC1); tracked_cudaFree(t_WexC2);
@@ -9974,6 +10103,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     if (d_v_oovo)      tracked_cudaFree(d_v_oovo);
     if (d_ovvv_t1_ic)  tracked_cudaFree(d_ovvv_t1_ic);
     if (d_ovvv_t1_dc)  tracked_cudaFree(d_ovvv_t1_dc);
+    if (d_vr_blk)      tracked_cudaFree(d_vr_blk);
+    if (d_c_blk)       tracked_cudaFree(d_c_blk);
     if (d_Wakic)       tracked_cudaFree(d_Wakic);
     if (d_Wakci)       tracked_cudaFree(d_Wakci);
     if (d_v_voov)      tracked_cudaFree(d_v_voov);
