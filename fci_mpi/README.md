@@ -1,6 +1,7 @@
 # GPU-Accelerated Full Configuration Interaction for 1.7 Trillion Determinants
 
-This directory contains the implementation accompanying the manuscript.
+This directory contains the implementation accompanying the manuscript entitled
+"GPU-Accelerated Full Configuration Interaction for 1.7 Trillion Determinants".
 
 The implementation provides a distributed-memory Full Configuration Interaction (FCI) solver accelerated by NVIDIA GPUs using CUDA, cuBLAS, NCCL, and MPI.
 
@@ -8,7 +9,7 @@ The implementation provides a distributed-memory Full Configuration Interaction 
 
 # Software Requirements
 
-The code has been tested with the following software versions:
+The implementation has been tested with the following software versions:
 
 | Software | Version       |
 | -------- | ------------- |
@@ -17,17 +18,6 @@ The code has been tested with the following software versions:
 | OpenMPI  | 4.1.x         |
 | CMake    | 3.20 or later |
 | Python   | 3.10.x        |
-
----
-
-# Tested Hardware
-
-| GPU         | Memory | CUDA | NCCL |
-| ----------- | ------ | ---- | ---- |
-| NVIDIA A100 | 80 GB  | 12.9 | 2.29 |
-| NVIDIA A100 | 20 GB  | 13.1 | 2.29 |
-| NVIDIA H200 | 141 GB | 12.9 | 2.28 |
-| NVIDIA V100 | 16 GB  | 12.0 | 2.28 |
 
 ---
 
@@ -85,6 +75,7 @@ pip install -r requirements.txt
 
 ## Build
 
+Please update the environment variables in `lib/build.sh` to match your local environment before building.
 ```bash
 cd lib
 
@@ -106,17 +97,21 @@ where \<nprocs\> is the number of MPI processes (GPUs) used for the calculation.
 
 A convenience script providing the same functionality is also included:
 ```bash
-./mpifci.sh C2 sto3g
+./run_gpufci.sh C2 sto3g
 ```
 
 ## Example 2: Calculation from FCIDUMP Integrals
 
 ```bash
-./run_gpufci_from_integral.sh
+./run_gpufci_from_fcidump.sh <molecule> <basis>
 ```
 
-The provided example uses the FCIDUMP integrals for the 2Fe2S system. 
 Please update the path specified by the --fcidump option.
+
+The example script expects FCIDUMP integral files as input.
+Representative FCIDUMP integral files used in this work were obtained from the SQD data repository:
+
+https://github.com/jrm874/sqd_data_repository/tree/main/integrals
 
 ---
 
@@ -136,8 +131,20 @@ The main driver supports the following command-line arguments:
 | `--debugmode` | Debug level (`0=none`, `1=basic`, `2=detailed`) | 1       |
 | `--chunksize` | Tile size used in σ = Hc evaluation             | 256     |
 
+## Directory Structure
+
+| Directory/File | Description |
+|----------------|-------------|
+| `README.md ` | This document | 
+| `geometry/` | Molecular geometries used in this work |
+| `lib/` | CUDA/C++ implementation |
+| `results/` | Output directory for benchmark data and user calculations |
+| `results/calculated_energy/` | Reference energies reported in the manuscript |
+| `common.py` | Utility functions for molecular geometry processing and common routines |
+| `fci.py` | Main driver for distributed GPU-accelerated FCI calculations |
+| `fci_from_fcidump.py` | Driver for FCI calculations from FCIDUMP integral files |
+| `requirements.txt` | Python package requirements |
+| `run_gpufci.sh` | Example script for running FCI calculations from molecular geometries |
+| `run_gpufci_from_fcidump.sh` | Example script for running FCI calculations from FCIDUMP integral files |
 ---
 
-# Contact
-
-Email: [gao.hong@fujitsu.com](mailto:gao.hong@fujitsu.com)

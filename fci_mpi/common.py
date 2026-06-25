@@ -100,10 +100,10 @@ def mol2geometry(fname: str, distance: float or None):
             return absolute_distance(distance, geometry, (1,0))
 
 def get_geometry_and_spin(molname: str, dist: float or None):
-    mol_info = pd.read_json('share/molecule_info.json', orient='index')
+    mol_info = pd.read_json('geometry/molecule_info.json', orient='index')
     if molname in mol_info.index:
         if mol_info['file'][molname] is not None:
-            geometry = mol2geometry('share/' + mol_info['file'][molname], dist)
+            geometry = mol2geometry('geometry/' + mol_info['file'][molname], dist)
         else:
             geometry = str2geometry(molname, dist)
         spin = int(mol_info['spin'][molname])
@@ -119,5 +119,5 @@ def get_geometry_and_spin(molname: str, dist: float or None):
 
 if __name__ == '__main__':
     #geometry = xyz2geometry('share/C2H2.xyz', 3.0)
-    geometry = mol2geometry('share/C2H2.mol', 3.0)
+    geometry = mol2geometry('geometry/C2H2.mol', 3.0)
     print(geometry)

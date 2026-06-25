@@ -1,15 +1,25 @@
 #!/bin/bash
 set -e
 
+export NCCL_HOME=$HOME/local/nccl
+export CPATH=$NCCL_HOME/include:$CPATH
+export LIBRARY_PATH=$NCCL_HOME/lib:$LIBRARY_PATH
+export LD_LIBRARY_PATH=$NCCL_HOME/lib:$LD_LIBRARY_PATH
+
+export PATH=$HOME/local/openmpi/bin:$PATH
+export LD_LIBRARY_PATH=$HOME/local/openmpi/lib:$LD_LIBRARY_PATH
+export MANPATH=$HOME/local/openmpi/share/man:$MANPATH
+MPI_INC=$HOME/local/openmpi/include
+MPI_LIB=$HOME/local/openmpi/lib
+which mpicc
+
 CUDA_HOME=/usr/local/cuda-12.9
 NVCC=${CUDA_HOME}/bin/nvcc
 NCCL_ROOT=$HOME/local/nccl2.29
-MPI_INC=/usr/lib/x86_64-linux-gnu/openmpi/include
-MPI_LIB=/usr/lib/x86_64-linux-gnu/openmpi/lib
-NUMPY_INC=$(python3 -c "import numpy; print(numpy.get_include())")
-which mpicc
-DIST_DIR=./build/
 
+NUMPY_INC=$(python3 -c "import numpy; print(numpy.get_include())")
+
+DIST_DIR=./build/
 mkdir -p ${DIST_DIR}
 
 INCLUDE="-I${CUDA_HOME}/include \
@@ -53,35 +63,6 @@ ${NVCC} -shared ${GENCODE} \
     -Xcompiler -static-libgcc \
     -Xlinker -rpath,'$ORIGIN' \
     -o ${DIST_DIR}/libfci.so
-
-# ===================================================
-# Copy NCCL libraries to dist directory (default: disabled)
-# Usage: COPY_NCCL=1 ./build.sh
-# ===================================================
-COPY_NCCL=${COPY_NCCL:-0}
-
-if [ "${COPY_NCCL}" = "1" ]; then
-    echo "=== Collecting NCCL libraries ==="
-    for lib in ${NCCL_ROOT}/lib/libnccl.so.2*; do
-        if [ -f "$lib" ]; then
-            cp $lib ${DIST_DIR}/
-            echo "  Copied: $(basename $lib)"
-        fi
-    done
-
-    # Create symbolic links
-    cd ${DIST_DIR}
-    for lib in libnccl.so.2*; do
-        base=$(echo $lib | sed 's/\.so\.\([0-9]*\)\..*/\.so\.\1/')
-        base2=$(echo $lib | sed 's/\.so\..*/\.so/')
-        [ "$base" != "$lib" ] && [ ! -f "$base" ] && ln -sf $lib $base && echo "  Symlink: $base -> $lib"
-        [ ! -f "$base2" ] && ln -sf $lib $base2 && echo "  Symlink: $base2 -> $lib"
-    done
-    cd -
-else
-    echo "=== Skipping NCCL copy (COPY_NCCL=0) ==="
-fi
-
 
 echo ""
 echo "=== Done! ==="

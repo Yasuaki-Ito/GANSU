@@ -1,0 +1,16 @@
+{
+    "nelec": 30,
+    "norb": 19,
+    "na": 3876,
+    "nstr": 15023376,
+    "nprocs": 2,
+    "use_cpu_memory": false,
+    "chunksize": 256,
+    "max_space": 12,
+    "device": "NVIDIA A100 80GB PCIe",
+    "geometry": "C 0.0 0.0 -0.5388; O 0.0 0.0 -1.6653; S 0.0 0.0 1.0347",
+    "ecore": 79.92044198897239,
+    "e_HF": -504.39725776045043,
+    "e_FCI": -504.58505381182874,
+    "fci_time": 4.306679725646973
+}

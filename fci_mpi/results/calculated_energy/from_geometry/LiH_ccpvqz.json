@@ -1,0 +1,16 @@
+{
+    "nelec": 4,
+    "norb": 85,
+    "na": 3570,
+    "nstr": 12744900,
+    "nprocs": 4,
+    "use_cpu_memory": false,
+    "chunksize": 1024,
+    "max_space": 12,
+    "device": "NVIDIA H100 SXM5",
+    "geometry": "Li 0.0 0.0 0.4089; H 0.0 0.0 -1.2267",
+    "ecore": 0.9706111719002203,
+    "e_HF": -7.98708436832344,
+    "e_FCI": -8.04241730910539,
+    "fci_time": 30.325876235961914
+}

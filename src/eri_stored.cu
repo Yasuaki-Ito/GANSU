@@ -7500,7 +7500,7 @@ __global__ void ccsd_Wakic_kernel(double* __restrict__ Wakic,
                                   const double* __restrict__ t1,
                                   const double* __restrict__ ovvv_t1_ic,
                                   int nocc, int nvir, int ib0, int ibn, int out_compact,
-                                  int ovt1_compact) {
+                                  int ovt1_compact, int vvoov_compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
     if (gid >= (size_t)nvir * nocc * ibn * nvir) return;
@@ -7508,7 +7508,12 @@ __global__ void ccsd_Wakic_kernel(double* __restrict__ Wakic,
     int i_local = (int)(r % ibn); r /= ibn;
     int k = (int)(r % nocc); int a = (int)(r / nocc);
     int i = ib0 + i_local;
-    double val = v_voov[((size_t)a*nocc + k)*(size_t)nocc*nvir + (size_t)i*nvir + c];
+    // (Phase-1a, Cat-B) v_voov i-block COMPACT: ((a·nocc+k)·(ibn·nvir) + i_local·nvir+c)
+    // holds only this device's I_d. Full / vvoov_compact=0 ⇒ ((a·nocc+k)·ov + i·nvir+c)
+    // = old layout ⇒ N=1 no-op.
+    double val = vvoov_compact
+        ? v_voov[((size_t)a*nocc + k)*(size_t)ibn*nvir + (size_t)i_local*nvir + c]
+        : v_voov[((size_t)a*nocc + k)*(size_t)nocc*nvir + (size_t)i*nvir + c];
     for (int l = 0; l < nocc; l++)
         val -= v_oovo[((size_t)k*nocc + l)*(size_t)nvir*nocc + (size_t)c*nocc + i] * t1[(size_t)l*nvir + a];
     // (DS-4) ovvv_t1_ic is full ((k,a,c)·nocc+i) or i-block COMPACT ((k,a,c)·ibn
@@ -7531,7 +7536,7 @@ __global__ void ccsd_Wakci_kernel(double* __restrict__ Wakci,
                                   const double* __restrict__ t1,
                                   const double* __restrict__ ovvv_t1_dc,
                                   int nocc, int nvir, int ib0, int ibn, int out_compact,
-                                  int ovt1_compact) {
+                                  int ovt1_compact, int vvovo_compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
     if (gid >= (size_t)nvir * nocc * nvir * ibn) return;
@@ -7540,7 +7545,11 @@ __global__ void ccsd_Wakci_kernel(double* __restrict__ Wakci,
     int k = (int)(r % nocc); int a = (int)(r / nocc);
     int i = ib0 + i_local;
     size_t vo = (size_t)nvir * nocc;
-    double val = v_vovo[((size_t)a*nocc + k)*vo + (size_t)c*nocc + i];
+    // (Phase-1a, Cat-B) v_vovo i-block COMPACT: ((a·nocc+k)·(nvir·ibn) + c·ibn+i_local)
+    // (i innermost). Full / vvovo_compact=0 ⇒ ((a·nocc+k)·vo + c·nocc+i) = old ⇒ N=1 no-op.
+    double val = vvovo_compact
+        ? v_vovo[((size_t)a*nocc + k)*(size_t)nvir*ibn + (size_t)c*ibn + i_local]
+        : v_vovo[((size_t)a*nocc + k)*vo + (size_t)c*nocc + i];
     for (int l = 0; l < nocc; l++)
         val -= v_oovo[((size_t)l*nocc + k)*(size_t)nvir*nocc + (size_t)c*nocc + i] * t1[(size_t)l*nvir + a];
     // (DS-4) ovvv_t1_dc full ((k,a,c)·nocc+i) or i-block COMPACT ((k,a,c)·ibn
@@ -7945,7 +7954,7 @@ __global__ void ccsd_Zbuild_kernel(double* __restrict__ Z,
                                    const double* __restrict__ v_voov,
                                    const double* __restrict__ t1,
                                    int nocc, int nvir,
-                                   int ib0, int ibn, int compact) {
+                                   int ib0, int ibn, int compact, int vin_compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t ov = (size_t)nocc * nvir;
     const size_t vv = (size_t)nvir * nvir;
@@ -7958,10 +7967,15 @@ __global__ void ccsd_Zbuild_kernel(double* __restrict__ Z,
         ? ((size_t)(a*nvir + b)*ibn + i_local)*nvir + c
         : ((size_t)(a*nvir + b)*nocc + i)*nvir + c;
 
+    // (Phase-1a, Cat-B) v_ovov/v_voov i-block COMPACT: the (i,c) column block is
+    // restricted to i∈I_d ⇒ stride ibn·nvir + i_local·nvir+c. Full / vin_compact=0
+    // ⇒ ov + i·nvir+c = old layout ⇒ N=1 no-op.
     double val = Z[out_idx];   // = v_vvov[ab,ic] (pre-loaded; compact when sharded)
     for (int k = 0; k < nocc; k++) {
-        val -= v_ovov[((size_t)k*nvir + b)*ov + (size_t)i*nvir + c] * t1[(size_t)k*nvir + a];
-        val -= v_voov[((size_t)a*nocc + k)*ov + (size_t)i*nvir + c] * t1[(size_t)k*nvir + b];
+        size_t ov_b = vin_compact ? (size_t)ibn*nvir : ov;
+        size_t ic   = vin_compact ? (size_t)i_local*nvir + c : (size_t)i*nvir + c;
+        val -= v_ovov[((size_t)k*nvir + b)*ov_b + ic] * t1[(size_t)k*nvir + a];
+        val -= v_voov[((size_t)a*nocc + k)*ov_b + ic] * t1[(size_t)k*nvir + b];
     }
     Z[out_idx] = val;
 }
@@ -9012,8 +9026,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             // compact==full ⇒ byte-identical.
             // (DS-4 device-0 shard) ovt1_compact=occi?1:0: the ⑥ build above now
             // produces d_ovvv_t1_ic/dc COMPACT for I_0 ⇒ read it compact too.
-            ccsd_Wakic_kernel<<<bl, th>>>(d_Wakic, d_v_voov, d_v_oovo, d_t1, d_ovvv_t1_ic, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, ccsd_occi?1:0);
-            ccsd_Wakci_kernel<<<bl, th>>>(d_Wakci, d_v_vovo, d_v_oovo, d_t1, d_ovvv_t1_dc, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, ccsd_occi?1:0);
+            ccsd_Wakic_kernel<<<bl, th>>>(d_Wakic, d_v_voov, d_v_oovo, d_t1, d_ovvv_t1_ic, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, ccsd_occi?1:0, 0);
+            ccsd_Wakci_kernel<<<bl, th>>>(d_Wakci, d_v_vovo, d_v_oovo, d_t1, d_ovvv_t1_dc, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, ccsd_occi?1:0, 0);
             // (⑦-2) Wakic/Wakci stay on the device through the ld-sum scatter;
             // downloaded once after ld-sum (below) for the still-host T1/W-exchange.
             if (std::getenv("GANSU_CCSD_P0_VALIDATE") && occi_NG<=1) {   // (DS-3) skip: compact I_0 when occi
@@ -9655,7 +9669,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             }
             size_t zsz = vv * (size_t)iblk_n * nvir;   // = vv·ov when full
             int thz = 256; int blz = (int)((zsz + thz - 1) / thz);
-            ccsd_Zbuild_kernel<<<blz, thz>>>(d_Z, d_v_ovov_c, d_v_voov, d_t1, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
+            ccsd_Zbuild_kernel<<<blz, thz>>>(d_Z, d_v_ovov_c, d_v_voov, d_t1, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, 0);
             if (std::getenv("GANSU_CCSD_P0_VALIDATE") && occi_NG<=1) {   // (DS-4) compact I_0 when NG>1 ⇒ skip
                 std::vector<real_t> ref(vv*ov, 0.0), dev(vv*ov, 0.0);
                 host_Z(ref);
@@ -9872,8 +9886,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 }
                 { int th=256; int blw=(int)(((size_t)nocc*ibn*vv+th-1)/th);
                   // (DS-4 C) ovt1_compact=1: p_ot1ic/dc are the device-d compact I_d build.
-                  ccsd_Wakic_kernel<<<blw,th>>>(p_Wakic, p_v_voov, p_v_oovo, p_t1, p_ot1ic, nocc, nvir, ib0, ibn, 1, 1);
-                  ccsd_Wakci_kernel<<<blw,th>>>(p_Wakci, p_v_vovo, p_v_oovo, p_t1, p_ot1dc, nocc, nvir, ib0, ibn, 1, 1);
+                  ccsd_Wakic_kernel<<<blw,th>>>(p_Wakic, p_v_voov, p_v_oovo, p_t1, p_ot1ic, nocc, nvir, ib0, ibn, 1, 1, 0);
+                  ccsd_Wakci_kernel<<<blw,th>>>(p_Wakci, p_v_vovo, p_v_oovo, p_t1, p_ot1dc, nocc, nvir, ib0, ibn, 1, 1, 0);
                   int blr=(int)(((size_t)ov*nvir*ibn+th-1)/th);
                   ccsd_ldsum_reshape_kernel<<<blr,th>>>(t_WexB, t_WexA, p_t2v, p_t1, nocc, nvir, ib0, ibn);
                   int Mia=(int)((size_t)nvir*ibn);
@@ -9952,7 +9966,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                              v_vvov.data() + (size_t)ib0*nvir, ov*sizeof(double),
                              (size_t)ibn*nvir*sizeof(double), vv, cudaMemcpyHostToDevice);
                 { size_t zsz=vv*(size_t)ibn*nvir; int thz=256; int blz=(int)((zsz+thz-1)/thz);
-                  ccsd_Zbuild_kernel<<<blz,thz>>>(p_Z, p_v_ovov, p_v_voov, p_t1, nocc, nvir, ib0, ibn, 1); }
+                  ccsd_Zbuild_kernel<<<blz,thz>>>(p_Z, p_v_ovov, p_v_voov, p_t1, nocc, nvir, ib0, ibn, 1, 0); }
                 gpu::matrixMatrixProductRect(p_Z, p_t1, p_Zt1, (int)((size_t)vv*ibn), nocc, nvir, false, true, false, 1.0);
                 // ⑪ reduced
                 { int th=256; size_t tt=(size_t)ibn*nocc*vv; int bl=(int)((tt+th-1)/th);
