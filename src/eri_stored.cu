@@ -7415,19 +7415,24 @@ __global__ void ccsd_t2_reduced_kernel(double* __restrict__ raw,
                                        const double* __restrict__ Zt1,
                                        const double* __restrict__ v_vooo,
                                        const double* __restrict__ t1,
-                                       int nocc, int nvir, int ib0, int ibn) {
+                                       int nocc, int nvir, int ib0, int ibn,
+                                       int zt1_compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
     size_t oo = (size_t)nocc * nocc;
     if (gid >= (size_t)ibn * nocc * vv) return;
     int b = (int)(gid % nvir); size_t r = gid / nvir;
     int a = (int)(r % nvir); r /= nvir;
-    int j = (int)(r % nocc); int i = ib0 + (int)(r / nocc);
+    int j = (int)(r % nocc); int i_loc = (int)(r / nocc); int i = ib0 + i_loc;
     size_t gout = ((size_t)i*nocc + j)*vv + (size_t)a*nvir + b;
     double val = 0.5 * v_oovv[gout];
     for (int k = 0; k < nocc; k++)
         val -= Lki[(size_t)k*nocc + i] * t2v[((size_t)k*nocc + j)*vv + (size_t)a*nvir + b];
-    val += Zt1[((size_t)a*nvir + b)*oo + (size_t)i*nocc + j];
+    // (DS-4) Zt1 full ((a·nvir+b)·oo + i·nocc+j) or i-block COMPACT (((a·nvir+b)·ibn
+    // +i_loc)·nocc+j). Full range / zt1_compact=0 ⇒ same index ⇒ N=1 no-op.
+    val += zt1_compact
+        ? Zt1[((size_t)(a*nvir + b)*ibn + i_loc)*nocc + j]
+        : Zt1[((size_t)a*nvir + b)*oo + (size_t)i*nocc + j];
     for (int k = 0; k < nocc; k++)
         val -= v_vooo[((size_t)a*nocc + k)*oo + (size_t)i*nocc + j] * t1[(size_t)k*nvir + b];
     raw[gout] += val;
@@ -7494,7 +7499,8 @@ __global__ void ccsd_Wakic_kernel(double* __restrict__ Wakic,
                                   const double* __restrict__ v_oovo,
                                   const double* __restrict__ t1,
                                   const double* __restrict__ ovvv_t1_ic,
-                                  int nocc, int nvir, int ib0, int ibn, int out_compact) {
+                                  int nocc, int nvir, int ib0, int ibn, int out_compact,
+                                  int ovt1_compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
     if (gid >= (size_t)nvir * nocc * ibn * nvir) return;
@@ -7505,7 +7511,11 @@ __global__ void ccsd_Wakic_kernel(double* __restrict__ Wakic,
     double val = v_voov[((size_t)a*nocc + k)*(size_t)nocc*nvir + (size_t)i*nvir + c];
     for (int l = 0; l < nocc; l++)
         val -= v_oovo[((size_t)k*nocc + l)*(size_t)nvir*nocc + (size_t)c*nocc + i] * t1[(size_t)l*nvir + a];
-    val += ovvv_t1_ic[((size_t)k*vv + (size_t)a*nvir + c)*nocc + i];
+    // (DS-4) ovvv_t1_ic is full ((k,a,c)·nocc+i) or i-block COMPACT ((k,a,c)·ibn
+    // +i_local). Full range / ovt1_compact=0 ⇒ same index ⇒ N=1 no-op.
+    val += ovt1_compact
+        ? ovvv_t1_ic[((size_t)k*vv + (size_t)a*nvir + c)*ibn + i_local]
+        : ovvv_t1_ic[((size_t)k*vv + (size_t)a*nvir + c)*nocc + i];
     size_t out_idx = out_compact
         ? ((size_t)(a*nocc + k)*ibn + i_local)*nvir + c
         : ((size_t)(a*nocc + k)*nocc + i)*nvir + c;
@@ -7520,7 +7530,8 @@ __global__ void ccsd_Wakci_kernel(double* __restrict__ Wakci,
                                   const double* __restrict__ v_oovo,
                                   const double* __restrict__ t1,
                                   const double* __restrict__ ovvv_t1_dc,
-                                  int nocc, int nvir, int ib0, int ibn, int out_compact) {
+                                  int nocc, int nvir, int ib0, int ibn, int out_compact,
+                                  int ovt1_compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
     if (gid >= (size_t)nvir * nocc * nvir * ibn) return;
@@ -7532,7 +7543,11 @@ __global__ void ccsd_Wakci_kernel(double* __restrict__ Wakci,
     double val = v_vovo[((size_t)a*nocc + k)*vo + (size_t)c*nocc + i];
     for (int l = 0; l < nocc; l++)
         val -= v_oovo[((size_t)l*nocc + k)*(size_t)nvir*nocc + (size_t)c*nocc + i] * t1[(size_t)l*nvir + a];
-    val += ovvv_t1_dc[((size_t)k*vv + (size_t)a*nvir + c)*nocc + i];
+    // (DS-4) ovvv_t1_dc full ((k,a,c)·nocc+i) or i-block COMPACT ((k,a,c)·ibn
+    // +i_local). Full range / ovt1_compact=0 ⇒ same index ⇒ N=1 no-op.
+    val += ovt1_compact
+        ? ovvv_t1_dc[((size_t)k*vv + (size_t)a*nvir + c)*ibn + i_local]
+        : ovvv_t1_dc[((size_t)k*vv + (size_t)a*nvir + c)*nocc + i];
     size_t out_idx = out_compact
         ? ((size_t)(a*nocc + k)*nvir + c)*ibn + i_local
         : ((size_t)(a*nocc + k)*nvir + c)*nocc + i;
@@ -7874,7 +7889,7 @@ __global__ void ccsd_Lac_tile_kernel(double* __restrict__ Lac,
 // (Z build) Z[ab,ic] = v_vvov[ab,ic] − Σ_k v_ovov[(k,b),(i,c)]·t1[k,a]
 //                                     − Σ_k v_voov[(a,k),(i,c)]·t1[k,b].
 // One thread per (a,b,i,c). d_Z is pre-filled with v_vvov, so each thread reads
-// its own element Z[gid] and subtracts the two t1 terms in place (the subtracted
+// its own element Z[out_idx] and subtracts the two t1 terms in place (the subtracted
 // values come from other arrays ∴ in-place is race-free). Same k-order /
 // ovov-then-voov order as host ∴ bit-exact.
 //   Z      [(a·nvir+b)·ov + i·nvir+c]   in/out (pre-loaded with v_vvov)
@@ -7882,25 +7897,35 @@ __global__ void ccsd_Lac_tile_kernel(double* __restrict__ Lac,
 //   v_voov [(a·nocc+k)·ov + i·nvir+c]   (constant, resident — d_v_voov)
 //   t1                                  (current iter)
 // gid = ((a·nvir+b)·nocc + i)·nvir + c.
+// (occ-i, DS-4 device-0 shard) The Z OUTPUT is either full ((a·nvir+b)·nocc+i)·nvir
+// +c over all nocc i's, or i-block COMPACT ((a·nvir+b)·ibn+i_local)·nvir+c holding
+// only this device's I_d (Z is pre-loaded COMPACT via a strided 2D copy of v_vvov).
+// v_ovov/v_voov are read at the full i = ib0+i_local. Full range (ib0=0, ibn=nocc,
+// compact=0) ⇒ out_idx = gid = old layout ⇒ N=1 no-op.
 __global__ void ccsd_Zbuild_kernel(double* __restrict__ Z,
                                    const double* __restrict__ v_ovov,
                                    const double* __restrict__ v_voov,
                                    const double* __restrict__ t1,
-                                   int nocc, int nvir) {
+                                   int nocc, int nvir,
+                                   int ib0, int ibn, int compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t ov = (size_t)nocc * nvir;
     const size_t vv = (size_t)nvir * nvir;
-    if (gid >= vv * ov) return;
+    if (gid >= vv * (size_t)ibn * nvir) return;
     const int c = (int)(gid % nvir); size_t r = gid / nvir;
-    const int i = (int)(r % nocc); r /= nocc;
+    const int i_local = (int)(r % ibn); r /= ibn;
     const int b = (int)(r % nvir); const int a = (int)(r / nvir);
+    const int i = ib0 + i_local;
+    size_t out_idx = compact
+        ? ((size_t)(a*nvir + b)*ibn + i_local)*nvir + c
+        : ((size_t)(a*nvir + b)*nocc + i)*nvir + c;
 
-    double val = Z[gid];   // = v_vvov[ab,ic]
+    double val = Z[out_idx];   // = v_vvov[ab,ic] (pre-loaded; compact when sharded)
     for (int k = 0; k < nocc; k++) {
         val -= v_ovov[((size_t)k*nvir + b)*ov + (size_t)i*nvir + c] * t1[(size_t)k*nvir + a];
         val -= v_voov[((size_t)a*nocc + k)*ov + (size_t)i*nvir + c] * t1[(size_t)k*nvir + b];
     }
-    Z[gid] = val;
+    Z[out_idx] = val;
 }
 
 __global__ void ccsd_w_oovv_from_ovov_kernel(const double* __restrict__ ovov,
@@ -8053,6 +8078,25 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // as the legacy path, minus the AO-N⁴ transient.
     const char* e_tile = std::getenv("GANSU_CCSD_RI_LADDER_TILE");
     const bool use_tiled_ladder = ri_bnative && (e_tile && e_tile[0] == '1');
+    // (DS-3/DS-4 device-0 shard) Decide the occ-i sharding up front — BEFORE the GPU
+    // pool is sized — so device-0's i-block transients (Wakic/Wakci, and the DS-4
+    // ovvv_t1_ic/dc + Z + Zt1) can be carved i-block COMPACT (≈ /NG) instead of full.
+    // ccsd_occi/occi_NG/iblk_n0 are also used by the carve, iter loop, and device
+    // loop below. NG==1 (incl. num_gpus 1) ⇒ iblk_n0 = nocc ⇒ compact == full ⇒
+    // byte-identical anchor.
+    bool ccsd_occi = false; int occi_NG = 1; int iblk_n0 = nocc;
+#ifdef GANSU_MULTI_GPU
+    {
+        const char* e_oi = std::getenv("GANSU_CCSD_OCCI");
+        if (use_tiled_ladder && ri_bnative && e_oi && e_oi[0]=='1') {
+            ccsd_occi = true;
+            occi_NG   = MultiGpuManager::instance().num_devices();
+            iblk_n0   = occi_split(nocc, occi_NG, 0).second;
+            std::cout << "[CCSD OCCI] occ-i raw distribution across " << occi_NG
+                      << " GPU(s) (env GANSU_CCSD_OCCI)" << std::endl;
+        }
+    }
+#endif
     const real_t* B_mo = nullptr;
     real_t* d_eri_mo = nullptr;
     bool free_eri_mo = false;
@@ -8279,9 +8323,12 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // from B_mo: shrink their carve to 1 / the non-ladder scratch need (oo·vv).
     const size_t sz_tau = t2Size, sz_Wabcd = use_tiled_ladder ? (size_t)1 : vv*vv, sz_Wklij = oo*oo, sz_raw = t2Size;
     const size_t sz_w_oovv = oo*vv, sz_v_oovv = oo*vv, sz_Fki = oo;
-    const size_t sz_v_ovvv_T = vvv*nocc, sz_t1 = t1Size, sz_ovvv_t1 = use_tiled_ladder ? t2Size : std::max(vvv*std::max((size_t)nvir,(size_t)nocc), t2Size);
+    // (DS-4 device-0 shard) Zt1 (= d_ovvv_t1 in the tiled path) and d_Z hold only
+    // device-0's I_0 i-block when occi ⇒ carve COMPACT (vv·iblk_n0·{nocc,nvir}).
+    // iblk_n0 = nocc when not occi ⇒ identical to the old full size (byte-identical).
+    const size_t sz_v_ovvv_T = vvv*nocc, sz_t1 = t1Size, sz_ovvv_t1 = use_tiled_ladder ? (ccsd_occi ? vv*(size_t)iblk_n0*nocc : t2Size) : std::max(vvv*std::max((size_t)nvir,(size_t)nocc), t2Size);
     const size_t sz_v_vvvv = use_tiled_ladder ? (size_t)1 : vv*vv, sz_Fac = vv, sz_Fkc = ov;
-    const size_t sz_t2v = t2Size, sz_Lac = vv, sz_Z = vv*ov;
+    const size_t sz_t2v = t2Size, sz_Lac = vv, sz_Z = ccsd_occi ? vv*(size_t)iblk_n0*nvir : vv*ov;
     const size_t sz_Wex = OV2;  // each of A, B, C1, C2, V_R, W_R, V_R2
     // (ovvv per-tile, Inc-A) d_v_ovvv / d_v_ovvv_perm are read only by the legacy
     // (non-tiled) ovvv_t1 build; the tiled path builds those per-k from B (Inc-G1).
@@ -8472,24 +8519,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     double *d_v_ooov_c = nullptr;   // (③ Lki) bare v_ooov on device
     double *d_v_ovov_c = nullptr;   // (Z build) bare v_ovov on device
     const int TA_OVVV = 16;  // a-tile width for w_ovvv_R per-a tiling (Inc-G2)
-    // (DS-3 device-0 shard) Decide the occ-i sharding up front so device-0's
-    // Wakic/Wakci can be carved i-block COMPACT (nocc·iblk_n0·vv) instead of full
-    // oo·vv. ccsd_occi/occi_NG are also used by the iter loop + device loop below
-    // (declared here, scope widened). NG==1 (incl. num_gpus 1) ⇒ iblk_n0 = nocc ⇒
-    // compact == full ⇒ byte-identical anchor.
-    bool ccsd_occi = false; int occi_NG = 1; int iblk_n0 = nocc;
-#ifdef GANSU_MULTI_GPU
-    {
-        const char* e_oi = std::getenv("GANSU_CCSD_OCCI");
-        if (use_tiled_ladder && ri_bnative && e_oi && e_oi[0]=='1') {
-            ccsd_occi = true;
-            occi_NG   = MultiGpuManager::instance().num_devices();
-            iblk_n0   = occi_split(nocc, occi_NG, 0).second;
-            std::cout << "[CCSD OCCI] occ-i raw distribution across " << occi_NG
-                      << " GPU(s) (env GANSU_CCSD_OCCI)" << std::endl;
-        }
-    }
-#endif
+    // (DS-3/DS-4 device-0 shard) ccsd_occi/occi_NG/iblk_n0 were decided above (moved
+    // before the GPU pool sizing so d_Z/d_ovvv_t1 carves can be compact). device-0
+    // Wakic/Wakci carved i-block COMPACT (nocc·iblk_n0·vv = oo·vv when full).
     const size_t wakic_dev0_sz = (size_t)nocc * iblk_n0 * vv;  // compact (=oo·vv when full)
     if (use_tiled_ladder) {
         tracked_cudaMalloc((void**)&d_ovvv_k, vvv * sizeof(double));
@@ -8513,8 +8545,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         cudaMemcpy(d_v_oovo, v_oovo.data(), (size_t)nocc*nocc*nvir*nocc * sizeof(double), cudaMemcpyHostToDevice);
         // (⑦-1) Wakic/Wakci device single-index: separate ovvv_t1 ic/dc (both survive
         // for the kernels) + Wakic/Wakci arrays + v_voov/v_vovo constants.
-        tracked_cudaMalloc((void**)&d_ovvv_t1_ic, (size_t)nocc*vv*nocc * sizeof(double));
-        tracked_cudaMalloc((void**)&d_ovvv_t1_dc, (size_t)nocc*vv*nocc * sizeof(double));
+        // (DS-4 device-0 shard) ovvv_t1_ic/dc hold only I_0 when occi (each k-block
+        // is vv·iblk_n0 instead of vv·nocc) ⇒ nocc·vv·iblk_n0 (= nocc·vv·nocc full).
+        tracked_cudaMalloc((void**)&d_ovvv_t1_ic, (size_t)nocc*vv*iblk_n0 * sizeof(double));
+        tracked_cudaMalloc((void**)&d_ovvv_t1_dc, (size_t)nocc*vv*iblk_n0 * sizeof(double));
         // (DS-3) device-0 Wakic/Wakci carved i-block COMPACT (= oo·vv when not occi).
         tracked_cudaMalloc((void**)&d_Wakic, wakic_dev0_sz * sizeof(double));
         tracked_cudaMalloc((void**)&d_Wakci, wakic_dev0_sz * sizeof(double));
@@ -8861,10 +8895,15 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             // (⑦-1) build ic into d_ovvv_t1_ic, dc into d_ovvv_t1_dc — both kept on
             // the device for the single-index kernels (no host download).
             // ic: ovvv_t1_ic[(k,a,c), i] = sum_d (k a|c d) * t1[i,d]
+            // (DS-4 device-0 shard) restrict the i (= the nocc result column) to this
+            // device's I_0: use t1 rows [iblk_start, iblk_start+iblk_n) (= d_t1 +
+            // iblk_start·nvir, N=iblk_n) ⇒ output [(a,c), i_local] COMPACT at k·vv·iblk_n.
+            // iblk_n = nocc when not occi ⇒ full layout (byte-identical no-op).
             for (int k = 0; k < nocc; k++) {
                 extract_block(d_ovvv_k, N, O+k,1, V,nvir, V,nvir, V,nvir);
-                gpu::matrixMatrixProductRect(d_ovvv_k, d_t1, d_ovvv_t1_ic + (size_t)k*vv*nocc,
-                                        (int)vv, nocc, nvir, false, true, false, 1.0);
+                gpu::matrixMatrixProductRect(d_ovvv_k, d_t1 + (size_t)iblk_start*nvir,
+                                        d_ovvv_t1_ic + (size_t)k*vv*iblk_n,
+                                        (int)vv, iblk_n, nvir, false, true, false, 1.0);
             }
             // dc: ovvv_t1_dc[(k,a,c), i] = sum_d (k a|d c) * t1[i,d]  (perm = swap c,d)
             // mid-2 transpose turns the [a,c,d] slice into [a,d,c] = v_ovvv_perm.
@@ -8872,8 +8911,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 extract_block(d_ovvv_k, N, O+k,1, V,nvir, V,nvir, V,nvir);
                 int th = 256; int bl = (int)((vvv + th - 1) / th);
                 ccsd_transpose_mid2_kernel<<<bl, th>>>(d_ovvv_k, d_ovvv_perm_k, nvir, nvir, nvir, 1);
-                gpu::matrixMatrixProductRect(d_ovvv_perm_k, d_t1, d_ovvv_t1_dc + (size_t)k*vv*nocc,
-                                        (int)vv, nocc, nvir, false, true, false, 1.0);
+                gpu::matrixMatrixProductRect(d_ovvv_perm_k, d_t1 + (size_t)iblk_start*nvir,
+                                        d_ovvv_t1_dc + (size_t)k*vv*iblk_n,
+                                        (int)vv, iblk_n, nvir, false, true, false, 1.0);
             }
         } else {
             // Use persistent d_v_ovvv / d_v_ovvv_perm buffers (uploaded once before the loop)
@@ -8898,8 +8938,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             // (DS-3) device-0 builds its I_0 block COMPACT when occi (iblk=occi_split(0),
             // out_compact=1); full-range no-op otherwise. NG==1 ⇒ iblk_n=nocc ⇒
             // compact==full ⇒ byte-identical.
-            ccsd_Wakic_kernel<<<bl, th>>>(d_Wakic, d_v_voov, d_v_oovo, d_t1, d_ovvv_t1_ic, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
-            ccsd_Wakci_kernel<<<bl, th>>>(d_Wakci, d_v_vovo, d_v_oovo, d_t1, d_ovvv_t1_dc, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
+            // (DS-4 device-0 shard) ovt1_compact=occi?1:0: the ⑥ build above now
+            // produces d_ovvv_t1_ic/dc COMPACT for I_0 ⇒ read it compact too.
+            ccsd_Wakic_kernel<<<bl, th>>>(d_Wakic, d_v_voov, d_v_oovo, d_t1, d_ovvv_t1_ic, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, ccsd_occi?1:0);
+            ccsd_Wakci_kernel<<<bl, th>>>(d_Wakci, d_v_vovo, d_v_oovo, d_t1, d_ovvv_t1_dc, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, ccsd_occi?1:0);
             // (⑦-2) Wakic/Wakci stay on the device through the ld-sum scatter;
             // downloaded once after ld-sum (below) for the still-host T1/W-exchange.
             if (std::getenv("GANSU_CCSD_P0_VALIDATE") && occi_NG<=1) {   // (DS-3) skip: compact I_0 when occi
@@ -9502,10 +9544,21 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         if (use_tiled_ladder) {
             // (Z build) build d_Z on the device: pre-load v_vvov, then subtract the
             // two t1 terms in place via ccsd_Zbuild_kernel — replaces the host loop.
-            cudaMemcpy(d_Z, v_vvov.data(), vv * ov * sizeof(double), cudaMemcpyHostToDevice);
-            int thz = 256; int blz = (int)((vv*ov + thz - 1) / thz);
-            ccsd_Zbuild_kernel<<<blz, thz>>>(d_Z, d_v_ovov_c, d_v_voov, d_t1, nocc, nvir);
-            if (std::getenv("GANSU_CCSD_P0_VALIDATE")) {
+            // (DS-4 device-0 shard) when occi, pre-load only the I_0 rows of v_vvov
+            // into COMPACT d_Z via a strided 2D copy (each (a,b) block: iblk_n·nvir
+            // contiguous doubles from i=iblk_start, src pitch ov, dst pitch iblk_n·nvir),
+            // and write Z compact. iblk_n = nocc ⇒ full copy (byte-identical).
+            if (ccsd_occi) {
+                cudaMemcpy2D(d_Z, (size_t)iblk_n*nvir*sizeof(double),
+                             v_vvov.data() + (size_t)iblk_start*nvir, ov*sizeof(double),
+                             (size_t)iblk_n*nvir*sizeof(double), vv, cudaMemcpyHostToDevice);
+            } else {
+                cudaMemcpy(d_Z, v_vvov.data(), vv * ov * sizeof(double), cudaMemcpyHostToDevice);
+            }
+            size_t zsz = vv * (size_t)iblk_n * nvir;   // = vv·ov when full
+            int thz = 256; int blz = (int)((zsz + thz - 1) / thz);
+            ccsd_Zbuild_kernel<<<blz, thz>>>(d_Z, d_v_ovov_c, d_v_voov, d_t1, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
+            if (std::getenv("GANSU_CCSD_P0_VALIDATE") && occi_NG<=1) {   // (DS-4) compact I_0 when NG>1 ⇒ skip
                 std::vector<real_t> ref(vv*ov, 0.0), dev(vv*ov, 0.0);
                 host_Z(ref);
                 cudaMemcpy(dev.data(), d_Z, vv * ov * sizeof(double), cudaMemcpyDeviceToHost);
@@ -9518,8 +9571,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             cudaMemcpy(d_Z, Z.data(), vv * ov * sizeof(double), cudaMemcpyHostToDevice);
         }
         // d_t1 already on GPU; result goes into d_ovvv_t1 (scratch, avoids overwriting d_t2v)
+        // (DS-4 device-0 shard) compact d_Z [vv·iblk_n, nvir] × t1^T → Zt1 [vv·iblk_n,
+        // nocc] (compact). iblk_n = nocc when not occi ⇒ full vv·nocc rows.
         gpu::matrixMatrixProductRect(d_Z, d_t1, d_ovvv_t1,
-                                (int)(vv * nocc), nocc, nvir,
+                                (int)((size_t)vv * iblk_n), nocc, nvir,
                                 false, true, false, 1.0);
         if (use_tiled_ladder) {
             // (P0-2) reduced T2 terms on device: 0.5·v_oovv − Lki·t2 + Zt1 − Q(inline).
@@ -9542,8 +9597,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 }
             }
             int th = 256; size_t tot = (size_t)iblk_n*nocc*vv; int bl = (int)((tot + th - 1) / th);
+            // (DS-4 device-0 shard) zt1_compact=occi?1:0: Zt1 (d_ovvv_t1) is now the
+            // compact I_0 Z×t1 result ⇒ read it compact.
             ccsd_t2_reduced_kernel<<<bl, th>>>(d_raw, d_v_oovv, d_Lki, d_t2v, d_ovvv_t1,
-                                               d_v_vooo, d_t1, nocc, nvir, iblk_start, iblk_n);
+                                               d_v_vooo, d_t1, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
             // (P0-3) raw stays on device — symmetrized on-device below (no download).
         } else {
             std::vector<real_t> Zt1_result(vv * oo);
@@ -9607,14 +9664,18 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 // of broadcasting the full arrays from device 0 (which now holds only
                 // I_0). Inputs for the ⑦-1/⑦-2 build are broadcast here.
                 double *p_v_voov,*p_v_vovo,*p_v_oovo,*p_ot1ic,*p_ot1dc,*p_V_R,*p_W_R,*p_V_R2;
+                // (DS-4 C) device d also builds its OWN ovvv_t1_ic/dc[I_d] (compact, ⑥
+                // build from p_Bmo) and Z[I_d]/Zt1[I_d] — device 0 now holds only I_0.
+                // p_v_ovov is broadcast for the Z build; v_vvov is loaded from host.
+                double *p_Z,*p_ovvv_k,*p_ovvv_perm_k,*p_v_ovov;
                 const size_t p_oovo = (size_t)nocc*nocc*nvir*nocc;   // v_oovo size
-                const size_t p_ot1  = (size_t)nocc*vv*nocc;          // ovvv_t1_ic/dc size
+                const size_t p_ot1  = (size_t)nocc*vv*ibn;           // ovvv_t1_ic/dc COMPACT (I_d)
                 tracked_cudaMalloc((void**)&p_tau,   t2Size*sizeof(double));
                 tracked_cudaMalloc((void**)&p_t2v,   t2Size*sizeof(double));
                 tracked_cudaMalloc((void**)&p_t1,    t1Size*sizeof(double));
                 tracked_cudaMalloc((void**)&p_Lac,   vv*sizeof(double));
                 tracked_cudaMalloc((void**)&p_Lki,   oo*sizeof(double));
-                tracked_cudaMalloc((void**)&p_Zt1,   t2Size*sizeof(double));
+                tracked_cudaMalloc((void**)&p_Zt1,   vv*(size_t)ibn*nocc*sizeof(double));  // compact Zt1[I_d]
                 tracked_cudaMalloc((void**)&p_Wakic, (size_t)nocc*ibn*vv*sizeof(double));  // compact I_d
                 tracked_cudaMalloc((void**)&p_Wakci, (size_t)nocc*ibn*vv*sizeof(double));
                 tracked_cudaMalloc((void**)&p_Wklij, oo*oo*sizeof(double));
@@ -9626,17 +9687,22 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 tracked_cudaMalloc((void**)&p_v_voov, oo*vv*sizeof(double));
                 tracked_cudaMalloc((void**)&p_v_vovo, (size_t)vo*vo*sizeof(double));
                 tracked_cudaMalloc((void**)&p_v_oovo, p_oovo*sizeof(double));
-                tracked_cudaMalloc((void**)&p_ot1ic,  p_ot1*sizeof(double));
+                tracked_cudaMalloc((void**)&p_ot1ic,  p_ot1*sizeof(double));   // compact I_d
                 tracked_cudaMalloc((void**)&p_ot1dc,  p_ot1*sizeof(double));
                 tracked_cudaMalloc((void**)&p_V_R,    OV2*sizeof(double));
                 tracked_cudaMalloc((void**)&p_W_R,    OV2*sizeof(double));
                 tracked_cudaMalloc((void**)&p_V_R2,   OV2*sizeof(double));
+                // (DS-4 C) Z[I_d] (compact) + ovvv k-slice scratch + p_v_ovov for Z build
+                tracked_cudaMalloc((void**)&p_Z,           vv*(size_t)ibn*nvir*sizeof(double));
+                tracked_cudaMalloc((void**)&p_ovvv_k,      (size_t)vvv*sizeof(double));
+                tracked_cudaMalloc((void**)&p_ovvv_perm_k, (size_t)vvv*sizeof(double));
+                tracked_cudaMalloc((void**)&p_v_ovov,      OV2*sizeof(double));
                 cudaMemcpyPeer(p_tau,   d, (const void*)d_tau,      0, t2Size*sizeof(double));
                 cudaMemcpyPeer(p_t2v,   d, (const void*)d_t2v,      0, t2Size*sizeof(double));
                 cudaMemcpyPeer(p_t1,    d, (const void*)d_t1,       0, t1Size*sizeof(double));
                 cudaMemcpyPeer(p_Lac,   d, (const void*)d_Lac,      0, vv*sizeof(double));
                 cudaMemcpyPeer(p_Lki,   d, (const void*)d_Lki,      0, oo*sizeof(double));
-                cudaMemcpyPeer(p_Zt1,   d, (const void*)d_ovvv_t1,  0, t2Size*sizeof(double));
+                // (DS-4 C) p_Zt1 is NOT broadcast — device d builds Z[I_d]→Zt1[I_d] itself.
                 cudaMemcpyPeer(p_Wklij, d, (const void*)d_Wklij,    0, oo*oo*sizeof(double));
                 cudaMemcpyPeer(p_Bmo,   d, (const void*)B_mo,       0, bmo_sz*sizeof(double));
                 cudaMemcpyPeer(p_vovvvT,d, (const void*)d_v_ovvv_T, 0, (size_t)vvv*nocc*sizeof(double));
@@ -9645,8 +9711,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 cudaMemcpyPeer(p_v_voov,d, (const void*)d_v_voov,   0, oo*vv*sizeof(double));
                 cudaMemcpyPeer(p_v_vovo,d, (const void*)d_v_vovo,   0, (size_t)vo*vo*sizeof(double));
                 cudaMemcpyPeer(p_v_oovo,d, (const void*)d_v_oovo,   0, p_oovo*sizeof(double));
-                cudaMemcpyPeer(p_ot1ic, d, (const void*)d_ovvv_t1_ic,0, p_ot1*sizeof(double));
-                cudaMemcpyPeer(p_ot1dc, d, (const void*)d_ovvv_t1_dc,0, p_ot1*sizeof(double));
+                // (DS-4 C) p_ot1ic/dc are NOT broadcast — device d builds them (⑥) itself.
+                cudaMemcpyPeer(p_v_ovov,d, (const void*)d_v_ovov_c, 0, OV2*sizeof(double));
                 cudaMemcpyPeer(p_V_R,   d, (const void*)d_V_R,      0, OV2*sizeof(double));
                 cudaMemcpyPeer(p_W_R,   d, (const void*)d_W_R,      0, OV2*sizeof(double));
                 cudaMemcpyPeer(p_V_R2,  d, (const void*)d_V_R2,     0, OV2*sizeof(double));
@@ -9673,9 +9739,26 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 // device 0 with iblk=(ib0,ibn) + out_compact=1. Reuses t_Wex* scratch
                 // (ld-sum then W-exchange are time-disjoint). t_WexB(OV2) holds eff_t2_R,
                 // t_WexA(wexAsz) holds t2_C, both ≤ their carve.
+                // (DS-4 C) ⑥ build this device's ovvv_t1_ic/dc[I_d] (compact) from p_Bmo,
+                // mirroring device-0's ⑥ build with i = the result column restricted to
+                // I_d (p_t1 rows ib0..ib0+ibn). ic = Σ_d (k a|c d)·t1[i,d];
+                // dc = Σ_d (k a|d c)·t1[i,d] (mid-2 transpose of the ovvv k-slice).
+                for (int k = 0; k < nocc; k++) {
+                    ccsd_block_chem_from_B(eri_ri, p_Bmo, N, O+k,1, V,nvir, V,nvir, V,nvir, p_ovvv_k);
+                    gpu::matrixMatrixProductRect(p_ovvv_k, p_t1 + (size_t)ib0*nvir,
+                                            p_ot1ic + (size_t)k*vv*ibn, (int)vv, ibn, nvir, false, true, false, 1.0);
+                }
+                for (int k = 0; k < nocc; k++) {
+                    ccsd_block_chem_from_B(eri_ri, p_Bmo, N, O+k,1, V,nvir, V,nvir, V,nvir, p_ovvv_k);
+                    int thp=256; int blp=(int)((vvv+thp-1)/thp);
+                    ccsd_transpose_mid2_kernel<<<blp,thp>>>(p_ovvv_k, p_ovvv_perm_k, nvir, nvir, nvir, 1);
+                    gpu::matrixMatrixProductRect(p_ovvv_perm_k, p_t1 + (size_t)ib0*nvir,
+                                            p_ot1dc + (size_t)k*vv*ibn, (int)vv, ibn, nvir, false, true, false, 1.0);
+                }
                 { int th=256; int blw=(int)(((size_t)nocc*ibn*vv+th-1)/th);
-                  ccsd_Wakic_kernel<<<blw,th>>>(p_Wakic, p_v_voov, p_v_oovo, p_t1, p_ot1ic, nocc, nvir, ib0, ibn, 1);
-                  ccsd_Wakci_kernel<<<blw,th>>>(p_Wakci, p_v_vovo, p_v_oovo, p_t1, p_ot1dc, nocc, nvir, ib0, ibn, 1);
+                  // (DS-4 C) ovt1_compact=1: p_ot1ic/dc are the device-d compact I_d build.
+                  ccsd_Wakic_kernel<<<blw,th>>>(p_Wakic, p_v_voov, p_v_oovo, p_t1, p_ot1ic, nocc, nvir, ib0, ibn, 1, 1);
+                  ccsd_Wakci_kernel<<<blw,th>>>(p_Wakci, p_v_vovo, p_v_oovo, p_t1, p_ot1dc, nocc, nvir, ib0, ibn, 1, 1);
                   int blr=(int)(((size_t)ov*nvir*ibn+th-1)/th);
                   ccsd_ldsum_reshape_kernel<<<blr,th>>>(t_WexB, t_WexA, p_t2v, p_t1, nocc, nvir, ib0, ibn);
                   int Mia=(int)((size_t)nvir*ibn);
@@ -9729,9 +9812,19 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                   gpu::matrixMatrixProductRect(t_WexA, t_WexB, t_WexC2, wexM,(int)ov,(int)ov, false,false,false,-1.0);
                   size_t tt=(size_t)ibn*nocc*vv; int bl=(int)((tt+th-1)/th);
                   ccsd_wexchange_scatter_kernel<<<bl,th>>>(t_WexC1, t_WexC2, p_raw, nocc, nvir, ib0, ibn); }
+                // (DS-4 C) build this device's Z[I_d] (compact) + Zt1[I_d] before the
+                // reduced kernel consumes it. v_vvov rows i∈I_d are loaded from host via
+                // a strided 2D copy (no broadcast); Z build subtracts the t1 terms; then
+                // Z×t1 → compact Zt1[(ab,i_local),j].
+                cudaMemcpy2D(p_Z, (size_t)ibn*nvir*sizeof(double),
+                             v_vvov.data() + (size_t)ib0*nvir, ov*sizeof(double),
+                             (size_t)ibn*nvir*sizeof(double), vv, cudaMemcpyHostToDevice);
+                { size_t zsz=vv*(size_t)ibn*nvir; int thz=256; int blz=(int)((zsz+thz-1)/thz);
+                  ccsd_Zbuild_kernel<<<blz,thz>>>(p_Z, p_v_ovov, p_v_voov, p_t1, nocc, nvir, ib0, ibn, 1); }
+                gpu::matrixMatrixProductRect(p_Z, p_t1, p_Zt1, (int)((size_t)vv*ibn), nocc, nvir, false, true, false, 1.0);
                 // ⑪ reduced
                 { int th=256; size_t tt=(size_t)ibn*nocc*vv; int bl=(int)((tt+th-1)/th);
-                  ccsd_t2_reduced_kernel<<<bl,th>>>(p_raw, p_voovv, p_Lki, p_t2v, p_Zt1, p_vvooo, p_t1, nocc, nvir, ib0, ibn); }
+                  ccsd_t2_reduced_kernel<<<bl,th>>>(p_raw, p_voovv, p_Lki, p_t2v, p_Zt1, p_vvooo, p_t1, nocc, nvir, ib0, ibn, 1); }
                 // free broadcast inputs + scratch (keep p_raw for AllReduce)
                 tracked_cudaFree(p_tau); tracked_cudaFree(p_t2v); tracked_cudaFree(p_t1);
                 tracked_cudaFree(p_Lac); tracked_cudaFree(p_Lki); tracked_cudaFree(p_Zt1);
@@ -9739,6 +9832,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 tracked_cudaFree(p_Bmo); tracked_cudaFree(p_vovvvT); tracked_cudaFree(p_voovv); tracked_cudaFree(p_vvooo);
                 tracked_cudaFree(p_v_voov); tracked_cudaFree(p_v_vovo); tracked_cudaFree(p_v_oovo);
                 tracked_cudaFree(p_ot1ic); tracked_cudaFree(p_ot1dc);
+                tracked_cudaFree(p_Z); tracked_cudaFree(p_ovvv_k); tracked_cudaFree(p_ovvv_perm_k); tracked_cudaFree(p_v_ovov);
                 tracked_cudaFree(p_V_R); tracked_cudaFree(p_W_R); tracked_cudaFree(p_V_R2);
                 tracked_cudaFree(t_vvvv); tracked_cudaFree(t_ot1); tracked_cudaFree(t_ot2);
                 tracked_cudaFree(t_W); tracked_cudaFree(t_rawt); tracked_cudaFree(t_t1s); tracked_cudaFree(t_WklijT);
