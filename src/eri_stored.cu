@@ -7380,20 +7380,23 @@ __global__ void ccsd_wovvvR_tile_kernel(const double* __restrict__ X,
 // (R12 = terms 1+2+3, R4 = term 4) directly into d_raw on the device, removing
 // the 2×ov² host download + host quadruple-loop scatter. gid = T2(i,j,a,b):
 //   raw[i,j,a,b] += R12[(a·nocc+i)·ov + j·nvir+b] + R4[(b·nocc+i)·ov + j·nvir+a]
+// (occ-i) gid runs over this device's i-block [ib0, ib0+ibn); i = ib0 + i_loc,
+// raw written at the global T2 index. ib0=0, ibn=nocc ⇒ all-ij (unchanged).
 __global__ void ccsd_wexchange_scatter_kernel(const double* __restrict__ R12,
                                               const double* __restrict__ R4,
                                               double* __restrict__ raw,
-                                              int nocc, int nvir) {
+                                              int nocc, int nvir, int ib0, int ibn) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
-    size_t total = (size_t)nocc * nocc * vv;
+    size_t total = (size_t)ibn * nocc * vv;
     if (gid >= total) return;
     int b = (int)(gid % nvir); size_t r = gid / nvir;
     int a = (int)(r % nvir); r /= nvir;
-    int j = (int)(r % nocc); int i = (int)(r / nocc);
+    int j = (int)(r % nocc); int i = ib0 + (int)(r / nocc);
     size_t ov = (size_t)nocc * nvir;
-    raw[gid] += R12[((size_t)a*nocc + i)*ov + (size_t)j*nvir + b]
-              + R4[((size_t)b*nocc + i)*ov + (size_t)j*nvir + a];
+    size_t gout = ((size_t)i*nocc + j)*vv + (size_t)a*nvir + b;
+    raw[gout] += R12[((size_t)a*nocc + i)*ov + (size_t)j*nvir + b]
+               + R4[((size_t)b*nocc + i)*ov + (size_t)j*nvir + a];
 }
 
 // (Phase 0 host-roundtrip removal, P0-2) The reduced T2 inner loop on the device:
@@ -7401,6 +7404,7 @@ __global__ void ccsd_wexchange_scatter_kernel(const double* __restrict__ R12,
 //                 + Zt1[(ab),(ij)] − Σ_k v_vooo[(a,k),(i,j)]·t1[k,b]
 // The last term (Q) is folded inline so no nvir²·nocc² Q buffer is needed.
 // gid = T2(i,j,a,b) = ((i·nocc+j)·vv + a·nvir+b) (= v_oovv index too).
+// (occ-i) gid over the i-block; i = ib0 + i_loc, raw/v_oovv at global T2 index.
 __global__ void ccsd_t2_reduced_kernel(double* __restrict__ raw,
                                        const double* __restrict__ v_oovv,
                                        const double* __restrict__ Lki,
@@ -7408,39 +7412,44 @@ __global__ void ccsd_t2_reduced_kernel(double* __restrict__ raw,
                                        const double* __restrict__ Zt1,
                                        const double* __restrict__ v_vooo,
                                        const double* __restrict__ t1,
-                                       int nocc, int nvir) {
+                                       int nocc, int nvir, int ib0, int ibn) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
     size_t oo = (size_t)nocc * nocc;
-    if (gid >= oo * vv) return;
+    if (gid >= (size_t)ibn * nocc * vv) return;
     int b = (int)(gid % nvir); size_t r = gid / nvir;
     int a = (int)(r % nvir); r /= nvir;
-    int j = (int)(r % nocc); int i = (int)(r / nocc);
-    double val = 0.5 * v_oovv[gid];
+    int j = (int)(r % nocc); int i = ib0 + (int)(r / nocc);
+    size_t gout = ((size_t)i*nocc + j)*vv + (size_t)a*nvir + b;
+    double val = 0.5 * v_oovv[gout];
     for (int k = 0; k < nocc; k++)
         val -= Lki[(size_t)k*nocc + i] * t2v[((size_t)k*nocc + j)*vv + (size_t)a*nvir + b];
     val += Zt1[((size_t)a*nvir + b)*oo + (size_t)i*nocc + j];
     for (int k = 0; k < nocc; k++)
         val -= v_vooo[((size_t)a*nocc + k)*oo + (size_t)i*nocc + j] * t1[(size_t)k*nvir + b];
-    raw[gid] += val;
+    raw[gout] += val;
 }
 
 // (Phase 0 host-roundtrip removal, P0-3) T2 symmetrize on the device:
 //   newT2[i,j,a,b] = (raw[i,j,a,b] + raw[j,i,b,a]) / Dijab[i,j,a,b]
 // gid = T2(i,j,a,b); raw[j,i,b,a] = raw[T2(j,i,b,a)] = ((j·nocc+i)·vv + b·nvir+a).
 // Removes the host raw download + host symmetrize quadruple loop.
+// (occ-i) gid over the i-block; i = ib0 + i_loc. newT2/raw/Dijab at global index;
+// raw[gidP] reads the transposed partner (first index j, any) ⇒ needs FULL raw
+// (AllGather raw before this when distributed). ib0=0, ibn=nocc ⇒ unchanged.
 __global__ void ccsd_t2_symmetrize_kernel(double* __restrict__ newT2,
                                           const double* __restrict__ raw,
                                           const double* __restrict__ Dijab,
-                                          int nocc, int nvir) {
+                                          int nocc, int nvir, int ib0, int ibn) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
-    if (gid >= (size_t)nocc * nocc * vv) return;
+    if (gid >= (size_t)ibn * nocc * vv) return;
     int b = (int)(gid % nvir); size_t r = gid / nvir;
     int a = (int)(r % nvir); r /= nvir;
-    int j = (int)(r % nocc); int i = (int)(r / nocc);
+    int j = (int)(r % nocc); int i = ib0 + (int)(r / nocc);
+    size_t gout  = ((size_t)i*nocc + j)*vv + (size_t)a*nvir + b;
     size_t gidP = ((size_t)j*nocc + i)*vv + (size_t)b*nvir + a;
-    newT2[gid] = (raw[gid] + raw[gidP]) / Dijab[gid];
+    newT2[gout] = (raw[gout] + raw[gidP]) / Dijab[gout];
 }
 
 // (Phase 0 host-roundtrip removal, P0-4) W^{kl}_{ij} on the device: add the
@@ -7886,20 +7895,49 @@ __global__ void build_Wabcd_tile_kernel(const double* __restrict__ vvvv_tile,
         - ot1_tile2[((size_t)b*vv + (size_t)c*nvir + d)*(size_t)ta + ap];
 }
 
-// Scatter-add a (oo × ta·nvir) ladder tile into the full raw[oo × vv]:
-//   raw[ij, (a0+a')·nvir + b] += raw_tile[ij, a'·nvir + b]
+// Scatter-add a (nij × ta·nvir) ladder tile into raw[oo × vv]:
+//   raw[(ij0+lij), (a0+a')·nvir + b] += raw_tile[lij, a'·nvir + b]
+// (occ-i) raw_tile holds nij local ij rows; ij0 is the global ij offset of the
+// first row (= iblk_start·nocc). ij0=0, nij=oo ⇒ the full-tile behavior.
 __global__ void scatter_add_abtile_kernel(const double* __restrict__ raw_tile,
                                           double* __restrict__ raw,
-                                          int nocc, int nvir, int a0, int ta) {
+                                          int nocc, int nvir, int a0, int ta,
+                                          int ij0, int nij) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
     size_t cols = (size_t)ta * nvir;
-    size_t total = (size_t)nocc * nocc * cols;
+    size_t total = (size_t)nij * cols;
     if (gid >= total) return;
     int b = (int)(gid % nvir); size_t rem = gid / nvir;
     int ap = (int)(rem % ta); rem /= ta;
-    size_t ij = rem;
-    raw[ij*vv + (size_t)(a0+ap)*nvir + b] += raw_tile[ij*cols + (size_t)ap*nvir + b];
+    size_t lij = rem;
+    raw[((size_t)ij0 + lij)*vv + (size_t)(a0+ap)*nvir + b] += raw_tile[lij*cols + (size_t)ap*nvir + b];
+}
+
+// (Phase 1 increment-2, occ-i) Contiguous occupied-index block owned by device
+// `d` of `NG` — same partition shape as eri_ri_distributed's aux_partition.
+// Returns {i_start, i_count}. With NG==1 → {0, nocc} (= full range, the residual
+// reduces byte-for-byte to the single-device path: every i-sliced GEMM is a no-op
+// at full range, so each slicing step is N=1 bit-exact verifiable before the
+// multi-GPU device loop is wired).
+static inline std::pair<int,int> occi_split(int nocc, int NG, int d) {
+    int base = nocc / NG, rem = nocc % NG;
+    int start = d * base + std::min(d, rem);
+    int count = base + (d < rem ? 1 : 0);
+    return {start, count};
+}
+
+// (occ-i) Transpose a square n×n row-major matrix: out[r,c] = in[c,r]. Used to
+// turn Wklij[kl,ij] (ij in columns, strided) into Wklij_T[ij,kl] (ij in rows,
+// contiguous) so the Wklij×tau GEMM output rows can be i-block sliced by pointer
+// offset (matrixMatrixProductRect has no leading-dimension argument).
+__global__ void transpose_square_kernel(const double* __restrict__ in,
+                                        double* __restrict__ out, int n) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (size_t)n * n) return;
+    int c = (int)(gid % n);
+    int r = (int)(gid / n);
+    out[(size_t)r*n + c] = in[(size_t)c*n + r];
 }
 
 real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
@@ -8457,6 +8495,16 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
 #endif
 
     for (int iter = 1; iter <= MAX_ITER; iter++) {
+
+        // (Phase 1 increment-2, occ-i) i-block this device owns. Full range for
+        // now (single-device) — the residual's raw-output operations are i-sliced
+        // against [iblk_start, iblk_start+iblk_n); at full range every slice is a
+        // no-op (byte-identical). The multi-GPU device loop will later set these
+        // per device so each computes only its raw rows. ib_off = T2 element offset
+        // of the first owned row (= iblk_start·nocc·vv).
+        const int    iblk_start = 0;
+        const int    iblk_n     = nocc;
+        const size_t ib_off     = (size_t)iblk_start * nocc * vv;   // into [ij,ab] arrays
 
         // Upload t1 and t2v to GPU, build tau on GPU (avoids CPU tau computation + upload)
         cudaMemcpy(d_t1, t1.data(), t1Size * sizeof(double), cudaMemcpyHostToDevice);
@@ -9059,7 +9107,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                     gpu::matrixMatrixProductRect(tau_d[d], tW[d], trawt[d],
                                             (int)oo, (int)((size_t)ta*nvir), (int)vv, false, true, false, 0.5);
                     { size_t tot=oo*(size_t)ta*nvir; int th=256; int bl=(int)((tot+th-1)/th);
-                      scatter_add_abtile_kernel<<<bl,th>>>(trawt[d], raw_d[d], nocc, nvir, a0, ta); }
+                      scatter_add_abtile_kernel<<<bl,th>>>(trawt[d], raw_d[d], nocc, nvir, a0, ta, 0, (int)oo); }
                 }
             }
             mgr.sync_all();   // all per-device default-stream compute complete
@@ -9110,13 +9158,16 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                     size_t tot = (size_t)ta*vvv; int th=256; int bl=(int)((tot+th-1)/th);
                     build_Wabcd_tile_kernel<<<bl,th>>>(d_vvvv_tile, d_ot1_tile1, d_ot1_tile2, d_Wtile, nvir, ta);
                 }
-                // 5. raw_tile[oo, ta·nvir] = 0.5 · tau[oo,vv] × Wtile[ta·nvir, vv]^T
-                gpu::matrixMatrixProductRect(d_tau, d_Wtile, d_raw_tile,
-                                        (int)oo, (int)((size_t)ta*nvir), (int)vv, false, true, false, 0.5);
-                // 6. scatter-add tile into the full raw[oo, vv]
+                // 5. raw_tile[nij, ta·nvir] = 0.5 · tau[i∈I_d,vv] × Wtile[ta·nvir, vv]^T
+                //    (occ-i) tau rows restricted to this device's i-block (offset
+                //    ib_off, count iblk_n·nocc); full range ⇒ all-ij.
+                gpu::matrixMatrixProductRect(d_tau + ib_off, d_Wtile, d_raw_tile,
+                                        (int)((size_t)iblk_n*nocc), (int)((size_t)ta*nvir), (int)vv, false, true, false, 0.5);
+                // 6. scatter-add tile into raw at the device's i-block rows
                 {
-                    size_t tot = oo*(size_t)ta*nvir; int th=256; int bl=(int)((tot+th-1)/th);
-                    scatter_add_abtile_kernel<<<bl,th>>>(d_raw_tile, d_raw, nocc, nvir, a0, ta);
+                    size_t tot = (size_t)iblk_n*nocc*(size_t)ta*nvir; int th=256; int bl=(int)((tot+th-1)/th);
+                    scatter_add_abtile_kernel<<<bl,th>>>(d_raw_tile, d_raw, nocc, nvir, a0, ta,
+                                                         iblk_start*nocc, iblk_n*nocc);
                 }
             }
             tracked_cudaFree(d_vvvv_tile); tracked_cudaFree(d_ot1_tile1); tracked_cudaFree(d_ot1_tile2);
@@ -9125,9 +9176,19 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         }   // close the tiled-ladder else-body (distributed | single-device)
 
         // raw[ij,ab] += 0.5 * Wklij^T[ij,kl] * tau[kl,ab]
-        gpu::matrixMatrixProductRect(d_Wklij, d_tau, d_raw,
-                                (int)oo, (int)vv, (int)oo,
-                                true, false, true, 0.5);
+        // (occ-i) Wklij[kl,ij] has ij in columns (strided) — transpose to
+        // Wklij_T[ij,kl] so the output ij rows can be i-block sliced by pointer
+        // offset. Full range ⇒ byte-identical to the transA=true full GEMM.
+        {
+            double* d_Wklij_T = nullptr;
+            tracked_cudaMalloc((void**)&d_Wklij_T, oo*oo*sizeof(double));
+            { size_t tot=oo*oo; int th=256; int bl=(int)((tot+th-1)/th);
+              transpose_square_kernel<<<bl,th>>>(d_Wklij, d_Wklij_T, (int)oo); }
+            gpu::matrixMatrixProductRect(d_Wklij_T + (size_t)iblk_start*nocc*oo, d_tau, d_raw + ib_off,
+                                    (int)((size_t)iblk_n*nocc), (int)vv, (int)oo,
+                                    false, false, true, 0.5);
+            tracked_cudaFree(d_Wklij_T);
+        }
 
         // ---- GPU batched DGEMM for Lac×t2 → d_raw (before download) ----
         // For each ij: raw[ij,ab] += Lac[a,c] × t2v[ij,cb]
@@ -9160,10 +9221,13 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         } else {
             cudaMemcpy(d_Lac, Lac.data(), vv * sizeof(double), cudaMemcpyHostToDevice);
         }
-        gpu::matrixMatrixProductBatched(d_Lac, d_t2v, d_raw,
+        // (occ-i) raw[ij,ab] += Lac[a,c]·t2v[ij,cb], batched over ij. Restrict the
+        // ij batches to this device's i-block (offset t2v/raw by ib_off, count
+        // iblk_n·nocc). Full range ⇒ identical to the all-ij batch.
+        gpu::matrixMatrixProductBatched(d_Lac, d_t2v + ib_off, d_raw + ib_off,
                                     nvir, nvir, nvir,
                                     0, (long long)vv, (long long)vv,
-                                    (int)oo,
+                                    (int)((size_t)iblk_n*nocc),
                                     false, false, true, 1.0);
 
         // (P0-1) raw stays on device through the W-exchange scatter; downloaded
@@ -9277,8 +9341,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             // (P0-1) Scatter R12 (d_Wex_C1) + R4 (d_Wex_C2) into d_raw on-device,
             // removing the 2×ov² host download and the host quadruple-loop scatter.
             {
-                size_t tot = t2Size; int th = 256; int bl = (int)((tot + th - 1) / th);
-                ccsd_wexchange_scatter_kernel<<<bl, th>>>(d_Wex_C1, d_Wex_C2, d_raw, nocc, nvir);
+                size_t tot = (size_t)iblk_n*nocc*vv; int th = 256; int bl = (int)((tot + th - 1) / th);
+                ccsd_wexchange_scatter_kernel<<<bl, th>>>(d_Wex_C1, d_Wex_C2, d_raw, nocc, nvir, iblk_start, iblk_n);
             }
         }
 
@@ -9353,9 +9417,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                     std::cout << "[P0-VALIDATE Lki] max|dev-host| = " << std::scientific << mx << std::endl;
                 }
             }
-            int th = 256; size_t tot = t2Size; int bl = (int)((tot + th - 1) / th);
+            int th = 256; size_t tot = (size_t)iblk_n*nocc*vv; int bl = (int)((tot + th - 1) / th);
             ccsd_t2_reduced_kernel<<<bl, th>>>(d_raw, d_v_oovv, d_Lki, d_t2v, d_ovvv_t1,
-                                               d_v_vooo, d_t1, nocc, nvir);
+                                               d_v_vooo, d_t1, nocc, nvir, iblk_start, iblk_n);
             // (P0-3) raw stays on device — symmetrized on-device below (no download).
         } else {
             std::vector<real_t> Zt1_result(vv * oo);
@@ -9402,8 +9466,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         if (use_tiled_ladder) {
             // (P0-3) device symmetrize: d_newT2 = (d_raw + d_raw^P) / d_Dijab, then
             // download newT2 once for host DIIS. raw never comes to host (P0-1/2/3).
-            int th = 256; size_t tot = t2Size; int bl = (int)((tot + th - 1) / th);
-            ccsd_t2_symmetrize_kernel<<<bl, th>>>(d_newT2, d_raw, d_Dijab, nocc, nvir);
+            int th = 256; size_t tot = (size_t)iblk_n*nocc*vv; int bl = (int)((tot + th - 1) / th);
+            ccsd_t2_symmetrize_kernel<<<bl, th>>>(d_newT2, d_raw, d_Dijab, nocc, nvir, iblk_start, iblk_n);
             cudaMemcpy(newT2.data(), d_newT2, t2Size * sizeof(double), cudaMemcpyDeviceToHost);
         } else {
             for (int i = 0; i < nocc; i++)
