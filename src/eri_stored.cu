@@ -8472,6 +8472,25 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     double *d_v_ooov_c = nullptr;   // (③ Lki) bare v_ooov on device
     double *d_v_ovov_c = nullptr;   // (Z build) bare v_ovov on device
     const int TA_OVVV = 16;  // a-tile width for w_ovvv_R per-a tiling (Inc-G2)
+    // (DS-3 device-0 shard) Decide the occ-i sharding up front so device-0's
+    // Wakic/Wakci can be carved i-block COMPACT (nocc·iblk_n0·vv) instead of full
+    // oo·vv. ccsd_occi/occi_NG are also used by the iter loop + device loop below
+    // (declared here, scope widened). NG==1 (incl. num_gpus 1) ⇒ iblk_n0 = nocc ⇒
+    // compact == full ⇒ byte-identical anchor.
+    bool ccsd_occi = false; int occi_NG = 1; int iblk_n0 = nocc;
+#ifdef GANSU_MULTI_GPU
+    {
+        const char* e_oi = std::getenv("GANSU_CCSD_OCCI");
+        if (use_tiled_ladder && ri_bnative && e_oi && e_oi[0]=='1') {
+            ccsd_occi = true;
+            occi_NG   = MultiGpuManager::instance().num_devices();
+            iblk_n0   = occi_split(nocc, occi_NG, 0).second;
+            std::cout << "[CCSD OCCI] occ-i raw distribution across " << occi_NG
+                      << " GPU(s) (env GANSU_CCSD_OCCI)" << std::endl;
+        }
+    }
+#endif
+    const size_t wakic_dev0_sz = (size_t)nocc * iblk_n0 * vv;  // compact (=oo·vv when full)
     if (use_tiled_ladder) {
         tracked_cudaMalloc((void**)&d_ovvv_k, vvv * sizeof(double));
         tracked_cudaMalloc((void**)&d_ovvv_perm_k, vvv * sizeof(double));
@@ -8496,8 +8515,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // for the kernels) + Wakic/Wakci arrays + v_voov/v_vovo constants.
         tracked_cudaMalloc((void**)&d_ovvv_t1_ic, (size_t)nocc*vv*nocc * sizeof(double));
         tracked_cudaMalloc((void**)&d_ovvv_t1_dc, (size_t)nocc*vv*nocc * sizeof(double));
-        tracked_cudaMalloc((void**)&d_Wakic, oo*vv * sizeof(double));
-        tracked_cudaMalloc((void**)&d_Wakci, oo*vv * sizeof(double));
+        // (DS-3) device-0 Wakic/Wakci carved i-block COMPACT (= oo·vv when not occi).
+        tracked_cudaMalloc((void**)&d_Wakic, wakic_dev0_sz * sizeof(double));
+        tracked_cudaMalloc((void**)&d_Wakci, wakic_dev0_sz * sizeof(double));
         tracked_cudaMalloc((void**)&d_v_voov, oo*vv * sizeof(double));
         tracked_cudaMalloc((void**)&d_v_vovo, vo*vo * sizeof(double));
         cudaMemcpy(d_v_voov, v_voov.data(), oo*vv * sizeof(double), cudaMemcpyHostToDevice);
@@ -8568,20 +8588,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // at num_gpus==1 (one iteration, I_d = full, existing buffers ⇒ byte-identical
     // to the in-place path) before the multi-GPU broadcasts matter. Env-gated +
     // tiled B-native; default off ⇒ in-place single-device path (unchanged).
-    bool ccsd_occi = false;
-    int  occi_NG   = 1;
-#ifdef GANSU_MULTI_GPU
-    {
-        const char* e_oi = std::getenv("GANSU_CCSD_OCCI");
-        if (use_tiled_ladder && ri_bnative && e_oi && e_oi[0]=='1') {
-            ccsd_occi = true;
-            occi_NG   = MultiGpuManager::instance().num_devices();
-            std::cout << "[CCSD OCCI] occ-i raw distribution across " << occi_NG
-                      << " GPU(s) (env GANSU_CCSD_OCCI)" << std::endl;
-        }
-    }
-#endif
-    (void)ccsd_occi; (void)occi_NG;   // (loop body wired next: gate raw ops + device loop)
+    // (DS-3) ccsd_occi/occi_NG/iblk_n0 are decided above (moved before the carve so
+    // d_Wakic/d_Wakci can be sized compact). The device loop gate (ccsd_occi &&
+    // occi_NG>1) and the per-device i-block (occi_split) are applied below.
 
     for (int iter = 1; iter <= MAX_ITER; iter++) {
 
@@ -8885,15 +8894,15 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         if (use_tiled_ladder) {
             // (⑦-1) single-index Wakic/Wakci on the device from d_ovvv_t1_ic/dc.
             // Download for the (still host) ld-sum scatter below (removed in ⑦-2).
-            int th = 256; int bl = (int)((oo*vv + th - 1) / th);
-            // (DS-1) full-range no-op (ib0=0, ibn=nocc, out_compact=0) ⇒ device-0
-            // builds full Wakic/Wakci as before. The I_0 compact build is switched on
-            // in the device-0 shard increment.
-            ccsd_Wakic_kernel<<<bl, th>>>(d_Wakic, d_v_voov, d_v_oovo, d_t1, d_ovvv_t1_ic, nocc, nvir, 0, nocc, 0);
-            ccsd_Wakci_kernel<<<bl, th>>>(d_Wakci, d_v_vovo, d_v_oovo, d_t1, d_ovvv_t1_dc, nocc, nvir, 0, nocc, 0);
+            int th = 256; int bl = (int)(((size_t)nocc*iblk_n*vv + th - 1) / th);
+            // (DS-3) device-0 builds its I_0 block COMPACT when occi (iblk=occi_split(0),
+            // out_compact=1); full-range no-op otherwise. NG==1 ⇒ iblk_n=nocc ⇒
+            // compact==full ⇒ byte-identical.
+            ccsd_Wakic_kernel<<<bl, th>>>(d_Wakic, d_v_voov, d_v_oovo, d_t1, d_ovvv_t1_ic, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
+            ccsd_Wakci_kernel<<<bl, th>>>(d_Wakci, d_v_vovo, d_v_oovo, d_t1, d_ovvv_t1_dc, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
             // (⑦-2) Wakic/Wakci stay on the device through the ld-sum scatter;
             // downloaded once after ld-sum (below) for the still-host T1/W-exchange.
-            if (std::getenv("GANSU_CCSD_P0_VALIDATE")) {
+            if (std::getenv("GANSU_CCSD_P0_VALIDATE") && occi_NG<=1) {   // (DS-3) skip: compact I_0 when occi
                 std::vector<real_t> Wd(oo*vv), Wcd(oo*vv);
                 cudaMemcpy(Wd.data(), d_Wakic, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpy(Wcd.data(), d_Wakci, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
@@ -8954,10 +8963,11 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         if (use_tiled_ladder) {
             // (⑦-2) ld-sum fully on device: reshape kernel → 3 GEMM (V_R/W_R/V_R2 are
             // already on the device) → scatter kernels into d_Wakic/d_Wakci.
-            int th = 256; int blr = (int)((OV2 + th - 1) / th);
-            // (DS-2) full-range no-op (ib0=0, ibn=nocc); device-0 I_0 shard is DS-3.
-            ccsd_ldsum_reshape_kernel<<<blr, th>>>(d_Wex_B, d_Wex_A, d_t2v, d_t1, nocc, nvir, 0, nocc);
-            if (std::getenv("GANSU_CCSD_P0_VALIDATE")) {
+            int th = 256; int blr = (int)(((size_t)ov*nvir*iblk_n + th - 1) / th);
+            // (DS-3) device-0 I_0 compact (iblk=occi_split(0)) when occi; full no-op
+            // otherwise (iblk_n=nocc ⇒ blr=OV2/th, byte-identical).
+            ccsd_ldsum_reshape_kernel<<<blr, th>>>(d_Wex_B, d_Wex_A, d_t2v, d_t1, nocc, nvir, iblk_start, iblk_n);
+            if (std::getenv("GANSU_CCSD_P0_VALIDATE") && occi_NG<=1) {
                 std::vector<real_t> Bd(OV2), Ad(OV2);
                 cudaMemcpy(Bd.data(), d_Wex_B, OV2*sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpy(Ad.data(), d_Wex_A, OV2*sizeof(double), cudaMemcpyDeviceToHost);
@@ -8973,17 +8983,20 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             }
                 std::cout << "[P0-VALIDATE ldsum-reshape] eff=" << std::scientific << mxe << " t2C=" << mxc << std::endl;
             }
-            gpu::matrixMatrixProductRect(d_Wex_B, d_V_R, d_Wex_C1, (int)ov, (int)ov, (int)ov, true, false, false, 1.0);
-            gpu::matrixMatrixProductRect(d_Wex_A, d_W_R, d_Wex_C1, (int)ov, (int)ov, (int)ov, true, false, true, 0.5);
-            gpu::matrixMatrixProductRect(d_Wex_B, d_V_R2, d_Wex_C2, (int)ov, (int)ov, (int)ov, true, false, false, 1.0);
-            int bls = (int)((oo*vv + th - 1) / th);
-            ccsd_wakic_ldsum_scatter_kernel<<<bls, th>>>(d_Wakic, d_Wex_C1, nocc, nvir, 0, nocc, 0);
-            ccsd_wakci_ldsum_scatter_kernel<<<bls, th>>>(d_Wakci, d_Wex_C2, nocc, nvir, 0, nocc, 0);
+            // (DS-3) C1/C2 have nvir·iblk_n compact (i,a) rows (= ov when full).
+            int Mia = (int)((size_t)nvir*iblk_n);
+            gpu::matrixMatrixProductRect(d_Wex_B, d_V_R, d_Wex_C1, Mia, (int)ov, (int)ov, true, false, false, 1.0);
+            gpu::matrixMatrixProductRect(d_Wex_A, d_W_R, d_Wex_C1, Mia, (int)ov, (int)ov, true, false, true, 0.5);
+            gpu::matrixMatrixProductRect(d_Wex_B, d_V_R2, d_Wex_C2, Mia, (int)ov, (int)ov, true, false, false, 1.0);
+            int bls = (int)(((size_t)nocc*iblk_n*vv + th - 1) / th);
+            ccsd_wakic_ldsum_scatter_kernel<<<bls, th>>>(d_Wakic, d_Wex_C1, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
+            ccsd_wakci_ldsum_scatter_kernel<<<bls, th>>>(d_Wakci, d_Wex_C2, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
             // (⑦-4) Wakic/Wakci stay on the device: T1 update (device kernel, uses
             // bare w_voov) and the W-exchange reshape (⑦-3, reads d_Wakic/d_Wakci)
             // no longer touch the host arrays. Only the ⑦-3 P0-VALIDATE chk reads
-            // them — download just for that.
-            if (std::getenv("GANSU_CCSD_P0_VALIDATE")) {
+            // them — download just for that. (DS-3) skip when occi (N≥2): device-0
+            // d_Wakic is compact I_0 ∴ the full oo·vv download/chk doesn't apply.
+            if (std::getenv("GANSU_CCSD_P0_VALIDATE") && occi_NG<=1) {
                 cudaMemcpy(Wakic.data(), d_Wakic, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpy(Wakci.data(), d_Wakci, oo*vv*sizeof(double), cudaMemcpyDeviceToHost);
             }
@@ -9356,7 +9369,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             const int wexM = (int)wexA_rows;                          // GEMM M (compact)
             const bool p0val = (std::getenv("GANSU_CCSD_P0_VALIDATE") != nullptr);
             auto chk = [&](const char* tag, int amode, int tmode) {
-                if (!p0val) return;
+                if (!p0val || occi_NG>1) return;   // (DS-3) host Wakic is full only when not occi
                 size_t Asz = (size_t)wexA_rows*ov;
                 std::vector<real_t> Ad(Asz), Bd(OV2);
                 cudaMemcpy(Ad.data(), d_Wex_A, Asz*sizeof(double), cudaMemcpyDeviceToHost);
@@ -9379,17 +9392,17 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 std::cout << "[P0-VALIDATE wex " << tag << "] A=" << std::scientific << mA << " B=" << mB << std::endl;
             };
             // GEMM 1: R12 = Weff × t2_R1   (M = nvir·iblk_n compact rows)
-            ccsd_wex_Wakic_reshape_kernel<<<blo_A,th>>>(d_Wex_A, d_Wakic, d_Wakci, 0, nocc, nvir, iblk_start, iblk_n, 0);
+            ccsd_wex_Wakic_reshape_kernel<<<blo_A,th>>>(d_Wex_A, d_Wakic, d_Wakci, 0, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
             ccsd_wex_t2_reshape_kernel<<<blo_B,th>>>(d_Wex_B, d_t2v, 1, nocc, nvir);
             chk("1 Weff/t2R1", 0, 1);
             gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C1, wexM,(int)ov,(int)ov, false,false,false,1.0);
             // GEMM 2: R12 -= Wakic_R × t2_R3
-            ccsd_wex_Wakic_reshape_kernel<<<blo_A,th>>>(d_Wex_A, d_Wakic, d_Wakci, 1, nocc, nvir, iblk_start, iblk_n, 0);
+            ccsd_wex_Wakic_reshape_kernel<<<blo_A,th>>>(d_Wex_A, d_Wakic, d_Wakci, 1, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
             ccsd_wex_t2_reshape_kernel<<<blo_B,th>>>(d_Wex_B, d_t2v, 3, nocc, nvir);
             chk("2 WakicR/t2R3", 1, 3);
             gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C1, wexM,(int)ov,(int)ov, false,false,true,-1.0);
             // GEMM 3: R4 = -Wakci_R × t2_R4
-            ccsd_wex_WakciRmat_reshape_kernel<<<blo_A,th>>>(d_Wex_A, d_Wakci, nocc, nvir, iblk_start, iblk_n, 0);
+            ccsd_wex_WakciRmat_reshape_kernel<<<blo_A,th>>>(d_Wex_A, d_Wakci, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
             ccsd_wex_t2_reshape_kernel<<<blo_B,th>>>(d_Wex_B, d_t2v, 4, nocc, nvir);
             chk("3 WakciR/t2R4", 2, 4);
             gpu::matrixMatrixProductRect(d_Wex_A, d_Wex_B, d_Wex_C2, wexM,(int)ov,(int)ov, false,false,false,-1.0);
@@ -9590,33 +9603,53 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 // per-device broadcast inputs
                 double *p_tau,*p_t2v,*p_t1,*p_Lac,*p_Lki,*p_Zt1,*p_Wakic,*p_Wakci,*p_Wklij;
                 double *p_Bmo,*p_vovvvT,*p_voovv,*p_vvooo,*p_raw;
+                // (DS-3 C) device d builds its OWN Wakic/Wakci[I_d] (compact) instead
+                // of broadcasting the full arrays from device 0 (which now holds only
+                // I_0). Inputs for the ⑦-1/⑦-2 build are broadcast here.
+                double *p_v_voov,*p_v_vovo,*p_v_oovo,*p_ot1ic,*p_ot1dc,*p_V_R,*p_W_R,*p_V_R2;
+                const size_t p_oovo = (size_t)nocc*nocc*nvir*nocc;   // v_oovo size
+                const size_t p_ot1  = (size_t)nocc*vv*nocc;          // ovvv_t1_ic/dc size
                 tracked_cudaMalloc((void**)&p_tau,   t2Size*sizeof(double));
                 tracked_cudaMalloc((void**)&p_t2v,   t2Size*sizeof(double));
                 tracked_cudaMalloc((void**)&p_t1,    t1Size*sizeof(double));
                 tracked_cudaMalloc((void**)&p_Lac,   vv*sizeof(double));
                 tracked_cudaMalloc((void**)&p_Lki,   oo*sizeof(double));
                 tracked_cudaMalloc((void**)&p_Zt1,   t2Size*sizeof(double));
-                tracked_cudaMalloc((void**)&p_Wakic, oo*vv*sizeof(double));
-                tracked_cudaMalloc((void**)&p_Wakci, oo*vv*sizeof(double));
+                tracked_cudaMalloc((void**)&p_Wakic, (size_t)nocc*ibn*vv*sizeof(double));  // compact I_d
+                tracked_cudaMalloc((void**)&p_Wakci, (size_t)nocc*ibn*vv*sizeof(double));
                 tracked_cudaMalloc((void**)&p_Wklij, oo*oo*sizeof(double));
                 tracked_cudaMalloc((void**)&p_Bmo,   bmo_sz*sizeof(double));
                 tracked_cudaMalloc((void**)&p_vovvvT,(size_t)vvv*nocc*sizeof(double));
                 tracked_cudaMalloc((void**)&p_voovv, oo*vv*sizeof(double));
                 tracked_cudaMalloc((void**)&p_vvooo, (size_t)vo*oo*sizeof(double));
                 tracked_cudaMalloc((void**)&p_raw,   t2Size*sizeof(double));
+                tracked_cudaMalloc((void**)&p_v_voov, oo*vv*sizeof(double));
+                tracked_cudaMalloc((void**)&p_v_vovo, (size_t)vo*vo*sizeof(double));
+                tracked_cudaMalloc((void**)&p_v_oovo, p_oovo*sizeof(double));
+                tracked_cudaMalloc((void**)&p_ot1ic,  p_ot1*sizeof(double));
+                tracked_cudaMalloc((void**)&p_ot1dc,  p_ot1*sizeof(double));
+                tracked_cudaMalloc((void**)&p_V_R,    OV2*sizeof(double));
+                tracked_cudaMalloc((void**)&p_W_R,    OV2*sizeof(double));
+                tracked_cudaMalloc((void**)&p_V_R2,   OV2*sizeof(double));
                 cudaMemcpyPeer(p_tau,   d, (const void*)d_tau,      0, t2Size*sizeof(double));
                 cudaMemcpyPeer(p_t2v,   d, (const void*)d_t2v,      0, t2Size*sizeof(double));
                 cudaMemcpyPeer(p_t1,    d, (const void*)d_t1,       0, t1Size*sizeof(double));
                 cudaMemcpyPeer(p_Lac,   d, (const void*)d_Lac,      0, vv*sizeof(double));
                 cudaMemcpyPeer(p_Lki,   d, (const void*)d_Lki,      0, oo*sizeof(double));
                 cudaMemcpyPeer(p_Zt1,   d, (const void*)d_ovvv_t1,  0, t2Size*sizeof(double));
-                cudaMemcpyPeer(p_Wakic, d, (const void*)d_Wakic,    0, oo*vv*sizeof(double));
-                cudaMemcpyPeer(p_Wakci, d, (const void*)d_Wakci,    0, oo*vv*sizeof(double));
                 cudaMemcpyPeer(p_Wklij, d, (const void*)d_Wklij,    0, oo*oo*sizeof(double));
                 cudaMemcpyPeer(p_Bmo,   d, (const void*)B_mo,       0, bmo_sz*sizeof(double));
                 cudaMemcpyPeer(p_vovvvT,d, (const void*)d_v_ovvv_T, 0, (size_t)vvv*nocc*sizeof(double));
                 cudaMemcpyPeer(p_voovv, d, (const void*)d_v_oovv,   0, oo*vv*sizeof(double));
                 cudaMemcpyPeer(p_vvooo, d, (const void*)d_v_vooo,   0, (size_t)vo*oo*sizeof(double));
+                cudaMemcpyPeer(p_v_voov,d, (const void*)d_v_voov,   0, oo*vv*sizeof(double));
+                cudaMemcpyPeer(p_v_vovo,d, (const void*)d_v_vovo,   0, (size_t)vo*vo*sizeof(double));
+                cudaMemcpyPeer(p_v_oovo,d, (const void*)d_v_oovo,   0, p_oovo*sizeof(double));
+                cudaMemcpyPeer(p_ot1ic, d, (const void*)d_ovvv_t1_ic,0, p_ot1*sizeof(double));
+                cudaMemcpyPeer(p_ot1dc, d, (const void*)d_ovvv_t1_dc,0, p_ot1*sizeof(double));
+                cudaMemcpyPeer(p_V_R,   d, (const void*)d_V_R,      0, OV2*sizeof(double));
+                cudaMemcpyPeer(p_W_R,   d, (const void*)d_W_R,      0, OV2*sizeof(double));
+                cudaMemcpyPeer(p_V_R2,  d, (const void*)d_V_R2,     0, OV2*sizeof(double));
                 cudaMemset(p_raw, 0, t2Size*sizeof(double));
                 // per-device scratch
                 double *t_vvvv,*t_ot1,*t_ot2,*t_W,*t_rawt,*t_t1s,*t_WklijT,*t_WexA,*t_WexB,*t_WexC1,*t_WexC2;
@@ -9635,6 +9668,23 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 tracked_cudaMalloc((void**)&t_WexB, OV2*sizeof(double));
                 tracked_cudaMalloc((void**)&t_WexC1,wexAsz*sizeof(double));
                 tracked_cudaMalloc((void**)&t_WexC2,wexAsz*sizeof(double));
+                // (DS-3 C) device d builds its own Wakic/Wakci[I_d] COMPACT before the
+                // W-exchange that consumes them. ⑦-1 single-index + ⑦-2 ld-sum, mirroring
+                // device 0 with iblk=(ib0,ibn) + out_compact=1. Reuses t_Wex* scratch
+                // (ld-sum then W-exchange are time-disjoint). t_WexB(OV2) holds eff_t2_R,
+                // t_WexA(wexAsz) holds t2_C, both ≤ their carve.
+                { int th=256; int blw=(int)(((size_t)nocc*ibn*vv+th-1)/th);
+                  ccsd_Wakic_kernel<<<blw,th>>>(p_Wakic, p_v_voov, p_v_oovo, p_t1, p_ot1ic, nocc, nvir, ib0, ibn, 1);
+                  ccsd_Wakci_kernel<<<blw,th>>>(p_Wakci, p_v_vovo, p_v_oovo, p_t1, p_ot1dc, nocc, nvir, ib0, ibn, 1);
+                  int blr=(int)(((size_t)ov*nvir*ibn+th-1)/th);
+                  ccsd_ldsum_reshape_kernel<<<blr,th>>>(t_WexB, t_WexA, p_t2v, p_t1, nocc, nvir, ib0, ibn);
+                  int Mia=(int)((size_t)nvir*ibn);
+                  gpu::matrixMatrixProductRect(t_WexB, p_V_R, t_WexC1, Mia,(int)ov,(int)ov, true,false,false,1.0);
+                  gpu::matrixMatrixProductRect(t_WexA, p_W_R, t_WexC1, Mia,(int)ov,(int)ov, true,false,true,0.5);
+                  gpu::matrixMatrixProductRect(t_WexB, p_V_R2,t_WexC2, Mia,(int)ov,(int)ov, true,false,false,1.0);
+                  int bls=(int)(((size_t)nocc*ibn*vv+th-1)/th);
+                  ccsd_wakic_ldsum_scatter_kernel<<<bls,th>>>(p_Wakic, t_WexC1, nocc, nvir, ib0, ibn, 1);
+                  ccsd_wakci_ldsum_scatter_kernel<<<bls,th>>>(p_Wakci, t_WexC2, nocc, nvir, ib0, ibn, 1); }
                 // ⑨ ladder (single-device tiled, this device's i-block)
                 for (int a0 = 0; a0 < nvir; a0 += TA) {
                     int ta = std::min(TA, nvir - a0);
@@ -9668,13 +9718,13 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                   // (M3-a foundation) p_Wakic/p_Wakci are still full-broadcast here
                   // ⇒ wakic_compact=0 (full read), identical to M1. The compact path
                   // (wakic_compact=1) is reserved for device-0 I_0 shard (next).
-                  ccsd_wex_Wakic_reshape_kernel<<<blo_A,th>>>(t_WexA, p_Wakic, p_Wakci, 0, nocc, nvir, ib0, ibn, 0);
+                  ccsd_wex_Wakic_reshape_kernel<<<blo_A,th>>>(t_WexA, p_Wakic, p_Wakci, 0, nocc, nvir, ib0, ibn, 1);
                   ccsd_wex_t2_reshape_kernel<<<blo_B,th>>>(t_WexB, p_t2v, 1, nocc, nvir);
                   gpu::matrixMatrixProductRect(t_WexA, t_WexB, t_WexC1, wexM,(int)ov,(int)ov, false,false,false,1.0);
-                  ccsd_wex_Wakic_reshape_kernel<<<blo_A,th>>>(t_WexA, p_Wakic, p_Wakci, 1, nocc, nvir, ib0, ibn, 0);
+                  ccsd_wex_Wakic_reshape_kernel<<<blo_A,th>>>(t_WexA, p_Wakic, p_Wakci, 1, nocc, nvir, ib0, ibn, 1);
                   ccsd_wex_t2_reshape_kernel<<<blo_B,th>>>(t_WexB, p_t2v, 3, nocc, nvir);
                   gpu::matrixMatrixProductRect(t_WexA, t_WexB, t_WexC1, wexM,(int)ov,(int)ov, false,false,true,-1.0);
-                  ccsd_wex_WakciRmat_reshape_kernel<<<blo_A,th>>>(t_WexA, p_Wakci, nocc, nvir, ib0, ibn, 0);
+                  ccsd_wex_WakciRmat_reshape_kernel<<<blo_A,th>>>(t_WexA, p_Wakci, nocc, nvir, ib0, ibn, 1);
                   ccsd_wex_t2_reshape_kernel<<<blo_B,th>>>(t_WexB, p_t2v, 4, nocc, nvir);
                   gpu::matrixMatrixProductRect(t_WexA, t_WexB, t_WexC2, wexM,(int)ov,(int)ov, false,false,false,-1.0);
                   size_t tt=(size_t)ibn*nocc*vv; int bl=(int)((tt+th-1)/th);
@@ -9687,6 +9737,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 tracked_cudaFree(p_Lac); tracked_cudaFree(p_Lki); tracked_cudaFree(p_Zt1);
                 tracked_cudaFree(p_Wakic); tracked_cudaFree(p_Wakci); tracked_cudaFree(p_Wklij);
                 tracked_cudaFree(p_Bmo); tracked_cudaFree(p_vovvvT); tracked_cudaFree(p_voovv); tracked_cudaFree(p_vvooo);
+                tracked_cudaFree(p_v_voov); tracked_cudaFree(p_v_vovo); tracked_cudaFree(p_v_oovo);
+                tracked_cudaFree(p_ot1ic); tracked_cudaFree(p_ot1dc);
+                tracked_cudaFree(p_V_R); tracked_cudaFree(p_W_R); tracked_cudaFree(p_V_R2);
                 tracked_cudaFree(t_vvvv); tracked_cudaFree(t_ot1); tracked_cudaFree(t_ot2);
                 tracked_cudaFree(t_W); tracked_cudaFree(t_rawt); tracked_cudaFree(t_t1s); tracked_cudaFree(t_WklijT);
                 tracked_cudaFree(t_WexA); tracked_cudaFree(t_WexB); tracked_cudaFree(t_WexC1); tracked_cudaFree(t_WexC2);
