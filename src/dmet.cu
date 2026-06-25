@@ -303,9 +303,16 @@ std::vector<DMETFragment> DMET::parse_fragments(const std::string& spec, int num
             while (pos < spec.size() && (spec[pos] == ' ' || spec[pos] == ',')) pos++;
             if (pos >= spec.size() || spec[pos] == '}') break;
             int start_atom = 0;
+            size_t digit_start = pos;
             while (pos < spec.size() && spec[pos] >= '0' && spec[pos] <= '9') {
                 start_atom = start_atom * 10 + (spec[pos] - '0'); pos++;
             }
+            // Guard against malformed specs (e.g. a literal "..." range shorthand):
+            // if no digit was consumed here the loop would never advance ⇒ infinite
+            // loop pushing atom 0 and growing memory without bound. Fail fast instead.
+            if (pos == digit_start)
+                throw std::runtime_error("DMET fragment parse error: expected a digit at position "
+                    + std::to_string(pos) + " (use comma list \"{0,1,2}\" or range \"{0-29}\", not \"...\")");
             if (pos < spec.size() && spec[pos] == '-') {
                 pos++;
                 int end_atom = 0;

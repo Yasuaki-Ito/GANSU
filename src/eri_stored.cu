@@ -8329,7 +8329,13 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     const size_t sz_v_ovvv_T = vvv*nocc, sz_t1 = t1Size, sz_ovvv_t1 = use_tiled_ladder ? (ccsd_occi ? vv*(size_t)iblk_n0*nocc : t2Size) : std::max(vvv*std::max((size_t)nvir,(size_t)nocc), t2Size);
     const size_t sz_v_vvvv = use_tiled_ladder ? (size_t)1 : vv*vv, sz_Fac = vv, sz_Fkc = ov;
     const size_t sz_t2v = t2Size, sz_Lac = vv, sz_Z = ccsd_occi ? vv*(size_t)iblk_n0*nvir : vv*ov;
-    const size_t sz_Wex = OV2;  // each of A, B, C1, C2, V_R, W_R, V_R2
+    const size_t sz_Wex = OV2;  // each of B, V_R, W_R, V_R2 (i-independent floor)
+    // (DS-5 device-0 Wex shard) WexA/C1/C2 hold i-block COMPACT data (nvir·iblk_n rows
+    // × ov) in both the ld-sum (⑦-2) and W-exchange (⑫) — ld-sum/W-ex are now I_d
+    // sharded (DS-2/DS-3) ⇒ device-0's A/C1/C2 carve shrinks to nvir·iblk_n0·ov.
+    // iblk_n0 = nocc when not occi ⇒ = OV2 (byte-identical). WexB (t2 reshape) is
+    // i-independent ⇒ stays full OV2.
+    const size_t sz_WexAC = ccsd_occi ? (size_t)nvir*iblk_n0*ov : OV2;
     // (ovvv per-tile, Inc-A) d_v_ovvv / d_v_ovvv_perm are read only by the legacy
     // (non-tiled) ovvv_t1 build; the tiled path builds those per-k from B (Inc-G1).
     // So shrink their carve to 1 when tiled — frees 2·nocc·nvir³ of device memory.
@@ -8341,7 +8347,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     const size_t total_gpu_doubles = sz_tau + sz_Wabcd + sz_Wklij + sz_raw
         + sz_w_oovv + sz_v_oovv + sz_Fki + sz_v_ovvv_T + sz_t1 + sz_ovvv_t1
         + sz_v_vvvv + sz_Fac + sz_Fkc + sz_t2v + sz_Lac + sz_Z
-        + 7 * sz_Wex  // Wex_A, Wex_B, Wex_C1, Wex_C2, V_R, W_R, V_R2
+        + 4 * sz_Wex + 3 * sz_WexAC  // Wex_B/V_R/W_R/V_R2 (OV2) + Wex_A/C1/C2 (compact)
         + sz_v_ovvv + sz_v_ovvv_perm + sz_w_ovvv_R;
 
     double *d_gpu_pool = nullptr;
@@ -8365,10 +8371,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     double *d_t2v       = carve(sz_t2v);
     double *d_Lac       = carve(sz_Lac);
     double *d_Z         = carve(sz_Z);
-    double *d_Wex_A     = carve(sz_Wex);
+    double *d_Wex_A     = carve(sz_WexAC);   // (DS-5) compact (nvir·iblk_n0·ov = OV2 when full)
     double *d_Wex_B     = carve(sz_Wex);
-    double *d_Wex_C1    = carve(sz_Wex);
-    double *d_Wex_C2    = carve(sz_Wex);
+    double *d_Wex_C1    = carve(sz_WexAC);
+    double *d_Wex_C2    = carve(sz_WexAC);
     double *d_V_R       = carve(sz_Wex);
     double *d_W_R       = carve(sz_Wex);
     double *d_V_R2      = carve(sz_Wex);
