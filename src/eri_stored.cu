@@ -7416,7 +7416,7 @@ __global__ void ccsd_t2_reduced_kernel(double* __restrict__ raw,
                                        const double* __restrict__ v_vooo,
                                        const double* __restrict__ t1,
                                        int nocc, int nvir, int ib0, int ibn,
-                                       int zt1_compact) {
+                                       int zt1_compact, int voovv_compact, int vvooo_compact) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
     size_t oo = (size_t)nocc * nocc;
@@ -7425,7 +7425,11 @@ __global__ void ccsd_t2_reduced_kernel(double* __restrict__ raw,
     int a = (int)(r % nvir); r /= nvir;
     int j = (int)(r % nocc); int i_loc = (int)(r / nocc); int i = ib0 + i_loc;
     size_t gout = ((size_t)i*nocc + j)*vv + (size_t)a*nvir + b;
-    double val = 0.5 * v_oovv[gout];
+    // (Cat-A §10.10 v_oovv dual-use) v_oovv i-block COMPACT: rows i∈I_d only (i is
+    // the leading index ⇒ contiguous slice ⇒ index relative to ib0). Full /
+    // voovv_compact=0 ⇒ gout ⇒ N=1 no-op.
+    size_t voovv_idx = voovv_compact ? ((size_t)(i_loc*nocc + j)*vv + (size_t)a*nvir + b) : gout;
+    double val = 0.5 * v_oovv[voovv_idx];
     for (int k = 0; k < nocc; k++)
         val -= Lki[(size_t)k*nocc + i] * t2v[((size_t)k*nocc + j)*vv + (size_t)a*nvir + b];
     // (DS-4) Zt1 full ((a·nvir+b)·oo + i·nocc+j) or i-block COMPACT (((a·nvir+b)·ibn
@@ -7433,8 +7437,15 @@ __global__ void ccsd_t2_reduced_kernel(double* __restrict__ raw,
     val += zt1_compact
         ? Zt1[((size_t)(a*nvir + b)*ibn + i_loc)*nocc + j]
         : Zt1[((size_t)a*nvir + b)*oo + (size_t)i*nocc + j];
-    for (int k = 0; k < nocc; k++)
-        val -= v_vooo[((size_t)a*nocc + k)*oo + (size_t)i*nocc + j] * t1[(size_t)k*nvir + b];
+    // (Cat-B v_vooo) i-block COMPACT: the (i,j) column block is restricted to i∈I_d
+    // ⇒ (a·nocc+k)·(ibn·nocc) + i_loc·nocc+j. Full / vvooo_compact=0 ⇒ ·oo + i·nocc+j
+    // = old layout ⇒ N=1 no-op.
+    for (int k = 0; k < nocc; k++) {
+        size_t vvidx = vvooo_compact
+            ? ((size_t)(a*nocc + k)*(size_t)ibn*nocc + (size_t)i_loc*nocc + j)
+            : ((size_t)(a*nocc + k)*oo + (size_t)i*nocc + j);
+        val -= v_vooo[vvidx] * t1[(size_t)k*nvir + b];
+    }
     raw[gout] += val;
 }
 
@@ -8058,6 +8069,49 @@ __global__ void scatter_add_abtile_kernel(const double* __restrict__ raw_tile,
     raw[((size_t)ij0 + lij)*vv + (size_t)(a0+ap)*nvir + b] += raw_tile[lij*cols + (size_t)ap*nvir + b];
 }
 
+// (Cat-A v_ovvv_T 2D slab) 2D (a-tile × b-tile) Wabcd build. b-tiling lets term2
+// read only v_ovvv_T[b-tile] (first index), so v_ovvv_T can be first-index slab-
+// distributed across devices. tb=nvir (b0=0) ⇒ index-identical to
+// build_Wabcd_tile_kernel ⇒ N=1 no-op scaffold. Layouts:
+//   vvvv_tile[(a',b'),(c,d)] = ((a'·tb+b')·nvir+c)·nvir+d
+//   ot1_tile1[(a',d,c),b']   = (a'·vv + d·nvir + c)·tb + b'   (term1, col-stride tb)
+//   ot1_tile2[(b',c,d),a']   = (b'·vv + c·nvir + d)·ta + a'   (term2, col-stride ta)
+__global__ void build_Wabcd_2dtile_kernel(const double* __restrict__ vvvv_tile,
+                                          const double* __restrict__ ot1_tile1,
+                                          const double* __restrict__ ot1_tile2,
+                                          double* __restrict__ W_tile,
+                                          int nvir, int ta, int tb) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir;
+    size_t total = (size_t)ta * tb * vv;
+    if (gid >= total) return;
+    int d = (int)(gid % nvir); size_t rem = gid / nvir;
+    int c = (int)(rem % nvir); rem /= nvir;
+    int bp = (int)(rem % tb);
+    int ap = (int)(rem / tb);
+    W_tile[gid] = vvvv_tile[gid]
+        - ot1_tile1[((size_t)ap*vv + (size_t)d*nvir + c)*tb + bp]
+        - ot1_tile2[((size_t)bp*vv + (size_t)c*nvir + d)*ta + ap];
+}
+
+// (Cat-A v_ovvv_T 2D slab) scatter a (nij × ta·tb) ladder tile into raw at output
+// (a0+a', b0+b'). b0=0, tb=nvir ⇒ index-identical to scatter_add_abtile_kernel.
+//   raw[(ij0+lij), (a0+ap)·nvir + (b0+bp)] += raw_tile[lij·(ta·tb) + ap·tb + bp]
+__global__ void scatter_add_abtile2d_kernel(const double* __restrict__ raw_tile,
+                                            double* __restrict__ raw,
+                                            int nocc, int nvir, int a0, int ta,
+                                            int b0, int tb, int ij0, int nij) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir;
+    size_t cols = (size_t)ta * tb;
+    size_t total = (size_t)nij * cols;
+    if (gid >= total) return;
+    int bp = (int)(gid % tb); size_t rem = gid / tb;
+    int ap = (int)(rem % ta); rem /= ta;
+    size_t lij = rem;
+    raw[((size_t)ij0 + lij)*vv + (size_t)(a0+ap)*nvir + (b0+bp)] += raw_tile[lij*cols + (size_t)ap*tb + bp];
+}
+
 // (Phase 1 increment-2, occ-i) Contiguous occupied-index block owned by device
 // `d` of `NG` — same partition shape as eri_ri_distributed's aux_partition.
 // Returns {i_start, i_count}. With NG==1 → {0, nocc} (= full range, the residual
@@ -8391,7 +8445,20 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // (DS-4 device-0 shard) Zt1 (= d_ovvv_t1 in the tiled path) and d_Z hold only
     // device-0's I_0 i-block when occi ⇒ carve COMPACT (vv·iblk_n0·{nocc,nvir}).
     // iblk_n0 = nocc when not occi ⇒ identical to the old full size (byte-identical).
-    const size_t sz_v_ovvv_T = vvv*nocc, sz_t1 = t1Size, sz_ovvv_t1 = use_tiled_ladder ? (ccsd_occi ? vv*(size_t)iblk_n0*nocc : t2Size) : std::max(vvv*std::max((size_t)nvir,(size_t)nocc), t2Size);
+    // (Cat-A Stage 2c-B') d_v_ovvv_T (vvv·nocc ≈ 10.7GB) is only read by the non-tiled
+    // ladder (!use_tiled_ladder, :8999) and the increment-1 MULTIGPU distributed ladder
+    // (ccsd_dist, :9404/:8752). The tiled 2D ladder — device-0 and occi device-d≥1 —
+    // now builds each v_ovvv_T tile from B (chem^T via transA) ⇒ no residency needed.
+    // vt_dist mirrors the ccsd_dist condition (decided later at :8740) using only
+    // already-available inputs. When not needed, carve a size-1 stub (frees ~10.7GB/dev).
+    bool vt_dist = false;
+#ifdef GANSU_MULTI_GPU
+    { const char* e_mg = std::getenv("GANSU_CCSD_MULTIGPU");
+      if (use_tiled_ladder && ri_bnative && e_mg && e_mg[0]=='1' && MultiGpuManager::instance().num_devices()>1)
+          vt_dist = true; }
+#endif
+    const bool vt_needed = (!use_tiled_ladder) || vt_dist;
+    const size_t sz_v_ovvv_T = vt_needed ? vvv*nocc : (size_t)1, sz_t1 = t1Size, sz_ovvv_t1 = use_tiled_ladder ? (ccsd_occi ? vv*(size_t)iblk_n0*nocc : t2Size) : std::max(vvv*std::max((size_t)nvir,(size_t)nocc), t2Size);
     const size_t sz_v_vvvv = use_tiled_ladder ? (size_t)1 : vv*vv, sz_Fac = vv, sz_Fkc = ov;
     const size_t sz_t2v = t2Size, sz_Lac = vv, sz_Z = ccsd_occi ? vv*(size_t)iblk_n0*nvir : vv*ov;
     const size_t sz_Wex = OV2;  // each of B, V_R, W_R, V_R2 (i-independent floor)
@@ -8516,7 +8583,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     if (free_eri_mo) tracked_cudaFree(d_eri_mo);
     d_eri_mo = nullptr;
 
-    cudaMemcpy(d_v_ovvv_T, v_ovvv_T.data(), vvv * nocc * sizeof(double), cudaMemcpyHostToDevice);
+    // (Cat-A Stage 2c-B') only populate d_v_ovvv_T when actually used (non-tiled /
+    // MULTIGPU). The tiled 2D ladder builds tiles from B ⇒ the carve is a size-1 stub.
+    if (vt_needed) cudaMemcpy(d_v_ovvv_T, v_ovvv_T.data(), vvv * nocc * sizeof(double), cudaMemcpyHostToDevice);
 
     // Pre-compute v_ovvv_perm (constant — transpose d,c within each (k,a) block)
     std::vector<real_t> v_ovvv_perm((size_t)nocc * vvv);
@@ -8611,9 +8680,15 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         tracked_cudaMalloc((void**)&d_wovvvR_tile, (size_t)TA_OVVV*nocc*vv * sizeof(double));
         // (P0-2) v_vooo constant (upload once) + Lki scratch (per-iter upload) for
         // the device reduced-T2 kernel (host-roundtrip removal).
-        tracked_cudaMalloc((void**)&d_v_vooo, (size_t)vo*oo * sizeof(double));
+        // (Cat-B v_vooo, device-0 I_0 shard) carved i-block COMPACT (= vo·oo when
+        // iblk_n0=nocc). v_vooo[(a,k),(i,j)]: (a,k) rows × (i,j) cols, I_0 = first
+        // iblk_n0·nocc cols (i leading in (i,j)). Strided cudaMemcpy2D = full copy when
+        // iblk_n0=nocc ⇒ byte-identical. Only the reduced kernel reads d_v_vooo.
+        tracked_cudaMalloc((void**)&d_v_vooo, (size_t)vo*iblk_n0*nocc * sizeof(double));
         tracked_cudaMalloc((void**)&d_Lki,    (size_t)oo * sizeof(double));
-        cudaMemcpy(d_v_vooo, v_vooo.data(), (size_t)vo*oo * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy2D(d_v_vooo, (size_t)iblk_n0*nocc*sizeof(double),
+                     v_vooo.data(), oo*sizeof(double),
+                     (size_t)iblk_n0*nocc*sizeof(double), (size_t)vo, cudaMemcpyHostToDevice);
         // (P0-3) device symmetrize output + Dijab denominator (const, upload once)
         tracked_cudaMalloc((void**)&d_newT2, t2Size * sizeof(double));
         tracked_cudaMalloc((void**)&d_Dijab, t2Size * sizeof(double));
@@ -8632,10 +8707,20 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // (DS-3) device-0 Wakic/Wakci carved i-block COMPACT (= oo·vv when not occi).
         tracked_cudaMalloc((void**)&d_Wakic, wakic_dev0_sz * sizeof(double));
         tracked_cudaMalloc((void**)&d_Wakci, wakic_dev0_sz * sizeof(double));
-        tracked_cudaMalloc((void**)&d_v_voov, oo*vv * sizeof(double));
-        tracked_cudaMalloc((void**)&d_v_vovo, vo*vo * sizeof(double));
-        cudaMemcpy(d_v_voov, v_voov.data(), oo*vv * sizeof(double), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_v_vovo, v_vovo.data(), vo*vo * sizeof(double), cudaMemcpyHostToDevice);
+        // (Phase-1a Cat-B, device-0 I_0 shard) v_voov/v_vovo carved i-block COMPACT
+        // (= oo·vv / vo·vo when iblk_n0=nocc). The I_0 block (ib0=0) is filled via a
+        // strided cudaMemcpy2D from the host vector (degenerates to a plain full copy
+        // when iblk_n0=nocc ⇒ byte-identical). v_voov[a,k,i,c]: (a,k) rows × (i,c) cols,
+        // I_0 = first iblk_n0·nvir cols. v_vovo[a,k,c,i] (i innermost): (a,k,c) rows of
+        // nocc each, I_0 = first iblk_n0 of each row.
+        tracked_cudaMalloc((void**)&d_v_voov, (size_t)vo*iblk_n0*nvir * sizeof(double));
+        tracked_cudaMalloc((void**)&d_v_vovo, (size_t)vo*nvir*iblk_n0 * sizeof(double));
+        cudaMemcpy2D(d_v_voov, (size_t)iblk_n0*nvir*sizeof(double),
+                     v_voov.data(), ov*sizeof(double),
+                     (size_t)iblk_n0*nvir*sizeof(double), (size_t)nvir*nocc, cudaMemcpyHostToDevice);
+        cudaMemcpy2D(d_v_vovo, (size_t)iblk_n0*sizeof(double),
+                     v_vovo.data(), (size_t)nocc*sizeof(double),
+                     (size_t)iblk_n0*sizeof(double), (size_t)nvir*nocc*nvir, cudaMemcpyHostToDevice);
         // (⑦-4) device T1 update buffers. Constants (w_voov dressed = 2voov−vovo,
         // w_ooov dressed, Dia denominator, fov) upload once; d_newT1/d_Fkc_t1 reused
         // per iteration (d_Fkc_t1 carries the fov-corrected Fkc — d_Fkc itself is
@@ -8652,8 +8737,12 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         tracked_cudaMalloc((void**)&d_v_ooov_c, (size_t)oo*ov * sizeof(double));
         cudaMemcpy(d_v_ooov_c, v_ooov.data(), (size_t)oo*ov * sizeof(double), cudaMemcpyHostToDevice);
         // (Z build) bare v_ovov (constant) for the device Z build.
-        tracked_cudaMalloc((void**)&d_v_ovov_c, (size_t)ov*ov * sizeof(double));
-        cudaMemcpy(d_v_ovov_c, v_ovov.data(), (size_t)ov*ov * sizeof(double), cudaMemcpyHostToDevice);
+        // (Phase-1a Cat-B, device-0 I_0 shard) carved i-block COMPACT (= ov·ov when
+        // iblk_n0=nocc). v_ovov[k,b,i,c]: (k,b) rows × (i,c) cols, I_0 = first iblk_n0·nvir.
+        tracked_cudaMalloc((void**)&d_v_ovov_c, (size_t)ov*iblk_n0*nvir * sizeof(double));
+        cudaMemcpy2D(d_v_ovov_c, (size_t)iblk_n0*nvir*sizeof(double),
+                     v_ovov.data(), ov*sizeof(double),
+                     (size_t)iblk_n0*nvir*sizeof(double), (size_t)nocc*nvir, cudaMemcpyHostToDevice);
         // (V_R floor reduction) per-k-block scratch (only when opt-in). block = ov·KT·nvir
         // (V_R/W_R/V_R2 reshape), C block = (nvir·iblk_n0)·KT·nvir (device-0 GEMM result).
         if (vr_tile) {
@@ -9026,8 +9115,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             // compact==full ⇒ byte-identical.
             // (DS-4 device-0 shard) ovt1_compact=occi?1:0: the ⑥ build above now
             // produces d_ovvv_t1_ic/dc COMPACT for I_0 ⇒ read it compact too.
-            ccsd_Wakic_kernel<<<bl, th>>>(d_Wakic, d_v_voov, d_v_oovo, d_t1, d_ovvv_t1_ic, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, ccsd_occi?1:0, 0);
-            ccsd_Wakci_kernel<<<bl, th>>>(d_Wakci, d_v_vovo, d_v_oovo, d_t1, d_ovvv_t1_dc, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, ccsd_occi?1:0, 0);
+            ccsd_Wakic_kernel<<<bl, th>>>(d_Wakic, d_v_voov, d_v_oovo, d_t1, d_ovvv_t1_ic, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, ccsd_occi?1:0, ccsd_occi?1:0);
+            ccsd_Wakci_kernel<<<bl, th>>>(d_Wakci, d_v_vovo, d_v_oovo, d_t1, d_ovvv_t1_dc, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, ccsd_occi?1:0, ccsd_occi?1:0);
             // (⑦-2) Wakic/Wakci stay on the device through the ld-sum scatter;
             // downloaded once after ld-sum (below) for the still-host T1/W-exchange.
             if (std::getenv("GANSU_CCSD_P0_VALIDATE") && occi_NG<=1) {   // (DS-3) skip: compact I_0 when occi
@@ -9396,50 +9485,73 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         } else
 #endif
         {
-            // (B-native Inc2) tiled particle-particle ladder — build Wabcd one
-            // a-tile at a time from B_mo, contract with tau, scatter into d_raw.
-            // No nvir⁴ buffer is ever allocated (peak ≈ TA·nvir³ per tile).
-            const int TA = 16;  // a-tile width (memory/throughput knob)
+            // (B-native Inc2 + Cat-A 2D) tiled particle-particle ladder — build
+            // Wabcd one (a-tile × b-tile) block at a time from B_mo, contract with
+            // tau, scatter into d_raw. b-tiling (TB) lets term2 read only
+            // v_ovvv_T[b-tile] (first index) so v_ovvv_T is first-index slab-able.
+            // TB=nvir ⇒ single b-tile ⇒ index-identical to the 1D a-tile ladder
+            // (Stage-1 scaffold, N=1 bit-exact). No nvir⁴ buffer is ever allocated.
+            const int TA = 16;       // a-tile width (output first virtual)
+            // (Stage 2a) b-tile width (output second virtual). TB<nvir exercises the
+            // real 2D striding (bp, b0); 12 gives a partial tile for nvir=32 (12/12/8).
+            // TB=nvir ⇒ 1D-identical (Stage-1 scaffold). Tuned for the v_ovvv_T slab
+            // (Stage 2c). Math is independent of TB ⇒ N=1 stays bit-exact for any TB.
+            const int TB = std::min(12, nvir);
             double *d_vvvv_tile=nullptr, *d_ot1_tile1=nullptr, *d_ot1_tile2=nullptr;
-            double *d_Wtile=nullptr, *d_raw_tile=nullptr, *d_t1_slice=nullptr;
-            tracked_cudaMalloc((void**)&d_vvvv_tile, (size_t)TA*vvv*sizeof(double));
-            tracked_cudaMalloc((void**)&d_ot1_tile1, (size_t)TA*vv*nvir*sizeof(double));
-            tracked_cudaMalloc((void**)&d_ot1_tile2, (size_t)vvv*TA*sizeof(double));
-            tracked_cudaMalloc((void**)&d_Wtile,     (size_t)TA*vvv*sizeof(double));
-            tracked_cudaMalloc((void**)&d_raw_tile,  (size_t)oo*TA*nvir*sizeof(double));
+            double *d_Wtile=nullptr, *d_raw_tile=nullptr, *d_t1_slice=nullptr, *d_t1_sliceb=nullptr;
+            // (Cat-A Stage 2c-B) build v_ovvv_T tiles from B (chem[k,(x',c,d)] = v_ovvv
+            // [k,x,c,d], used transposed in the GEMM ⇒ = v_ovvv_T[x-tile]). No resident
+            // d_v_ovvv_T read; device 0 holds only these two tile scratches.
+            double *d_chem_a=nullptr, *d_chem_b=nullptr;
+            tracked_cudaMalloc((void**)&d_vvvv_tile, (size_t)TA*TB*vv*sizeof(double));
+            tracked_cudaMalloc((void**)&d_ot1_tile1, (size_t)TA*vv*TB*sizeof(double));
+            tracked_cudaMalloc((void**)&d_ot1_tile2, (size_t)TB*vv*TA*sizeof(double));
+            tracked_cudaMalloc((void**)&d_Wtile,     (size_t)TA*TB*vv*sizeof(double));
+            tracked_cudaMalloc((void**)&d_raw_tile,  (size_t)oo*TA*TB*sizeof(double));
             tracked_cudaMalloc((void**)&d_t1_slice,  (size_t)nocc*TA*sizeof(double));
+            tracked_cudaMalloc((void**)&d_t1_sliceb, (size_t)nocc*TB*sizeof(double));
+            tracked_cudaMalloc((void**)&d_chem_a,    (size_t)nocc*TA*vv*sizeof(double));
+            tracked_cudaMalloc((void**)&d_chem_b,    (size_t)nocc*TB*vv*sizeof(double));
             for (int a0 = 0; a0 < nvir; a0 += TA) {
                 int ta = std::min(TA, nvir - a0);
-                // 1. vvvv_tile[(a'b),(cd)] = (a c|b d), a=a0+a'  (Inc1-validated helper)
-                ccsd_block_chem_from_B(eri_ri, B_mo, N, V+a0,ta, V,nvir, V,nvir, V,nvir, d_vvvv_tile);
-                // 2. ot1_tile1[ta·vv, nvir] = v_ovvv_T[a0·vv:, :] × t1   (term1 dressing)
-                gpu::matrixMatrixProductRect(d_v_ovvv_T + (size_t)a0*vv*nocc, d_t1, d_ot1_tile1,
-                                        (int)((size_t)ta*vv), nvir, nocc, false, false, false, 1.0);
-                // 3. ot1_tile2[nvir³, ta] = v_ovvv_T × t1[:, a0:a0+ta]   (term2 dressing)
+                // term2 t1 a-slice (cols a0:a0+ta) — reused across the b-loop
                 cudaMemcpy2D(d_t1_slice, (size_t)ta*sizeof(double),
                              d_t1 + a0, (size_t)nvir*sizeof(double),
                              (size_t)ta*sizeof(double), nocc, cudaMemcpyDeviceToDevice);
-                gpu::matrixMatrixProductRect(d_v_ovvv_T, d_t1_slice, d_ot1_tile2,
-                                        (int)vvv, ta, nocc, false, false, false, 1.0);
-                // 4. Wabcd tile = vvvv_tile - dressing
-                {
-                    size_t tot = (size_t)ta*vvv; int th=256; int bl=(int)((tot+th-1)/th);
-                    build_Wabcd_tile_kernel<<<bl,th>>>(d_vvvv_tile, d_ot1_tile1, d_ot1_tile2, d_Wtile, nvir, ta);
-                }
-                // 5. raw_tile[nij, ta·nvir] = 0.5 · tau[i∈I_d,vv] × Wtile[ta·nvir, vv]^T
-                //    (occ-i) tau rows restricted to this device's i-block (offset
-                //    ib_off, count iblk_n·nocc); full range ⇒ all-ij.
-                gpu::matrixMatrixProductRect(d_tau + ib_off, d_Wtile, d_raw_tile,
-                                        (int)((size_t)iblk_n*nocc), (int)((size_t)ta*nvir), (int)vv, false, true, false, 0.5);
-                // 6. scatter-add tile into raw at the device's i-block rows
-                {
-                    size_t tot = (size_t)iblk_n*nocc*(size_t)ta*nvir; int th=256; int bl=(int)((tot+th-1)/th);
-                    scatter_add_abtile_kernel<<<bl,th>>>(d_raw_tile, d_raw, nocc, nvir, a0, ta,
-                                                         iblk_start*nocc, iblk_n*nocc);
+                // term1 v_ovvv_T a-tile from B: chem_a[k,(a',c,d)] = v_ovvv[k,a,c,d] = (kc|ad)
+                ccsd_block_chem_from_B(eri_ri, B_mo, N, O,nocc, V+a0,ta, V,nvir, V,nvir, d_chem_a);
+                for (int b0 = 0; b0 < nvir; b0 += TB) {
+                    int tb = std::min(TB, nvir - b0);
+                    // 1. vvvv_tile[(a',b'),(c,d)] = (a c|b d), a=a0+a', b=b0+b'
+                    ccsd_block_chem_from_B(eri_ri, B_mo, N, V+a0,ta, V+b0,tb, V,nvir, V,nvir, d_vvvv_tile);
+                    // term2 v_ovvv_T b-tile from B: chem_b[k,(b',c,d)] = v_ovvv[k,b,c,d]
+                    ccsd_block_chem_from_B(eri_ri, B_mo, N, O,nocc, V+b0,tb, V,nvir, V,nvir, d_chem_b);
+                    // 2. term1 ot1_tile1[ta·vv, tb] = (chem_a)^T × t1[:,b0:b0+tb]
+                    //    = v_ovvv_T[a-tile] × t1[:,b-tile]  (transA ⇒ chem^T = v_ovvv_T)
+                    cudaMemcpy2D(d_t1_sliceb, (size_t)tb*sizeof(double),
+                                 d_t1 + b0, (size_t)nvir*sizeof(double),
+                                 (size_t)tb*sizeof(double), nocc, cudaMemcpyDeviceToDevice);
+                    gpu::matrixMatrixProductRect(d_chem_a, d_t1_sliceb, d_ot1_tile1,
+                                            (int)((size_t)ta*vv), tb, nocc, true, false, false, 1.0);
+                    // 3. term2 ot1_tile2[tb·vv, ta] = (chem_b)^T × t1[:,a0:a0+ta]
+                    gpu::matrixMatrixProductRect(d_chem_b, d_t1_slice, d_ot1_tile2,
+                                            (int)((size_t)tb*vv), ta, nocc, true, false, false, 1.0);
+                    // 4. Wabcd 2D tile = vvvv_tile - dressing
+                    { size_t tot=(size_t)ta*tb*vv; int th=256; int bl=(int)((tot+th-1)/th);
+                      build_Wabcd_2dtile_kernel<<<bl,th>>>(d_vvvv_tile, d_ot1_tile1, d_ot1_tile2, d_Wtile, nvir, ta, tb); }
+                    // 5. raw_tile[nij, ta·tb] = 0.5 · tau[i∈I_d,vv] × Wtile[ta·tb, vv]^T
+                    //    (occ-i) tau rows restricted to this device's i-block.
+                    gpu::matrixMatrixProductRect(d_tau + ib_off, d_Wtile, d_raw_tile,
+                                            (int)((size_t)iblk_n*nocc), (int)((size_t)ta*tb), (int)vv, false, true, false, 0.5);
+                    // 6. scatter-add 2D tile into raw at the device's i-block rows
+                    { size_t tot=(size_t)iblk_n*nocc*(size_t)ta*tb; int th=256; int bl=(int)((tot+th-1)/th);
+                      scatter_add_abtile2d_kernel<<<bl,th>>>(d_raw_tile, d_raw, nocc, nvir, a0, ta, b0, tb,
+                                                             iblk_start*nocc, iblk_n*nocc); }
                 }
             }
             tracked_cudaFree(d_vvvv_tile); tracked_cudaFree(d_ot1_tile1); tracked_cudaFree(d_ot1_tile2);
-            tracked_cudaFree(d_Wtile); tracked_cudaFree(d_raw_tile); tracked_cudaFree(d_t1_slice);
+            tracked_cudaFree(d_Wtile); tracked_cudaFree(d_raw_tile); tracked_cudaFree(d_t1_slice); tracked_cudaFree(d_t1_sliceb);
+            tracked_cudaFree(d_chem_a); tracked_cudaFree(d_chem_b);
         }
         }   // close the tiled-ladder else-body (distributed | single-device)
 
@@ -9669,7 +9781,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             }
             size_t zsz = vv * (size_t)iblk_n * nvir;   // = vv·ov when full
             int thz = 256; int blz = (int)((zsz + thz - 1) / thz);
-            ccsd_Zbuild_kernel<<<blz, thz>>>(d_Z, d_v_ovov_c, d_v_voov, d_t1, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, 0);
+            ccsd_Zbuild_kernel<<<blz, thz>>>(d_Z, d_v_ovov_c, d_v_voov, d_t1, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, ccsd_occi?1:0);
             if (std::getenv("GANSU_CCSD_P0_VALIDATE") && occi_NG<=1) {   // (DS-4) compact I_0 when NG>1 ⇒ skip
                 std::vector<real_t> ref(vv*ov, 0.0), dev(vv*ov, 0.0);
                 host_Z(ref);
@@ -9712,7 +9824,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             // (DS-4 device-0 shard) zt1_compact=occi?1:0: Zt1 (d_ovvv_t1) is now the
             // compact I_0 Z×t1 result ⇒ read it compact.
             ccsd_t2_reduced_kernel<<<bl, th>>>(d_raw, d_v_oovv, d_Lki, d_t2v, d_ovvv_t1,
-                                               d_v_vooo, d_t1, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0);
+                                               d_v_vooo, d_t1, nocc, nvir, iblk_start, iblk_n, ccsd_occi?1:0, 0, ccsd_occi?1:0);
             // (P0-3) raw stays on device — symmetrized on-device below (no download).
         } else {
             std::vector<real_t> Zt1_result(vv * oo);
@@ -9761,6 +9873,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         if (ccsd_occi && occi_NG > 1) {
             auto& mgr = MultiGpuManager::instance();
             const int TA = 16;
+            // (Cat-A 2D, Stage 2b) b-tile width — mirrors the device-0 ladder so the
+            // distributed path uses the same 2D Wabcd build. TB=nvir ⇒ 1D-identical.
+            const int TB = std::min(12, nvir);
             const size_t bmo_sz = (size_t)eri_ri->get_num_auxiliary_basis() * (size_t)N * N;
             std::vector<double*> raw_d(occi_NG, nullptr); raw_d[0] = d_raw;
             for (int d = 1; d < occi_NG; d++) {
@@ -9771,7 +9886,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 const size_t iboff = (size_t)ib0*nocc*vv;
                 // per-device broadcast inputs
                 double *p_tau,*p_t2v,*p_t1,*p_Lac,*p_Lki,*p_Zt1,*p_Wakic,*p_Wakci,*p_Wklij;
-                double *p_Bmo,*p_vovvvT,*p_voovv,*p_vvooo,*p_raw;
+                double *p_Bmo,*p_vt_a,*p_vt_b,*p_voovv,*p_vvooo,*p_raw;
+                double *p_voovv_iblk=nullptr;   // (Cat-A §10.10) v_oovv i-block for reduced
                 // (DS-3 C) device d builds its OWN Wakic/Wakci[I_d] (compact) instead
                 // of broadcasting the full arrays from device 0 (which now holds only
                 // I_0). Inputs for the ⑦-1/⑦-2 build are broadcast here.
@@ -9795,12 +9911,17 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 tracked_cudaMalloc((void**)&p_Wakci, (size_t)nocc*ibn*vv*sizeof(double));
                 tracked_cudaMalloc((void**)&p_Wklij, oo*oo*sizeof(double));
                 tracked_cudaMalloc((void**)&p_Bmo,   bmo_sz*sizeof(double));
-                tracked_cudaMalloc((void**)&p_vovvvT,(size_t)vvv*nocc*sizeof(double));
+                // (Cat-A Stage 2c-A) v_ovvv_T NOT replicated on device d≥1 — only the
+                // a-tile/b-tile slices, peer-copied just-in-time from device 0's full
+                // d_v_ovvv_T (contiguous first-index slices). 10.7GB → 2 small tiles.
+                tracked_cudaMalloc((void**)&p_vt_a, (size_t)TA*vv*nocc*sizeof(double));
+                tracked_cudaMalloc((void**)&p_vt_b, (size_t)TB*vv*nocc*sizeof(double));
                 tracked_cudaMalloc((void**)&p_voovv, oo*vv*sizeof(double));
-                tracked_cudaMalloc((void**)&p_vvooo, (size_t)vo*oo*sizeof(double));
+                tracked_cudaMalloc((void**)&p_vvooo, (size_t)vo*ibn*nocc*sizeof(double));   // (Cat-B) compact I_d
                 tracked_cudaMalloc((void**)&p_raw,   t2Size*sizeof(double));
-                tracked_cudaMalloc((void**)&p_v_voov, oo*vv*sizeof(double));
-                tracked_cudaMalloc((void**)&p_v_vovo, (size_t)vo*vo*sizeof(double));
+                // (Phase-1a Cat-B, device-d≥1 I_d shard) v_voov/v_vovo compact (i∈I_d).
+                tracked_cudaMalloc((void**)&p_v_voov, (size_t)vo*ibn*nvir*sizeof(double));
+                tracked_cudaMalloc((void**)&p_v_vovo, (size_t)vo*nvir*ibn*sizeof(double));
                 tracked_cudaMalloc((void**)&p_v_oovo, p_oovo*sizeof(double));
                 tracked_cudaMalloc((void**)&p_ot1ic,  p_ot1*sizeof(double));   // compact I_d
                 tracked_cudaMalloc((void**)&p_ot1dc,  p_ot1*sizeof(double));
@@ -9819,7 +9940,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 tracked_cudaMalloc((void**)&p_Z,           vv*(size_t)ibn*nvir*sizeof(double));
                 tracked_cudaMalloc((void**)&p_ovvv_k,      (size_t)vvv*sizeof(double));
                 tracked_cudaMalloc((void**)&p_ovvv_perm_k, (size_t)vvv*sizeof(double));
-                tracked_cudaMalloc((void**)&p_v_ovov,      OV2*sizeof(double));
+                tracked_cudaMalloc((void**)&p_v_ovov,      (size_t)ov*ibn*nvir*sizeof(double));  // (Phase-1a Cat-B) compact I_d
                 cudaMemcpyPeer(p_tau,   d, (const void*)d_tau,      0, t2Size*sizeof(double));
                 cudaMemcpyPeer(p_t2v,   d, (const void*)d_t2v,      0, t2Size*sizeof(double));
                 cudaMemcpyPeer(p_t1,    d, (const void*)d_t1,       0, t1Size*sizeof(double));
@@ -9828,14 +9949,32 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 // (DS-4 C) p_Zt1 is NOT broadcast — device d builds Z[I_d]→Zt1[I_d] itself.
                 cudaMemcpyPeer(p_Wklij, d, (const void*)d_Wklij,    0, oo*oo*sizeof(double));
                 cudaMemcpyPeer(p_Bmo,   d, (const void*)B_mo,       0, bmo_sz*sizeof(double));
-                cudaMemcpyPeer(p_vovvvT,d, (const void*)d_v_ovvv_T, 0, (size_t)vvv*nocc*sizeof(double));
+                // (Cat-A Stage 2c-A) p_vt_a/p_vt_b are peer-copied per-tile inside the
+                // ladder (not the full v_ovvv_T here).
                 cudaMemcpyPeer(p_voovv, d, (const void*)d_v_oovv,   0, oo*vv*sizeof(double));
-                cudaMemcpyPeer(p_vvooo, d, (const void*)d_v_vooo,   0, (size_t)vo*oo*sizeof(double));
-                cudaMemcpyPeer(p_v_voov,d, (const void*)d_v_voov,   0, oo*vv*sizeof(double));
-                cudaMemcpyPeer(p_v_vovo,d, (const void*)d_v_vovo,   0, (size_t)vo*vo*sizeof(double));
+                // (Cat-B v_vooo) device d builds its I_d block via strided host copy
+                // (device 0's d_v_vooo is now only I_0 ∴ not a peer source). (a,k) rows ×
+                // (i,j) cols, I_d = ibn·nocc cols at src offset ib0·nocc.
+                cudaMemcpy2D(p_vvooo, (size_t)ibn*nocc*sizeof(double),
+                             v_vooo.data() + (size_t)ib0*nocc, oo*sizeof(double),
+                             (size_t)ibn*nocc*sizeof(double), (size_t)vo, cudaMemcpyHostToDevice);
+                // (Phase-1a Cat-B, device-d≥1 I_d shard) v_voov/v_vovo/v_ovov are no
+                // longer peer-copied from device 0 (which now holds only I_0). Each device
+                // fills its OWN I_d block via a strided cudaMemcpy2D from the host vector
+                // (data == device-0's source ⇒ bit-exact). v_voov[a,k,i,c]/v_ovov[k,b,i,c]:
+                // (row) × (i,c) cols, I_d = ibn·nvir cols at src offset ib0·nvir. v_vovo
+                // [a,k,c,i] (i innermost): (a,k,c) rows of nocc each, I_d = ibn at offset ib0.
+                cudaMemcpy2D(p_v_voov, (size_t)ibn*nvir*sizeof(double),
+                             v_voov.data() + (size_t)ib0*nvir, ov*sizeof(double),
+                             (size_t)ibn*nvir*sizeof(double), (size_t)nvir*nocc, cudaMemcpyHostToDevice);
+                cudaMemcpy2D(p_v_vovo, (size_t)ibn*sizeof(double),
+                             v_vovo.data() + (size_t)ib0, (size_t)nocc*sizeof(double),
+                             (size_t)ibn*sizeof(double), (size_t)nvir*nocc*nvir, cudaMemcpyHostToDevice);
                 cudaMemcpyPeer(p_v_oovo,d, (const void*)d_v_oovo,   0, p_oovo*sizeof(double));
                 // (DS-4 C) p_ot1ic/dc are NOT broadcast — device d builds them (⑥) itself.
-                cudaMemcpyPeer(p_v_ovov,d, (const void*)d_v_ovov_c, 0, OV2*sizeof(double));
+                cudaMemcpy2D(p_v_ovov, (size_t)ibn*nvir*sizeof(double),
+                             v_ovov.data() + (size_t)ib0*nvir, ov*sizeof(double),
+                             (size_t)ibn*nvir*sizeof(double), (size_t)nocc*nvir, cudaMemcpyHostToDevice);
                 // (VR-tile Stage 3) broadcast p_w_oovv (for per-block W_R build) instead
                 // of the 3 full V_R/W_R/V_R2; v_oovv is already in p_voovv.
                 if (vr_tile) {
@@ -9846,14 +9985,15 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                     cudaMemcpyPeer(p_V_R2,  d, (const void*)d_V_R2,     0, OV2*sizeof(double));
                 }
                 cudaMemset(p_raw, 0, t2Size*sizeof(double));
-                // per-device scratch
-                double *t_vvvv,*t_ot1,*t_ot2,*t_W,*t_rawt,*t_t1s,*t_WklijT,*t_WexA,*t_WexB,*t_WexC1,*t_WexC2;
-                tracked_cudaMalloc((void**)&t_vvvv, (size_t)TA*vvv*sizeof(double));
-                tracked_cudaMalloc((void**)&t_ot1,  (size_t)TA*vv*nvir*sizeof(double));
-                tracked_cudaMalloc((void**)&t_ot2,  (size_t)vvv*TA*sizeof(double));
-                tracked_cudaMalloc((void**)&t_W,    (size_t)TA*vvv*sizeof(double));
-                tracked_cudaMalloc((void**)&t_rawt, (size_t)oo*TA*nvir*sizeof(double));
+                // per-device scratch (Cat-A 2D: tiles sized TA·TB, +t_t1sb for term1 b-slice)
+                double *t_vvvv,*t_ot1,*t_ot2,*t_W,*t_rawt,*t_t1s,*t_t1sb,*t_WklijT,*t_WexA,*t_WexB,*t_WexC1,*t_WexC2;
+                tracked_cudaMalloc((void**)&t_vvvv, (size_t)TA*TB*vv*sizeof(double));
+                tracked_cudaMalloc((void**)&t_ot1,  (size_t)TA*vv*TB*sizeof(double));
+                tracked_cudaMalloc((void**)&t_ot2,  (size_t)TB*vv*TA*sizeof(double));
+                tracked_cudaMalloc((void**)&t_W,    (size_t)TA*TB*vv*sizeof(double));
+                tracked_cudaMalloc((void**)&t_rawt, (size_t)oo*TA*TB*sizeof(double));
                 tracked_cudaMalloc((void**)&t_t1s,  (size_t)nocc*TA*sizeof(double));
+                tracked_cudaMalloc((void**)&t_t1sb, (size_t)nocc*TB*sizeof(double));
                 tracked_cudaMalloc((void**)&t_WklijT, oo*oo*sizeof(double));
                 // (occ-i Wex shard) A/C1/C2 are i-block COMPACT (nvir·ibn rows);
                 // B (t2 reshape) is i-independent ⇒ full OV2. This is where the
@@ -9886,8 +10026,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 }
                 { int th=256; int blw=(int)(((size_t)nocc*ibn*vv+th-1)/th);
                   // (DS-4 C) ovt1_compact=1: p_ot1ic/dc are the device-d compact I_d build.
-                  ccsd_Wakic_kernel<<<blw,th>>>(p_Wakic, p_v_voov, p_v_oovo, p_t1, p_ot1ic, nocc, nvir, ib0, ibn, 1, 1, 0);
-                  ccsd_Wakci_kernel<<<blw,th>>>(p_Wakci, p_v_vovo, p_v_oovo, p_t1, p_ot1dc, nocc, nvir, ib0, ibn, 1, 1, 0);
+                  ccsd_Wakic_kernel<<<blw,th>>>(p_Wakic, p_v_voov, p_v_oovo, p_t1, p_ot1ic, nocc, nvir, ib0, ibn, 1, 1, 1);
+                  ccsd_Wakci_kernel<<<blw,th>>>(p_Wakci, p_v_vovo, p_v_oovo, p_t1, p_ot1dc, nocc, nvir, ib0, ibn, 1, 1, 1);
                   int blr=(int)(((size_t)ov*nvir*ibn+th-1)/th);
                   ccsd_ldsum_reshape_kernel<<<blr,th>>>(t_WexB, t_WexA, p_t2v, p_t1, nocc, nvir, ib0, ibn);
                   int Mia=(int)((size_t)nvir*ibn);
@@ -9914,21 +10054,51 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                   int bls=(int)(((size_t)nocc*ibn*vv+th-1)/th);
                   ccsd_wakic_ldsum_scatter_kernel<<<bls,th>>>(p_Wakic, t_WexC1, nocc, nvir, ib0, ibn, 1);
                   ccsd_wakci_ldsum_scatter_kernel<<<bls,th>>>(p_Wakci, t_WexC2, nocc, nvir, ib0, ibn, 1); }
-                // ⑨ ladder (single-device tiled, this device's i-block)
+                // (Cat-A §10.10 temporal free) p_w_oovv (oo·vv) + V_R-build scratch are
+                // used ONLY by the vr_block above (their last use). Free them now — before
+                // the ladder/reduced phase peak — instead of at the loop end. Set to null
+                // so the end-of-loop free skips them. Math-inert ⇒ bit-exact.
+                if (p_w_oovv) { tracked_cudaFree(p_w_oovv); p_w_oovv = nullptr; }
+                if (p_vr_blk) { tracked_cudaFree(p_vr_blk); p_vr_blk = nullptr; }
+                if (p_c_blk)  { tracked_cudaFree(p_c_blk);  p_c_blk  = nullptr; }
+                // (Cat-A §10.10 v_oovv dual-use) the full p_voovv is read only by the
+                // vr_block above; the reduced kernel needs just the i-block (i leading ⇒
+                // contiguous I_d slice). Copy it compact and free the full ⇒ removes
+                // ~oo·vv·(1−1/N) from the ladder/reduced peak. Math-inert ⇒ bit-exact.
+                tracked_cudaMalloc((void**)&p_voovv_iblk, (size_t)ibn*nocc*vv*sizeof(double));
+                cudaMemcpy(p_voovv_iblk, p_voovv + (size_t)ib0*nocc*vv,
+                           (size_t)ibn*nocc*vv*sizeof(double), cudaMemcpyDeviceToDevice);
+                tracked_cudaFree(p_voovv); p_voovv = nullptr;
+                // ⑨ ladder (Cat-A 2D a-tile × b-tile, this device's i-block). v_ovvv_T
+                // is NOT resident on device d≥1 (Stage 2c-B'): term1/term2 build the
+                // chem tile from p_Bmo (chem[k,(x',c,d)] = v_ovvv[k,x,c,d]) and use it
+                // transposed (transA ⇒ chem^T = v_ovvv_T[x-tile]). No peer-copy from
+                // device 0 ⇒ device d≥1 holds no v_ovvv_T at all. p_vt_a (a-tile chem)
+                // is hoisted (once per a-tile); p_vt_b (b-tile chem) per (a,b).
                 for (int a0 = 0; a0 < nvir; a0 += TA) {
                     int ta = std::min(TA, nvir - a0);
-                    ccsd_block_chem_from_B(eri_ri, p_Bmo, N, V+a0,ta, V,nvir, V,nvir, V,nvir, t_vvvv);
-                    gpu::matrixMatrixProductRect(p_vovvvT + (size_t)a0*vv*nocc, p_t1, t_ot1,
-                                            (int)((size_t)ta*vv), nvir, nocc, false, false, false, 1.0);
                     cudaMemcpy2D(t_t1s, (size_t)ta*sizeof(double), p_t1 + a0, (size_t)nvir*sizeof(double),
                                  (size_t)ta*sizeof(double), nocc, cudaMemcpyDeviceToDevice);
-                    gpu::matrixMatrixProductRect(p_vovvvT, t_t1s, t_ot2, (int)vvv, ta, nocc, false, false, false, 1.0);
-                    { size_t tt=(size_t)ta*vvv; int th=256; int bl=(int)((tt+th-1)/th);
-                      build_Wabcd_tile_kernel<<<bl,th>>>(t_vvvv, t_ot1, t_ot2, t_W, nvir, ta); }
-                    gpu::matrixMatrixProductRect(p_tau + iboff, t_W, t_rawt,
-                                            (int)((size_t)ibn*nocc), (int)((size_t)ta*nvir), (int)vv, false, true, false, 0.5);
-                    { size_t tt=(size_t)ibn*nocc*(size_t)ta*nvir; int th=256; int bl=(int)((tt+th-1)/th);
-                      scatter_add_abtile_kernel<<<bl,th>>>(t_rawt, p_raw, nocc, nvir, a0, ta, ib0*nocc, ibn*nocc); }
+                    // term1 v_ovvv_T a-tile from B: p_vt_a[k,(a',c,d)] = v_ovvv[k,a,c,d]
+                    ccsd_block_chem_from_B(eri_ri, p_Bmo, N, O,nocc, V+a0,ta, V,nvir, V,nvir, p_vt_a);
+                    for (int b0 = 0; b0 < nvir; b0 += TB) {
+                        int tb = std::min(TB, nvir - b0);
+                        ccsd_block_chem_from_B(eri_ri, p_Bmo, N, V+a0,ta, V+b0,tb, V,nvir, V,nvir, t_vvvv);
+                        cudaMemcpy2D(t_t1sb, (size_t)tb*sizeof(double), p_t1 + b0, (size_t)nvir*sizeof(double),
+                                     (size_t)tb*sizeof(double), nocc, cudaMemcpyDeviceToDevice);
+                        // term2 v_ovvv_T b-tile from B: p_vt_b[k,(b',c,d)] = v_ovvv[k,b,c,d]
+                        ccsd_block_chem_from_B(eri_ri, p_Bmo, N, O,nocc, V+b0,tb, V,nvir, V,nvir, p_vt_b);
+                        gpu::matrixMatrixProductRect(p_vt_a, t_t1sb, t_ot1,
+                                                (int)((size_t)ta*vv), tb, nocc, true, false, false, 1.0);
+                        gpu::matrixMatrixProductRect(p_vt_b, t_t1s, t_ot2,
+                                                (int)((size_t)tb*vv), ta, nocc, true, false, false, 1.0);
+                        { size_t tt=(size_t)ta*tb*vv; int th=256; int bl=(int)((tt+th-1)/th);
+                          build_Wabcd_2dtile_kernel<<<bl,th>>>(t_vvvv, t_ot1, t_ot2, t_W, nvir, ta, tb); }
+                        gpu::matrixMatrixProductRect(p_tau + iboff, t_W, t_rawt,
+                                                (int)((size_t)ibn*nocc), (int)((size_t)ta*tb), (int)vv, false, true, false, 0.5);
+                        { size_t tt=(size_t)ibn*nocc*(size_t)ta*tb; int th=256; int bl=(int)((tt+th-1)/th);
+                          scatter_add_abtile2d_kernel<<<bl,th>>>(t_rawt, p_raw, nocc, nvir, a0, ta, b0, tb, ib0*nocc, ibn*nocc); }
+                    }
                 }
                 // ⑨ Wklij×tau
                 { size_t tt=oo*oo; int th=256; int bl=(int)((tt+th-1)/th);
@@ -9966,16 +10136,18 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                              v_vvov.data() + (size_t)ib0*nvir, ov*sizeof(double),
                              (size_t)ibn*nvir*sizeof(double), vv, cudaMemcpyHostToDevice);
                 { size_t zsz=vv*(size_t)ibn*nvir; int thz=256; int blz=(int)((zsz+thz-1)/thz);
-                  ccsd_Zbuild_kernel<<<blz,thz>>>(p_Z, p_v_ovov, p_v_voov, p_t1, nocc, nvir, ib0, ibn, 1, 0); }
+                  ccsd_Zbuild_kernel<<<blz,thz>>>(p_Z, p_v_ovov, p_v_voov, p_t1, nocc, nvir, ib0, ibn, 1, 1); }
                 gpu::matrixMatrixProductRect(p_Z, p_t1, p_Zt1, (int)((size_t)vv*ibn), nocc, nvir, false, true, false, 1.0);
                 // ⑪ reduced
                 { int th=256; size_t tt=(size_t)ibn*nocc*vv; int bl=(int)((tt+th-1)/th);
-                  ccsd_t2_reduced_kernel<<<bl,th>>>(p_raw, p_voovv, p_Lki, p_t2v, p_Zt1, p_vvooo, p_t1, nocc, nvir, ib0, ibn, 1); }
+                  ccsd_t2_reduced_kernel<<<bl,th>>>(p_raw, p_voovv_iblk, p_Lki, p_t2v, p_Zt1, p_vvooo, p_t1, nocc, nvir, ib0, ibn, 1, 1, 1); }
                 // free broadcast inputs + scratch (keep p_raw for AllReduce)
                 tracked_cudaFree(p_tau); tracked_cudaFree(p_t2v); tracked_cudaFree(p_t1);
                 tracked_cudaFree(p_Lac); tracked_cudaFree(p_Lki); tracked_cudaFree(p_Zt1);
                 tracked_cudaFree(p_Wakic); tracked_cudaFree(p_Wakci); tracked_cudaFree(p_Wklij);
-                tracked_cudaFree(p_Bmo); tracked_cudaFree(p_vovvvT); tracked_cudaFree(p_voovv); tracked_cudaFree(p_vvooo);
+                tracked_cudaFree(p_Bmo); tracked_cudaFree(p_vt_a); tracked_cudaFree(p_vt_b); tracked_cudaFree(p_vvooo);
+                if (p_voovv) tracked_cudaFree(p_voovv);   // freed early (dual-use); guard
+                if (p_voovv_iblk) tracked_cudaFree(p_voovv_iblk);
                 tracked_cudaFree(p_v_voov); tracked_cudaFree(p_v_vovo); tracked_cudaFree(p_v_oovo);
                 tracked_cudaFree(p_ot1ic); tracked_cudaFree(p_ot1dc);
                 tracked_cudaFree(p_Z); tracked_cudaFree(p_ovvv_k); tracked_cudaFree(p_ovvv_perm_k); tracked_cudaFree(p_v_ovov);
@@ -9984,7 +10156,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 if (p_vr_blk) tracked_cudaFree(p_vr_blk);
                 if (p_c_blk)  tracked_cudaFree(p_c_blk);
                 tracked_cudaFree(t_vvvv); tracked_cudaFree(t_ot1); tracked_cudaFree(t_ot2);
-                tracked_cudaFree(t_W); tracked_cudaFree(t_rawt); tracked_cudaFree(t_t1s); tracked_cudaFree(t_WklijT);
+                tracked_cudaFree(t_W); tracked_cudaFree(t_rawt); tracked_cudaFree(t_t1s); tracked_cudaFree(t_t1sb); tracked_cudaFree(t_WklijT);
                 tracked_cudaFree(t_WexA); tracked_cudaFree(t_WexB); tracked_cudaFree(t_WexC1); tracked_cudaFree(t_WexC2);
                 raw_d[d] = p_raw;
             }
