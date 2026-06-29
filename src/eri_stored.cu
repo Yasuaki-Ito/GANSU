@@ -8094,6 +8094,24 @@ __global__ void build_Wabcd_2dtile_kernel(const double* __restrict__ vvvv_tile,
         - ot1_tile2[((size_t)bp*vv + (size_t)c*nvir + d)*ta + ap];
 }
 
+// (resident nvir⁴) Copy the (a-tile × b-tile) slice of the resident d_v_vvvv
+// [a,b,c,d] = (ac|bd) into the tile buffer t_vvvv[(a',b'),(c,d)], replacing the
+// per-tile ccsd_block_chem_from_B (the loop-invariant (ac|bd) is built once). The
+// slice value equals exactly what the per-tile block_chem produces ⇒ bit-exact.
+__global__ void ccsd_vvvv_slice_kernel(const double* __restrict__ d_vvvv,
+                                       double* __restrict__ t_vvvv,
+                                       int nvir, int a0, int ta, int b0, int tb) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t vv = (size_t)nvir * nvir;
+    size_t total = (size_t)ta * tb * vv;
+    if (gid >= total) return;
+    int d = (int)(gid % nvir); size_t r = gid / nvir;
+    int c = (int)(r % nvir); r /= nvir;
+    int bp = (int)(r % tb);
+    int ap = (int)(r / tb);
+    t_vvvv[gid] = d_vvvv[(((size_t)(a0+ap)*nvir + (b0+bp))*nvir + c)*nvir + d];
+}
+
 // (Cat-A v_ovvv_T 2D slab) scatter a (nij × ta·tb) ladder tile into raw at output
 // (a0+a', b0+b'). b0=0, tb=nvir ⇒ index-identical to scatter_add_abtile_kernel.
 //   raw[(ij0+lij), (a0+ap)·nvir + (b0+bp)] += raw_tile[lij·(ta·tb) + ap·tb + bp]
@@ -8480,7 +8498,17 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     }
     const bool vt_needed = (!use_tiled_ladder) || vt_dist || vt_resident;
     const size_t sz_v_ovvv_T = vt_needed ? vvv*nocc : (size_t)1, sz_t1 = t1Size, sz_ovvv_t1 = use_tiled_ladder ? (ccsd_occi ? vv*(size_t)iblk_n0*nocc : t2Size) : std::max(vvv*std::max((size_t)nvir,(size_t)nocc), t2Size);
-    const size_t sz_v_vvvv = use_tiled_ladder ? (size_t)1 : vv*vv, sz_Fac = vv, sz_Fkc = ov;
+    // (resident nvir⁴) The tiled ladder rebuilds the (ac|bd) tile from B every (a,b)
+    // tile every iter — the dominant CCSD re-solve cost (the integral is t1-independent
+    // ⇒ loop-invariant). When nvir⁴ fits, build d_v_vvvv ONCE (resident) and read tile
+    // slices from it (no per-tile block_chem). Auto by free-mem probe; env override.
+    bool nv4_resident = false;
+    if (use_tiled_ladder) {
+        const char* e_nv = std::getenv("GANSU_CCSD_VVVV_RESIDENT");
+        if (e_nv) nv4_resident = (e_nv[0] == '1');
+        else { size_t fb=0,tb=0; cudaMemGetInfo(&fb,&tb); nv4_resident = ((size_t)vv*vv*sizeof(double)*2 < fb); }
+    }
+    const size_t sz_v_vvvv = (use_tiled_ladder && !nv4_resident) ? (size_t)1 : vv*vv, sz_Fac = vv, sz_Fkc = ov;
     const size_t sz_t2v = t2Size, sz_Lac = vv, sz_Z = ccsd_occi ? vv*(size_t)iblk_n0*nvir : vv*ov;
     const size_t sz_Wex = OV2;  // each of B, V_R, W_R, V_R2 (i-independent floor)
     // (DS-5 device-0 Wex shard) WexA/C1/C2 hold i-block COMPACT data (nvir·iblk_n rows
@@ -8565,8 +8593,13 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // v_vvvv: v(V+a, V+b, V+c, V+d) → d_v_vvvv (largest: nvir⁴)
     // (B-native) build d_v_vvvv ONCE from B_mo (resident). Skipped only when the
     // opt-in tiled ladder rebuilds vvvv per-iter (huge systems that can't hold nvir⁴).
+    // (resident nvir⁴) When the tiled ladder runs but nvir⁴ fits, also build it once
+    // here (same ccsd_block_chem_from_B the per-tile path uses ⇒ slices are bit-exact),
+    // so the ladder reads tile slices instead of rebuilding (ac|bd) every iter.
     if (!use_tiled_ladder)
         extract_block(d_v_vvvv, N, V,nvir, V,nvir, V,nvir, V,nvir);
+    else if (nv4_resident && ri_bnative)
+        ccsd_block_chem_from_B(eri_ri, B_mo, N, V,nvir, V,nvir, V,nvir, V,nvir, d_v_vvvv);
     // v_oovv and w_oovv → d_v_oovv, d_w_oovv
     extract_block(d_v_oovv, N, O,nocc, O,nocc, V,nvir, V,nvir);
     if (ri_bnative) {
@@ -8821,6 +8854,23 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // (DS-3) ccsd_occi/occi_NG/iblk_n0 are decided above (moved before the carve so
     // d_Wakic/d_Wakci can be sized compact). The device loop gate (ccsd_occi &&
     // occi_NG>1) and the per-device i-block (occi_split) are applied below.
+
+    // (resident nvir⁴, Step 2) When occi distributes the residual and nvir⁴ fits,
+    // each device d≥1 also needs the loop-invariant d_v_vvvv. Peer-copy device 0's
+    // resident copy to each device ONCE here (persistent across all iters) so the
+    // occi loop reads tile slices instead of rebuilding (ac|bd) from B every iter.
+    std::vector<double*> p_vvvv_dev;
+#ifdef GANSU_MULTI_GPU
+    if (nv4_resident && ccsd_occi && occi_NG > 1) {
+        p_vvvv_dev.assign(occi_NG, nullptr);
+        for (int d = 1; d < occi_NG; d++) {
+            MultiGpuManager::DeviceGuard g(d);
+            tracked_cudaMalloc((void**)&p_vvvv_dev[d], (size_t)vv*vv*sizeof(double));
+            cudaMemcpyPeer(p_vvvv_dev[d], d, (const void*)d_v_vvvv, 0, (size_t)vv*vv*sizeof(double));
+        }
+        cudaSetDevice(0); gpu::GPUHandle::reset();
+    }
+#endif
 
     for (int iter = 1; iter <= MAX_ITER; iter++) {
 
@@ -9547,8 +9597,14 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                     ccsd_block_chem_from_B(eri_ri, B_mo, N, O,nocc, V+a0,ta, V,nvir, V,nvir, d_chem_a);
                 for (int b0 = 0; b0 < nvir; b0 += TB) {
                     int tb = std::min(TB, nvir - b0);
-                    // 1. vvvv_tile[(a',b'),(c,d)] = (a c|b d), a=a0+a', b=b0+b'
-                    ccsd_block_chem_from_B(eri_ri, B_mo, N, V+a0,ta, V+b0,tb, V,nvir, V,nvir, d_vvvv_tile);
+                    // 1. vvvv_tile[(a',b'),(c,d)] = (a c|b d), a=a0+a', b=b0+b'.
+                    //    (resident nvir⁴) slice from d_v_vvvv (built once) instead of
+                    //    rebuilding from B every iter; else build the tile from B.
+                    if (nv4_resident) {
+                        size_t tot=(size_t)ta*tb*vv; int th=256; int bl=(int)((tot+th-1)/th);
+                        ccsd_vvvv_slice_kernel<<<bl,th>>>(d_v_vvvv, d_vvvv_tile, nvir, a0, ta, b0, tb);
+                    } else
+                        ccsd_block_chem_from_B(eri_ri, B_mo, N, V+a0,ta, V+b0,tb, V,nvir, V,nvir, d_vvvv_tile);
                     // term2 v_ovvv_T b-tile from B (only when not resident)
                     if (!vt_resident)
                         ccsd_block_chem_from_B(eri_ri, B_mo, N, O,nocc, V+b0,tb, V,nvir, V,nvir, d_chem_b);
@@ -10124,7 +10180,13 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                         ccsd_block_chem_from_B(eri_ri, p_Bmo, N, O,nocc, V+a0,ta, V,nvir, V,nvir, p_vt_a);
                     for (int b0 = 0; b0 < nvir; b0 += TB) {
                         int tb = std::min(TB, nvir - b0);
-                        ccsd_block_chem_from_B(eri_ri, p_Bmo, N, V+a0,ta, V+b0,tb, V,nvir, V,nvir, t_vvvv);
+                        // (resident nvir⁴, Step 2) slice from this device's persistent
+                        // d_v_vvvv (peer-copied once) instead of rebuilding from B.
+                        if (nv4_resident && !p_vvvv_dev.empty() && p_vvvv_dev[d]) {
+                            size_t tot=(size_t)ta*tb*vv; int th=256; int bl=(int)((tot+th-1)/th);
+                            ccsd_vvvv_slice_kernel<<<bl,th>>>(p_vvvv_dev[d], t_vvvv, nvir, a0, ta, b0, tb);
+                        } else
+                            ccsd_block_chem_from_B(eri_ri, p_Bmo, N, V+a0,ta, V+b0,tb, V,nvir, V,nvir, t_vvvv);
                         cudaMemcpy2D(t_t1sb, (size_t)tb*sizeof(double), p_t1 + b0, (size_t)nvir*sizeof(double),
                                      (size_t)tb*sizeof(double), nocc, cudaMemcpyDeviceToDevice);
                         // term2 v_ovvv_T b-tile from B (only when not resident)
@@ -10301,6 +10363,13 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             break;
         }
     }
+
+    // (resident nvir⁴, Step 2) free the per-device d_v_vvvv replicas.
+#ifdef GANSU_MULTI_GPU
+    for (int d = 1; d < (int)p_vvvv_dev.size(); d++)
+        if (p_vvvv_dev[d]) { MultiGpuManager::DeviceGuard g(d); tracked_cudaFree(p_vvvv_dev[d]); }
+    if (!p_vvvv_dev.empty()) { cudaSetDevice(0); gpu::GPUHandle::reset(); }
+#endif
 
     // Optionally copy converged T1/T2 to new device allocations for EOM-CCSD
     if (d_t1_out) {
