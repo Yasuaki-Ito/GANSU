@@ -8457,7 +8457,28 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
       if (use_tiled_ladder && ri_bnative && e_mg && e_mg[0]=='1' && MultiGpuManager::instance().num_devices()>1)
           vt_dist = true; }
 #endif
-    const bool vt_needed = (!use_tiled_ladder) || vt_dist;
+    // (Cat-A v_ovvv_T fast-path knob) When v_ovvv_T (vvv·nocc) fits in free device
+    // memory, keep it RESIDENT and read it directly in the tiled ladder (transA=false,
+    // fast) instead of rebuilding each tile from B (transA=true, memory-saving but slow
+    // per-tile block_chem). Both paths are bit-exact (same values into the GEMM). Auto
+    // by a free-memory probe; env GANSU_CCSD_VT_RESIDENT=1/0 overrides. The non-tiled /
+    // MULTIGPU paths always read the resident buffer.
+    bool vt_resident = true;
+    if (use_tiled_ladder) {
+        const char* e_vr = std::getenv("GANSU_CCSD_VT_RESIDENT");
+        if (e_vr) vt_resident = (e_vr[0] == '1');
+        else {
+            size_t freeb = 0, totalb = 0; cudaMemGetInfo(&freeb, &totalb);
+            // resident needs v_ovvv_T on device 0 (+ broadcast room on d≥1); 2× margin.
+            vt_resident = ((size_t)vvv*nocc*sizeof(double)*2 < freeb);
+        }
+        size_t freeb=0,totalb=0; cudaMemGetInfo(&freeb,&totalb);
+        std::cout << "  [CCSD ladder] v_ovvv_T " << (vt_resident ? "RESIDENT (fast)" : "build-from-B (mem)")
+                  << " | free=" << (freeb>>30) << "GB v_ovvv_T=" << ((vvv*nocc*sizeof(double))>>30)
+                  << "GB nvir^4=" << ((vv*vv*sizeof(double))>>30) << "GB (fits="
+                  << ((vv*vv*sizeof(double)*2 < freeb)?"Y":"N") << ")" << std::endl;
+    }
+    const bool vt_needed = (!use_tiled_ladder) || vt_dist || vt_resident;
     const size_t sz_v_ovvv_T = vt_needed ? vvv*nocc : (size_t)1, sz_t1 = t1Size, sz_ovvv_t1 = use_tiled_ladder ? (ccsd_occi ? vv*(size_t)iblk_n0*nocc : t2Size) : std::max(vvv*std::max((size_t)nvir,(size_t)nocc), t2Size);
     const size_t sz_v_vvvv = use_tiled_ladder ? (size_t)1 : vv*vv, sz_Fac = vv, sz_Fkc = ov;
     const size_t sz_t2v = t2Size, sz_Lac = vv, sz_Z = ccsd_occi ? vv*(size_t)iblk_n0*nvir : vv*ov;
@@ -9499,9 +9520,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             const int TB = std::min(12, nvir);
             double *d_vvvv_tile=nullptr, *d_ot1_tile1=nullptr, *d_ot1_tile2=nullptr;
             double *d_Wtile=nullptr, *d_raw_tile=nullptr, *d_t1_slice=nullptr, *d_t1_sliceb=nullptr;
-            // (Cat-A Stage 2c-B) build v_ovvv_T tiles from B (chem[k,(x',c,d)] = v_ovvv
-            // [k,x,c,d], used transposed in the GEMM ⇒ = v_ovvv_T[x-tile]). No resident
-            // d_v_ovvv_T read; device 0 holds only these two tile scratches.
+            // (Cat-A Stage 2c-B / fast-path) term1/term2 read v_ovvv_T either RESIDENT
+            // (d_v_ovvv_T + offset, transA=false, fast) or built per-tile from B (chem[k,
+            // (x',c,d)] = v_ovvv[k,x,c,d], transposed ⇒ v_ovvv_T[x-tile], transA=true,
+            // memory-saving). vt_resident selects; both bit-exact.
             double *d_chem_a=nullptr, *d_chem_b=nullptr;
             tracked_cudaMalloc((void**)&d_vvvv_tile, (size_t)TA*TB*vv*sizeof(double));
             tracked_cudaMalloc((void**)&d_ot1_tile1, (size_t)TA*vv*TB*sizeof(double));
@@ -9510,32 +9532,43 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             tracked_cudaMalloc((void**)&d_raw_tile,  (size_t)oo*TA*TB*sizeof(double));
             tracked_cudaMalloc((void**)&d_t1_slice,  (size_t)nocc*TA*sizeof(double));
             tracked_cudaMalloc((void**)&d_t1_sliceb, (size_t)nocc*TB*sizeof(double));
-            tracked_cudaMalloc((void**)&d_chem_a,    (size_t)nocc*TA*vv*sizeof(double));
-            tracked_cudaMalloc((void**)&d_chem_b,    (size_t)nocc*TB*vv*sizeof(double));
+            if (!vt_resident) {
+                tracked_cudaMalloc((void**)&d_chem_a, (size_t)nocc*TA*vv*sizeof(double));
+                tracked_cudaMalloc((void**)&d_chem_b, (size_t)nocc*TB*vv*sizeof(double));
+            }
             for (int a0 = 0; a0 < nvir; a0 += TA) {
                 int ta = std::min(TA, nvir - a0);
                 // term2 t1 a-slice (cols a0:a0+ta) — reused across the b-loop
                 cudaMemcpy2D(d_t1_slice, (size_t)ta*sizeof(double),
                              d_t1 + a0, (size_t)nvir*sizeof(double),
                              (size_t)ta*sizeof(double), nocc, cudaMemcpyDeviceToDevice);
-                // term1 v_ovvv_T a-tile from B: chem_a[k,(a',c,d)] = v_ovvv[k,a,c,d] = (kc|ad)
-                ccsd_block_chem_from_B(eri_ri, B_mo, N, O,nocc, V+a0,ta, V,nvir, V,nvir, d_chem_a);
+                // term1 v_ovvv_T a-tile from B (only when not resident): chem_a[k,(a',c,d)]
+                if (!vt_resident)
+                    ccsd_block_chem_from_B(eri_ri, B_mo, N, O,nocc, V+a0,ta, V,nvir, V,nvir, d_chem_a);
                 for (int b0 = 0; b0 < nvir; b0 += TB) {
                     int tb = std::min(TB, nvir - b0);
                     // 1. vvvv_tile[(a',b'),(c,d)] = (a c|b d), a=a0+a', b=b0+b'
                     ccsd_block_chem_from_B(eri_ri, B_mo, N, V+a0,ta, V+b0,tb, V,nvir, V,nvir, d_vvvv_tile);
-                    // term2 v_ovvv_T b-tile from B: chem_b[k,(b',c,d)] = v_ovvv[k,b,c,d]
-                    ccsd_block_chem_from_B(eri_ri, B_mo, N, O,nocc, V+b0,tb, V,nvir, V,nvir, d_chem_b);
-                    // 2. term1 ot1_tile1[ta·vv, tb] = (chem_a)^T × t1[:,b0:b0+tb]
-                    //    = v_ovvv_T[a-tile] × t1[:,b-tile]  (transA ⇒ chem^T = v_ovvv_T)
+                    // term2 v_ovvv_T b-tile from B (only when not resident)
+                    if (!vt_resident)
+                        ccsd_block_chem_from_B(eri_ri, B_mo, N, O,nocc, V+b0,tb, V,nvir, V,nvir, d_chem_b);
+                    // 2. term1 ot1_tile1[ta·vv, tb] = v_ovvv_T[a-tile] × t1[:,b-tile]
                     cudaMemcpy2D(d_t1_sliceb, (size_t)tb*sizeof(double),
                                  d_t1 + b0, (size_t)nvir*sizeof(double),
                                  (size_t)tb*sizeof(double), nocc, cudaMemcpyDeviceToDevice);
-                    gpu::matrixMatrixProductRect(d_chem_a, d_t1_sliceb, d_ot1_tile1,
-                                            (int)((size_t)ta*vv), tb, nocc, true, false, false, 1.0);
-                    // 3. term2 ot1_tile2[tb·vv, ta] = (chem_b)^T × t1[:,a0:a0+ta]
-                    gpu::matrixMatrixProductRect(d_chem_b, d_t1_slice, d_ot1_tile2,
-                                            (int)((size_t)tb*vv), ta, nocc, true, false, false, 1.0);
+                    if (vt_resident)
+                        gpu::matrixMatrixProductRect(d_v_ovvv_T + (size_t)a0*vv*nocc, d_t1_sliceb, d_ot1_tile1,
+                                                (int)((size_t)ta*vv), tb, nocc, false, false, false, 1.0);
+                    else
+                        gpu::matrixMatrixProductRect(d_chem_a, d_t1_sliceb, d_ot1_tile1,
+                                                (int)((size_t)ta*vv), tb, nocc, true, false, false, 1.0);
+                    // 3. term2 ot1_tile2[tb·vv, ta] = v_ovvv_T[b-tile] × t1[:,a-tile]
+                    if (vt_resident)
+                        gpu::matrixMatrixProductRect(d_v_ovvv_T + (size_t)b0*vv*nocc, d_t1_slice, d_ot1_tile2,
+                                                (int)((size_t)tb*vv), ta, nocc, false, false, false, 1.0);
+                    else
+                        gpu::matrixMatrixProductRect(d_chem_b, d_t1_slice, d_ot1_tile2,
+                                                (int)((size_t)tb*vv), ta, nocc, true, false, false, 1.0);
                     // 4. Wabcd 2D tile = vvvv_tile - dressing
                     { size_t tot=(size_t)ta*tb*vv; int th=256; int bl=(int)((tot+th-1)/th);
                       build_Wabcd_2dtile_kernel<<<bl,th>>>(d_vvvv_tile, d_ot1_tile1, d_ot1_tile2, d_Wtile, nvir, ta, tb); }
@@ -9551,7 +9584,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             }
             tracked_cudaFree(d_vvvv_tile); tracked_cudaFree(d_ot1_tile1); tracked_cudaFree(d_ot1_tile2);
             tracked_cudaFree(d_Wtile); tracked_cudaFree(d_raw_tile); tracked_cudaFree(d_t1_slice); tracked_cudaFree(d_t1_sliceb);
-            tracked_cudaFree(d_chem_a); tracked_cudaFree(d_chem_b);
+            if (d_chem_a) tracked_cudaFree(d_chem_a);
+            if (d_chem_b) tracked_cudaFree(d_chem_b);
         }
         }   // close the tiled-ladder else-body (distributed | single-device)
 
@@ -9911,11 +9945,17 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 tracked_cudaMalloc((void**)&p_Wakci, (size_t)nocc*ibn*vv*sizeof(double));
                 tracked_cudaMalloc((void**)&p_Wklij, oo*oo*sizeof(double));
                 tracked_cudaMalloc((void**)&p_Bmo,   bmo_sz*sizeof(double));
-                // (Cat-A Stage 2c-A) v_ovvv_T NOT replicated on device d≥1 — only the
-                // a-tile/b-tile slices, peer-copied just-in-time from device 0's full
-                // d_v_ovvv_T (contiguous first-index slices). 10.7GB → 2 small tiles.
-                tracked_cudaMalloc((void**)&p_vt_a, (size_t)TA*vv*nocc*sizeof(double));
-                tracked_cudaMalloc((void**)&p_vt_b, (size_t)TB*vv*nocc*sizeof(double));
+                // (Cat-A fast-path) RESIDENT: p_vt_a = full v_ovvv_T (peer-copied from
+                // device 0), p_vt_b = unused stub; term1/term2 read p_vt_a+offset
+                // (transA=false, fast). BUILD-FROM-B: p_vt_a/p_vt_b = small a/b-tile chem
+                // built from p_Bmo (transA=true, memory-saving). Both bit-exact.
+                if (vt_resident) {
+                    tracked_cudaMalloc((void**)&p_vt_a, (size_t)vvv*nocc*sizeof(double));  // full resident
+                    tracked_cudaMalloc((void**)&p_vt_b, sizeof(double));                   // unused stub
+                } else {
+                    tracked_cudaMalloc((void**)&p_vt_a, (size_t)TA*vv*nocc*sizeof(double));
+                    tracked_cudaMalloc((void**)&p_vt_b, (size_t)TB*vv*nocc*sizeof(double));
+                }
                 tracked_cudaMalloc((void**)&p_voovv, oo*vv*sizeof(double));
                 tracked_cudaMalloc((void**)&p_vvooo, (size_t)vo*ibn*nocc*sizeof(double));   // (Cat-B) compact I_d
                 tracked_cudaMalloc((void**)&p_raw,   t2Size*sizeof(double));
@@ -9949,8 +9989,11 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 // (DS-4 C) p_Zt1 is NOT broadcast — device d builds Z[I_d]→Zt1[I_d] itself.
                 cudaMemcpyPeer(p_Wklij, d, (const void*)d_Wklij,    0, oo*oo*sizeof(double));
                 cudaMemcpyPeer(p_Bmo,   d, (const void*)B_mo,       0, bmo_sz*sizeof(double));
-                // (Cat-A Stage 2c-A) p_vt_a/p_vt_b are peer-copied per-tile inside the
-                // ladder (not the full v_ovvv_T here).
+                // (Cat-A fast-path) RESIDENT: broadcast the full v_ovvv_T once (device 0
+                // holds it full when vt_resident). BUILD-FROM-B: p_vt_a/p_vt_b are built
+                // per-tile from p_Bmo inside the ladder (no broadcast here).
+                if (vt_resident)
+                    cudaMemcpyPeer(p_vt_a, d, (const void*)d_v_ovvv_T, 0, (size_t)vvv*nocc*sizeof(double));
                 cudaMemcpyPeer(p_voovv, d, (const void*)d_v_oovv,   0, oo*vv*sizeof(double));
                 // (Cat-B v_vooo) device d builds its I_d block via strided host copy
                 // (device 0's d_v_vooo is now only I_0 ∴ not a peer source). (a,k) rows ×
@@ -10069,29 +10112,36 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 cudaMemcpy(p_voovv_iblk, p_voovv + (size_t)ib0*nocc*vv,
                            (size_t)ibn*nocc*vv*sizeof(double), cudaMemcpyDeviceToDevice);
                 tracked_cudaFree(p_voovv); p_voovv = nullptr;
-                // ⑨ ladder (Cat-A 2D a-tile × b-tile, this device's i-block). v_ovvv_T
-                // is NOT resident on device d≥1 (Stage 2c-B'): term1/term2 build the
-                // chem tile from p_Bmo (chem[k,(x',c,d)] = v_ovvv[k,x,c,d]) and use it
-                // transposed (transA ⇒ chem^T = v_ovvv_T[x-tile]). No peer-copy from
-                // device 0 ⇒ device d≥1 holds no v_ovvv_T at all. p_vt_a (a-tile chem)
-                // is hoisted (once per a-tile); p_vt_b (b-tile chem) per (a,b).
+                // ⑨ ladder (Cat-A 2D a-tile × b-tile, this device's i-block). v_ovvv_T is
+                // either RESIDENT (p_vt_a = full, read at +a0/+b0 offset, transA=false) or
+                // built per-tile from p_Bmo (chem^T via transA=true). vt_resident selects.
                 for (int a0 = 0; a0 < nvir; a0 += TA) {
                     int ta = std::min(TA, nvir - a0);
                     cudaMemcpy2D(t_t1s, (size_t)ta*sizeof(double), p_t1 + a0, (size_t)nvir*sizeof(double),
                                  (size_t)ta*sizeof(double), nocc, cudaMemcpyDeviceToDevice);
-                    // term1 v_ovvv_T a-tile from B: p_vt_a[k,(a',c,d)] = v_ovvv[k,a,c,d]
-                    ccsd_block_chem_from_B(eri_ri, p_Bmo, N, O,nocc, V+a0,ta, V,nvir, V,nvir, p_vt_a);
+                    // term1 v_ovvv_T a-tile from B (only when not resident)
+                    if (!vt_resident)
+                        ccsd_block_chem_from_B(eri_ri, p_Bmo, N, O,nocc, V+a0,ta, V,nvir, V,nvir, p_vt_a);
                     for (int b0 = 0; b0 < nvir; b0 += TB) {
                         int tb = std::min(TB, nvir - b0);
                         ccsd_block_chem_from_B(eri_ri, p_Bmo, N, V+a0,ta, V+b0,tb, V,nvir, V,nvir, t_vvvv);
                         cudaMemcpy2D(t_t1sb, (size_t)tb*sizeof(double), p_t1 + b0, (size_t)nvir*sizeof(double),
                                      (size_t)tb*sizeof(double), nocc, cudaMemcpyDeviceToDevice);
-                        // term2 v_ovvv_T b-tile from B: p_vt_b[k,(b',c,d)] = v_ovvv[k,b,c,d]
-                        ccsd_block_chem_from_B(eri_ri, p_Bmo, N, O,nocc, V+b0,tb, V,nvir, V,nvir, p_vt_b);
-                        gpu::matrixMatrixProductRect(p_vt_a, t_t1sb, t_ot1,
-                                                (int)((size_t)ta*vv), tb, nocc, true, false, false, 1.0);
-                        gpu::matrixMatrixProductRect(p_vt_b, t_t1s, t_ot2,
-                                                (int)((size_t)tb*vv), ta, nocc, true, false, false, 1.0);
+                        // term2 v_ovvv_T b-tile from B (only when not resident)
+                        if (!vt_resident)
+                            ccsd_block_chem_from_B(eri_ri, p_Bmo, N, O,nocc, V+b0,tb, V,nvir, V,nvir, p_vt_b);
+                        if (vt_resident)
+                            gpu::matrixMatrixProductRect(p_vt_a + (size_t)a0*vv*nocc, t_t1sb, t_ot1,
+                                                    (int)((size_t)ta*vv), tb, nocc, false, false, false, 1.0);
+                        else
+                            gpu::matrixMatrixProductRect(p_vt_a, t_t1sb, t_ot1,
+                                                    (int)((size_t)ta*vv), tb, nocc, true, false, false, 1.0);
+                        if (vt_resident)
+                            gpu::matrixMatrixProductRect(p_vt_a + (size_t)b0*vv*nocc, t_t1s, t_ot2,
+                                                    (int)((size_t)tb*vv), ta, nocc, false, false, false, 1.0);
+                        else
+                            gpu::matrixMatrixProductRect(p_vt_b, t_t1s, t_ot2,
+                                                    (int)((size_t)tb*vv), ta, nocc, true, false, false, 1.0);
                         { size_t tt=(size_t)ta*tb*vv; int th=256; int bl=(int)((tt+th-1)/th);
                           build_Wabcd_2dtile_kernel<<<bl,th>>>(t_vvvv, t_ot1, t_ot2, t_W, nvir, ta, tb); }
                         gpu::matrixMatrixProductRect(p_tau + iboff, t_W, t_rawt,
