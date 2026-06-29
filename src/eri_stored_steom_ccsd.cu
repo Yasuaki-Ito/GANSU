@@ -932,6 +932,17 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         cudaMemcpy(d_t1, bt.T1.data(), t1n * sizeof(real_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_t2, bt.T2.data(), t2n * sizeof(real_t), cudaMemcpyHostToDevice);
         std::cout << "  STEOM using DLPNO back-transformed canonical T1/T2 (hybrid bt-PNO-STEOM P5b)." << std::endl;
+    } else if (ctx && ctx->cc_ground_cached) {
+        // (solve-once) reuse the cluster CCSD ground cached by an earlier stage —
+        // IP/EA/STEOM share one cluster ⇒ identical T1/T2. Skips the re-solve.
+        const size_t t1n = (size_t)nocc_active*nvir;
+        const size_t t2n = (size_t)nocc_active*nocc_active*(size_t)nvir*nvir;
+        tracked_cudaMalloc(&d_t1, t1n*sizeof(real_t));
+        tracked_cudaMalloc(&d_t2, t2n*sizeof(real_t));
+        cudaMemcpy(d_t1, ctx->cc_t1, t1n*sizeof(real_t), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(d_t2, ctx->cc_t2, t2n*sizeof(real_t), cudaMemcpyDeviceToDevice);
+        std::cout << "  STEOM CCSD ground reused from cache (solve-once): " << std::fixed
+                  << std::setprecision(10) << ctx->cc_E << " Ha" << std::endl;
     } else {
         // Inc3: cluster storage-free ground CCSD — when the cluster MO-ERI is NOT
         // precomputed (block mode) hand the RI engine to ccsd_spatial_orbital so it
@@ -950,6 +961,16 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         std::cout << "  STEOM CCSD ground-state re-solve: " << std::fixed << std::setprecision(10)
                   << E_CCSD << " Ha   (in " << std::setprecision(3)
                   << ccsd_timer.elapsed_seconds() << " s)" << std::endl;
+        // (solve-once) cache the cluster ground for any later reuse.
+        if (ctx && !std::getenv("GANSU_STEOM_NO_CCSD_CACHE")) {
+            const size_t t1n = (size_t)nocc_active*nvir;
+            const size_t t2n = (size_t)nocc_active*nocc_active*(size_t)nvir*nvir;
+            tracked_cudaMalloc(&ctx->cc_t1, t1n*sizeof(real_t));
+            tracked_cudaMalloc(&ctx->cc_t2, t2n*sizeof(real_t));
+            cudaMemcpy(ctx->cc_t1, d_t1, t1n*sizeof(real_t), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(ctx->cc_t2, d_t2, t2n*sizeof(real_t), cudaMemcpyDeviceToDevice);
+            ctx->cc_t1n=t1n; ctx->cc_t2n=t2n; ctx->cc_E=E_CCSD; ctx->cc_ground_cached=true;
+        }
     }
 
     // P4b: RI DLPNO path builds MO-ERI sub-blocks on the fly from B_mo
@@ -1635,6 +1656,10 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
 
     compute_steom_ccsd_impl(cfg, eri_method, /*d_eri_ao=*/nullptr, n_states,
                             /*d_eri_mo_precomputed=*/d_eri_mo, &ctx);
+
+    // (solve-once) release the cached cluster CCSD ground amplitudes.
+    if (ctx.cc_t1) tracked_cudaFree(ctx.cc_t1);
+    if (ctx.cc_t2) tracked_cudaFree(ctx.cc_t2);
 
     return std::move(ctx.steom_result);
 }

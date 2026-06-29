@@ -120,6 +120,21 @@ struct EOMChainContext {
     const ERI_RI* eri_block_src   = nullptr; ///< set by the driver once build_B_mo succeeds (else stays null ⇒ dense)
     const real_t* d_B_mo_blocks   = nullptr; ///< cluster B_mo [naux × nmo²] on device (owned by the ERI_RI workspace)
 
+    // -------------------------------------------------------------------------
+    // (solve-once) Cached cluster CCSD ground T1/T2 (device). The IP, EA and STEOM
+    // stages each re-solve the SAME cluster CCSD ground (identical C/ε/MO-ERI ⇒
+    // identical T1/T2 — verified -1.2882022500 Ha in all three). The first stage
+    // caches the converged amplitudes here; the later stages copy them instead of
+    // re-running the (expensive, storage-free) CCSD iterations — eliminating 2 of
+    // the 3 identical re-solves. Owned here; freed at the standalone entry exit.
+    // Disabled (cc_ground_cached stays false) by env GANSU_STEOM_NO_CCSD_CACHE.
+    // -------------------------------------------------------------------------
+    real_t* cc_t1 = nullptr;            ///< cluster ground T1 [nocc_act·nvir]
+    real_t* cc_t2 = nullptr;            ///< cluster ground T2 [nocc_act²·nvir²]
+    real_t  cc_E  = 0.0;                ///< cluster ground CCSD correlation energy
+    size_t  cc_t1n = 0, cc_t2n = 0;     ///< cached amplitude element counts
+    bool    cc_ground_cached = false;   ///< set once the first stage caches the ground
+
     // ----- convenience accessors mirroring the RHF getters used by the chain ---
     int get_num_basis()        const { return nmo; }
     int get_num_electrons()    const { return n_elec; }

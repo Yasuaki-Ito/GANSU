@@ -282,6 +282,18 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
         cudaMemcpy(d_t2, bt.T2.data(), t2n * sizeof(real_t), cudaMemcpyHostToDevice);
         E_CCSD = rhf.get_post_hf_energy();  // DLPNO-CCSD energy (set by stage 1)
         std::cout << "  Using DLPNO back-transformed canonical T1/T2 (hybrid bt-PNO-STEOM P5b)." << std::endl;
+    } else if (ctx && ctx->cc_ground_cached) {
+        // (solve-once) reuse the cluster CCSD ground cached by an earlier stage.
+        const size_t t1n = (size_t)nocc_active*nvir;
+        const size_t t2n = (size_t)nocc_active*nocc_active*(size_t)nvir*nvir;
+        tracked_cudaMalloc(&d_t1, t1n*sizeof(real_t));
+        tracked_cudaMalloc(&d_t2, t2n*sizeof(real_t));
+        cudaMemcpy(d_t1, ctx->cc_t1, t1n*sizeof(real_t), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(d_t2, ctx->cc_t2, t2n*sizeof(real_t), cudaMemcpyDeviceToDevice);
+        E_CCSD = ctx->cc_E;
+        ctx->post_hf_energy = E_CCSD;
+        std::cout << "  CCSD ground reused from cache (solve-once): " << std::fixed
+                  << std::setprecision(10) << E_CCSD << " Ha" << std::endl;
     } else {
         // Inc3: cluster block mode (eri_block_src set, no dense precomputed) hands
         // the RI engine to the ground-CCSD re-solve so it builds its own cluster B
@@ -301,6 +313,16 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
                   << ccsd_timer.elapsed_seconds() << " s)" << std::endl;
         if (ctx) ctx->post_hf_energy = E_CCSD;
         else     rhf.set_post_hf_energy(E_CCSD);
+        // (solve-once) cache the cluster ground for the later stages.
+        if (ctx && !std::getenv("GANSU_STEOM_NO_CCSD_CACHE")) {
+            const size_t t1n = (size_t)nocc_active*nvir;
+            const size_t t2n = (size_t)nocc_active*nocc_active*(size_t)nvir*nvir;
+            tracked_cudaMalloc(&ctx->cc_t1, t1n*sizeof(real_t));
+            tracked_cudaMalloc(&ctx->cc_t2, t2n*sizeof(real_t));
+            cudaMemcpy(ctx->cc_t1, d_t1, t1n*sizeof(real_t), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(ctx->cc_t2, d_t2, t2n*sizeof(real_t), cudaMemcpyDeviceToDevice);
+            ctx->cc_t1n=t1n; ctx->cc_t2n=t2n; ctx->cc_E=E_CCSD; ctx->cc_ground_cached=true;
+        }
     }
 
     // Step 2: Build MO ERI (matches EE-EOM pattern) and trim for frozen core.
