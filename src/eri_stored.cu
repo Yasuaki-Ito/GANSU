@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <iostream>
 #include <cstdlib> // std::getenv (GANSU_CCSD_NO_SINGLES diagnostic gate)
+#include <chrono>  // (CCSD residual per-iter profiler, GANSU_CCSD_RESID_PROF)
 #include <assert.h>
 
 
@@ -8143,6 +8144,69 @@ static inline std::pair<int,int> occi_split(int nocc, int NG, int d) {
     return {start, count};
 }
 
+#ifndef GANSU_CPU_ONLY
+// (device amplitude flow, GANSU_CCSD_DEVICE_AMP) Build the DIIS amplitude/error
+// vectors on the device: amp = [newT1; newT2], err = amp - [t1; t2v]. Replaces the
+// host element-wise fill over the full 3.9 GB vector (profiler: the host amplitude
+// processing was 49% of the cluster CCSD re-solve).
+__global__ void ccsd_amp_err_kernel(double* __restrict__ amp, double* __restrict__ err,
+                                    const double* __restrict__ newT1, const double* __restrict__ newT2,
+                                    const double* __restrict__ t1, const double* __restrict__ t2v,
+                                    size_t t1n, size_t t2n) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= t1n + t2n) return;
+    double a   = (gid < t1n) ? newT1[gid] : newT2[gid - t1n];
+    double cur = (gid < t1n) ? t1[gid]    : t2v[gid - t1n];
+    amp[gid] = a;
+    err[gid] = a - cur;
+}
+
+// (device amplitude flow) Device-resident DIIS for the storage-free cluster CCSD.
+// Keeps the amplitude (x) and error (e) history on the GPU so the per-iter B-matrix
+// (eᵢ·eⱼ) and extrapolation (Σ cᵢ xᵢ) run as cuBLAS ddot/axpy instead of memory-bound
+// host loops. NOT bit-exact vs the host DIIS (cuBLAS ddot reduction order differs) —
+// but DIIS only accelerates a fixed point, so the converged CCSD energy matches to
+// convergence precision. Bounded by max_hist (device memory). Reuses the host
+// DIIS::solve_diis_coeffs for the tiny (m+1)² coefficient solve.
+struct DeviceDIIS {
+    int max_hist, min_hist; size_t dim;
+    std::vector<double*> xs, es;
+    DeviceDIIS(int maxh, int minh, size_t d) : max_hist(maxh), min_hist(minh), dim(d) {}
+    ~DeviceDIIS() { for (auto p : xs) tracked_cudaFree(p); for (auto p : es) tracked_cudaFree(p); }
+    int history_size() const { return (int)xs.size(); }
+    bool can_extrapolate() const { return (int)xs.size() >= min_hist; }
+    void push(const double* d_x, const double* d_e) {
+        double *px, *pe;
+        if ((int)xs.size() >= max_hist) {           // ring: reuse the oldest slot
+            px = xs.front(); pe = es.front();
+            xs.erase(xs.begin()); es.erase(es.begin());
+        } else {
+            tracked_cudaMalloc((void**)&px, dim*sizeof(double));
+            tracked_cudaMalloc((void**)&pe, dim*sizeof(double));
+        }
+        cudaMemcpy(px, d_x, dim*sizeof(double), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(pe, d_e, dim*sizeof(double), cudaMemcpyDeviceToDevice);
+        xs.push_back(px); es.push_back(pe);
+    }
+    void extrapolate(double* d_out) {               // d_out = Σ cᵢ xᵢ (device)
+        int m = (int)xs.size();
+        cublasHandle_t h = gpu::GPUHandle::cublas();
+        std::vector<std::vector<double>> B(m+1, std::vector<double>(m+1, -1.0));
+        for (int i = 0; i < m; i++)
+            for (int j = i; j < m; j++) {
+                double d = 0.0;
+                cublasDdot(h, (int)dim, es[i], 1, es[j], 1, &d);   // host-pointer result (sync)
+                B[i][j] = d; B[j][i] = d;
+            }
+        for (int i = 0; i < m; i++) { B[i][i] += 1e-12; B[i][m] = -1.0; B[m][i] = -1.0; }
+        B[m][m] = 0.0;
+        auto c = DIIS::solve_diis_coeffs(B);
+        cudaMemset(d_out, 0, dim*sizeof(double));
+        for (int i = 0; i < m; i++) cublasDaxpy(h, (int)dim, &c[i], xs[i], 1, d_out, 1);
+    }
+};
+#endif
+
 // (occ-i) Transpose a square n×n row-major matrix: out[r,c] = in[c,r]. Used to
 // turn Wklij[kl,ij] (ij in columns, strided) into Wklij_T[ij,kl] (ij in rows,
 // contiguous) so the Wklij×tau GEMM output rows can be i-block sliced by pointer
@@ -8872,7 +8936,50 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     }
 #endif
 
+    // (CCSD residual per-iter profiler, env GANSU_CCSD_RESID_PROF) Split each iter's
+    // wall time into device-0 main path / occi device-d≥1 loop / symmetrize+DIIS+rest
+    // to find the real bottleneck. cudaDeviceSynchronize only when profiling (else
+    // off ⇒ no overhead). Printed accumulated after convergence.
+    const bool resid_prof = std::getenv("GANSU_CCSD_RESID_PROF") != nullptr;
+    double pf_dev0 = 0.0, pf_occi = 0.0, pf_rest = 0.0, pf_diis = 0.0, pf_d2h = 0.0;
+    auto pf_mark = [&]() { if (resid_prof) cudaDeviceSynchronize(); return std::chrono::steady_clock::now(); };
+    auto pf_cpu  = []() { return std::chrono::steady_clock::now(); };
+
+    // (device amplitude flow, GANSU_CCSD_DEVICE_AMP — increment 1: device DIIS) Replace
+    // the host DIIS (profiler: host amplitude processing ≈ 50% of the cluster CCSD
+    // re-solve, of which push+extrapolate ≈ 401s/955s) with a device-resident DIIS fed
+    // by device-built amp/err vectors. The surrounding host copies/energy stay (a later
+    // increment makes the amplitudes fully device-resident). NOT bit-exact (cuBLAS ddot
+    // order) but converges to the same energy. Gated on env + history fitting free mem.
+    bool device_amp = false;
+    int dev_diis_hist = 8;
+    double *d_ampVec = nullptr, *d_errVec = nullptr;
+#ifndef GANSU_CPU_ONLY
+    if (use_tiled_ladder && gpu::gpu_available() && std::getenv("GANSU_CCSD_DEVICE_AMP")) {
+        size_t fb = 0, tbb = 0; cudaMemGetInfo(&fb, &tbb);
+        // The DIIS history (hist·2 amplitude vectors) + the 2 scratch vectors must fit
+        // with a MARGIN for the per-iter occi transients (tau/t2v/raw/Bmo broadcasts
+        // alloc'd/freed each iter AFTER this gate). Without the margin the history OOMs
+        // mid-iteration on a memory-tight cluster. margin ≈ a few amplitude buffers.
+        const size_t margin = (size_t)8 * num_amps * sizeof(double);   // ~8 amplitude vectors
+        while (dev_diis_hist >= 3 &&
+               (size_t)(dev_diis_hist*2+2)*num_amps*sizeof(double) + margin > fb) dev_diis_hist--;
+        device_amp = ((size_t)(dev_diis_hist*2+2)*num_amps*sizeof(double) + margin < fb) && dev_diis_hist >= 3;
+        if (device_amp) {
+            tracked_cudaMalloc((void**)&d_ampVec, num_amps*sizeof(double));
+            tracked_cudaMalloc((void**)&d_errVec, num_amps*sizeof(double));
+            std::cout << "  [CCSD] device DIIS enabled (hist=" << dev_diis_hist << ", history "
+                      << (((size_t)dev_diis_hist*2*num_amps*sizeof(double))>>30) << "GB)" << std::endl;
+        } else {
+            std::cout << "  [CCSD] device DIIS requested but insufficient free memory "
+                         "(need history+margin) — using host DIIS." << std::endl;
+        }
+    }
+    DeviceDIIS dev_diis(dev_diis_hist, 2, num_amps);
+#endif
+
     for (int iter = 1; iter <= MAX_ITER; iter++) {
+        auto _pt0 = pf_mark();
 
         // (Phase 1 increment-2, occ-i) i-block this device owns. Full range for
         // now (single-device) — the residual's raw-output operations are i-sliced
@@ -9448,7 +9555,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                                               d_t2v, d_t1, d_w_voov_c, d_Fkc, d_w_ooov_c,
                                               (h_fov_active ? d_fov : nullptr), d_Dia,
                                               nocc, nvir);
-            cudaMemcpy(newT1.data(), d_newT1, t1Size * sizeof(double), cudaMemcpyDeviceToHost);
+            // (device amplitude flow) keep d_newT1 on device for the device DIIS; the
+            // host download happens after the (device or host) DIIS update instead.
+            if (!device_amp)
+                cudaMemcpy(newT1.data(), d_newT1, t1Size * sizeof(double), cudaMemcpyDeviceToHost);
             if (std::getenv("GANSU_CCSD_P0_VALIDATE")) {
                 std::vector<real_t> ref(t1Size, 0.0);
                 host_T1(ref);
@@ -9954,6 +10064,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                         }
         }
 
+        auto _pt1 = pf_mark(); pf_dev0 += std::chrono::duration<double>(_pt1 - _pt0).count();
+
         // (Phase 1 increment-2, occ-i) device loop: device 0 already holds raw[I_0]
         // (in-place i-sliced ops above). Each device d=1..NG-1 recomputes raw[I_d]
         // from broadcast intermediates (the i-independent builds are full on device
@@ -10285,6 +10397,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             iblk_start = 0; iblk_n = nocc;   // full raw assembled on device 0 ⇒ symmetrize all i
         }
 #endif
+        auto _pt2 = pf_mark(); pf_occi += std::chrono::duration<double>(_pt2 - _pt1).count();
 
         // Symmetrize: t2_new(i,j,a,b) = [raw(i,a,j,b) + raw(j,b,i,a)] / D
         // raw is stored as raw[T2(i,j,a,b)] = raw(i,a,j,b)
@@ -10295,7 +10408,13 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             // download newT2 once for host DIIS. raw never comes to host (P0-1/2/3).
             int th = 256; size_t tot = (size_t)iblk_n*nocc*vv; int bl = (int)((tot + th - 1) / th);
             ccsd_t2_symmetrize_kernel<<<bl, th>>>(d_newT2, d_raw, d_Dijab, nocc, nvir, iblk_start, iblk_n);
-            cudaMemcpy(newT2.data(), d_newT2, t2Size * sizeof(double), cudaMemcpyDeviceToHost);
+            // (device amplitude flow) device DIIS reads d_newT2 directly; download only
+            // for the host DIIS path (after the device DIIS update otherwise).
+            if (!device_amp) {
+                auto _ph0 = pf_cpu();
+                cudaMemcpy(newT2.data(), d_newT2, t2Size * sizeof(double), cudaMemcpyDeviceToHost);
+                pf_d2h += std::chrono::duration<double>(pf_cpu() - _ph0).count();
+            }
         } else {
             for (int i = 0; i < nocc; i++)
                 for (int j = 0; j < nocc; j++)
@@ -10327,6 +10446,28 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 std::fill(newT1.begin(), newT1.end(), 0.0);
             }
         }
+#ifndef GANSU_CPU_ONLY
+        // (device amplitude flow, increment 1) device DIIS: build amp/err on the device
+        // from d_newT1/d_newT2 (this iter) and d_t1/d_t2v (previous), extrapolate via
+        // cuBLAS, write back into d_newT1/d_newT2, then download for the host t1/t2v
+        // copy + energy. Replaces the memory-bound host push/extrapolate.
+        if (device_amp) {
+            auto _pd0 = pf_cpu();
+            int th = 256; size_t bl = (num_amps + th - 1) / th;
+            ccsd_amp_err_kernel<<<(unsigned)bl, th>>>(d_ampVec, d_errVec, d_newT1, d_newT2,
+                                                      d_t1, d_t2v, t1Size, t2Size);
+            dev_diis.push(d_ampVec, d_errVec);
+            if (dev_diis.can_extrapolate()) {
+                dev_diis.extrapolate(d_ampVec);
+                cudaMemcpy(d_newT1, d_ampVec,            t1Size*sizeof(double), cudaMemcpyDeviceToDevice);
+                cudaMemcpy(d_newT2, d_ampVec + t1Size,   t2Size*sizeof(double), cudaMemcpyDeviceToDevice);
+            }
+            cudaMemcpy(newT1.data(), d_newT1, t1Size*sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(newT2.data(), d_newT2, t2Size*sizeof(double), cudaMemcpyDeviceToHost);
+            pf_diis += std::chrono::duration<double>(pf_cpu() - _pd0).count();
+        }
+#endif
+        if (!device_amp) {
         std::vector<real_t> ampVec(num_amps);
         std::vector<real_t> errVec(num_amps);
         for (size_t k = 0; k < t1Size; k++) {
@@ -10337,11 +10478,14 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             ampVec[t1Size + k] = newT2[k];
             errVec[t1Size + k] = newT2[k] - t2v[k];
         }
+        auto _pd0 = pf_cpu();
         diis.push(ampVec, errVec);
         if (diis.can_extrapolate()) {
             auto extrap = diis.extrapolate();
             for (size_t k = 0; k < t1Size; k++) newT1[k] = extrap[k];
             for (size_t k = 0; k < t2Size; k++) newT2[k] = extrap[t1Size + k];
+        }
+        pf_diis += std::chrono::duration<double>(pf_cpu() - _pd0).count();
         }
 
         for (size_t k = 0; k < t1Size; k++) t1[k] = newT1[k];
@@ -10350,6 +10494,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         real_t newEcc = energy();
         real_t deltaE = newEcc - Ecc;
         Ecc = newEcc;
+        pf_rest += std::chrono::duration<double>(pf_mark() - _pt2).count();
 
         std::cout << "CCSD iter " << std::setw(2) << iter
                   << ": E = " << std::fixed << std::setprecision(12) << Ecc
@@ -10363,6 +10508,12 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             break;
         }
     }
+
+    if (resid_prof)
+        std::cout << "  [CCSD RESID-PROF] total over all iters: dev0-main=" << std::fixed
+                  << std::setprecision(2) << pf_dev0 << "s  occi-loop=" << pf_occi
+                  << "s  symm+DIIS+rest=" << pf_rest << "s  (of which: D2H-newT2=" << pf_d2h
+                  << "s  DIIS-push+extrap=" << pf_diis << "s)" << std::endl;
 
     // (resident nvir⁴, Step 2) free the per-device d_v_vvvv replicas.
 #ifdef GANSU_MULTI_GPU
@@ -10414,6 +10565,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     if (d_Wakci)       tracked_cudaFree(d_Wakci);
     if (d_v_voov)      tracked_cudaFree(d_v_voov);
     if (d_v_vovo)      tracked_cudaFree(d_v_vovo);
+    if (d_ampVec)      tracked_cudaFree(d_ampVec);
+    if (d_errVec)      tracked_cudaFree(d_errVec);
     if (d_newT1)       tracked_cudaFree(d_newT1);
     if (d_Fkc_t1)      tracked_cudaFree(d_Fkc_t1);
     if (d_w_voov_c)    tracked_cudaFree(d_w_voov_c);
