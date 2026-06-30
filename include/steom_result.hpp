@@ -38,6 +38,7 @@ struct STEOMResult {
     int nvir        = 0;
     int num_frozen  = 0;
     int n_states    = 0;    ///< Number of excited states actually produced (≤ n_excited_states)
+    real_t ground_corr_energy = 0.0;  ///< cluster CCSD ground correlation energy (DMET-STEOM; reported as the post-HF correction)
 
     struct PerRoot {
         real_t omega          = 0.0;   ///< Excitation energy in Ha (positive)

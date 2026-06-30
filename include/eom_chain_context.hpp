@@ -120,6 +120,15 @@ struct EOMChainContext {
     const ERI_RI* eri_block_src   = nullptr; ///< set by the driver once build_B_mo succeeds (else stays null ⇒ dense)
     const real_t* d_B_mo_blocks   = nullptr; ///< cluster B_mo [naux × nmo²] on device (owned by the ERI_RI workspace)
 
+    // (B / denominator-only level shift) The DMET cluster shifts the virtual ε to
+    // stabilise the small-gap embedded CCSD, but as a *global* ε shift that biases
+    // the converged correlation energy (~0.075 Ha on the in-domain {0-9} cluster).
+    // When this is > 0 the cluster CCSD instead keeps the shifted denominators for
+    // stability but adds a residual correction (raw -= s·t2, val -= s·t1) so the
+    // iteration converges to the TRUE (unshifted) energy. 0 ⇒ legacy direct form
+    // (byte-identical). Set by dmet.cu under env GANSU_DMET_LEVEL_SHIFT_DENOM_ONLY.
+    real_t level_shift = 0.0;                ///< virtual ε shift s (Hartree); 0 = off
+
     // -------------------------------------------------------------------------
     // (solve-once) Cached cluster CCSD ground T1/T2 (device). The IP, EA and STEOM
     // stages each re-solve the SAME cluster CCSD ground (identical C/ε/MO-ERI ⇒
@@ -181,7 +190,8 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
                                   const real_t* d_eps,
                                   real_t* d_eri_mo,
                                   int nao, int n_emb, int n_emb_occ,
-                                  int n_states, int n_frozen);
+                                  int n_states, int n_frozen,
+                                  real_t level_shift = 0.0);
 
 } // namespace gansu
 

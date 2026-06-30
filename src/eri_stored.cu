@@ -7460,7 +7460,9 @@ __global__ void ccsd_t2_reduced_kernel(double* __restrict__ raw,
 __global__ void ccsd_t2_symmetrize_kernel(double* __restrict__ newT2,
                                           const double* __restrict__ raw,
                                           const double* __restrict__ Dijab,
-                                          int nocc, int nvir, int ib0, int ibn) {
+                                          int nocc, int nvir, int ib0, int ibn,
+                                          const double* __restrict__ t2v_old,
+                                          double level_shift) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t vv = (size_t)nvir * nvir;
     if (gid >= (size_t)ibn * nocc * vv) return;
@@ -7469,7 +7471,13 @@ __global__ void ccsd_t2_symmetrize_kernel(double* __restrict__ newT2,
     int j = (int)(r % nocc); int i = ib0 + (int)(r / nocc);
     size_t gout  = ((size_t)i*nocc + j)*vv + (size_t)a*nvir + b;
     size_t gidP = ((size_t)j*nocc + i)*vv + (size_t)b*nvir + a;
-    newT2[gout] = (raw[gout] + raw[gidP]) / Dijab[gout];
+    // (B / denominator-only) Dijab here is the SHIFTED denominator (= D_true − 2s).
+    // Subtracting 2s·t2_old from the numerator turns the direct update into the
+    // residual-form update, whose fixed point is raw_sym/D_true = the TRUE energy.
+    // level_shift = 0 ⇒ the term vanishes ⇒ byte-identical legacy update.
+    double num = raw[gout] + raw[gidP];
+    if (level_shift != 0.0) num -= 2.0 * level_shift * t2v_old[gout];
+    newT2[gout] = num / Dijab[gout];
 }
 
 // (Phase 0 host-roundtrip removal, P0-4) W^{kl}_{ij} on the device: add the
@@ -7783,7 +7791,8 @@ __global__ void ccsd_t1_update_kernel(double* __restrict__ newT1,
                                       const double* __restrict__ w_ooov,
                                       const double* __restrict__ fov,
                                       const double* __restrict__ Dia,
-                                      int nocc, int nvir) {
+                                      int nocc, int nvir,
+                                      double level_shift) {
     size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t ov = (size_t)nocc * nvir;
     if (gid >= ov) return;
@@ -7828,7 +7837,10 @@ __global__ void ccsd_t1_update_kernel(double* __restrict__ newT1,
                 cubic += fov[(size_t)k*nvir + c] * t1[(size_t)k*nvir + a] * t1[(size_t)i*nvir + c];
         val -= 2.0 * cubic;
     }
-    newT1[gid] = val / Dia[gid];
+    // (B / denominator-only) Dia is the SHIFTED denominator (= Dia_true − s); the
+    // residual correction −s·t1_old makes the fixed point val/Dia_true = TRUE energy.
+    // level_shift = 0 ⇒ byte-identical legacy update.
+    newT1[gid] = (val - level_shift * t1[gid]) / Dia[gid];
 }
 
 // (③ Lki) L^k_i intermediate — one thread per (k,i), mirroring the host loop
@@ -8229,8 +8241,12 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             real_t* d_eri_mo_precomputed = nullptr,
                             int num_frozen = 0,
                             const real_t* h_fov_active = nullptr,
-                            const ERI_RI* eri_ri = nullptr)
+                            const ERI_RI* eri_ri = nullptr,
+                            const real_t level_shift = 0.0)
 //
+// level_shift (B / denominator-only): when > 0 the cluster CCSD keeps the (shifted)
+//   denominators d_orbital_energies provides but adds a residual correction so it
+//   converges to the TRUE unshifted energy (see ctx.level_shift). 0 ⇒ legacy form.
 // eri_ri (optional, RI-CCSD B-native): when non-null and a GPU is available,
 //   the MO-ERI sub-blocks are built on the fly from the half-transformed B_mo
 //   (density-fitting factors) via ccsd_block_chem_from_B — the full nmo⁴ tensor
@@ -8365,7 +8381,13 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     DIIS diis(8, 2);
     size_t num_amps = t1Size + t2Size;
     const int MAX_ITER = 100;
-    const real_t CONV = 1e-10;
+    // (B / tail) CCSD-ground convergence threshold on |dE|. The default 1e-10 grinds a
+    // long near-degeneracy tail (the cluster energy is converged to ~1e-7 by iter ~9,
+    // then ~27 more iters shave digits far below STEOM root accuracy ~1e-3 Ha ~0.01 eV).
+    // Relaxable via env for the embedded-cluster STEOM ground re-solve; default 1e-10 =
+    // byte-identical legacy convergence.
+    real_t CONV = 1e-10;
+    if (const char* e = std::getenv("GANSU_CCSD_CONV")) CONV = std::atof(e);
 
     // Pre-build contiguous integral sub-blocks (constant, computed once)
     const size_t oo = (size_t)nocc * nocc;
@@ -8741,15 +8763,27 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
 
     // Energy: E = sum_{ijab} w_oovv[ij,ab] * (t2(i,j,a,b) + t1(i,a)*t1(j,b))
     auto energy = [&]() -> real_t {
-        real_t E = 0.0;
-        // 2-electron part (canonical CCSD)
+        // (host amplitude flow, Path A) The 2-electron energy is the largest serial
+        // host loop on the per-iter path (oo·vv mul-adds reading w_oovv/t2v/t1).
+        // Parallelise over (i,j) into a per-pair partial array, then reduce it in
+        // index order. Each (i,j) block keeps its serial a,b order and the outer sum
+        // is deterministic ⇒ run-to-run reproducible and matching the serial loop to
+        // ~1e-15 (the partial-sum boundaries differ and FP add is non-associative),
+        // within the existing device-kernel corr band. Energy is a readout only — it
+        // does not feed the amplitudes ⇒ t1/t2 (and STEOM roots) are unaffected.
+        std::vector<real_t> Epart((size_t)nocc * nocc, 0.0);
+        #pragma omp parallel for collapse(2) schedule(static)
         for (int i = 0; i < nocc; i++)
-            for (int j = 0; j < nocc; j++)
+            for (int j = 0; j < nocc; j++) {
+                real_t e = 0.0;
                 for (int a = 0; a < nvir; a++)
-                    for (int b = 0; b < nvir; b++) {
-                        E += w_oovv[((size_t)i*nocc+j)*vv + (size_t)a*nvir+b]
+                    for (int b = 0; b < nvir; b++)
+                        e += w_oovv[((size_t)i*nocc+j)*vv + (size_t)a*nvir+b]
                            * (t2v[T2(i,j,a,b)] + t1[i*nvir+a]*t1[j*nvir+b]);
-                    }
+                Epart[(size_t)i*nocc + j] = e;
+            }
+        real_t E = 0.0;
+        for (size_t ij = 0; ij < (size_t)nocc * nocc; ij++) E += Epart[ij];
         // Semi-canonical: + 2 Σ_ia f_ov[i,a] t1[i,a]   (Brillouin term in CCSD energy)
         if (h_fov_active) {
             for (int i = 0; i < nocc; i++)
@@ -8977,6 +9011,18 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     }
     DeviceDIIS dev_diis(dev_diis_hist, 2, num_amps);
 #endif
+
+    // (host amplitude flow, Path A) Hoist the host-DIIS scratch out of the iter
+    // loop. These were std::vector-constructed every iteration, value-initialising
+    // (zero-filling) ~oo·vv doubles each (≈3.9 GB ×3/iter for an in-domain cluster)
+    // only to be fully overwritten before use — the bulk of the RESID-PROF "remainder"
+    // on the memory-bound host-DIIS path. Allocate once and reuse; every element is
+    // rewritten before any read ⇒ bit-exact. ampVec/errVec live on the host-DIIS path
+    // only (device_amp builds its amp/err on the device).
+    std::vector<real_t> newT1(t1Size);
+    std::vector<real_t> newT2(t2Size);
+    std::vector<real_t> ampVec, errVec;
+    if (!device_amp) { ampVec.resize(num_amps); errVec.resize(num_amps); }
 
     for (int iter = 1; iter <= MAX_ITER; iter++) {
         auto _pt0 = pf_mark();
@@ -9496,7 +9542,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         std::vector<real_t> t1_wovvv(ov);
         cudaMemcpy(t1_wovvv.data(), d_Fkc, ov * sizeof(double), cudaMemcpyDeviceToHost);
 
-        std::vector<real_t> newT1(t1Size, 0.0);
+        // (host amplitude flow, Path A) newT1 hoisted above the loop; fully
+        // overwritten below by the device T1-update D2H (host-DIIS path) or by
+        // host_T1 (non-tiled path) before any read.
         // Host T1 update (legacy path + ⑦-4 self-check reference). Mirrored
         // byte-for-byte by ccsd_t1_update_kernel.
         auto host_T1 = [&](std::vector<real_t>& out) {
@@ -9541,7 +9589,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                                        * t1[k*nvir + a] * t1[i*nvir + c];
                         val -= 2.0 * cubic;
                     }
-                    out[i*nvir+a] = val / Dia[i*nvir+a];
+                    // (B / denominator-only) mirror the device kernel's residual
+                    // correction so the P0-VALIDATE self-check stays machine-eps.
+                    out[i*nvir+a] = (val - level_shift * t1[i*nvir+a]) / Dia[i*nvir+a];
                 }
         };
         if (use_tiled_ladder) {
@@ -9554,7 +9604,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             ccsd_t1_update_kernel<<<bl, th>>>(d_newT1, d_Fac, d_Fki, d_Fkc_t1,
                                               d_t2v, d_t1, d_w_voov_c, d_Fkc, d_w_ooov_c,
                                               (h_fov_active ? d_fov : nullptr), d_Dia,
-                                              nocc, nvir);
+                                              nocc, nvir, level_shift);
             // (device amplitude flow) keep d_newT1 on device for the device DIIS; the
             // host download happens after the (device or host) DIIS update instead.
             if (!device_amp)
@@ -10402,12 +10452,13 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // Symmetrize: t2_new(i,j,a,b) = [raw(i,a,j,b) + raw(j,b,i,a)] / D
         // raw is stored as raw[T2(i,j,a,b)] = raw(i,a,j,b)
         // so raw(j,b,i,a) = raw[T2(j,i,b,a)]
-        std::vector<real_t> newT2(t2Size);
+        // (host amplitude flow, Path A) newT2 hoisted above the loop.
         if (use_tiled_ladder) {
             // (P0-3) device symmetrize: d_newT2 = (d_raw + d_raw^P) / d_Dijab, then
             // download newT2 once for host DIIS. raw never comes to host (P0-1/2/3).
             int th = 256; size_t tot = (size_t)iblk_n*nocc*vv; int bl = (int)((tot + th - 1) / th);
-            ccsd_t2_symmetrize_kernel<<<bl, th>>>(d_newT2, d_raw, d_Dijab, nocc, nvir, iblk_start, iblk_n);
+            ccsd_t2_symmetrize_kernel<<<bl, th>>>(d_newT2, d_raw, d_Dijab, nocc, nvir, iblk_start, iblk_n,
+                                                  d_t2v, level_shift);
             // (device amplitude flow) device DIIS reads d_newT2 directly; download only
             // for the host DIIS path (after the device DIIS update otherwise).
             if (!device_amp) {
@@ -10421,7 +10472,11 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                     for (int a = 0; a < nvir; a++)
                         for (int b = 0; b < nvir; b++) {
                             size_t idx = T2(i,j,a,b);
-                            newT2[idx] = (raw[idx] + raw[T2(j,i,b,a)]) / Dijab[idx];
+                            // (B / denominator-only) residual correction (mirror of the
+                            // device kernel); level_shift = 0 ⇒ byte-identical.
+                            real_t num = raw[idx] + raw[T2(j,i,b,a)];
+                            if (level_shift != 0.0) num -= 2.0 * level_shift * t2v[idx];
+                            newT2[idx] = num / Dijab[idx];
                         }
         }
 
@@ -10468,12 +10523,15 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         }
 #endif
         if (!device_amp) {
-        std::vector<real_t> ampVec(num_amps);
-        std::vector<real_t> errVec(num_amps);
+        // (host amplitude flow, Path A) ampVec/errVec hoisted above the loop; the
+        // element-wise build parallelises trivially (no cross-element dependency or
+        // reduction ⇒ bit-exact).
+        #pragma omp parallel for schedule(static)
         for (size_t k = 0; k < t1Size; k++) {
             ampVec[k] = newT1[k];
             errVec[k] = newT1[k] - t1[k];
         }
+        #pragma omp parallel for schedule(static)
         for (size_t k = 0; k < t2Size; k++) {
             ampVec[t1Size + k] = newT2[k];
             errVec[t1Size + k] = newT2[k] - t2v[k];
@@ -10482,13 +10540,19 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         diis.push(ampVec, errVec);
         if (diis.can_extrapolate()) {
             auto extrap = diis.extrapolate();
+            #pragma omp parallel for schedule(static)
             for (size_t k = 0; k < t1Size; k++) newT1[k] = extrap[k];
+            #pragma omp parallel for schedule(static)
             for (size_t k = 0; k < t2Size; k++) newT2[k] = extrap[t1Size + k];
         }
         pf_diis += std::chrono::duration<double>(pf_cpu() - _pd0).count();
         }
 
+        // (host amplitude flow, Path A) parallel copy-back of the accepted
+        // amplitudes (element-wise ⇒ bit-exact).
+        #pragma omp parallel for schedule(static)
         for (size_t k = 0; k < t1Size; k++) t1[k] = newT1[k];
+        #pragma omp parallel for schedule(static)
         for (size_t k = 0; k < t2Size; k++) t2v[k] = newT2[k];
 
         real_t newEcc = energy();

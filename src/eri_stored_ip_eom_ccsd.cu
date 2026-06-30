@@ -71,7 +71,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             real_t* d_eri_mo_precomputed = nullptr,
                             int num_frozen = 0,
                             const real_t* h_fov_active = nullptr,
-                            const ERI_RI* eri_ri = nullptr);
+                            const ERI_RI* eri_ri = nullptr,
+                            const real_t level_shift = 0.0);
 
 // GPU kernel for trimming MO ERI to frozen-core active space
 // (defined in eri_stored.cu, also used by EE-EOM-CCSD driver)
@@ -209,7 +210,8 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
             &d_t1, &d_t2,
             d_eri_mo_precomputed,
             num_frozen,
-            /*h_fov_active=*/nullptr, /*eri_ri=*/ccsd_eri_ri);
+            /*h_fov_active=*/nullptr, /*eri_ri=*/ccsd_eri_ri,
+            /*level_shift=*/(ctx ? ctx->level_shift : 0.0));
 
         std::cout << "  CCSD correlation energy: " << std::fixed << std::setprecision(10)
                   << E_CCSD << " Ha   (in " << std::setprecision(3)

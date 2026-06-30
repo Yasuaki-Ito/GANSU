@@ -346,7 +346,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             real_t* d_eri_mo_precomputed = nullptr,
                             int num_frozen = 0,
                             const real_t* h_fov_active = nullptr,
-                            const ERI_RI* eri_ri = nullptr);
+                            const ERI_RI* eri_ri = nullptr,
+                            const real_t level_shift = 0.0);
 
 extern __global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ eri_full,
                                                     real_t* __restrict__ eri_trimmed,
@@ -957,7 +958,8 @@ static void compute_steom_ccsd_impl(RHF& rhf,
             &d_t1, &d_t2,
             d_eri_mo_precomputed,
             num_frozen,
-            /*h_fov_active=*/nullptr, /*eri_ri=*/ccsd_eri_ri);
+            /*h_fov_active=*/nullptr, /*eri_ri=*/ccsd_eri_ri,
+            /*level_shift=*/(ctx ? ctx->level_shift : 0.0));
         std::cout << "  STEOM CCSD ground-state re-solve: " << std::fixed << std::setprecision(10)
                   << E_CCSD << " Ha   (in " << std::setprecision(3)
                   << ccsd_timer.elapsed_seconds() << " s)" << std::endl;
@@ -1627,7 +1629,8 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
                                   const real_t* d_eps,
                                   real_t* d_eri_mo,
                                   int nao, int n_emb, int n_emb_occ,
-                                  int n_states, int n_frozen)
+                                  int n_states, int n_frozen,
+                                  real_t level_shift)
 {
     PROFILE_FUNCTION();
     if (n_emb_occ <= n_frozen || n_emb_occ >= n_emb)
@@ -1653,6 +1656,7 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
     // MO-ERI blocks from the cluster B (build_B_mo) instead of the dense n_emb⁴
     // tensor — the caller (dmet.cu) correspondingly passes d_eri_mo == nullptr.
     ctx.prefer_ri_block = (std::getenv("GANSU_DMET_STEOM_RI_BLOCK") != nullptr);
+    ctx.level_shift     = level_shift;   // (B / denominator-only) 0 ⇒ legacy direct form
 
     compute_steom_ccsd_impl(cfg, eri_method, /*d_eri_ao=*/nullptr, n_states,
                             /*d_eri_mo_precomputed=*/d_eri_mo, &ctx);
@@ -1660,6 +1664,10 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
     // (solve-once) release the cached cluster CCSD ground amplitudes.
     if (ctx.cc_t1) tracked_cudaFree(ctx.cc_t1);
     if (ctx.cc_t2) tracked_cudaFree(ctx.cc_t2);
+
+    // Carry the cluster CCSD ground correlation energy out so the caller can report
+    // it as the post-HF correction (was lost with ctx ⇒ summary showed 0).
+    ctx.steom_result.ground_corr_energy = ctx.post_hf_energy;
 
     return std::move(ctx.steom_result);
 }
@@ -1671,6 +1679,9 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
 void ERI_RI_RHF::compute_dmet_steom_ccsd(int n_states) {
     DMET dmet(rhf_, *this);
     STEOMResult r = dmet.compute_steom(*this, n_states);
+    // Report the cluster CCSD ground correlation energy as the post-HF correction
+    // (otherwise the final summary prints 0 even though the cluster CCSD ran).
+    rhf_.set_post_hf_energy(r.ground_corr_energy);
     rhf_.append_excited_state_report(r.report);
     rhf_.set_steom_result(std::move(r));
 }

@@ -58,7 +58,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             real_t* d_eri_mo_precomputed,
                             int num_frozen,
                             const real_t* h_fov_active = nullptr,
-                            const ERI_RI* eri_ri = nullptr);
+                            const ERI_RI* eri_ri = nullptr,
+                            const real_t level_shift = 0.0);
 
 // RAII guard: redirect std::cout to a discarded sink for the lifetime of the
 // object. Used to silence ccsd_spatial_orbital's per-iteration output during
@@ -665,7 +666,11 @@ FragmentResult DMET::solve_fragment_ccsd(
         real_t homo = h_eps[n_emb_occ - 1];
         real_t lumo = h_eps[n_emb_occ];
         real_t gap = lumo - homo;
-        const real_t target_gap = 0.5;  // Hartree — ensures stable CCSD convergence
+        // (B / iter-reduction lever) Same global ε level shift as solve_fragment_steom;
+        // tunable via the shared env (default 0.5 = byte-identical). See the note there:
+        // changing this changes the converged cluster correlation energy, not just speed.
+        real_t target_gap = 0.5;  // Hartree — ensures stable CCSD convergence
+        if (const char* e = std::getenv("GANSU_DMET_LEVEL_SHIFT_GAP")) target_gap = std::atof(e);
 
         if (gap < target_gap) {
             real_t shift = target_gap - gap;
@@ -781,18 +786,45 @@ STEOMResult DMET::solve_fragment_steom(
     gpu::eigenDecomposition(d_h_emb, d_eigvals, d_eigvecs, n_emb);
     tracked_cudaFree(d_h_emb);
 
+    // (B / denominator-only level shift) When enabled, the ε shift below is still
+    // applied (so the cluster CCSD denominators are unchanged = stable convergence),
+    // but the shift s is carried into the chain so the CCSD adds a residual correction
+    // (raw -= s·t2, val -= s·t1) and converges to the TRUE unshifted energy instead of
+    // the biased one (~0.075 Ha on the {0-9} cluster). Off ⇒ legacy biased direct form.
+    real_t cluster_level_shift = 0.0;
+    const bool denom_only_ls = (std::getenv("GANSU_DMET_LEVEL_SHIFT_DENOM_ONLY") != nullptr);
     {
         std::vector<real_t> h_eps(n_emb);
         cudaMemcpy(h_eps.data(), d_eigvals, n_emb * sizeof(real_t), cudaMemcpyDeviceToHost);
         real_t gap = h_eps[n_emb_occ] - h_eps[n_emb_occ - 1];
-        const real_t target_gap = 0.5;  // Hartree
+        // (B / iter-reduction lever) Cluster level shift that stabilises the small-gap
+        // embedded CCSD. A larger target_gap = stronger damping of the virtual ε =
+        // slower convergence (the in-domain {0-9} 33-iter cost); smaller = faster but
+        // risks divergence. ⚠ This is a *global* ε shift — it feeds Dijab, the F
+        // intermediates and the cluster energy ⇒ changing it changes the converged
+        // cluster correlation energy (and STEOM roots), not just the convergence path.
+        // Tunable via env to measure the iter-vs-shift-vs-energy trade-off; default 0.5
+        // = byte-identical baseline. Set to 0 to disable the shift (true unshifted ε).
+        real_t target_gap = 0.5;  // Hartree
+        if (const char* e = std::getenv("GANSU_DMET_LEVEL_SHIFT_GAP")) {
+            target_gap = std::atof(e);
+            std::cout << "  [DMET-STEOM] level-shift target_gap = " << std::fixed
+                      << std::setprecision(4) << target_gap << " Ha (env override; "
+                      << (gap < target_gap ? "shift applied" : "no shift — gap already ≥ target")
+                      << ")" << std::defaultfloat << std::endl;
+        }
         if (gap < target_gap) {
             real_t shift = target_gap - gap;
+            if (denom_only_ls) cluster_level_shift = shift;   // carry s into the chain
             for (int i = n_emb_occ; i < n_emb; i++) h_eps[i] += shift;
             cudaMemcpy(d_eigvals, h_eps.data(), n_emb * sizeof(real_t), cudaMemcpyHostToDevice);
             std::cout << "  [DMET-STEOM] HOMO-LUMO gap " << std::fixed << std::setprecision(4)
                       << gap << " → " << target_gap << " Ha (level shift +" << shift << ")"
                       << std::defaultfloat << std::endl;
+            if (denom_only_ls)
+                std::cout << "  [DMET-STEOM] denominator-only level shift ON (s=" << std::fixed
+                          << std::setprecision(4) << shift << ") — converging to the TRUE "
+                          << "unshifted cluster energy" << std::defaultfloat << std::endl;
         }
     }
 
@@ -824,7 +856,8 @@ STEOMResult DMET::solve_fragment_steom(
     real_t* d_eri_mo = ri_block ? nullptr : eri_method.build_mo_eri(d_C_can, n_emb);
     STEOMResult r = steom_spatial_orbital(rhf_, eri_method, d_C_can, d_eigvals, d_eri_mo,
                                           /*nao=*/nao, /*n_emb=*/n_emb,
-                                          /*n_emb_occ=*/n_emb_occ, n_states, n_frozen);
+                                          /*n_emb_occ=*/n_emb_occ, n_states, n_frozen,
+                                          /*level_shift=*/cluster_level_shift);
 
     tracked_cudaFree(d_eigvals); tracked_cudaFree(d_eigvecs);
     tracked_cudaFree(d_C_can);
