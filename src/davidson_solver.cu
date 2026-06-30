@@ -344,7 +344,10 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
         {
             // Find max residual norm
             real_t max_res = *std::max_element(residual_norms_.begin(), residual_norms_.end());
-            if (config_.verbose > 1) {
+            // Per-iteration progress at verbose > 0 (one line/iter): the EOM/STEOM
+            // solves set verbose=1 expecting this (each sigma apply is tens of seconds
+            // on large clusters — without it the multi-minute solve looks frozen).
+            if (config_.verbose > 0) {
                 std::cout << "---- Davidson iteration " << std::setw(3) << (iter + 1) << " ---- ";
                 for (int i = 0; i < std::min(5, config_.num_eigenvalues); ++i) {
                     std::cout << std::fixed << std::setprecision(6) << h_eigenvalues_[i];

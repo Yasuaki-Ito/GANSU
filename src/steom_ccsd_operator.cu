@@ -658,7 +658,9 @@ STEOMCCSDOperator::STEOMCCSDOperator(
         }
         // Per-phase build profiling (env GANSU_STEOM_BUILD_PROF=1). Sync + chrono around
         // each ctor stage to split the "Operator build time" (diagnostic, once).
-        const bool prof = std::getenv("GANSU_STEOM_BUILD_PROF") != nullptr;
+        const char* _stp = std::getenv("GANSU_PROGRESS");   // progress default-on; GANSU_PROGRESS=0 to quiet
+        const bool prof = (std::getenv("GANSU_STEOM_BUILD_PROF") != nullptr)
+                        || !_stp || _stp[0] != '0';
 
         // Stage 1: build-phase multi-GPU device count (env GANSU_STEOM_BUILD_GPUS=N>1).
         // Decoupled from --num_gpus / GANSU_STEOM_EOM_GPUS. Clamp to the physical
@@ -1163,7 +1165,9 @@ void STEOMCCSDOperator::build_dressed_intermediates() {
 
     // Internal split-timer (env GANSU_STEOM_BUILD_PROF) to locate the host
     // 足回り hotspots inside build_dressed for the GPU-resident port.
-    const bool _bdprof = std::getenv("GANSU_STEOM_BUILD_PROF") != nullptr;
+    const char* _bdp = std::getenv("GANSU_PROGRESS");   // progress default-on; GANSU_PROGRESS=0 to quiet
+    const bool _bdprof = (std::getenv("GANSU_STEOM_BUILD_PROF") != nullptr)
+                       || !_bdp || _bdp[0] != '0';
     std::chrono::high_resolution_clock::time_point _bt = std::chrono::high_resolution_clock::now();
     auto _bsplit = [&](const char* nm){
         if(!_bdprof) return;
@@ -3597,7 +3601,9 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     const int NMv = n_act_vir_;
 
     // Internal block profiler (env GANSU_STEOM_BUILD_PROF=1). All host loops → chrono only.
-    const bool bprof = std::getenv("GANSU_STEOM_BUILD_PROF") != nullptr;
+    const char* _wgp = std::getenv("GANSU_PROGRESS");   // progress default-on; GANSU_PROGRESS=0 to quiet
+    const bool bprof = (std::getenv("GANSU_STEOM_BUILD_PROF") != nullptr)
+                     || !_wgp || _wgp[0] != '0';
     auto bclk = std::chrono::high_resolution_clock::now();
     auto bmark = [&](const char* name) {
         if (!bprof) return;
@@ -4293,8 +4299,10 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     std::vector<real_t> g_phhp((size_t)NV*NO*NO*NV, 0.0);
     auto GPHPH=[&](int a,int k,int c,int i)->real_t&{ return g_phph[(((size_t)a*NO+k)*NV+c)*NO+i]; };
     auto GPHHP=[&](int b,int k,int j,int c)->real_t&{ return g_phhp[(((size_t)b*NO+k)*NO+j)*NV+c]; };
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int a=0;a<NV;++a) for(int k=0;k<NO;++k) for(int c=0;c<NV;++c) for(int i=0;i<NO;++i)
         GPHPH(a,k,c,i)=wovov(k,a,i,c);
+    #pragma omp parallel for schedule(static)              // distinct kf=active_occ_idx_[m] per m
     for (int m=0;m<NMo;++m){ const int kf=active_occ_idx_[m];
         for(int a=0;a<NV;++a) for(int c=0;c<NV;++c) for(int i=0;i<NO;++i)
             GPHPH(a,kf,c,i)+=UAMCI(a,m,c,i); }
@@ -4305,28 +4313,39 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     //   + Σ_{N,F}(2seA(e,N,c,F)-seA(e,N,F,c))·wooov(i,N,k,F) - Σ_{N,F} seA(e,N,c,F)·wooov(N,i,k,F) [Wooov]
     // The Wvovv term reuses the existing uakei_t4 GEMM (Σ_cd wvovv(a,k,c,d)·seA(e,i,c,d)); with
     // (a,k,e,i)->(c,i,e,k) it equals the Wvovv contraction here.
-    for (int e=0;e<NMv;++e){ const int af=active_vir_idx_[e];
-        for(int k=0;k<NO;++k) for(int c=0;c<NV;++c) for(int i=0;i<NO;++i){
-            real_t v=0.0;
-            for(int F=0;F<NV;++F) v += seA(e,k,c,F)*fov(i,F);              // Fov
-            if (uakei_t4_gpu) {                                            // Wvovv (GEMM reuse)
-                v += uakei_t4[(((size_t)c*NO+i)*NMv+e)*NO+k];
-            } else {
-                for(int G=0;G<NV;++G) for(int F=0;F<NV;++F)
-                    v += seA(e,k,G,F)*wvovv(c,i,G,F);
+    // (W^eff build perf) This u_akei block dominated the assemble phase: the (N,F)
+    // Wooov contraction makes it O(NMv·NO³·NV²), and it ran serially (≈16 min on the
+    // in-domain {0-9} cluster — the "stuck at W^eff build" wall). Parallelise over
+    // (e,k): each (e,k) writes the distinct GPHPH(af,k,·,·) slab (af = active_vir_idx_[e]
+    // is distinct per e), and every v keeps its serial inner-sum order ⇒ bit-exact.
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int e=0;e<NMv;++e)
+        for(int k=0;k<NO;++k){
+            const int af=active_vir_idx_[e];
+            for(int c=0;c<NV;++c) for(int i=0;i<NO;++i){
+                real_t v=0.0;
+                for(int F=0;F<NV;++F) v += seA(e,k,c,F)*fov(i,F);              // Fov
+                if (uakei_t4_gpu) {                                            // Wvovv (GEMM reuse)
+                    v += uakei_t4[(((size_t)c*NO+i)*NMv+e)*NO+k];
+                } else {
+                    for(int G=0;G<NV;++G) for(int F=0;F<NV;++F)
+                        v += seA(e,k,G,F)*wvovv(c,i,G,F);
+                }
+                for(int N=0;N<NO;++N) for(int F=0;F<NV;++F){                   // Wooov (2 terms)
+                    v += (2.0*seA(e,N,c,F)-seA(e,N,F,c))*wooov(i,N,k,F);
+                    v -= seA(e,N,c,F)*wooov(N,i,k,F);
+                }
+                GPHPH(af,k,c,i)+=v;
             }
-            for(int N=0;N<NO;++N) for(int F=0;F<NV;++F){                   // Wooov (2 terms)
-                v += (2.0*seA(e,N,c,F)-seA(e,N,F,c))*wooov(i,N,k,F);
-                v -= seA(e,N,c,F)*wooov(N,i,k,F);
-            }
-            GPHPH(af,k,c,i)+=v;
         }
-    }
+    #pragma omp parallel for collapse(2) schedule(static)  // distinct (kf,cf) per (m,e)
     for (int m=0;m<NMo;++m) for(int e=0;e<NMv;++e){ const int kf=active_occ_idx_[m], cf=active_vir_idx_[e];
         for(int a=0;a<NV;++a) for(int i=0;i<NO;++i)
             GPHPH(a,kf,cf,i)+=UAMEI(a,m,e,i); }       // g_phph cross (kept, old form)
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int b=0;b<NV;++b) for(int k=0;k<NO;++k) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c)
         GPHHP(b,k,j,c)=wovvo(k,b,c,j);
+    #pragma omp parallel for schedule(static)              // distinct kf per m
     for (int m=0;m<NMo;++m){ const int kf=active_occ_idx_[m];
         for(int b=0;b<NV;++b) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c)
             GPHHP(b,kf,j,c)+=UBMJC(b,m,j,c); }        // g_phhp IP route (SO-derived)
@@ -4338,6 +4357,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     // ---- G^{1h1p} singlet: row=i*NV+a, col=j*NV+b ----
     //  G = F_eff_vv δ_ij − F_eff_oo δ_ab + 2 g_phhp[b,j,i,a] − g_phph[a,j,b,i]
     std::vector<real_t> Gmat((size_t)total_dim_*total_dim_, 0.0);
+    #pragma omp parallel for collapse(2) schedule(static)  // distinct row=(i,a) per thread
     for (int i=0;i<NO;++i) for(int a=0;a<NV;++a){
         const int row=i*NV+a;
         for (int j=0;j<NO;++j) for(int b=0;b<NV;++b){

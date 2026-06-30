@@ -1219,7 +1219,9 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     // hotspots inside the 32 s EA build are localized before GPU-porting them.
     // A cudaDeviceSynchronize() is issued so GEMM-port phases time their device
     // work, not just the async launch.
-    const bool ea_subprof = std::getenv("GANSU_EA_BUILD_SUBPROF") != nullptr;
+    const char* _eap = std::getenv("GANSU_PROGRESS");   // progress default-on; GANSU_PROGRESS=0 to quiet
+    const bool ea_subprof = (std::getenv("GANSU_EA_BUILD_SUBPROF") != nullptr)
+                          || !_eap || _eap[0] != '0';
     auto _spclk = std::chrono::high_resolution_clock::now();
     auto subprof = [&](const char* nm) {
         if (!ea_subprof) return;

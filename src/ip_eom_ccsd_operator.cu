@@ -935,7 +935,12 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
     // Per-intermediate profiler (env GANSU_EOM_BUILD_PROF2=1) — pinpoints the host-loop
     // hotspot inside build_dressed (GANSU_EOM_BUILD_PROF times only the whole phase). Each
     // blap() prints the wall time since the previous call. Off → zero overhead.
-    const bool bprof2 = [](){ const char* e = std::getenv("GANSU_EOM_BUILD_PROF2"); return e && e[0] == '1'; }();
+    // Per-sub-step progress through the (minutes-long on large clusters)
+    // build_dressed phase, so it shows movement instead of freezing silently.
+    // Default ON; quiet the whole progress stream with GANSU_PROGRESS=0.
+    const bool bprof2 = [](){ const char* e = std::getenv("GANSU_EOM_BUILD_PROF2");
+        const char* p = std::getenv("GANSU_PROGRESS");
+        return (e && e[0] == '1') || !p || p[0] != '0'; }();
     auto bp_t0 = std::chrono::high_resolution_clock::now();
     auto blap = [&](const char* name) {
         if (!bprof2) return;
