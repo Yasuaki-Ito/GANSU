@@ -41,6 +41,7 @@
 #include <limits>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 
 #include "rhf.hpp"
 #include "steom_ccsd_operator.hpp"
@@ -391,6 +392,136 @@ static std::vector<int> steom_assign_distinct(
     return assign;
 }
 
+// ============================================================================
+//  (debug accelerator) DMET-STEOM checkpoint — cache the CIS-NTO/IP/EA results +
+//  cluster CCSD T1/T2 + published bar-H so a re-run skips the ~24 min CCSD+IP+EA
+//  prefix and iterates on the STEOM stage in ~5 min. Gated by GANSU_DMET_STEOM_CKPT
+//  =<file>. The loaded state is bit-identical to the recomputed one (deterministic
+//  inputs), so STEOM roots are unchanged; this is purely to shorten the debug loop.
+// ============================================================================
+namespace {
+constexpr int kSteomCkptMagic = 0x53544D32;  // "STM2"
+
+template<class T> void ckpt_wr(std::ofstream& f, const T& v){ f.write((const char*)&v, sizeof(T)); }
+template<class T> void ckpt_rd(std::ifstream& f, T& v){ f.read((char*)&v, sizeof(T)); }
+template<class T> void ckpt_wr_vec(std::ofstream& f, const std::vector<T>& v){
+    size_t n = v.size(); f.write((const char*)&n, sizeof(n));
+    if (n) f.write((const char*)v.data(), n * sizeof(T)); }
+template<class T> void ckpt_rd_vec(std::ifstream& f, std::vector<T>& v){
+    size_t n = 0; f.read((char*)&n, sizeof(n)); v.resize(n);
+    if (n) f.read((char*)v.data(), n * sizeof(T)); }
+// Device buffer: D2H then write (with element count). Null ⇒ count 0.
+inline void ckpt_wr_dev(std::ofstream& f, const real_t* d, size_t n){
+    size_t nn = (d ? n : 0); f.write((const char*)&nn, sizeof(nn));
+    if (nn) { std::vector<real_t> h(nn);
+        cudaMemcpy(h.data(), d, nn * sizeof(real_t), cudaMemcpyDeviceToHost);
+        f.write((const char*)h.data(), nn * sizeof(real_t)); } }
+// Read into a fresh tracked device buffer (nullptr if count 0).
+inline real_t* ckpt_rd_dev(std::ifstream& f){
+    size_t n = 0; f.read((char*)&n, sizeof(n)); if (!n) return nullptr;
+    std::vector<real_t> h(n); f.read((char*)h.data(), n * sizeof(real_t));
+    real_t* d = nullptr; tracked_cudaMalloc(&d, n * sizeof(real_t));
+    cudaMemcpy(d, h.data(), n * sizeof(real_t), cudaMemcpyHostToDevice); return d; }
+
+// per-root label accessor overloads (IP uses canonical_occ_label, EA canonical_vir_label)
+inline int ckpt_eom_label(const IPEOMResult::PerRoot& pr){ return pr.canonical_occ_label; }
+inline int ckpt_eom_label(const EAEOMResult::PerRoot& pr){ return pr.canonical_vir_label; }
+inline void ckpt_set_label(IPEOMResult::PerRoot& pr, int v){ pr.canonical_occ_label = v; }
+inline void ckpt_set_label(EAEOMResult::PerRoot& pr, int v){ pr.canonical_vir_label = v; }
+template<class Res> void ckpt_wr_eom(std::ofstream& f, const Res& r){
+    ckpt_wr(f, r.nocc_active); ckpt_wr(f, r.nvir); ckpt_wr(f, r.num_frozen); ckpt_wr(f, r.n_active);
+    size_t n = r.per_active.size(); ckpt_wr(f, n);
+    for (const auto& pr : r.per_active) {
+        ckpt_wr(f, pr.omega); ckpt_wr(f, pr.percent_singles); ckpt_wr(f, pr.followcis_overlap);
+        int label = ckpt_eom_label(pr);
+        ckpt_wr(f, label);
+        ckpt_wr_vec(f, pr.R1); ckpt_wr_vec(f, pr.R2);
+    } }
+template<class Res> void ckpt_rd_eom(std::ifstream& f, Res& r){
+    ckpt_rd(f, r.nocc_active); ckpt_rd(f, r.nvir); ckpt_rd(f, r.num_frozen); ckpt_rd(f, r.n_active);
+    size_t n = 0; ckpt_rd(f, n); r.per_active.resize(n);
+    for (auto& pr : r.per_active) {
+        ckpt_rd(f, pr.omega); ckpt_rd(f, pr.percent_singles); ckpt_rd(f, pr.followcis_overlap);
+        int label = -1; ckpt_rd(f, label); ckpt_set_label(pr, label);
+        ckpt_rd_vec(f, pr.R1); ckpt_rd_vec(f, pr.R2);
+    } }
+
+void steom_ckpt_save(const EOMChainContext& ctx, const char* path){
+    std::ofstream f(path, std::ios::binary);
+    if (!f) { std::cout << "  [STEOM ckpt] WARN cannot open " << path << " for write." << std::endl; return; }
+    int magic = kSteomCkptMagic; ckpt_wr(f, magic);
+    // cluster CCSD ground
+    int cached = ctx.cc_ground_cached ? 1 : 0; ckpt_wr(f, cached);
+    ckpt_wr(f, ctx.cc_t1n); ckpt_wr(f, ctx.cc_t2n); ckpt_wr(f, ctx.cc_E);
+    ckpt_wr_dev(f, ctx.cc_t1, ctx.cc_t1n); ckpt_wr_dev(f, ctx.cc_t2, ctx.cc_t2n);
+    // CIS-NTO result
+    { const auto& c = ctx.cis_nto_result;
+      ckpt_wr(f, c.nocc_active); ckpt_wr(f, c.nvir); ckpt_wr(f, c.num_frozen);
+      ckpt_wr(f, c.n_act_occ); ckpt_wr(f, c.n_act_vir);
+      ckpt_wr_vec(f, c.nto_occ_occupations); ckpt_wr_vec(f, c.nto_vir_occupations);
+      ckpt_wr_vec(f, c.U_occ); ckpt_wr_vec(f, c.U_vir);
+      ckpt_wr_vec(f, c.active_occ_indices); ckpt_wr_vec(f, c.active_vir_indices);
+      ckpt_wr(f, c.trace_occ); ckpt_wr(f, c.trace_vir); ckpt_wr(f, c.weight_sum);
+      ckpt_wr(f, c.o_thresh); ckpt_wr(f, c.v_thresh); }
+    ckpt_wr_eom(f, ctx.ip_eom_result);
+    ckpt_wr_eom(f, ctx.ea_eom_result);
+    // bar-H (partial-capable: after IP only the 8 IP buffers are present; each
+    // ckpt_wr_dev writes count 0 for a null slot, so partial state round-trips).
+    const auto& b = ctx.barh;
+    int hip = b.has_ip ? 1 : 0, hea = b.has_ea ? 1 : 0; ckpt_wr(f, hip); ckpt_wr(f, hea);
+    ckpt_wr(f, b.nocc); ckpt_wr(f, b.nvir); int cs = b.canonical_skip_wvvvv ? 1 : 0; ckpt_wr(f, cs);
+    const size_t NO = (size_t)b.nocc, NV = (size_t)b.nvir;
+    ckpt_wr_dev(f, b.d_Loo, NO*NO);   ckpt_wr_dev(f, b.d_Lvv, NV*NV);   ckpt_wr_dev(f, b.d_Fov, NO*NV);
+    ckpt_wr_dev(f, b.d_Woooo, NO*NO*NO*NO); ckpt_wr_dev(f, b.d_Wooov, NO*NO*NO*NV);
+    ckpt_wr_dev(f, b.d_Wovov, NO*NV*NO*NV); ckpt_wr_dev(f, b.d_Wovvo, NO*NV*NV*NO);
+    ckpt_wr_dev(f, b.d_Wovoo, NO*NV*NO*NO); ckpt_wr_dev(f, b.d_Wvovv, NV*NO*NV*NV);
+    ckpt_wr_dev(f, b.d_Wvvvv, NV*NV*NV*NV); ckpt_wr_dev(f, b.d_Wvvvo, NV*NV*NV*NO);
+    f.flush();
+    std::cout << "  [STEOM ckpt] saved to " << path << " (cc=" << (ctx.cc_ground_cached?"y":"n")
+              << " ip=" << ctx.ip_eom_result.per_active.size()
+              << " ea=" << ctx.ea_eom_result.per_active.size()
+              << " barH ip/ea=" << hip << "/" << hea << ")." << std::endl;
+}
+
+bool steom_ckpt_load(EOMChainContext& ctx, const char* path){
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    int magic = 0; ckpt_rd(f, magic);
+    if (magic != kSteomCkptMagic) {
+        std::cout << "  [STEOM ckpt] " << path << " bad magic — ignoring." << std::endl; return false; }
+    int cached = 0; ckpt_rd(f, cached);
+    ckpt_rd(f, ctx.cc_t1n); ckpt_rd(f, ctx.cc_t2n); ckpt_rd(f, ctx.cc_E);
+    ctx.cc_t1 = ckpt_rd_dev(f); ctx.cc_t2 = ckpt_rd_dev(f);
+    ctx.cc_ground_cached = (cached != 0);
+    { auto& c = ctx.cis_nto_result;
+      ckpt_rd(f, c.nocc_active); ckpt_rd(f, c.nvir); ckpt_rd(f, c.num_frozen);
+      ckpt_rd(f, c.n_act_occ); ckpt_rd(f, c.n_act_vir);
+      ckpt_rd_vec(f, c.nto_occ_occupations); ckpt_rd_vec(f, c.nto_vir_occupations);
+      ckpt_rd_vec(f, c.U_occ); ckpt_rd_vec(f, c.U_vir);
+      ckpt_rd_vec(f, c.active_occ_indices); ckpt_rd_vec(f, c.active_vir_indices);
+      ckpt_rd(f, c.trace_occ); ckpt_rd(f, c.trace_vir); ckpt_rd(f, c.weight_sum);
+      ckpt_rd(f, c.o_thresh); ckpt_rd(f, c.v_thresh); }
+    ckpt_rd_eom(f, ctx.ip_eom_result);
+    ckpt_rd_eom(f, ctx.ea_eom_result);
+    { auto& b = ctx.barh;
+      int hip = 0, hea = 0; ckpt_rd(f, hip); ckpt_rd(f, hea);
+      ckpt_rd(f, b.nocc); ckpt_rd(f, b.nvir);
+      int cs = 0; ckpt_rd(f, cs); b.canonical_skip_wvvvv = (cs != 0);
+      b.d_Loo = ckpt_rd_dev(f); b.d_Lvv = ckpt_rd_dev(f); b.d_Fov = ckpt_rd_dev(f);
+      b.d_Woooo = ckpt_rd_dev(f); b.d_Wooov = ckpt_rd_dev(f); b.d_Wovov = ckpt_rd_dev(f);
+      b.d_Wovvo = ckpt_rd_dev(f); b.d_Wovoo = ckpt_rd_dev(f); b.d_Wvovv = ckpt_rd_dev(f);
+      b.d_Wvvvv = ckpt_rd_dev(f); b.d_Wvvvo = ckpt_rd_dev(f);
+      b.has_ip = (hip != 0); b.has_ea = (hea != 0); }
+    const bool ip_done = !ctx.ip_eom_result.per_active.empty();
+    const bool ea_done = !ctx.ea_eom_result.per_active.empty();
+    std::cout << "  [STEOM ckpt] loaded from " << path << " — skip CCSD"
+              << (ip_done ? "+IP" : "") << (ea_done ? "+EA" : "")
+              << (ea_done ? "" : " (IP-only checkpoint: EA re-runs)")
+              << (ctx.barh.has_ip ? "; bar-H restored" : "") << "." << std::endl;
+    return true;
+}
+}  // anonymous namespace
+
 // `eri_method` is taken by ERI base reference so the composite auto-dispatch
 // (compute_cis_nto / compute_ip_eom_ccsd / compute_ea_eom_ccsd) resolves
 // polymorphically — stored uses AO→MO transform, RI builds the MO ERI from B.
@@ -526,10 +657,28 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     mpi_barh_xfer = mpi_steom;
 #endif
 
-    // DMET-STEOM cluster: run a single self-contained STEOM (no MPI IP||EA split,
-    // no cross-operator bar-H sharing — ctx->share_barh stays false). Fragment-
-    // parallelism is handled one level up (DMET fragment loop / MPI rank=fragment).
-    if (ctx) { mpi_steom = false; mpi_barh_xfer = false; }
+    // DMET-STEOM cluster: run a single self-contained STEOM (no MPI IP||EA split).
+    // Fragment-parallelism is handled one level up (DMET fragment loop / MPI rank).
+    if (ctx) {
+        mpi_steom = false; mpi_barh_xfer = false;
+        // (perf) Cluster share-barH: the cluster IP publishes its 8 dressed bar-H and
+        // EA its 3 unique ones into ctx->barh (same validated mechanism as the non-
+        // cluster path — see eri_stored_ip/ea_eom_ccsd.cu), so the STEOM operator
+        // borrows all 11 and SKIPS its ~320 s build_dressed_intermediates.
+        // ⚠ OPT-IN for the cluster (GANSU_STEOM_SHARE_BARH=1): keeping IP's 8 + EA's 3
+        // bar-H resident on device 0 through the STEOM build adds ~28 GB that, together
+        // with the RI B replica (~17 GB/GPU), OOMs the STEOM G build on a large cluster
+        // (log174: needed 13.55 GB, 2.42 free). Realising the win needs device-balancing
+        // the STEOM operator onto a freer GPU (cross-device bar-H) or freeing B first —
+        // future work. Default OFF ⇒ STEOM rebuilds its bar-H (safe, no OOM).
+        const char* e = std::getenv("GANSU_STEOM_SHARE_BARH");
+        ctx->share_barh = (e && e[0] == '1');
+        if (ctx->share_barh)
+            std::cout << "  [DMET-STEOM share-barH] ON (opt-in) — IP/EA publish dressed bar-H; "
+                         "STEOM borrows all 11 (skips ~320 s build_dressed). Multi-GPU: the "
+                         "STEOM operator is device-balanced onto the freest GPU (bar-H/T1/T2 "
+                         "migrated) to avoid device-0 OOM." << std::endl;
+    }
 
     if (!ctx) {
         const char* env     = std::getenv("GANSU_STEOM_SHARE_BARH");
@@ -590,6 +739,17 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                          "is not RI — falling back to the dense cluster MO-ERI." << std::endl;
     }
 
+    // (debug accelerator) Resume from a STEOM checkpoint: load CIS-NTO / IP / EA
+    // results + cluster CCSD T1/T2 + published bar-H, so the CIS/IP/EA dispatch
+    // below no-ops (populated results) and we jump straight to the STEOM stage.
+    bool ckpt_loaded = false;
+    if (ctx) {
+        if (const char* ck = std::getenv("GANSU_DMET_STEOM_CKPT")) {
+            ckpt_loaded = steom_ckpt_load(*ctx, ck);
+            if (ckpt_loaded && ctx->barh.complete()) ctx->share_barh = true;  // borrow the restored bar-H
+        }
+    }
+
     // Stage 1/3 — CIS-NTO active space.
     if (!mpi_steom) {
         const bool need_cis = ctx ? (ctx->cis_nto_result.n_act_occ == 0)
@@ -641,6 +801,39 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     }
     if (std::getenv("GANSU_STEOM_MEM_DUMP"))
         dump_tracked_allocations("after stage 2 (IP-EOM)");
+    // (debug accelerator) Save an IP-stage checkpoint now (before EA) so a re-run can
+    // resume past CCSD+IP and iterate on EA (+STEOM) — reached even if EA later OOMs.
+    // The after-EA save below overwrites this with the full state once EA completes.
+    if (ctx && !ckpt_loaded) {
+        if (const char* ck = std::getenv("GANSU_DMET_STEOM_CKPT"))
+            steom_ckpt_save(*ctx, ck);
+    }
+#ifndef GANSU_CPU_ONLY
+    // (perf) EA-solve device relief (user request): with share-barH, IP's 8 published
+    // bar-H (~16 GB) pin device 0 and OOM the EA Davidson subspace there (log174/175:
+    // needed 13.55 GB, 2.42 free). IP's operator is already destroyed (the cache owns
+    // the buffers — no alias), so move the 8 to the freest peer GPU now; EA then
+    // builds+solves on device 0 with room. STEOM later pulls EA's 3 onto the same GPU
+    // (barh.ip_dev) and builds there. Only under sharing + a complete IP set + >1 GPU.
+    if (ctx && ctx->share_barh && gpu::gpu_available()
+        && ctx->barh.has_ip && !ctx->barh.has_ea && ctx->barh.ip_dev == 0) {
+        int n_dev = 0; cudaGetDeviceCount(&n_dev);
+        if (n_dev > 1) {
+            int saved = 0; cudaGetDevice(&saved);
+            std::vector<size_t> freeb(n_dev, 0);
+            for (int d = 1; d < n_dev; ++d) { cudaSetDevice(d); size_t fb=0,tb=0;
+                if (cudaMemGetInfo(&fb,&tb) == cudaSuccess) freeb[d] = fb; }
+            cudaSetDevice(saved);
+            int D = 1; size_t bf = freeb[1];
+            for (int d = 2; d < n_dev; ++d) if (freeb[d] > bf) { bf = freeb[d]; D = d; }
+            ctx->barh.migrate_ip_to(D);
+            std::cout << "  [DMET-STEOM share-barH] moved IP bar-H (8) off device 0 → GPU "
+                      << D << " (free=" << std::fixed << std::setprecision(1)
+                      << (bf/(1024.0*1024.0*1024.0)) << " GB) so the EA solve has room on device 0."
+                      << std::defaultfloat << std::endl;
+        }
+    }
+#endif
     const bool need_ea = ctx ? ctx->ea_eom_result.per_active.empty()
                               : rhf.get_ea_eom_result().per_active.empty();
     if (do_ea && need_ea) {
@@ -704,6 +897,13 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         }
     }
 #endif
+
+    // (debug accelerator) Save the STEOM checkpoint now that CCSD+IP+EA (+bar-H when
+    // sharing) are populated in ctx — a subsequent run with the same file resumes here.
+    if (ctx && !ckpt_loaded) {
+        if (const char* ck = std::getenv("GANSU_DMET_STEOM_CKPT"))
+            steom_ckpt_save(*ctx, ck);
+    }
 
     // Sanity check — both per_active vectors must now have entries.
     const IPEOMResult& ip_result = ctx ? ctx->ip_eom_result : rhf.get_ip_eom_result();
@@ -1078,6 +1278,7 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     bool steom_dev_balance_active = false;
     int  steom_dev_balance_restore = 0;
     int  steom_dev_balance_target  = 0;
+    real_t* d_eps_bd = nullptr;   // cluster share-barH: best-device ε copy (freed at restore)
 #ifndef GANSU_CPU_ONLY
     if (!ctx && gpu::gpu_available()) {   // cluster: small, single-GPU → no device audit/balance
         const size_t tracked_global = GlobalGpuMemoryTracker::get_current();
@@ -1236,6 +1437,67 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     }
 #endif
 
+#ifndef GANSU_CPU_ONLY
+    // (perf, user request) Cluster share-barH: STEOM is built on the GPU that already
+    // holds IP's 8 bar-H (barh.ip_dev — moved off device 0 before the EA solve). Bring
+    // EA's 3 bar-H there too, migrate the operator's other device inputs (T1/T2 in place,
+    // ε, and the B_mo block source), then cudaSetDevice + GPUHandle::reset so all W^eff
+    // GEMMs + geev run there (device 0 stays free of the ~28 GB bar-H). Restored at impl
+    // exit. Skips the ~320 s build_dressed (borrow) AND avoids the device-0 OOM.
+    if (ctx && ctx->share_barh && gpu::gpu_available()
+        && ctx->barh.complete() && !steom_dev_balance_active) {
+        int saved = 0; cudaGetDevice(&saved);
+        // Target GPU: where IP's bar-H already are (choreography), else the freest
+        // peer (e.g. a full-checkpoint resume that loaded all 11 onto device 0).
+        int best = ctx->barh.ip_dev;
+        if (best == saved) {
+            int n_dev = 0; cudaGetDeviceCount(&n_dev);
+            if (n_dev > 1) {
+                std::vector<size_t> freeb(n_dev, 0);
+                for (int d = 1; d < n_dev; ++d) { cudaSetDevice(d); size_t fb=0,tb=0;
+                    if (cudaMemGetInfo(&fb,&tb) == cudaSuccess) freeb[d] = fb; }
+                cudaSetDevice(saved);
+                best = 1; size_t bf = freeb[1];
+                for (int d = 2; d < n_dev; ++d) if (freeb[d] > bf) { bf = freeb[d]; best = d; }
+            }
+        }
+        if (best != saved) {
+            std::cout << "  [DMET-STEOM share-barH] building STEOM operator on GPU " << best
+                      << " (bar-H device); migrating bar-H + T1/T2 there." << std::endl;
+            ctx->barh.migrate_ip_to(best);                     // no-op if already on best
+            ctx->barh.migrate_ea_to(best);                     // EA's 3 join IP's 8 on best
+            auto move_ip = [&](real_t*& p, size_t n) {          // in-place peer migrate
+                if (!p) return;
+                cudaSetDevice(best);
+                real_t* np = nullptr; tracked_cudaMalloc(&np, n * sizeof(real_t));
+                cudaMemcpyPeer(np, best, p, saved, n * sizeof(real_t));
+                tracked_cudaFree(p); p = np;
+                cudaSetDevice(saved);
+            };
+            move_ip(d_t1, (size_t)nocc_active * nvir);                       // operator owns
+            move_ip(d_t2, (size_t)nocc_active * nocc_active * (size_t)nvir * nvir);
+            cudaSetDevice(best);
+            tracked_cudaMalloc(&d_eps_bd, (size_t)nao_active * sizeof(real_t));
+            cudaMemcpyPeer(d_eps_bd, best, d_eps_active, saved,
+                           (size_t)nao_active * sizeof(real_t));
+            gpu::GPUHandle::reset();                            // cuBLAS/cuSOLVER on best
+            if (eri_ri_block) {
+                // Rebuild the B_mo block source on best (uses best's B replica);
+                // build_B_mo needs C on best — copy it transiently.
+                const size_t Csz = coefficient_matrix.rows() * coefficient_matrix.cols();
+                real_t* d_C_bd = nullptr; tracked_cudaMalloc(&d_C_bd, Csz * sizeof(real_t));
+                cudaMemcpyPeer(d_C_bd, best, d_C, saved, Csz * sizeof(real_t));
+                d_B_mo_blocks = eri_ri_block->build_B_mo(d_C_bd, num_basis);
+                tracked_cudaFree(d_C_bd);
+            }
+            d_eps_active = d_eps_bd;                            // ctor reads ε on best
+            steom_dev_balance_active  = true;
+            steom_dev_balance_restore = saved;
+            steom_dev_balance_target  = best;
+        }
+    }
+#endif
+
     Timer build_timer;
     STEOMCCSDOperator steom_op(d_eri_for_op, d_eps_active,
                                d_t1, d_t2,
@@ -1331,6 +1593,12 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                     std::cout << "  [STEOM dense diag] released RI AO-B replica before geev: "
                               << CudaMemoryManager<real_t>::format_bytes(before - after)
                               << " reclaimed (global)." << std::endl;
+#ifndef GANSU_CPU_ONLY
+                // free_replicated_B resets the current device to 0; when the operator +
+                // G live on a device-balanced GPU, restore it so the geev below runs on
+                // the device that holds d_G_ (else cusolverXgeev fails, info=-1).
+                if (steom_dev_balance_active) cudaSetDevice(steom_dev_balance_target);
+#endif
             }
         }
 
@@ -1638,6 +1906,7 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // both destructed (RAII), so downstream output / API code sees the same
     // device it set before calling STEOM.
 #ifndef GANSU_CPU_ONLY
+    if (d_eps_bd) tracked_cudaFree(d_eps_bd);   // cluster share-barH best-device ε copy
     if (steom_dev_balance_active) {
         cudaSetDevice(steom_dev_balance_restore);
         gpu::GPUHandle::reset();

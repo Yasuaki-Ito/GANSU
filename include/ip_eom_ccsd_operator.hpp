@@ -197,6 +197,26 @@ private:
     int num_gpus_ = 1;
     bool use_gpu_multi_ = false;
     mutable int multi_check_count_ = 0;
+    // (perf) When true the memory-bound big σ2 terms (Woooo·r2, and especially the
+    // UNCOALESCED Wovvo·r2 / Wovov·r2 that dominate wall time) are skipped in the σ2
+    // kernel and computed instead as dense device-0 cuBLAS GEMMs.
+    // Opt-in via GANSU_IP_SIGMA_GEMM (default off ⇒ legacy kernel, byte-identical).
+    bool sigma_gemm_ = false;
+    mutable int sigma_gemm_check_count_ = 0;
+    // One-time contraction-major repacks of Wovvo / Wovov (device 0): [(l,d),(a,j)]
+    // = Wovvo(l,a,d,j) / Wovov(l,a,j,d).  Built lazily on first GEMM apply.
+    mutable real_t* d_WA_  = nullptr;   // Wovvo repack  [nocc·nvir·nvir·nocc]
+    mutable real_t* d_WVA_ = nullptr;   // Wovov repack  [nocc·nvir·nvir·nocc]
+    // Per-matvec scratch (device 0): reshaped r2 views + GEMM outputs (all h2p_dim).
+    mutable real_t* d_R2comb_ = nullptr;  // 2·r2(x,l,d) − r2(l,x,d)
+    mutable real_t* d_R2sw_   = nullptr;  // r2(l,x,d)
+    mutable real_t* d_out1_   = nullptr;  // Wovvo(A+B) + Wovov(C) → [i,(a,j)]
+    mutable real_t* d_out2_   = nullptr;  // Wovov(D)             → [j,(a,i)]
+    void ensure_sigma_gemm_scratch() const;   // lazy alloc + WA/WVA repack (device 0)
+    // Device-0 GEMMs for the big σ2 terms (Woooo + Wovvo + Wovov), added into d_s2.
+    void add_big_terms_gemm(const real_t* d_r2, real_t* d_s2) const;
+    // Compare GEMM-path σ2 vs the legacy full kernel (GANSU_IP_SIGMA_GEMM_VALIDATE).
+    void sigma_gemm_selfcheck(const real_t* d_input, const real_t* d_output_s2) const;
     struct DeviceWorkspace {
         int     device  = -1;
         real_t* d_input = nullptr;   // [total_dim]   broadcast matvec input

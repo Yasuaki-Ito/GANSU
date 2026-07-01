@@ -188,7 +188,8 @@ __global__ void ip_eom_sigma2_full_kernel(
     const real_t* __restrict__ r2,         // [nocc² · nvir]
     real_t* __restrict__ sigma2,           // [nocc² · nvir]
     int nocc, int nvir,
-    int i_begin, int i_end)                // Stage IP-5: compute only this outer-occ slab
+    int i_begin, int i_end,                // Stage IP-5: compute only this outer-occ slab
+    bool add_big)                          // false ⇒ Woooo/Wovvo/Wovov terms done by cuBLAS GEMMs
 {
     int lidx = blockIdx.x * blockDim.x + threadIdx.x;
     const int slabtot = (i_end - i_begin) * nocc * nvir;
@@ -219,6 +220,12 @@ __global__ void ip_eom_sigma2_full_kernel(
         s -= Loo[l * nocc + j] * r2[((size_t)i * nocc + l) * nvir + a];
     }
 
+    // The three big terms below (Woooo·r2, Wovvo·r2, Wovov·r2) are O(nocc²)/O(nocc·nvir)
+    // per output element and read the nocc⁴ / nocc²·nvir² intermediates with poor reuse
+    // (Wovvo/Wovov are UNCOALESCED: their index depends on a, so a warp's consecutive-a
+    // threads touch elements nvir·nocc apart). This is the memory-bound bulk of the kernel.
+    // When add_big is false they are all computed instead as dense cuBLAS GEMMs.
+    if (add_big) {
     // +Σ_{k,l} Woooo[k,l,i,j] r2[k,l,a]      layout: ((k*nocc+l)*nocc + i)*nocc + j
     for (int k = 0; k < nocc; ++k)
         for (int l = 0; l < nocc; ++l) {
@@ -248,6 +255,7 @@ __global__ void ip_eom_sigma2_full_kernel(
             real_t w2 = Wovov[(((size_t)k_or_l * nvir + a) * nocc + i) * nvir + d];
             s -= w2 * r2[((size_t)k_or_l * nocc + j) * nvir + d];
         }
+    }  // add_big
 
     // -Σ_c d_tmp_c[c] * t2[i,j,c,a]
     for (int c = 0; c < nvir; ++c) {
@@ -255,6 +263,70 @@ __global__ void ip_eom_sigma2_full_kernel(
     }
 
     sigma2[((size_t)i * nocc + j) * nvir + a] = s;   // global index (slab writes its rows)
+}
+
+// ------------------------------------------------------------------------------
+// (perf) GEMM-path helpers for the σ2 Wovvo/Wovov terms (the uncoalesced, wall-time-
+// dominant part of the matvec).  We recast them as dense cuBLAS GEMMs.  One-time
+// index repacks turn the intermediates into contraction-major matrices [(l,d),(a,j)];
+// per-matvec we build reshaped r2 views, GEMM, and transpose-accumulate into σ2.
+// ------------------------------------------------------------------------------
+
+// One-time: WA[(l,d),(a,j)] = Wovvo(l,a,d,j).  Output linear = ((l*nvir+d)*nvir+a)*nocc+j.
+__global__ void ip_repack_wovvo_kernel(const real_t* __restrict__ Wovvo,
+                                       real_t* __restrict__ WA, int nocc, int nvir) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t tot = (size_t)nocc * nvir * nvir * nocc;
+    if (idx >= tot) return;
+    int j = idx % nocc; size_t t = idx / nocc;
+    int a = t % nvir;   t /= nvir;
+    int d = t % nvir;   t /= nvir;
+    int l = (int)t;
+    WA[idx] = Wovvo[(((size_t)l * nvir + a) * nvir + d) * nocc + j];
+}
+
+// One-time: WVA[(l,d),(a,j)] = Wovov(l,a,j,d).  Same output layout as WA.
+__global__ void ip_repack_wovov_kernel(const real_t* __restrict__ Wovov,
+                                       real_t* __restrict__ WVA, int nocc, int nvir) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t tot = (size_t)nocc * nvir * nvir * nocc;
+    if (idx >= tot) return;
+    int j = idx % nocc; size_t t = idx / nocc;
+    int a = t % nvir;   t /= nvir;
+    int d = t % nvir;   t /= nvir;
+    int l = (int)t;
+    WVA[idx] = Wovov[(((size_t)l * nvir + a) * nocc + j) * nvir + d];
+}
+
+// Per-matvec: build R2comb[x,(l,d)] = 2·r2(x,l,d) − r2(l,x,d) and R2sw[x,(l,d)] = r2(l,x,d).
+// (R2b = r2 directly.)  Linear index over [x,(l,d)] = (x*nocc+l)*nvir+d = r2 layout.
+__global__ void ip_build_r2_views_kernel(const real_t* __restrict__ r2,
+                                         real_t* __restrict__ R2comb,
+                                         real_t* __restrict__ R2sw, int nocc, int nvir) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t tot = (size_t)nocc * nocc * nvir;
+    if (idx >= tot) return;
+    int d = idx % nvir; size_t t = idx / nvir;
+    int l = t % nocc;   int x = (int)(t / nocc);
+    const real_t r_xl = r2[((size_t)x * nocc + l) * nvir + d];   // r2(x,l,d)
+    const real_t r_lx = r2[((size_t)l * nocc + x) * nvir + d];   // r2(l,x,d)
+    R2sw[idx]   = r_lx;
+    R2comb[idx] = 2.0 * r_xl - r_lx;
+}
+
+// Per-matvec: σ2[(i,j),a] += out1[i,(a,j)] + out2[j,(a,i)].
+//   out1 linear = (i*nvir+a)*nocc+j ;  out2 linear = (j*nvir+a)*nocc+i.
+__global__ void ip_sigma2_transpose_add_kernel(real_t* __restrict__ sigma2,
+                                               const real_t* __restrict__ out1,
+                                               const real_t* __restrict__ out2,
+                                               int nocc, int nvir) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t tot = (size_t)nocc * nocc * nvir;
+    if (idx >= tot) return;
+    int a = idx % nvir; size_t t = idx / nvir;
+    int j = t % nocc;   int i = (int)(t / nocc);
+    sigma2[idx] += out1[((size_t)i * nvir + a) * nocc + j]
+                 + out2[((size_t)j * nvir + a) * nocc + i];
 }
 
 
@@ -359,9 +431,19 @@ IPEOMCCSDOperator::IPEOMCCSDOperator(
         num_gpus_ = (num_gpus > 1 ? num_gpus : 1);
         setup_multi_gpu();   // Stage IP-5: per-device replicas (no-op when num_gpus_==1)
     }
+    // (perf) Opt-in: cast the memory-bound big σ2 terms (Woooo/Wovvo/Wovov) as
+    // device-0 cuBLAS GEMMs instead of the uncoalesced one-thread-per-output kernel.
+    sigma_gemm_ = (std::getenv("GANSU_IP_SIGMA_GEMM") != nullptr) && gpu::gpu_available();
 }
 
 IPEOMCCSDOperator::~IPEOMCCSDOperator() {
+    // (perf) GEMM σ2 path scratch (device 0).
+    if (d_WA_)     tracked_cudaFree(d_WA_);
+    if (d_WVA_)    tracked_cudaFree(d_WVA_);
+    if (d_R2comb_) tracked_cudaFree(d_R2comb_);
+    if (d_R2sw_)   tracked_cudaFree(d_R2sw_);
+    if (d_out1_)   tracked_cudaFree(d_out1_);
+    if (d_out2_)   tracked_cudaFree(d_out2_);
     if (d_t1_)        tracked_cudaFree(d_t1_);
     if (d_t2_)        tracked_cudaFree(d_t2_);
     if (d_D_h_)       tracked_cudaFree(d_D_h_);
@@ -1986,6 +2068,10 @@ void IPEOMCCSDOperator::apply(const real_t* d_input, real_t* d_output) const {
                             d_Loo_, d_Lvv_, d_Fov_, d_Woooo_, d_Wooov_, d_Wovov_,
                             d_Wovvo_, d_Wovoo_, d_eri_oovv_, d_t2_,
                             /*i_begin=*/0, /*i_end=*/nocc_, /*do_sigma1=*/true);
+            if (sigma_gemm_) {
+                add_big_terms_gemm(d_r2, d_s2);            // Woooo/Wovvo/Wovov via GEMM
+                sigma_gemm_selfcheck(d_input, d_s2);
+            }
         }
 #endif
     }
@@ -2023,10 +2109,103 @@ void IPEOMCCSDOperator::apply_sigma_gpu(
     const int blocks_2 = (islab * nocc_ * nvir_ + threads - 1) / threads;
     ip_eom_sigma2_full_kernel<<<blocks_2, threads>>>(
         Loo, Lvv, Woooo, Wovov, Wovvo, Wovoo,
-        d_tmp_c, t2, d_r1, d_r2, d_s2, nocc_, nvir_, i_begin, i_end);
+        d_tmp_c, t2, d_r1, d_r2, d_s2, nocc_, nvir_, i_begin, i_end,
+        /*add_big=*/!sigma_gemm_);
 
     if (!scr_tmp_c) tracked_cudaFree(d_tmp_c);
 }
+
+#ifndef GANSU_CPU_ONLY
+// Lazy device-0 setup for the GEMM σ2 path: allocate scratch + build the one-time
+// contraction-major repacks WA (Wovvo) and WVA (Wovov).  Idempotent.
+void IPEOMCCSDOperator::ensure_sigma_gemm_scratch() const {
+    if (d_WA_ != nullptr) return;   // already built
+    const size_t Wsz   = (size_t)nocc_ * nvir_ * nvir_ * nocc_;   // WA / WVA
+    const size_t h2p   = (size_t)h2p_dim_;
+    tracked_cudaMalloc(&d_WA_,     Wsz * sizeof(real_t));
+    tracked_cudaMalloc(&d_WVA_,    Wsz * sizeof(real_t));
+    tracked_cudaMalloc(&d_R2comb_, h2p * sizeof(real_t));
+    tracked_cudaMalloc(&d_R2sw_,   h2p * sizeof(real_t));
+    tracked_cudaMalloc(&d_out1_,   h2p * sizeof(real_t));
+    tracked_cudaMalloc(&d_out2_,   h2p * sizeof(real_t));
+    const int threads = 256;
+    const size_t wblocks = (Wsz + threads - 1) / threads;
+    ip_repack_wovvo_kernel<<<wblocks, threads>>>(d_Wovvo_, d_WA_,  nocc_, nvir_);
+    ip_repack_wovov_kernel<<<wblocks, threads>>>(d_Wovov_, d_WVA_, nocc_, nvir_);
+}
+
+// (perf) Device-0 cuBLAS GEMMs for the three big σ2 terms (skipped in the kernel when
+// sigma_gemm_ is set), accumulated into d_s2:
+//   Woooo : σ2[(ij),a] += Σ_kl Woooo[(kl),(ij)]·r2[(kl),a]
+//           col-major Scm[a,ij]=Rcm·Wcmᵀ ⇒ dgemm(N,T,nvir,P,P, r2, Woooo, s2), β=1.
+//   Wovvo/Wovov (uncoalesced in the kernel → the real bottleneck):
+//     out1[i,(a,j)] = Σ_(l,d) R2comb[i,(l,d)]·WA[(l,d),(a,j)]  − R2b·WVA
+//     out2[j,(a,i)] = Σ_(l,d) (−R2sw[j,(l,d)])·WVA[(l,d),(a,i)]
+//     σ2[(i,j),a] += out1[i,(a,j)] + out2[j,(a,i)]
+//   (R2comb = 2·r2(x,l,d)−r2(l,x,d), R2sw = r2(l,x,d), R2b = r2 direct.)
+// Caller guarantees the current device is 0 (GPUHandle::cublas() is device-0 bound).
+void IPEOMCCSDOperator::add_big_terms_gemm(const real_t* d_r2, real_t* d_s2) const {
+    if (!gpu::gpu_available() || d_Woooo_ == nullptr) return;
+    ensure_sigma_gemm_scratch();
+    const int P = nocc_ * nocc_;
+    const int MO = nocc_, KLD = nocc_ * nvir_, AJ = nvir_ * nocc_;
+    cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+    const real_t one = 1.0, negone = -1.0, zero = 0.0;
+
+    // Woooo term (accumulate directly into σ2).
+    cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T, nvir_, P, P,
+                &one, d_r2, nvir_, d_Woooo_, P, &one, d_s2, nvir_);
+
+    // Reshaped r2 views for the Wovvo/Wovov GEMMs.
+    const int threads = 256;
+    const size_t blocks = ((size_t)h2p_dim_ + threads - 1) / threads;
+    ip_build_r2_views_kernel<<<blocks, threads>>>(d_r2, d_R2comb_, d_R2sw_, nocc_, nvir_);
+
+    // out1 = R2comb·WA − R2b·WVA  (rows i=MO, cols (a,j)=AJ, contract (l,d)=KLD).
+    cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, AJ, MO, KLD,
+                &one,    d_WA_,  AJ, d_R2comb_, KLD, &zero, d_out1_, AJ);
+    cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, AJ, MO, KLD,
+                &negone, d_WVA_, AJ, d_r2,      KLD, &one,  d_out1_, AJ);
+    // out2 = −R2sw·WVA  (rows j=MO, cols (a,i)=AJ).
+    cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, AJ, MO, KLD,
+                &negone, d_WVA_, AJ, d_R2sw_,   KLD, &zero, d_out2_, AJ);
+
+    // σ2[(i,j),a] += out1[i,(a,j)] + out2[j,(a,i)].
+    ip_sigma2_transpose_add_kernel<<<blocks, threads>>>(d_s2, d_out1_, d_out2_, nocc_, nvir_);
+}
+
+// (validation) Compare the assembled GEMM-path σ2 (in d_output_s2) against the legacy
+// full kernel (all terms, add_big=true) on device 0.  Gated by GANSU_IP_SIGMA_GEMM_VALIDATE.
+void IPEOMCCSDOperator::sigma_gemm_selfcheck(const real_t* d_input,
+                                             const real_t* d_output_s2) const {
+    if (!(std::getenv("GANSU_IP_SIGMA_GEMM_VALIDATE") != nullptr) || sigma_gemm_check_count_ >= 2)
+        return;
+    const real_t* d_r1 = d_input;
+    const real_t* d_r2 = d_input + h_dim_;
+    real_t* d_ref  = nullptr;  real_t* d_tmpc = nullptr;
+    tracked_cudaMalloc(&d_ref,  (size_t)h2p_dim_ * sizeof(real_t));
+    tracked_cudaMalloc(&d_tmpc, (size_t)nvir_    * sizeof(real_t));
+    const int threads = 256;
+    ip_eom_sigma2_tmp_c_kernel<<<(nvir_+threads-1)/threads, threads>>>(
+        d_eri_oovv_, d_r2, d_tmpc, nocc_, nvir_);
+    ip_eom_sigma2_full_kernel<<<(h2p_dim_+threads-1)/threads, threads>>>(
+        d_Loo_, d_Lvv_, d_Woooo_, d_Wovov_, d_Wovvo_, d_Wovoo_,
+        d_tmpc, d_t2_, d_r1, d_r2, d_ref, nocc_, nvir_, 0, nocc_, /*add_big=*/true);
+    cudaDeviceSynchronize();
+    std::vector<real_t> hr(h2p_dim_), ho(h2p_dim_);
+    cudaMemcpy(hr.data(), d_ref,        (size_t)h2p_dim_*sizeof(real_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(ho.data(), d_output_s2,  (size_t)h2p_dim_*sizeof(real_t), cudaMemcpyDeviceToHost);
+    real_t dmax = 0.0, ref = 0.0;
+    for (int i = 0; i < h2p_dim_; ++i) {
+        dmax = std::max(dmax, std::fabs(hr[i] - ho[i]));
+        ref  = std::max(ref,  std::fabs(hr[i]));
+    }
+    std::cout << "[IP-EOM σ2 GEMM self-check] max|Δ| = " << std::scientific << dmax
+              << "  (max|σ2_ref| = " << ref << ", expect Δ ≤ 1e-9)" << std::defaultfloat << std::endl;
+    tracked_cudaFree(d_ref); tracked_cudaFree(d_tmpc);
+    ++sigma_gemm_check_count_;
+}
+#endif
 
 // Stage IP-5: i-slab multi-GPU σ.  σ1 (full) + device 0's σ2 slab into d_output;
 // each d>0 computes ONLY its σ2 i-slab into its replica workspace, then the slabs
@@ -2067,6 +2246,14 @@ void IPEOMCCSDOperator::apply_multi(const real_t* d_input, real_t* d_output) con
     }
     { MultiGpuManager::DeviceGuard g0(0); cudaDeviceSynchronize(); }
 
+    // (perf) Big σ2 terms (Woooo/Wovvo/Wovov): device-0 GEMMs over the full range,
+    // added onto the gathered σ2 (the per-device kernels skipped them when sigma_gemm_).
+    if (sigma_gemm_) {
+        MultiGpuManager::DeviceGuard g0(0);
+        add_big_terms_gemm(d_input + h_dim_, d_output + h_dim_);
+        sigma_gemm_selfcheck(d_input, d_output + h_dim_);
+    }
+
     static const bool do_validate = [] {
         const char* e = std::getenv("GANSU_STEOM_EOM_MULTI_VALIDATE");
         return e && e[0] == '1';
@@ -2079,6 +2266,8 @@ void IPEOMCCSDOperator::apply_multi(const real_t* d_input, real_t* d_output) con
                         d_Loo_, d_Lvv_, d_Fov_, d_Woooo_, d_Wooov_, d_Wovov_,
                         d_Wovvo_, d_Wovoo_, d_eri_oovv_, d_t2_,
                         0, nocc_, /*do_sigma1=*/false, ws_[0].d_tmp_c);
+        // Match the gathered path: it also adds the big-term GEMMs when sigma_gemm_.
+        if (sigma_gemm_) add_big_terms_gemm(d_input + h_dim_, d_ref);
         cudaDeviceSynchronize();
         std::vector<real_t> h_ref(h2p_dim_), h_out(h2p_dim_);
         cudaMemcpy(h_ref.data(), d_ref, (size_t)h2p_dim_ * sizeof(real_t), cudaMemcpyDeviceToHost);

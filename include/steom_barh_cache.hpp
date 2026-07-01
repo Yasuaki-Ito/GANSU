@@ -100,6 +100,25 @@ struct SteomBarHCache {
     /// Free all owned device pointers (tracked_cudaFree) and reset. Implemented
     /// in src/steom_barh_cache.cu where the GPU allocator is visible.
     void free();
+
+    /// Peer-migrate every owned buffer from src_dev to dst_dev (allocate on
+    /// dst_dev, cudaMemcpyPeer, free the src copy, repoint). Used to relocate the
+    /// borrowed IP+EA bar-H onto the GPU where the STEOM operator/G is built when
+    /// the cluster share-barH path device-balances (avoids OOM on device 0).
+    /// No-op if src_dev==dst_dev or on CPU. Implemented in steom_barh_cache.cu.
+    void migrate_to_device(int src_dev, int dst_dev);
+
+    // --- per-group current device (for the EA-solve-on-device-0 choreography) ---
+    // The 8 IP buffers and the 3 EA buffers can live on different GPUs: we move
+    // IP's off device 0 before EA solves (so EA's Davidson has room there), then
+    // move EA's onto the IP device before STEOM. These track where each group is.
+    int ip_dev = 0;   ///< GPU holding Loo/Lvv/Fov/Woooo/Wooov/Wovov/Wovvo/Wovoo
+    int ea_dev = 0;   ///< GPU holding Wvovv/Wvvvv/Wvvvo
+
+    /// Migrate the 8 IP-side buffers from ip_dev → dst (peer copy) and set ip_dev.
+    void migrate_ip_to(int dst);
+    /// Migrate the 3 EA-side buffers from ea_dev → dst (peer copy) and set ea_dev.
+    void migrate_ea_to(int dst);
 };
 
 }  // namespace gansu
