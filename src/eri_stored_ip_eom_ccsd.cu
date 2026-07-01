@@ -278,7 +278,29 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
             cudaDeviceSynchronize();
         }
     }
-    const real_t* d_eps_for_op = (num_frozen > 0) ? d_eps + num_frozen : d_eps;
+    // (denom-only level shift — EOM ε un-shift) The cluster CCSD converged to the
+    // TRUE unshifted amplitudes via the denominator-only residual, but ctx->eps still
+    // carries the virtual-ε shift (+s) applied in dmet.cu for CCSD stability. That
+    // shift MUST NOT leak into the EOM operator: the excitation-energy diagonal
+    // (εa−εi …) is biased by ~+s otherwise (verified: STEOM roots drift by exactly s,
+    // log184). Rebuild a shift-free ε copy so the dressed Ĥ uses the true Fock diagonal.
+    // Default-on (correctness fix, validated log185: roots s-invariant); opt-out with
+    // GANSU_DMET_STEOM_EOM_UNSHIFT=0 (reproduces the shift-leak). level_shift==0 ⇒ untouched.
+    real_t* d_eps_unshifted = nullptr;
+    const real_t* d_eps_op_src = d_eps;
+    const char* eu_env = std::getenv("GANSU_DMET_STEOM_EOM_UNSHIFT");
+    if (ctx && ctx->level_shift != 0.0 && !(eu_env && eu_env[0] == '0')) {
+        std::vector<real_t> h_eps(num_basis);
+        cudaMemcpy(h_eps.data(), d_eps, (size_t)num_basis * sizeof(real_t), cudaMemcpyDeviceToHost);
+        for (int i = full_occ; i < num_basis; ++i) h_eps[i] -= ctx->level_shift;
+        tracked_cudaMalloc(&d_eps_unshifted, (size_t)num_basis * sizeof(real_t));
+        cudaMemcpy(d_eps_unshifted, h_eps.data(), (size_t)num_basis * sizeof(real_t), cudaMemcpyHostToDevice);
+        d_eps_op_src = d_eps_unshifted;
+        std::cout << "  [DMET-STEOM] IP-EOM operator ε un-shifted (−s=" << std::fixed
+                  << std::setprecision(4) << ctx->level_shift << ") — true excitation spectrum"
+                  << std::defaultfloat << std::endl;
+    }
+    const real_t* d_eps_for_op = (num_frozen > 0) ? d_eps_op_src + num_frozen : d_eps_op_src;
 
     // Step 3: Build IPEOMCCSDOperator. Sub-phase 1.2: ERI blocks + dressed
     // intermediates ARE now built in the constructor; apply() still uses the
@@ -313,6 +335,7 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
     // full MO ERI tensor (the operator owns the extracted sub-blocks).
     if (free_eri_for_op) tracked_cudaFree(d_eri_for_op);
     if (free_eri_mo)     tracked_cudaFree(d_eri_mo);
+    if (d_eps_unshifted) tracked_cudaFree(d_eps_unshifted);  // EOM ε un-shift copy (ctor consumed it)
 
     std::cout << "  Operator build time: " << std::fixed << std::setprecision(3)
               << build_timer.elapsed_seconds() << " s" << std::endl;
