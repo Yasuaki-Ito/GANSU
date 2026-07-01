@@ -1864,6 +1864,103 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
     }
 #endif
     blap("  Wovoo ct_6 ooov·t2 (prep+GEMM)");
+
+    // (perf) GEMM the 4 remaining O(N⁵) host contractions of the Wovoo assembly
+    // (~85 s memory-bound bulk: reads W1ovov/W1ovvo/Woooo 3.9 GB arrays w/ poor reuse).
+    // Same host-repack→cublasDgemm pattern as ct_wovoo_t2/ct_6 above; consumed below.
+    //   ct_wa[(k,b,i),j] = Σ_d W1ovov(k,b,i,d)·t1(j,d)   (same layout as Wovoo; no repack)
+    //   ct_wb[(k,i,j),b] = Σ_l Woooo(k,l,i,j)·t1(l,b)     (subtracted)
+    //   ct_wc[(k,b,j),i] = Σ_c W1ovvo(k,b,c,j)·t1(i,c)
+    //   ct_wf[k,(i,j,b)] = Σ_c Fov(k,c)·t2(i,j,c,b)
+    std::vector<real_t> ct_wa, ct_wb, ct_wc, ct_wf;
+    bool wovoo_asm_gpu = false;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+        const real_t one = 1.0, zero = 0.0;
+        real_t* d_t1d = nullptr; tracked_cudaMalloc(&d_t1d, (size_t)NO*NV*sizeof(real_t));
+        cudaMemcpy(d_t1d, h_t1.data(), (size_t)NO*NV*sizeof(real_t), cudaMemcpyHostToDevice);
+        // T_a: C[(kbi),j] = Σ_d W1ovov[(kbi),d]·t1[j,d]   (W1ovov used raw)
+        { const int M=NO*NV*NO, Ncol=NO, K=NV;
+          real_t *dA=nullptr,*dC=nullptr;
+          tracked_cudaMalloc(&dA,(size_t)M*K*sizeof(real_t));
+          tracked_cudaMalloc(&dC,(size_t)M*Ncol*sizeof(real_t));
+          cudaMemcpy(dA,h_W1ovov.data(),(size_t)M*K*sizeof(real_t),cudaMemcpyHostToDevice);
+          cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,Ncol,M,K,&one,d_t1d,K,dA,K,&zero,dC,Ncol);
+          ct_wa.assign((size_t)M*Ncol,0.0);
+          cudaMemcpy(ct_wa.data(),dC,(size_t)M*Ncol*sizeof(real_t),cudaMemcpyDeviceToHost);
+          tracked_cudaFree(dA);tracked_cudaFree(dC); }
+        // T_b: C[(kij),b] = Σ_l Woooo'[(kij),l]·t1[l,b]   (Woooo repacked to [(k,i,j),l])
+        { const int M=NO*NO*NO, Ncol=NV, K=NO;
+          std::vector<real_t> Wr((size_t)M*K);
+          #pragma omp parallel for collapse(2)
+          for (int k=0;k<NO;++k) for (int i=0;i<NO;++i)
+            for (int j=0;j<NO;++j) for (int l=0;l<NO;++l)
+              Wr[(((size_t)k*NO+i)*NO+j)*NO+l] = h_Woooo[(((size_t)k*NO+l)*NO+i)*NO+j];
+          real_t *dA=nullptr,*dC=nullptr;
+          tracked_cudaMalloc(&dA,(size_t)M*K*sizeof(real_t));
+          tracked_cudaMalloc(&dC,(size_t)M*Ncol*sizeof(real_t));
+          cudaMemcpy(dA,Wr.data(),(size_t)M*K*sizeof(real_t),cudaMemcpyHostToDevice);
+          cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,Ncol,M,K,&one,d_t1d,Ncol,dA,K,&zero,dC,Ncol);
+          ct_wb.assign((size_t)M*Ncol,0.0);
+          cudaMemcpy(ct_wb.data(),dC,(size_t)M*Ncol*sizeof(real_t),cudaMemcpyDeviceToHost);
+          tracked_cudaFree(dA);tracked_cudaFree(dC); }
+        // T_c: C[(kbj),i] = Σ_c W1ovvo'[(kbj),c]·t1[i,c]  (W1ovvo repacked to [(k,b,j),c])
+        { const int M=NO*NV*NO, Ncol=NO, K=NV;
+          std::vector<real_t> Wr((size_t)M*K);
+          #pragma omp parallel for collapse(2)
+          for (int k=0;k<NO;++k) for (int b=0;b<NV;++b)
+            for (int j=0;j<NO;++j) for (int c=0;c<NV;++c)
+              Wr[(((size_t)k*NV+b)*NO+j)*NV+c] = h_W1ovvo[(((size_t)k*NV+b)*NV+c)*NO+j];
+          real_t *dA=nullptr,*dC=nullptr;
+          tracked_cudaMalloc(&dA,(size_t)M*K*sizeof(real_t));
+          tracked_cudaMalloc(&dC,(size_t)M*Ncol*sizeof(real_t));
+          cudaMemcpy(dA,Wr.data(),(size_t)M*K*sizeof(real_t),cudaMemcpyHostToDevice);
+          cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,Ncol,M,K,&one,d_t1d,K,dA,K,&zero,dC,Ncol);
+          ct_wc.assign((size_t)M*Ncol,0.0);
+          cudaMemcpy(ct_wc.data(),dC,(size_t)M*Ncol*sizeof(real_t),cudaMemcpyDeviceToHost);
+          tracked_cudaFree(dA);tracked_cudaFree(dC); }
+        // T_f: C[k,(ijb)] = Σ_c Fov[k,c]·t2'[(ijb),c]     (t2 repacked to [(i,j,b),c])
+        { const int M=NO, Ncol=NO*NO*NV, K=NV;
+          std::vector<real_t> t2r((size_t)Ncol*K);
+          #pragma omp parallel for collapse(2)
+          for (int i=0;i<NO;++i) for (int j=0;j<NO;++j)
+            for (int b=0;b<NV;++b) for (int c=0;c<NV;++c)
+              t2r[(((size_t)i*NO+j)*NV+b)*NV+c] = H_T2(i,j,c,b);
+          real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
+          tracked_cudaMalloc(&dA,(size_t)M*K*sizeof(real_t));
+          tracked_cudaMalloc(&dB,(size_t)Ncol*K*sizeof(real_t));
+          tracked_cudaMalloc(&dC,(size_t)M*Ncol*sizeof(real_t));
+          cudaMemcpy(dA,h_Fov.data(),(size_t)M*K*sizeof(real_t),cudaMemcpyHostToDevice);
+          cudaMemcpy(dB,t2r.data(),(size_t)Ncol*K*sizeof(real_t),cudaMemcpyHostToDevice);
+          cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,Ncol,M,K,&one,dB,K,dA,K,&zero,dC,Ncol);
+          ct_wf.assign((size_t)M*Ncol,0.0);
+          cudaMemcpy(ct_wf.data(),dC,(size_t)M*Ncol*sizeof(real_t),cudaMemcpyDeviceToHost);
+          tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC); }
+        tracked_cudaFree(d_t1d);
+        wovoo_asm_gpu = true;
+        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+            real_t da=0,db=0,dc=0,df=0;
+            for (int k=0;k<NO;k+=(NO/3>0?NO/3:1)) for (int b=0;b<NV;b+=(NV/3>0?NV/3:1))
+              for (int i=0;i<NO;i+=(NO/3>0?NO/3:1)) for (int j=0;j<NO;j+=(NO/3>0?NO/3:1)) {
+                real_t ta=0,tb=0,tc=0,tf=0;
+                for (int d=0;d<NV;++d) ta += H_W1OVOV(k,b,i,d)*H_T1(j,d);
+                for (int l=0;l<NO;++l) tb += h_Woooo[(((size_t)k*NO+l)*NO+i)*NO+j]*H_T1(l,b);
+                for (int c=0;c<NV;++c) tc += H_W1OVVO(k,b,c,j)*H_T1(i,c);
+                for (int c=0;c<NV;++c) tf += h_Fov[k*NV+c]*H_T2(i,j,c,b);
+                da=std::max(da,std::fabs(ta-ct_wa[(((size_t)k*NV+b)*NO+i)*NO+j]));
+                db=std::max(db,std::fabs(tb-ct_wb[(((size_t)k*NO+i)*NO+j)*NV+b]));
+                dc=std::max(dc,std::fabs(tc-ct_wc[(((size_t)k*NV+b)*NO+j)*NO+i]));
+                df=std::max(df,std::fabs(tf-ct_wf[(size_t)k*NO*NO*NV+((i*NO+j)*NV+b)]));
+              }
+            std::cout << "[IP-EOM build self-check] Wovoo asm GEMM max|Δ| Wa/Wb/Wc/Wf = "
+                      << std::scientific << da << "/" << db << "/" << dc << "/" << df
+                      << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+        }
+    }
+#endif
+    blap("  Wovoo asm (W1ovov·t1/Woooo·t1/W1ovvo·t1/Fov·t2 GEMM)");
+
     std::vector<real_t> h_Wovoo(wovoo_sz, 0.0);
     #pragma omp parallel for collapse(2)
     for (int k = 0; k < NO; ++k)
@@ -1871,12 +1968,18 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
             for (int i = 0; i < NO; ++i)
                 for (int j = 0; j < NO; ++j) {
                     real_t v = H_OOOV(i,k,j,b);  // bare
-                    for (int d = 0; d < NV; ++d)
-                        v += H_W1OVOV(k,b,i,d) * H_T1(j,d);
-                    for (int l = 0; l < NO; ++l)
-                        v -= h_Woooo[(((size_t)k * NO + l) * NO + i) * NO + j] * H_T1(l,b);
-                    for (int c = 0; c < NV; ++c)
-                        v += H_W1OVVO(k,b,c,j) * H_T1(i,c);
+                    if (wovoo_asm_gpu) {
+                        v += ct_wa[(((size_t)k*NV+b)*NO+i)*NO+j];              // Σ_d W1ovov·t1
+                        v -= ct_wb[(((size_t)k*NO+i)*NO+j)*NV+b];             // Σ_l Woooo·t1
+                        v += ct_wc[(((size_t)k*NV+b)*NO+j)*NO+i];             // Σ_c W1ovvo·t1
+                    } else {
+                        for (int d = 0; d < NV; ++d)
+                            v += H_W1OVOV(k,b,i,d) * H_T1(j,d);
+                        for (int l = 0; l < NO; ++l)
+                            v -= h_Woooo[(((size_t)k * NO + l) * NO + i) * NO + j] * H_T1(l,b);
+                        for (int c = 0; c < NV; ++c)
+                            v += H_W1OVVO(k,b,c,j) * H_T1(i,c);
+                    }
                     if (wovoo_t2_gpu) {
                         v += ct_wovoo_t2[(size_t)(k*NO+i)*JB_N + (j*NV+b)];
                     } else {
@@ -1903,8 +2006,12 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
                             for (int l = 0; l < NO; ++l)
                                 v -= H_OOOV(l,j,k,c) * H_T2(l,i,b,c);
                     }
-                    for (int c = 0; c < NV; ++c)
-                        v += h_Fov[k*NV + c] * H_T2(i,j,c,b);
+                    if (wovoo_asm_gpu) {
+                        v += ct_wf[(size_t)k*NO*NO*NV + ((i*NO+j)*NV+b)];      // Σ_c Fov·t2
+                    } else {
+                        for (int c = 0; c < NV; ++c)
+                            v += h_Fov[k*NV + c] * H_T2(i,j,c,b);
+                    }
                     h_Wovoo[(((size_t)k * NV + b) * NO + i) * NO + j] = v;
                 }
     blap("Wovoo (+ W1ovov/W1ovvo)");
