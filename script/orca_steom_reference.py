@@ -64,9 +64,16 @@ def build_orca_input(xyz_path, basis, n_states):
     # difference is small enough that the 1 mHa STEOM gate is still
     # meaningful for sub-phase 3.9 + 3.13 validation.
     method_block = ""
+    # Parallel execution: ORCA needs an explicit %pal block (it runs serial
+    # otherwise). Set ORCA_NPROCS=N (>1) to add it. ORCA MPI parallelism
+    # requires the orca binary to be launched by its ABSOLUTE path with a
+    # matching OpenMPI in PATH — set ORCA_PATH to the full path if needed.
+    nprocs = int(os.environ.get("ORCA_NPROCS", "1") or "1")
+    pal_block = f"%pal nprocs {nprocs} end\n" if nprocs > 1 else ""
     body = (
         f"! STEOM-CCSD {basis} TightSCF\n"
         f"{method_block}"
+        f"{pal_block}"
         f"%mdci\n"
         f"  NRoots {n_states}\n"
         f"  DoSTEOM true\n"
