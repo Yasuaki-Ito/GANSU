@@ -620,6 +620,12 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                   << rhf.get_cis_nto_result().n_act_vir << ") from rank 0." << std::endl;
     }
 #endif
+    // (measure-first) Device-memory checkpoint after CIS-NTO. Placed AFTER the full
+    // stage-1 if/else-if chain (must not sit between `if(!mpi_steom){}` and the
+    // `#ifdef GANSU_MPI else if`, or the else binds to this dump's if — that
+    // mis-fires the MPI stage-1 in a non-MPI run; cf. log169 MPI_Send crash).
+    if (std::getenv("GANSU_STEOM_MEM_DUMP"))
+        dump_tracked_allocations("after stage 1 (CIS-NTO)");
 
     // Stage 2/3 (IP, rank 0) and 3/3 (EA, rank 1) run concurrently under MPI.
     const bool do_ip = (!mpi_steom) || (mpi_rank == 0);
@@ -633,6 +639,8 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         if (ctx) compute_cluster_ip_eom_ccsd(rhf, *ctx, d_eri_mo_precomputed, n_states_requested);
         else     eri_method.compute_ip_eom_ccsd(n_states_requested);
     }
+    if (std::getenv("GANSU_STEOM_MEM_DUMP"))
+        dump_tracked_allocations("after stage 2 (IP-EOM)");
     const bool need_ea = ctx ? ctx->ea_eom_result.per_active.empty()
                               : rhf.get_ea_eom_result().per_active.empty();
     if (do_ea && need_ea) {
@@ -641,6 +649,8 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         if (ctx) compute_cluster_ea_eom_ccsd(rhf, *ctx, d_eri_mo_precomputed, n_states_requested);
         else     eri_method.compute_ea_eom_ccsd(n_states_requested);
     }
+    if (std::getenv("GANSU_STEOM_MEM_DUMP"))
+        dump_tracked_allocations("after stage 3 (EA-EOM)");
 
 #ifdef GANSU_MPI
     // EA hand-off rank 1 → rank 0; rank 1 is then done with stage-2.
@@ -1255,6 +1265,12 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                  "+ F^eff_oo/vv + full W^eff-dressed G^{1h1p}; apply = dense non-Hermitian "
                  "matvec)" << std::endl;
     if (verbose >= 2) steom_op.print_amplitude_norms(std::cout);
+    // (measure-first) Checkpoint after the STEOM operator (G^{1h1p}) is built.
+    // At this point G is dense in device memory; the dense geev below needs
+    // ~3·total_dim² more. This dump shows whether stale IP/EA/B buffers can be
+    // freed first to make the dense path fit at total_dim≈22200 ({0-9}).
+    if (std::getenv("GANSU_STEOM_MEM_DUMP"))
+        dump_tracked_allocations("after STEOM operator build (G ready, before diag)");
 
     // ----------------------------------------------------------------------
     // Step 3: diagonalize G^{1h1p}.
@@ -1293,11 +1309,44 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 
     if (dense_diag) {
         const real_t min_eigenvalue = 0.0;  // STEOM excitation energies are positive
+
+        // (blocker (a) fix) Reclaim the RI AO-B replica before the dense geev.
+        // The STEOM operator's dense G is already built; from here on the diag is
+        // pure matvec on G and never pulls MO-ERI blocks again, so the per-GPU
+        // AO-B replica (naux·nao², ~17.6 GB/GPU on {0-9}) is dead weight that
+        // otherwise OOMs the device-0 dense buffers (G copy + evecs + geev
+        // workspace ≈ tens of GB at total_dim≈22200). release_bmo_ao_replica is
+        // the established lazy-replica reclaim hook (no-op for single-GPU /
+        // non-distributed; a later build_B_mo would re-replicate — none follows
+        // STEOM in this run). Default on; opt out with GANSU_STEOM_KEEP_B_REPLICA.
+        if (!std::getenv("GANSU_STEOM_KEEP_B_REPLICA")) {
+            // release_bmo_ao_replica is declared on ERI_RI (not the ERI base), so
+            // resolve via dynamic_cast; no-op for non-RI / single-GPU engines.
+            ERI_RI* eri_ri = dynamic_cast<ERI_RI*>(&eri_method);
+            if (eri_ri) {
+                const size_t before = GlobalGpuMemoryTracker::get_current();
+                eri_ri->release_bmo_ao_replica();
+                const size_t after = GlobalGpuMemoryTracker::get_current();
+                if (before > after)
+                    std::cout << "  [STEOM dense diag] released RI AO-B replica before geev: "
+                              << CudaMemoryManager<real_t>::format_bytes(before - after)
+                              << " reclaimed (global)." << std::endl;
+            }
+        }
+
         // eigenDecompositionNonSymmetric expects column-major input. d_G_ is
         // row-major [total_dim × total_dim]; its linear buffer is exactly the
         // column-major storage of Gᵀ. eig(Gᵀ) == eig(G), so passing the buffer
         // directly yields the correct eigenvalues; to also recover the RIGHT
         // eigenvectors of G we transpose the copy into true column-major G.
+        if (std::getenv("GANSU_STEOM_MEM_DUMP")) {
+            const size_t need = (size_t)total_dim * total_dim * sizeof(real_t);
+            std::cout << "  [STEOM dense diag] about to allocate G copy + eval/evec/"
+                         "workspace; d_G_cm alone = "
+                      << CudaMemoryManager<real_t>::format_bytes(need)
+                      << " (total_dim=" << total_dim << ")" << std::endl;
+            dump_tracked_allocations("just before dense geev allocations");
+        }
         real_t* d_G_cm = nullptr;
         tracked_cudaMalloc(&d_G_cm, (size_t)total_dim * total_dim * sizeof(real_t));
         cudaMemcpy(d_G_cm, steom_op.get_G_device(),

@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <cstring>
 #include <mutex>
@@ -190,6 +191,20 @@ struct GlobalGpuMemoryTracker {
     }
 };
 
+/**
+ * @brief Per-pointer registry for CudaMemoryManager-backed device buffers
+ *        (DeviceHostMemory / DeviceHostMatrix).
+ *
+ * These do NOT go through tracked_cudaMalloc (they call real_cudaMalloc + a
+ * separate track_allocation), so they are absent from g_allocated_memory_map.
+ * The big RI 3-center tensor (ERI::intermediate_matrix_B_) is one of these.
+ * Registering them here lets the measure-first dump (dump_tracked_allocations)
+ * attribute large per-device totals to specific buffers (e.g. a 4-way B replica).
+ * Stores (size_bytes, device_id) keyed by device pointer. Behaviour-inert.
+ */
+inline std::unordered_map<void*, std::pair<size_t, int>> g_cmm_allocated_memory_map;
+inline std::mutex g_cmm_allocated_memory_map_mutex;
+
 
 /**
  * @brief Base class for managing CUDA memory.
@@ -235,8 +250,8 @@ public:
     virtual ~CudaMemoryManager() {
         if (gpu::gpu_available()) {
             if (device_ptr_) {
+                track_deallocation(device_bytes_, device_id_, device_ptr_);
                 gansu::detail::real_cudaFree(device_ptr_);
-                track_deallocation(device_bytes_, device_id_);
             }
             if (host_ptr_) {
                 cudaFreeHost(host_ptr_);
@@ -244,6 +259,7 @@ public:
         } else {
             // CPU mode: device_ptr_ == host_ptr_, free once
             if (host_ptr_) {
+                track_deallocation(device_bytes_, device_id_, device_ptr_);
                 std::free(host_ptr_);
             }
             // Don't free device_ptr_ separately (same pointer)
@@ -258,10 +274,10 @@ public:
      */
     void release() {
         if (gpu::gpu_available()) {
-            if (device_ptr_) { gansu::detail::real_cudaFree(device_ptr_); track_deallocation(device_bytes_, device_id_); }
+            if (device_ptr_) { track_deallocation(device_bytes_, device_id_, device_ptr_); gansu::detail::real_cudaFree(device_ptr_); }
             if (host_ptr_) cudaFreeHost(host_ptr_);
         } else {
-            if (host_ptr_) std::free(host_ptr_);
+            if (host_ptr_) { track_deallocation(device_bytes_, device_id_, device_ptr_); std::free(host_ptr_); }
         }
         device_ptr_ = nullptr;
         host_ptr_ = nullptr;
@@ -395,14 +411,24 @@ public:
      * @param bytes Number of bytes allocated.
      * @param device Owning device id (-1 for CPU mode / unknown).
      */
-    static void track_allocation(size_t bytes, int device = -1) {
-        std::lock_guard<std::mutex> lock(memory_stats_mutex_);
-        current_allocated_bytes_ += bytes;
-        total_allocated_bytes_ += bytes;
-        if (current_allocated_bytes_ > peak_allocated_bytes_) {
-            peak_allocated_bytes_ = current_allocated_bytes_;
+    static void track_allocation(size_t bytes, int device = -1, void* ptr = nullptr) {
+        {
+            std::lock_guard<std::mutex> lock(memory_stats_mutex_);
+            current_allocated_bytes_ += bytes;
+            total_allocated_bytes_ += bytes;
+            if (current_allocated_bytes_ > peak_allocated_bytes_) {
+                peak_allocated_bytes_ = current_allocated_bytes_;
+            }
         }
         GlobalGpuMemoryTracker::track_allocation(bytes, device);
+        // Register CMM-backed buffers (ptr supplied only by DeviceHostMemory::
+        // allocate) so the diagnostic dump can attribute them. The raw
+        // tracked_cudaMalloc path calls this with ptr==nullptr (already tracked
+        // in g_allocated_memory_map) ⇒ no double counting.
+        if (ptr) {
+            std::lock_guard<std::mutex> lock(g_cmm_allocated_memory_map_mutex);
+            g_cmm_allocated_memory_map[ptr] = {bytes, device};
+        }
     }
 
     /**
@@ -410,12 +436,18 @@ public:
      * @param bytes Number of bytes deallocated.
      * @param device Owning device id (captured at alloc time, -1 if unknown).
      */
-    static void track_deallocation(size_t bytes, int device = -1) {
-        std::lock_guard<std::mutex> lock(memory_stats_mutex_);
-        if (current_allocated_bytes_ >= bytes) {
-            current_allocated_bytes_ -= bytes;
+    static void track_deallocation(size_t bytes, int device = -1, void* ptr = nullptr) {
+        {
+            std::lock_guard<std::mutex> lock(memory_stats_mutex_);
+            if (current_allocated_bytes_ >= bytes) {
+                current_allocated_bytes_ -= bytes;
+            }
         }
         GlobalGpuMemoryTracker::track_deallocation(bytes, device);
+        if (ptr) {
+            std::lock_guard<std::mutex> lock(g_cmm_allocated_memory_map_mutex);
+            g_cmm_allocated_memory_map.erase(ptr);
+        }
     }
 
     /**
@@ -468,7 +500,7 @@ public:
             }
             this->device_ptr_ = this->host_ptr_; // Same pointer
             this->device_id_ = -1;
-            this->track_allocation(this->device_bytes_, -1);
+            this->track_allocation(this->device_bytes_, -1, this->device_ptr_);
             return;
         }
 
@@ -503,7 +535,7 @@ public:
 
         // Track successful allocation (capture owning device for per-GPU stats)
         cudaGetDevice(&this->device_id_);
-        this->track_allocation(this->device_bytes_, this->device_id_);
+        this->track_allocation(this->device_bytes_, this->device_id_, this->device_ptr_);
     }
 
     void toDevice() override {
@@ -941,6 +973,102 @@ protected:
  */
 inline std::unordered_map<void*, std::pair<size_t, int>> g_allocated_memory_map;
 inline std::mutex g_allocated_memory_map_mutex;
+
+/**
+ * @brief Diagnostic dump of the live tracked device allocations (measure-first).
+ *
+ * Walks g_allocated_memory_map and prints, for a given checkpoint label:
+ *   - global + per-device current live bytes,
+ *   - the largest individual allocations (size + owning device),
+ *   - allocations grouped by identical byte-size (count × size per device) so
+ *     replicated buffers stand out at a glance (e.g. a 4-way B replica appears
+ *     as "4 × 17.60 GB" rather than four separate lines).
+ *
+ * Behaviour-inert (read-only). Intended to be called from env-gated checkpoints
+ * (e.g. GANSU_STEOM_MEM_DUMP) to find what occupies the device just before a
+ * large allocation fails — e.g. the STEOM dense-geev buffers at total_dim≈22200.
+ *
+ * @param label   Checkpoint name printed in the header.
+ * @param top_k   Number of largest individual allocations to list (default 25).
+ */
+inline void dump_tracked_allocations(const char* label, int top_k = 25) {
+    auto fmt = [](size_t bytes) {
+        const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+        int u = 0; double s = static_cast<double>(bytes);
+        while (s >= 1024.0 && u < 4) { s /= 1024.0; ++u; }
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2) << s << " " << units[u];
+        return oss.str();
+    };
+
+    // Snapshot both registries under their locks, then format without holding.
+    // Each entry: (size, device, is_cmm). "raw" = tracked_cudaMalloc path,
+    // "CMM" = DeviceHostMemory/Matrix (e.g. the RI B tensor).
+    struct Alloc { size_t size; int dev; bool cmm; };
+    std::vector<Alloc> allocs;
+    size_t raw_n = 0, cmm_n = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
+        raw_n = g_allocated_memory_map.size();
+        allocs.reserve(raw_n);
+        for (const auto& kv : g_allocated_memory_map)
+            allocs.push_back({kv.second.first, kv.second.second, false});
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_cmm_allocated_memory_map_mutex);
+        cmm_n = g_cmm_allocated_memory_map.size();
+        allocs.reserve(allocs.size() + cmm_n);
+        for (const auto& kv : g_cmm_allocated_memory_map)
+            allocs.push_back({kv.second.first, kv.second.second, true});
+    }
+
+    std::cout << "\n=== [tracked-mem dump] " << label << " ===" << std::endl;
+    std::cout << "  live allocations: " << allocs.size()
+              << " (raw=" << raw_n << ", CMM=" << cmm_n << ")"
+              << "   global current: "
+              << fmt(GlobalGpuMemoryTracker::get_current()) << std::endl;
+    const auto per_dev = GlobalGpuMemoryTracker::get_per_device_snapshot();
+    {
+        std::vector<int> devs;
+        for (const auto& kv : per_dev) devs.push_back(kv.first);
+        std::sort(devs.begin(), devs.end());
+        for (int d : devs)
+            std::cout << "    GPU " << d << ": current=" << fmt(per_dev.at(d)[0])
+                      << "  peak=" << fmt(per_dev.at(d)[2]) << std::endl;
+    }
+
+    // Largest individual allocations.
+    std::sort(allocs.begin(), allocs.end(),
+              [](const Alloc& a, const Alloc& b) { return a.size > b.size; });
+    const int klist = std::min<int>(top_k, static_cast<int>(allocs.size()));
+    std::cout << "  largest " << klist << " allocations:" << std::endl;
+    for (int i = 0; i < klist; ++i)
+        std::cout << "    [" << std::setw(2) << i << "] " << std::setw(10)
+                  << fmt(allocs[i].size) << "  (GPU " << allocs[i].dev << ", "
+                  << (allocs[i].cmm ? "CMM" : "raw") << ")" << std::endl;
+
+    // Group by identical byte-size to expose replicated buffers. Only sizes that
+    // appear more than once OR are ≥ 256 MB are reported (keeps it short).
+    std::map<size_t, std::map<int, int>> by_size;  // size -> (device -> count)
+    for (const auto& a : allocs) by_size[a.size][a.dev]++;
+    std::cout << "  grouped (count × size, ≥256 MB or replicated):" << std::endl;
+    // Iterate largest-size first.
+    for (auto it = by_size.rbegin(); it != by_size.rend(); ++it) {
+        const size_t sz = it->first;
+        int total_count = 0;
+        for (const auto& dc : it->second) total_count += dc.second;
+        if (sz < (size_t)256 * 1024 * 1024 && total_count <= 1) continue;
+        std::cout << "    " << std::setw(10) << fmt(sz) << "  × " << total_count
+                  << " = " << fmt(sz * (size_t)total_count) << "   [";
+        bool first = true;
+        for (const auto& dc : it->second) {
+            std::cout << (first ? "" : ", ") << "GPU" << dc.first << "×" << dc.second;
+            first = false;
+        }
+        std::cout << "]" << std::endl;
+    }
+    std::cout << "=== [tracked-mem dump end] " << label << " ===\n" << std::endl;
+}
 
 /**
  * @brief Wrapper for cudaMalloc with memory statistics tracking.

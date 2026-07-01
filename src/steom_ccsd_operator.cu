@@ -4314,26 +4314,137 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     // The Wvovv term reuses the existing uakei_t4 GEMM (Σ_cd wvovv(a,k,c,d)·seA(e,i,c,d)); with
     // (a,k,e,i)->(c,i,e,k) it equals the Wvovv contraction here.
     // (W^eff build perf) This u_akei block dominated the assemble phase: the (N,F)
-    // Wooov contraction makes it O(NMv·NO³·NV²), and it ran serially (≈16 min on the
-    // in-domain {0-9} cluster — the "stuck at W^eff build" wall). Parallelise over
-    // (e,k): each (e,k) writes the distinct GPHPH(af,k,·,·) slab (af = active_vir_idx_[e]
-    // is distinct per e), and every v keeps its serial inner-sum order ⇒ bit-exact.
+    // Wooov contraction makes it O(NMv·NO³·NV²) and, run as a serial/host loop, it is
+    // memory-bandwidth-bound on the giant wooov[NO³·NV] / seA[NMv·NO·NV²] arrays
+    // (≈16 min serial, ≈436 s even with OMP on the in-domain {0-9} cluster — the
+    // "stuck at W^eff build" wall). The fix is to cast the two memory-bound
+    // contractions (the Fov Σ_F term and the combined Wooov Σ_{N,F} term) as dense
+    // GEMMs, exactly like the neighbouring W^eff sub-terms (UAMCI/UAKEI/UAMEI/UBMJC).
+    // The Wvovv term already reuses the uakei_t4 GEMM. Results are accumulated into
+    // GPHPH(af,k,·,·) below; the GEMM summation order differs from the serial inner
+    // loop, so this matches to ≈1e-11 (the W^eff GEMM-port tolerance), not byte-exact.
+    //
+    //   ct_fov[(e,k,c),i]   = Σ_F seA(e,k,c,F)·fov(i,F)
+    //                         A = sEA (raw, [(e,k,c)×F]),  B = Fov (raw, [i×F]).
+    //   ct_uakei_wooov[(e,c),(k,i)] = Σ_{N,F} (2 seA(e,N,c,F)−seA(e,N,F,c))·wooov(i,N,k,F)
+    //                                − Σ_{N,F} seA(e,N,c,F)·wooov(N,i,k,F)
+    //                         two GEMMs accumulated into one dC (contract (N,F)).
+    std::vector<real_t> ct_uakei_fov;       bool uakei_fov_gpu   = false;
+    std::vector<real_t> ct_uakei_wooov;     bool uakei_wooov_gpu = false;
+    const int AK_N1 = NO*NO;   // ct_uakei_wooov column stride (k,i)
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+        const real_t one = 1.0, negone = -1.0, zero = 0.0;
+        // ---- Fov GEMM: A = sEA (no repack), B = Fov (no repack) ----
+        {
+            const int Mf = NMv*NO*NV, Nf = NO, Kf = NV;   // rowA=(e,k,c), rowB=i, contract F
+            real_t *d_seA=nullptr, *d_Fov=nullptr, *dC=nullptr;
+            tracked_cudaMalloc(&d_seA, sEA.size()*sizeof(real_t));
+            tracked_cudaMalloc(&d_Fov, Fov.size()*sizeof(real_t));
+            tracked_cudaMalloc(&dC, (size_t)Mf*Nf*sizeof(real_t));
+            cudaMemcpy(d_seA, sEA.data(), sEA.size()*sizeof(real_t), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_Fov, Fov.data(), Fov.size()*sizeof(real_t), cudaMemcpyHostToDevice);
+            cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, Nf, Mf, Kf, &one,
+                        d_Fov, Kf, d_seA, Kf, &zero, dC, Nf);
+            ct_uakei_fov.assign((size_t)Mf*Nf, 0.0);
+            cudaMemcpy(ct_uakei_fov.data(), dC, (size_t)Mf*Nf*sizeof(real_t), cudaMemcpyDeviceToHost);
+            tracked_cudaFree(d_seA); tracked_cudaFree(d_Fov); tracked_cudaFree(dC);
+            uakei_fov_gpu = true;
+        }
+        // ---- Wooov GEMM (2 terms, contract (N,F)) ----
+        {
+            const int Mw = NMv*NV, Nw = NO*NO, Kw = NO*NV;   // rowA=(e,c), rowB=(k,i)
+            real_t *dC=nullptr;
+            tracked_cudaMalloc(&dC, (size_t)Mw*Nw*sizeof(real_t));
+            {   // Term 1: +(2 seA(e,N,c,F) − seA(e,N,F,c))·wooov(i,N,k,F)
+                std::vector<real_t> hA((size_t)Mw*Kw), hB((size_t)Nw*Kw);
+                #pragma omp parallel for collapse(2)
+                for (int e=0;e<NMv;++e) for(int c=0;c<NV;++c)
+                    for(int N=0;N<NO;++N) for(int F=0;F<NV;++F)
+                        hA[(size_t)(e*NV+c)*Kw+(N*NV+F)] = 2.0*seA(e,N,c,F)-seA(e,N,F,c);
+                #pragma omp parallel for collapse(2)
+                for (int k=0;k<NO;++k) for(int i=0;i<NO;++i)
+                    for(int N=0;N<NO;++N) for(int F=0;F<NV;++F)
+                        hB[(size_t)(k*NO+i)*Kw+(N*NV+F)] = wooov(i,N,k,F);
+                real_t *dA=nullptr,*dB=nullptr;
+                tracked_cudaMalloc(&dA,(size_t)Mw*Kw*sizeof(real_t));
+                tracked_cudaMalloc(&dB,(size_t)Nw*Kw*sizeof(real_t));
+                cudaMemcpy(dA,hA.data(),(size_t)Mw*Kw*sizeof(real_t),cudaMemcpyHostToDevice);
+                cudaMemcpy(dB,hB.data(),(size_t)Nw*Kw*sizeof(real_t),cudaMemcpyHostToDevice);
+                cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,Nw,Mw,Kw,&one,dB,Kw,dA,Kw,&zero,dC,Nw);
+                tracked_cudaFree(dA); tracked_cudaFree(dB);
+            }
+            {   // Term 2: −seA(e,N,c,F)·wooov(N,i,k,F)
+                std::vector<real_t> hA((size_t)Mw*Kw), hB((size_t)Nw*Kw);
+                #pragma omp parallel for collapse(2)
+                for (int e=0;e<NMv;++e) for(int c=0;c<NV;++c)
+                    for(int N=0;N<NO;++N) for(int F=0;F<NV;++F)
+                        hA[(size_t)(e*NV+c)*Kw+(N*NV+F)] = seA(e,N,c,F);
+                #pragma omp parallel for collapse(2)
+                for (int k=0;k<NO;++k) for(int i=0;i<NO;++i)
+                    for(int N=0;N<NO;++N) for(int F=0;F<NV;++F)
+                        hB[(size_t)(k*NO+i)*Kw+(N*NV+F)] = wooov(N,i,k,F);
+                real_t *dA=nullptr,*dB=nullptr;
+                tracked_cudaMalloc(&dA,(size_t)Mw*Kw*sizeof(real_t));
+                tracked_cudaMalloc(&dB,(size_t)Nw*Kw*sizeof(real_t));
+                cudaMemcpy(dA,hA.data(),(size_t)Mw*Kw*sizeof(real_t),cudaMemcpyHostToDevice);
+                cudaMemcpy(dB,hB.data(),(size_t)Nw*Kw*sizeof(real_t),cudaMemcpyHostToDevice);
+                cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,Nw,Mw,Kw,&negone,dB,Kw,dA,Kw,&one,dC,Nw);
+                tracked_cudaFree(dA); tracked_cudaFree(dB);
+            }
+            ct_uakei_wooov.assign((size_t)Mw*Nw, 0.0);
+            cudaMemcpy(ct_uakei_wooov.data(), dC, (size_t)Mw*Nw*sizeof(real_t), cudaMemcpyDeviceToHost);
+            tracked_cudaFree(dC);
+            uakei_wooov_gpu = true;
+        }
+        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+            real_t dfov=0.0, dwoo=0.0;
+            for (int e=0;e<NMv;e+=(NMv/2>0?NMv/2:1)) for(int k=0;k<NO;k+=(NO/2>0?NO/2:1))
+                for(int c=0;c<NV;c+=(NV/2>0?NV/2:1)) for(int i=0;i<NO;i+=(NO/2>0?NO/2:1)){
+                    real_t f=0.0; for(int F=0;F<NV;++F) f += seA(e,k,c,F)*fov(i,F);
+                    dfov=std::max(dfov,std::fabs(f-ct_uakei_fov[(size_t)((e*NO+k)*NV+c)*NO+i]));
+                    real_t w=0.0;
+                    for(int N=0;N<NO;++N) for(int F=0;F<NV;++F){
+                        w += (2.0*seA(e,N,c,F)-seA(e,N,F,c))*wooov(i,N,k,F);
+                        w -= seA(e,N,c,F)*wooov(N,i,k,F);
+                    }
+                    dwoo=std::max(dwoo,std::fabs(w-ct_uakei_wooov[(size_t)(e*NV+c)*AK_N1+(k*NO+i)]));
+                }
+            std::cout << "[W_eff_and_G self-check] UAKEI Fov GEMM vs host: max|Δ| = "
+                      << std::scientific << dfov << "; Wooov GEMM vs host: max|Δ| = "
+                      << dwoo << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+        }
+    }
+#endif
+    // Parallelise over (e,k): each (e,k) writes the distinct GPHPH(af,k,·,·) slab
+    // (af = active_vir_idx_[e] is distinct per e) and every v keeps its serial
+    // inner-sum order ⇒ no races. With the GEMMs above the inner work is just a few
+    // table reads (Wvovv/Fov/Wooov all precomputed); host fallbacks retained.
     #pragma omp parallel for collapse(2) schedule(static)
     for (int e=0;e<NMv;++e)
         for(int k=0;k<NO;++k){
             const int af=active_vir_idx_[e];
             for(int c=0;c<NV;++c) for(int i=0;i<NO;++i){
                 real_t v=0.0;
-                for(int F=0;F<NV;++F) v += seA(e,k,c,F)*fov(i,F);              // Fov
+                if (uakei_fov_gpu) {                                           // Fov (GEMM)
+                    v += ct_uakei_fov[(size_t)((e*NO+k)*NV+c)*NO+i];
+                } else {
+                    for(int F=0;F<NV;++F) v += seA(e,k,c,F)*fov(i,F);
+                }
                 if (uakei_t4_gpu) {                                            // Wvovv (GEMM reuse)
                     v += uakei_t4[(((size_t)c*NO+i)*NMv+e)*NO+k];
                 } else {
                     for(int G=0;G<NV;++G) for(int F=0;F<NV;++F)
                         v += seA(e,k,G,F)*wvovv(c,i,G,F);
                 }
-                for(int N=0;N<NO;++N) for(int F=0;F<NV;++F){                   // Wooov (2 terms)
-                    v += (2.0*seA(e,N,c,F)-seA(e,N,F,c))*wooov(i,N,k,F);
-                    v -= seA(e,N,c,F)*wooov(N,i,k,F);
+                if (uakei_wooov_gpu) {                                         // Wooov 2 terms (GEMM)
+                    v += ct_uakei_wooov[(size_t)(e*NV+c)*AK_N1+(k*NO+i)];
+                } else {
+                    for(int N=0;N<NO;++N) for(int F=0;F<NV;++F){
+                        v += (2.0*seA(e,N,c,F)-seA(e,N,F,c))*wooov(i,N,k,F);
+                        v -= seA(e,N,c,F)*wooov(N,i,k,F);
+                    }
                 }
                 GPHPH(af,k,c,i)+=v;
             }
