@@ -598,6 +598,19 @@ public:
     void switchHasMatrixC() { hasMatrixC_ = true; }
 
     /**
+     * @brief Set/clear the coefficient-matrix-valid flag
+     * @details Used by the C API SCF-free energy evaluation (gansu_energy_from_density)
+     * to force the density-based Fock build path even after SCF has populated C
+     * (the RI Fock builders switch to the coefficient-matrix path once hasMatrixC_ is true).
+     */
+    void set_hasMatrixC(bool b) { hasMatrixC_ = b; }
+
+    /**
+     * @brief Get the ERI method object (nullptr until set by the builder)
+     */
+    ERI* get_eri_method() { return eri_method_.get(); }
+
+    /**
      * @brief Function to compute the coefficient matrix and set hasMatrixC_ to true
      * @details This function computes the coefficient matrix by calling compute_coefficient_matrix()
      * and sets hasMatrixC_ to true.

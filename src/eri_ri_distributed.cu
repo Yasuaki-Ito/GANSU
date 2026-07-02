@@ -2831,6 +2831,14 @@ void ERI_RI_Distributed_RHF::build_mo_eri_into(const real_t* d_C, int nmo,
 bool ERI_RI_Distributed_RHF::replicate_B_to_all_gpus() {
     if (b_replicated_) return true;
 
+    // Restore the CALLER's current device on every exit (not a hardcoded device 0):
+    // DMET-STEOM can run the whole cluster chain on a free peer GPU
+    // (GANSU_DMET_STEOM_CLUSTER_GPU); leaving the device at 0 here would leave the
+    // Davidson / operator DGEMMs running with a device-0-bound handle against
+    // device-N data → cublas status=13. All legacy callers are already on device 0,
+    // so restore-to-caller == restore-to-0 for them (byte-identical).
+    int caller_dev = 0; cudaGetDevice(&caller_dev);
+
     // Debug override: force the Distributed path even when B would fit.
     // Useful for exercising the collective build_mo_eri on small test systems
     // where memory is plentiful (otherwise Replicated is always selected).
@@ -2853,7 +2861,7 @@ bool ERI_RI_Distributed_RHF::replicate_B_to_all_gpus() {
         cudaMemGetInfo(&free_bytes, &total_bytes);
         min_free = std::min(min_free, free_bytes);
     }
-    cudaSetDevice(0);
+    cudaSetDevice(caller_dev);
 
     // Need to leave headroom for fragment-local working memory (CCSD intermediates,
     // MO ERI, B_tmp, etc). Require full_bytes < 60% of free on the tightest GPU.
@@ -2862,6 +2870,7 @@ bool ERI_RI_Distributed_RHF::replicate_B_to_all_gpus() {
                   << (full_bytes >> 20) << " MB exceeds 60% of free GPU memory ("
                   << (min_free >> 20) << " MB). Falling back to gather-to-GPU0 path."
                   << std::endl;
+        cudaSetDevice(caller_dev);
         return false;
     }
 
@@ -2913,25 +2922,50 @@ bool ERI_RI_Distributed_RHF::replicate_B_to_all_gpus() {
         cudaSetDevice(g);
         cudaStreamSynchronize(mgr_b.comm_stream(g));
     }
-    cudaSetDevice(0);
+    cudaSetDevice(caller_dev);
 
     b_replicated_ = true;
     std::cout << "[Multi-GPU DMET] B replicated across " << num_gpus_
               << " GPUs (" << (full_bytes >> 20) << " MB each)" << std::endl;
+
+    // (DMET-STEOM device-0 fit) The full replica now supersedes the per-GPU 3c
+    // slices d_B_local_ for build_B_mo (the cluster chain reads d_B_full_per_gpu_,
+    // never d_B_local_ — see build_B_mo above). The SCF (the only B_local consumer)
+    // is finished before this lazy replication runs, so freeing B_local reclaims
+    // ~naux_local·nao² (~3 GB/GPU) — enough to close the ~1 GB by which a device-0
+    // cluster CCSD is short at cc-pVDZ (n_emb=427). Env-gated (DMET-STEOM sets it);
+    // other flows keep B_local. Irreversible for this object (no post-cluster reuse).
+    if (std::getenv("GANSU_DMET_STEOM_FREE_BLOCAL")) {
+        size_t freed = 0;
+        for (int g = 0; g < (int)d_B_local_.size(); g++) {
+            if (d_B_local_[g]) {
+                cudaSetDevice(g);
+                tracked_cudaFree(d_B_local_[g]);
+                d_B_local_[g] = nullptr;
+                freed += (size_t)naux_local_[g] * nao2;
+            }
+        }
+        cudaSetDevice(caller_dev);
+        std::cout << "[Multi-GPU DMET] freed per-GPU B_local slices post-replication "
+                  << "(GANSU_DMET_STEOM_FREE_BLOCAL) — reclaimed ~"
+                  << ((freed * sizeof(real_t)) >> 20) / std::max(1, num_gpus_)
+                  << " MB/GPU." << std::endl;
+    }
     return true;
 }
 
 void ERI_RI_Distributed_RHF::free_replicated_B() {
     if (!b_replicated_) return;
-    for (int g = 0; g < (int)d_B_full_per_gpu_.size(); g++) {
-        if (d_B_full_per_gpu_[g]) {
-            cudaSetDevice(g);
-            tracked_cudaFree(d_B_full_per_gpu_[g]);
+    int caller_dev = 0; cudaGetDevice(&caller_dev);  // restore caller (not hardcoded 0):
+    for (int g = 0; g < (int)d_B_full_per_gpu_.size(); g++) {   // DMET-STEOM cluster may
+        if (d_B_full_per_gpu_[g]) {                             // run on a free peer GPU,
+            cudaSetDevice(g);                                   // where the following geev
+            tracked_cudaFree(d_B_full_per_gpu_[g]);            // must stay on that device.
         }
     }
     d_B_full_per_gpu_.clear();
     b_replicated_ = false;
-    cudaSetDevice(0);
+    cudaSetDevice(caller_dev);
 }
 
 // (ERI_RI hook) Free the AO-B replica after build_B_mo. const_cast mirrors

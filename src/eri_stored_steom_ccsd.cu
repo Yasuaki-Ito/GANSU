@@ -1976,6 +1976,42 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
         throw std::runtime_error("steom_spatial_orbital: invalid cluster occupation "
             "(need n_frozen < n_emb_occ < n_emb).");
 
+    // (device placement) Run the WHOLE cluster chain (CIS-NTO/CCSD/IP/EA/STEOM) on a
+    // chosen or freest GPU. At large n_emb the cluster CCSD device working set
+    // (O(nocc²·nvir²) ≈ 90 GB at cc-pVDZ n_emb=427) plus the RI 3c resident on device 0
+    // exceed one GPU (~1 GB over, log194). device 0 keeps the RI 3c; a free peer runs
+    // the solve. Switch device HERE, before C/ε alloc, so the DeviceHostMatrix views —
+    // and hence build_B_mo (distributed RI replicates the AO B per-GPU) + every operator
+    // — are born on the target device: no cross-device reads. GPUHandle::reset() rebinds
+    // the thread_local cuBLAS/cuSOLVER to the target (CRITICAL — cross-device DGEMM dies
+    // otherwise). Env GANSU_DMET_STEOM_CLUSTER_GPU=<N>|auto; unset ⇒ current device
+    // (byte-identical). Best paired with share-barH OFF (single-device, no choreography).
+    int cl_dev_saved = 0; bool cl_dev_active = false;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        if (const char* e = std::getenv("GANSU_DMET_STEOM_CLUSTER_GPU")) {
+            cudaGetDevice(&cl_dev_saved);
+            int n_dev = 0; cudaGetDeviceCount(&n_dev);
+            int target = -1;
+            if (e[0] >= '0' && e[0] <= '9') target = std::atoi(e);       // explicit GPU id
+            else {                                                        // "auto" → freest
+                size_t bf = 0;
+                for (int d = 0; d < n_dev; ++d) { cudaSetDevice(d); size_t fb = 0, tb = 0;
+                    if (cudaMemGetInfo(&fb, &tb) == cudaSuccess && fb > bf) { bf = fb; target = d; } }
+                cudaSetDevice(cl_dev_saved);
+            }
+            if (target >= 0 && target < n_dev && target != cl_dev_saved) {
+                cudaSetDevice(target);
+                gpu::GPUHandle::reset();   // rebind cuBLAS/cuSOLVER to the target device
+                cl_dev_active = true;
+                std::cout << "  [DMET-STEOM] cluster solve on GPU " << target
+                          << " (device " << cl_dev_saved << " keeps RI 3c; frees the "
+                          << "solve from single-device OOM)." << std::endl;
+            }
+        }
+    }
+#endif
+
     // Own the cluster C / ε in DeviceHostMatrix views (the chain calls
     // .device_ptr()/.toHost()/.host_ptr() on them). Device→device copy from the
     // caller's buffers; the views free on scope exit, after the chain returns.
@@ -1999,6 +2035,12 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
 
     compute_steom_ccsd_impl(cfg, eri_method, /*d_eri_ao=*/nullptr, n_states,
                             /*d_eri_mo_precomputed=*/d_eri_mo, &ctx);
+
+#ifndef GANSU_CPU_ONLY
+    // (device placement) restore the caller's device + rebind handles. C/ε (on the
+    // target device) free by pointer in their destructors regardless of current device.
+    if (cl_dev_active) { cudaSetDevice(cl_dev_saved); gpu::GPUHandle::reset(); }
+#endif
 
     // (solve-once) release the cached cluster CCSD ground amplitudes.
     if (ctx.cc_t1) tracked_cudaFree(ctx.cc_t1);

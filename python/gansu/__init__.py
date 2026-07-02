@@ -170,6 +170,7 @@ def _find_or_fetch_lib():
 
 
 _lib = None
+_HAS_ENERGY_EVAL_API = False
 
 
 def _preload_cuda_libs():
@@ -194,7 +195,13 @@ def _preload_cuda_libs():
         ("nvidia.nccl", "libnccl.so.2"),
     ]
     for pkg, soname in nvidia_libs:
-        spec = importlib.util.find_spec(pkg)
+        # find_spec raises ModuleNotFoundError (rather than returning None)
+        # when the parent package "nvidia" itself is not installed, e.g. in
+        # development environments using a system-wide CUDA toolkit.
+        try:
+            spec = importlib.util.find_spec(pkg)
+        except ModuleNotFoundError:
+            return
         if spec is None or spec.submodule_search_locations is None:
             continue
         for base in spec.submodule_search_locations:
@@ -312,6 +319,32 @@ def _setup_signatures(lib):
 
     lib.gansu_set_initial_density.argtypes = [c_handle, c_double_p, c_int]
     lib.gansu_set_initial_density.restype = c_int
+
+    # SCF-free energy-functional evaluation (FMQA interface).
+    # Tolerate an older libgansu.so that predates these symbols — import
+    # still works, and the Molecule methods raise a clear error when used.
+    global _HAS_ENERGY_EVAL_API
+    try:
+        lib.gansu_prepare.argtypes = [c_handle]
+        lib.gansu_prepare.restype = c_int
+
+        lib.gansu_energy_from_mo.argtypes = [c_handle, c_double_p, c_int, c_int, c_double_p]
+        lib.gansu_energy_from_mo.restype = c_int
+
+        lib.gansu_energy_from_density.argtypes = [c_handle, c_double_p, c_int, c_double_p]
+        lib.gansu_energy_from_density.restype = c_int
+
+        lib.gansu_energy_from_mo_batch.argtypes = [c_handle, c_double_p, c_int, c_int, c_int, c_double_p]
+        lib.gansu_energy_from_mo_batch.restype = c_int
+
+        lib.gansu_get_hcore.argtypes = [c_handle, c_double_p, c_int]
+        lib.gansu_get_hcore.restype = c_int
+
+        lib.gansu_get_eri.argtypes = [c_handle, c_double_p, c_int]
+        lib.gansu_get_eri.restype = c_int
+        _HAS_ENERGY_EVAL_API = True
+    except AttributeError:
+        _HAS_ENERGY_EVAL_API = False
 
     # Progress callback: void(const char*, int, int, const double*, void*)
     global PROGRESS_FUNC_TYPE
@@ -506,6 +539,10 @@ class Molecule:
         self._h = self._lib.gansu_create()
         self._lib.gansu_set_xyz(self._h, os.path.abspath(xyz_path).encode())
         self._lib.gansu_set_basis(self._h, resolve_basis(basis).encode())
+        # Quiet by default so SCF-free evaluation (energy_of etc., which may
+        # lazily build integrals without run()) doesn't spam stdout.
+        # run(quiet=...) still controls verbosity for full calculations.
+        self._lib.gansu_set(self._h, b"quiet", b"true")
         for k, v in kwargs.items():
             self._lib.gansu_set(self._h, k.encode(), str(v).encode())
 
@@ -523,6 +560,140 @@ class Molecule:
             flat = np.ascontiguousarray(density.ravel(), dtype=np.float64)
             self._lib.gansu_set_initial_density(
                 self._h, flat.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), len(flat))
+
+    # -- SCF-free energy-functional evaluation (FMQA interface) --
+
+    def _dp(self, arr):
+        """numpy array -> POINTER(c_double)."""
+        return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+
+    def prepare(self):
+        """Prepare integrals for SCF-free energy evaluation (no SCF run).
+        Idempotent; called implicitly by energy_of / hcore / eri / overlap."""
+        self._require_energy_eval_api()
+        if self._lib.gansu_prepare(self._h) != 0:
+            raise RuntimeError("gansu_prepare failed")
+
+    def _require_energy_eval_api(self):
+        if not _HAS_ENERGY_EVAL_API:
+            raise RuntimeError(
+                "The loaded libgansu.so predates the SCF-free energy API "
+                "(gansu_prepare / gansu_energy_from_mo ...). Rebuild the "
+                "library (cd build && make gansu_shared) and make sure the "
+                "new .so is the one loaded — e.g. set GANSU_LIB to its path, "
+                "or remove a stale bundled copy at python/gansu/lib/libgansu.so "
+                "(it takes priority over build/libgansu.so).")
+
+    @property
+    def num_basis(self):
+        """Number of basis functions (prepares integrals lazily)."""
+        self.prepare()
+        return self._lib.gansu_get_num_basis(self._h)
+
+    @property
+    def num_electrons(self):
+        self.prepare()
+        return self._lib.gansu_get_num_electrons(self._h)
+
+    @property
+    def nocc(self):
+        """Number of doubly-occupied orbitals (closed-shell)."""
+        return self.num_electrons // 2
+
+    @property
+    def nuclear_repulsion_energy(self):
+        """Nuclear repulsion energy E_nn in Hartree (no SCF required)."""
+        self.prepare()
+        return self._lib.gansu_get_nuclear_repulsion_energy(self._h)
+
+    def energy_of(self, C_occ=None, P=None):
+        """SCF-free single-point RHF energy evaluation.
+
+        E = sum_pq P_pq h_pq + 1/2 sum_pq P_pq G_pq(P) + E_nn,  G = J - K/2.
+
+        Args:
+            C_occ: (n, nocc) numpy array of occupied MO coefficients
+                   (column j = j-th occupied orbital). P = 2 C C^T is formed.
+                   Orthonormality (C^T S C = I) is the caller's responsibility.
+            P: (n, n) numpy array, AO density matrix (Tr(PS) = n_electrons).
+            Specify exactly one of the two.
+
+        Returns:
+            Total energy in Hartree (E_nn included). No SCF is performed;
+            integrals are prepared once on the first call and reused.
+        """
+        self._require_energy_eval_api()
+        if (C_occ is None) == (P is None):
+            raise ValueError("specify exactly one of C_occ or P")
+        out = ctypes.c_double()
+        if C_occ is not None:
+            C = np.ascontiguousarray(C_occ, dtype=np.float64)
+            if C.ndim != 2:
+                raise ValueError(f"C_occ must be 2-D (n, nocc), got shape {C.shape}")
+            n, nocc = C.shape
+            ret = self._lib.gansu_energy_from_mo(
+                self._h, self._dp(C), n, nocc, ctypes.byref(out))
+        else:
+            Pm = np.ascontiguousarray(P, dtype=np.float64)
+            if Pm.ndim != 2 or Pm.shape[0] != Pm.shape[1]:
+                raise ValueError(f"P must be square (n, n), got shape {Pm.shape}")
+            ret = self._lib.gansu_energy_from_density(
+                self._h, self._dp(Pm), Pm.shape[0], ctypes.byref(out))
+        if ret != 0:
+            raise RuntimeError(f"energy evaluation failed (status {ret})")
+        return out.value
+
+    def energy_of_batch(self, C_occ_batch):
+        """Batched SCF-free evaluation: (batch, n, nocc) -> (batch,) energies."""
+        self._require_energy_eval_api()
+        arr = np.ascontiguousarray(C_occ_batch, dtype=np.float64)
+        if arr.ndim != 3:
+            raise ValueError(f"C_occ_batch must be 3-D (batch, n, nocc), got shape {arr.shape}")
+        batch, n, nocc = arr.shape
+        out = np.empty(batch, dtype=np.float64)
+        ret = self._lib.gansu_energy_from_mo_batch(
+            self._h, self._dp(arr), batch, n, nocc, self._dp(out))
+        if ret != 0:
+            raise RuntimeError(f"batch energy evaluation failed (status {ret})")
+        return out
+
+    @property
+    def hcore(self):
+        """Core Hamiltonian h = T + V_ne as (n, n) numpy array."""
+        n = self.num_basis
+        buf = np.empty(n * n, dtype=np.float64)
+        if self._lib.gansu_get_hcore(self._h, self._dp(buf), n * n) < 0:
+            raise RuntimeError("Failed to get core Hamiltonian")
+        return buf.reshape(n, n)
+
+    @property
+    def eri(self):
+        """Full AO ERI tensor (pq|rs), chemists' notation, as (n, n, n, n)
+        numpy array. Stored-ERI method only; refused for large n."""
+        n = self.num_basis
+        need = n ** 4
+        buf = np.empty(need, dtype=np.float64)
+        ret = self._lib.gansu_get_eri(self._h, self._dp(buf), need)
+        if ret == -2:
+            raise RuntimeError(
+                "ERI tensor unavailable: requires eri_method=stored and n^4 <= INT_MAX")
+        if ret < 0:
+            raise RuntimeError("Failed to get ERI tensor")
+        return buf.reshape(n, n, n, n)
+
+    @property
+    def overlap(self):
+        """Overlap matrix S as (n, n) numpy array (no SCF required)."""
+        n = self.num_basis
+        buf = np.empty(n * n, dtype=np.float64)
+        if self._lib.gansu_get_overlap_matrix(self._h, self._dp(buf), n * n) < 0:
+            raise RuntimeError("Failed to get overlap matrix")
+        return buf.reshape(n, n)
+
+    def scf_reference(self, **kwargs):
+        """Run SCF and return the converged total energy (Hartree).
+        Convenience for FMQA's GansuEnergy.scf_reference()."""
+        return self.run(**kwargs).total_energy
 
     def run(self, method="RHF", post_hf="none", quiet=True, on_progress=None, **kwargs):
         """Run the calculation.

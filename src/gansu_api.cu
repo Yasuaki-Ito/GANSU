@@ -20,11 +20,13 @@
 #include "uhf.hpp"
 #include "progress.hpp"
 
+#include <climits>
 #include <map>
 #include <memory>
 #include <string>
 #include <iostream>
 #include <fstream>
+#include <vector>
 
 using namespace gansu;
 
@@ -38,6 +40,7 @@ struct GansuContext {
     std::unique_ptr<HF> hf;
     std::string excited_state_report_cache;
     bool solved = false;
+    bool integrals_ready = false;  // integrals prepared (by gansu_run or gansu_prepare)
     bool quiet = false;
     gansu_progress_fn progress_fn = nullptr;
     void* progress_userdata = nullptr;
@@ -121,6 +124,7 @@ extern "C" int gansu_run(gansu_handle_t h) {
         // Clean up previous run (release GPU memory)
         ctx->hf.reset();
         ctx->solved = false;
+        ctx->integrals_ready = false;
 
         // Install progress callback for this thread
         if (ctx->progress_fn) {
@@ -147,6 +151,7 @@ extern "C" int gansu_run(gansu_handle_t h) {
             ctx->hf->solve();
         }
         ctx->solved = true;
+        ctx->integrals_ready = true;  // solve() prepared all integrals
 
         gansu::clear_progress_callback();
         if (orig_cout) std::cout.rdbuf(orig_cout);
@@ -165,6 +170,7 @@ extern "C" int gansu_run(gansu_handle_t h) {
             ctx->hf.release();
         }
         ctx->solved = false;
+        ctx->integrals_ready = false;
         ctx->initial_density.clear();
         ctx->progress_fn = nullptr;
         ctx->progress_userdata = nullptr;
@@ -235,7 +241,8 @@ extern "C" double gansu_get_post_hf_energy(gansu_handle_t h) {
 extern "C" double gansu_get_nuclear_repulsion_energy(gansu_handle_t h) {
     if (!h) return 0.0;
     auto* ctx = static_cast<GansuContext*>(h);
-    if (!ctx->solved || !ctx->hf) return 0.0;
+    // Available after gansu_run() or gansu_prepare().
+    if (!ctx->hf || !ctx->integrals_ready) return 0.0;
     return ctx->hf->get_nuclear_repulsion_energy();
 }
 
@@ -433,7 +440,9 @@ extern "C" void gansu_set_progress_callback(gansu_handle_t h, gansu_progress_fn 
 extern "C" int gansu_get_overlap_matrix(gansu_handle_t h, double* buf, int buf_size) {
     if (!h || !buf) return -1;
     auto* ctx = static_cast<GansuContext*>(h);
-    if (!ctx->solved || !ctx->hf) return -1;
+    // Available after gansu_run() or gansu_prepare() (overlap is computed
+    // together with the core Hamiltonian).
+    if (!ctx->hf || !ctx->integrals_ready) return -1;
     int nao = ctx->hf->get_num_basis();
     int n2 = nao * nao;
     if (buf_size < n2) return -1;
@@ -441,4 +450,173 @@ extern "C" int gansu_get_overlap_matrix(gansu_handle_t h, double* buf, int buf_s
     S.toHost();
     for (int i = 0; i < n2; i++) buf[i] = S.host_ptr()[i];
     return n2;
+}
+
+// ---- SCF-free energy-functional evaluation (FMQA interface) ----
+
+namespace {
+
+// RAII stdout suppression, same policy as gansu_run's quiet handling.
+struct QuietGuard {
+    std::streambuf* orig = nullptr;
+    std::ofstream devnull;
+    explicit QuietGuard(bool quiet) {
+        if (quiet) {
+            devnull.open("/dev/null");
+            orig = std::cout.rdbuf(devnull.rdbuf());
+        }
+    }
+    ~QuietGuard() { if (orig) std::cout.rdbuf(orig); }
+};
+
+// Build the HF object (if absent) and prepare the integrals once:
+// nuclear repulsion + core Hamiltonian/overlap + ERI precomputation.
+// This is the setup phase of HF::solve() without the SCF iterations,
+// so repeated energy evaluations only pay one Fock build each.
+int ensure_prepared(GansuContext* ctx) {
+    if (ctx->hf && ctx->integrals_ready) return 0;
+    QuietGuard qg(ctx->quiet);
+    try {
+        if (!ctx->hf) {
+            ParameterManager params(false);
+            for (const auto& kv : ctx->user_params) {
+                if (kv.first != "parameter_file" || !kv.second.empty()) {
+                    params[kv.first] = kv.second;
+                }
+            }
+            ctx->hf = HFBuilder::buildHF(params);
+        }
+        ctx->hf->compute_nuclear_repulsion_energy();
+        ctx->hf->compute_core_hamiltonian_matrix();
+        ctx->hf->precompute_eri_matrix();
+        ctx->integrals_ready = true;
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "gansu_prepare error: " << e.what() << std::endl;
+        return -1;
+    } catch (...) {
+        std::cerr << "gansu_prepare error: unknown exception" << std::endl;
+        return -1;
+    }
+}
+
+// Core evaluation: upload P (n x n, row-major), one Fock build,
+// E = 0.5 Tr[P (h + F)] + E_nn. The caller-supplied density is trusted
+// as-is. Overwrites the handle's working density/Fock matrices.
+int energy_from_density_impl(GansuContext* ctx, const double* density, int n,
+                             double* energy_out) {
+    RHF* rhf = as_rhf(ctx->hf.get());
+    if (!rhf) return -3;  // closed-shell RHF only
+    if (n != ctx->hf->get_num_basis()) return -1;
+    QuietGuard qg(ctx->quiet);  // suppress per-call profiler START/END lines
+    const size_t n2 = (size_t)n * n;
+
+    auto& P = rhf->get_density_matrix();
+    cudaMemcpy(P.device_ptr(), density, n2 * sizeof(real_t), cudaMemcpyHostToDevice);
+
+    // Force the density-based Fock path: the RI builders switch to the
+    // coefficient-matrix path once SCF has set hasMatrixC.
+    const bool hadC = ctx->hf->get_hasMatrixC();
+    ctx->hf->set_hasMatrixC(false);
+    real_t e_elec;
+    try {
+        rhf->compute_fock_matrix();
+        e_elec = gpu::computeEnergy_RHF(
+            P.device_ptr(),
+            rhf->get_core_hamiltonian_matrix().device_ptr(),
+            rhf->get_fock_matrix().device_ptr(),
+            n);
+    } catch (const std::exception& e) {
+        ctx->hf->set_hasMatrixC(hadC);
+        std::cerr << "gansu_energy_from_density error: " << e.what() << std::endl;
+        return -1;
+    } catch (...) {
+        ctx->hf->set_hasMatrixC(hadC);
+        return -1;
+    }
+    ctx->hf->set_hasMatrixC(hadC);
+
+    *energy_out = e_elec + ctx->hf->get_nuclear_repulsion_energy();
+    return 0;
+}
+
+} // namespace
+
+extern "C" int gansu_prepare(gansu_handle_t h) {
+    if (!h) return -1;
+    return ensure_prepared(static_cast<GansuContext*>(h));
+}
+
+extern "C" int gansu_energy_from_density(gansu_handle_t h,
+                                         const double* density, int n,
+                                         double* energy_out) {
+    if (!h || !density || !energy_out || n <= 0) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (ensure_prepared(ctx) != 0) return -1;
+    return energy_from_density_impl(ctx, density, n, energy_out);
+}
+
+extern "C" int gansu_energy_from_mo(gansu_handle_t h,
+                                    const double* c_occ, int n, int nocc,
+                                    double* energy_out) {
+    if (!h || !c_occ || !energy_out || n <= 0 || nocc <= 0 || nocc > n) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (ensure_prepared(ctx) != 0) return -1;
+    if (n != ctx->hf->get_num_basis()) return -1;
+
+    // P = 2 C_occ C_occ^T (row-major; column j of C_occ = j-th occupied MO)
+    std::vector<double> P((size_t)n * n);
+    for (int i = 0; i < n; i++) {
+        const double* ci = c_occ + (size_t)i * nocc;
+        for (int j = i; j < n; j++) {
+            const double* cj = c_occ + (size_t)j * nocc;
+            double s = 0.0;
+            for (int k = 0; k < nocc; k++) s += ci[k] * cj[k];
+            P[(size_t)i * n + j] = 2.0 * s;
+            P[(size_t)j * n + i] = 2.0 * s;
+        }
+    }
+    return energy_from_density_impl(ctx, P.data(), n, energy_out);
+}
+
+extern "C" int gansu_energy_from_mo_batch(gansu_handle_t h,
+                                          const double* c_occ_batch,
+                                          int batch, int n, int nocc,
+                                          double* energies_out) {
+    if (!h || !c_occ_batch || !energies_out || batch <= 0) return -1;
+    for (int b = 0; b < batch; b++) {
+        const int status = gansu_energy_from_mo(
+            h, c_occ_batch + (size_t)b * n * nocc, n, nocc, &energies_out[b]);
+        if (status != 0) return status;
+    }
+    return 0;
+}
+
+extern "C" int gansu_get_hcore(gansu_handle_t h, double* buf, int len) {
+    if (!h || !buf) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (ensure_prepared(ctx) != 0) return -1;
+    int nao = ctx->hf->get_num_basis();
+    int n2 = nao * nao;
+    if (len < n2) return -1;
+    auto& H = ctx->hf->get_core_hamiltonian_matrix();
+    H.toHost();
+    for (int i = 0; i < n2; i++) buf[i] = H.host_ptr()[i];
+    return n2;
+}
+
+extern "C" int gansu_get_eri(gansu_handle_t h, double* buf, int len) {
+    if (!h || !buf) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (ensure_prepared(ctx) != 0) return -1;
+    const size_t nao = (size_t)ctx->hf->get_num_basis();
+    const size_t n4 = nao * nao * nao * nao;
+    if (n4 > (size_t)INT_MAX) return -2;  // refuse: n^4 exceeds the int API
+    if (len < (int)n4) return -1;
+    ERI* eri = ctx->hf->get_eri_method();
+    const real_t* d_eri = eri ? eri->get_eri_matrix_device() : nullptr;
+    if (!d_eri) return -2;  // not a stored-ERI method
+    // Full (pq|rs) tensor, row-major eri[((p*n + q)*n + r)*n + s].
+    cudaMemcpy(buf, d_eri, n4 * sizeof(real_t), cudaMemcpyDeviceToHost);
+    return (int)n4;
 }

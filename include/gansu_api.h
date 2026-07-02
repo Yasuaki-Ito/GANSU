@@ -156,6 +156,67 @@ int gansu_get_overlap_matrix(gansu_handle_t h, double* buf, int buf_size);
  *  Pass NULL to clear. buf is nao*nao doubles, row-major. */
 int gansu_set_initial_density(gansu_handle_t h, const double* buf, int buf_size);
 
+/* ---- SCF-free energy-functional evaluation (FMQA interface) ----
+ *
+ * These functions evaluate the RHF energy functional
+ *   E = sum_pq P_pq h_pq + 1/2 sum_pq P_pq G_pq(P) + E_nn,   G = J - 1/2 K
+ * for a caller-supplied density / MO coefficients WITHOUT running SCF.
+ *
+ * Prerequisites: xyz and basis set on the handle. gansu_run() is NOT
+ * required — on the first call the integrals (core Hamiltonian, overlap,
+ * ERI) are lazily prepared once and reused across subsequent calls, so
+ * repeated evaluation (10^2..10^4 calls) only costs one Fock build each.
+ * Closed-shell RHF only (method must be RHF; even electron count).
+ */
+
+/** Prepare integrals for SCF-free evaluation without running SCF.
+ *  Idempotent; called implicitly by the functions below. After this,
+ *  gansu_get_num_basis / gansu_get_num_electrons / gansu_get_overlap_matrix /
+ *  gansu_get_hcore / gansu_get_eri are usable without gansu_run().
+ *  @return 0 on success, <0 on error. */
+int gansu_prepare(gansu_handle_t h);
+
+/** Evaluate the RHF energy functional from an AO density matrix P
+ *  (n x n, row-major, RHF convention Tr(PS) = n_electrons). No SCF.
+ *  The density is used as given — no normalization, no checks.
+ *  Note: overwrites the handle's working density/Fock matrices.
+ *  @return 0 on success; -1 on dimension mismatch / error; -3 if not RHF.
+ *  On success *energy_out = total energy in Hartree (E_nn included). */
+int gansu_energy_from_density(gansu_handle_t h,
+                              const double* density, int n,
+                              double* energy_out);
+
+/** Evaluate the RHF energy functional from occupied MO coefficients C_occ
+ *  (n x nocc, row-major; column j = j-th occupied orbital). Builds
+ *  P = 2 C_occ C_occ^T and evaluates as gansu_energy_from_density.
+ *  Orthonormality (C^T S C = I) is the CALLER's responsibility — the
+ *  coefficients are trusted as-is (no checks, for high call rates).
+ *  @return 0 on success; -1 on dimension mismatch / error; -3 if not RHF. */
+int gansu_energy_from_mo(gansu_handle_t h,
+                         const double* c_occ, int n, int nocc,
+                         double* energy_out);
+
+/** Batched variant: batch sets of occupied MO coefficients, contiguous
+ *  (set b starts at c_occ_batch + (size_t)b*n*nocc). energies_out has
+ *  length batch. Integrals are prepared once; one Fock build per point.
+ *  @return 0 on success (all points evaluated), <0 on first error. */
+int gansu_energy_from_mo_batch(gansu_handle_t h,
+                               const double* c_occ_batch,
+                               int batch, int n, int nocc,
+                               double* energies_out);
+
+/** Get core Hamiltonian h = T + V_ne (n x n, row-major).
+ *  Usable after gansu_prepare() or gansu_run().
+ *  @return n*n elements written, or -1 on error (len < n*n, not prepared). */
+int gansu_get_hcore(gansu_handle_t h, double* buf, int len);
+
+/** Get the full AO ERI tensor (pq|rs), chemists' notation, row-major
+ *  n^4 layout: buf[((p*n + q)*n + r)*n + s]. Small-scale verification use.
+ *  Only available for eri_method=stored.
+ *  @return n^4 elements written; -1 on error (len too small, not prepared);
+ *          -2 if refused (non-stored ERI method, or n^4 exceeds INT_MAX). */
+int gansu_get_eri(gansu_handle_t h, double* buf, int len);
+
 /* ---- Progress callback ---- */
 
 /**

@@ -796,6 +796,36 @@ STEOMResult DMET::solve_fragment_steom(
     {
         std::vector<real_t> h_eps(n_emb);
         cudaMemcpy(h_eps.data(), d_eigvals, n_emb * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+        // (ii) DMET frozen-core propagation. --frozen_core sets the *molecular* core
+        // count, but the DMET embedding rebuilds the all-electron cluster (incoming
+        // n_frozen == 0). The cluster's deepest occupied canonical orbitals ARE the
+        // fragment atomic 1s cores (ε ≪ valence: C 1s ≈ −11, O 1s ≈ −20 Ha); freezing
+        // them removes them from the CCSD/EOM correlation, shrinking the active
+        // occupied nocc and hence the whole O(nocc²·nvir²) device working set (the
+        // 119 GB pool that OOMs cc-pVDZ Doxorubicin, n_emb=427: nocc 142→123 ⇒ ~0.75×
+        // ⇒ ~90 GB, fits). Bath orbitals are valence entanglement, never cores, so a
+        // core-ε threshold auto-selects exactly the fragment cores. Chain frozen-core
+        // plumbing (eps offset + ERI block trim) is the validated DLPNO-STEOM path.
+        // Only active when --frozen_core was requested; ε < −3 Ha cleanly separates
+        // 1s cores (< −8) from valence (> −1.6). Env override GANSU_DMET_STEOM_FROZEN=0
+        // forces it off (all-electron cluster, byte-identical to pre-(ii) behaviour).
+        if (rhf_.get_num_frozen_core() > 0 &&
+            !(std::getenv("GANSU_DMET_STEOM_FROZEN") && std::getenv("GANSU_DMET_STEOM_FROZEN")[0] == '0')) {
+            real_t core_thresh = -3.0;
+            if (const char* e = std::getenv("GANSU_DMET_STEOM_CORE_THRESH")) core_thresh = std::atof(e);
+            int n_core_cl = 0;
+            for (int i = 0; i < n_emb_occ; i++) if (h_eps[i] < core_thresh) ++n_core_cl;
+            if (n_core_cl > 0 && n_core_cl < n_emb_occ) {
+                n_frozen = n_core_cl;
+                std::cout << "  [DMET-STEOM] frozen core (ii): " << n_frozen
+                          << " cluster core orbitals frozen (ε < " << std::fixed
+                          << std::setprecision(1) << core_thresh << " Ha) → "
+                          << (n_emb_occ - n_frozen) << " active occupied of " << n_emb_occ
+                          << std::defaultfloat << "." << std::endl;
+            }
+        }
+
         real_t gap = h_eps[n_emb_occ] - h_eps[n_emb_occ - 1];
         // (B / iter-reduction lever) Cluster level shift that stabilises the small-gap
         // embedded CCSD. A larger target_gap = stronger damping of the virtual ε =
