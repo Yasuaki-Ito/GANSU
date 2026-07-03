@@ -533,10 +533,12 @@ STEOMCCSDOperator::STEOMCCSDOperator(
     int nmo_full,
     std::vector<real_t*>* d_eri_vvvv_slabs_input,
     SteomBarHCache* barh_cache,
-    int frozen_off)
+    int frozen_off,
+    bool triplet)
     : nocc_active_(nocc_active), nvir_(nvir), nao_active_(nao_active),
       n_act_occ_(n_act_occ), n_act_vir_(n_act_vir),
       total_dim_(nocc_active * nvir),
+      triplet_(triplet),
       d_t1_(d_t1), d_t2_(d_t2),
       eri_block_src_(eri_block_src), d_B_mo_blocks_(d_B_mo_blocks), nmo_full_(nmo_full),
       frozen_off_(frozen_off),
@@ -4180,7 +4182,11 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
 
     bmark("phph (UAMCI/UAKEI/UAMEI)");
     // ---- phhp (Eq.60-62) ----
-    std::vector<real_t> u_bmjc((size_t)NV*NMo*NO*NV, 0.0); // [b][m][j][c]
+    // Triplet block: g_phhp (the Coulomb ph-hp channel) drops out of G entirely
+    // (G_triplet = F_eff − g_phph), so the whole UBMJC route is skipped and the
+    // u_bmjc / g_phhp buffers stay empty (never read — the assembly below gates
+    // on triplet_ before touching GPHHP/UBMJC).
+    std::vector<real_t> u_bmjc(triplet_ ? 0 : (size_t)NV*NMo*NO*NV, 0.0); // [b][m][j][c]
     auto UBMJC=[&](int b,int m,int j,int c)->real_t&{ return u_bmjc[(((size_t)b*NMo+m)*NO+j)*NV+c]; };
     // GPU GEMM port of UBMJC Term1 (FIX 2026-06-20, g_phhp IP SO route -Wvovv·s):
     //   ct[b,c,m,j] = Σ_{k,d} wvovv(c,k,d,b)·siP(m,j,k,d)   (subtracted below)
@@ -4189,7 +4195,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     std::vector<real_t> ct_ubmjc;
     bool ubmjc_gpu = false;
 #ifndef GANSU_CPU_ONLY
-    if (gpu::gpu_available()) {
+    if (!triplet_ && gpu::gpu_available()) {
         cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
         std::vector<real_t> hA((size_t)BC_M*KD_K), hB((size_t)MJ_N*KD_K);
         #pragma omp parallel for collapse(2)
@@ -4231,7 +4237,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     std::vector<real_t> ct_ubmjc_t2;
     bool ubmjc_t2_gpu = false;
 #ifndef GANSU_CPU_ONLY
-    if (gpu::gpu_available()) {
+    if (!triplet_ && gpu::gpu_available()) {
         cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
         std::vector<real_t> hA((size_t)CJ_M2*KL_K2), hB((size_t)MB_N2*KL_K2);
         #pragma omp parallel for collapse(2)
@@ -4273,6 +4279,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     // GANSU layout g_phhp[b,k,j,c], root m -> k=occ_idx[m]; UBMJC loop vars (b,m,j,c) map to the
     // Python block as j=Python-i, c=Python-a (NO Fov term here - Fov lives in F_eff_oo).
     // GEMMs ct_ubmjc (Term1 -Wvovv·s) and ct_ubmjc_t2 (Term2 +0.5 Wooov·s) re-ported above.
+    if (!triplet_) {
     #pragma omp parallel for collapse(2)
     for (int m=0;m<NMo;++m)
         for (int b=0;b<NV;++b) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c){
@@ -4289,6 +4296,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                     t += 0.5*wooov(k,l,j,b)*siP(m,k,l,c);
             UBMJC(b,m,j,c)=t;
         }
+    }
     // (UBKJE T2/T3 + UBMJE T3/T4 GEMMs and fallbacks removed 2026-06-20: their u_bkje/u_bmje
     //  outputs were the g_phhp EA + cross routes, both ZEROED in the assembly below since the
     //  base wovvo + UBMJC IP route already matches ORCA. UKLIE/UMLID/u_ma/u_ie stay for UAMEI.)
@@ -4296,7 +4304,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     bmark("phhp (UBMJC)");
     // ---- assemble g_phph[a,k,c,i] (Eq.59) and g_phhp[b,k,j,c] (Eq.63) ----
     std::vector<real_t> g_phph((size_t)NV*NO*NV*NO, 0.0);
-    std::vector<real_t> g_phhp((size_t)NV*NO*NO*NV, 0.0);
+    std::vector<real_t> g_phhp(triplet_ ? 0 : (size_t)NV*NO*NO*NV, 0.0);
     auto GPHPH=[&](int a,int k,int c,int i)->real_t&{ return g_phph[(((size_t)a*NO+k)*NV+c)*NO+i]; };
     auto GPHHP=[&](int b,int k,int j,int c)->real_t&{ return g_phhp[(((size_t)b*NO+k)*NO+j)*NV+c]; };
     #pragma omp parallel for collapse(2) schedule(static)
@@ -4453,6 +4461,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     for (int m=0;m<NMo;++m) for(int e=0;e<NMv;++e){ const int kf=active_occ_idx_[m], cf=active_vir_idx_[e];
         for(int a=0;a<NV;++a) for(int i=0;i<NO;++i)
             GPHPH(a,kf,cf,i)+=UAMEI(a,m,e,i); }       // g_phph cross (kept, old form)
+    if (!triplet_) {
     #pragma omp parallel for collapse(2) schedule(static)
     for (int b=0;b<NV;++b) for(int k=0;k<NO;++k) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c)
         GPHHP(b,k,j,c)=wovvo(k,b,c,j);
@@ -4460,20 +4469,26 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     for (int m=0;m<NMo;++m){ const int kf=active_occ_idx_[m];
         for(int b=0;b<NV;++b) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c)
             GPHHP(b,kf,j,c)+=UBMJC(b,m,j,c); }        // g_phhp IP route (SO-derived)
+    }
     // u_bkje (g_phhp EA) and u_bmje (g_phhp cross) ZEROED 2026-06-20: old forms buggy; base+IP
     // (UBMJC) already matches ORCA on H2O/CH2O (n->pi* 0.04-0.08 eV). The correct small EA route
     // is derived in memory pt41 but adding it lands at the 2nd-order {e^S}, below ORCA (pt42).
 
     bmark("assemble g_phph/g_phhp");
-    // ---- G^{1h1p} singlet: row=i*NV+a, col=j*NV+b ----
-    //  G = F_eff_vv δ_ij − F_eff_oo δ_ab + 2 g_phhp[b,j,i,a] − g_phph[a,j,b,i]
+    // ---- G^{1h1p} spin blocks: row=i*NV+a, col=j*NV+b ----
+    //  singlet: G = F_eff_vv δ_ij − F_eff_oo δ_ab + 2 g_phhp[b,j,i,a] − g_phph[a,j,b,i]
+    //  triplet: G = F_eff_vv δ_ij − F_eff_oo δ_ab − g_phph[a,j,b,i]
+    //  (spin adaptation of the 1h1p operator; the Coulomb g_phhp channel carries a
+    //   factor 2 in the singlet and 0 in the triplet, exactly as in CIS. Same
+    //   convention as the Python reference steom_eig_harness.py assemble().)
     std::vector<real_t> Gmat((size_t)total_dim_*total_dim_, 0.0);
     #pragma omp parallel for collapse(2) schedule(static)  // distinct row=(i,a) per thread
     for (int i=0;i<NO;++i) for(int a=0;a<NV;++a){
         const int row=i*NV+a;
         for (int j=0;j<NO;++j) for(int b=0;b<NV;++b){
             const int col=j*NV+b;
-            real_t v = 2.0*GPHHP(b,j,i,a) - GPHPH(a,j,b,i);
+            real_t v = triplet_ ? -GPHPH(a,j,b,i)
+                                : 2.0*GPHHP(b,j,i,a) - GPHPH(a,j,b,i);
             if (i==j) v += Fvv[(size_t)a*NV+b];
             if (a==b) v -= Foo[(size_t)i*NO+j];
             Gmat[(size_t)row*total_dim_+col]=v;
@@ -4501,10 +4516,12 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     // routes gave ~0.393).
     {
         const int hl = (NO - 1) * NV + 0;
-        std::cout << "  STEOM-CCSD G^{1h1p} built (W^eff dressing Eq.34-63, dense "
+        std::cout << "  STEOM-CCSD G^{1h1p} " << (triplet_ ? "TRIPLET" : "singlet")
+                  << " block built (W^eff dressing Eq.34-63, dense "
                   << total_dim_ << "×" << total_dim_ << "); G[HOMO->LUMO diag] = "
                   << Gmat[(size_t)hl * total_dim_ + hl]
-                  << "  (H2O sto-3g ref ~0.433 after route fix)." << std::endl;
+                  << (triplet_ ? "." : "  (H2O sto-3g singlet ref ~0.433 after route fix).")
+                  << std::endl;
     }
 }
 

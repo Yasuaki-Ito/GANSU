@@ -546,12 +546,20 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // single-GPU). `ctx == nullptr` ⇒ byte-identical legacy plain-STEOM path.
     const int verbose = rhf.get_steom_verbose();
 
-    // Sub-phase 3.12 (early stub): spin warn-and-ignore.
+    // Spin block (--spin_type): singlet (default) or triplet. Both share the
+    // whole chain (CIS-NTO active-space selection — itself spin-adapted via
+    // rhf.is_triplet() — CCSD, IP/EA-EOM, bar-H, W^eff routes); only the final
+    // G^{1h1p} assembly differs (triplet drops the 2·g_phhp Coulomb channel).
+    const bool steom_triplet = rhf.is_triplet();
     {
         const std::string& st = rhf.get_spin_type();
-        if (st != "singlet") {
-            std::cout << "Warning: STEOM-CCSD currently runs the singlet block only. "
-                         "--spin_type \"" << st << "\" is ignored at sub-phase 3.0+3.1." << std::endl;
+        if (st != "singlet" && st != "triplet") {
+            std::cout << "Warning: STEOM-CCSD supports --spin_type singlet|triplet; \""
+                      << st << "\" falls back to singlet." << std::endl;
+        }
+        if (steom_triplet) {
+            std::cout << "STEOM-CCSD: TRIPLET block requested (G = F_eff − g_phph; "
+                         "CIS-NTO active-space selection uses triplet CIS)." << std::endl;
         }
     }
 
@@ -1534,7 +1542,9 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                                    ? (ctx ? &ctx->barh : &rhf.steom_barh_cache()) : nullptr,
                                // Frozen core: block ranges read [num_frozen, num_basis)
                                // of the full-C B_mo (only used on the block path).
-                               num_frozen);
+                               num_frozen,
+                               // Spin block: triplet G = F_eff − g_phph (--spin_type).
+                               steom_triplet);
 
     // Operator owns T1/T2 + has copied bar-H intermediates; we can free the
     // trimmed / full MO ERI tensor (operator pulled the sub-blocks it needs).
@@ -1874,14 +1884,20 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // ----------------------------------------------------------------------
     std::ostringstream os;
     os << "[STEOM-CCSD] sub-phase 3.5-3.7 — full W^eff-dressed G^{1h1p} "
-          "(Nooijen-Bartlett Eq.34-63: F^eff_oo/vv + hp/hhhp/phph/phhp + IP×EA cross), "
+       << (steom_triplet ? "TRIPLET" : "singlet") << " block "
+          "(Nooijen-Bartlett Eq.34-63: F^eff_oo/vv + hp/hhhp/phph"
+       << (steom_triplet ? "" : "/phhp") << " + IP×EA cross), "
           "diagonalized by "
        << (dense_diag ? "dense non-Hermitian geev (deterministic)"
                       : "non-Hermitian Davidson")
-       << ". Validated vs Python reference (W^eff routes corrected 2026-06-20): "
-          "H2O sto-3g FC1 lowest two roots 0.432663 / 0.496991 Ha "
-          "(11.773 / 13.524 eV; ORCA 11.849 / 13.60).\n"
-       << "  STEOM excited-state energies"
+       << (steom_triplet
+           ? ". Validated vs Python reference (triplet = F_eff − g_phph, routes "
+             "corrected 2026-06-20): CH2O sto-3g fc2 triplets 4.223 / 5.904 eV "
+             "(ORCA 4.197 / 5.959); H2O sto-3g FC1 lowest ~10.25 eV.\n"
+           : ". Validated vs Python reference (W^eff routes corrected 2026-06-20): "
+             "H2O sto-3g FC1 lowest two roots 0.432663 / 0.496991 Ha "
+             "(11.773 / 13.524 eV; ORCA 11.849 / 13.60).\n")
+       << "  STEOM " << (steom_triplet ? "TRIPLET " : "") << "excited-state energies"
        << (can_eta ? "  (η = % active character; low η ⇒ active space / DMET bath "
                      "under-describes this root, energy untrustworthy)" : "")
        << ":\n"

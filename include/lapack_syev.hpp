@@ -15,10 +15,14 @@
 // density). Eigen's solver uses implicit QR; LAPACK's D&C is typically 2-4x
 // faster for the n≈130-450 matrices that dominate DLPNO pair_setup / SC-PNO.
 //
-// dsyevd_ is resolved from the already-linked BLAS library (OpenBLAS ships
-// LAPACK in the same .so), so no extra CMake linking is required.
+// dsyevd_ is linked explicitly via CMake find_package(LAPACK) → LAPACK::LAPACK,
+// which also defines GANSU_HAVE_LAPACK. When LAPACK is NOT available at build
+// time (GANSU_HAVE_LAPACK undefined) this eigensolver is compiled out and every
+// caller falls back to Eigen — so libgansu.so never carries an unresolved
+// dsyevd_ symbol that would only fail at first call (and force an LD_PRELOAD).
 //
-// Default ON (opt-out with GANSU_DLPNO_LAPACK_EIG=0). Validated on Decacene:
+// Default ON when LAPACK is present (opt-out with GANSU_DLPNO_LAPACK_EIG=0).
+// Validated on Decacene:
 // LAPACK D&C is ~57x faster than Eigen's QR for the n≈130-458 per-pair eigs
 // (Sdom_eig 2607→47 s, FPAO_eig 1326→21 s thread-summed; pair_setup phase1 host
 // 73→3.6 s), with naphthalene ΔE 2.4e-14 (eigenvalues match Eigen; eigenvector
@@ -34,19 +38,27 @@
 
 namespace gansu {
 
+#ifdef GANSU_HAVE_LAPACK
 extern "C" void dsyevd_(const char* jobz, const char* uplo, const int* n,
                         double* a, const int* lda, double* w,
                         double* work, const int* lwork,
                         int* iwork, const int* liwork, int* info);
+#endif
 
-// Runtime gate (evaluated once). Default ON; opt out with
-// GANSU_DLPNO_LAPACK_EIG=0 to fall back to the Eigen eigensolver.
+// Runtime gate (evaluated once). Default ON when LAPACK was linked; opt out
+// with GANSU_DLPNO_LAPACK_EIG=0 to fall back to the Eigen eigensolver. When
+// GANSU_HAVE_LAPACK is undefined, dsyevd_ is not linked, so this is compiled to
+// a constant false and no caller ever references the symbol.
 inline bool use_lapack_eig() {
+#ifdef GANSU_HAVE_LAPACK
     static const bool on = []() {
         const char* e = std::getenv("GANSU_DLPNO_LAPACK_EIG");
         return !(e && e[0] == '0');
     }();
     return on;
+#else
+    return false;
+#endif
 }
 
 // Symmetric eigendecomposition matching Eigen::SelfAdjointEigenSolver's output
@@ -64,6 +76,13 @@ inline void lapack_syevd(const double* mat_in, int n,
                          std::vector<double>& evals,
                          std::vector<double>& evecs_rowmajor)
 {
+#ifndef GANSU_HAVE_LAPACK
+    // LAPACK was not linked; use_lapack_eig() is compiled to false so this is
+    // never reached at runtime. Compiling the body out keeps dsyevd_ off the
+    // .so's undefined-symbol list entirely (no LD_PRELOAD needed).
+    (void)mat_in; (void)n; (void)evals; (void)evecs_rowmajor;
+    throw std::runtime_error("lapack_syevd: built without LAPACK");
+#else
     if (n <= 0) { evals.clear(); evecs_rowmajor.clear(); return; }
     evals.assign(static_cast<size_t>(n), 0.0);
     // dsyevd overwrites the matrix with the eigenvectors (column-major).
@@ -98,6 +117,7 @@ inline void lapack_syevd(const double* mat_in, int n,
         for (int i = 0; i < n; ++i)
             evecs_rowmajor[static_cast<size_t>(i) * n + k] =
                 a[static_cast<size_t>(i) + static_cast<size_t>(k) * n];
+#endif  // GANSU_HAVE_LAPACK
 }
 
 }  // namespace gansu

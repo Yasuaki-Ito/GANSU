@@ -56,7 +56,8 @@ if [[ "$SKIP_BUILD" != "1" ]]; then
     cmake -S . -B "$BUILD_DIR" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
-        -DENABLE_MULTI_GPU=ON
+        -DENABLE_MULTI_GPU=ON \
+        -DGANSU_BUNDLE_OPENBLAS=ON
     cmake --build "$BUILD_DIR" --target gansu_shared -j "$JOBS"
 fi
 
@@ -102,6 +103,27 @@ cat > "$STAGE_DIR/python/gansu/_native_meta.json" <<EOF
   "sha256": "$SHA256"
 }
 EOF
+
+# Fortran runtime for the statically-embedded OpenBLAS (GANSU_BUNDLE_OPENBLAS).
+# libgansu.so links libopenblas.a statically but keeps a dynamic dependency on
+# libgfortran.so.5 / libquadmath.so.0 (their static archives are not reliably
+# PIC). Ship these two small libs in the wheel; the Python loader preloads them
+# (RTLD_GLOBAL) before libgansu.so, satisfying its DT_NEEDED with no system
+# OpenBLAS/Fortran runtime required. Resolve symlinks so we copy the real ELF.
+mkdir -p "$STAGE_DIR/python/gansu/lib"
+for soname in libquadmath.so.0 libgfortran.so.5; do
+    src=$(gfortran -print-file-name="$soname" 2>/dev/null || true)
+    if [[ -z "$src" || "$src" == "$soname" || ! -e "$src" ]]; then
+        # -print-file-name returns the bare name when not found on the search path
+        src=$(gcc -print-file-name="$soname" 2>/dev/null || true)
+    fi
+    if [[ -z "$src" || "$src" == "$soname" || ! -e "$src" ]]; then
+        echo "ERROR: bundled runtime lib '$soname' not found (need gcc-gfortran)" >&2
+        exit 1
+    fi
+    cp -L "$src" "$STAGE_DIR/python/gansu/lib/$soname"
+    echo "==> Staged Fortran runtime: $soname  <-  $src"
+done
 
 # Basis sets (.gbs and .sad cache) — kept inside the thin wheel since
 # they are only a few MB total and never need to vary at runtime.

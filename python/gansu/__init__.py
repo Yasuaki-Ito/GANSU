@@ -214,11 +214,34 @@ def _preload_cuda_libs():
                 break
 
 
+def _preload_bundled_runtime():
+    """Preload the Fortran runtime shipped in the wheel for the statically
+    embedded OpenBLAS.
+
+    The wheel-built libgansu.so links OpenBLAS statically but keeps a dynamic
+    dependency on libgfortran.so.5 / libquadmath.so.0 (their static archives are
+    not reliably position-independent). We dlopen them RTLD_GLOBAL before loading
+    libgansu.so so its DT_NEEDED entries resolve against the already-loaded
+    objects — no system OpenBLAS / Fortran runtime required. Order matters:
+    libgfortran depends on libquadmath, so preload libquadmath first. Silent
+    no-op for development builds (system BLAS/LAPACK) where these aren't shipped.
+    """
+    libdir = Path(__file__).parent / "lib"
+    for soname in ("libquadmath.so.0", "libgfortran.so.5"):
+        so_path = libdir / soname
+        if so_path.is_file():
+            try:
+                ctypes.CDLL(str(so_path), mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+
+
 def _get_lib():
     global _lib
     if _lib is not None:
         return _lib
     _preload_cuda_libs()
+    _preload_bundled_runtime()
     path = _find_or_fetch_lib()
     _lib = ctypes.CDLL(path)
     _setup_signatures(_lib)

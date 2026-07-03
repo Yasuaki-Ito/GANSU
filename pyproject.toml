@@ -50,5 +50,6 @@ gansu = [
     "data/auxiliary_basis/*.gbs",
     "lib/libgansu.so",
     "lib/libgansu.dylib",
+    "lib/*.so*",
     "_native_meta.json",
 ]

@@ -123,7 +123,15 @@ public:
                       // on-the-fly mo_eri_block_into range so the active blocks are
                       // read from the full-C B_mo at columns [num_frozen, num_basis).
                       // 0 ⇒ no frozen core (byte-identical).
-                      int frozen_off = 0);
+                      int frozen_off = 0,
+                      // Spin block of G^{1h1p} (--spin_type). false = singlet
+                      // (default, byte-identical): G = F_eff + 2·g_phhp − g_phph.
+                      // true = triplet: G = F_eff − g_phph (the g_phhp Coulomb
+                      // channel drops out by spin adaptation, so its UBMJC route
+                      // is skipped entirely). Both blocks share the identical
+                      // W^eff-dressed g_phph (IP=Wooov / EA=ujaie / cross routes,
+                      // triplet-eigenvalue-validated vs ORCA 2026-06-20).
+                      bool triplet = false);
 
     ~STEOMCCSDOperator();
 
@@ -161,6 +169,9 @@ private:
     int n_act_occ_;
     int n_act_vir_;
     int total_dim_;
+
+    // Spin block: false = singlet G (default), true = triplet G = F_eff − g_phph.
+    bool triplet_ = false;
 
     // Build-phase multi-GPU device count (env GANSU_STEOM_BUILD_GPUS=N>1).
     // Decoupled from the solve-phase GANSU_STEOM_EOM_GPUS and from --num_gpus

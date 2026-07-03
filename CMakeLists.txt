@@ -110,12 +110,80 @@ FetchContent_MakeAvailable(eigen)
 # capping the DLPNO per-pair CPU loops to dlpno_cpu_threads (default
 # min(cores,64)) via OmpThreadCapGuard, keeping the OpenBLAS caller count
 # bounded — not by changing this define.
-find_package(BLAS QUIET)
-if(BLAS_FOUND)
-    message(STATUS "BLAS found: ${BLAS_LIBRARIES}")
-    add_definitions(-DEIGEN_USE_BLAS)
+# BLAS + LAPACK provide Eigen's DGEMM (EIGEN_USE_BLAS) and the host dsyevd_
+# divide-and-conquer eigensolver used in the DLPNO per-pair hot loops
+# (include/lapack_syev.hpp). Two modes:
+#
+#  * Normal build (GANSU_BUNDLE_OPENBLAS=OFF, default): use the system BLAS /
+#    LAPACK found by find_package. LAPACK is linked EXPLICITLY — dsyevd_ was
+#    previously assumed to come in transitively via BLAS_LIBRARIES, which only
+#    holds when BLAS resolves to OpenBLAS. With reference netlib libblas.so, or
+#    when no BLAS is found, dsyevd_ was left undefined in libgansu.so and only
+#    failed at first call, forcing users to LD_PRELOAD libopenblas. Linking
+#    ${LAPACK_LIBRARIES} bakes the dependency into the .so's DT_NEEDED.
+#
+#  * Bundled build (GANSU_BUNDLE_OPENBLAS=ON, used by the PyPI wheel): statically
+#    embed a PIC OpenBLAS archive (provides BLAS *and* LAPACK incl. dsyevd_) into
+#    libgansu.so so pip-only users get the fast path with no system OpenBLAS and
+#    no LD_PRELOAD. OpenBLAS's LAPACK is Fortran-derived and needs the libgfortran
+#    / libquadmath runtime; their static archives are not reliably PIC, so those
+#    two (small) libs are linked dynamically and shipped + preloaded by the wheel
+#    (see script/build_wheel.sh and python/gansu/__init__.py).
+#
+# In both cases GANSU_HAVE_LAPACK gates use_lapack_eig(); when it is undefined
+# the eigensolver is compiled out and every caller falls back to Eigen, so the
+# .so never carries an unresolved dsyevd_.
+option(GANSU_BUNDLE_OPENBLAS "Statically embed OpenBLAS+LAPACK into libgansu.so (PyPI wheel)" OFF)
+
+set(GANSU_BLAS_LAPACK_LIBS "")
+if(GANSU_BUNDLE_OPENBLAS)
+    # Locate a static, PIC OpenBLAS archive. Prefer the OpenMP-threaded variant
+    # (libopenblaso.a, built with USE_OPENMP=1): GANSU calls BLAS/LAPACK from
+    # INSIDE its own OpenMP parallel regions (the DLPNO per-pair loops), and the
+    # pthread variant (libopenblasp.a) detects that context and prints
+    # "Detect OpenMP Loop ... may hang" — spawning its own pthread pool nested in
+    # an OpenMP thread risks a deadlock. The OpenMP variant shares GANSU's single
+    # libgomp runtime (already linked), so nested calls run serial (nesting off
+    # by default) with no oversubscription, while standalone GEMMs (e.g. the (T)
+    # contraction) still thread. There is no "second OpenMP runtime" cost since
+    # GANSU already depends on libgomp. Fall back to pthread/serial only if the
+    # OpenMP archive is unavailable.
+    set(_gansu_saved_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+    find_library(GANSU_OPENBLAS_STATIC
+        NAMES openblaso openblas_openmp openblasp openblas openblas_pthreads
+        DOC "Static PIC OpenBLAS archive to embed into libgansu.so")
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${_gansu_saved_suffixes})
+    if(NOT GANSU_OPENBLAS_STATIC)
+        message(FATAL_ERROR
+            "GANSU_BUNDLE_OPENBLAS=ON but no static OpenBLAS archive (libopenblas*.a) "
+            "was found. Install openblas-static (dnf/apt) or unset the option.")
+    endif()
+    find_library(GANSU_GFORTRAN_SO NAMES gfortran DOC "libgfortran runtime")
+    find_library(GANSU_QUADMATH_SO NAMES quadmath DOC "libquadmath runtime")
+    message(STATUS "Bundling OpenBLAS statically: ${GANSU_OPENBLAS_STATIC}")
+    add_definitions(-DGANSU_HAVE_LAPACK -DEIGEN_USE_BLAS)
+    # Order matters: the static archive must precede the Fortran runtime it
+    # references. gfortran/quadmath are linked dynamically (DT_NEEDED) and
+    # shipped in the wheel; pthread/m complete OpenBLAS's runtime needs.
+    set(GANSU_BLAS_LAPACK_LIBS ${GANSU_OPENBLAS_STATIC} gfortran quadmath pthread m)
 else()
-    message(STATUS "BLAS not found — Eigen will use built-in (slower) implementations")
+    find_package(BLAS QUIET)
+    if(BLAS_FOUND)
+        message(STATUS "BLAS found: ${BLAS_LIBRARIES}")
+        add_definitions(-DEIGEN_USE_BLAS)
+        list(APPEND GANSU_BLAS_LAPACK_LIBS ${BLAS_LIBRARIES})
+    else()
+        message(STATUS "BLAS not found — Eigen will use built-in (slower) implementations")
+    endif()
+    find_package(LAPACK QUIET)
+    if(LAPACK_FOUND)
+        message(STATUS "LAPACK found: ${LAPACK_LIBRARIES}")
+        add_definitions(-DGANSU_HAVE_LAPACK)
+        list(APPEND GANSU_BLAS_LAPACK_LIBS ${LAPACK_LIBRARIES})
+    else()
+        message(STATUS "LAPACK not found — DLPNO host eigensolver falls back to Eigen")
+    endif()
 endif()
 
 find_package(OpenMP REQUIRED)
@@ -300,7 +368,6 @@ target_link_libraries(gansu
         Eigen3::Eigen
         OpenMP::OpenMP_CXX
         $<$<TARGET_EXISTS:OpenMP::OpenMP_CUDA>:OpenMP::OpenMP_CUDA>
-        $<$<BOOL:${BLAS_FOUND}>:${BLAS_LIBRARIES}>
         int1e
         int2e
         int2e_hash
@@ -325,6 +392,11 @@ target_link_libraries(gansu
         hessian_k
         hessian_v
         hessian_w
+        # BLAS/LAPACK last: a static OpenBLAS archive (bundle mode) only pulls
+        # objects that satisfy symbols still undefined at this point on the link
+        # line, so it must follow every object library that references dsyevd_ /
+        # dgemm_ (the DLPNO objects live in this target's own sources).
+        ${GANSU_BLAS_LAPACK_LIBS}
     )
 
 if(ENABLE_GPU)

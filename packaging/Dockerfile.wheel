@@ -29,6 +29,16 @@ RUN dnf config-manager --add-repo \
         libnccl-devel \
  && dnf clean all && rm -rf /var/cache/dnf
 
+# OpenBLAS (static PIC archive) + the Fortran runtime it depends on, for the
+# GANSU_BUNDLE_OPENBLAS wheel build (see CMakeLists.txt / script/build_wheel.sh).
+# The static libopenblasp.a is embedded into libgansu.so so pip-only users get
+# the fast BLAS/LAPACK path with no system OpenBLAS and no LD_PRELOAD. gcc-gfortran
+# supplies libgfortran.so.5 / libquadmath.so.0, which are shipped in the wheel.
+# openblas-static lives in EPEL for RHEL 8.
+RUN dnf install -y epel-release \
+ && dnf install -y openblas-static gcc-gfortran \
+ && dnf clean all && rm -rf /var/cache/dnf
+
 ENV CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:/opt/python/cp311-cp311/bin:${PATH} \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}

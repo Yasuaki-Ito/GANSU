@@ -2928,29 +2928,13 @@ bool ERI_RI_Distributed_RHF::replicate_B_to_all_gpus() {
     std::cout << "[Multi-GPU DMET] B replicated across " << num_gpus_
               << " GPUs (" << (full_bytes >> 20) << " MB each)" << std::endl;
 
-    // (DMET-STEOM device-0 fit) The full replica now supersedes the per-GPU 3c
-    // slices d_B_local_ for build_B_mo (the cluster chain reads d_B_full_per_gpu_,
-    // never d_B_local_ — see build_B_mo above). The SCF (the only B_local consumer)
-    // is finished before this lazy replication runs, so freeing B_local reclaims
-    // ~naux_local·nao² (~3 GB/GPU) — enough to close the ~1 GB by which a device-0
-    // cluster CCSD is short at cc-pVDZ (n_emb=427). Env-gated (DMET-STEOM sets it);
-    // other flows keep B_local. Irreversible for this object (no post-cluster reuse).
-    if (std::getenv("GANSU_DMET_STEOM_FREE_BLOCAL")) {
-        size_t freed = 0;
-        for (int g = 0; g < (int)d_B_local_.size(); g++) {
-            if (d_B_local_[g]) {
-                cudaSetDevice(g);
-                tracked_cudaFree(d_B_local_[g]);
-                d_B_local_[g] = nullptr;
-                freed += (size_t)naux_local_[g] * nao2;
-            }
-        }
-        cudaSetDevice(caller_dev);
-        std::cout << "[Multi-GPU DMET] freed per-GPU B_local slices post-replication "
-                  << "(GANSU_DMET_STEOM_FREE_BLOCAL) — reclaimed ~"
-                  << ((freed * sizeof(real_t)) >> 20) / std::max(1, num_gpus_)
-                  << " MB/GPU." << std::endl;
-    }
+    // NOTE: an earlier GANSU_DMET_STEOM_FREE_BLOCAL knob freed the per-GPU 3c slices
+    // d_B_local_ here to reclaim ~3 GB/GPU for the device-0 cluster CCSD. It was a
+    // footgun: the CCSD ground releases the AO replica (release_bmo_ao_replica) and
+    // later stages (IP/EA build_B_mo) LAZILY RE-REPLICATE from d_B_local_ — freeing it
+    // made that re-replication read freed memory (illegal access, log dox_d0c). Removed;
+    // memory is instead reclaimed via GANSU_CCSD_VT_RESIDENT=0 (frees the 17 GB v_ovvv_T
+    // persistent), which is re-replication-safe.
     return true;
 }
 
