@@ -271,6 +271,12 @@ void ERI_Stored_RHF::compute_cis_nto(int n_states_cis) {
             "compute_cis_nto: invalid orbital partition (nocc_active or nvir <= 0)");
     }
 
+    // The CIS solve clamps n_states to the CIS dimension internally and returns
+    // eigenvectors only for the clamped count — the NTO state-average below must
+    // use the SAME count, or it reads past the amplitude buffer (garbage NTO
+    // occupations at tiny dim, e.g. H2O sto-3g dim=8 < default n_states_cis=10).
+    if (n_states_cis > nocc_active * nvir) n_states_cis = nocc_active * nvir;
+
     std::vector<real_t> cis_amplitudes;
     compute_cis_impl(rhf_, eri_matrix_.device_ptr(), n_states_cis,
                      /*d_eri_mo_precomputed=*/nullptr,
@@ -582,6 +588,10 @@ void ERI_RI_RHF::compute_cis_nto(int n_states_cis) {
             "compute_cis_nto (RI): invalid orbital partition (nocc_active or nvir <= 0)");
     }
 
+    // Clamp to the CIS dimension (same reason as the stored path: the solver
+    // returns eigenvectors for the clamped count only; the NTO average must match).
+    if (n_states_cis > nocc_active * nvir) n_states_cis = nocc_active * nvir;
+
     // Frozen core is now plumbed through compute_cis_ri_impl: the CIS excitation space
     // is built from the active-occupied block [num_frozen, full_occ) → virtuals, so the
     // returned amplitudes are (n_states × nocc_active × nvir) — exactly what the NTO
@@ -716,6 +726,10 @@ void compute_cluster_cis_nto(RHF& cfg, EOMChainContext& ctx,
             "compute_cluster_cis_nto: invalid cluster orbital partition "
             "(nocc_active or nvir <= 0)");
     }
+
+    // Clamp to the CIS dimension (same reason as the stored path: the solver
+    // returns eigenvectors for the clamped count only; the NTO average must match).
+    if (n_states_cis > nocc_active * nvir) n_states_cis = nocc_active * nvir;
 
     std::vector<real_t> cis_amplitudes;
     if (ctx.eri_block_src != nullptr) {
