@@ -1742,6 +1742,13 @@ void ERI_RI_RHF::compute_thc_sos_adc2(int n_states) {
         THROW_EXCEPTION("THC-SOS-ADC(2): frozen core not yet supported.");
     }
 
+    // Spin: SINGLET block only — warn-and-ignore other --spin_type.
+    if (rhf_.get_spin_type() != "singlet") {
+        std::cout << "Warning: THC-SOS-ADC(2) computes SINGLET excited states only. "
+                     "--spin_type \"" << rhf_.get_spin_type()
+                  << "\" is ignored (use STEOM-CCSD / ADC(2) / CIS for triplets)." << std::endl;
+    }
+
     const bool enable_b3a3_log = rhf_.get_thc_b3a3();
     std::cout << "\n---- THC-SOS-ADC(2) ("
               << (enable_b3a3_log ? "Coulomb + B3 + A3" : "Coulomb-only")

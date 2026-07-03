@@ -138,10 +138,17 @@ By default GANSU uses **Cartesian** Gaussians (6 d-functions, 10 f, 15 g). To ma
 | `fci` | Full CI |
 | `cis` | CIS excited states |
 | `adc2` | ADC(2) excited states |
+| `sos_adc2` | SOS-ADC(2) excited states |
+| `lt_sos_adc2` | Laplace-transform SOS-ADC(2) (O(N⁴) with RI) |
 | `adc2x` | ADC(2)-x excited states |
+| `thc_sos_adc2` | Tensor Hypercontraction SOS-ADC(2) (O(N³) sigma; `--eri_method ri` recommended) |
 | `eom_mp2` | EOM-MP2 excited states |
 | `eom_cc2` | EOM-CC2 excited states |
 | `eom_ccsd` | EOM-CCSD excited states |
+| `ip_eom_ccsd` | IP-EOM-CCSD — (N−1)-electron ionized states (RHF) |
+| `ea_eom_ccsd` | EA-EOM-CCSD — (N+1)-electron attached states (RHF) |
+| `steom_ccsd` | STEOM-CCSD (auto-runs CIS-NTO + IP/EA-EOM; RHF) |
+| `dlpno_steom_ccsd` | DLPNO-STEOM-CCSD — local STEOM (RHF, requires RI) |
 
 ### Optimizers
 
@@ -262,6 +269,14 @@ precision (H₂O/sto-3g cross-check: single-GPU vs. 2-rank FCI energy differ by
 
 # EOM-CCSD — gold standard for excited states
 ./gansu -x h2o.xyz -g cc-pvdz --post_hf_method eom_ccsd
+
+# STEOM-CCSD — auto-runs CIS-NTO + IP-EOM + EA-EOM (RI recommended)
+./gansu -x h2o.xyz -g cc-pvdz --eri_method ri -ag cc-pvdz-rifit.gbs \
+        --post_hf_method steom_ccsd --n_excited_states 5
+
+# THC-SOS-ADC(2) — O(N^3) sigma build for larger systems
+./gansu -x h2o.xyz -g cc-pvdz --eri_method ri -ag cc-pvdz-rifit.gbs \
+        --post_hf_method thc_sos_adc2 --n_excited_states 5
 
 # Triplet states
 ./gansu -x h2o.xyz -g cc-pvdz --post_hf_method adc2 --spin_type triplet

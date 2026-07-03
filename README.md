@@ -16,6 +16,7 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
 * Cartesian & spherical basis: Cartesian Gaussians (6D/10F/15G, default) or pure spherical harmonics (5D/7F/9G, Molden ordering) via `--use_spherical`, reproducing ORCA / PySCF / NWChem spherical-basis references (e.g. cc-pVDZ).
 * Python API: Call GANSU from Python via `import gansu` with automatic basis set resolution.
 * C API: Stable ABI for external bindings (`libgansu.so`).
+* Programmatic properties: retrieve results directly from the C and Python APIs (no output parsing) — total/correlation energies, orbital energies, MO coefficients, density and overlap matrices, CCSD 1-RDM, Mulliken charges and Mayer/Wiberg bond orders, and (computed on demand) the analytic energy gradient (nuclear forces), Hessian, harmonic vibrational frequencies, dipole moment, and excited-state energies with oscillator strengths.
 * Flexible Input Options: Supports standard file formats such as XYZ and Gaussian basis set files.
 * The numerical calculations in this software are performed using 64-bit double precision floating-point arithmetic.
 
@@ -45,10 +46,14 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
     * RI CIS with B-matrix based sigma vector (no nmo⁴ MO ERI, O(naux×nmo²) memory)
 * Excited state methods
     * Configuration Interaction Singles (CIS)
-    * Algebraic Diagrammatic Construction (ADC(2), SOS-ADC(2), ADC(2)-x)
+    * Algebraic Diagrammatic Construction (ADC(2), SOS-ADC(2), LT-SOS-ADC(2), ADC(2)-x)
+    * Tensor Hypercontraction SOS-ADC(2) (THC-SOS-ADC(2)) — LS-THC factorization on a Becke–Lebedev grid with a memory-light RI-Z path, giving an $\mathcal{O}(N^3)$ sigma build
     * Equation-of-Motion MP2 (EOM-MP2)
     * Equation-of-Motion CC2 (EOM-CC2)
     * Equation-of-Motion CCSD (EOM-CCSD)
+    * Ionization-Potential and Electron-Affinity EOM-CCSD (IP-EOM-CCSD, EA-EOM-CCSD) — (N∓1)-electron states (RHF closed-shell)
+    * Similarity-Transformed EOM-CCSD (STEOM-CCSD) — automatically runs CIS-NTO + IP-EOM-CCSD + EA-EOM-CCSD as prerequisites (RHF closed-shell)
+    * DLPNO-STEOM-CCSD — local STEOM: the DLPNO-CCSD ground state is back-transformed to the canonical basis and fed to canonical CIS-NTO + IP/EA-EOM + STEOM (RHF closed-shell, requires RI)
     * Singlet and triplet excited states (CIS, ADC(2), ADC(2)-x)
     * Oscillator strengths for all singlet excited state methods
     * RI support for all excited state methods
@@ -169,7 +174,9 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
 pip install gansu
 ```
 
-That's it — no CUDA toolkit required on the user side, no compilation, no `cmake`. The PyPI wheel ships a thin Python wrapper (~2.6 MB) and declares the CUDA runtime libraries (`nvidia-cublas-cu12`, `nvidia-cusolver-cu12`, `nvidia-nccl-cu12`, etc.) as dependencies, so they are pulled in automatically. The GPU-accelerated shared library `libgansu.so` (~460 MB, multi-arch fatbin covering SM 8.0–12.0) is downloaded from the matching [GitHub Release](https://github.com/Yasuaki-Ito/GANSU/releases/latest) on first use and cached under `~/.cache/gansu/<version>/` with SHA-256 verification.
+That's it — no CUDA toolkit required on the user side, no compilation, no `cmake`. The PyPI wheel ships a thin Python wrapper and declares the CUDA runtime libraries (`nvidia-cublas-cu12`, `nvidia-cusolver-cu12`, `nvidia-nccl-cu12`, etc.) as dependencies, so they are pulled in automatically. The GPU-accelerated shared library `libgansu.so` (multi-arch fatbin covering SM 8.0–12.0, with OpenBLAS/LAPACK statically embedded) is downloaded from the matching [GitHub Release](https://github.com/Yasuaki-Ito/GANSU/releases/latest) on first use and cached under `~/.cache/gansu/<version>/` with SHA-256 verification.
+
+No system BLAS/LAPACK is required — the shared library is fully self-contained (OpenBLAS with LAPACK is linked statically, so the DLPNO divide-and-conquer eigensolver and Eigen's DGEMM work out of the box with no `LD_PRELOAD`). The small Fortran runtime the embedded OpenBLAS needs (`libgfortran`, `libquadmath`) ships inside the wheel and is loaded automatically.
 
 **System requirements:**
 * Linux x86_64 (manylinux_2_28+, i.e. Ubuntu 18.04+, Debian 10+, RHEL 8+ and equivalents)
@@ -222,7 +229,7 @@ The remaining sections — Prerequisites, Directory Structure, and Build instruc
   * cuBLAS 12.9 or later
   * cuSOLVER 11.7 or later
   * [Eigen](https://eigen.tuxfamily.org/) 3.4+ (automatically downloaded via CMake FetchContent)
-  * [OpenBLAS](https://www.openblas.net/) (optional but recommended, `sudo apt install libopenblas-dev` on Ubuntu) — automatically detected by CMake; significantly accelerates CPU-mode computation
+  * [OpenBLAS](https://www.openblas.net/) / LAPACK (optional but recommended, `sudo apt install libopenblas-dev` on Ubuntu) — CMake explicitly finds and links both BLAS (used by Eigen's DGEMM) and LAPACK (the DLPNO divide-and-conquer host eigensolver `dsyevd`); significantly accelerates CPU-mode and DLPNO computation. When LAPACK is absent the DLPNO eigensolver falls back to Eigen. The PyPI wheel embeds OpenBLAS statically (via `-DGANSU_BUNDLE_OPENBLAS=ON`), so end users need nothing on the system side.
   * [NCCL](https://developer.nvidia.com/nccl) (optional, required for multi-GPU support) — `sudo apt install libnccl-dev` on Ubuntu, or included in CUDA Toolkit
 
 ##### CPU-only mode (`--cpu`)
@@ -349,6 +356,12 @@ make
 # DLPNO-CCSD / DLPNO-CCSD(T) — local correlation, scales to ~100 atoms with RI
 ./gansu -x ../xyz/large_molecular/water_hexamer.xyz -g cc-pvdz --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method dlpno_ccsd --dlpno_preset normal
 ./gansu -x ../xyz/large_molecular/water_hexamer.xyz -g cc-pvdz --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method dlpno_ccsd_t --dlpno_preset normal
+
+# STEOM-CCSD excited states (auto-runs CIS-NTO + IP-EOM + EA-EOM); RI recommended
+./gansu -x ../xyz/H2O.xyz -g cc-pvdz --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method steom_ccsd --n_excited_states 5
+
+# DLPNO-STEOM-CCSD — local STEOM for larger chromophores (RHF, requires RI)
+./gansu -x ../xyz/Benzene.xyz -g cc-pvdz --eri_method ri -ag ../auxiliary_basis/cc-pvdz-rifit.gbs --post_hf_method dlpno_steom_ccsd --n_excited_states 5
 
 # Full CI — single GPU (exact within the basis; small systems only)
 ./gansu -x ../xyz/H2O.xyz -g sto-3g --post_hf_method fci

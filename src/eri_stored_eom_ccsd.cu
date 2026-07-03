@@ -68,6 +68,14 @@ __global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ eri_full,
 static void compute_eom_ccsd_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, real_t* d_eri_mo_precomputed = nullptr) {
     PROFILE_FUNCTION();
 
+    // Spin: this driver implements the SINGLET block only (no spin-adapted
+    // triplet σ). Warn-and-ignore so --spin_type triplet is not silently wrong.
+    if (rhf.get_spin_type() != "singlet") {
+        std::cout << "Warning: EOM-CCSD computes SINGLET excited states only. "
+                     "--spin_type \"" << rhf.get_spin_type()
+                  << "\" is ignored (use STEOM-CCSD / ADC(2) / CIS for triplets)." << std::endl;
+    }
+
     const int num_frozen = rhf.get_num_frozen_core();
     const int num_basis = rhf.get_num_basis();
     const int full_occ = rhf.get_num_electrons() / 2;

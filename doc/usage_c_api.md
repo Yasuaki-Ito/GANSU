@@ -72,6 +72,8 @@ int gansu_set_method(gansu_handle_t h, const char* method);  // set method
 int gansu_set_post_hf(gansu_handle_t h, const char* post_hf); // set post_hf_method
 ```
 
+Any `post_hf_method` value from [parameters.md](parameters.md) is accepted as a string, including the correlation methods (`"mp2"`, `"ccsd"`, `"ccsd_t"`, `"dlpno_ccsd"`, `"fci"`, …) and the excited-state / spectroscopy methods (`"cis"`, `"adc2"`, `"thc_sos_adc2"`, `"eom_ccsd"`, `"ip_eom_ccsd"`, `"ea_eom_ccsd"`, `"steom_ccsd"`, `"dlpno_steom_ccsd"`, …). For excited-state methods, set `"n_excited_states"` and read the results with `gansu_get_excited_state_report`.
+
 ---
 
 ### Execution
@@ -145,6 +147,38 @@ Copy CCSD 1-RDM in MO basis (nao x nao, row-major) into `buf`. Only available af
 const char* gansu_get_excited_state_report(gansu_handle_t h);
 ```
 Returns a formatted string with excited state energies, oscillator strengths, and dominant transitions. Pointer is valid until `gansu_destroy`.
+
+#### `gansu_get_excited_states`
+```c
+int gansu_get_excited_states(gansu_handle_t h, double* energies_out, double* osc_out, int n_max);
+```
+Excited-state data as raw arrays (after a CIS/ADC/EOM/STEOM run). Writes up to `n_max` excitation energies (Hartree) into `energies_out` and oscillator strengths into `osc_out`; either pointer may be `NULL` to skip it. Returns the number of states written, or -1 on error.
+
+### Derivatives and molecular properties
+
+#### `gansu_get_energy_gradient`
+```c
+int gansu_get_energy_gradient(gansu_handle_t h, double* buf, int len);
+```
+Analytic energy gradient (nuclear forces), computed on demand. Writes `3*num_atoms` values (dE/dx, dE/dy, dE/dz per atom, Hartree/Bohr). Returns `3*num_atoms`, -1 on error, or -2 if unavailable for the current method. `len` must be ≥ `3*num_atoms`.
+
+#### `gansu_get_hessian`
+```c
+int gansu_get_hessian(gansu_handle_t h, double* buf, int len);
+```
+Analytic Hessian d²E/dR_i dR_j (Hartree/Bohr²), `3N x 3N` row-major, computed on demand. Returns `(3*num_atoms)^2`, -1 on error, or -2 if unavailable. `len` must be ≥ `(3*num_atoms)^2`.
+
+#### `gansu_get_frequencies`
+```c
+int gansu_get_frequencies(gansu_handle_t h, double* buf, int len);
+```
+Harmonic vibrational frequencies (cm⁻¹), computed on demand (Hessian + mass-weighting + translation/rotation projection + diagonalization). Imaginary modes are returned as negative values. Returns the number of frequencies (3N − 5 or 3N − 6), -1 on error, or -2 if unavailable. `len` should be ≥ `3*num_atoms`.
+
+#### `gansu_get_dipole`
+```c
+int gansu_get_dipole(gansu_handle_t h, double* xyz);
+```
+Ground-state SCF dipole moment in atomic units (e·Bohr). Writes 3 doubles (mu_x, mu_y, mu_z) into `xyz`. Multiply by 2.5417464157 for Debye. Closed-shell RHF only. Returns 0 on success, -1 on error, -3 if not RHF.
 
 ---
 

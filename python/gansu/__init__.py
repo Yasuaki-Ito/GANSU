@@ -319,6 +319,21 @@ def _setup_signatures(lib):
     lib.gansu_get_excited_state_report.argtypes = [c_handle]
     lib.gansu_get_excited_state_report.restype = c_str
 
+    lib.gansu_get_excited_states.argtypes = [c_handle, c_double_p, c_double_p, c_int]
+    lib.gansu_get_excited_states.restype = c_int
+
+    lib.gansu_get_energy_gradient.argtypes = [c_handle, c_double_p, c_int]
+    lib.gansu_get_energy_gradient.restype = c_int
+
+    lib.gansu_get_hessian.argtypes = [c_handle, c_double_p, c_int]
+    lib.gansu_get_hessian.restype = c_int
+
+    lib.gansu_get_frequencies.argtypes = [c_handle, c_double_p, c_int]
+    lib.gansu_get_frequencies.restype = c_int
+
+    lib.gansu_get_dipole.argtypes = [c_handle, c_double_p]
+    lib.gansu_get_dipole.restype = c_int
+
     lib.gansu_get_atomic_number.argtypes = [c_handle, c_int]
     lib.gansu_get_atomic_number.restype = c_int
 
@@ -479,6 +494,71 @@ class Result:
         """Formatted excited-state summary string."""
         s = self._lib.gansu_get_excited_state_report(self._h)
         return s.decode("utf-8") if s else ""
+
+    @property
+    def excited_states(self):
+        """Excited-state data after a CIS/ADC/EOM/STEOM run, as a dict with
+        'energies' (Hartree) and 'oscillator_strengths' numpy arrays."""
+        n_max = 256
+        e = (ctypes.c_double * n_max)()
+        f = (ctypes.c_double * n_max)()
+        n = self._lib.gansu_get_excited_states(self._h, e, f, n_max)
+        if n < 0:
+            raise RuntimeError("Excited-state data not available (run an excited-state method)")
+        return {"energies": np.array(e[:n]),
+                "oscillator_strengths": np.array(f[:n])}
+
+    @property
+    def energy_gradient(self):
+        """Analytic energy gradient (nuclear forces) as an (natoms, 3) numpy
+        array in Hartree/Bohr. Computed on demand from the converged wavefunction."""
+        n = 3 * self.num_atoms
+        buf = (ctypes.c_double * n)()
+        ret = self._lib.gansu_get_energy_gradient(self._h, buf, n)
+        if ret == -2:
+            raise RuntimeError("Energy gradient not available for this method")
+        if ret < 0:
+            raise RuntimeError("Failed to compute energy gradient")
+        return np.array(buf[:ret]).reshape(-1, 3)
+
+    @property
+    def hessian(self):
+        """Analytic Hessian d²E/dR_i dR_j (Hartree/Bohr²) as a (3N, 3N) numpy
+        array. Computed on demand."""
+        ndim = 3 * self.num_atoms
+        n = ndim * ndim
+        buf = (ctypes.c_double * n)()
+        ret = self._lib.gansu_get_hessian(self._h, buf, n)
+        if ret == -2:
+            raise RuntimeError("Hessian not available for this method")
+        if ret < 0:
+            raise RuntimeError("Failed to compute Hessian")
+        return np.array(buf[:ret]).reshape(ndim, ndim)
+
+    @property
+    def frequencies(self):
+        """Harmonic vibrational frequencies (cm⁻¹) as a numpy array (imaginary
+        modes negative). Computed on demand (Hessian + mass-weighting + TR projection)."""
+        n = 3 * self.num_atoms
+        buf = (ctypes.c_double * n)()
+        ret = self._lib.gansu_get_frequencies(self._h, buf, n)
+        if ret == -2:
+            raise RuntimeError("Frequencies not available for this method")
+        if ret < 0:
+            raise RuntimeError("Failed to compute frequencies")
+        return np.array(buf[:ret])
+
+    @property
+    def dipole(self):
+        """Ground-state SCF dipole moment (atomic units, e·Bohr) as a length-3
+        numpy array [mu_x, mu_y, mu_z]. Multiply by 2.5417464157 for Debye. RHF only."""
+        xyz = (ctypes.c_double * 3)()
+        ret = self._lib.gansu_get_dipole(self._h, xyz)
+        if ret == -3:
+            raise RuntimeError("Dipole moment is only available for closed-shell RHF")
+        if ret != 0:
+            raise RuntimeError("Failed to compute dipole moment")
+        return np.array(xyz[:3])
 
     @property
     def atoms(self):

@@ -664,6 +664,112 @@ void HF::compute_transform_matrix(){
 }
 
 
+std::vector<double> HF::vibrational_frequencies_cm(const std::vector<double>& hess) {
+    atoms.toHost();
+    const int num_atoms_val = static_cast<int>(atoms.size());
+    const int ndim = 3 * num_atoms_val;
+    if (ndim == 0 || (int)hess.size() != ndim * ndim) return {};
+
+    // Mass-weighted Hessian: H_mw[i][j] = H[i][j] / sqrt(m_i * m_j)
+    std::vector<double> masses(ndim);
+    for (int i = 0; i < num_atoms_val; i++) {
+        double m = atomic_mass(atoms[i].atomic_number);
+        masses[3*i+0] = m; masses[3*i+1] = m; masses[3*i+2] = m;
+    }
+    std::vector<double> hess_mw(ndim * ndim);
+    for (int i = 0; i < ndim; i++)
+        for (int j = 0; j < ndim; j++)
+            hess_mw[i*ndim+j] = hess[i*ndim+j] / std::sqrt(masses[i] * masses[j]);
+
+    // Translation (3) and rotation (2 or 3) vectors in mass-weighted coordinates.
+    std::vector<double> sqrt_m(ndim);
+    for (int i = 0; i < ndim; i++) sqrt_m[i] = std::sqrt(masses[i]);
+
+    double total_mass = 0.0, com[3] = {0.0, 0.0, 0.0};
+    for (int i = 0; i < num_atoms_val; i++) {
+        double m = atomic_mass(atoms[i].atomic_number);
+        total_mass += m;
+        com[0] += m * atoms[i].coordinate.x;
+        com[1] += m * atoms[i].coordinate.y;
+        com[2] += m * atoms[i].coordinate.z;
+    }
+    com[0] /= total_mass; com[1] /= total_mass; com[2] /= total_mass;
+
+    std::vector<std::vector<double>> D;
+    for (int k = 0; k < 3; k++) {
+        std::vector<double> d(ndim, 0.0);
+        for (int i = 0; i < num_atoms_val; i++) d[3*i+k] = sqrt_m[3*i+k];
+        D.push_back(d);
+    }
+    {
+        std::vector<double> rx(ndim, 0.0), ry(ndim, 0.0), rz(ndim, 0.0);
+        for (int i = 0; i < num_atoms_val; i++) {
+            double x = atoms[i].coordinate.x - com[0];
+            double y = atoms[i].coordinate.y - com[1];
+            double z = atoms[i].coordinate.z - com[2];
+            double sm = std::sqrt(atomic_mass(atoms[i].atomic_number));
+            rx[3*i+1] =  z * sm;  rx[3*i+2] = -y * sm;
+            ry[3*i+0] = -z * sm;  ry[3*i+2] =  x * sm;
+            rz[3*i+0] =  y * sm;  rz[3*i+1] = -x * sm;
+        }
+        D.push_back(rx); D.push_back(ry); D.push_back(rz);
+    }
+
+    // Gram-Schmidt orthonormalize; discard near-zero vectors (linear molecules).
+    std::vector<std::vector<double>> Q;
+    for (auto& d : D) {
+        for (auto& q : Q) {
+            double dot = 0.0;
+            for (int i = 0; i < ndim; i++) dot += d[i] * q[i];
+            for (int i = 0; i < ndim; i++) d[i] -= dot * q[i];
+        }
+        double norm = 0.0;
+        for (int i = 0; i < ndim; i++) norm += d[i] * d[i];
+        norm = std::sqrt(norm);
+        if (norm > 1e-6) {
+            for (int i = 0; i < ndim; i++) d[i] /= norm;
+            Q.push_back(d);
+        }
+    }
+
+    // Project TR out: H_proj = H - |q><q|H - H|q><q| + |q><q|H|q><q|.
+    for (auto& q : Q) {
+        std::vector<double> Hq(ndim, 0.0);
+        for (int i = 0; i < ndim; i++)
+            for (int j = 0; j < ndim; j++)
+                Hq[i] += hess_mw[i*ndim+j] * q[j];
+        double qHq = 0.0;
+        for (int i = 0; i < ndim; i++) qHq += q[i] * Hq[i];
+        for (int i = 0; i < ndim; i++)
+            for (int j = 0; j < ndim; j++)
+                hess_mw[i*ndim+j] -= q[i]*Hq[j] + Hq[i]*q[j] - qHq*q[i]*q[j];
+    }
+
+    std::vector<double> eigenvalues(ndim);
+    {
+        Eigen::Map<Eigen::MatrixXd> H(hess_mw.data(), ndim, ndim);
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(H);
+        for (int i = 0; i < ndim; i++) eigenvalues[i] = solver.eigenvalues()(i);
+    }
+
+    // freq = sqrt(|eigenvalue|) * 5140.487 (Hartree/(bohr^2 * amu) -> cm^-1);
+    // imaginary modes reported as negative. Skip the projected-out TR modes.
+    const double conv_factor = 5140.487;
+    const int n_tr = static_cast<int>(Q.size());
+    std::vector<double> freqs;
+    for (int i = n_tr; i < ndim; i++) {
+        double f = (eigenvalues[i] >= 0) ? std::sqrt(eigenvalues[i]) * conv_factor
+                                         : -std::sqrt(-eigenvalues[i]) * conv_factor;
+        freqs.push_back(f);
+    }
+    return freqs;
+}
+
+std::vector<double> HF::compute_vibrational_frequencies() {
+    std::vector<double> hess = compute_Energy_Hessian();
+    return vibrational_frequencies_cm(hess);
+}
+
 real_t HF::single_point_energy(const real_t* density_matrix_alpha, const real_t* density_matrix_beta, bool force_density){
 //    PROFILE_FUNCTION();
     // Reset convergence method state (DIIS history, damping state) for a fresh SCF cycle
@@ -1167,119 +1273,8 @@ real_t HF::solve(const real_t* density_matrix_alpha, const real_t* density_matri
                     std::cout << std::endl;
                 }
 
-                // Vibrational frequency analysis
-                // Mass-weighted Hessian: H_mw[i][j] = H[i][j] / sqrt(m_i * m_j)
-                // where m_i is the atomic mass of the atom corresponding to coordinate i
-                std::vector<double> masses(ndim);
-                for(int i = 0; i < num_atoms_val; i++){
-                    double m = atomic_mass(atoms[i].atomic_number);
-                    masses[3*i+0] = m;
-                    masses[3*i+1] = m;
-                    masses[3*i+2] = m;
-                }
-
-                std::vector<double> hess_mw(ndim * ndim);
-                for(int i = 0; i < ndim; i++){
-                    for(int j = 0; j < ndim; j++){
-                        hess_mw[i*ndim+j] = hess[i*ndim+j] / sqrt(masses[i] * masses[j]);
-                    }
-                }
-
-                // Project out translations and rotations from mass-weighted Hessian
-                // Build translation vectors (3) and rotation vectors (3 for nonlinear, 2 for linear)
-                std::vector<double> sqrt_m(ndim);
-                for(int i = 0; i < ndim; i++) sqrt_m[i] = sqrt(masses[i]);
-
-                // Mass-weighted center of mass
-                double total_mass = 0.0;
-                double com[3] = {0.0, 0.0, 0.0};
-                for(int i = 0; i < num_atoms_val; i++){
-                    double m = atomic_mass(atoms[i].atomic_number);
-                    total_mass += m;
-                    com[0] += m * atoms[i].coordinate.x;
-                    com[1] += m * atoms[i].coordinate.y;
-                    com[2] += m * atoms[i].coordinate.z;
-                }
-                com[0] /= total_mass; com[1] /= total_mass; com[2] /= total_mass;
-
-                // Translation vectors in mass-weighted coordinates: D_T
-                // d_tx[3*i+k] = sqrt(m_i) * delta(k,0), etc.
-                std::vector<std::vector<double>> D;
-                for(int k = 0; k < 3; k++){
-                    std::vector<double> d(ndim, 0.0);
-                    for(int i = 0; i < num_atoms_val; i++)
-                        d[3*i+k] = sqrt_m[3*i+k];
-                    D.push_back(d);
-                }
-
-                // Rotation vectors in mass-weighted coordinates: D_R
-                // Using r_i - com for each atom
-                // Rx: (0, z, -y)*sqrt(m), Ry: (-z, 0, x)*sqrt(m), Rz: (y, -x, 0)*sqrt(m)
-                {
-                    std::vector<double> rx(ndim, 0.0), ry(ndim, 0.0), rz(ndim, 0.0);
-                    for(int i = 0; i < num_atoms_val; i++){
-                        double x = atoms[i].coordinate.x - com[0];
-                        double y = atoms[i].coordinate.y - com[1];
-                        double z = atoms[i].coordinate.z - com[2];
-                        double sm = sqrt(atomic_mass(atoms[i].atomic_number));
-                        rx[3*i+1] =  z * sm;  rx[3*i+2] = -y * sm;
-                        ry[3*i+0] = -z * sm;  ry[3*i+2] =  x * sm;
-                        rz[3*i+0] =  y * sm;  rz[3*i+1] = -x * sm;
-                    }
-                    D.push_back(rx); D.push_back(ry); D.push_back(rz);
-                }
-
-                // Gram-Schmidt orthonormalize the D vectors, discard near-zero ones (linear molecules)
-                std::vector<std::vector<double>> Q;
-                for(auto& d : D){
-                    // Subtract projections onto existing Q vectors
-                    for(auto& q : Q){
-                        double dot = 0.0;
-                        for(int i = 0; i < ndim; i++) dot += d[i] * q[i];
-                        for(int i = 0; i < ndim; i++) d[i] -= dot * q[i];
-                    }
-                    double norm = 0.0;
-                    for(int i = 0; i < ndim; i++) norm += d[i] * d[i];
-                    norm = sqrt(norm);
-                    if(norm > 1e-6){
-                        for(int i = 0; i < ndim; i++) d[i] /= norm;
-                        Q.push_back(d);
-                    }
-                }
-
-                // Projector P = sum_k |q_k><q_k|, then H_proj = (1-P) H (1-P)
-                // Equivalent to H_proj = H - P*H - H*P + P*H*P
-                // Simpler: subtract projections directly
-                for(auto& q : Q){
-                    // H_proj = H - |q><q|H - H|q><q| + |q><q|H|q><q|
-                    // Compute H*q
-                    std::vector<double> Hq(ndim, 0.0);
-                    for(int i = 0; i < ndim; i++)
-                        for(int j = 0; j < ndim; j++)
-                            Hq[i] += hess_mw[i*ndim+j] * q[j];
-                    double qHq = 0.0;
-                    for(int i = 0; i < ndim; i++) qHq += q[i] * Hq[i];
-                    for(int i = 0; i < ndim; i++){
-                        for(int j = 0; j < ndim; j++){
-                            hess_mw[i*ndim+j] -= q[i]*Hq[j] + Hq[i]*q[j] - qHq*q[i]*q[j];
-                        }
-                    }
-                }
-
-                // Eigenvalue decomposition of projected mass-weighted Hessian (Eigen)
-                std::vector<double> eigenvalues(ndim);
-                {
-                    Eigen::Map<Eigen::MatrixXd> H(hess_mw.data(), ndim, ndim);
-                    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(H);
-                    for (int i = 0; i < ndim; i++) eigenvalues[i] = solver.eigenvalues()(i);
-                }
-
-                // Convert eigenvalues to frequencies (cm^-1)
-                // freq = sqrt(|eigenvalue|) * 5140.487 (Hartree/(bohr^2 * amu) -> cm^-1)
-                const double conv_factor = 5140.487;
-
-                int n_tr = static_cast<int>(Q.size()); // number of projected out modes (5 or 6)
-                int n_vib = ndim - n_tr;
+                // Vibrational frequency analysis (shared with gansu_get_frequencies).
+                std::vector<double> freqs = vibrational_frequencies_cm(hess);
 
                 std::cout << std::endl;
                 std::cout << "============================================================" << std::endl;
@@ -1288,16 +1283,8 @@ real_t HF::solve(const real_t* density_matrix_alpha, const real_t* density_matri
                 std::cout << std::fixed << std::setprecision(2);
                 std::cout << std::setw(6) << "Mode" << std::setw(18) << "Frequency (cm-1)" << std::endl;
                 std::cout << std::setw(6) << "----" << std::setw(18) << "----------------" << std::endl;
-
-                // Skip the first n_tr eigenvalues (projected out, should be ~0)
-                for(int i = n_tr; i < ndim; i++){
-                    double freq;
-                    if(eigenvalues[i] >= 0){
-                        freq = sqrt(eigenvalues[i]) * conv_factor;
-                    } else {
-                        freq = -sqrt(-eigenvalues[i]) * conv_factor;
-                    }
-                    std::cout << std::setw(6) << (i - n_tr + 1) << std::setw(18) << freq << std::endl;
+                for(size_t i = 0; i < freqs.size(); i++){
+                    std::cout << std::setw(6) << (i + 1) << std::setw(18) << freqs[i] << std::endl;
                 }
                 std::cout << std::defaultfloat;
             } else {

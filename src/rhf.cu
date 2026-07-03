@@ -20,6 +20,7 @@
 #include "rhf.hpp"
 #include <memory>
 #include "cphf_solver.hpp"
+#include "oscillator_strength.hpp"  // compute_ao_dipole_integrals (ground-state dipole)
 #include "multi_gpu_manager.hpp"   // for actual GPU count in post-HF summary
 #include "progress.hpp"
 #include "dlpno_localizer.hpp"     // for export_lmo_molden_file (PM localization)
@@ -516,6 +517,50 @@ void RHF::compute_energy(){
         std::cout << "Energy: " << energy_ << std::endl;
         std::cout << "Total energy: " << get_total_energy() << std::endl;
     }
+}
+
+/**
+ * @brief Ground-state SCF dipole moment in atomic units (e·Bohr).
+ * @details mu_d = -Tr(D · <mu|r_d|nu>) + sum_A Z_A R_A,d, gauge origin at (0,0,0).
+ *          The dipole AO integrals are computed in the active basis
+ *          (Cartesian or spherical — compute_ao_dipole_integrals handles the
+ *          Cart→Sph transform internally), matching the density matrix.
+ */
+std::vector<double> RHF::compute_dipole_moment(){
+    const int nao = num_basis;
+
+    // Electronic part: contract the total AO density with the dipole integrals.
+    density_matrix.toHost();
+    std::vector<real_t> dip_x, dip_y, dip_z;
+    const auto& shells    = get_primitive_shells();
+    const auto& cgto_norm = get_cgto_normalization_factors();
+    const auto& shell_infos = get_shell_type_infos();
+    compute_ao_dipole_integrals(shells.host_ptr(), shells.size(),
+                                cgto_norm.host_ptr(), nao, shell_infos,
+                                dip_x, dip_y, dip_z);
+
+    double mu_x = 0.0, mu_y = 0.0, mu_z = 0.0;
+    for(int mu = 0; mu < nao; mu++){
+        for(int nu = 0; nu < nao; nu++){
+            const double Dmn = density_matrix(mu, nu);
+            const size_t k = static_cast<size_t>(mu) * nao + nu;
+            mu_x -= Dmn * dip_x[k];   // electron charge is -e
+            mu_y -= Dmn * dip_y[k];
+            mu_z -= Dmn * dip_z[k];
+        }
+    }
+
+    // Nuclear part: + sum_A Z_A R_A (coordinates already in Bohr).
+    atoms.toHost();
+    for(size_t a = 0; a < atoms.size(); a++){
+        const auto& at = atoms.host_ptr()[a];
+        const double Z = static_cast<double>(at.effective_charge);
+        mu_x += Z * at.coordinate.x;
+        mu_y += Z * at.coordinate.y;
+        mu_z += Z * at.coordinate.z;
+    }
+
+    return { mu_x, mu_y, mu_z };
 }
 
 /**

@@ -973,6 +973,31 @@ public:
     }
 
     /**
+     * @brief Vibrational frequencies (cm^-1) from a Cartesian Hessian.
+     * @param hessian Flat (3N x 3N) Cartesian Hessian (Hartree/Bohr^2), row-major.
+     * @details Mass-weights the Hessian, projects out translations/rotations,
+     *          diagonalizes, and returns the vibrational frequencies in cm^-1
+     *          (imaginary modes as negative values). Length = 3N minus the number
+     *          of projected-out TR modes (5 for linear, 6 for non-linear).
+     *          Shared by the run_type="hessian" report and gansu_get_frequencies.
+     */
+    std::vector<double> vibrational_frequencies_cm(const std::vector<double>& hessian);
+
+    /**
+     * @brief Convenience: compute the Hessian then the vibrational frequencies.
+     * @return Frequencies in cm^-1 (empty if the Hessian is unavailable).
+     */
+    std::vector<double> compute_vibrational_frequencies();
+
+    /**
+     * @brief Ground-state SCF dipole moment in atomic units (e·Bohr).
+     * @return {mu_x, mu_y, mu_z}, or empty if not implemented for this method.
+     * @details mu_d = -Tr(D · <mu|r_d|nu>) + sum_A Z_A R_A,d (gauge origin at 0).
+     *          Multiply by 2.5417464157 to convert to Debye. Default: empty.
+     */
+    virtual std::vector<double> compute_dipole_moment() { return {}; }
+
+    /**
      * @brief Export the density matrix
      * @param density_matrix_a Density matrix (alpha spin) if UHF, otherwise the density matrix
      * @param density_matrix_b Density matrix (beta spin) if UHF, otherwise no use

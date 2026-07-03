@@ -136,6 +136,13 @@ result = mol.run(
 | `mo_coefficients` | `np.ndarray` | MO coefficients (nao, nao) |
 | `ccsd_1rdm_mo` | `np.ndarray` | CCSD 1-RDM in MO basis (nao, nao) |
 | `excited_state_report` | `str` | Formatted excited state table |
+| `excited_states` | `dict` | `{'energies', 'oscillator_strengths'}` arrays (after an excited-state run) |
+| `dipole` | `np.ndarray` | Ground-state SCF dipole (3,), atomic units e·Bohr (RHF) |
+| `energy_gradient` | `np.ndarray` | Analytic gradient / forces (natoms, 3), Hartree/Bohr — computed on demand |
+| `hessian` | `np.ndarray` | Analytic Hessian (3N, 3N), Hartree/Bohr² — computed on demand |
+| `frequencies` | `np.ndarray` | Harmonic vibrational frequencies (cm⁻¹), imaginary modes negative — computed on demand |
+
+Note: `energy_gradient`, `hessian`, and `frequencies` are computed lazily when the property is accessed, so no special `run_type` is required — a plain `run()` is enough.
 
 ---
 
@@ -223,6 +230,28 @@ print(r.excited_state_report)
 gansu.finalize()
 ```
 
+Available excited-state / spectroscopy `post_hf` methods (all accept `n_excited_states`):
+
+| `post_hf=` | Method |
+| --- | --- |
+| `"cis"` | Configuration Interaction Singles |
+| `"adc2"`, `"sos_adc2"`, `"lt_sos_adc2"`, `"adc2x"` | ADC(2) family |
+| `"thc_sos_adc2"` | Tensor Hypercontraction SOS-ADC(2) (`--eri_method ri` recommended) |
+| `"eom_mp2"`, `"eom_cc2"`, `"eom_ccsd"` | Equation-of-Motion methods |
+| `"ip_eom_ccsd"`, `"ea_eom_ccsd"` | IP / EA-EOM-CCSD — (N∓1)-electron states (RHF) |
+| `"steom_ccsd"` | Similarity-Transformed EOM-CCSD (auto-runs CIS-NTO + IP/EA-EOM; RHF) |
+| `"dlpno_steom_ccsd"` | Local STEOM-CCSD (RHF, requires RI) |
+
+```python
+# STEOM-CCSD (RI recommended); reads the auxiliary basis via the `ag` kwarg.
+r = gansu.Molecule("h2o.xyz", basis="cc-pvdz").run(
+        post_hf="steom_ccsd",
+        eri_method="ri",
+        ag="cc-pvdz-rifit",       # auxiliary basis (name or path)
+        n_excited_states="5")
+print(r.excited_state_report)
+```
+
 ### 5. Orbital Energies and MO Coefficients
 
 ```python
@@ -244,6 +273,34 @@ for i, e in enumerate(eps):
     print(f"  MO {i+1:3d} ({label})  {e:12.6f}")
 
 print(f"\nHOMO-LUMO gap: {(eps[nocc] - eps[nocc-1]) * 27.2114:.2f} eV")
+
+gansu.finalize()
+```
+
+### 5b. Forces, Hessian, Frequencies, and Dipole
+
+```python
+import gansu
+import numpy as np
+
+gansu.init()
+
+with open("h2o.xyz", "w") as f:
+    f.write("3\nWater\nO 0 0 0.127\nH 0 0.758 -0.509\nH 0 -0.758 -0.509\n")
+
+r = gansu.Molecule("h2o.xyz", basis="cc-pvdz").run()   # plain energy run is enough
+
+# Dipole moment (atomic units e·Bohr; ×2.5417464157 → Debye)
+mu = r.dipole
+print(f"Dipole |mu| = {np.linalg.norm(mu) * 2.5417464157:.4f} Debye")
+
+# Nuclear forces (analytic gradient), (natoms, 3) in Hartree/Bohr
+g = r.energy_gradient
+print("Max |grad| =", np.abs(g).max())
+
+# Harmonic vibrational frequencies (cm^-1); Hessian built on demand
+freqs = r.frequencies
+print("Frequencies (cm^-1):", np.round(freqs, 1))
 
 gansu.finalize()
 ```

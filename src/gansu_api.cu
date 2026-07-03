@@ -20,6 +20,7 @@
 #include "uhf.hpp"
 #include "progress.hpp"
 
+#include <algorithm>
 #include <climits>
 #include <map>
 #include <memory>
@@ -325,6 +326,95 @@ extern "C" const char* gansu_get_excited_state_report(gansu_handle_t h) {
     if (!ctx->hf) return "";
     ctx->excited_state_report_cache = ctx->hf->get_excited_state_report();
     return ctx->excited_state_report_cache.c_str();
+}
+
+extern "C" int gansu_get_excited_states(gansu_handle_t h, double* energies_out,
+                                        double* osc_out, int n_max) {
+    if (!h || n_max <= 0) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (!ctx->solved || !ctx->hf) return -1;
+    const auto& energies = ctx->hf->get_excitation_energies();
+    const auto& osc = ctx->hf->get_oscillator_strengths();
+    int n = std::min<int>(n_max, (int)energies.size());
+    for (int i = 0; i < n; i++) {
+        if (energies_out) energies_out[i] = energies[i];
+        if (osc_out) osc_out[i] = (i < (int)osc.size()) ? osc[i] : 0.0;
+    }
+    return n;
+}
+
+// ---- Derivatives and molecular properties ----
+
+extern "C" int gansu_get_energy_gradient(gansu_handle_t h, double* buf, int len) {
+    if (!h || !buf) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (!ctx->solved || !ctx->hf) return -1;
+    int natom = (int)ctx->hf->get_atoms().size();
+    if (len < 3 * natom) return -1;
+    try {
+        std::vector<double> grad = ctx->hf->compute_Energy_Gradient();
+        if (grad.empty()) return -2;  // not available for this method
+        int n = (int)grad.size();
+        if (len < n) return -1;
+        for (int i = 0; i < n; i++) buf[i] = grad[i];
+        return n;
+    } catch (const std::exception& e) {
+        std::cerr << "gansu_get_energy_gradient error: " << e.what() << std::endl;
+        return -2;
+    } catch (...) { return -2; }
+}
+
+extern "C" int gansu_get_hessian(gansu_handle_t h, double* buf, int len) {
+    if (!h || !buf) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (!ctx->solved || !ctx->hf) return -1;
+    int ndim = 3 * (int)ctx->hf->get_atoms().size();
+    if (len < ndim * ndim) return -1;
+    try {
+        std::vector<double> hess = ctx->hf->compute_Energy_Hessian();
+        if (hess.empty()) return -2;
+        int n = (int)hess.size();
+        if (len < n) return -1;
+        for (int i = 0; i < n; i++) buf[i] = hess[i];
+        return n;
+    } catch (const std::exception& e) {
+        std::cerr << "gansu_get_hessian error: " << e.what() << std::endl;
+        return -2;
+    } catch (...) { return -2; }
+}
+
+extern "C" int gansu_get_frequencies(gansu_handle_t h, double* buf, int len) {
+    if (!h || !buf) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (!ctx->solved || !ctx->hf) return -1;
+    try {
+        std::vector<double> freqs = ctx->hf->compute_vibrational_frequencies();
+        if (freqs.empty()) return -2;
+        int n = (int)freqs.size();
+        if (len < n) return -1;
+        for (int i = 0; i < n; i++) buf[i] = freqs[i];
+        return n;
+    } catch (const std::exception& e) {
+        std::cerr << "gansu_get_frequencies error: " << e.what() << std::endl;
+        return -2;
+    } catch (...) { return -2; }
+}
+
+extern "C" int gansu_get_dipole(gansu_handle_t h, double* xyz) {
+    if (!h || !xyz) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (!ctx->solved || !ctx->hf) return -1;
+    RHF* rhf = as_rhf(ctx->hf.get());
+    if (!rhf) return -3;  // closed-shell RHF only
+    try {
+        std::vector<double> mu = rhf->compute_dipole_moment();
+        if (mu.size() < 3) return -1;
+        xyz[0] = mu[0]; xyz[1] = mu[1]; xyz[2] = mu[2];
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "gansu_get_dipole error: " << e.what() << std::endl;
+        return -1;
+    } catch (...) { return -1; }
 }
 
 // ---- Atom coordinates ----

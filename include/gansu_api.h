@@ -122,6 +122,41 @@ int gansu_get_ccsd_1rdm_mo(gansu_handle_t h, double* buf, int buf_size);
 /** Get excited state report string. Returns pointer to internal buffer (valid until destroy). */
 const char* gansu_get_excited_state_report(gansu_handle_t h);
 
+/** Get excited-state data as arrays (valid after a CIS/ADC/EOM/STEOM run).
+ *  Writes up to n_max excitation energies (Hartree) into energies_out and the
+ *  matching oscillator strengths (dimensionless) into osc_out. Either buffer may
+ *  be NULL to skip it. Energies are relative to the ground state.
+ *  @return number of states written (min(n_max, available)), or -1 on error. */
+int gansu_get_excited_states(gansu_handle_t h, double* energies_out,
+                             double* osc_out, int n_max);
+
+/* ---- Derivatives and molecular properties ---- */
+
+/** Get the analytic energy gradient (nuclear forces), computed on demand from
+ *  the converged wavefunction. Writes 3*num_atoms values (dE/dx, dE/dy, dE/dz
+ *  per atom, Hartree/Bohr) in atom-major row-major order.
+ *  @return 3*num_atoms, or -1 on error, or -2 if unavailable for this method. */
+int gansu_get_energy_gradient(gansu_handle_t h, double* buf, int len);
+
+/** Get the analytic Hessian d²E/dR_i dR_j (Hartree/Bohr²), 3N x 3N row-major,
+ *  computed on demand.
+ *  @return (3*num_atoms)^2, or -1 on error, or -2 if unavailable for this method. */
+int gansu_get_hessian(gansu_handle_t h, double* buf, int len);
+
+/** Get harmonic vibrational frequencies (cm⁻¹), computed on demand (builds the
+ *  Hessian, mass-weights, projects out translations/rotations, diagonalizes).
+ *  Imaginary modes are returned as negative values. The number of frequencies is
+ *  3N minus the projected-out modes (5 for linear, 6 for non-linear molecules).
+ *  @param len size of buf; must be >= 3*num_atoms to be safe.
+ *  @return number of frequencies written, or -1 on error, or -2 if unavailable. */
+int gansu_get_frequencies(gansu_handle_t h, double* buf, int len);
+
+/** Get the ground-state SCF dipole moment in atomic units (e·Bohr). Writes 3
+ *  doubles (mu_x, mu_y, mu_z) into xyz. Multiply by 2.5417464157 for Debye.
+ *  Closed-shell RHF only.
+ *  @return 0 on success, -1 on error, -3 if not RHF. */
+int gansu_get_dipole(gansu_handle_t h, double* xyz);
+
 /* ---- Atom coordinates ---- */
 
 /** Get atomic number of atom i (0-indexed). Returns 0 on error. */

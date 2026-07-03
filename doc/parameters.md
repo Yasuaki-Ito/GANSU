@@ -254,6 +254,11 @@ Method names are case-insensitive. Hyphen variants are accepted (`scs-mp2` ≡ `
 | EOM_CC2 | Equation-of-Motion CC2. Doubles kept at CC2 quality. M22 is exactly diagonal — Schur complement is exact (no approximation in `schur_omega`) |
 | EOM_CCSD | Equation-of-Motion CCSD. Most accurate single-reference excited-state method available here |
 | THC_SOS_ADC2 | Tensor Hypercontraction SOS-ADC(2) with Laplace transform (`O(N^3)` sigma build). LS-THC factorisation $V_{\mu\nu\lambda\sigma}\!\approx\!\sum_{PQ}X^P_\mu X^P_\nu Z_{PQ}X^Q_\lambda X^Q_\sigma$ on a Becke–Lebedev grid. Schur-folded Davidson + ω-iter. Set `--eri_method ri` (with auxiliary basis) for the memory-light Phase 2.3 RI-Z path; `--eri_method stored` works at small scales. See [THC parameters](#thc-parameters). Aliases: `thc-sos-adc2`, `thc_sos_adc(2)` |
+| IP_EOM_CCSD | Ionization-Potential EOM-CCSD — $(N-1)$-electron ionized states on top of the CCSD reference (ionization potentials / cationic states). RHF closed-shell only; stored or RI. Aliases: `ip-eom-ccsd`, `ipeom_ccsd`, `ipeom-ccsd` |
+| EA_EOM_CCSD | Electron-Affinity EOM-CCSD — $(N+1)$-electron attached states (electron affinities / anionic states). RHF closed-shell only; stored or RI. Aliases: `ea-eom-ccsd`, `eaeom_ccsd`, `eaeom-ccsd` |
+| STEOM_CCSD | Similarity-Transformed EOM-CCSD (Nooijen–Bartlett). Diagonalizes the doubly similarity-transformed Hamiltonian in the singles space, capturing double excitations at singles cost. **Automatically runs CIS-NTO + IP-EOM-CCSD + EA-EOM-CCSD as prerequisites.** RHF closed-shell only. Aliases: `steom-ccsd`, `steomccsd` |
+| DLPNO_STEOM_CCSD | Local (linear-scaling-oriented) STEOM-CCSD. The DLPNO-CCSD ground state is back-transformed to the canonical basis and fed to canonical CIS-NTO + IP/EA-EOM + STEOM. RHF closed-shell; **requires RI**. Aliases: `dlpno-steom-ccsd`, `dlpno_steom`, `dlpnosteom` |
+| CIS_NTO | State-averaged CIS with a natural-transition-orbital (NTO) active space. Primarily the STEOM prerequisite (P0); can also be run standalone. Alias: `cis-nto` |
 
 For excited-state methods, see the [Excited state parameters](#excited-state-parameters) section for `n_excited_states`, `spin_type`, and per-method solver (`adc2_solver`, `eom_mp2_solver`, `eom_cc2_solver`).
 
