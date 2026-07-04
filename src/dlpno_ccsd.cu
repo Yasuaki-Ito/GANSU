@@ -1063,6 +1063,10 @@ real_t DLPNOCCSD::compute_energy()
         const char* e = std::getenv("GANSU_DLPNO_CCSD_SINGLES");
         return e && e[0] == '1';
     }();
+    // Increment E: t1⊗t1 part of the CCSD correlation energy (canonical
+    // spin-orbital ½Σ⟨ij‖ab⟩t1_i^a t1_j^b; closed-shell Σ_ij L·(2t1t1−t1t1ᵀ)).
+    // 0 unless the singles are active (T1≈0 otherwise).
+    real_t E_t1t1 = 0.0;
     if (ccsd_singles_inc1) {
         // Increment 2 (full singles, coupled T1↔T2). Factor the T1 Jacobi solve
         // into a lambda reused for the first T1 and inside the coupled macro loop.
@@ -1373,6 +1377,59 @@ real_t DLPNOCCSD::compute_energy()
                       << std::scientific << std::setprecision(3) << t1_norm_max
                       << std::endl;
         }
+
+        // ---- Increment E (energy completion) ------------------------------
+        // The pair energies below use Y (= t2) only; the canonical CCSD energy
+        // uses tau = t2 + t1⊗t1. Add the t1⊗t1 piece per surviving pair,
+        //   E_t1t1 += pair_factor · Σ_ab L_ij[a,b]·(2·t1_i[a]·t1_j[b]
+        //                                           −  t1_i[b]·t1_j[a]),
+        // with T1 projected covariantly into PNO(ij): t1_i = bar_Q_ijᵀ·S_AO·
+        // (C_can_ii·T1_pao[i]). Also refresh E_T1 (= 2Σ f_ia·t1) with the
+        // singles-refined T1 (the pre-singles value at its definition used the
+        // linear-solve T1 ≈ 0).
+        {
+            E_T1 = 0.0;
+            for (int i = 0; i < nocc_; ++i)
+                for (size_t a = 0; a < T1[i].size(); ++a)
+                    E_T1 += 2.0 * f_ia[i][a] * T1[i][a];
+
+            // Per-LMO T1 as AO vectors (PAO(ii) → AO), then S·V once.
+            RowMatXd V = RowMatXd::Zero(nao_, nocc_);
+            for (int i = 0; i < nocc_; ++i) {
+                const int idx_ii = res.pair_lookup[i * nocc_ + i];
+                if (idx_ii < 0) continue;
+                const PairSetup& s_ii = res.setups[idx_ii];
+                if (s_ii.n_pao == 0
+                    || static_cast<int>(T1[i].size()) != s_ii.n_pao) continue;
+                Eigen::Map<const RowMatXd> Cii(
+                    s_ii.C_can_pair.data(), nao_, s_ii.n_pao);
+                Eigen::Map<const Eigen::VectorXd> ti(T1[i].data(), s_ii.n_pao);
+                V.col(i).noalias() = Cii * ti;
+            }
+            Eigen::Map<const RowMatXd> Smat(h_S, nao_, nao_);
+            const RowMatXd SV = Smat * V;   // [nao × nocc]
+
+            for (size_t idx = 0; idx < res.setups.size(); ++idx) {
+                const PairSetup& s = res.setups[idx];
+                const PairData&  p = res.pairs[idx];
+                const int n = p.n_pno;
+                if (n == 0 || p.L.empty() || p.bar_Q.empty()) continue;
+                Eigen::Map<const RowMatXd> bQ(p.bar_Q.data(), nao_, n);
+                const Eigen::VectorXd t1i = bQ.transpose() * SV.col(s.i);
+                const Eigen::VectorXd t1j = bQ.transpose() * SV.col(s.j);
+                real_t e_in = 0.0;
+                for (int a = 0; a < n; ++a)
+                    for (int b = 0; b < n; ++b)
+                        e_in += p.L[(size_t)a * n + b]
+                              * (2.0 * t1i(a) * t1j(b) - t1i(b) * t1j(a));
+                E_t1t1 += s.pair_factor * e_in;
+            }
+            if (params_.verbose >= 1) {
+                std::cout << "[DLPNO-CCSD] singles energy terms: E(t1⊗t1) = "
+                          << std::scientific << std::setprecision(6) << E_t1t1
+                          << "  E_T1(2f·t1) = " << E_T1 << std::endl;
+            }
+        }
     }
 
     // Recompute strong/weak energies from the post-CCSD Y. With dressing on
@@ -1412,7 +1469,7 @@ real_t DLPNOCCSD::compute_energy()
     E_strong = E_strong_post;
     E_weak   = E_weak_post;
 
-    const real_t E_total = E_strong + E_weak + E_T1;
+    const real_t E_total = E_strong + E_weak + E_T1 + E_t1t1;
 
     if (params_.verbose >= 1) {
         std::cout << "[DLPNO-CCSD] T1 "
@@ -1424,6 +1481,7 @@ real_t DLPNOCCSD::compute_energy()
                   << std::scientific << std::setprecision(15) << E_strong
                   << "\n[DLPNO-CCSD]   E(weak-pair MP2)    = " << E_weak
                   << "\n[DLPNO-CCSD]   E(T1 contribution)  = " << E_T1
+                  << "\n[DLPNO-CCSD]   E(t1⊗t1 tau)        = " << E_t1t1
                   << "\n[DLPNO-CCSD]   E(total CCSD corr)  = " << E_total
                   << std::endl;
     }
