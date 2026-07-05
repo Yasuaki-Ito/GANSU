@@ -630,6 +630,63 @@ int energy_from_density_impl(GansuContext* ctx, const double* density, int n,
     return 0;
 }
 
+// P[i][j] = factor * sum_k C[i][k] C[j][k] for an (n x nocc) row-major
+// coefficient block (column k = k-th occupied orbital). nocc == 0 gives P = 0.
+void mo_to_density(const double* c_occ, int n, int nocc, double factor, double* P) {
+    for (int i = 0; i < n; i++) {
+        const double* ci = c_occ + (size_t)i * nocc;
+        for (int j = i; j < n; j++) {
+            const double* cj = c_occ + (size_t)j * nocc;
+            double s = 0.0;
+            for (int k = 0; k < nocc; k++) s += ci[k] * cj[k];
+            P[(size_t)i * n + j] = factor * s;
+            P[(size_t)j * n + i] = factor * s;
+        }
+    }
+}
+
+// UHF counterpart of energy_from_density_impl: upload Pa, Pb, one UHF Fock
+// build, E = 0.5 (Tr[Pa(h+Fa)] + Tr[Pb(h+Fb)]) + E_nn. Densities trusted as-is.
+int energy_from_density_uhf_impl(GansuContext* ctx, const double* Pa,
+                                 const double* Pb, int n, double* energy_out) {
+    UHF* uhf = as_uhf(ctx->hf.get());
+    if (!uhf) return -3;  // UHF only
+    if (n != ctx->hf->get_num_basis()) return -1;
+    QuietGuard qg(ctx->quiet);  // suppress per-call profiler START/END lines
+    const size_t n2 = (size_t)n * n;
+
+    auto& Da = uhf->get_density_matrix_a();
+    auto& Db = uhf->get_density_matrix_b();
+    cudaMemcpy(Da.device_ptr(), Pa, n2 * sizeof(real_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(Db.device_ptr(), Pb, n2 * sizeof(real_t), cudaMemcpyHostToDevice);
+
+    // Force the density-based Fock path (mirrors the RHF evaluator).
+    const bool hadC = ctx->hf->get_hasMatrixC();
+    ctx->hf->set_hasMatrixC(false);
+    real_t e_elec;
+    try {
+        uhf->compute_fock_matrix();
+        e_elec = gpu::computeEnergy_UHF(
+            Da.device_ptr(),
+            Db.device_ptr(),
+            uhf->get_core_hamiltonian_matrix().device_ptr(),
+            uhf->get_fock_matrix_a().device_ptr(),
+            uhf->get_fock_matrix_b().device_ptr(),
+            n);
+    } catch (const std::exception& e) {
+        ctx->hf->set_hasMatrixC(hadC);
+        std::cerr << "gansu_energy_from_density_uhf error: " << e.what() << std::endl;
+        return -1;
+    } catch (...) {
+        ctx->hf->set_hasMatrixC(hadC);
+        return -1;
+    }
+    ctx->hf->set_hasMatrixC(hadC);
+
+    *energy_out = e_elec + ctx->hf->get_nuclear_repulsion_energy();
+    return 0;
+}
+
 } // namespace
 
 extern "C" int gansu_prepare(gansu_handle_t h) {
@@ -709,4 +766,176 @@ extern "C" int gansu_get_eri(gansu_handle_t h, double* buf, int len) {
     // Full (pq|rs) tensor, row-major eri[((p*n + q)*n + r)*n + s].
     cudaMemcpy(buf, d_eri, n4 * sizeof(real_t), cudaMemcpyDeviceToHost);
     return (int)n4;
+}
+
+// ---- SCF-free UHF evaluation (FMQA broken-symmetry interface) ----
+
+extern "C" int gansu_energy_from_density_uhf(gansu_handle_t h,
+                                             const double* Pa, const double* Pb,
+                                             int n, double* energy_out) {
+    if (!h || !Pa || !Pb || !energy_out || n <= 0) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (ensure_prepared(ctx) != 0) return -1;
+    return energy_from_density_uhf_impl(ctx, Pa, Pb, n, energy_out);
+}
+
+extern "C" int gansu_energy_from_mo_uhf(gansu_handle_t h,
+                                        const double* c_alpha_occ,
+                                        const double* c_beta_occ,
+                                        int n, int na, int nb,
+                                        double* energy_out) {
+    if (!h || !c_alpha_occ || !c_beta_occ || !energy_out) return -1;
+    if (n <= 0 || na < 0 || nb < 0 || na > n || nb > n) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (ensure_prepared(ctx) != 0) return -1;
+    if (n != ctx->hf->get_num_basis()) return -1;
+
+    // Single occupancy per spin orbital: Pa = Ca Ca^T, Pb = Cb Cb^T.
+    std::vector<double> Pa((size_t)n * n, 0.0), Pb((size_t)n * n, 0.0);
+    mo_to_density(c_alpha_occ, n, na, 1.0, Pa.data());
+    mo_to_density(c_beta_occ,  n, nb, 1.0, Pb.data());
+    return energy_from_density_uhf_impl(ctx, Pa.data(), Pb.data(), n, energy_out);
+}
+
+extern "C" int gansu_energy_from_mo_uhf_batch(gansu_handle_t h,
+                                              const double* ca_batch,
+                                              const double* cb_batch,
+                                              int batch, int n, int na, int nb,
+                                              double* energies_out) {
+    if (!h || !ca_batch || !cb_batch || !energies_out || batch <= 0) return -1;
+    for (int b = 0; b < batch; b++) {
+        const int status = gansu_energy_from_mo_uhf(
+            h, ca_batch + (size_t)b * n * na, cb_batch + (size_t)b * n * nb,
+            n, na, nb, &energies_out[b]);
+        if (status != 0) return status;
+    }
+    return 0;
+}
+
+extern "C" int gansu_uhf_scf_from_mo(gansu_handle_t h,
+                                     const double* c_alpha_occ,
+                                     const double* c_beta_occ,
+                                     int n, int na, int nb,
+                                     double* energy_out,
+                                     double* pa_out, double* pb_out) {
+    if (!h || !c_alpha_occ || !c_beta_occ || !energy_out) return -1;
+    if (n <= 0 || na < 0 || nb < 0 || na > n || nb > n) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    QuietGuard qg(ctx->quiet);
+    try {
+        // Fresh UHF build so a prior eval/run leaves no stale state; solve()
+        // re-prepares all integrals from scratch.
+        ctx->hf.reset();
+        ctx->solved = false;
+        ctx->integrals_ready = false;
+
+        ParameterManager params(false);
+        for (const auto& kv : ctx->user_params) {
+            if (kv.first != "parameter_file" || !kv.second.empty()) {
+                params[kv.first] = kv.second;
+            }
+        }
+        ctx->hf = HFBuilder::buildHF(params);
+        UHF* uhf = as_uhf(ctx->hf.get());
+        if (!uhf) { ctx->hf.reset(); return -3; }  // UHF only
+        if (n != ctx->hf->get_num_basis()) { ctx->hf.reset(); return -1; }
+
+        // Initial density from the supplied occupied MOs (single occupancy).
+        std::vector<double> Pa((size_t)n * n, 0.0), Pb((size_t)n * n, 0.0);
+        mo_to_density(c_alpha_occ, n, na, 1.0, Pa.data());
+        mo_to_density(c_beta_occ,  n, nb, 1.0, Pb.data());
+
+        // Polish: run SCF from this density without the extra HOMO/LUMO break,
+        // so a symmetric guess stays at the RHF stationary point.
+        uhf->set_density_guess_break_symmetry(false);
+        ctx->hf->solve(Pa.data(), Pb.data(), true);
+        ctx->solved = true;
+        ctx->integrals_ready = true;
+
+        *energy_out = ctx->hf->get_total_energy();
+
+        if (pa_out || pb_out) {
+            std::vector<double> da((size_t)n * n), db((size_t)n * n);
+            uhf->export_density_matrix(da.data(), db.data(), n);
+            if (pa_out) std::copy(da.begin(), da.end(), pa_out);
+            if (pb_out) std::copy(db.begin(), db.end(), pb_out);
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        if (gpu::gpu_available()) cudaGetLastError();
+        try { ctx->hf.reset(); } catch (...) { ctx->hf.release(); }
+        ctx->solved = false;
+        ctx->integrals_ready = false;
+        std::cerr << "gansu_uhf_scf_from_mo error: " << e.what() << std::endl;
+        return -1;
+    } catch (...) {
+        if (gpu::gpu_available()) cudaGetLastError();
+        try { ctx->hf.reset(); } catch (...) { ctx->hf.release(); }
+        ctx->solved = false;
+        ctx->integrals_ready = false;
+        return -1;
+    }
+}
+
+extern "C" int gansu_spin_properties(gansu_handle_t h,
+                                     const double* Pa, const double* Pb, int n,
+                                     double* s_squared_out,
+                                     double* atom_spin_out, int natom) {
+    if (!h || !Pa || !Pb || n <= 0) return -1;
+    auto* ctx = static_cast<GansuContext*>(h);
+    if (ensure_prepared(ctx) != 0) return -1;
+    if (!as_uhf(ctx->hf.get())) return -3;  // UHF only
+    if (n != ctx->hf->get_num_basis()) return -1;
+    QuietGuard qg(ctx->quiet);
+
+    auto& S = ctx->hf->get_overlap_matrix();
+    S.toHost();
+    const real_t* Sp = S.host_ptr();
+
+    // PaS = Pa * S, PbS = Pb * S (row-major, n x n).
+    std::vector<double> PaS((size_t)n * n, 0.0), PbS((size_t)n * n, 0.0);
+    for (int i = 0; i < n; i++) {
+        double* PaSrow = PaS.data() + (size_t)i * n;
+        double* PbSrow = PbS.data() + (size_t)i * n;
+        for (int k = 0; k < n; k++) {
+            const double a = Pa[(size_t)i * n + k];
+            const double b = Pb[(size_t)i * n + k];
+            if (a == 0.0 && b == 0.0) continue;
+            const real_t* Srow = Sp + (size_t)k * n;
+            for (int j = 0; j < n; j++) {
+                PaSrow[j] += a * Srow[j];
+                PbSrow[j] += b * Srow[j];
+            }
+        }
+    }
+
+    if (s_squared_out) {
+        double Na = 0.0, Nb = 0.0;
+        for (int i = 0; i < n; i++) {
+            Na += PaS[(size_t)i * n + i];
+            Nb += PbS[(size_t)i * n + i];
+        }
+        // Tr(Pa S Pb S) = sum_ij (Pa S)_ij (Pb S)_ji.
+        double ov = 0.0;
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+                ov += PaS[(size_t)i * n + j] * PbS[(size_t)j * n + i];
+        const double Sspin = 0.5 * (Na - Nb);
+        *s_squared_out = Sspin * (Sspin + 1.0) + Nb - ov;
+    }
+
+    if (atom_spin_out) {
+        const int nat = (int)ctx->hf->get_atoms().size();
+        if (natom < nat) return -1;
+        // Mulliken spin population m_A = sum_{mu in A} ((Pa - Pb) S)_mu,mu.
+        const auto& ranges = ctx->hf->get_atom_to_basis_range();
+        for (int A = 0; A < nat; A++) {
+            double m = 0.0;
+            for (size_t mu = ranges[A].start_index; mu < ranges[A].end_index; mu++) {
+                m += PaS[mu * n + mu] - PbS[mu * n + mu];
+            }
+            atom_spin_out[A] = m;
+        }
+    }
+    return 0;
 }

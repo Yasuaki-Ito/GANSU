@@ -171,6 +171,7 @@ def _find_or_fetch_lib():
 
 _lib = None
 _HAS_ENERGY_EVAL_API = False
+_HAS_UHF_EVAL_API = False
 
 
 def _preload_cuda_libs():
@@ -383,6 +384,34 @@ def _setup_signatures(lib):
         _HAS_ENERGY_EVAL_API = True
     except AttributeError:
         _HAS_ENERGY_EVAL_API = False
+
+    # SCF-free UHF evaluation (FMQA broken-symmetry interface). Tolerated
+    # separately so a build with only the RHF API still imports and works.
+    global _HAS_UHF_EVAL_API
+    try:
+        lib.gansu_energy_from_mo_uhf.argtypes = [
+            c_handle, c_double_p, c_double_p, c_int, c_int, c_int, c_double_p]
+        lib.gansu_energy_from_mo_uhf.restype = c_int
+
+        lib.gansu_energy_from_density_uhf.argtypes = [
+            c_handle, c_double_p, c_double_p, c_int, c_double_p]
+        lib.gansu_energy_from_density_uhf.restype = c_int
+
+        lib.gansu_energy_from_mo_uhf_batch.argtypes = [
+            c_handle, c_double_p, c_double_p, c_int, c_int, c_int, c_int, c_double_p]
+        lib.gansu_energy_from_mo_uhf_batch.restype = c_int
+
+        lib.gansu_uhf_scf_from_mo.argtypes = [
+            c_handle, c_double_p, c_double_p, c_int, c_int, c_int,
+            c_double_p, c_double_p, c_double_p]
+        lib.gansu_uhf_scf_from_mo.restype = c_int
+
+        lib.gansu_spin_properties.argtypes = [
+            c_handle, c_double_p, c_double_p, c_int, c_double_p, c_double_p, c_int]
+        lib.gansu_spin_properties.restype = c_int
+        _HAS_UHF_EVAL_API = True
+    except AttributeError:
+        _HAS_UHF_EVAL_API = False
 
     # Progress callback: void(const char*, int, int, const double*, void*)
     global PROGRESS_FUNC_TYPE
@@ -759,6 +788,139 @@ class Molecule:
         if ret != 0:
             raise RuntimeError(f"batch energy evaluation failed (status {ret})")
         return out
+
+    # -- SCF-free UHF evaluation (FMQA broken-symmetry interface) --
+
+    def _require_uhf_eval_api(self):
+        if not _HAS_UHF_EVAL_API:
+            raise RuntimeError(
+                "The loaded libgansu.so predates the SCF-free UHF API "
+                "(gansu_energy_from_mo_uhf / gansu_uhf_scf_from_mo / "
+                "gansu_spin_properties ...). Rebuild the library "
+                "(cd build && make gansu_shared) and make sure the new .so is "
+                "the one loaded (see the RHF-API error for details).")
+
+    def energy_of_uhf(self, Ca_occ=None, Cb_occ=None, Pa=None, Pb=None):
+        """SCF-free single-point UHF energy evaluation.
+
+        E = sum_pq Pt_pq h_pq + 1/2 sum_pq Pt_pq J[Pt]_pq
+            - 1/2 (sum_pq Pa_pq K[Pa]_pq + sum_pq Pb_pq K[Pb]_pq) + E_nn,
+        with Pt = Pa + Pb. Requires the handle's method to be UHF.
+
+        Specify either (Ca_occ, Cb_occ) — occupied MO coefficients
+        (n, na)/(n, nb), single occupancy, Pa/Pb formed as Ca Ca^T / Cb Cb^T —
+        or (Pa, Pb) AO density matrices (n, n). Orthonormality of the MOs is
+        the caller's responsibility. No SCF; integrals prepared once and reused.
+
+        Returns:
+            Total energy in Hartree (E_nn included).
+        """
+        self._require_uhf_eval_api()
+        have_mo = Ca_occ is not None and Cb_occ is not None
+        have_p = Pa is not None and Pb is not None
+        if have_mo == have_p:
+            raise ValueError("specify exactly one of (Ca_occ, Cb_occ) or (Pa, Pb)")
+        out = ctypes.c_double()
+        if have_mo:
+            Ca = np.ascontiguousarray(Ca_occ, dtype=np.float64)
+            Cb = np.ascontiguousarray(Cb_occ, dtype=np.float64)
+            if Ca.ndim != 2 or Cb.ndim != 2:
+                raise ValueError("Ca_occ/Cb_occ must be 2-D (n, na)/(n, nb)")
+            if Ca.shape[0] != Cb.shape[0]:
+                raise ValueError("Ca_occ and Cb_occ must share the first dim n")
+            n, na = Ca.shape
+            nb = Cb.shape[1]
+            ret = self._lib.gansu_energy_from_mo_uhf(
+                self._h, self._dp(Ca), self._dp(Cb), n, na, nb, ctypes.byref(out))
+        else:
+            Pam = np.ascontiguousarray(Pa, dtype=np.float64)
+            Pbm = np.ascontiguousarray(Pb, dtype=np.float64)
+            if Pam.shape != Pbm.shape or Pam.ndim != 2 or Pam.shape[0] != Pam.shape[1]:
+                raise ValueError("Pa/Pb must be square (n, n) of equal shape")
+            ret = self._lib.gansu_energy_from_density_uhf(
+                self._h, self._dp(Pam), self._dp(Pbm), Pam.shape[0], ctypes.byref(out))
+        if ret != 0:
+            raise RuntimeError(f"UHF energy evaluation failed (status {ret})")
+        return out.value
+
+    def energy_of_uhf_batch(self, Ca_batch, Cb_batch):
+        """Batched SCF-free UHF evaluation.
+        (batch, n, na), (batch, n, nb) -> (batch,) energies."""
+        self._require_uhf_eval_api()
+        ca = np.ascontiguousarray(Ca_batch, dtype=np.float64)
+        cb = np.ascontiguousarray(Cb_batch, dtype=np.float64)
+        if ca.ndim != 3 or cb.ndim != 3:
+            raise ValueError("Ca_batch/Cb_batch must be 3-D (batch, n, na/nb)")
+        if ca.shape[0] != cb.shape[0] or ca.shape[1] != cb.shape[1]:
+            raise ValueError("Ca_batch/Cb_batch must share batch and n dims")
+        batch, n, na = ca.shape
+        nb = cb.shape[2]
+        out = np.empty(batch, dtype=np.float64)
+        ret = self._lib.gansu_energy_from_mo_uhf_batch(
+            self._h, self._dp(ca), self._dp(cb), batch, n, na, nb, self._dp(out))
+        if ret != 0:
+            raise RuntimeError(f"batch UHF energy evaluation failed (status {ret})")
+        return out
+
+    def uhf_scf_from(self, Ca_occ, Cb_occ, return_density=False):
+        """Run UHF-SCF to convergence from the given occupied MOs (FMQA polish).
+
+        A symmetric guess (Ca == Cb) stays at the RHF stationary point; a
+        spin-alternating guess relaxes to the broken-symmetry solution.
+
+        Returns:
+            E (float), or (E, Pa, Pb) if return_density=True (converged
+            alpha/beta AO densities as (n, n) numpy arrays).
+        """
+        self._require_uhf_eval_api()
+        Ca = np.ascontiguousarray(Ca_occ, dtype=np.float64)
+        Cb = np.ascontiguousarray(Cb_occ, dtype=np.float64)
+        if Ca.ndim != 2 or Cb.ndim != 2 or Ca.shape[0] != Cb.shape[0]:
+            raise ValueError("Ca_occ/Cb_occ must be 2-D (n, na)/(n, nb) sharing n")
+        n, na = Ca.shape
+        nb = Cb.shape[1]
+        out = ctypes.c_double()
+        if return_density:
+            pa = np.empty(n * n, dtype=np.float64)
+            pb = np.empty(n * n, dtype=np.float64)
+            pa_ptr, pb_ptr = self._dp(pa), self._dp(pb)
+        else:
+            pa_ptr = pb_ptr = ctypes.POINTER(ctypes.c_double)()
+        ret = self._lib.gansu_uhf_scf_from_mo(
+            self._h, self._dp(Ca), self._dp(Cb), n, na, nb,
+            ctypes.byref(out), pa_ptr, pb_ptr)
+        if ret != 0:
+            raise RuntimeError(f"UHF SCF polish failed (status {ret})")
+        if return_density:
+            return out.value, pa.reshape(n, n), pb.reshape(n, n)
+        return out.value
+
+    def spin_properties(self, Pa, Pb):
+        """<S^2> and per-atom Mulliken spin densities of a UHF solution.
+
+        Args:
+            Pa, Pb: (n, n) AO density matrices (alpha, beta).
+        Returns:
+            (s_squared: float, atom_spins: np.ndarray[natom]).
+        """
+        self._require_uhf_eval_api()
+        Pam = np.ascontiguousarray(Pa, dtype=np.float64)
+        Pbm = np.ascontiguousarray(Pb, dtype=np.float64)
+        if Pam.shape != Pbm.shape or Pam.ndim != 2 or Pam.shape[0] != Pam.shape[1]:
+            raise ValueError("Pa/Pb must be square (n, n) of equal shape")
+        n = Pam.shape[0]
+        # Ensure the handle's HF object exists so num_atoms is known.
+        if self._lib.gansu_prepare(self._h) != 0:
+            raise RuntimeError("gansu_prepare failed")
+        natom = self._lib.gansu_get_num_atoms(self._h)
+        s2 = ctypes.c_double()
+        spins = np.empty(natom, dtype=np.float64)
+        ret = self._lib.gansu_spin_properties(
+            self._h, self._dp(Pam), self._dp(Pbm), n,
+            ctypes.byref(s2), self._dp(spins), natom)
+        if ret != 0:
+            raise RuntimeError(f"spin_properties failed (status {ret})")
+        return s2.value, spins
 
     @property
     def hcore(self):

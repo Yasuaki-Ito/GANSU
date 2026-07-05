@@ -252,6 +252,82 @@ int gansu_get_hcore(gansu_handle_t h, double* buf, int len);
  *          -2 if refused (non-stored ERI method, or n^4 exceeds INT_MAX). */
 int gansu_get_eri(gansu_handle_t h, double* buf, int len);
 
+/* ---- SCF-free UHF evaluation (FMQA broken-symmetry interface) ----
+ *
+ * UHF counterparts of the RHF functions above, for FMQA global search of
+ * the HF energy landscape (broken-symmetry / multiple-solution enumeration).
+ * The evaluated functional (chemists' J, K, Pt = Pa + Pb) is
+ *   E = sum_pq Pt_pq h_pq + 1/2 sum_pq Pt_pq J[Pt]_pq
+ *       - 1/2 ( sum_pq Pa_pq K[Pa]_pq + sum_pq Pb_pq K[Pb]_pq ) + E_nn.
+ * The handle's method must be UHF (set "method"="UHF"); functions return -3
+ * otherwise. Alpha/beta occupations (na, nb) are explicit arguments, so
+ * closed-shell broken-symmetry (na == nb, Ca != Cb) and open-shell radicals
+ * (na != nb) share one API independent of the handle's charge/multiplicity.
+ * Consistency: passing Ca == Cb == C_RHF (occupied columns) reproduces the
+ * RHF total energy to |dE| < 1e-10.
+ */
+
+/** Evaluate the UHF energy functional from occupied alpha/beta MO coefficients
+ *  c_alpha_occ (n x na) and c_beta_occ (n x nb), row-major (column j = j-th
+ *  occupied orbital). Builds Pa = Ca_occ Ca_occ^T, Pb = Cb_occ Cb_occ^T
+ *  (single occupancy per spin orbital), one Fock build, no SCF. Orthonormality
+ *  is the CALLER's responsibility (no checks, for high call rates).
+ *  @return 0 on success; -1 on dimension mismatch / error; -3 if not UHF.
+ *  On success *energy_out = total energy in Hartree (E_nn included). */
+int gansu_energy_from_mo_uhf(gansu_handle_t h,
+                             const double* c_alpha_occ,
+                             const double* c_beta_occ,
+                             int n, int na, int nb,
+                             double* energy_out);
+
+/** Evaluate the UHF energy functional from AO density matrices Pa, Pb
+ *  (each n x n, row-major). No SCF; densities are used as given.
+ *  Overwrites the handle's working density/Fock matrices.
+ *  @return 0 on success; -1 on dimension mismatch / error; -3 if not UHF. */
+int gansu_energy_from_density_uhf(gansu_handle_t h,
+                                  const double* Pa, const double* Pb,
+                                  int n, double* energy_out);
+
+/** Batched UHF evaluation: `batch` sets of (Ca, Cb), contiguous (set b starts
+ *  at ca_batch + (size_t)b*n*na and cb_batch + (size_t)b*n*nb). energies_out
+ *  has length batch. Integrals are prepared once; one Fock build per point.
+ *  @return 0 on success (all points evaluated), <0 on first error. */
+int gansu_energy_from_mo_uhf_batch(gansu_handle_t h,
+                                   const double* ca_batch,
+                                   const double* cb_batch,
+                                   int batch, int n, int na, int nb,
+                                   double* energies_out);
+
+/** Run a UHF-SCF to convergence starting from the given occupied MOs, i.e.
+ *  the "polish" step that turns an FMQA basin into a true stationary point.
+ *  Builds Pa/Pb (single occupancy) as the initial density and runs UHF-SCF.
+ *  No extra symmetry breaking is applied, so a symmetric initial guess
+ *  (Ca == Cb) stays at the RHF stationary point while a spin-alternating guess
+ *  relaxes to the broken-symmetry solution. If pa_out/pb_out are non-NULL
+ *  (each n*n, row-major) the converged alpha/beta densities are written there
+ *  (for duplicate removal / spin classification).
+ *  @return 0 on success; -1 on error; -3 if not UHF.
+ *  On success *energy_out = converged total energy in Hartree. */
+int gansu_uhf_scf_from_mo(gansu_handle_t h,
+                          const double* c_alpha_occ,
+                          const double* c_beta_occ,
+                          int n, int na, int nb,
+                          double* energy_out,
+                          double* pa_out /* n*n or NULL */,
+                          double* pb_out /* n*n or NULL */);
+
+/** Spin properties of a UHF solution from AO densities Pa, Pb (each n x n,
+ *  row-major). Writes <S^2> to *s_squared_out (may be NULL) and the per-atom
+ *  Mulliken spin population m_A = sum_{mu in A} ((Pa - Pb) S)_mu,mu to
+ *  atom_spin_out (natom doubles, may be NULL). <S^2> uses the UHF formula
+ *  S(S+1) + Nb - Tr(Pa S Pb S) with Na = Tr(Pa S), Nb = Tr(Pb S),
+ *  S = (Na - Nb)/2. Usable after gansu_prepare() or gansu_run().
+ *  @return 0 on success; -1 on dimension mismatch / error; -3 if not UHF. */
+int gansu_spin_properties(gansu_handle_t h,
+                          const double* Pa, const double* Pb, int n,
+                          double* s_squared_out,
+                          double* atom_spin_out, int natom);
+
 /* ---- Progress callback ---- */
 
 /**

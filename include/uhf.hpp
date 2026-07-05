@@ -56,6 +56,17 @@ public:
     void precompute_eri_matrix() override;
     void compute_fock_matrix() override;
     void compute_density_matrix() override;
+
+    /**
+     * @brief Toggle the HOMO/LUMO symmetry-breaking rotation applied by the
+     *        density initial guess (InitialGuess_UHF_Density).
+     * @details Enabled by default so ordinary UHF runs escape the RHF solution.
+     *          The SCF-free FMQA "polish" API disables it so a caller-supplied
+     *          density flows to the nearest stationary point unperturbed (a
+     *          symmetric guess then stays at the RHF stationary point).
+     */
+    void set_density_guess_break_symmetry(bool b) { density_guess_break_symmetry_ = b; }
+    bool get_density_guess_break_symmetry() const { return density_guess_break_symmetry_; }
     void guess_initial_fock_matrix(const real_t* density_matrix_a=nullptr, const real_t* density_matrix_b=nullptr, bool force_density=false) override;
     void compute_coefficient_matrix_impl() override;
     void compute_energy() override;
@@ -172,6 +183,8 @@ private:
     DeviceHostMatrix<real_t> fock_matrix_b; ///< Fock matrix (beta spin)
 
     std::unique_ptr<Convergence_UHF> convergence_method_; ///< Convergence_UHF
+
+    bool density_guess_break_symmetry_ = true; ///< Apply HOMO/LUMO break in the density initial guess (off for FMQA polish)
 
     const std::string initial_guess_method_; ///< Initial guess method name
     const std::string gbsfilename_; ///< Basis set file name (Gaussian basis set file)
@@ -649,7 +662,7 @@ public:
 
         hf_.compute_fock_matrix(); // compute the Fock matrix from the density matrix
         hf_.compute_coefficient_matrix(); // compute the coefficient matrix from the density matrix
-        break_symmetry();
+        if(hf_.get_density_guess_break_symmetry()) break_symmetry();
         hf_.compute_density_matrix(); // compute the density matrix from the coefficient matrix
         hf_.compute_fock_matrix(); // compute the Fock matrix from the density matrix
     }
