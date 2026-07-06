@@ -1939,20 +1939,67 @@ static void compute_steom_ccsd_impl(RHF& rhf,
        << ":\n"
        << "   k   omega (Ha)        omega (eV)"
        << (can_eta ? "      η        %act_o   %act_v" : "") << "\n";
+    // ORCA convergence criterion for a STEOM root w.r.t. the active space:
+    // the root is "converged" when its % active character η ≥ 0.96 (DLPNO-STEOM)
+    // / 0.98 (canonical STEOM). Below that ORCA flags the excitation energy as
+    // unreliable; the remedy is to enlarge the active space — tighten
+    // OThresh/VThresh, raise the IP/EA safety margin, or lower TCutPNOSingles
+    // (Dutta, Nooijen, Neese, Izsák, "Automatic active space selection for the
+    // STEOM-CCSD method", J. Chem. Theory Comput. 2018). Report-only, numerically
+    // inert; override the flag threshold with GANSU_STEOM_ETA_THRESH.
+    real_t eta_thresh = static_cast<real_t>(0.96);
+    if (const char* e = std::getenv("GANSU_STEOM_ETA_THRESH")) {
+        const double v = std::atof(e);
+        if (v > 0.0 && v <= 1.0) eta_thresh = static_cast<real_t>(v);
+    }
+    int n_below_eta = 0;
     for (int n = 0; n < n_states_to_compute; ++n) {
         const auto& pr = result.per_root[n];
         os << "  " << std::setw(2) << n
            << "   " << std::setw(12) << std::setprecision(8) << std::fixed << pr.omega
            << "   " << std::setw(10) << std::setprecision(4) << (pr.omega * 27.2114);
-        if (can_eta && pr.eta >= 0.0)
+        if (can_eta && pr.eta >= 0.0) {
             os << "   " << std::setw(7) << std::setprecision(4) << pr.eta
                << "  " << std::setw(7) << std::setprecision(4) << pr.percent_active_occ
                << "  " << std::setw(7) << std::setprecision(4) << pr.percent_active_vir;
+            if (pr.eta < eta_thresh) { os << "  ⚠ <" << std::setprecision(2) << eta_thresh; ++n_below_eta; }
+        }
         os << "\n";
     }
     if (!can_eta)
         os << "  (η = % active character: not computed — CIS-NTO basis "
               "dimensions did not match the STEOM active space.)\n";
+
+    // Active-space health summary (ORCA-style, report-only). Two things a low-η
+    // spectrum tells us: (1) how many computed roots fall below the ORCA η
+    // threshold (their energies are untrustworthy — enlarge the active space),
+    // and (2) the active-space provenance chain — the requested CIS-NTO count
+    // vs the EFFECTIVE count that actually enters the second similarity
+    // transform. NTOs are silently dropped when their IP/EA-EOM root fails the
+    // %singles filter or gets no FollowCIS assignment (canonical_*_label < 0),
+    // so a spectrum can "lose" low states not because the physics is missing but
+    // because the effective active space quietly shrank below the requested one.
+    // This is exactly the diagnostic to read when low valence states go missing.
+    if (can_eta) {
+        os << "  active-space health: " << n_below_eta << "/" << n_states_to_compute
+           << " root(s) below η = " << std::setprecision(2) << eta_thresh
+           << (n_below_eta > 0
+                 ? "  ⚠ enlarge active space (tighten OThresh/VThresh, raise IP/EA "
+                   "safety margin, lower TCutPNOSingles)"
+                 : "  (all roots converged w.r.t. active space)")
+           << "\n";
+        os << "  active occ: requested(CIS-NTO)=" << cis_nto.n_act_occ
+           << " → routed=" << n_act_occ << " → effective=" << n_act_occ_eff
+           << "   |   active vir: requested=" << cis_nto.n_act_vir
+           << " → routed=" << n_act_vir << " → effective=" << n_act_vir_eff << "\n";
+        if (n_act_occ_eff < cis_nto.n_act_occ || n_act_vir_eff < cis_nto.n_act_vir)
+            os << "  ⚠ effective active space is SMALLER than requested — "
+               << (cis_nto.n_act_occ - n_act_occ_eff) << " occ / "
+               << (cis_nto.n_act_vir - n_act_vir_eff) << " vir NTO(s) dropped "
+                  "(unassigned or failed the IP/EA %singles filter). Enlarging the "
+                  "CIS-NTO active space will NOT help these back in; raise the IP/EA "
+                  "safety margin and/or loosen ip_thresh/ea_thresh instead.\n";
+    }
 
     result.report = os.str();
     std::cout << result.report;
