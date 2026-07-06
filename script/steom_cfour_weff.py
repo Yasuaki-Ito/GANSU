@@ -31,18 +31,34 @@ def spinad(T):
     return 2.0 * T - T.swapaxes(0, 1)
 
 
-def load(xyz, basis, ncore):
+def load(xyz, basis, ncore, atom=None, active=None):
+    """atom overrides xyz (raw PySCF atom string); active = explicit active MO list
+    (CAS window: freeze every occ/vir not in active), mirrors
+    steom_fockspace_ref.get_active_data so the oracle and GANSU-analytic share a space."""
     from pyscf import gto, scf, cc, ao2mo
     from pyscf.cc import eom_rccsd
-    mol = gto.M(atom=read_xyz(xyz), basis=basis, cart=True, unit="Angstrom")
+    geom = atom if atom is not None else read_xyz(xyz)
+    mol = gto.M(atom=geom, basis=basis, cart=True, unit="Angstrom")
     mf = scf.RHF(mol); mf.conv_tol = 1e-10; mf.kernel()
-    mycc = cc.CCSD(mf, frozen=ncore); mycc.conv_tol = 1e-9; mycc.conv_tol_normt = 1e-7
+    nmo_tot = mf.mo_coeff.shape[1]; nocc_tot = mol.nelectron // 2
+    if active is None:
+        active = list(range(ncore, nmo_tot))
+    active = sorted(active)
+    frozen = [p for p in range(nmo_tot) if p not in active]
+    mycc = cc.CCSD(mf, frozen=(frozen if frozen else 0))
+    mycc.conv_tol = 1e-9; mycc.conv_tol_normt = 1e-7
     mycc.kernel()
     t1, t2 = mycc.t1, mycc.t2
     nocc = mycc.nocc; nmo = mycc.nmo; nvir = nmo - nocc
-    mo_c = mf.mo_coeff[:, ncore:]; moe = mf.mo_energy[ncore:]
+    mo_c = mf.mo_coeff[:, active]; moe = mf.mo_energy[active]
     eri = ao2mo.kernel(mol, mo_c, compact=False).reshape(nmo, nmo, nmo, nmo)
     bar = build_bar_h(eri, t1, t2, np.diag(moe[:nocc]), np.diag(moe[nocc:]), nocc, nvir)
+    # EE-consistent singles-block intermediates for the STEOM base fix (2026-07-06):
+    # the correct s=0 base is 2 woVvO + woVVo (PySCF eom_rccsd make_ee), NOT the IP-side
+    # 2 Wovvo - Wovov. Stash them so build_g_canonical_full can use them under STEOM_EE_BASE.
+    _eeimds = eom_rccsd.EOMEESinglet(mycc).make_imds()
+    bar["woVvO"] = np.asarray(_eeimds.woVvO)   # [m,b,e,j]
+    bar["woVVo"] = np.asarray(_eeimds.woVVo)   # [m,b,e,j]
     dim = nocc * nvir
 
     # exact singlet/triplet effective singles H -> exact g_phph / g_phhp

@@ -27,15 +27,31 @@ import numpy as np
 from scipy.linalg import expm
 
 # ----------------------------------------------------------------- integrals
-def get_active_data(xyz="xyz/H2O.xyz", basis="sto-3g", ncore=2):
+def get_active_data(xyz="xyz/H2O.xyz", basis="sto-3g", ncore=2, atom=None, active=None):
+    """Active-space integrals + CCSD(t1,t2) + FCI for the STEOM determinant oracle.
+
+    xyz/atom : geometry from file (xyz) or a raw PySCF atom string (atom, overrides xyz).
+    ncore    : freeze the lowest `ncore` spatial MOs (all higher MOs active).
+    active   : explicit list of active spatial-MO indices (energy order). When given it
+               OVERRIDES ncore: every occupied MO not in `active` becomes frozen-core
+               (doubly-occ, folded into Dcore) and every virtual MO not in `active` is
+               deleted. Enables a CAS window, e.g. butadiene pi-CAS(4,4)."""
     from pyscf import gto, scf, cc, ao2mo, fci
     def read_xyz(fn):
         L = open(fn).read().splitlines(); n = int(L[0]); return "\n".join(L[2:2+n])
-    mol = gto.M(atom=read_xyz(xyz), basis=basis, cart=True, unit="Angstrom")
+    geom = atom if atom is not None else read_xyz(xyz)
+    mol = gto.M(atom=geom, basis=basis, cart=True, unit="Angstrom")
     mf = scf.RHF(mol); mf.conv_tol = 1e-12; mf.kernel()
     nmo = mf.mo_coeff.shape[1]
-    act = list(range(ncore, nmo)); nact = len(act)
-    C_act = mf.mo_coeff[:, act]; C_core = mf.mo_coeff[:, :ncore]
+    nocc_tot = mol.nelectron // 2
+    if active is None:
+        active = list(range(ncore, nmo))
+    active = sorted(active)
+    frozen_occ = [p for p in range(nocc_tot) if p not in active]
+    frozen_vir = [p for p in range(nocc_tot, nmo) if p not in active]
+    frozen = frozen_occ + frozen_vir
+    nact = len(active)
+    C_act = mf.mo_coeff[:, active]; C_core = mf.mo_coeff[:, frozen_occ]
     Dcore = 2.0 * C_core @ C_core.T
     hcore = mf.get_hcore()
     vj, vk = scf.hf.get_jk(mol, Dcore)
@@ -44,15 +60,16 @@ def get_active_data(xyz="xyz/H2O.xyz", basis="sto-3g", ncore=2):
     eri = ao2mo.kernel(mol, C_act, compact=False).reshape(nact, nact, nact, nact)
     Ecore = np.einsum("ij,ji->", Dcore, hcore) + 0.5 * np.einsum("ij,ji->", Dcore, vj - 0.5 * vk)
     Enuc = mol.energy_nuc()
-    nelec_act = mol.nelectron - 2 * ncore
-    mycc = cc.CCSD(mf, frozen=ncore); mycc.conv_tol = 1e-10; mycc.conv_tol_normt = 1e-8
+    nelec_act = mol.nelectron - 2 * len(frozen_occ)
+    mycc = cc.CCSD(mf, frozen=(frozen if frozen else 0))
+    mycc.conv_tol = 1e-10; mycc.conv_tol_normt = 1e-8
     mycc.kernel()
     cis = fci.direct_spin1.FCI()
     Efci, _ = cis.kernel(h1, eri, nact, nelec_act, ecore=Ecore + Enuc)
     nocc = nelec_act // 2; nvir = nact - nocc
     return dict(h1=h1, eri=eri, nact=nact, nocc=nocc, nvir=nvir, nelec=nelec_act,
                 Ecore=Ecore, Enuc=Enuc, Ehf=mf.e_tot, Eccsd=mycc.e_tot, Efci=Efci,
-                t1=mycc.t1, t2=mycc.t2, moe=mf.mo_energy[ncore:], mycc=mycc, mf=mf)
+                t1=mycc.t1, t2=mycc.t2, moe=mf.mo_energy[active], mycc=mycc, mf=mf)
 
 
 # ------------------------------------------------------ determinant Fock space

@@ -953,12 +953,29 @@ def build_g_canonical_full(
     # awaits the same SO derivation (root = ket-particle, ||~0.5x IP||). Zeroed for now so
     # g_phhp = base + (validated IP route); base+IP already nails n→π* on both molecules.
     u_bkje = np.zeros((nvir, nocc, nocc, n_act_vir))
+    # PROBE (2026-07-06): env-gated g_phhp EA route to test the ππ* hypothesis on
+    # naphthalene. Nooijen Eq.61 form (build_u_bkje_canonical). Default OFF keeps the
+    # shipped/GANSU-matching (EA=0) behaviour bit-identical.
+    import os as _os
+    _ea_mode = _os.environ.get("STEOM_TEST_GPHHP_EA")
+    if _ea_mode == "1":
+        u_bkje = build_u_bkje_canonical(bar_h, r2_ea_list, nocc, nvir)
     # u_bmje (cross, g_phhp) — old form buggy; correct small cross awaits SO derivation.
     # Zeroed for now (base + validated IP route nails n→π* on both molecules).
     u_bmje = np.zeros((nvir, n_act_occ, nocc, n_act_vir))
 
     # ---------- assemble g_phph (Eq.59) + g_phhp (Eq.63) ----------
-    g_phph = np.einsum("kaic->akci", Wovov).copy()   # [a,k,c,i]
+    # BASE FIX (STEOM_EE_BASE, 2026-07-06): the s=0 base must equal the EE-CCSD singlet
+    # singles block = 2 woVvO + woVVo (machine-exact vs det oracle H4/H6). The shipped
+    # IP-side `2 Wovvo - Wovov` is only correct on the diagonal/semi-diagonal (single-
+    # config); it is wrong on the i!=j&a!=b config-coupling block (naphthalene Lb +1 eV).
+    #   g_phhp[b,k,j,c] = woVvO[k,c,b,j] ;  g_phph[a,k,c,i] = -woVVo[k,a,c,i]
+    #   (=> singlet 2g_phhp-g_phph = 2woVvO+woVVo ; triplet -g_phph = woVVo, both exact)
+    _ee_base = _os.environ.get("STEOM_EE_BASE")
+    if _ee_base:
+        g_phph = -np.einsum("kaci->akci", bar_h["woVVo"]).copy()   # [a,k,c,i]
+    else:
+        g_phph = np.einsum("kaic->akci", Wovov).copy()   # [a,k,c,i]
     for m in range(n_act_occ):
         k_full = active_occ_idx[m]
         g_phph[:, k_full, :, :] += u_amci[:, m, :, :]          # δ_mk u_amci
@@ -969,7 +986,10 @@ def build_g_canonical_full(
             c_full = active_vir_idx[e]
             g_phph[:, k_full, c_full, :] += u_amei[:, m, e, :]  # δ_ec δ_km u_amei
 
-    g_phhp = np.einsum("kbcj->bkjc", Wovvo).copy()   # [b,k,j,c]
+    if _ee_base:
+        g_phhp = np.einsum("kcbj->bkjc", bar_h["woVvO"]).copy()   # [b,k,j,c]
+    else:
+        g_phhp = np.einsum("kbcj->bkjc", Wovvo).copy()   # [b,k,j,c]
     _hp_base = g_phhp.copy()
     for m in range(n_act_occ):
         k_full = active_occ_idx[m]
@@ -984,6 +1004,18 @@ def build_g_canonical_full(
         for e in range(n_act_vir):
             c_full = active_vir_idx[e]
             g_phhp[:, k_full, :, c_full] += u_bmje[:, m, :, e]  # cross
+    # PROBE mode 2 (2026-07-06): pt41 SO-derived g_phhp EA route (root=ket-particle b,
+    # scatter to b=active_vir_idx[e], NOT the δ_ce slot of the buggy Nooijen Eq.61).
+    #   block[j,i,a] = 0.5 Σ_lc Wovoo[l,c,j,i]·s_EA[e][l,a,c]
+    #               + 0.5 Σ_cd Wvovv[a,j,c,d]·s_EA[e][i,c,d]
+    #   g_phhp[b,k=j,j=i,c=a] += block   (b = active_vir_idx[e])
+    if _ea_mode == "2":
+        for e in range(n_act_vir):
+            bt = active_vir_idx[e]
+            s = s_EA[e]                                   # [i,a,c] (occ,vir,vir)
+            block = (0.5 * np.einsum("lcji,lac->jia", Wovoo, s)
+                     + 0.5 * np.einsum("ajcd,icd->jia", Wvovv, s))   # [j,i,a]
+            g_phhp[bt] += block                           # array axes [k,j,c] = [j,i,a]
     # debug decomposition of g_phhp into [base, +u_bmjc, +u_bkje, +u_bmje(cross)]
     _g_phhp_decomp = (_hp_base, _hp_1 - _hp_base, _hp_2 - _hp_1, g_phhp - _hp_2)
 
@@ -1635,7 +1667,7 @@ def main(xyz_path, basis, n_act_occ, n_act_vir, n_steom_roots):
         print(f"  state {k}:  ω = {ec[k]:.10f} Ha  ({ec[k]*27.2114:.4f} eV)")
 
     # Step 5e: CANONICAL FULL with cross terms (Eq.56-63, pre-normalized s)
-    Gf, gf_phph, gf_phhp, u_amei_f, u_bmje_f = build_g_canonical_full(
+    Gf, gf_phph, gf_phhp, u_amei_f, u_bmje_f, _gf_decomp = build_g_canonical_full(
         bar_h, r2_ip_list, r2_ea_list, r1_ip_list, r1_ea_list,
         active_occ_idx, active_vir_idx, nocc, nvir,
     )
