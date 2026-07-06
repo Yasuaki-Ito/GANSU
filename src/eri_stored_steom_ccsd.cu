@@ -1653,6 +1653,42 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                    cudaMemcpyDeviceToDevice);
         gpu::transposeMatrixInPlace(d_G_cm, total_dim);  // row-major G → column-major G
 
+        // Robustness rescue (GANSU_STEOM_SYMMETRIZE=1, OPT-IN, default OFF ⇒
+        // byte-identical). The analytic 2nd-order STEOM G is non-Hermitian and, at
+        // near-degeneracies (floppy / poorly-optimised geometries), a low physical
+        // state can emerge as a spurious complex-conjugate pair. That complex-ness is
+        // a TRUNCATION ARTIFACT — the true all-orders STEOM G (implicit triples) is
+        // real-diagonalisable (verified: script/steom_es_complex_test.py — H2O triplet
+        // analytic max|Im|=0.78 eV → determinant {e^S} 0.0). Replacing G by ½(G+Gᵀ)
+        // yields a real spectrum whose complex-derived roots land near the true {e^S}
+        // values (2-octanone idealised n→π* 5.40+complex → 4.86 real ≈ ORCA 4.64).
+        // ⚠ It is a UNIFORM approximation: it also shifts the already-real states by
+        // ~0.1-0.3 eV (2-octanone_opt 4.92→4.65), so it is NOT auto-applied — on a
+        // GOOD geometry the non-Hermitian roots match the full canonical STEOM and
+        // should be trusted. Enable it only to turn complex garbage into a usable
+        // (approximate) real spectrum on a run that reports near-defective roots.
+        // The true fix for the energy is implicit triples (not this). One host pass.
+#ifndef GANSU_CPU_ONLY
+        if (std::getenv("GANSU_STEOM_SYMMETRIZE")) {
+            std::vector<real_t> hG((size_t)total_dim * total_dim);
+            cudaMemcpy(hG.data(), d_G_cm,
+                       (size_t)total_dim * total_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
+            for (int i = 0; i < total_dim; ++i)          // ½(G+Gᵀ); transpose-invariant
+                for (int j = i + 1; j < total_dim; ++j) {
+                    const size_t a = (size_t)i * total_dim + j, b = (size_t)j * total_dim + i;
+                    const real_t s = real_t(0.5) * (hG[a] + hG[b]);
+                    hG[a] = s; hG[b] = s;
+                }
+            cudaMemcpy(d_G_cm, hG.data(),
+                       (size_t)total_dim * total_dim * sizeof(real_t), cudaMemcpyHostToDevice);
+            std::cout << "  [STEOM] G symmetrized ½(G+Gᵀ) before geev "
+                         "(GANSU_STEOM_SYMMETRIZE, opt-in rescue) — real eigenvalues; "
+                         "complex near-defective roots regularized (approximate; also "
+                         "shifts real states ~0.2 eV — use only on near-defective runs)."
+                      << std::endl;
+        }
+#endif
+
         real_t* d_all_evals = nullptr;
         real_t* d_all_evals_imag = nullptr;
         real_t* d_all_evecs = nullptr;
