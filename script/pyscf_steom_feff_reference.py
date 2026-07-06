@@ -966,16 +966,15 @@ def build_g_canonical_full(
 
     # ---------- assemble g_phph (Eq.59) + g_phhp (Eq.63) ----------
     # BASE FIX (STEOM_EE_BASE, 2026-07-06): the s=0 base must equal the EE-CCSD singlet
-    # singles block = 2 woVvO + woVVo (machine-exact vs det oracle H4/H6). The shipped
-    # IP-side `2 Wovvo - Wovov` is only correct on the diagonal/semi-diagonal (single-
-    # config); it is wrong on the i!=j&a!=b config-coupling block (naphthalene Lb +1 eV).
-    #   g_phhp[b,k,j,c] = woVvO[k,c,b,j] ;  g_phph[a,k,c,i] = -woVVo[k,a,c,i]
-    #   (=> singlet 2g_phhp-g_phph = 2woVvO+woVVo ; triplet -g_phph = woVVo, both exact)
+    # singles block = 2 woVvO + woVVo. Machine-exact identities (verified H4/H6/H2O, 1e-16):
+    #   woVvO == Wovvo  and  woVVo == -Wovov[mbje].  So g_phph base (= -woVVo = Wovov[kaic])
+    #   is ALREADY correct, but g_phhp base is wrong: shipped uses Wovvo[k,b,c,j] where the
+    #   correct singlet base needs Wovvo[k,c,b,j] (the two VIRTUAL indices swapped). The
+    #   shipped `2 Wovvo - Wovov` is only right on the diag/semi-diag (single-config); it is
+    #   wrong on the i!=j&a!=b config-coupling block (naphthalene Lb +1 eV).  => ONE index
+    #   swap in g_phhp; g_phph unchanged. C++ port = same swap in GPHHP base (Wovvo access).
     _ee_base = _os.environ.get("STEOM_EE_BASE")
-    if _ee_base:
-        g_phph = -np.einsum("kaci->akci", bar_h["woVVo"]).copy()   # [a,k,c,i]
-    else:
-        g_phph = np.einsum("kaic->akci", Wovov).copy()   # [a,k,c,i]
+    g_phph = np.einsum("kaic->akci", Wovov).copy()   # [a,k,c,i]  (already correct)
     for m in range(n_act_occ):
         k_full = active_occ_idx[m]
         g_phph[:, k_full, :, :] += u_amci[:, m, :, :]          # δ_mk u_amci
@@ -987,9 +986,9 @@ def build_g_canonical_full(
             g_phph[:, k_full, c_full, :] += u_amei[:, m, e, :]  # δ_ec δ_km u_amei
 
     if _ee_base:
-        g_phhp = np.einsum("kcbj->bkjc", bar_h["woVvO"]).copy()   # [b,k,j,c]
+        g_phhp = np.einsum("kcbj->bkjc", Wovvo).copy()   # [b,k,j,c]  FIX: virtual b<->c swap
     else:
-        g_phhp = np.einsum("kbcj->bkjc", Wovvo).copy()   # [b,k,j,c]
+        g_phhp = np.einsum("kbcj->bkjc", Wovvo).copy()   # [b,k,j,c]  (shipped, buggy off-diag)
     _hp_base = g_phhp.copy()
     for m in range(n_act_occ):
         k_full = active_occ_idx[m]
@@ -1016,6 +1015,27 @@ def build_g_canonical_full(
             block = (0.5 * np.einsum("lcji,lac->jia", Wovoo, s)
                      + 0.5 * np.einsum("ajcd,icd->jia", Wvovv, s))   # [j,i,a]
             g_phhp[bt] += block                           # array axes [k,j,c] = [j,i,a]
+    # CORRECT g_phhp EA route (env STEOM_EA_ROUTE, 2026-07-07): derived by SO systematic
+    # enumeration fit (script/steom_so_fit2.py) — g_phhp is the CROSS-SPIN (direct-Coulomb)
+    # block, so the route is 2 direct-Coulomb·s_EA terms with coeff +1 (NOT the campaign's
+    # same-spin {Fov,Wvovv,Wooov} u_bkje, which is structurally wrong). SO chemist ERI:
+    #   Term1  Σ_cd s_EA[e][i,c,d]·(ca|dj) ,  (ca|dj)=eri_ovvv[j,d,c,a]  (vir-vir contraction)
+    #   Term2  Σ_kc s_EA[e][k,c,a]·(ki|cj) ,  (ki|cj)=eri_ooov[k,i,j,c]  (occ-vir contraction)
+    # root e scatters to b=active_vir_idx[e]. Spin factor `fac` tuned to the det oracle.
+    _ea_route = _os.environ.get("STEOM_EA_ROUTE")
+    if _ea_route:
+        fac = float(_os.environ.get("STEOM_EA_FAC", "1.0"))
+        eri_ovvv = bar_h["eri_ovvv"]; eri_ooov = bar_h["eri_ooov"]
+        for e in range(n_act_vir):
+            bt = active_vir_idx[e]
+            s = s_EA[e]                                   # [i,c,d] (occ,vir,vir)
+            # Term1 uses sea block (i,c_a,d_b); Term2 uses (k,c_b,a_a) = particle-swapped
+            # spatial amplitude s_EA[e][k,a,c] (NOT [k,c,a]).
+            t1v = float(_os.environ.get("STEOM_EA_T1", "1.0"))
+            t2v = float(_os.environ.get("STEOM_EA_T2", "1.0"))
+            block = (t1v * np.einsum("icd,jdca->jia", s, eri_ovvv)
+                     + t2v * np.einsum("kac,kijc->jia", s, eri_ooov))    # [j,i,a]
+            g_phhp[bt] += fac * block
     # debug decomposition of g_phhp into [base, +u_bmjc, +u_bkje, +u_bmje(cross)]
     _g_phhp_decomp = (_hp_base, _hp_1 - _hp_base, _hp_2 - _hp_1, g_phhp - _hp_2)
 

@@ -4462,9 +4462,22 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         for(int a=0;a<NV;++a) for(int i=0;i<NO;++i)
             GPHPH(a,kf,cf,i)+=UAMEI(a,m,e,i); }       // g_phph cross (kept, old form)
     if (!triplet_) {
+    // BASE FIX (env STEOM_EE_BASE, default OFF so shipped behaviour is bit-identical):
+    // the s=0 g_phhp base must equal the EE-CCSD singlet singles block. Correct form is
+    // woVvO[k,c,b,j] == Wovvo[k,c,b,j] (machine-exact identity woVvO==Wovvo verified vs
+    // PySCF EE imds on H4/H6/H2O). The shipped wovvo(k,b,c,j) has the two VIRTUAL indices
+    // swapped — correct on the diagonal/semi-diagonal (single-config, so H2O n->pi*
+    // validation passed) but wrong on the i!=j&a!=b config-coupling block, which over-shoots
+    // config-mixed valence states (naphthalene Lb ~+1 eV). The exchange channel g_phph base
+    // (wovov above) is already correct (== -woVVo). Verified machine-exact vs the determinant
+    // STEOM oracle (script/steom_gansu_vs_oracle.py: EE-BASE sorted-spectrum RMS
+    // 0.478->0.000 on config-mixed H4). NOTE: base fix alone is minor for real pi systems;
+    // the dominant config-mixed overshoot is the ZEROED g_phhp EA/cross s-routes (see below).
+    const bool ee_base = (std::getenv("STEOM_EE_BASE") != nullptr);
     #pragma omp parallel for collapse(2) schedule(static)
     for (int b=0;b<NV;++b) for(int k=0;k<NO;++k) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c)
-        GPHHP(b,k,j,c)=wovvo(k,b,c,j);
+        GPHHP(b,k,j,c) = ee_base ? wovvo(k,c,b,j)    // FIX: virtual b<->c swap
+                                 : wovvo(k,b,c,j);   // shipped (buggy config-coupling)
     #pragma omp parallel for schedule(static)              // distinct kf per m
     for (int m=0;m<NMo;++m){ const int kf=active_occ_idx_[m];
         for(int b=0;b<NV;++b) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c)
