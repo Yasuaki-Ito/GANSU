@@ -4487,6 +4487,46 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     // (UBMJC) already matches ORCA on H2O/CH2O (n->pi* 0.04-0.08 eV). The correct small EA route
     // is derived in memory pt41 but adding it lands at the 2nd-order {e^S}, below ORCA (pt42).
 
+    // ---- PROJECTION off-diagonal replacement (2026-07-07, config-coupling overshoot fix) ----
+    // env GANSU_STEOM_GPHPH_PROJECTION=1 (default OFF => shipped behaviour bit-identical).
+    // Replaces the i!=j && a!=b (config-coupling) block of g_phph AND g_phhp with the exact
+    // order-2 projection route of the second similarity transform (plain BCH projection = the
+    // ORCA/det-oracle convention): g_phph = Wovov base + (Mc-Ms), g_phhp = Wovvo(EE) base + Mc.
+    // Diag/semi-diag keep the connected/F_eff-consistent values above (a full replacement
+    // double-counts the F_eff dressing). The generated .inc evaluates the 96+84 spatial terms
+    // (auto-derived + machine-verified: script/steom_gphph_cppgen.py; gates = H2O FC1 +
+    // hexatriene pi-CAS eigenvalues == determinant e^S oracle to 1e-8 eV; memory
+    // project_dlpno_steom_orca_reconsider step1続31-37).
+    if (std::getenv("GANSU_STEOM_GPHPH_PROJECTION")) {
+        std::vector<real_t> proj_route_ph((size_t)NO*NV*NO*NV, 0.0);
+        std::vector<real_t> proj_route_mc((size_t)NO*NV*NO*NV, 0.0);
+        #include "steom_gphph_projection.inc"
+        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+            real_t nph=0.0, nmc=0.0;
+            for (int i=0;i<NO;++i) for (int a=0;a<NV;++a)
+                for (int j=0;j<NO;++j) for (int b=0;b<NV;++b) {
+                    if (i==j || a==b) continue;
+                    const size_t x=(((size_t)i*NV+a)*NO+j)*NV+b;
+                    nph += proj_route_ph[x]*proj_route_ph[x];
+                    nmc += proj_route_mc[x]*proj_route_mc[x];
+                }
+            std::cout << "[proj] off-diag route norms: ||route_ph|| = " << std::scientific
+                      << std::sqrt(nph) << ", ||route_mc|| = " << std::sqrt(nmc)
+                      << std::defaultfloat << std::endl;
+        }
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int i=0;i<NO;++i) for (int a=0;a<NV;++a)
+            for (int j=0;j<NO;++j) for (int b=0;b<NV;++b) {
+                if (i==j || a==b) continue;
+                const size_t x=(((size_t)i*NV+a)*NO+j)*NV+b;
+                GPHPH(a,j,b,i) = wovov(j,a,i,b) + proj_route_ph[x];
+                if (!triplet_)
+                    GPHHP(b,j,i,a) = wovvo(j,a,b,i) + proj_route_mc[x];
+            }
+        std::cout << "  STEOM g_phph/g_phhp config-coupling block: PROJECTION route "
+                  << "(GANSU_STEOM_GPHPH_PROJECTION)." << std::endl;
+    }
+
     bmark("assemble g_phph/g_phhp");
     // ---- G^{1h1p} spin blocks: row=i*NV+a, col=j*NV+b ----
     //  singlet: G = F_eff_vv δ_ij − F_eff_oo δ_ab + 2 g_phhp[b,j,i,a] − g_phph[a,j,b,i]
