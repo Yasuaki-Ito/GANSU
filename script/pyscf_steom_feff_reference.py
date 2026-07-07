@@ -1015,27 +1015,35 @@ def build_g_canonical_full(
             block = (0.5 * np.einsum("lcji,lac->jia", Wovoo, s)
                      + 0.5 * np.einsum("ajcd,icd->jia", Wvovv, s))   # [j,i,a]
             g_phhp[bt] += block                           # array axes [k,j,c] = [j,i,a]
-    # CORRECT g_phhp EA route (env STEOM_EA_ROUTE, 2026-07-07): derived by SO systematic
-    # enumeration fit (script/steom_so_fit2.py) — g_phhp is the CROSS-SPIN (direct-Coulomb)
-    # block, so the route is 2 direct-Coulomb·s_EA terms with coeff +1 (NOT the campaign's
-    # same-spin {Fov,Wvovv,Wooov} u_bkje, which is structurally wrong). SO chemist ERI:
-    #   Term1  Σ_cd s_EA[e][i,c,d]·(ca|dj) ,  (ca|dj)=eri_ovvv[j,d,c,a]  (vir-vir contraction)
-    #   Term2  Σ_kc s_EA[e][k,c,a]·(ki|cj) ,  (ki|cj)=eri_ooov[k,i,j,c]  (occ-vir contraction)
-    # root e scatters to b=active_vir_idx[e]. Spin factor `fac` tuned to the det oracle.
+    # CORRECT g_phhp EA route (env STEOM_EA_ROUTE, 2026-07-07): derived analytically by
+    # spin-integrating the SO Term1/Term2 (steom_so_fit2) with the CONFIRMED PySCF EOMEA
+    # convention (spatial2spin_ea): spatial r2[j,a,b] == SO bab block sea[j_b,a_a,b_b].
+    # Kramers-reducing the beta-root blocks (steom_ea_spinadapt.py, Term2 machine-exact,
+    # Term1 exact vs the clean convention sea) gives g_phhp = Mc[i,a,j,b] with:
+    #   Term1  -Σ_cd s_EA[e][i,c,d]·(ca|dj) ,  (ca|dj)=(jd|ca)=eri_ovvv[j,d,c,a]  (MINUS sign)
+    #   Term2  +Σ_kc s_EA[e][k,c,a]·(ki|cj) ,  (ki|cj)=(ki|jc)=eri_ooov[k,i,j,c]  (amp [k,c,a])
+    # g_phhp is the CROSS-SPIN (direct-Coulomb) block: the route is 2 direct-Coulomb·s_EA
+    # terms — NOT the campaign's same-spin {Fov,Wvovv,Wooov} u_bkje (structurally wrong,
+    # eigenvalue-worsening).  The earlier STEOM_EA_ROUTE guess had (a) Term1 wrong sign and
+    # (b) Term2 amplitude [k,a,c] (virtuals swapped).  root e scatters to b=active_vir_idx[e].
     _ea_route = _os.environ.get("STEOM_EA_ROUTE")
     if _ea_route:
         fac = float(_os.environ.get("STEOM_EA_FAC", "1.0"))
         eri_ovvv = bar_h["eri_ovvv"]; eri_ooov = bar_h["eri_ooov"]
+        t1v = float(_os.environ.get("STEOM_EA_T1", "1.0"))
+        t2v = float(_os.environ.get("STEOM_EA_T2", "1.0"))
         for e in range(n_act_vir):
             bt = active_vir_idx[e]
             s = s_EA[e]                                   # [i,c,d] (occ,vir,vir)
-            # Term1 uses sea block (i,c_a,d_b); Term2 uses (k,c_b,a_a) = particle-swapped
-            # spatial amplitude s_EA[e][k,a,c] (NOT [k,c,a]).
-            t1v = float(_os.environ.get("STEOM_EA_T1", "1.0"))
-            t2v = float(_os.environ.get("STEOM_EA_T2", "1.0"))
-            block = (t1v * np.einsum("icd,jdca->jia", s, eri_ovvv)
-                     + t2v * np.einsum("kac,kijc->jia", s, eri_ooov))    # [j,i,a]
+            block = (-t1v * np.einsum("icd,jdca->jia", s, eri_ovvv)     # Term1 (ca|dj), MINUS
+                     + t2v * np.einsum("kca,kijc->jia", s, eri_ooov))   # Term2 (ki|cj), [k,c,a]
             g_phhp[bt] += fac * block
+    # VALIDATION hook (STEOM_EA_EXACT_NPY): inject a numerically-exact clean-gauge EA
+    # route tensor gph_EA[b,j,i,a] (from the det oracle) to test whether the EA route
+    # is the correct fix, decoupled from the closed-form collinearity problem.
+    _ea_exact = _os.environ.get("STEOM_EA_EXACT_NPY")
+    if _ea_exact:
+        g_phhp += np.load(_ea_exact)                     # [b,j,i,a]
     # debug decomposition of g_phhp into [base, +u_bmjc, +u_bkje, +u_bmje(cross)]
     _g_phhp_decomp = (_hp_base, _hp_1 - _hp_base, _hp_2 - _hp_1, g_phhp - _hp_2)
 

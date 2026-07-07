@@ -110,7 +110,7 @@ def run(label, n, n_pi):
         return e, V
     e_sh, V_sh = variant()
     e_ee, V_ee = variant(STEOM_EE_BASE="1")
-    e_ea, V_ea = variant(STEOM_EE_BASE="1", STEOM_TEST_GPHHP_EA="2")
+    e_ea, V_ea = variant(STEOM_EE_BASE="1", STEOM_EA_ROUTE="1")
     print(f"    {'root':>4} {'PR':>5} {'oracle':>8} | {'shipped':>8} {'+EEbase':>8} {'+EE+EA':>8} "
           f"| {'g_sh':>7} {'g_ee':>7} {'g_all':>7}")
     for i in range(len(e_or)):
