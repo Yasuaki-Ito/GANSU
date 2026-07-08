@@ -1957,6 +1957,11 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         const double v = std::atof(e);
         if (v > 0.0 && v <= 1.0) eta_thresh = static_cast<real_t>(v);
     }
+    // (diagnostic, gated by GANSU_STEOM_DUMP_SPECTRUM) dominant 1h1p components
+    // per root in canonical MO labels (0-based, same numbering as ORCA's STEOM
+    // amplitude lists: HOMO = num_occ−1, LUMO = num_occ) — for state assignment
+    // against external references. Report-only, numerically inert.
+    const bool dump_comp = (std::getenv("GANSU_STEOM_DUMP_SPECTRUM") != nullptr);
     int n_below_eta = 0;
     for (int n = 0; n < n_states_to_compute; ++n) {
         const auto& pr = result.per_root[n];
@@ -1970,6 +1975,29 @@ static void compute_steom_ccsd_impl(RHF& rhf,
             if (pr.eta < eta_thresh) { os << "  ⚠ <" << std::setprecision(2) << eta_thresh; ++n_below_eta; }
         }
         os << "\n";
+        if (dump_comp && (int)pr.R1.size() == total_dim && total_dim > 0) {
+            const real_t* R1 = pr.R1.data();
+            double norm2 = 0.0;
+            for (int x = 0; x < total_dim; ++x) norm2 += (double)R1[x] * R1[x];
+            const double inv = (norm2 > 0.0) ? 1.0 / std::sqrt(norm2) : 0.0;
+            const int ntop = std::min(6, total_dim);
+            std::vector<int> ord(total_dim);
+            for (int x = 0; x < total_dim; ++x) ord[x] = x;
+            std::partial_sort(ord.begin(), ord.begin() + ntop, ord.end(),
+                [&](int x, int y) {
+                    return std::fabs(R1[x]) > std::fabs(R1[y]);
+                });
+            for (int t = 0; t < ntop; ++t) {
+                const int x = ord[t];
+                const double c = (double)R1[x] * inv;
+                if (std::fabs(c) < 0.10) break;
+                const int i = x / nvir, a = x % nvir;
+                os << "        " << (c >= 0.0 ? "+" : "-") << std::setw(6)
+                   << std::setprecision(4) << std::fixed << std::fabs(c)
+                   << "   " << std::setw(3) << (num_frozen + i) << " -> "
+                   << std::setw(3) << (num_frozen + nocc_active + a) << "\n";
+            }
+        }
     }
     if (!can_eta)
         os << "  (η = % active character: not computed — CIS-NTO basis "
