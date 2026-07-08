@@ -104,7 +104,7 @@ def main():
     open(f"{WORK}/harness.cpp", "w").write(HARNESS)
 
     inc = os.path.abspath("include")
-    cmd = ["g++", "-O2", "-fopenmp", f"-DDATA_DIR=\"{WORK}\"", f"-I{inc}",
+    cmd = ["g++", "-O2", "-fopenmp", "-DGANSU_CPU_ONLY", f"-DDATA_DIR=\"{WORK}\"", f"-I{inc}",
            f"{WORK}/harness.cpp", "-o", f"{WORK}/harness"]
     print("compiling:", " ".join(cmd))
     r = subprocess.run(cmd, capture_output=True, text=True)
