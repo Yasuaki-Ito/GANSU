@@ -8239,6 +8239,21 @@ __global__ void transpose_square_kernel(const double* __restrict__ in,
     out[(size_t)r*n + c] = in[(size_t)c*n + r];
 }
 
+// ---- Warm-start side channel for ccsd_spatial_orbital (bt-polish) ----
+// Staged host amplitudes replace the MP2 initial guess on the NEXT call
+// (consumed-and-cleared; pointers must stay valid for that call). Layouts are
+// the ACTIVE-space t1[i·nvir+a] / t2[(i·nocc+j)·nvir²+a·nvir+b] this solver
+// uses (== BTAmplitudes). max_iter_override > 0 caps the iteration count.
+static const real_t* g_ccsd_init_t1 = nullptr;
+static const real_t* g_ccsd_init_t2 = nullptr;
+static int           g_ccsd_init_max_iter = -1;
+void ccsd_set_initial_guess(const real_t* h_t1, const real_t* h_t2,
+                            int max_iter_override) {
+    g_ccsd_init_t1 = h_t1;
+    g_ccsd_init_t2 = h_t2;
+    g_ccsd_init_max_iter = max_iter_override;
+}
+
 real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             const real_t* __restrict__ d_coefficient_matrix,
                             const real_t* __restrict__ d_orbital_energies,
@@ -8495,15 +8510,33 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     tracked_cudaFree(d_extract_tmp);
 
     // MP2 initial guess: t2(i,j,a,b) = v_oovv[i,j,a,b] / Dijab
+    // (bt-polish) warm start: amplitudes staged via ccsd_set_initial_guess
+    // replace the MP2 guess (consumed-and-cleared here).
+    const real_t* init_t1 = g_ccsd_init_t1;
+    const real_t* init_t2 = g_ccsd_init_t2;
+    const int max_iter_eff =
+        (g_ccsd_init_max_iter > 0) ? g_ccsd_init_max_iter : MAX_ITER;
+    g_ccsd_init_t1 = nullptr;
+    g_ccsd_init_t2 = nullptr;
+    g_ccsd_init_max_iter = -1;
     std::vector<real_t> t1(t1Size, 0.0);
     std::vector<real_t> t2v(t2Size);
-    for (int i = 0; i < nocc; i++)
-        for (int j = 0; j < nocc; j++)
-            for (int a = 0; a < nvir; a++)
-                for (int b = 0; b < nvir; b++) {
-                    size_t idx = T2(i,j,a,b);
-                    t2v[idx] = v_oovv[((size_t)i*nocc+j)*vv + (size_t)a*nvir+b] / Dijab[idx];
-                }
+    if (init_t1 != nullptr && init_t2 != nullptr) {
+        for (size_t k = 0; k < t1Size; k++) t1[k] = init_t1[k];
+        for (size_t k = 0; k < t2Size; k++) t2v[k] = init_t2[k];
+        std::cout << "CCSD warm start: initial T1/T2 injected"
+                  << (max_iter_eff != MAX_ITER
+                      ? "  (max_iter " + std::to_string(max_iter_eff) + ")" : "")
+                  << std::endl;
+    } else {
+        for (int i = 0; i < nocc; i++)
+            for (int j = 0; j < nocc; j++)
+                for (int a = 0; a < nvir; a++)
+                    for (int b = 0; b < nvir; b++) {
+                        size_t idx = T2(i,j,a,b);
+                        t2v[idx] = v_oovv[((size_t)i*nocc+j)*vv + (size_t)a*nvir+b] / Dijab[idx];
+                    }
+    }
 
     // v_ovvv reshaped for Wabcd DGEMM: v_ovvv_T[nvir³, nocc]
     std::vector<real_t> v_ovvv_T(vvv * nocc);
@@ -9031,7 +9064,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     std::vector<real_t> ampVec, errVec;
     if (!device_amp) { ampVec.resize(num_amps); errVec.resize(num_amps); }
 
-    for (int iter = 1; iter <= MAX_ITER; iter++) {
+    for (int iter = 1; iter <= max_iter_eff; iter++) {
         auto _pt0 = pf_mark();
 
         // (Phase 1 increment-2, occ-i) i-block this device owns. Full range for

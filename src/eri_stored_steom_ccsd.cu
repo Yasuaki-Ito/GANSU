@@ -350,6 +350,11 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             const ERI_RI* eri_ri = nullptr,
                             const real_t level_shift = 0.0);
 
+// (bt-polish) stage warm-start amplitudes for the NEXT ccsd_spatial_orbital
+// call (defined in eri_stored.cu; consumed-and-cleared there).
+void ccsd_set_initial_guess(const real_t* h_t1, const real_t* h_t2,
+                            int max_iter_override);
+
 extern __global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ eri_full,
                                                     real_t* __restrict__ eri_trimmed,
                                                     int N_full, int na_active, int offset);
@@ -2187,13 +2192,24 @@ void ERI_RI_RHF::compute_dlpno_steom_ccsd(int n_states) {
     // Scoped to this DLPNO-STEOM run: standalone IP/EA-EOM use a different entry
     // and are unaffected.
     if (std::getenv("GANSU_DLPNO_NATIVE_EOM") == nullptr) {
+        // bt-polish (GANSU_DLPNO_BT_POLISH): the polish replaces the CANONICAL
+        // back-transformed amplitudes only; the native per-pair σ would still
+        // consume the UNPOLISHED per-pair DLPNO state. Default the native path
+        // OFF under polish so IP/EA/STEOM consistently consume the polished
+        // canonical amplitudes (explicit GANSU_DLPNO_NATIVE_EOM=1 overrides).
+        const char* pol = std::getenv("GANSU_DLPNO_BT_POLISH");
+        const bool polish_on = (pol != nullptr && pol[0] != '0');
+        const char* nat_def = polish_on ? "0" : "1";
 #ifdef _WIN32
-        _putenv_s("GANSU_DLPNO_NATIVE_EOM", "1");
+        _putenv_s("GANSU_DLPNO_NATIVE_EOM", nat_def);
 #else
-        setenv("GANSU_DLPNO_NATIVE_EOM", "1", /*overwrite=*/0);
+        setenv("GANSU_DLPNO_NATIVE_EOM", nat_def, /*overwrite=*/0);
 #endif
-        std::cout << "  [DLPNO-STEOM] native EOM path defaulted ON "
-                     "(set GANSU_DLPNO_NATIVE_EOM=0 to disable)" << std::endl;
+        std::cout << "  [DLPNO-STEOM] native EOM path defaulted "
+                  << (polish_on ? "OFF (bt-polish active; canonical σ from "
+                                  "polished amplitudes)"
+                                : "ON (set GANSU_DLPNO_NATIVE_EOM=0 to disable)")
+                  << std::endl;
     }
 
     // MPI Step 4 stage-1 broadcast (OPT-IN, GANSU_STEOM_STAGE1_BCAST=1): rank 0
@@ -2269,6 +2285,56 @@ void ERI_RI_RHF::compute_dlpno_steom_ccsd(int n_states) {
 #endif
     std::cout << "  DLPNO-CCSD correlation energy = " << std::fixed << std::setprecision(10)
               << E_dlpno << " Ha  (fed to the canonical STEOM machinery)" << std::endl;
+
+    // ---- bt-polish (env GANSU_DLPNO_BT_POLISH=1, or =N to cap iterations) ----
+    // Warm-start a canonical CCSD from the back-transformed DLPNO amplitudes to
+    // erase the PNO-truncation error before the EOM chain (the DLPNO-vs-canonical
+    // STEOM gap is T2-truncation borne: naphthalene root0 5.08@normal /
+    // 4.90@very_tight vs canonical 4.68 — singles audit, 2026-07-08).
+    // Few DIIS iterations from the warm start; the polished amplitudes REPLACE
+    // the stored BT set, so CIS-NTO / IP / EA / STEOM all consume them (native
+    // per-pair σ is defaulted OFF above for consistency). Default OFF.
+    {
+        const char* pe = std::getenv("GANSU_DLPNO_BT_POLISH");
+        if (pe != nullptr && pe[0] != '0' && rhf_.use_dlpno_amplitudes()
+            && gpu::gpu_available()) {
+            Timer polish_timer;
+            BTAmplitudes bt = rhf_.get_dlpno_bt_amplitudes();  // copy; polished below
+            const int cap = std::atoi(pe);
+            std::cout << "---- DLPNO-STEOM bt-polish: canonical CCSD warm-started "
+                         "from DLPNO amplitudes ----" << std::endl;
+            ccsd_set_initial_guess(bt.T1.data(), bt.T2.data(),
+                                   cap > 1 ? cap : -1);
+            real_t* d_t1p = nullptr;
+            real_t* d_t2p = nullptr;
+            const real_t E_pol = ccsd_spatial_orbital(
+                /*d_eri_ao=*/nullptr,
+                rhf_.get_coefficient_matrix().device_ptr(),
+                rhf_.get_orbital_energies().device_ptr(),
+                rhf_.get_num_basis(), rhf_.get_num_electrons() / 2,
+                /*computing_ccsd_t=*/false, /*ccsd_t_energy=*/nullptr,
+                &d_t1p, &d_t2p, /*d_eri_mo_precomputed=*/nullptr,
+                rhf_.get_num_frozen_core(), /*h_fov_active=*/nullptr,
+                /*eri_ri=*/this, /*level_shift=*/0.0);
+            cudaMemcpy(bt.T1.data(), d_t1p, bt.T1.size() * sizeof(real_t),
+                       cudaMemcpyDeviceToHost);
+            cudaMemcpy(bt.T2.data(), d_t2p, bt.T2.size() * sizeof(real_t),
+                       cudaMemcpyDeviceToHost);
+            tracked_cudaFree(d_t1p);
+            tracked_cudaFree(d_t2p);
+            rhf_.set_dlpno_bt_amplitudes(std::move(bt));
+            rhf_.set_post_hf_energy(E_pol);
+            std::cout << "  [bt-polish] E_corr = " << std::fixed
+                      << std::setprecision(10) << E_pol << " Ha  (DLPNO was "
+                      << E_dlpno << ", dE = " << std::scientific
+                      << std::setprecision(2) << (E_pol - E_dlpno) << ";  "
+                      << std::fixed << std::setprecision(1)
+                      << polish_timer.elapsed_seconds() << " s)" << std::endl;
+        } else if (pe != nullptr && pe[0] != '0') {
+            std::cout << "  [bt-polish] skipped (no GPU or no BT amplitudes)."
+                      << std::endl;
+        }
+    }
 
     // Stage B opt-in (env GANSU_DLPNO_PROJECTED_EOM=1): run the Galerkin-
     // projected DLPNO-IP-EOM and DLPNO-EA-EOM (per-pair PNO 2h1p / per-i PNO(ii)
