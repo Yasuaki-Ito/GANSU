@@ -59,6 +59,10 @@ def load(xyz, basis, ncore, atom=None, active=None):
     _eeimds = eom_rccsd.EOMEESinglet(mycc).make_imds()
     bar["woVvO"] = np.asarray(_eeimds.woVvO)   # [m,b,e,j]
     bar["woVVo"] = np.asarray(_eeimds.woVVo)   # [m,b,e,j]
+    # EE-convention 1-body intermediates (exact base F for the singles-singles
+    # block; differ from IP-side Loo/Lvv by t1-dressing convention).
+    bar["Foo_ee"] = np.asarray(_eeimds.Foo)
+    bar["Fvv_ee"] = np.asarray(_eeimds.Fvv)
     dim = nocc * nvir
 
     # exact singlet/triplet effective singles H -> exact g_phph / g_phhp
@@ -91,7 +95,7 @@ def load(xyz, basis, ncore, atom=None, active=None):
     r1_ip, r2_ip, w_ip, occ_idx, _ = principal_roots_ip(mycc, nocc, nvir)
     r1_ea, r2_ea, w_ea, vir_idx, _ = principal_roots_ea(mycc, nocc, nvir)
     X_IP, X_EA = build_x_matrices(r1_ip, r1_ea, occ_idx, vir_idx)
-    return dict(bar=bar, nocc=nocc, nvir=nvir, dim=dim,
+    return dict(bar=bar, nocc=nocc, nvir=nvir, dim=dim, t1=t1, t2=t2,
                 r1_ip=r1_ip, r1_ea=r1_ea,
                 r2_ip=r2_ip, r2_ea=r2_ea, X_IP=X_IP, X_EA=X_EA,
                 occ_idx=occ_idx, vir_idx=vir_idx, G_s=G_s, G_t=G_t,

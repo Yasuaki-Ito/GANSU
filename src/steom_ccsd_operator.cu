@@ -4487,17 +4487,85 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     // (UBMJC) already matches ORCA on H2O/CH2O (n->pi* 0.04-0.08 eV). The correct small EA route
     // is derived in memory pt41 but adding it lands at the 2nd-order {e^S}, below ORCA (pt42).
 
+    // ---- FULL-CLASS projection replacement (2026-07-08, franken-G experiment) ----
+    // env GANSU_STEOM_PROJ_FULL=1 (default OFF).  ⚠⚠ FULL-ACTIVE-SPACE ONLY — DO NOT
+    // USE IN PRODUCTION.  The mode is formula-exact (gates: H2O FC1 + hexatriene
+    // pi-CAS singlet+triplet == det e^S oracle to <1e-4 eV, incl. PARTIAL-root gates;
+    // .inc machine-verified 2e-17; C++ routes == Python zero-padded evaluation to
+    // 1e-18), but the plain-BCH-projection representation it computes requires S
+    // amplitudes for essentially EVERY orbital: the relaxation enters G through 1h1p
+    // couplings that each need an IP/EA root at their orbital.  With a production
+    // active space (naphthalene: 12/24 occ, 14/156 vir roots) ~90% of those channels
+    // are zeroed and the whole spectrum blue-shifts ~+4.5 eV (HOMO-LUMO diag
+    // 0.217 -> 0.402 Ha; hexatriene det oracle reproduces the effect when roots are
+    // dropped: root0 5.35 -> 5.75 eV).  The connected/CFOUR form (shipped) stays
+    // physical at partial S precisely because its F_eff/u-dressing re-sums that
+    // physics per active root.  Background/derivation: memory
+    // project_dlpno_steom_orca_reconsider 続48; franken-G mechanism (why the off-diag
+    // -only replacement below breaks single-config roots): script/steom_gphph_franken.py.
+    const bool proj_full = (std::getenv("GANSU_STEOM_PROJ_FULL") != nullptr);
+    if (proj_full) {
+        std::vector<real_t> proj_route_ph((size_t)NO*NV*NO*NV, 0.0);
+        std::vector<real_t> proj_route_mc((size_t)NO*NV*NO*NV, 0.0);
+        #include "steom_gphph_projection_full.inc"
+        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+            real_t nph=0.0, nmc=0.0, nph_d=0.0;
+            for (int i=0;i<NO;++i) for (int a=0;a<NV;++a)
+                for (int j=0;j<NO;++j) for (int b=0;b<NV;++b) {
+                    const size_t x=(((size_t)i*NV+a)*NO+j)*NV+b;
+                    nph += proj_route_ph[x]*proj_route_ph[x];
+                    nmc += proj_route_mc[x]*proj_route_mc[x];
+                    if (i==j || a==b) nph_d += proj_route_ph[x]*proj_route_ph[x];
+                }
+            std::cout << "[proj-full] route norms: ||route_ph|| = " << std::scientific
+                      << std::sqrt(nph) << " (diag/semi part " << std::sqrt(nph_d)
+                      << "), ||route_mc|| = " << std::sqrt(nmc)
+                      << std::defaultfloat << std::endl;
+        }
+        if (const char* dp = std::getenv("GANSU_STEOM_PROJ_DUMP")) {
+            auto wr = [&](const char* nm, const void* p, size_t bytes) {
+                FILE* f = fopen((std::string(dp) + nm).c_str(), "wb");
+                if (f) { fwrite(p, 1, bytes, f); fclose(f); }
+            };
+            const int dims[4] = {NO, NV, NMo, NMv};
+            wr("_dims.bin",  dims, sizeof(dims));
+            wr("_aocc.bin",  active_occ_idx_.data(), (size_t)NMo*sizeof(int));
+            wr("_avir.bin",  active_vir_idx_.data(), (size_t)NMv*sizeof(int));
+            wr("_fov.bin",   Fov.data(),   Fov.size()*sizeof(real_t));
+            wr("_wooov.bin", Wooov.data(), Wooov.size()*sizeof(real_t));
+            wr("_wvovv.bin", Wvovv.data(), Wvovv.size()*sizeof(real_t));
+            wr("_eriov.bin", ERIov.data(), ERIov.size()*sizeof(real_t));
+            wr("_sip.bin",   sIP.data(),   sIP.size()*sizeof(real_t));
+            wr("_sea.bin",   sEA.data(),   sEA.size()*sizeof(real_t));
+            wr("_rph.bin",   proj_route_ph.data(), proj_route_ph.size()*sizeof(real_t));
+            wr("_rmc.bin",   proj_route_mc.data(), proj_route_mc.size()*sizeof(real_t));
+            std::cout << "  [proj-full] dumped route arrays + inputs to " << dp
+                      << "_*.bin" << std::endl;
+        }
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int i=0;i<NO;++i) for (int a=0;a<NV;++a)
+            for (int j=0;j<NO;++j) for (int b=0;b<NV;++b) {
+                const size_t x=(((size_t)i*NV+a)*NO+j)*NV+b;
+                GPHPH(a,j,b,i) = wovov(j,a,i,b) + proj_route_ph[x];
+                if (!triplet_)
+                    GPHHP(b,j,i,a) = wovvo(j,a,b,i) + proj_route_mc[x];
+            }
+        std::cout << "  STEOM g_phph/g_phhp: FULL-CLASS PROJECTION replacement "
+                  << "(GANSU_STEOM_PROJ_FULL; EE F-base in G assembly)." << std::endl;
+    }
+
     // ---- PROJECTION off-diagonal replacement (2026-07-07, config-coupling overshoot fix) ----
     // env GANSU_STEOM_GPHPH_PROJECTION=1 (default OFF => shipped behaviour bit-identical).
     // Replaces the i!=j && a!=b (config-coupling) block of g_phph AND g_phhp with the exact
     // order-2 projection route of the second similarity transform (plain BCH projection = the
     // ORCA/det-oracle convention): g_phph = Wovov base + (Mc-Ms), g_phhp = Wovvo(EE) base + Mc.
-    // Diag/semi-diag keep the connected/F_eff-consistent values above (a full replacement
-    // double-counts the F_eff dressing). The generated .inc evaluates the 96+84 spatial terms
+    // Diag/semi-diag keep the connected/F_eff-consistent values above.  ⚠ franken-G: this
+    // mix repairs config-mixed roots but breaks single-config ones (La); prefer
+    // GANSU_STEOM_PROJ_FULL above. The generated .inc evaluates the 96+84 spatial terms
     // (auto-derived + machine-verified: script/steom_gphph_cppgen.py; gates = H2O FC1 +
     // hexatriene pi-CAS eigenvalues == determinant e^S oracle to 1e-8 eV; memory
     // project_dlpno_steom_orca_reconsider step1続31-37).
-    if (std::getenv("GANSU_STEOM_GPHPH_PROJECTION")) {
+    if (!proj_full && std::getenv("GANSU_STEOM_GPHPH_PROJECTION")) {
         std::vector<real_t> proj_route_ph((size_t)NO*NV*NO*NV, 0.0);
         std::vector<real_t> proj_route_mc((size_t)NO*NV*NO*NV, 0.0);
         #include "steom_gphph_projection.inc"
@@ -4534,6 +4602,35 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     //  (spin adaptation of the 1h1p operator; the Coulomb g_phhp channel carries a
     //   factor 2 in the singlet and 0 in the triplet, exactly as in CIS. Same
     //   convention as the Python reference steom_eig_harness.py assemble().)
+    //  GANSU_STEOM_PROJ_FULL: the F-base is the EE one-body (no S-dressing — that is
+    //  now carried by the projection route delta terms):
+    //    Foo_ee[m,i] = Loo[m,i] − Σ_e Fov[m,e]·t1[i,e]   (accessed TRANSPOSED [j,i]:
+    //                  Hbar is non-Hermitian, the ket hole is the row; cf. PySCF
+    //                  Hr1 −= einsum('mi,ma->ia', Foo, r1))
+    //    Fvv_ee[a,c] = Lvv[a,c] + Σ_k t1[k,a]·Fov[k,c]
+    //  Verified: base identity vs raw det Hbar block 3e-9 (steom_gphph_fullgate.py).
+    std::vector<real_t> FooP, FvvP;
+    if (proj_full) {
+        FooP = Loo; FvvP = Lvv;
+        if (d_t1_ != nullptr) {
+            std::vector<real_t> h_t1p = pull(d_t1_, (size_t)NO*NV);
+            #pragma omp parallel for collapse(2)
+            for (int m=0;m<NO;++m) for (int i=0;i<NO;++i) {
+                real_t u=0.0;
+                for (int e=0;e<NV;++e) u += fov(m,e)*h_t1p[(size_t)i*NV+e];
+                FooP[(size_t)m*NO+i] -= u;
+            }
+            #pragma omp parallel for collapse(2)
+            for (int a=0;a<NV;++a) for (int c=0;c<NV;++c) {
+                real_t u=0.0;
+                for (int k=0;k<NO;++k) u += h_t1p[(size_t)k*NV+a]*fov(k,c);
+                FvvP[(size_t)a*NV+c] += u;
+            }
+        } else {
+            std::cout << "  [proj-full] WARNING: d_t1_ is null — EE F-base t1 correction "
+                      << "skipped (Loo/Lvv used; ~0.004 eV level)." << std::endl;
+        }
+    }
     std::vector<real_t> Gmat((size_t)total_dim_*total_dim_, 0.0);
     #pragma omp parallel for collapse(2) schedule(static)  // distinct row=(i,a) per thread
     for (int i=0;i<NO;++i) for(int a=0;a<NV;++a){
@@ -4542,8 +4639,8 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
             const int col=j*NV+b;
             real_t v = triplet_ ? -GPHPH(a,j,b,i)
                                 : 2.0*GPHHP(b,j,i,a) - GPHPH(a,j,b,i);
-            if (i==j) v += Fvv[(size_t)a*NV+b];
-            if (a==b) v -= Foo[(size_t)i*NO+j];
+            if (i==j) v += proj_full ? FvvP[(size_t)a*NV+b] : Fvv[(size_t)a*NV+b];
+            if (a==b) v -= proj_full ? FooP[(size_t)j*NO+i] : Foo[(size_t)i*NO+j];
             Gmat[(size_t)row*total_dim_+col]=v;
         }
     }
