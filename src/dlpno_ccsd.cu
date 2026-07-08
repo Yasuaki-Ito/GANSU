@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <fstream>   // GANSU_DLPNO_BT_DUMP singles diagnostic
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -221,21 +222,15 @@ inline Phase24Integrals precompute_phase24_integrals(
     out.W_ovvo_bare_j.assign(n_pairs, {});
     out.W_oovv_bare_i.assign(n_pairs, {});
     out.W_oovv_bare_j.assign(n_pairs, {});
-    // Increment 2 / S1: VVOV (i/j orientations) + VOOO per strong pair for the
-    // linear T1→T2 back-coupling in the CCSD T2 residual. Filled below per pair.
-    out.W_vvov_i.assign(n_pairs, {});
-    out.W_vvov_j.assign(n_pairs, {});
-    out.W_vooo_i.assign(n_pairs, {});
-    // Increment 2 / S2: off-diag ovvv (occ i/j) + ooov/oovo per strong pair for
-    // the T2-driven T1 sources that complete the coupled singles. Filled below.
+    // Increment 2 / S2: off-diag ovvv (occ i/j) + exchange-paired ooov/oovo per
+    // strong pair for the T2-driven T1 sources that complete the coupled
+    // singles. Filled below. (S1/S4 singles couplings reuse the always-built
+    // W_ovvv_pi/pj, W_ovoo_lambda/_alt and W_ovov_i/W_ovvo_i blocks — see the
+    // pairing note in dlpno_pair_data.hpp.)
     out.W_ovvv_pi.assign(n_pairs, {});
     out.W_ovvv_pj.assign(n_pairs, {});
     out.W_ooov_pq.assign(n_pairs, {});
     out.W_oovo_pq.assign(n_pairs, {});
-    // Increment 2 / S4: w_voov·t1 blocks, stored per LMO (diagonal pairs only),
-    // like W_ovvv_diag. Filled below when is_diag.
-    out.W_voov_diag.assign(res.nocc, {});
-    out.W_vovo_diag.assign(res.nocc, {});
 
     // Phase B — multi-GPU pair-parallel integral build.
     //   Detect distributed RI back-end with replicated B; if available,
@@ -404,36 +399,22 @@ inline Phase24Integrals precompute_phase24_integrals(
                 BI(si, 1, n_lmo, n_pno, n_lmo, n_pno, n_lmo, n_pno,
                    P + layout.off_W_ovvv_diag);
             }
-            // Increment 2 / S1 — VVOV + VOOO (T1→T2 linear back-coupling).
-            //   W_vvov_i[a,b,c] = (a' b' | si c') = (ab|ic); _j with sj.
-            //   W_vooo_i[a,k]   = (a' k  | si sj) = (ak|ij).
-            // All natural mo_eri_block_into layout == dest (no relayout).
+            // Increment 2 / S2 — off-diag ovvv + exchange-paired ooov/oovo
+            // (see dlpno_pair_data.hpp pairing note; the S1/S4 couplings
+            // reuse the always-built W_ovvv_pi/pj, W_ovoo_lambda/_alt and
+            // W_ovov_i/W_ovvo_i blocks — no extra extraction needed).
             // Gated: layout reserves these blocks only when singles_want.
             if (singles_want) {
-                BI(n_lmo, n_pno, n_lmo, n_pno, si, 1, n_lmo, n_pno,
-                   P + layout.off_W_vvov_i);
-                BI(n_lmo, n_pno, n_lmo, n_pno, sj, 1, n_lmo, n_pno,
-                   P + layout.off_W_vvov_j);
-                BI(n_lmo, n_pno, 0, n_lmo, si, 1, sj, 1,
-                   P + layout.off_W_vooo_i);
-                // S2 — off-diag ovvv: W_ovvv_pi[a,b,c]=(si a'|b' c'); _pj with sj.
-                //   W_ooov_pq[i,c]=(si sj|i c'); W_oovo_pq[c,i]=(si sj|c' i).
+                // W_ovvv_pi[a,b,c]=(si a'|b' c'); _pj with sj.
                 BI(si, 1, n_lmo, n_pno, n_lmo, n_pno, n_lmo, n_pno,
                    P + layout.off_W_ovvv_pi);
                 BI(sj, 1, n_lmo, n_pno, n_lmo, n_pno, n_lmo, n_pno,
                    P + layout.off_W_ovvv_pj);
-                BI(si, 1, sj, 1, 0, n_lmo, n_lmo, n_pno,
+                // W_ooov_pq[i,c]=(si i|sj c'); W_oovo_pq[i,c]=(sj i|si c').
+                BI(si, 1, 0, n_lmo, sj, 1, n_lmo, n_pno,
                    P + layout.off_W_ooov_pq);
-                BI(si, 1, sj, 1, n_lmo, n_pno, 0, n_lmo,
+                BI(sj, 1, 0, n_lmo, si, 1, n_lmo, n_pno,
                    P + layout.off_W_oovo_pq);
-                // S4 — w_voov·t1 blocks, diagonal pair only (occ = si).
-                //   W_voov_diag[a,k,c]=(a' k|si c'); W_vovo_diag[a,k,c]=(a' k|c' si).
-                if (is_diag) {
-                    BI(n_lmo, n_pno, 0, n_lmo, si, 1, n_lmo, n_pno,
-                       P + layout.off_W_voov_diag);
-                    BI(n_lmo, n_pno, 0, n_lmo, n_lmo, n_pno, si, 1,
-                       P + layout.off_W_vovo_diag);
-                }
             }
 
             // --- Relayout blocks (build into scratch, transpose mid → dest) ---
@@ -520,20 +501,11 @@ inline Phase24Integrals precompute_phase24_integrals(
         copy_block(out.W_ovvo_bare_j[idx], layout.off_W_ovvo_bare_j, layout.sz_W_ovov);
         copy_block(out.W_oovv_bare_i[idx], layout.off_W_oovv_bare_i, layout.sz_W_ovov);
         copy_block(out.W_oovv_bare_j[idx], layout.off_W_oovv_bare_j, layout.sz_W_ovov);
-        // Increment 2 / S1: VVOV (i/j) + VOOO.
-        copy_block(out.W_vvov_i[idx], layout.off_W_vvov_i, layout.sz_vvov);
-        copy_block(out.W_vvov_j[idx], layout.off_W_vvov_j, layout.sz_vvov);
-        copy_block(out.W_vooo_i[idx], layout.off_W_vooo_i, layout.sz_vooo);
         // Increment 2 / S2: off-diag ovvv (i/j) + ooov/oovo.
         copy_block(out.W_ovvv_pi[idx], layout.off_W_ovvv_pi, layout.sz_ovvv);
         copy_block(out.W_ovvv_pj[idx], layout.off_W_ovvv_pj, layout.sz_ovvv);
         copy_block(out.W_ooov_pq[idx], layout.off_W_ooov_pq, layout.sz_ooov);
         copy_block(out.W_oovo_pq[idx], layout.off_W_oovo_pq, layout.sz_ooov);
-        // Increment 2 / S4: w_voov·t1 blocks (diagonal pairs, per LMO).
-        if (is_diag) {
-            copy_block(out.W_voov_diag[s.i], layout.off_W_voov_diag, layout.sz_voov);
-            copy_block(out.W_vovo_diag[s.i], layout.off_W_vovo_diag, layout.sz_voov);
-        }
 
         (void)s;  // s used above; suppress -Wunused if conditional.
     }
@@ -1068,13 +1040,179 @@ real_t DLPNOCCSD::compute_energy()
     // 0 unless the singles are active (T1≈0 otherwise).
     real_t E_t1t1 = 0.0;
     if (ccsd_singles_inc1) {
+        // -------------------------------------------------------------------
+        // Increments C + A (2026-07-08): correlation dressings of the T1
+        // equation that the bare increment-1/2 set lacks (term audit:
+        // script/dlpno_singles_term_audit.py — missing C+A leaves an 8-16%
+        // T1 error with a ~20% norm overshoot; with C+A the fixed point is
+        // within ~1% of canonical T1).
+        //   C: Fac/Fki tau-dressing of the linear operator
+        //      (canonical eri_stored.cu:7003-7027 — Fki = Σ w·(t2+t1t1),
+        //       Fac = −Σ w·(t2+t1t1); the DLPNO linear part had bare Fock only)
+        //   A: + Σ_kc F̃kc·(2·t2_ki^{ca} − t2_ik^{ca} + t1_ic·t1_ka),
+        //      F̃kc = Σ_ld w_oovv·t1 (eri_stored.cu:6993-7001, 7138-7142)
+        // Both are evaluated with canonical-basis intermediates: the (ov|ov)
+        // MO block (built once) + the back-transformed T2/T1 (rebuilt at each
+        // solve_t1 entry; the same bt the hybrid DLPNO-STEOM already needs).
+        // Escape hatch: GANSU_DLPNO_SINGLES_NO_DRESS=1 reverts to the bare set.
+        // -------------------------------------------------------------------
+        const bool singles_dress =
+            std::getenv("GANSU_DLPNO_SINGLES_NO_DRESS") == nullptr;
+        const int  num_fc_sd = rhf_.get_num_frozen_core();
+        const int  no_tot_sd = nocc_ + num_fc_sd;
+        const int  nvir_sd   = nao_ - no_tot_sd;
+        std::vector<real_t> w_ovov_sd;      // [(i·nv+a)(j·nv+b)] = 2(ia|jb)−(ib|ja)
+        std::vector<real_t> C_vir_sd;       // [nao × nvir] canonical virtuals
+        std::vector<RowMatXd> V1_sd(nocc_); // per-LMO CiiᵀS·Cv [n_pao × nvir]
+        bool dress_ok = false;
+        if (singles_dress && nvir_sd > 0) {
+            const double mo_eri_gb = std::pow((double)nao_, 4) * 8.0 / 1e9;
+            if (mo_eri_gb < 40.0) {
+                rhf_.get_coefficient_matrix().toHost();
+                const real_t* C_full = rhf_.get_coefficient_matrix().host_ptr();
+                C_vir_sd.assign((size_t)nao_ * nvir_sd, 0.0);
+                for (int mu = 0; mu < nao_; ++mu)
+                    for (int a = 0; a < nvir_sd; ++a)
+                        C_vir_sd[(size_t)mu * nvir_sd + a] =
+                            C_full[(size_t)mu * nao_ + (no_tot_sd + a)];
+                // (ov|ov) chemist block gathered plane-wise from the full MO
+                // ERI (RI-backed build_mo_eri, same call BT_VALIDATE uses).
+                real_t* d_mo_eri_sd = eri_.build_mo_eri(
+                    rhf_.get_coefficient_matrix().device_ptr(), nao_);
+                w_ovov_sd.assign(
+                    (size_t)nocc_ * nvir_sd * nocc_ * nvir_sd, 0.0);
+                {
+                    const size_t nao2 = (size_t)nao_ * nao_;
+                    std::vector<real_t> plane(nao2);
+                    for (int i = 0; i < nocc_; ++i)
+                        for (int x = 0; x < nvir_sd; ++x) {
+                            const size_t off =
+                                ((size_t)(num_fc_sd + i) * nao_ +
+                                 (no_tot_sd + x)) * nao2;
+                            cudaMemcpy(plane.data(), d_mo_eri_sd + off,
+                                       nao2 * sizeof(real_t),
+                                       cudaMemcpyDeviceToHost);
+                            for (int j = 0; j < nocc_; ++j)
+                                for (int y = 0; y < nvir_sd; ++y) {
+                                    const real_t v =
+                                        plane[(size_t)(num_fc_sd + j) * nao_ +
+                                              (no_tot_sd + y)];
+                                    // (ix|jy): +2v into w[i,x,j,y]; the same
+                                    // value is the exchange of w[i,y,j,x].
+                                    w_ovov_sd[(((size_t)i * nvir_sd + x) * nocc_
+                                               + j) * nvir_sd + y] += 2.0 * v;
+                                    w_ovov_sd[(((size_t)i * nvir_sd + y) * nocc_
+                                               + j) * nvir_sd + x] -= v;
+                                }
+                        }
+                }
+                tracked_cudaFree(d_mo_eri_sd);
+                Eigen::Map<const RowMatXd> Smat(h_S, nao_, nao_);
+                Eigen::Map<const RowMatXd> Cv(C_vir_sd.data(), nao_, nvir_sd);
+                const RowMatXd SCv = Smat * Cv;   // [nao × nvir]
+                for (int i = 0; i < nocc_; ++i) {
+                    const int idx_ii = res.pair_lookup[i * nocc_ + i];
+                    const PairSetup& s_ii = res.setups[idx_ii];
+                    if (s_ii.n_pao == 0) continue;
+                    Eigen::Map<const RowMatXd> Cii(
+                        s_ii.C_can_pair.data(), nao_, s_ii.n_pao);
+                    V1_sd[i] = Cii.transpose() * SCv;   // [n_pao × nvir]
+                }
+                dress_ok = true;
+                if (params_.verbose >= 1)
+                    std::cout << "[DLPNO-CCSD] singles C+A dressing active "
+                              << "(nvir=" << nvir_sd << ", w_ovov "
+                              << std::fixed << std::setprecision(1)
+                              << (w_ovov_sd.size() * 8.0 / 1e6) << " MB)"
+                              << std::endl;
+            } else if (params_.verbose >= 1) {
+                std::cout << "[DLPNO-CCSD] singles C+A dressing skipped "
+                          << "(full MO ERI " << std::fixed
+                          << std::setprecision(1) << mo_eri_gb
+                          << " GB over cap)" << std::endl;
+            }
+        }
+        const bool uloc_id_sd =
+            (static_cast<int>(res.U_loc.size()) != nocc_ * nocc_);
+        // t2-dependent dressing intermediates, rebuilt at solve_t1 entry.
+        std::vector<real_t> t2c_sd;             // canonical T2 (active)
+        RowMatXd t1c_sd;                        // canonical T1 at entry (lagged)
+        RowMatXd Fki_lmo_sd;                    // [nocc × nocc] LMO basis
+        std::vector<RowMatXd> Fac_pao_sd(nocc_);
+
         // Increment 2 (full singles, coupled T1↔T2). Factor the T1 Jacobi solve
         // into a lambda reused for the first T1 and inside the coupled macro loop.
         auto solve_t1 = [&]() {
+        // ---- C+A: dressing intermediates from the current amplitudes ----
+        if (dress_ok) {
+            BTAmplitudes btd = bt_pno_to_canonical(
+                res, res.U_loc, C_vir_sd, h_S, nao_, nvir_sd, T1,
+                /*include_t1=*/true);
+            t2c_sd = std::move(btd.T2);
+            t1c_sd = Eigen::Map<const RowMatXd>(
+                btd.T1.data(), nocc_, nvir_sd);
+            const size_t vvs = (size_t)nvir_sd * nvir_sd;
+            // Fki_can[k,i] = Σ_lcd w[k,c,l,d]·(t2c[i,l,c,d] + t1c[i,c]t1c[l,d])
+            RowMatXd Fki_can(nocc_, nocc_);
+            #pragma omp parallel for collapse(2) schedule(static)
+            for (int k = 0; k < nocc_; ++k)
+                for (int i = 0; i < nocc_; ++i) {
+                    real_t acc = 0.0;
+                    for (int l = 0; l < nocc_; ++l) {
+                        const real_t* t2il =
+                            t2c_sd.data() + ((size_t)i * nocc_ + l) * vvs;
+                        for (int c = 0; c < nvir_sd; ++c) {
+                            const real_t* wr = w_ovov_sd.data()
+                                + (((size_t)k * nvir_sd + c) * nocc_ + l)
+                                  * nvir_sd;
+                            const real_t t1ic = t1c_sd(i, c);
+                            for (int d = 0; d < nvir_sd; ++d)
+                                acc += wr[d] * (t2il[(size_t)c * nvir_sd + d]
+                                                + t1ic * t1c_sd(l, d));
+                        }
+                    }
+                    Fki_can(k, i) = acc;
+                }
+            // Fac_can[a,c] = −Σ_kld w[k,c,l,d]·(t2c[k,l,a,d] + t1c[k,a]t1c[l,d])
+            RowMatXd Fac_can(nvir_sd, nvir_sd);
+            #pragma omp parallel for schedule(static)
+            for (int a = 0; a < nvir_sd; ++a)
+                for (int c = 0; c < nvir_sd; ++c) {
+                    real_t acc = 0.0;
+                    for (int k = 0; k < nocc_; ++k) {
+                        const real_t t1ka = t1c_sd(k, a);
+                        for (int l = 0; l < nocc_; ++l) {
+                            const real_t* wr = w_ovov_sd.data()
+                                + (((size_t)k * nvir_sd + c) * nocc_ + l)
+                                  * nvir_sd;
+                            const real_t* t2kl =
+                                t2c_sd.data() + ((size_t)k * nocc_ + l) * vvs
+                                + (size_t)a * nvir_sd;
+                            for (int d = 0; d < nvir_sd; ++d)
+                                acc += wr[d] * (t2kl[d] + t1ka * t1c_sd(l, d));
+                        }
+                    }
+                    Fac_can(a, c) = -acc;
+                }
+            // Occupied rotation to LMO + per-LMO PAO(ii) projection.
+            if (uloc_id_sd) {
+                Fki_lmo_sd = Fki_can;
+            } else {
+                Eigen::Map<const RowMatXd> Uloc(
+                    res.U_loc.data(), nocc_, nocc_);
+                Fki_lmo_sd = Uloc.transpose() * Fki_can * Uloc;
+            }
+            for (int i = 0; i < nocc_; ++i) {
+                if (V1_sd[i].size() == 0) { Fac_pao_sd[i].resize(0, 0); continue; }
+                Fac_pao_sd[i].noalias() =
+                    V1_sd[i] * Fac_can * V1_sd[i].transpose();
+            }
+        }
         // ---- Increment 2 / S2: T2-driven T1 sources, precomputed once per
         // solve_t1 call (Y is fixed here; the Jacobi sweeps below only relax T1).
-        //   (a) off-diag ovvv·t2 (k≠i):  +Σ_cd (2(ka|dc)−(ka|cd)) t2_ik^cd
-        //   (b) ooov·t2:                 −Σ_klc (2(kl|ic)−(kl|ci)) t2_kl^ac
+        // Chemist (exchange-paired; see dlpno_pair_data.hpp pairing note):
+        //   (a) off-diag ovvv·t2 (k≠i):  +Σ_cd (2(ac|kd)−(ad|kc)) t2_ik^cd
+        //   (b) ooov·t2:                 −Σ_klc (2(ki|lc)−(kc|li)) t2_kl^ac
         // Each pair accumulates an AO-space source per target LMO; the result is
         // projected to covariant PAO(ii) (C_can_pair S-orthonormal ⇒ this equals
         // the M-projection of the inc-1 diagonal source). canonical val sign.
@@ -1090,21 +1228,30 @@ real_t DLPNOCCSD::compute_energy()
                 Eigen::Map<const RowMatXd> bQ(p.bar_Q.data(), nao_, n);
                 Eigen::Map<const RowMatXd> Y(p.Y.data(), n, n);
 
-                // (b) ooov·t2 — contributes to ALL LMO i.
+                // (b) ooov·t2 — contributes to ALL LMO i. Canonical (physicist
+                // eri_stored.cu:7150-7153): −Σ_klc [2<kl|ic>−<kl|ci>]·t2_kl^ac,
+                // i.e. chemist −Σ_klc [2(ki|lc)−(kc|li)]·t2_kl^ac. For stored
+                // pair (p,q)=(pi,pj) with A[i,c]=(pi|qc), B[i,c]=(qi|pc)
+                // (note (pc|qi)=(qi|pc)):
+                //   (k,l)=(p,q): W2a=2A−B contracted with t2_pq^ac = Y[a,c]
+                //   (k,l)=(q,p): W2b=2B−A contracted with t2_qp^ac = Y[c,a]
+                //   S[i,a] = −(W2a·Yᵀ)[i,a] − (W2b·Y)[i,a];  diag: −(A·Yᵀ).
                 if (idx < phase24.W_ooov_pq.size()
                     && phase24.W_ooov_pq[idx].size() == (size_t)nocc_ * n
-                    && phase24.W_oovo_pq[idx].size() == (size_t)n * nocc_) {
-                    const real_t* WO = phase24.W_ooov_pq[idx].data();  // [i·n + c]
-                    const real_t* WV = phase24.W_oovo_pq[idx].data();  // [c·nocc + i]
-                    RowMatXd W2(nocc_, n);   // 2(kl|ic) − (kl|ci)
-                    for (int i2 = 0; i2 < nocc_; ++i2)
-                        for (int c = 0; c < n; ++c)
-                            W2(i2, c) = 2.0 * WO[(size_t)i2 * n + c]
-                                      -       WV[(size_t)c * nocc_ + i2];
-                    const RowMatXd Yeff = (pi == pj)
-                        ? RowMatXd(Y) : RowMatXd(Y + Y.transpose());
-                    // S[i,a] = −Σ_c W2[i,c]·Yeff[a,c] = −(W2·Yeffᵀ)[i,a]
-                    const RowMatXd S = -(W2 * Yeff.transpose());   // nocc × n
+                    && phase24.W_oovo_pq[idx].size() == (size_t)nocc_ * n) {
+                    Eigen::Map<const RowMatXd> A(
+                        phase24.W_ooov_pq[idx].data(), nocc_, n);
+                    Eigen::Map<const RowMatXd> B(
+                        phase24.W_oovo_pq[idx].data(), nocc_, n);
+                    RowMatXd S(nocc_, n);
+                    if (pi == pj) {
+                        S.noalias() = -(A * Y.transpose());
+                    } else {
+                        const RowMatXd W2a = 2.0 * A - B;
+                        const RowMatXd W2b = 2.0 * B - A;
+                        S.noalias()  = -(W2a * Y.transpose());
+                        S.noalias() -= W2b * Y;
+                    }
                     src_ao_all.noalias() += bQ * S.transpose();    // nao × nocc
                 }
 
@@ -1115,7 +1262,11 @@ real_t DLPNOCCSD::compute_energy()
                     && phase24.W_ovvv_pj[idx].size() == (size_t)n * n * n) {
                     const real_t* Wpi = phase24.W_ovvv_pi[idx].data();  // (pi a|b c)
                     const real_t* Wpj = phase24.W_ovvv_pj[idx].data();  // (pj a|b c)
-                    // ovvv[a] = Σ_cd (2 W[a,d,c] − W[a,c,d])·Ym[c,d]
+                    // Canonical (physicist): +Σ_cd [2<ak|cd>−<ak|dc>]·τ_ik^cd,
+                    // chemist +Σ_cd [2(ac|kd)−(ad|kc)]·τ^cd. With the block
+                    // W[x,y,z] = (k x|y z): (ac|kd)=(kd|ac)=W[d,a,c] and
+                    // (ad|kc)=(kc|ad)=W[c,a,d]:
+                    //   ovvv[a] = Σ_cd (2 W[d,a,c] − W[c,a,d])·Ym[c,d]
                     auto ovvv_contract =
                         [&](const real_t* W, const RowMatXd& Ym) {
                             Eigen::VectorXd sv(n);
@@ -1123,8 +1274,8 @@ real_t DLPNOCCSD::compute_energy()
                                 real_t acc = 0.0;
                                 for (int c = 0; c < n; ++c)
                                     for (int d = 0; d < n; ++d)
-                                        acc += (2.0 * W[((size_t)a*n+d)*n+c]
-                                              -       W[((size_t)a*n+c)*n+d])
+                                        acc += (2.0 * W[((size_t)d*n+a)*n+c]
+                                              -       W[((size_t)c*n+a)*n+d])
                                              * Ym(c, d);
                                 sv(a) = acc;
                             }
@@ -1161,8 +1312,8 @@ real_t DLPNOCCSD::compute_energy()
             real_t r_max = 0.0;
 
             // ---- Increment 2 / S4: w_voov·t1 ring restoring source ----
-            // Canonical T1 (eri_stored.cu:8024-8027) val += Σ_kc w_voov[a,k,i,c]
-            // ·t1[k,c], w_voov = 2(ak|ic)−(ak|ci) = 2·W_ovov_i − W_ovvo_i for the
+            // Canonical T1 (eri_stored.cu:7143-7145) val += Σ_kc w_voov[a,k,i,c]
+            // ·t1[k,c], w_voov = 2<ak|ic>−<ak|ci> = 2·W_ovov_i − W_ovvo_i for the
             // diagonal pair (I=i). This LINEAR-in-t1 term is the restoring force
             // missing so far (T1 blew up). It needs t1[k] projected into each
             // pair(ii) PNO; precompute the AO column St1ao[:,k] = S·bar_Q_kk·
@@ -1181,6 +1332,70 @@ real_t DLPNOCCSD::compute_energy()
                     const Eigen::VectorXd t1pno = Mkk.transpose() * tk;   // PNO(kk)
                     Eigen::Map<const RowMatXd> bQkk(pkk.bar_Q.data(), nao_, pkk.n_pno);
                     wv_St1ao.col(k).noalias() = Smat * (bQkk * t1pno);
+                }
+            }
+
+            // ---- Increment A: F̃kc·(2t2−t2ᵀ+t1t1) source, canonical detour.
+            // Exact per-iteration linear(+quadratic) operator on T1_old:
+            //   t1_can = Uloc·(V1ᵀ·t1_pao);  F̃ = w_ovov·t1_can (GEMV);
+            //   term_can[i,a] = Σ_kc F̃[k,c]·(2t2c[k,i,c,a]−t2c[i,k,c,a])
+            //                   + Σ_k (F̃_k·t1_can_i)·t1_can[k,a];
+            //   A_src_lmo = Ulocᵀ·term_can  → per-i V1·row → R += (val + sign).
+            RowMatXd A_src_lmo;
+            if (dress_ok && !t2c_sd.empty()) {
+                RowMatXd t1_lmo = RowMatXd::Zero(nocc_, nvir_sd);
+                for (int l = 0; l < nocc_; ++l) {
+                    const int idx_ll = res.pair_lookup[l * nocc_ + l];
+                    const int n_pao_l = res.setups[idx_ll].n_pao;
+                    if (V1_sd[l].size() == 0
+                        || static_cast<int>(T1_old[l].size()) != n_pao_l)
+                        continue;
+                    Eigen::Map<const Eigen::VectorXd> tl(
+                        T1_old[l].data(), n_pao_l);
+                    t1_lmo.row(l) = (V1_sd[l].transpose() * tl).transpose();
+                }
+                RowMatXd t1_can;
+                if (uloc_id_sd) {
+                    t1_can = t1_lmo;
+                } else {
+                    Eigen::Map<const RowMatXd> Uloc(
+                        res.U_loc.data(), nocc_, nocc_);
+                    t1_can.noalias() = Uloc * t1_lmo;
+                }
+                const size_t ovn = (size_t)nocc_ * nvir_sd;
+                Eigen::Map<const RowMatXd> Wm(
+                    w_ovov_sd.data(), (Eigen::Index)ovn, (Eigen::Index)ovn);
+                Eigen::Map<const Eigen::VectorXd> t1v(
+                    t1_can.data(), (Eigen::Index)ovn);
+                const Eigen::VectorXd fkc_v = Wm * t1v;
+                Eigen::Map<const RowMatXd> Fkc_m(
+                    fkc_v.data(), nocc_, nvir_sd);
+                RowMatXd term_can(nocc_, nvir_sd);
+                const size_t vvs = (size_t)nvir_sd * nvir_sd;
+                #pragma omp parallel for collapse(2) schedule(static)
+                for (int i2 = 0; i2 < nocc_; ++i2)
+                    for (int a = 0; a < nvir_sd; ++a) {
+                        real_t acc = 0.0;
+                        for (int k = 0; k < nocc_; ++k) {
+                            const real_t* t2ki = t2c_sd.data()
+                                + ((size_t)k * nocc_ + i2) * vvs;
+                            const real_t* t2ik = t2c_sd.data()
+                                + ((size_t)i2 * nocc_ + k) * vvs;
+                            for (int c = 0; c < nvir_sd; ++c)
+                                acc += Fkc_m(k, c)
+                                     * (2.0 * t2ki[(size_t)c * nvir_sd + a]
+                                        -     t2ik[(size_t)c * nvir_sd + a]);
+                        }
+                        term_can(i2, a) = acc;
+                    }
+                // quadratic t1t1 piece: (t1_can·Fkcᵀ)·t1_can
+                term_can.noalias() += (t1_can * Fkc_m.transpose()) * t1_can;
+                if (uloc_id_sd) {
+                    A_src_lmo = std::move(term_can);
+                } else {
+                    Eigen::Map<const RowMatXd> Uloc(
+                        res.U_loc.data(), nocc_, nocc_);
+                    A_src_lmo.noalias() = Uloc.transpose() * term_can;
                 }
             }
 
@@ -1213,13 +1428,12 @@ real_t DLPNOCCSD::compute_energy()
                 }
 
                 // INCREMENT-1 source: diagonal (m=i) ovvv T2→T1 coupling.
-                // Canonical T1 (eri_stored.cu:8002-8029) source[i,a] =
-                //   Σ_kcd (2(ka|dc) − (ka|cd))·tau_ik^cd, the m=i (k=i) piece is
-                //   Σ_cd (2(ia|dc) − (ia|cd))·Y_ii[c,d]
-                //   = Σ_cd (2·W[a,d,c] − W[a,c,d])·Y[c,d],
-                // with W[a,b,c] = W_ovvv_diag[i][a,b,c] = (ia|bc) and the TARGET
-                // virtual a adjacent to occ i (NOT (if|ae) — the old W[f,a,e]
-                // slice had a in the wrong slot). Canonical adds this to `val`
+                // Canonical T1 (physicist, eri_stored.cu:7146-7149) source =
+                //   Σ_kcd [2<ak|cd> − <ak|dc>]·tau_ik^cd; the k=i piece in
+                //   chemist pairing is Σ_cd [2(ac|id) − (ad|ic)]·Y_ii[c,d]
+                //   = Σ_cd (2·W[d,a,c] − W[c,a,d])·Y[c,d]
+                // with W[x,y,z] = W_ovvv_diag[i][x,y,z] = (i x|y z).
+                // Canonical adds this to `val`
                 // with + and newT1=val/Dia, Dia=eps_i−eps_a<0 ⇒ the DLPNO
                 // residual (Jacobi −R/denom, denom=eps_a−F_ii>0) carries it with
                 // the SAME sign as the validated T2 4-vir anchor ⇒ R += source.
@@ -1232,12 +1446,15 @@ real_t DLPNOCCSD::compute_energy()
                     const real_t* Y = p_ii.Y.data();
                     const real_t* W = phase24.W_ovvv_diag[i].data();
                     std::vector<real_t> R1_pno(npno, 0.0);
+                    // Canonical k=i piece (chemist): Σ_cd [2(ac|id)−(ad|ic)]
+                    // ·Y[c,d]. With W[x,y,z]=(i x|y z): (ac|id)=(id|ac)=W[d,a,c],
+                    // (ad|ic)=(ic|ad)=W[c,a,d].
                     for (int a = 0; a < npno; ++a) {
                         real_t acc = 0.0;
                         for (int c = 0; c < npno; ++c)
                             for (int d = 0; d < npno; ++d)
-                                acc += (2.0 * W[(static_cast<size_t>(a) * npno + d) * npno + c]
-                                      -       W[(static_cast<size_t>(a) * npno + c) * npno + d])
+                                acc += (2.0 * W[(static_cast<size_t>(d) * npno + a) * npno + c]
+                                      -       W[(static_cast<size_t>(c) * npno + a) * npno + d])
                                      * Y[c * npno + d];
                         R1_pno[a] = acc;
                     }
@@ -1258,26 +1475,26 @@ real_t DLPNOCCSD::compute_energy()
                         R[a] += t1_src2[i][a];
 
                 // INCREMENT-2 / S4: w_voov·t1 ring restoring.
-                //   R[i,a] += Σ_kc (2·(ak|ic) − (ak|ci))·t1_proj[k,c]
-                // with W_voov_diag[i][a,k,c]=(ak|ic), W_vovo_diag[i][a,k,c]=(ak|ci)
-                // the pair(ii) blocks (occ=i) and t1_proj[k,c] =
-                // (bar_Q_iiᵀ·St1ao[:,k])[c] (t1[k] in PNO(ii)). NOTE: the
-                // pre-existing W_ovov_i/W_ovvo_i are (ai|kc)/(ac|ki) — a DIFFERENT
-                // pairing — so dedicated blocks are required. Source built in
-                // PNO(ii) then M·source → PAO(ii). canonical val + sign.
+                //   R[i,a] += Σ_kc (2·<ak|ic> − <ak|ci>)·t1_proj[k,c]
+                // In chemist pairing <ak|ic>=(ai|kc) and <ak|ci>=(ac|ki) —
+                // exactly the always-built W_ovov_i / W_ovvo_i blocks of the
+                // DIAGONAL pair (occ role = i), layout (a·n_lmo+k)·n_pno+c.
+                // t1_proj[k,c] = (bar_Q_iiᵀ·St1ao[:,k])[c] (t1[k] in PNO(ii)).
+                // Source built in PNO(ii) then M·source → PAO(ii);
+                // canonical val + sign.
                 {
                     if (npno > 0
-                        && i < static_cast<int>(phase24.W_voov_diag.size())
-                        && phase24.W_voov_diag[i].size()
+                        && idx_ii < static_cast<int>(phase24.W_ovov_i.size())
+                        && phase24.W_ovov_i[idx_ii].size()
                                == static_cast<size_t>(npno) * nocc_ * npno
-                        && phase24.W_vovo_diag[i].size()
+                        && phase24.W_ovvo_i[idx_ii].size()
                                == static_cast<size_t>(npno) * nocc_ * npno
                         && static_cast<int>(p_ii.M.size()) == n_pao_i * npno) {
                         Eigen::Map<const RowMatXd> bQii(
                             p_ii.bar_Q.data(), nao_, npno);
                         const RowMatXd Pii = bQii.transpose() * wv_St1ao;  // npno×nocc
-                        const real_t* WOV = phase24.W_voov_diag[i].data();
-                        const real_t* WVO = phase24.W_vovo_diag[i].data();
+                        const real_t* WOV = phase24.W_ovov_i[idx_ii].data();
+                        const real_t* WVO = phase24.W_ovvo_i[idx_ii].data();
                         std::vector<real_t> src_pno(npno, 0.0);
                         for (int a = 0; a < npno; ++a) {
                             real_t acc = 0.0;
@@ -1294,6 +1511,51 @@ real_t DLPNOCCSD::compute_energy()
                         const Eigen::VectorXd src_pao = M * sp;
                         for (int a = 0; a < n_pao_i; ++a)
                             R[a] += src_pao(a);   // canonical val += w_voov·t1
+                    }
+                }
+
+                // ---- Increments C + A: apply the correlation dressings ----
+                if (dress_ok) {
+                    // C (vv): canonical val += Σ_c Fac[a,c]·t1[i,c], as the
+                    // PAO(ii)-projected linear operator on T1_old[i].
+                    if (Fac_pao_sd[i].rows() == n_pao_i
+                        && static_cast<int>(T1_old[i].size()) == n_pao_i) {
+                        Eigen::Map<const Eigen::VectorXd> ti(
+                            T1_old[i].data(), n_pao_i);
+                        const Eigen::VectorXd fac_t1 = Fac_pao_sd[i] * ti;
+                        for (int a = 0; a < n_pao_i; ++a)
+                            R[a] += fac_t1(a);
+                    }
+                    // C (oo): canonical val −= Σ_k Fki[k,i]·t1[k,a] over ALL k
+                    // (incl. k==i; the bare-Fock part is already in the linear
+                    // terms above — this adds only the correlation dressing).
+                    if (Fki_lmo_sd.rows() == nocc_) {
+                        for (int k = 0; k < nocc_; ++k) {
+                            const real_t g = Fki_lmo_sd(k, i);
+                            if (std::fabs(g) < 1e-14) continue;
+                            if (k == i) {
+                                for (int a = 0; a < n_pao_i; ++a)
+                                    R[a] -= g * T1_old[i][a];
+                                continue;
+                            }
+                            const int idx_kk = res.pair_lookup[k * nocc_ + k];
+                            const PairSetup& s_kk = res.setups[idx_kk];
+                            if (s_kk.n_pao == 0) continue;
+                            const auto proj = project_t1(
+                                s_ii.C_can_pair.data(), n_pao_i,
+                                s_kk.C_can_pair.data(), s_kk.n_pao,
+                                T1_old[k], h_S, nao_);
+                            for (int a = 0; a < n_pao_i; ++a)
+                                R[a] -= g * proj[a];
+                        }
+                    }
+                    // A: canonical-detour F̃kc source (val + sign).
+                    if (A_src_lmo.rows() == nocc_
+                        && V1_sd[i].rows() == n_pao_i) {
+                        const Eigen::VectorXd asrc =
+                            V1_sd[i] * A_src_lmo.row(i).transpose();
+                        for (int a = 0; a < n_pao_i; ++a)
+                            R[a] += asrc(a);
                     }
                 }
 
@@ -1606,6 +1868,37 @@ real_t DLPNOCCSD::compute_energy()
                       << "  max|ΔT2| = " << max_dt2
                       << "   ||ΔT2||_F/||T2||_F = " << rel_f
                       << "   max|ΔT1| = " << max_dt1 << std::endl;
+
+            // [singles-diag] T1 pattern comparison + optional dump
+            // (env GANSU_DLPNO_BT_DUMP=<path-prefix>). Diagnostic only —
+            // active only inside the BT_VALIDATE gate, zero production cost.
+            {
+                double n_bt = 0.0, n_can = 0.0, dot = 0.0;
+                for (size_t k = 0; k < t1n; ++k) {
+                    n_bt  += bt.T1[k] * bt.T1[k];
+                    n_can += t1c[k] * t1c[k];
+                    dot   += bt.T1[k] * t1c[k];
+                }
+                const double cosv = (n_bt > 0.0 && n_can > 0.0)
+                    ? dot / (std::sqrt(n_bt) * std::sqrt(n_can)) : 0.0;
+                std::cout << "  [T1-diag] ||T1_bt|| = " << std::scientific
+                          << std::setprecision(4) << std::sqrt(n_bt)
+                          << "   ||T1_can|| = " << std::sqrt(n_can)
+                          << "   cos(T1_bt,T1_can) = " << std::fixed
+                          << std::setprecision(6) << cosv << std::endl;
+                if (const char* dp = std::getenv("GANSU_DLPNO_BT_DUMP")) {
+                    std::ofstream f1(std::string(dp) + "_t1_bt.txt");
+                    std::ofstream f2(std::string(dp) + "_t1_can.txt");
+                    f1 << std::setprecision(17);
+                    f2 << std::setprecision(17);
+                    for (int i = 0; i < nocc_; ++i)
+                        for (int a = 0; a < nvir; ++a) {
+                            const char sep = (a + 1 < nvir) ? ' ' : '\n';
+                            f1 << bt.T1[(size_t)i * nvir + a] << sep;
+                            f2 << t1c[(size_t)i * nvir + a] << sep;
+                        }
+                }
+            }
 
             tracked_cudaFree(d_t1c);
             tracked_cudaFree(d_t2c);

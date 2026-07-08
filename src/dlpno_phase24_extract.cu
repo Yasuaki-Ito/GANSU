@@ -354,74 +354,11 @@ __global__ void extract_lambda_ovoo_kernel(
     d_ovoo_alt[tid] = d_eri_mo[e_j];
 }
 
-/// Increment 2 / S1: two VVOV extracts in one launch (over n_pno³):
-///   W_vvov_i[a,b,c] = eri[n_lmo+a, n_lmo+b, si, n_lmo+c] = (ab|ic)
-///   W_vvov_j[a,b,c] = eri[n_lmo+a, n_lmo+b, sj, n_lmo+c] = (ab|jc)
-/// Output layout: (a · n_pno + b) · n_pno + c.
-__global__ void extract_vvov_kernel(
-    const real_t* __restrict__ d_eri_mo,
-    real_t*       __restrict__ d_vvov_i,
-    real_t*       __restrict__ d_vvov_j,
-    int n_emb, int n_lmo, int n_pno, int si, int sj)
-{
-    const std::size_t total =
-        static_cast<std::size_t>(n_pno) * n_pno * n_pno;
-    const std::size_t tid =
-        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (tid >= total) return;
-
-    const std::size_t n_emb2 = static_cast<std::size_t>(n_emb) * n_emb;
-    const std::size_t n_emb3 = n_emb2 * n_emb;
-
-    const int c = static_cast<int>(tid % n_pno);
-    const std::size_t t1 = tid / n_pno;
-    const int b = static_cast<int>(t1 % n_pno);
-    const int a = static_cast<int>(t1 / n_pno);
-
-    const std::size_t base =
-        static_cast<std::size_t>(n_lmo + a) * n_emb3 +
-        static_cast<std::size_t>(n_lmo + b) * n_emb2;
-    const std::size_t e_i =
-        base + static_cast<std::size_t>(si) * n_emb +
-        static_cast<std::size_t>(n_lmo + c);
-    const std::size_t e_j =
-        base + static_cast<std::size_t>(sj) * n_emb +
-        static_cast<std::size_t>(n_lmo + c);
-    d_vvov_i[tid] = d_eri_mo[e_i];
-    d_vvov_j[tid] = d_eri_mo[e_j];
-}
-
-/// Increment 2 / S1: VOOO extract (over n_pno · n_lmo):
-///   W_vooo_i[a,k] = eri[n_lmo+a, k, si, sj] = (ak|ij)
-/// Output layout: a · n_lmo + k.
-__global__ void extract_vooo_kernel(
-    const real_t* __restrict__ d_eri_mo,
-    real_t*       __restrict__ d_vooo,
-    int n_emb, int n_lmo, int n_pno, int si, int sj)
-{
-    const std::size_t total =
-        static_cast<std::size_t>(n_pno) * n_lmo;
-    const std::size_t tid =
-        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (tid >= total) return;
-
-    const std::size_t n_emb2 = static_cast<std::size_t>(n_emb) * n_emb;
-    const std::size_t n_emb3 = n_emb2 * n_emb;
-
-    const int k = static_cast<int>(tid % n_lmo);
-    const int a = static_cast<int>(tid / n_lmo);
-
-    const std::size_t e =
-        static_cast<std::size_t>(n_lmo + a) * n_emb3 +
-        static_cast<std::size_t>(k) * n_emb2 +
-        static_cast<std::size_t>(si) * n_emb +
-        static_cast<std::size_t>(sj);
-    d_vooo[tid] = d_eri_mo[e];
-}
-
-/// Increment 2 / S2: OOOV + OOVO extracts in one launch (over n_lmo · n_pno):
-///   W_ooov_pq[i,c] = eri[si, sj, i, n_lmo+c] = (kl|ic)   layout i·n_pno + c
-///   W_oovo_pq[c,i] = eri[si, sj, n_lmo+c, i] = (kl|ci)   layout c·n_lmo + i
+/// Increment 2 / S2: OOOV + OOVO extracts in one launch (over n_lmo · n_pno).
+/// EXCHANGE-paired chemist blocks for the canonical ooov·t2 T1 source
+/// (see dlpno_pair_data.hpp pairing note); both laid out i·n_pno + c:
+///   W_ooov_pq[i,c] = eri[si, i, sj, n_lmo+c] = (pi|qc)
+///   W_oovo_pq[i,c] = eri[sj, i, si, n_lmo+c] = (qi|pc)
 __global__ void extract_ooov_oovo_kernel(
     const real_t* __restrict__ d_eri_mo,
     real_t*       __restrict__ d_ooov,
@@ -440,54 +377,18 @@ __global__ void extract_ooov_oovo_kernel(
     const int c = static_cast<int>(tid % n_pno);
     const int i = static_cast<int>(tid / n_pno);
 
-    const std::size_t base =
-        static_cast<std::size_t>(si) * n_emb3 +
-        static_cast<std::size_t>(sj) * n_emb2;
     const std::size_t e_ooov =
-        base + static_cast<std::size_t>(i) * n_emb +
+        static_cast<std::size_t>(si) * n_emb3 +
+        static_cast<std::size_t>(i) * n_emb2 +
+        static_cast<std::size_t>(sj) * n_emb +
         static_cast<std::size_t>(n_lmo + c);
     const std::size_t e_oovo =
-        base + static_cast<std::size_t>(n_lmo + c) * n_emb +
-        static_cast<std::size_t>(i);
-    d_ooov[static_cast<std::size_t>(i) * n_pno + c] = d_eri_mo[e_ooov];
-    d_oovo[static_cast<std::size_t>(c) * n_lmo + i] = d_eri_mo[e_oovo];
-}
-
-/// Increment 2 / S4: VOOV + VOVO extracts in one launch (over n_pno·n_lmo·n_pno):
-///   W_voov_diag[a,k,c] = eri[n_lmo+a, k, si, n_lmo+c] = (ak|ic)
-///   W_vovo_diag[a,k,c] = eri[n_lmo+a, k, n_lmo+c, si] = (ak|ci)
-/// Output layout: (a·n_lmo + k)·n_pno + c.  Diagonal pair only (occ = si).
-__global__ void extract_voov_vovo_kernel(
-    const real_t* __restrict__ d_eri_mo,
-    real_t*       __restrict__ d_voov,
-    real_t*       __restrict__ d_vovo,
-    int n_emb, int n_lmo, int n_pno, int si)
-{
-    const std::size_t total =
-        static_cast<std::size_t>(n_pno) * n_lmo * n_pno;
-    const std::size_t tid =
-        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (tid >= total) return;
-
-    const std::size_t n_emb2 = static_cast<std::size_t>(n_emb) * n_emb;
-    const std::size_t n_emb3 = n_emb2 * n_emb;
-
-    const int c = static_cast<int>(tid % n_pno);
-    const std::size_t t1 = tid / n_pno;
-    const int k = static_cast<int>(t1 % n_lmo);
-    const int a = static_cast<int>(t1 / n_lmo);
-
-    const std::size_t base =
-        static_cast<std::size_t>(n_lmo + a) * n_emb3 +
-        static_cast<std::size_t>(k) * n_emb2;
-    const std::size_t e_voov =
-        base + static_cast<std::size_t>(si) * n_emb +
+        static_cast<std::size_t>(sj) * n_emb3 +
+        static_cast<std::size_t>(i) * n_emb2 +
+        static_cast<std::size_t>(si) * n_emb +
         static_cast<std::size_t>(n_lmo + c);
-    const std::size_t e_vovo =
-        base + static_cast<std::size_t>(n_lmo + c) * n_emb +
-        static_cast<std::size_t>(si);
-    d_voov[tid] = d_eri_mo[e_voov];
-    d_vovo[tid] = d_eri_mo[e_vovo];
+    d_ooov[tid] = d_eri_mo[e_ooov];
+    d_oovo[tid] = d_eri_mo[e_oovo];
 }
 
 // ---------------------------------------------------------------------------
@@ -570,16 +471,10 @@ Phase24ExtractLayout compute_phase24_extract_layout(
                        : 0;
     L.sz_pno2        = static_cast<std::size_t>(n_pno) * n_pno;
     L.sz_ovoo        = static_cast<std::size_t>(n_pno) * n_lmo;
-    L.sz_vvov        = include_singles
-                       ? static_cast<std::size_t>(n_pno) * n_pno * n_pno : 0;
-    L.sz_vooo        = include_singles
-                       ? static_cast<std::size_t>(n_pno) * n_lmo : 0;
     L.sz_ovvv        = include_singles
                        ? static_cast<std::size_t>(n_pno) * n_pno * n_pno : 0;
     L.sz_ooov        = include_singles
                        ? static_cast<std::size_t>(n_lmo) * n_pno : 0;
-    L.sz_voov        = (include_singles && is_diag)
-                       ? static_cast<std::size_t>(n_pno) * n_lmo * n_pno : 0;
 
     std::size_t off = 0;
     L.off_T_pair             = off; off += L.sz_T_pair;
@@ -601,18 +496,11 @@ Phase24ExtractLayout compute_phase24_extract_layout(
     L.off_W_ovvo_bare_j      = off; off += L.sz_W_ovov;
     L.off_W_oovv_bare_i      = off; off += L.sz_W_ovov;
     L.off_W_oovv_bare_j      = off; off += L.sz_W_ovov;
-    // Increment 2 / S1: VVOV (two orientations) + VOOO.
-    L.off_W_vvov_i           = off; off += L.sz_vvov;
-    L.off_W_vvov_j           = off; off += L.sz_vvov;
-    L.off_W_vooo_i           = off; off += L.sz_vooo;
     // Increment 2 / S2: off-diag ovvv (occ i/j) + ooov/oovo.
     L.off_W_ovvv_pi          = off; off += L.sz_ovvv;
     L.off_W_ovvv_pj          = off; off += L.sz_ovvv;
     L.off_W_ooov_pq          = off; off += L.sz_ooov;
     L.off_W_oovo_pq          = off; off += L.sz_ooov;
-    // Increment 2 / S4: w_voov·t1 blocks (diagonal pair only).
-    L.off_W_voov_diag        = off; off += L.sz_voov;
-    L.off_W_vovo_diag        = off; off += L.sz_voov;
     L.total = off;
     return L;
 }
@@ -736,25 +624,6 @@ void launch_phase24_extract(
                 n_emb, n_lmo, n_pno, sj, /*mode=*/1);
         }
     }
-    // Increment 2 / S1: VVOV (i/j orientations) + VOOO.
-    {
-        const std::size_t n = layout.sz_vvov;
-        if (n > 0) {
-            extract_vvov_kernel<<<grid_for(n), kBlock, 0, stream>>>(
-                d_eri_mo,
-                d_packed_out + layout.off_W_vvov_i,
-                d_packed_out + layout.off_W_vvov_j,
-                n_emb, n_lmo, n_pno, si, sj);
-        }
-    }
-    {
-        const std::size_t n = layout.sz_vooo;
-        if (n > 0) {
-            extract_vooo_kernel<<<grid_for(n), kBlock, 0, stream>>>(
-                d_eri_mo, d_packed_out + layout.off_W_vooo_i,
-                n_emb, n_lmo, n_pno, si, sj);
-        }
-    }
     // Increment 2 / S2: off-diag ovvv (occ si / sj) reuse the ovvv_diag kernel.
     {
         const std::size_t n = layout.sz_ovvv;
@@ -776,17 +645,6 @@ void launch_phase24_extract(
                 d_packed_out + layout.off_W_ooov_pq,
                 d_packed_out + layout.off_W_oovo_pq,
                 n_emb, n_lmo, n_pno, si, sj);
-        }
-    }
-    // Increment 2 / S4: w_voov·t1 blocks (diagonal pair only, occ = si).
-    {
-        const std::size_t n = layout.sz_voov;
-        if (n > 0) {
-            extract_voov_vovo_kernel<<<grid_for(n), kBlock, 0, stream>>>(
-                d_eri_mo,
-                d_packed_out + layout.off_W_voov_diag,
-                d_packed_out + layout.off_W_vovo_diag,
-                n_emb, n_lmo, n_pno, si);
         }
     }
 }

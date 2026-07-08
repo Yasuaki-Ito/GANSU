@@ -273,26 +273,23 @@ struct Phase24Integrals {
     std::vector<std::vector<real_t>> W_oovv_bare_i;     ///< [n_pairs] of [nocc · n_pno²]
     std::vector<std::vector<real_t>> W_oovv_bare_j;
 
-    /// Increment 2 / S1: VVOV + VOOO blocks per strong pair (i,j) for the
-    /// linear T1→T2 back-coupling in the CCSD T2 residual (the spin-adapted,
-    /// symmetrised reduction of the canonical raw(i,a,j,b) terms
-    ///   + Σ_c (ab|ic) t1(j,c)   − Σ_k (ak|ij) t1(k,b)).
+    /// Increment 2 (CCSD singles) — integral-pairing note.
     ///
-    /// Per pair (i,j) with PNO indices a,b,c and LMO index k:
-    ///   W_vvov_i[idx][a,b,c] = (n_lmo+a, n_lmo+b | s.i,    n_lmo+c) = (ab|ic)
-    ///   W_vvov_j[idx][a,b,c] = (n_lmo+a, n_lmo+b | s.j,    n_lmo+c) = (ab|jc)
-    ///   W_vooo_i[idx][a,k]   = (n_lmo+a, k        | s.i,    s.j)    = (ak|ij)
-    /// (no 8-fold symmetry relates the i/j orientations of vvov; vooo needs
-    /// only the (i,j) ket since the j-role contraction reuses the same block
-    /// with the virtual roles swapped — see the residual sweep).
-    ///
-    /// Layout (row-major): vvov ((a·n_pno + b)·n_pno + c); vooo (a·n_lmo + k).
-    /// Scaling: vvov is n_pair_strong · n_pno³ · 16 B (two blocks); vooo is
-    /// n_pair_strong · n_pno · n_lmo · 8 B (both ≲ the existing W_pair n_pno⁴).
-    /// Only built/consumed when CCSD singles (T1_pao) are active.
-    std::vector<std::vector<real_t>> W_vvov_i;   ///< [n_pairs] of [n_pno³]
-    std::vector<std::vector<real_t>> W_vvov_j;   ///< [n_pairs] of [n_pno³]
-    std::vector<std::vector<real_t>> W_vooo_i;   ///< [n_pairs] of [n_pno · n_lmo]
+    /// The canonical T1/T2 singles terms in eri_stored.cu are written with
+    /// PHYSICIST integrals v(p,q,r,s) = <pq|rs>; in chemist notation
+    /// <pq|rs> = (pr|qs). The singles couplings therefore need the
+    /// EXCHANGE-paired chemist blocks, all of which already exist here:
+    ///   S1 vvov:  <ab|ic> = (ai|bc)          -> W_ovvv_pi / W_ovvv_pj
+    ///   S1 vooo:  <ak|ij> = (ai|kj) = (ia|jk) -> W_ovoo_lambda / _alt
+    ///   S4 ring:  <ak|ic> = (ai|kc), <ak|ci> = (ac|ki)
+    ///                                        -> W_ovov_i / W_ovvo_i (diag pair)
+    ///   ovvv src: <ak|cd> = (ac|kd) = (kd|ac) -> W_ovvv_diag / W_ovvv_pi/pj
+    ///                                            contracted as W[d,a,c]
+    /// (A previous revision extracted Coulomb-paired blocks (ab|ic), (ak|ij),
+    /// (ak|ic), ... by transliterating the physicist index strings into
+    /// chemist parentheses; since (pq|rs) = (pq|sr), the 2W−W' exchange
+    /// combinations then collapsed and the converged T1 was structurally
+    /// wrong — cos(T1, T1_canonical) ≈ 0.26. Fixed 2026-07-08.)
 
     /// Increment 2 / S2: the two T2-driven T1 sources that complete the
     /// canonical T1 equation (eri_stored.cu:8002-8034), feeding back into the
@@ -305,28 +302,18 @@ struct Phase24Integrals {
     ///     a,b,c PNO of pair (i,j). Layout (a·n_pno+b)·n_pno+c.
     ///     Source for T1[i] uses occ=j (W_ovvv_pj), for T1[j] uses occ=i.
     ///
-    /// (b) ooov·t2 (the large balancing −source). For pair (k,l):
-    ///       W_ooov_pq[idx][i,c] = (s.i s.j|i_lmo c') = (kl|ic)   layout i·n_pno+c
-    ///       W_oovo_pq[idx][c,i] = (s.i s.j|c' i_lmo) = (kl|ci)   layout c·n_lmo+i
-    ///     i an LMO (all), c PNO of pair (k,l). w_ooov = 2(kl|ic)−(kl|ci).
+    /// (b) ooov·t2 (the large balancing −source). For pair (p,q) = (s.i,s.j),
+    ///     both blocks laid out i·n_pno + c (i an LMO, c PNO of the pair):
+    ///       W_ooov_pq[idx][i,c] = (s.i i | s.j c') = (pi|qc)
+    ///       W_oovo_pq[idx][i,c] = (s.j i | s.i c') = (qi|pc)
+    ///     Canonical w_ooov for orientation (k,l)=(p,q) is 2(pi|qc)−(qi|pc)
+    ///     (note (pc|qi) = (qi|pc)); for (k,l)=(q,p) it is 2(qi|pc)−(pi|qc).
     ///
     /// All four only built/consumed when CCSD singles (T1_pao) are active.
     std::vector<std::vector<real_t>> W_ovvv_pi;  ///< [n_pairs] of [n_pno³]
     std::vector<std::vector<real_t>> W_ovvv_pj;  ///< [n_pairs] of [n_pno³]
     std::vector<std::vector<real_t>> W_ooov_pq;  ///< [n_pairs] of [n_lmo · n_pno]
-    std::vector<std::vector<real_t>> W_oovo_pq;  ///< [n_pairs] of [n_pno · n_lmo]
-
-    /// Increment 2 / S4: w_voov·t1 ring restoring blocks for diagonal pair (i,i).
-    ///   W_voov_diag[i][a,k,c] = (n_lmo+a, k | i, n_lmo+c) = (ak|ic)
-    ///   W_vovo_diag[i][a,k,c] = (n_lmo+a, k | n_lmo+c, i) = (ak|ci)
-    /// a,c PNO of pair (i,i); k an LMO. Layout (a·n_lmo+k)·n_pno+c.
-    /// w_voov = 2(ak|ic)−(ak|ci); the T1 source is Σ_kc w_voov·t1_proj[k,c]
-    /// with t1[k] projected into pair(ii)'s PNO. Stored per LMO (diagonal pairs
-    /// only), like W_ovvv_diag. (The existing W_ovov_i/W_ovvo_i are the DIFFERENT
-    /// pairings (ai|kc)/(ac|ki) and cannot be reused here.)
-    /// Only built/consumed when CCSD singles (T1_pao) are active.
-    std::vector<std::vector<real_t>> W_voov_diag;  ///< [nocc] of [n_pno·n_lmo·n_pno]
-    std::vector<std::vector<real_t>> W_vovo_diag;  ///< [nocc] of [n_pno·n_lmo·n_pno]
+    std::vector<std::vector<real_t>> W_oovo_pq;  ///< [n_pairs] of [n_lmo · n_pno]
 };
 
 /**

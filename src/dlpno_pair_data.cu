@@ -1919,22 +1919,30 @@ LMP2Status iterate_dlpno_ccsd_t2(
                     prof_clock::now() - t_w4virt_0).count();
 
                 // ---- Increment 2 / S1: VVOV + VOOO linear T1→T2 coupling ----
-                // Symmetrised canonical raw(i,a,j,b) singles terms in pair
-                // (i,j)'s PNO (a,b PNO; c PNO; k LMO):
-                //   R[a,b] += Σ_c (ab|ic) t1_j[c] + Σ_c (ab|jc) t1_i[c]   (vvov)
-                //   R[a,b] −= Σ_k (ak|ij) t1_k[b] + Σ_k (bk|ij) t1_k[a]   (vooo)
+                // Symmetrised canonical raw(i,a,j,b) singles terms (physicist
+                // eri_stored.cu:7180-7186: +<ab|ic>·t1[j,c] − <ak|ij>·t1[k,b],
+                // plus the (j,i)-orientation transpose). In chemist pairing
+                // <ab|ic> = (ai|bc) and <ak|ij> = (ai|kj) = (ia|jk), so the
+                // always-built exchange-paired blocks provide everything:
+                //   R[a,b] += Σ_c Wpi[a,b,c] t1_j[c] + Σ_c Wpj[b,a,c] t1_i[c]
+                //     with Wpi = W_ovvv_pi = (i a'|b' c'), Wpj = (j a'|b' c')
+                //   R[a,b] −= Σ_k Gi[a,k] t1_k[b] + Σ_k Gj[b,k] t1_k[a]
+                //     with Gi = W_ovoo_lambda = (i a'|j k) = (ai|kj),
+                //          Gj = W_ovoo_lambda_alt = (j a'|i k) = (aj|ki).
                 // t1_i = barS^(ij,ii)·t1_in_pno[i], t1_j = barS^(ij,jj)·…[j];
                 // t1_k[·] = (bar_Q_ij^T · St1ao[:,k]) projects LMO k's singles
                 // into this pair's PNO. Same signs as the canonical raw (the
                 // DLPNO residual carries raw's coupling terms verbatim — Jacobi
                 // divides by −denom). CPU-only, mirrors the t1·t1 4-vir piece.
                 if (T1_pao != nullptr
-                    && idx < static_cast<long long>(phase24->W_vvov_i.size())
-                    && phase24->W_vvov_i[idx].size()
+                    && idx < static_cast<long long>(phase24->W_ovvv_pi.size())
+                    && phase24->W_ovvv_pi[idx].size()
                            == static_cast<size_t>(n) * n * n
-                    && phase24->W_vvov_j[idx].size()
+                    && phase24->W_ovvv_pj[idx].size()
                            == static_cast<size_t>(n) * n * n
-                    && phase24->W_vooo_i[idx].size()
+                    && phase24->W_ovoo_lambda[idx].size()
+                           == static_cast<size_t>(n) * nocc
+                    && phase24->W_ovoo_lambda_alt[idx].size()
                            == static_cast<size_t>(n) * nocc) {
                     const auto t_s1_0 = prof_clock::now();
                     const int idx_ii = pair_lookup[(size_t)sij.i * nocc + sij.i];
@@ -1950,13 +1958,17 @@ LMP2Status iterate_dlpno_ccsd_t2(
                             barS_cache[idx][idx_jj] * t1_in_pno[sij.j];   // [n]
 
                         // VVOV: reshape (a·n+b, c); contract over c with t1.
-                        Eigen::Map<const RowMatXd> VVOV_i(
-                            phase24->W_vvov_i[idx].data(), n * n, n);
-                        Eigen::Map<const RowMatXd> VVOV_j(
-                            phase24->W_vvov_j[idx].data(), n * n, n);
-                        Eigen::Map<Eigen::VectorXd> Rvec(R.data(), n * n);
-                        Rvec.noalias() += VVOV_i * t1j;   // + Σ_c (ab|ic) t1_j
-                        Rvec.noalias() += VVOV_j * t1i;   // + Σ_c (ab|jc) t1_i
+                        // The j-orientation lands transposed in (a,b).
+                        Eigen::Map<const RowMatXd> Wpi(
+                            phase24->W_ovvv_pi[idx].data(), n * n, n);
+                        Eigen::Map<const RowMatXd> Wpj(
+                            phase24->W_ovvv_pj[idx].data(), n * n, n);
+                        const Eigen::VectorXd Mi = Wpi * t1j;   // [(a·n+b)]
+                        const Eigen::VectorXd Mj = Wpj * t1i;   // [(b·n+a)]
+                        Eigen::Map<const RowMatXd> Mi_m(Mi.data(), n, n);
+                        Eigen::Map<const RowMatXd> Mj_m(Mj.data(), n, n);
+                        R.noalias() += Mi_m;               // + (ai|bc) t1_j
+                        R.noalias() += Mj_m.transpose();   // + (bj|ac) t1_i
 
                         // VOOO: P_ij[b,k] = bar_Q_ij^T · St1ao[:,k] (k-th col).
                         if (St1ao_mat.size() > 0) {
@@ -1964,12 +1976,14 @@ LMP2Status iterate_dlpno_ccsd_t2(
                                 pij.bar_Q.data(), nao, n);
                             const RowMatXd P_ij =
                                 bQ_ij.transpose() * St1ao_mat;   // [n × nocc]
-                            Eigen::Map<const RowMatXd> G(
-                                phase24->W_vooo_i[idx].data(), n, nocc);
-                            // O1: −Σ_k (ak|ij) t1_k[b] = −(G·P_ij^T)
-                            // O2: −Σ_k (bk|ij) t1_k[a] = −(P_ij·G^T)
-                            R.noalias() -= G * P_ij.transpose();
-                            R.noalias() -= P_ij * G.transpose();
+                            Eigen::Map<const RowMatXd> Gi(
+                                phase24->W_ovoo_lambda[idx].data(), n, nocc);
+                            Eigen::Map<const RowMatXd> Gj(
+                                phase24->W_ovoo_lambda_alt[idx].data(), n, nocc);
+                            // O1: −Σ_k (ai|kj) t1_k[b] = −(Gi·P_ij^T)
+                            // O2: −Σ_k (bj|ki) t1_k[a] = −(P_ij·Gj^T)
+                            R.noalias() -= Gi * P_ij.transpose();
+                            R.noalias() -= P_ij * Gj.transpose();
                         }
                     }
                     prof_slot.t_w4virt += std::chrono::duration<double>(
