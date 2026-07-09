@@ -8315,12 +8315,28 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     if (ri_bnative && !e_tile) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const size_t need = (size_t)nvir * nvir * nvir * nvir * sizeof(real_t) * 2;
-        if (need > (size_t)(0.85 * free_b)) {
+        // Faithful DENSE-path pool estimate (mirrors the total_gpu_doubles sum
+        // below with use_tiled_ladder=false / occi=false / vr_tile=false;
+        // verified == the actual 161.1 GB single pool alloc at tetracene):
+        //   3×vv² (Wabcd + resident v_vvvv + ovvv_t1) + 4×nocc·vvv (v_ovvv_T +
+        //   v_ovvv + v_ovvv_perm + w_ovvv_R) + 3×t2 + 2×oovv + 7×ov² + vv·ov + small.
+        const size_t e_vv  = (size_t)nvir * nvir;
+        const size_t e_vvv = e_vv * nvir;
+        const size_t e_ov  = (size_t)nocc * nvir;
+        const size_t e_t2  = (size_t)nocc * nocc * e_vv;
+        const size_t e_ovvv_t1 = std::max(e_vvv * (size_t)std::max(nvir, nocc), e_t2);
+        const size_t dense_doubles =
+              2 * e_vv * e_vv + e_ovvv_t1
+            + 4 * (size_t)nocc * e_vvv
+            + 3 * e_t2 + 2 * e_t2                 // tau/raw/t2v + w_oovv/v_oovv
+            + 7 * e_ov * e_ov + e_vv * e_ov
+            + (size_t)nocc * nocc * nocc * nocc;
+        const size_t need = dense_doubles * sizeof(real_t);
+        if (need > (size_t)(0.90 * free_b)) {
             tile_auto = true;
-            std::cout << "[CCSD auto-tile] dense vvvv est "
-                      << (need >> 30) << " GiB > 0.85*free "
-                      << ((size_t)(0.85 * free_b) >> 30)
+            std::cout << "[CCSD auto-tile] dense pool est "
+                      << (need >> 30) << " GiB > 0.90*free "
+                      << ((size_t)(0.90 * free_b) >> 30)
                       << " GiB -> enabling per-iter tiled RI ladder "
                          "(force off with GANSU_CCSD_RI_LADDER_TILE=0)."
                       << std::endl;
