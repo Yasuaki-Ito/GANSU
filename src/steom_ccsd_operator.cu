@@ -4186,7 +4186,16 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     // (G_triplet = F_eff − g_phph), so the whole UBMJC route is skipped and the
     // u_bmjc / g_phhp buffers stay empty (never read — the assembly below gates
     // on triplet_ before touching GPHHP/UBMJC).
-    std::vector<real_t> u_bmjc(triplet_ ? 0 : (size_t)NV*NMo*NO*NV, 0.0); // [b][m][j][c]
+    // DEFAULT = COMPLETE paper g_phhp (2026-07-09, Nooijen JCP 107,6812 Eq.60-63 with
+    // vswap placement; H2O/zigzag-C6H8/butadiene ORCA gates ≤9-59 meV, naphthalene
+    // La −9 meV / Lb −31 meV).  GANSU_STEOM_PAPER_GPHHP=0 reverts to the legacy
+    // shipped route (UBMJC IP-only + ZEROED EA/cross; H2O 11.7726/13.5225/16.9632,
+    // naphthalene Lb +1.13 eV overshoot).  The legacy UBMJC buffers/GEMMs below are
+    // only built in legacy mode.
+    const char* env_paper = std::getenv("GANSU_STEOM_PAPER_GPHHP");
+    const bool paper_gphhp = env_paper ? (std::atoi(env_paper) != 0) : true;
+    const bool legacy_ubmjc = !triplet_ && !paper_gphhp;
+    std::vector<real_t> u_bmjc(legacy_ubmjc ? (size_t)NV*NMo*NO*NV : 0, 0.0); // [b][m][j][c]
     auto UBMJC=[&](int b,int m,int j,int c)->real_t&{ return u_bmjc[(((size_t)b*NMo+m)*NO+j)*NV+c]; };
     // GPU GEMM port of UBMJC Term1 (FIX 2026-06-20, g_phhp IP SO route -Wvovv·s):
     //   ct[b,c,m,j] = Σ_{k,d} wvovv(c,k,d,b)·siP(m,j,k,d)   (subtracted below)
@@ -4195,7 +4204,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     std::vector<real_t> ct_ubmjc;
     bool ubmjc_gpu = false;
 #ifndef GANSU_CPU_ONLY
-    if (!triplet_ && gpu::gpu_available()) {
+    if (legacy_ubmjc && gpu::gpu_available()) {
         cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
         std::vector<real_t> hA((size_t)BC_M*KD_K), hB((size_t)MJ_N*KD_K);
         #pragma omp parallel for collapse(2)
@@ -4237,7 +4246,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     std::vector<real_t> ct_ubmjc_t2;
     bool ubmjc_t2_gpu = false;
 #ifndef GANSU_CPU_ONLY
-    if (!triplet_ && gpu::gpu_available()) {
+    if (legacy_ubmjc && gpu::gpu_available()) {
         cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
         std::vector<real_t> hA((size_t)CJ_M2*KL_K2), hB((size_t)MB_N2*KL_K2);
         #pragma omp parallel for collapse(2)
@@ -4279,7 +4288,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     // GANSU layout g_phhp[b,k,j,c], root m -> k=occ_idx[m]; UBMJC loop vars (b,m,j,c) map to the
     // Python block as j=Python-i, c=Python-a (NO Fov term here - Fov lives in F_eff_oo).
     // GEMMs ct_ubmjc (Term1 -Wvovv·s) and ct_ubmjc_t2 (Term2 +0.5 Wooov·s) re-ported above.
-    if (!triplet_) {
+    if (legacy_ubmjc) {
     #pragma omp parallel for collapse(2)
     for (int m=0;m<NMo;++m)
         for (int b=0;b<NV;++b) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c){
@@ -4473,18 +4482,22 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     // STEOM oracle (script/steom_gansu_vs_oracle.py: EE-BASE sorted-spectrum RMS
     // 0.478->0.000 on config-mixed H4). NOTE: base fix alone is minor for real pi systems;
     // the dominant config-mixed overshoot is the ZEROED g_phhp EA/cross s-routes (see below).
-    // ---- COMPLETE paper g_phhp (2026-07-09, env GANSU_STEOM_PAPER_GPHHP, default OFF) ----
+    // ---- COMPLETE paper g_phhp (2026-07-09, DEFAULT ON; GANSU_STEOM_PAPER_GPHHP=0
+    // reverts to the legacy shipped route) ----
     // Nooijen & Bartlett JCP 107, 6812 (1997) Eqs.(60)-(63): base(EE-ordered Wovvo)
-    // + S^IP-linear (60) + S^EA-linear (61) + S^IP*S^EA cross (62).  This is the
-    // connected/normal-ordered closed form ORCA implements: ORCA 8+8 H2O gate
-    // singlet rms 0.98 -> 0.056 eV with roots 2/3 config-mixing splitting restored,
-    // triplet regression intact, active-shrink invariant (memory 続51,
-    // script/steom_gphhp_paper.py).  Replaces the shipped UBMJC IP route and the
-    // ZEROED EA/cross.  Sub-toggles GANSU_STEOM_PAPER_A / _B pick the Eq.(62)
-    // helper index readings (default A=0/B=0 = pair-symmetry-principled reading;
-    // A=0 confirmed decisively by the zigzag-C6H8 gate: root0 0.308 vs ORCA 0.317
-    // where A=1 gives 0.259; B toggles are +-10 meV, B=0 kept as principled).
-    const bool paper_gphhp = (std::getenv("GANSU_STEOM_PAPER_GPHHP") != nullptr);
+    // + S^IP-linear (60) + S^EA-linear (61) + S^IP*S^EA cross (62), all placed with
+    // the vswap convention (see below).  This is the connected/normal-ordered closed
+    // form ORCA implements.  Gates (memory 続51-55, script/steom_gphhp_{paper,vswap}.py):
+    // H2O 8+8 ORCA gate singlet rms 0.0056 eV (≤9 meV, triplet-level), zigzag-C6H8
+    // 0.016, butadiene 0.059; naphthalene cc-pVDZ La 5.365 (ORCA 5.374) / Lb 4.253
+    // (4.284) / Lb+ 6.528 (6.521) — fixes the legacy Lb +1.13 eV overshoot while
+    // keeping La exact.  Regression refs (H2O sto-3g FC1, effective (3,2) active):
+    //   default : S 11.8461/13.5872/16.0991/18.2213  T 10.2539/12.6753/13.0750/14.7470
+    //   legacy=0: S 11.7726/13.5225/16.9632/16.9975  (T identical — triplet untouched)
+    // Sub-toggles GANSU_STEOM_PAPER_A / _B pick the Eq.(62) helper index readings
+    // (default A=0/B=0 = pair-symmetry-principled reading; A=0 confirmed decisively
+    // by the zigzag-C6H8 gate: root0 0.308 vs ORCA 0.317 where A=1 gives 0.259;
+    // B toggles are +-10 meV, B=0 kept as principled).
     const bool ee_base = paper_gphhp || (std::getenv("STEOM_EE_BASE") != nullptr);
     #pragma omp parallel for collapse(2) schedule(static)
     for (int b=0;b<NV;++b) for(int k=0;k<NO;++k) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c)
@@ -4602,9 +4615,10 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                   << ", EE base forced)." << std::endl;
     }
     }
-    // u_bkje (g_phhp EA) and u_bmje (g_phhp cross) ZEROED 2026-06-20: old forms buggy; base+IP
-    // (UBMJC) already matches ORCA on H2O/CH2O (n->pi* 0.04-0.08 eV). The correct small EA route
-    // is derived in memory pt41 but adding it lands at the 2nd-order {e^S}, below ORCA (pt42).
+    // (legacy mode only) u_bkje (g_phhp EA) and u_bmje (g_phhp cross) ZEROED 2026-06-20:
+    // old forms buggy; base+IP (UBMJC) matches ORCA on single-config n->pi* states
+    // (H2O/CH2O 0.04-0.08 eV) but overshoots config-mixed states by up to +1.13 eV
+    // (naphthalene Lb) — fixed by the default paper form above.
 
     // ---- FULL-CLASS projection replacement (2026-07-08, franken-G experiment) ----
     // env GANSU_STEOM_PROJ_FULL=1 (default OFF).  ⚠⚠ FULL-ACTIVE-SPACE ONLY — DO NOT
