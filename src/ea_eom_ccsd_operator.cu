@@ -2800,6 +2800,21 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     subprof("H2D uploads + ring-M kernel");
     std::cout << "  EA-EOM-CCSD dressed intermediates built (PySCF EA definitions)." << std::endl;
 
+    // (2026-07-09, tetracene polish OOM) The RAW (ab|cd) block d_eri_vvvv_ is a
+    // BUILD-time-only input (dressed Wvvvv / Wvvvo·t1 Term A); the Davidson σ uses
+    // only the DRESSED d_Wvvvv_. Keeping the raw ~nvir⁴ block resident through the
+    // solve doubles the vvvv footprint (2×39.6 GB at tetracene/cc-pVDZ) and pushed
+    // the EA Davidson out of memory in the bt-polish chain. Free it here (host
+    // h_vvvv copy survives for the BUILD_VALIDATE self-checks). Opt-out:
+    // GANSU_EA_KEEP_RAW_VVVV=1. Slab-mode buffers (d_eri_vvvv_slabs_) are left
+    // untouched (they double as σ-path storage under Ship 12).
+    if (d_eri_vvvv_ && !std::getenv("GANSU_EA_KEEP_RAW_VVVV")) {
+        tracked_cudaFree(d_eri_vvvv_);
+        d_eri_vvvv_ = nullptr;
+        std::cout << "  [EA-EOM] raw (ab|cd) block freed after build "
+                     "(dressed Wvvvv retained for sigma/share-barH)." << std::endl;
+    }
+
     #undef H_WOOOV
     #undef H_W1OVOV
     #undef H_W1OVVO

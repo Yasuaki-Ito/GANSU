@@ -973,8 +973,19 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
     // slab via d_eri_vvvv_slabs_[d] allocated by the driver before ctor.
     // (RI Term A) skip the nvir⁴ alloc when Wvvvo·t1 is evaluated from B-factors
     // (keep it under BUILD_VALIDATE so the host self-check reference survives).
-    const bool keep_dense_vvvv = !ri_vvvv_term_a_
+    // (2026-07-09) Also skip it when the shared bar-H cache will satisfy
+    // build_dressed_intermediates entirely (same condition as the borrow at the
+    // top of that function): with all 11 dressed intermediates borrowed the raw
+    // (ab|cd) block has no consumer in this operator — at tetracene/cc-pVDZ this
+    // 39.6 GB alloc was pure dead weight in the bt-polish chain.
+    const bool barh_will_borrow = barh_cache_ && barh_cache_->complete()
+        && barh_cache_->nocc == nocc_active_ && barh_cache_->nvir == nvir_
+        && barh_cache_->canonical_skip_wvvvv == canonical_skip_wvvvv_;
+    const bool keep_dense_vvvv = (!ri_vvvv_term_a_ && !barh_will_borrow)
                                  || std::getenv("GANSU_STEOM_BUILD_VALIDATE") != nullptr;
+    if (!keep_dense_vvvv && barh_will_borrow)
+        std::cout << "  [STEOM] raw (ab|cd) extraction skipped (bar-H fully "
+                     "borrowed from IP+EA; nvir^4 block has no consumer)." << std::endl;
     if (eri_vvvv_nslab_ <= 1 && keep_dense_vvvv) {
         tracked_cudaMalloc(&d_eri_vvvv_, vvvv_sz * sizeof(real_t));
     }
@@ -1060,6 +1071,7 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
                           + (size_t)(b + nocc) * N + (size_t)(c + nocc);
             d_eri_ovvv_[idx] = d_eri_mo[mo_idx];
         }
+        if (d_eri_vvvv_) {           // skipped when bar-H is fully borrowed (2026-07-09)
         #pragma omp parallel for
         for (size_t idx = 0; idx < vvvv_sz; ++idx) {
             int a = (int)(idx / ((size_t)nvir * nvir * nvir));
@@ -1071,6 +1083,7 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
             size_t mo_idx = (size_t)(a + nocc) * N * N * N + (size_t)(b + nocc) * N * N
                           + (size_t)(c + nocc) * N + (size_t)(d + nocc);
             d_eri_vvvv_[idx] = d_eri_mo[mo_idx];
+        }
         }
     } else {
 #ifndef GANSU_CPU_ONLY
@@ -1088,8 +1101,10 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
         eom_mp2_extract_eri_ovvo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvo_, nocc_active_, nvir_, nao_active_);
         blocks = (ovvv_sz + threads - 1) / threads;
         eom_ccsd_extract_eri_ovvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvv_, nocc_active_, nvir_, nao_active_);
-        blocks = (vvvv_sz + threads - 1) / threads;
-        eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv_, nocc_active_, nvir_, nao_active_, 0, -1);
+        if (d_eri_vvvv_) {           // skipped when bar-H is fully borrowed (2026-07-09)
+            blocks = (vvvv_sz + threads - 1) / threads;
+            eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv_, nocc_active_, nvir_, nao_active_, 0, -1);
+        }
         cudaDeviceSynchronize();
 #endif
     }
