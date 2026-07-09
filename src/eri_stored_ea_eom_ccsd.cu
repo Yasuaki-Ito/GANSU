@@ -530,6 +530,18 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
     config.num_eigenvalues       = n_roots_to_compute;
     config.convergence_threshold = rhf.get_ea_eom_d_tol();
     config.max_subspace_size     = std::min(total_dim, std::max(80, 20 * n_roots_to_compute));
+    // (2026-07-09) EA Davidson device footprint = dim × max_subspace × 2 vectors.
+    // At tetracene scale (dim = nocc·nvir² ≈ 3.1e6, ~13 roots → subspace 260) that is
+    // ~12.5 GiB, which no longer fits next to the resident dressed Wvvvv (~42 GB) in
+    // the bt-polish chain.  GANSU_EOM_MAX_SUB_PER_ROOT=<m> caps the subspace at
+    // m·nroots (min 4·nroots; more restarts, same converged roots) so canonical-EOM
+    // polish runs fit on one GPU.  Unset = legacy sizing (bit-identical).
+    if (const char* e = std::getenv("GANSU_EOM_MAX_SUB_PER_ROOT")) {
+        const int m = std::atoi(e);
+        if (m >= 4)
+            config.max_subspace_size = std::min(total_dim,
+                std::max(4 * n_roots_to_compute, m * n_roots_to_compute));
+    }
     config.max_iterations        = rhf.get_ea_eom_max_iter();
     config.use_preconditioner    = true;
     config.symmetric             = false;
