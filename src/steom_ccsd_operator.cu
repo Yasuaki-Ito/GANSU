@@ -4473,15 +4473,123 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     // STEOM oracle (script/steom_gansu_vs_oracle.py: EE-BASE sorted-spectrum RMS
     // 0.478->0.000 on config-mixed H4). NOTE: base fix alone is minor for real pi systems;
     // the dominant config-mixed overshoot is the ZEROED g_phhp EA/cross s-routes (see below).
-    const bool ee_base = (std::getenv("STEOM_EE_BASE") != nullptr);
+    // ---- COMPLETE paper g_phhp (2026-07-09, env GANSU_STEOM_PAPER_GPHHP, default OFF) ----
+    // Nooijen & Bartlett JCP 107, 6812 (1997) Eqs.(60)-(63): base(EE-ordered Wovvo)
+    // + S^IP-linear (60) + S^EA-linear (61) + S^IP*S^EA cross (62).  This is the
+    // connected/normal-ordered closed form ORCA implements: ORCA 8+8 H2O gate
+    // singlet rms 0.98 -> 0.056 eV with roots 2/3 config-mixing splitting restored,
+    // triplet regression intact, active-shrink invariant (memory 続51,
+    // script/steom_gphhp_paper.py).  Replaces the shipped UBMJC IP route and the
+    // ZEROED EA/cross.  Sub-toggles GANSU_STEOM_PAPER_A / _B pick the Eq.(62)
+    // helper index readings (default A=0/B=0 = pair-symmetry-principled reading;
+    // A=0 confirmed decisively by the zigzag-C6H8 gate: root0 0.308 vs ORCA 0.317
+    // where A=1 gives 0.259; B toggles are +-10 meV, B=0 kept as principled).
+    const bool paper_gphhp = (std::getenv("GANSU_STEOM_PAPER_GPHHP") != nullptr);
+    const bool ee_base = paper_gphhp || (std::getenv("STEOM_EE_BASE") != nullptr);
     #pragma omp parallel for collapse(2) schedule(static)
     for (int b=0;b<NV;++b) for(int k=0;k<NO;++k) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c)
         GPHHP(b,k,j,c) = ee_base ? wovvo(k,c,b,j)    // FIX: virtual b<->c swap
                                  : wovvo(k,b,c,j);   // shipped (buggy config-coupling)
+    if (!paper_gphhp) {
     #pragma omp parallel for schedule(static)              // distinct kf per m
     for (int m=0;m<NMo;++m){ const int kf=active_occ_idx_[m];
         for(int b=0;b<NV;++b) for(int j=0;j<NO;++j) for(int c=0;c<NV;++c)
             GPHHP(b,kf,j,c)+=UBMJC(b,m,j,c); }        // g_phhp IP route (SO-derived)
+    } else {
+        const char* envA = std::getenv("GANSU_STEOM_PAPER_A");
+        const char* envB = std::getenv("GANSU_STEOM_PAPER_B");
+        const int ambA = envA ? std::atoi(envA) : 0;
+        const int ambB = envB ? std::atoi(envB) : 0;
+        // (60) S^IP-linear: u_bmjc = -Σ_k Fov(k,c) s(m,k,j,b) + Σ_{k,l} Wooov(l,k,j,c) s(m,k,l,b)
+        //                            - Σ_{k,d} Wvovv(b,k,d,c) s(m,k,j,d);  scatter k=occ_idx[m]
+        #pragma omp parallel for schedule(static)          // distinct kf per m
+        for (int m=0;m<NMo;++m){ const int kf=active_occ_idx_[m];
+            for (int b=0;b<NV;++b) for (int j=0;j<NO;++j) for (int c=0;c<NV;++c){
+                real_t t=0.0;
+                for (int k=0;k<NO;++k) t -= fov(k,c)*siP(m,k,j,b);
+                for (int k=0;k<NO;++k) for (int l=0;l<NO;++l) t += wooov(l,k,j,c)*siP(m,k,l,b);
+                for (int k=0;k<NO;++k) for (int d=0;d<NV;++d) t -= wvovv(b,k,d,c)*siP(m,k,j,d);
+                GPHHP(b,kf,j,c) += t;
+            }
+        }
+        // (61) S^EA-linear: u_bkje = +Σ_d Fov(k,d) s(e,j,d,b) + Σ_{c,d} Wvovv(b,k,d,c) s(e,j,c,d)
+        //                            - Σ_{l,d} Wooov(l,k,j,d) s(e,l,d,b);  scatter c=vir_idx[e]
+        #pragma omp parallel for schedule(static)          // distinct b rows
+        for (int b=0;b<NV;++b)
+            for (int e=0;e<NMv;++e){ const int cf=active_vir_idx_[e];
+                for (int k=0;k<NO;++k) for (int j=0;j<NO;++j){
+                    real_t t=0.0;
+                    for (int d=0;d<NV;++d) t += fov(k,d)*seA(e,j,d,b);
+                    for (int c=0;c<NV;++c) for (int d=0;d<NV;++d) t += wvovv(b,k,d,c)*seA(e,j,c,d);
+                    for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) t -= wooov(l,k,j,d)*seA(e,l,d,b);
+                    GPHHP(b,k,j,cf) += t;
+                }
+            }
+        // (62) cross: helpers (38)/(39) with BARE integrals (the shipped u_ma/u_ie use
+        // dressed Wovvo — old-form UAMEI convention — so build fresh bare versions):
+        //   u_ma_p[m][a] = -Σ_{k,l,d} <kl|ad> s~IP ;  u_ie_p[e][k] = +Σ_{l,c,d} <kl|cd> s~EA
+        std::vector<real_t> u_ma_p((size_t)NMo*NV,0.0), u_ie_p((size_t)NMv*NO,0.0);
+        #pragma omp parallel for collapse(2)
+        for (int m=0;m<NMo;++m) for (int a=0;a<NV;++a){
+            real_t v=0.0;
+            for (int k=0;k<NO;++k) for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
+                v -= eriov(k,a,l,d)*(2.0*siP(m,k,l,d)-siP(m,l,k,d));
+            u_ma_p[(size_t)m*NV+a]=v;
+        }
+        #pragma omp parallel for collapse(2)
+        for (int e=0;e<NMv;++e) for (int k=0;k<NO;++k){
+            real_t v=0.0;
+            for (int l=0;l<NO;++l) for (int c=0;c<NV;++c) for (int d=0;d<NV;++d)
+                v += eriov(k,c,l,d)*(2.0*seA(e,l,c,d)-seA(e,l,d,c));
+            u_ie_p[(size_t)e*NO+k]=v;
+        }
+        // u_bmje = +Σ_d u_ma_p(m,d) s(e,j,d,b) - Σ_k u_ie_p(e,k) s(m,k,j,b)
+        //          +Σ_{k,l} Y(k,l,j) s(m,k,l,b) - Σ_{l,d} X(l,j,d) s(e,l,d,b)
+        // Y (toggle B): B0 = UKLIE(k,l,j,e) [bare, matches gate winner]
+        //               B1 = Σ_{a,b'} eriov(k,a,l,b') seA(e,j,b',a)
+        // X (toggle A): A0 = UKMID(l,m,j,d);  A1 = explicit (42)-style guess (gate winner):
+        //               A1: Σ_{p,b'} [eriov(p,b',l,d)(2 s(m,p,j,b')-s(m,j,p,b'))
+        //                              - eriov(l,b',p,d) s(m,p,j,b')]
+        std::vector<real_t> Xb((size_t)NO*NO*NV,0.0), Yb((size_t)NO*NO*NO,0.0);
+        for (int m=0;m<NMo;++m){ const int kf=active_occ_idx_[m];
+            #pragma omp parallel for collapse(2)
+            for (int l=0;l<NO;++l) for (int j=0;j<NO;++j) for (int d=0;d<NV;++d){
+                real_t x=0.0;
+                if (ambA==0) x = UKMID(l,m,j,d);
+                else {
+                    for (int p=0;p<NO;++p) for (int bb=0;bb<NV;++bb)
+                        x += eriov(p,bb,l,d)*(2.0*siP(m,p,j,bb)-siP(m,j,p,bb))
+                           - eriov(l,bb,p,d)*siP(m,p,j,bb);
+                }
+                Xb[((size_t)l*NO+j)*NV+d]=x;
+            }
+            for (int e=0;e<NMv;++e){ const int cf=active_vir_idx_[e];
+                if (ambB==1){
+                    #pragma omp parallel for collapse(2)
+                    for (int k=0;k<NO;++k) for (int l=0;l<NO;++l) for (int j=0;j<NO;++j){
+                        real_t y=0.0;
+                        for (int a=0;a<NV;++a) for (int bb=0;bb<NV;++bb)
+                            y += eriov(k,a,l,bb)*seA(e,j,bb,a);
+                        Yb[((size_t)k*NO+l)*NO+j]=y;
+                    }
+                }
+                #pragma omp parallel for collapse(2)
+                for (int b=0;b<NV;++b) for (int j=0;j<NO;++j){
+                    real_t t=0.0;
+                    for (int d=0;d<NV;++d) t += u_ma_p[(size_t)m*NV+d]*seA(e,j,d,b);
+                    for (int k=0;k<NO;++k) t -= u_ie_p[(size_t)e*NO+k]*siP(m,k,j,b);
+                    for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
+                        t += (ambB==0 ? UKLIE(k,l,j,e) : Yb[((size_t)k*NO+l)*NO+j])*siP(m,k,l,b);
+                    for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
+                        t -= Xb[((size_t)l*NO+j)*NV+d]*seA(e,l,d,b);
+                    GPHHP(b,kf,j,cf) += t;
+                }
+            }
+        }
+        std::cout << "[STEOM] g_phhp: COMPLETE paper form (Nooijen JCP 107,6812 Eq.60-63; "
+                  << "GANSU_STEOM_PAPER_GPHHP, A=" << ambA << " B=" << ambB
+                  << ", EE base forced)." << std::endl;
+    }
     }
     // u_bkje (g_phhp EA) and u_bmje (g_phhp cross) ZEROED 2026-06-20: old forms buggy; base+IP
     // (UBMJC) already matches ORCA on H2O/CH2O (n->pi* 0.04-0.08 eV). The correct small EA route
