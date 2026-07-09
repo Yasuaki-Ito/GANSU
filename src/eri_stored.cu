@@ -8247,11 +8247,13 @@ __global__ void transpose_square_kernel(const double* __restrict__ in,
 static const real_t* g_ccsd_init_t1 = nullptr;
 static const real_t* g_ccsd_init_t2 = nullptr;
 static int           g_ccsd_init_max_iter = -1;
+static real_t        g_ccsd_init_conv = -1.0;
 void ccsd_set_initial_guess(const real_t* h_t1, const real_t* h_t2,
-                            int max_iter_override) {
+                            int max_iter_override, real_t conv_override) {
     g_ccsd_init_t1 = h_t1;
     g_ccsd_init_t2 = h_t2;
     g_ccsd_init_max_iter = max_iter_override;
+    g_ccsd_init_conv = conv_override;   // >0: |dE| threshold for THIS call only
 }
 
 real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
@@ -8303,7 +8305,30 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // d_v_vvvv ONCE from B (resident) and dress it per-iter — same cost profile
     // as the legacy path, minus the AO-N⁴ transient.
     const char* e_tile = std::getenv("GANSU_CCSD_RI_LADDER_TILE");
-    const bool use_tiled_ladder = ri_bnative && (e_tile && e_tile[0] == '1');
+    // (2026-07-09) AUTO default: when the env is unset, enable the tiled ladder
+    // whenever the resident nvir⁴ buffer (+ headroom for the dressed copy /
+    // workspace) would not fit in currently-free device memory — this is what
+    // unlocked the tetracene bt-polish (161 GB dense estimate vs 141 GB H200).
+    // GANSU_CCSD_RI_LADDER_TILE=1/0 still forces either path.
+    bool tile_auto = false;
+#ifndef GANSU_CPU_ONLY
+    if (ri_bnative && !e_tile) {
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const size_t need = (size_t)nvir * nvir * nvir * nvir * sizeof(real_t) * 2;
+        if (need > (size_t)(0.85 * free_b)) {
+            tile_auto = true;
+            std::cout << "[CCSD auto-tile] dense vvvv est "
+                      << (need >> 30) << " GiB > 0.85*free "
+                      << ((size_t)(0.85 * free_b) >> 30)
+                      << " GiB -> enabling per-iter tiled RI ladder "
+                         "(force off with GANSU_CCSD_RI_LADDER_TILE=0)."
+                      << std::endl;
+        }
+    }
+#endif
+    const bool use_tiled_ladder = ri_bnative
+                                  && ((e_tile && e_tile[0] == '1') || tile_auto);
     // (DS-3/DS-4 device-0 shard) Decide the occ-i sharding up front — BEFORE the GPU
     // pool is sized — so device-0's i-block transients (Wakic/Wakci, and the DS-4
     // ovvv_t1_ic/dc + Z + Zt1) can be carved i-block COMPACT (≈ /NG) instead of full.
@@ -8409,6 +8434,8 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // Relaxable via env for the embedded-cluster STEOM ground re-solve; default 1e-10 =
     // byte-identical legacy convergence.
     real_t CONV = 1e-10;
+    if (g_ccsd_init_conv > 0) CONV = g_ccsd_init_conv;   // per-call override (bt-polish: 1e-7)
+    g_ccsd_init_conv = -1.0;                             // consumed-and-cleared
     if (const char* e = std::getenv("GANSU_CCSD_CONV")) CONV = std::atof(e);
 
     // Pre-build contiguous integral sub-blocks (constant, computed once)

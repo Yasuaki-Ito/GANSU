@@ -351,9 +351,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             const real_t level_shift = 0.0);
 
 // (bt-polish) stage warm-start amplitudes for the NEXT ccsd_spatial_orbital
-// call (defined in eri_stored.cu; consumed-and-cleared there).
+// call (defined in eri_stored.cu; consumed-and-cleared there). conv_override > 0
+// sets that call's |dE| threshold (GANSU_CCSD_CONV still wins if set).
 void ccsd_set_initial_guess(const real_t* h_t1, const real_t* h_t2,
-                            int max_iter_override);
+                            int max_iter_override, real_t conv_override);
 
 extern __global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ eri_full,
                                                     real_t* __restrict__ eri_trimmed,
@@ -2226,7 +2227,7 @@ void ERI_RI_RHF::compute_dlpno_steom_ccsd(int n_states) {
         // OFF under polish so IP/EA/STEOM consistently consume the polished
         // canonical amplitudes (explicit GANSU_DLPNO_NATIVE_EOM=1 overrides).
         const char* pol = std::getenv("GANSU_DLPNO_BT_POLISH");
-        const bool polish_on = (pol != nullptr && pol[0] != '0');
+        const bool polish_on = (pol == nullptr) || (pol[0] != '0');   // DEFAULT ON (2026-07-09)
         const char* nat_def = polish_on ? "0" : "1";
 #ifdef _WIN32
         _putenv_s("GANSU_DLPNO_NATIVE_EOM", nat_def);
@@ -2314,25 +2315,29 @@ void ERI_RI_RHF::compute_dlpno_steom_ccsd(int n_states) {
     std::cout << "  DLPNO-CCSD correlation energy = " << std::fixed << std::setprecision(10)
               << E_dlpno << " Ha  (fed to the canonical STEOM machinery)" << std::endl;
 
-    // ---- bt-polish (env GANSU_DLPNO_BT_POLISH=1, or =N to cap iterations) ----
+    // ---- bt-polish (GANSU_DLPNO_BT_POLISH: DEFAULT ON since 2026-07-09; =0 to
+    // disable, =N to cap iterations) ----
     // Warm-start a canonical CCSD from the back-transformed DLPNO amplitudes to
     // erase the PNO-truncation error before the EOM chain (the DLPNO-vs-canonical
     // STEOM gap is T2-truncation borne: naphthalene root0 5.08@normal /
-    // 4.90@very_tight vs canonical 4.68 — singles audit, 2026-07-08).
+    // 4.90@very_tight vs canonical 4.68 — singles audit, 2026-07-08). The polish
+    // re-solve defaults to |dE| < 1e-7 (12 iters vs 46 at 1e-10; STEOM roots
+    // agree to 4 digits — 続46/47); GANSU_CCSD_CONV overrides.
     // Few DIIS iterations from the warm start; the polished amplitudes REPLACE
     // the stored BT set, so CIS-NTO / IP / EA / STEOM all consume them (native
-    // per-pair σ is defaulted OFF above for consistency). Default OFF.
+    // per-pair σ is defaulted OFF above for consistency).
     {
         const char* pe = std::getenv("GANSU_DLPNO_BT_POLISH");
-        if (pe != nullptr && pe[0] != '0' && rhf_.use_dlpno_amplitudes()
+        const bool pol_on = (pe == nullptr) || (pe[0] != '0');
+        if (pol_on && rhf_.use_dlpno_amplitudes()
             && gpu::gpu_available()) {
             Timer polish_timer;
             BTAmplitudes bt = rhf_.get_dlpno_bt_amplitudes();  // copy; polished below
-            const int cap = std::atoi(pe);
+            const int cap = pe ? std::atoi(pe) : 0;
             std::cout << "---- DLPNO-STEOM bt-polish: canonical CCSD warm-started "
                          "from DLPNO amplitudes ----" << std::endl;
             ccsd_set_initial_guess(bt.T1.data(), bt.T2.data(),
-                                   cap > 1 ? cap : -1);
+                                   cap > 1 ? cap : -1, /*conv_override=*/1e-7);
             real_t* d_t1p = nullptr;
             real_t* d_t2p = nullptr;
             const real_t E_pol = ccsd_spatial_orbital(
@@ -2358,7 +2363,7 @@ void ERI_RI_RHF::compute_dlpno_steom_ccsd(int n_states) {
                       << std::setprecision(2) << (E_pol - E_dlpno) << ";  "
                       << std::fixed << std::setprecision(1)
                       << polish_timer.elapsed_seconds() << " s)" << std::endl;
-        } else if (pe != nullptr && pe[0] != '0') {
+        } else if (pol_on) {
             std::cout << "  [bt-polish] skipped (no GPU or no BT amplitudes)."
                       << std::endl;
         }
