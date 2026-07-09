@@ -30,7 +30,12 @@ from pyscf_steom_feff_reference import build_g_canonical_full, build_normalized_
 from steom_gphhp_gate import restrict, assemble, eig_lab, ORCA_S, ORCA_T, Ha2eV
 
 
-def build_paper_gphhp(d, ambA=0, ambB=0, ambC=0):
+def build_paper_gphhp(d, ambA=0, ambB=0, ambC=0, fcross=1.0, fea=1.0, fip=1.0,
+                      vswap=()):
+    """vswap: subset of {'ip','ea','cross'} — place that route with the two
+    VIRTUAL roles exchanged (amplitude-vir -> bra slot, integral/scattered vir
+    -> ket slot), i.e. the ST-CC2-appendix convention.  Our g layout:
+    g[ketvir b, kethole k, brahole j, bravir c]."""
     bar = d["bar"]; nocc = d["nocc"]; nvir = d["nvir"]
     Fov = bar["Fov"]; Wvovv = bar["Wvovv"]; Wooov = bar["Wooov"]
     Wovvo = bar["Wovvo"]; eri = bar["eri_ovov"]      # eri[i,a,j,b] = <ij|ab>
@@ -53,14 +58,20 @@ def build_paper_gphhp(d, ambA=0, ambB=0, ambC=0):
         u = -np.einsum("kc,kjb->bjc", Fov, s)            # -w_kc s^{mb}_{kj}
         u += np.einsum("lkjc,klb->bjc", Wooov, s)        # +w_klcj s^{mb}_{kl} (<kl|cj>=Wooov[l,k,j,c])
         u -= np.einsum("bkdc,kjd->bjc", Wvovv, s)        # -w_kbcd s^{md}_{kj} (<kb|cd>=Wvovv[b,k,d,c])
-        g[:, occ_idx[m], :, :] += u
+        if "ip" in vswap:
+            g[:, occ_idx[m], :, :] += fip * u.transpose(2, 1, 0)   # amp-vir b -> bra slot
+        else:
+            g[:, occ_idx[m], :, :] += fip * u
     # ---- Eq.(61): u_bkje (S^EA linear), scatter c=vir_idx[e] ----
     for e in range(nE):
         s = sE[e]                                        # s^{ab}_{ej} = s[j,a,b]
         u = np.einsum("kd,jdb->bkj", Fov, s)             # +w_kd s^{db}_{ej}
         u += np.einsum("bkdc,jcd->bkj", Wvovv, s)        # +w_bkdc s^{cd}_{ej}
         u -= np.einsum("lkjd,ldb->bkj", Wooov, s)        # -w_lkjd s^{db}_{el}
-        g[:, :, :, vir_idx[e]] += u
+        if "ea" in vswap:
+            g[vir_idx[e], :, :, :] += fea * u.transpose(1, 2, 0)   # e -> ket slot
+        else:
+            g[:, :, :, vir_idx[e]] += fea * u
     # ---- Eq.(62): u_bmje (cross), scatter k=occ_idx[m], c=vir_idx[e] ----
     # helpers (38)/(39)/(44)/(42)/(43) with bare v = eri_ovov
     u_ma = np.zeros((nM, nvir))
@@ -97,7 +108,10 @@ def build_paper_gphhp(d, ambA=0, ambB=0, ambC=0):
             u -= np.einsum("k,kjb->bj", u_ie[e], sm)         # -u_ke s^{mb}_{kj}
             u += np.einsum("klj,klb->bj", u_klej, sm)        # +u_klej s^{mb}_{kl}
             u -= np.einsum("ljd,ldb->bj", u_lmjd, se)        # -u_lmjd s^{db}_{el}
-            g[:, occ_idx[m], :, vir_idx[e]] += u
+            if "cross" in vswap:
+                g[vir_idx[e], occ_idx[m], :, :] += fcross * u.T
+            else:
+                g[:, occ_idx[m], :, vir_idx[e]] += fcross * u
     return g
 
 

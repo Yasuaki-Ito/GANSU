@@ -4500,6 +4500,16 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         const char* envB = std::getenv("GANSU_STEOM_PAPER_B");
         const int ambA = envA ? std::atoi(envA) : 0;
         const int ambB = envB ? std::atoi(envB) : 0;
+        // VSWAP (2026-07-09, 続55): the routes must be placed with the two VIRTUAL
+        // roles exchanged (amplitude-vir -> bra slot, integral/scattered vir -> ket
+        // slot), consistent with the EE base fix which swaps the BASE virtuals.
+        // Validated on three ORCA gates: H2O rms6 0.0695 -> 0.0056 eV (<=9 meV,
+        // triplet-level), zigzag-C6H8 0.028 -> 0.016, butadiene 0.42 -> 0.059
+        // (script/steom_gphhp_vswap.py; convention matches the ST-CC2 appendix,
+        // arXiv:2106.13630).  GANSU_STEOM_PAPER_VSWAP=0 reverts to the unswapped
+        // placement (debug only).
+        const char* envW = std::getenv("GANSU_STEOM_PAPER_VSWAP");
+        const bool vsw = envW ? (std::atoi(envW) != 0) : true;
         // (60) S^IP-linear: u_bmjc = -Σ_k Fov(k,c) s(m,k,j,b) + Σ_{k,l} Wooov(l,k,j,c) s(m,k,l,b)
         //                            - Σ_{k,d} Wvovv(b,k,d,c) s(m,k,j,d);  scatter k=occ_idx[m]
         #pragma omp parallel for schedule(static)          // distinct kf per m
@@ -4509,7 +4519,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                 for (int k=0;k<NO;++k) t -= fov(k,c)*siP(m,k,j,b);
                 for (int k=0;k<NO;++k) for (int l=0;l<NO;++l) t += wooov(l,k,j,c)*siP(m,k,l,b);
                 for (int k=0;k<NO;++k) for (int d=0;d<NV;++d) t -= wvovv(b,k,d,c)*siP(m,k,j,d);
-                GPHHP(b,kf,j,c) += t;
+                if (vsw) GPHHP(c,kf,j,b) += t; else GPHHP(b,kf,j,c) += t;
             }
         }
         // (61) S^EA-linear: u_bkje = +Σ_d Fov(k,d) s(e,j,d,b) + Σ_{c,d} Wvovv(b,k,d,c) s(e,j,c,d)
@@ -4522,7 +4532,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                     for (int d=0;d<NV;++d) t += fov(k,d)*seA(e,j,d,b);
                     for (int c=0;c<NV;++c) for (int d=0;d<NV;++d) t += wvovv(b,k,d,c)*seA(e,j,c,d);
                     for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) t -= wooov(l,k,j,d)*seA(e,l,d,b);
-                    GPHHP(b,k,j,cf) += t;
+                    if (vsw) GPHHP(cf,k,j,b) += t; else GPHHP(b,k,j,cf) += t;
                 }
             }
         // (62) cross: helpers (38)/(39) with BARE integrals (the shipped u_ma/u_ie use
@@ -4582,12 +4592,13 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                         t += (ambB==0 ? UKLIE(k,l,j,e) : Yb[((size_t)k*NO+l)*NO+j])*siP(m,k,l,b);
                     for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
                         t -= Xb[((size_t)l*NO+j)*NV+d]*seA(e,l,d,b);
-                    GPHHP(b,kf,j,cf) += t;
+                    if (vsw) GPHHP(cf,kf,j,b) += t; else GPHHP(b,kf,j,cf) += t;
                 }
             }
         }
         std::cout << "[STEOM] g_phhp: COMPLETE paper form (Nooijen JCP 107,6812 Eq.60-63; "
                   << "GANSU_STEOM_PAPER_GPHHP, A=" << ambA << " B=" << ambB
+                  << " vswap=" << (vsw ? 1 : 0)
                   << ", EE base forced)." << std::endl;
     }
     }
