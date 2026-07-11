@@ -36,6 +36,32 @@ std::vector<real_t> build_pao_global(
     const real_t* S,
     int nao, int nocc);
 
+/**
+ * @brief Global PAOs restricted to an embedding-cluster VIRTUAL subspace
+ *        (DMET×DLPNO Phase 1a, rectangular C).
+ *
+ *   |μ̃⟩ = P̂_vir^emb |χ_μ⟩,  P̂_vir^emb = Σ_{a ∈ cluster vir} |φ_a⟩⟨φ_a|
+ *
+ *       C̃^{PAO,emb} = (C_vir · C_vir^T) · S,
+ *
+ *   shape (nao × nao), rank = nmo − nocc_full. In the square (complete-C)
+ *   limit D_occ + D_vir = S⁻¹, so this equals the legacy I − D_occ·S exactly;
+ *   for rectangular C it removes the environment complement that
+ *   I − D_occ·S would leak into the PAO span. Redundancy handled downstream
+ *   by orthogonalize_pao_domain (t_cut_do), unchanged.
+ *
+ * @param C_emb   [nao × nmo] row-major cluster MO coefficients (ALL columns).
+ * @param S       [nao × nao] AO overlap (row-major, symmetric).
+ * @param nao, nmo  AO count / cluster MO count.
+ * @param nocc_full cluster occupied count INCLUDING frozen (virtuals =
+ *                  columns [nocc_full, nmo)).
+ * @return [nao × nao] row-major C̃^{PAO,emb}.
+ */
+std::vector<real_t> build_pao_cluster_virtual(
+    const real_t* C_emb,
+    const real_t* S,
+    int nao, int nmo, int nocc_full);
+
 /// Result of per-domain PAO Löwdin orthogonalisation.
 struct PAODomainResult {
     /// Orthonormal PAO expansion in global AO basis: shape [nao × n_kept],

@@ -112,7 +112,8 @@ __global__ void extract_V_block_kernel(
 //  CCSD residual loop).
 // ---------------------------------------------------------------------------
 DLPNOLMP2Result solve_dlpno_lmp2(
-    RHF& rhf, const ERI& eri, const DLPNOParams& params)
+    RHF& rhf, const ERI& eri, const DLPNOParams& params,
+    const DLPNOClusterSpace* cluster)
 {
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
@@ -129,7 +130,12 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     result.nao  = rhf.get_num_basis();
     // Frozen-core aware: nocc = active occupied (= total - num_frozen_core_).
     // For --frozen_core none, num_frozen_core_ = 0 → identical to legacy.
-    result.nocc = rhf.get_num_active_occ();
+    // Cluster mode (DMET×DLPNO Phase 1a): the orbital space (C/eps/F/nocc/
+    // frozen) comes from the embedding cluster; the AO-side quantities (S,
+    // atom ranges, the RI engine) stay the full molecule's — cluster MOs are
+    // genuine LCAO over the real AO basis. cluster == nullptr is byte-identical
+    // legacy.
+    result.nocc = cluster ? cluster->nocc : rhf.get_num_active_occ();
     if (result.nocc <= 0) return result;
 
     const int nao_  = result.nao;
@@ -144,12 +150,15 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     rhf.get_fock_matrix().toHost();
     rhf.get_orbital_energies().toHost();
 
-    const real_t* h_C   = rhf.get_coefficient_matrix().host_ptr();
+    const real_t* h_C   = cluster ? cluster->h_C
+                                  : rhf.get_coefficient_matrix().host_ptr();
     const real_t* h_S   = rhf.get_overlap_matrix().host_ptr();
-    const real_t* h_F   = rhf.get_fock_matrix().host_ptr();
-    const real_t* h_eps = rhf.get_orbital_energies().host_ptr();
+    const real_t* h_F   = cluster ? cluster->h_F_eff   // S·C·diag(eps)·C^T·S (== F in the square limit)
+                                  : rhf.get_fock_matrix().host_ptr();
+    const real_t* h_eps = cluster ? cluster->h_eps
+                                  : rhf.get_orbital_energies().host_ptr();
 
-    // Frozen-core: skip the first num_fc columns of the (nao × nao) MO
+    // Frozen-core: skip the first num_fc columns of the (nao × ncol) MO
     // coefficient matrix and the matching orbital-energy entries. With
     // --frozen_core none, num_fc = 0 and behaviour is identical to legacy.
     //
@@ -161,17 +170,19 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     //     The PAO projector must remove ALL occupied (frozen + active),
     //     otherwise the frozen orbital leaks into the PAO virtual space
     //     and CCSD picks up spurious frozen↔active T2 excitations.
-    const int num_fc = rhf.get_num_frozen_core();
+    const int num_fc = cluster ? cluster->nfrozen : rhf.get_num_frozen_core();
     const int nocc_full = nocc_ + num_fc;
+    // C row stride = column count: nao (square, legacy) / nmo (rectangular cluster C).
+    const int c_ld = cluster ? cluster->nmo : nao_;
 
     std::vector<real_t> C_occ_full(
         static_cast<size_t>(nao_) * nocc_full, 0.0);
     std::vector<real_t> C_occ(static_cast<size_t>(nao_) * nocc_, 0.0);
     for (int mu = 0; mu < nao_; ++mu) {
         for (int i = 0; i < nocc_full; ++i)
-            C_occ_full[mu * nocc_full + i] = h_C[mu * nao_ + i];
+            C_occ_full[mu * nocc_full + i] = h_C[(size_t)mu * c_ld + i];
         for (int i = 0; i < nocc_; ++i)
-            C_occ[mu * nocc_ + i] = h_C[mu * nao_ + (num_fc + i)];
+            C_occ[mu * nocc_ + i] = h_C[(size_t)mu * c_ld + (num_fc + i)];
     }
 
     std::vector<std::pair<int,int>> atom_ranges;
@@ -247,8 +258,12 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     // C_occ_full instead of h_C_LMO so frozen orbitals are projected out
     // of the PAO virtual space (otherwise CCSD T2 sees spurious
     // frozen↔active excitations and diverges).
-    auto C_pao_global = build_pao_global(
-        C_occ_full.data(), h_S, nao_, nocc_full);
+    // Cluster mode: build PAOs from the cluster-VIRTUAL projector instead —
+    // I − D_occ·S would leak the environment complement into the PAO span
+    // (== the same matrix only in the square-C limit).
+    auto C_pao_global = cluster
+        ? build_pao_cluster_virtual(cluster->h_C, h_S, nao_, cluster->nmo, nocc_full)
+        : build_pao_global(C_occ_full.data(), h_S, nao_, nocc_full);
 
     auto lmo_domains = build_lmo_domains(
         h_C_LMO, h_S, nao_, nocc_, atom_ranges,
@@ -618,7 +633,7 @@ DLPNOLMP2Result solve_dlpno_lmp2(
         // distribution. Useful for sizing parallel slabs and estimating
         // load balance. Counts include the (i,j)↔(j,i) symmetry expansion
         // via pair_factor so they are comparable to canonical = nocc²·nvir².
-        const int    nvir = nao_ - nocc_;
+        const int    nvir = (cluster ? cluster->nmo : nao_) - nocc_;
         const size_t canonical_T2 = static_cast<size_t>(nocc_) * nocc_
                                   * static_cast<size_t>(nvir) * nvir;
         size_t pao_T2 = 0, pno_T2 = 0;

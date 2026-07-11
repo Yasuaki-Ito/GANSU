@@ -1080,6 +1080,17 @@ void DavidsonSolver::restart_subspace() {
         tracked_cudaFree(temp);
 
         subspace_dim_ = num_keep;
+        // (2026-07-10) Re-orthonormalize the restart basis. For a NON-Hermitian
+        // operator (IP/EA/EE-EOM) the subspace eigenvectors are not mutually
+        // orthogonal, so the kept Ritz vectors V·c_i are not an orthonormal set —
+        // yet build_subspace_matrix (H = V^T·Σ) and the Gram-Schmidt in
+        // add_correction_vectors both assume orthonormal V. Restarting without
+        // this silently degenerates the basis (observed: EA roots collapsing to
+        // 0.000000 after the first restart under GANSU_EOM_MAX_SUB_PER_ROOT).
+        // Gram-Schmidt preserves span(kept Ritz vectors), so the restart stays
+        // mathematically sound; for Hermitian problems the Ritz vectors are
+        // already orthonormal and this is a numerical no-op.
+        orthogonalize_vectors(0, num_keep);
         return;
     }
 
@@ -1118,6 +1129,11 @@ void DavidsonSolver::restart_subspace() {
     tracked_cudaFree(d_temp);
 
     subspace_dim_ = num_keep;
+    // (2026-07-10) Re-orthonormalize the restart basis — see the CPU-path note
+    // above: non-Hermitian Ritz vectors are not mutually orthogonal, and every
+    // downstream step assumes an orthonormal V. Span-preserving, so restarts
+    // stay mathematically sound; Hermitian case ≈ numerical no-op.
+    orthogonalize_vectors(0, num_keep);
 }
 
 // ========== Public Getters ==========

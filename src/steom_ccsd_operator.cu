@@ -963,14 +963,6 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
     const size_t ovvv_sz = (size_t)nocc * nvir * nvir * nvir;
     const size_t vvvv_sz = (size_t)nvir * nvir * nvir * nvir;
 
-    tracked_cudaMalloc(&d_eri_oooo_, oooo_sz * sizeof(real_t));
-    tracked_cudaMalloc(&d_eri_ooov_, ooov_sz * sizeof(real_t));
-    tracked_cudaMalloc(&d_eri_ovov_, ovov_sz * sizeof(real_t));
-    tracked_cudaMalloc(&d_eri_oovv_, oovv_sz * sizeof(real_t));
-    tracked_cudaMalloc(&d_eri_ovvo_, ovvo_sz * sizeof(real_t));
-    tracked_cudaMalloc(&d_eri_ovvv_, ovvv_sz * sizeof(real_t));
-    // Ship 14: in slab mode d_eri_vvvv_ stays null; each device owns its
-    // slab via d_eri_vvvv_slabs_[d] allocated by the driver before ctor.
     // (RI Term A) skip the nvir⁴ alloc when Wvvvo·t1 is evaluated from B-factors
     // (keep it under BUILD_VALIDATE so the host self-check reference survives).
     // (2026-07-09) Also skip it when the shared bar-H cache will satisfy
@@ -981,6 +973,31 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
     const bool barh_will_borrow = barh_cache_ && barh_cache_->complete()
         && barh_cache_->nocc == nocc_active_ && barh_cache_->nvir == nvir_
         && barh_cache_->canonical_skip_wvvvv == canonical_skip_wvvvv_;
+    // (2026-07-10, DMET cluster W_eff wall) Under a full bar-H borrow the five
+    // o-block raws are dead weight too: build_dressed (their ONLY reader — the
+    // D2H host copies + build GEMMs sit after its borrow early-return) is
+    // skipped entirely, and the X/F_eff/W_eff stages read just the borrowed
+    // bar-H + t1/t2 + raw ovov. Skip extracting them (Doxorubicin cc-pVDZ
+    // cluster: ovvv 15.3 + oovv 5.9 + ovvo 5.9 + ooov 2.3 + oooo 0.9 GiB
+    // ≈ 30 GiB — exactly the margin the W^eff build OOM'd on, run4/5).
+    // VALIDATE keeps them; opt-out GANSU_STEOM_KEEP_RAW_OBLOCKS=1.
+    const bool skip_dead_o_blocks = barh_will_borrow
+        && std::getenv("GANSU_STEOM_BUILD_VALIDATE") == nullptr
+        && std::getenv("GANSU_STEOM_KEEP_RAW_OBLOCKS") == nullptr;
+    if (!skip_dead_o_blocks) {
+        tracked_cudaMalloc(&d_eri_oooo_, oooo_sz * sizeof(real_t));
+        tracked_cudaMalloc(&d_eri_ooov_, ooov_sz * sizeof(real_t));
+        tracked_cudaMalloc(&d_eri_oovv_, oovv_sz * sizeof(real_t));
+        tracked_cudaMalloc(&d_eri_ovvo_, ovvo_sz * sizeof(real_t));
+        tracked_cudaMalloc(&d_eri_ovvv_, ovvv_sz * sizeof(real_t));
+    } else {
+        std::cout << "  [STEOM] raw oooo/ooov/oovv/ovvo/ovvv extraction skipped "
+                     "(bar-H fully borrowed; W^eff reads only bar-H + t1/t2 + ovov)."
+                  << std::endl;
+    }
+    tracked_cudaMalloc(&d_eri_ovov_, ovov_sz * sizeof(real_t));   // W^eff consumer — always kept
+    // Ship 14: in slab mode d_eri_vvvv_ stays null; each device owns its
+    // slab via d_eri_vvvv_slabs_[d] allocated by the driver before ctor.
     const bool keep_dense_vvvv = (!ri_vvvv_term_a_ && !barh_will_borrow)
                                  || std::getenv("GANSU_STEOM_BUILD_VALIDATE") != nullptr;
     if (!keep_dense_vvvv && barh_will_borrow)
@@ -1002,12 +1019,13 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
         // frozen_off_ to read the active occ [O,O+nocc) / vir [O+nocc,O+nocc+nvir)
         // window. O = 0 ⇒ non-frozen (byte-identical).
         const int O = frozen_off_;
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         O,nocc,O,nocc,           d_eri_oooo_); // (ij|kl)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         O,nocc,nocc+O,nvir,      d_eri_ooov_); // (ji|kb)
+        // null slots = extraction skipped (dead under full bar-H borrow)
+        if (d_eri_oooo_) eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         O,nocc,O,nocc,           d_eri_oooo_); // (ij|kl)
+        if (d_eri_ooov_) eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         O,nocc,nocc+O,nvir,      d_eri_ooov_); // (ji|kb)
         eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    O,nocc,nocc+O,nvir,      d_eri_ovov_); // (ia|jb)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         nocc+O,nvir,nocc+O,nvir, d_eri_oovv_); // (ij|ab)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,O,nocc,      d_eri_ovvo_); // (ia|bj)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,nocc+O,nvir, d_eri_ovvv_); // (ia|bc)
+        if (d_eri_oovv_) eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         nocc+O,nvir,nocc+O,nvir, d_eri_oovv_); // (ij|ab)
+        if (d_eri_ovvo_) eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,O,nocc,      d_eri_ovvo_); // (ia|bj)
+        if (d_eri_ovvv_) eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,nocc+O,nvir, d_eri_ovvv_); // (ia|bc)
         // Ship 14: slab mode skips legacy single-device vvvv extract (driver
         // pre-populated d_eri_vvvv_slabs_).
         if (eri_vvvv_nslab_ <= 1 && keep_dense_vvvv) {
@@ -1027,6 +1045,7 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
             int j = rem / nvir; int b = rem % nvir;
             d_eri_ovov_[idx] = d_eri_mo[((size_t)i*nao + a+nocc)*nao2 + (size_t)j*nao + b+nocc];
         }
+        if (d_eri_ooov_) {           // null = skipped under full bar-H borrow
         #pragma omp parallel for
         for (int idx = 0; idx < (int)ooov_sz; ++idx) {
             int j = idx / (nocc * nocc * nvir);
@@ -1035,6 +1054,8 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
             int k = rem / nvir; int b = rem % nvir;
             d_eri_ooov_[idx] = d_eri_mo[((size_t)j*nao + i)*nao2 + (size_t)k*nao + b+nocc];
         }
+        }
+        if (d_eri_oooo_) {
         #pragma omp parallel for
         for (int idx = 0; idx < (int)oooo_sz; ++idx) {
             int i = idx / (nocc * nocc * nocc);
@@ -1043,6 +1064,8 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
             int k = rem / nocc; int l = rem % nocc;
             d_eri_oooo_[idx] = d_eri_mo[((size_t)i*nao + j)*nao2 + (size_t)k*nao + l];
         }
+        }
+        if (d_eri_oovv_) {
         #pragma omp parallel for
         for (int idx = 0; idx < (int)oovv_sz; ++idx) {
             int i = idx / (nocc * nvir * nvir);
@@ -1051,6 +1074,8 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
             int a = rem / nvir; int b = rem % nvir;
             d_eri_oovv_[idx] = d_eri_mo[((size_t)i*nao + j)*nao2 + (size_t)(a+nocc)*nao + b+nocc];
         }
+        }
+        if (d_eri_ovvo_) {
         #pragma omp parallel for
         for (int idx = 0; idx < (int)ovvo_sz; ++idx) {
             int i = idx / (nvir * nvir * nocc);
@@ -1059,6 +1084,8 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
             int b = rem / nocc; int j = rem % nocc;
             d_eri_ovvo_[idx] = d_eri_mo[((size_t)i*nao + a+nocc)*nao2 + (size_t)(b+nocc)*nao + j];
         }
+        }
+        if (d_eri_ovvv_) {
         #pragma omp parallel for
         for (size_t idx = 0; idx < ovvv_sz; ++idx) {
             int i = (int)(idx / ((size_t)nvir * nvir * nvir));
@@ -1070,6 +1097,7 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
             size_t mo_idx = (size_t)i * N * N * N + (size_t)(a + nocc) * N * N
                           + (size_t)(b + nocc) * N + (size_t)(c + nocc);
             d_eri_ovvv_[idx] = d_eri_mo[mo_idx];
+        }
         }
         if (d_eri_vvvv_) {           // skipped when bar-H is fully borrowed (2026-07-09)
         #pragma omp parallel for
@@ -1091,16 +1119,26 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
         int blocks;
         blocks = (ovov_sz + threads - 1) / threads;
         eom_mp2_extract_eri_ovov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovov_, nocc_active_, nvir_, nao_active_);
-        blocks = (ooov_sz + threads - 1) / threads;
-        eom_mp2_extract_eri_ooov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ooov_, nocc_active_, nvir_, nao_active_);
-        blocks = (oooo_sz + threads - 1) / threads;
-        eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo_, nocc_active_, nao_active_, 0);
-        blocks = (oovv_sz + threads - 1) / threads;
-        eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv_, nocc_active_, nvir_, nao_active_, 0, -1);
-        blocks = (ovvo_sz + threads - 1) / threads;
-        eom_mp2_extract_eri_ovvo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvo_, nocc_active_, nvir_, nao_active_);
-        blocks = (ovvv_sz + threads - 1) / threads;
-        eom_ccsd_extract_eri_ovvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvv_, nocc_active_, nvir_, nao_active_);
+        if (d_eri_ooov_) {           // null slots = skipped under full bar-H borrow
+            blocks = (ooov_sz + threads - 1) / threads;
+            eom_mp2_extract_eri_ooov_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ooov_, nocc_active_, nvir_, nao_active_);
+        }
+        if (d_eri_oooo_) {
+            blocks = (oooo_sz + threads - 1) / threads;
+            eom_mp2_extract_eri_oooo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oooo_, nocc_active_, nao_active_, 0);
+        }
+        if (d_eri_oovv_) {
+            blocks = (oovv_sz + threads - 1) / threads;
+            eom_mp2_extract_eri_oovv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_oovv_, nocc_active_, nvir_, nao_active_, 0, -1);
+        }
+        if (d_eri_ovvo_) {
+            blocks = (ovvo_sz + threads - 1) / threads;
+            eom_mp2_extract_eri_ovvo_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvo_, nocc_active_, nvir_, nao_active_);
+        }
+        if (d_eri_ovvv_) {
+            blocks = (ovvv_sz + threads - 1) / threads;
+            eom_ccsd_extract_eri_ovvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_ovvv_, nocc_active_, nvir_, nao_active_);
+        }
         if (d_eri_vvvv_) {           // skipped when bar-H is fully borrowed (2026-07-09)
             blocks = (vvvv_sz + threads - 1) / threads;
             eom_mp2_extract_eri_vvvv_kernel<<<blocks, threads>>>(d_eri_mo, d_eri_vvvv_, nocc_active_, nvir_, nao_active_, 0, -1);
@@ -4538,15 +4576,346 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         // placement (debug only).
         const char* envW = std::getenv("GANSU_STEOM_PAPER_VSWAP");
         const bool vsw = envW ? (std::atoi(envW) != 0) : true;
+        // (W^eff build perf, 2026-07-11) GEMM port of the flop-heavy paper-route inner
+        // contractions (Eq.60 S^IP-linear, Eq.61 S^EA-linear, Eq.62 u_ma/u_ie helpers
+        // and the ambA==1 explicit Xb).  Run as host loops these are DRAM-bound
+        // random-access sums (~2e13 flop on a DMET cluster — hours of wall time; the
+        // Eq.60 loop only parallelises over m=NMo).  Each inner contraction is cast
+        // as a dense cublasDgemm exactly like the neighbouring W^eff sub-terms
+        // (UAMCI/UAKEI/UAMEI/UBMJC).  The scatter placement (vswap), signs and
+        // coefficients below are untouched — only the evaluation of t changes.  The
+        // GEMM summation order differs from the serial inner loops, so this matches
+        // to ≈1e-11 (the W^eff GEMM-port tolerance), not byte-exact.  Host fallbacks
+        // retained (p60/p61/p62 flags stay false without a GPU).  The two giant raw
+        // operands are uploaded ONCE each and freed right after use (no residency):
+        //   Wvovv [NV·NO·NV·NV]: Eq.60 term3 (per-b [(k,d)×c] slices via OP_T) +
+        //                        Eq.61 Wvovv term (raw [(b,k)×(d,c)] view, the
+        //                        contraction pair is already LAST — no repack);
+        //   ERIov [NO·NV·NO·NV]: u_ie (raw [k×(c,l,d)] view), u_ma (per-k [a×(l,d)]
+        //                        slices) and the ambA==1 Xb (raw [(p,bb)×(l,d)] view).
+        const int P60_MJ = NMo*NO;  // Eq.60 term3 output cols (m,j)
+        const int P60_N2 = NO*NV;   // Eq.60 term2 output cols (j,c)
+        const int P61_EJ = NMv*NO;  // Eq.61 Wvovv-term output cols (e,j)
+        const int P61_EB = NMv*NV;  // Eq.61 Wooov-term output cols (e,b)
+        const int P62_LD = NO*NV;   // Eq.62 Xb output cols (l,d)
+        std::vector<real_t> ct60_t1, ct60_t2, ct60_t3;   bool p60_gpu  = false;
+        std::vector<real_t> ct61_t1, ct61_w,  ct61_t3;   bool p61_gpu  = false;
+        std::vector<real_t> ct62_uma, ct62_uie;          bool p62u_gpu = false;
+        std::vector<real_t> ct62_xb;                     bool p62x_gpu = false;  // ambA==1 only
+#ifndef GANSU_CPU_ONLY
+        if (gpu::gpu_available() && (NMo > 0 || NMv > 0)) {
+            cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+            const real_t one = 1.0, negone = -1.0, zero = 0.0;
+            // ---- Eq.60 term1: ct60_t1[(m,j,b),c] = Σ_k fov(k,c)·siP(m,k,j,b) ----
+            if (NMo > 0) {
+                const int M1 = NMo*NO*NV;
+                std::vector<real_t> hA((size_t)M1*NO);
+                #pragma omp parallel for collapse(2)
+                for (int m=0;m<NMo;++m) for (int j=0;j<NO;++j)
+                    for (int b=0;b<NV;++b) for (int k=0;k<NO;++k)
+                        hA[(size_t)((m*NO+j)*NV+b)*NO+k] = siP(m,k,j,b);
+                real_t *dA=nullptr,*dF=nullptr,*dC=nullptr;
+                tracked_cudaMalloc(&dA,(size_t)M1*NO*sizeof(real_t));
+                tracked_cudaMalloc(&dF,Fov.size()*sizeof(real_t));
+                tracked_cudaMalloc(&dC,(size_t)M1*NV*sizeof(real_t));
+                cudaMemcpy(dA,hA.data(),(size_t)M1*NO*sizeof(real_t),cudaMemcpyHostToDevice);
+                cudaMemcpy(dF,Fov.data(),Fov.size()*sizeof(real_t),cudaMemcpyHostToDevice);
+                // raw Fov is [k×c] with the contraction k FIRST -> plain (N,N) col-major
+                // product, no Fov repack: C_cm(c,row) = Σ_k Fov_cm(c,k)·hA_cm(k,row)
+                cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,NV,M1,NO,&one,dF,NV,dA,NO,&zero,dC,NV);
+                ct60_t1.assign((size_t)M1*NV,0.0);
+                cudaMemcpy(ct60_t1.data(),dC,(size_t)M1*NV*sizeof(real_t),cudaMemcpyDeviceToHost);
+                tracked_cudaFree(dA);tracked_cudaFree(dF);tracked_cudaFree(dC);
+            }
+            // ---- Eq.60 term2: ct60_t2[(m,b),(j,c)] = Σ_{k,l} wooov(l,k,j,c)·siP(m,k,l,b) ----
+            if (NMo > 0) {
+                const int M2 = NMo*NV, K2 = NO*NO;
+                std::vector<real_t> hA((size_t)M2*K2), hB((size_t)P60_N2*K2);
+                #pragma omp parallel for collapse(2)
+                for (int m=0;m<NMo;++m) for (int b=0;b<NV;++b)
+                    for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
+                        hA[(size_t)(m*NV+b)*K2+(k*NO+l)] = siP(m,k,l,b);
+                #pragma omp parallel for collapse(2)
+                for (int j=0;j<NO;++j) for (int c=0;c<NV;++c)
+                    for (int k=0;k<NO;++k) for (int l=0;l<NO;++l)
+                        hB[(size_t)(j*NV+c)*K2+(k*NO+l)] = wooov(l,k,j,c);
+                real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
+                tracked_cudaMalloc(&dA,(size_t)M2*K2*sizeof(real_t));
+                tracked_cudaMalloc(&dB,(size_t)P60_N2*K2*sizeof(real_t));
+                tracked_cudaMalloc(&dC,(size_t)M2*P60_N2*sizeof(real_t));
+                cudaMemcpy(dA,hA.data(),(size_t)M2*K2*sizeof(real_t),cudaMemcpyHostToDevice);
+                cudaMemcpy(dB,hB.data(),(size_t)P60_N2*K2*sizeof(real_t),cudaMemcpyHostToDevice);
+                cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,P60_N2,M2,K2,&one,dB,K2,dA,K2,&zero,dC,P60_N2);
+                ct60_t2.assign((size_t)M2*P60_N2,0.0);
+                cudaMemcpy(ct60_t2.data(),dC,(size_t)M2*P60_N2*sizeof(real_t),cudaMemcpyDeviceToHost);
+                tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
+            }
+            // ---- raw Wvovv uploaded ONCE, shared by Eq.60 term3 and the Eq.61 Wvovv term ----
+            {
+                const int P60_KD = NO*NV;   // Eq.60 term3 contraction block (k,d)
+                real_t* dW=nullptr;
+                tracked_cudaMalloc(&dW,Wvovv.size()*sizeof(real_t));
+                cudaMemcpy(dW,Wvovv.data(),Wvovv.size()*sizeof(real_t),cudaMemcpyHostToDevice);
+                // Eq.60 term3: ct60_t3[(b,c),(m,j)] = Σ_{k,d} wvovv(b,k,d,c)·siP(m,k,j,d).
+                // Per-b GEMM on the raw slice Wvovv[b] = [(k,d)×c] (col-major NV×KD, OP_T).
+                if (NMo > 0) {
+                    std::vector<real_t> hB((size_t)P60_MJ*P60_KD);
+                    #pragma omp parallel for collapse(2)
+                    for (int m=0;m<NMo;++m) for (int j=0;j<NO;++j)
+                        for (int k=0;k<NO;++k) for (int d=0;d<NV;++d)
+                            hB[(size_t)(m*NO+j)*P60_KD+(k*NV+d)] = siP(m,k,j,d);
+                    real_t *dB=nullptr,*dC=nullptr;
+                    tracked_cudaMalloc(&dB,(size_t)P60_MJ*P60_KD*sizeof(real_t));
+                    tracked_cudaMalloc(&dC,(size_t)NV*NV*P60_MJ*sizeof(real_t));
+                    cudaMemcpy(dB,hB.data(),(size_t)P60_MJ*P60_KD*sizeof(real_t),cudaMemcpyHostToDevice);
+                    for (int b=0;b<NV;++b)
+                        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_T,P60_MJ,NV,P60_KD,&one,
+                                    dB,P60_KD,dW+(size_t)b*P60_KD*NV,NV,&zero,
+                                    dC+(size_t)b*NV*P60_MJ,P60_MJ);
+                    ct60_t3.assign((size_t)NV*NV*P60_MJ,0.0);
+                    cudaMemcpy(ct60_t3.data(),dC,(size_t)NV*NV*P60_MJ*sizeof(real_t),cudaMemcpyDeviceToHost);
+                    tracked_cudaFree(dB);tracked_cudaFree(dC);
+                    p60_gpu = true;
+                }
+                // Eq.61 Wvovv term: ct61_w[(b,k),(e,j)] = Σ_{c,d} wvovv(b,k,d,c)·seA(e,j,c,d).
+                // Raw Wvovv is already [(b,k)×(d,c)] with the contraction pair LAST -> no repack.
+                if (NMv > 0) {
+                    const int BK = NV*NO, DC = NV*NV;
+                    std::vector<real_t> hB((size_t)P61_EJ*DC);
+                    #pragma omp parallel for collapse(2)
+                    for (int e=0;e<NMv;++e) for (int j=0;j<NO;++j)
+                        for (int d=0;d<NV;++d) for (int c=0;c<NV;++c)
+                            hB[(size_t)(e*NO+j)*DC+(d*NV+c)] = seA(e,j,c,d);
+                    real_t *dB=nullptr,*dC=nullptr;
+                    tracked_cudaMalloc(&dB,(size_t)P61_EJ*DC*sizeof(real_t));
+                    tracked_cudaMalloc(&dC,(size_t)BK*P61_EJ*sizeof(real_t));
+                    cudaMemcpy(dB,hB.data(),(size_t)P61_EJ*DC*sizeof(real_t),cudaMemcpyHostToDevice);
+                    cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,P61_EJ,BK,DC,&one,dB,DC,dW,DC,&zero,dC,P61_EJ);
+                    ct61_w.assign((size_t)BK*P61_EJ,0.0);
+                    cudaMemcpy(ct61_w.data(),dC,(size_t)BK*P61_EJ*sizeof(real_t),cudaMemcpyDeviceToHost);
+                    tracked_cudaFree(dB);tracked_cudaFree(dC);
+                }
+                tracked_cudaFree(dW);
+            }
+            // ---- Eq.61 term1: ct61_t1[(e,j,b),k] = Σ_d fov(k,d)·seA(e,j,d,b) ----
+            if (NMv > 0) {
+                const int M1 = NMv*NO*NV;
+                std::vector<real_t> hA((size_t)M1*NV);
+                #pragma omp parallel for collapse(2)
+                for (int e=0;e<NMv;++e) for (int j=0;j<NO;++j)
+                    for (int b=0;b<NV;++b) for (int d=0;d<NV;++d)
+                        hA[(size_t)((e*NO+j)*NV+b)*NV+d] = seA(e,j,d,b);
+                real_t *dA=nullptr,*dF=nullptr,*dC=nullptr;
+                tracked_cudaMalloc(&dA,(size_t)M1*NV*sizeof(real_t));
+                tracked_cudaMalloc(&dF,Fov.size()*sizeof(real_t));
+                tracked_cudaMalloc(&dC,(size_t)M1*NO*sizeof(real_t));
+                cudaMemcpy(dA,hA.data(),(size_t)M1*NV*sizeof(real_t),cudaMemcpyHostToDevice);
+                cudaMemcpy(dF,Fov.data(),Fov.size()*sizeof(real_t),cudaMemcpyHostToDevice);
+                cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,NO,M1,NV,&one,dF,NV,dA,NV,&zero,dC,NO);
+                ct61_t1.assign((size_t)M1*NO,0.0);
+                cudaMemcpy(ct61_t1.data(),dC,(size_t)M1*NO*sizeof(real_t),cudaMemcpyDeviceToHost);
+                tracked_cudaFree(dA);tracked_cudaFree(dF);tracked_cudaFree(dC);
+            }
+            // ---- Eq.61 term3: ct61_t3[(k,j),(e,b)] = Σ_{l,d} wooov(l,k,j,d)·seA(e,l,d,b) ----
+            if (NMv > 0) {
+                const int MKJ = NO*NO, KLD = NO*NV;
+                std::vector<real_t> hA((size_t)MKJ*KLD), hB((size_t)P61_EB*KLD);
+                #pragma omp parallel for collapse(2)
+                for (int k=0;k<NO;++k) for (int j=0;j<NO;++j)
+                    for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
+                        hA[(size_t)(k*NO+j)*KLD+(l*NV+d)] = wooov(l,k,j,d);
+                #pragma omp parallel for collapse(2)
+                for (int e=0;e<NMv;++e) for (int b=0;b<NV;++b)
+                    for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
+                        hB[(size_t)(e*NV+b)*KLD+(l*NV+d)] = seA(e,l,d,b);
+                real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
+                tracked_cudaMalloc(&dA,(size_t)MKJ*KLD*sizeof(real_t));
+                tracked_cudaMalloc(&dB,(size_t)P61_EB*KLD*sizeof(real_t));
+                tracked_cudaMalloc(&dC,(size_t)MKJ*P61_EB*sizeof(real_t));
+                cudaMemcpy(dA,hA.data(),(size_t)MKJ*KLD*sizeof(real_t),cudaMemcpyHostToDevice);
+                cudaMemcpy(dB,hB.data(),(size_t)P61_EB*KLD*sizeof(real_t),cudaMemcpyHostToDevice);
+                cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,P61_EB,MKJ,KLD,&one,dB,KLD,dA,KLD,&zero,dC,P61_EB);
+                ct61_t3.assign((size_t)MKJ*P61_EB,0.0);
+                cudaMemcpy(ct61_t3.data(),dC,(size_t)MKJ*P61_EB*sizeof(real_t),cudaMemcpyDeviceToHost);
+                tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
+                p61_gpu = true;
+            }
+            // ---- Eq.62 helpers: raw ERIov uploaded ONCE (u_ie GEMM, u_ma per-k GEMMs,
+            //      and the ambA==1 explicit Xb), freed at the end of this scope ----
+            {
+                real_t* dE=nullptr;
+                tracked_cudaMalloc(&dE,ERIov.size()*sizeof(real_t));
+                cudaMemcpy(dE,ERIov.data(),ERIov.size()*sizeof(real_t),cudaMemcpyHostToDevice);
+                // u_ie_p[e][k] = +Σ_{l,c,d} eriov(k,c,l,d)·(2 seA(e,l,c,d) − seA(e,l,d,c)):
+                // raw ERIov is [k×(c,l,d)] with the full contraction triple LAST -> no repack.
+                if (NMv > 0) {
+                    const int K3 = NV*NO*NV;
+                    std::vector<real_t> hB((size_t)NMv*K3);
+                    #pragma omp parallel for collapse(2)
+                    for (int e=0;e<NMv;++e) for (int c=0;c<NV;++c)
+                        for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
+                            hB[(size_t)e*K3+((size_t)c*NO+l)*NV+d] = 2.0*seA(e,l,c,d)-seA(e,l,d,c);
+                    real_t *dB=nullptr,*dC=nullptr;
+                    tracked_cudaMalloc(&dB,(size_t)NMv*K3*sizeof(real_t));
+                    tracked_cudaMalloc(&dC,(size_t)NMv*NO*sizeof(real_t));
+                    cudaMemcpy(dB,hB.data(),(size_t)NMv*K3*sizeof(real_t),cudaMemcpyHostToDevice);
+                    cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,NO,NMv,K3,&one,dE,K3,dB,K3,&zero,dC,NO);
+                    ct62_uie.assign((size_t)NMv*NO,0.0);
+                    cudaMemcpy(ct62_uie.data(),dC,(size_t)NMv*NO*sizeof(real_t),cudaMemcpyDeviceToHost);
+                    tracked_cudaFree(dB);tracked_cudaFree(dC);
+                }
+                // u_ma_p[m][a] = −Σ_{k,l,d} eriov(k,a,l,d)·(2 siP(m,k,l,d) − siP(m,l,k,d)):
+                // per-k GEMM on the raw slice ERIov[k] = [a×(l,d)], beta-accumulated over k;
+                // alpha = −1 carries the overall sign so ct62_uma IS u_ma_p.
+                if (NMo > 0) {
+                    const int K2d = NO*NV;
+                    std::vector<real_t> hA((size_t)NMo*NO*K2d);
+                    #pragma omp parallel for collapse(2)
+                    for (int m=0;m<NMo;++m) for (int k=0;k<NO;++k)
+                        for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
+                            hA[((size_t)m*NO+k)*K2d+(l*NV+d)] = 2.0*siP(m,k,l,d)-siP(m,l,k,d);
+                    real_t *dA=nullptr,*dC=nullptr;
+                    tracked_cudaMalloc(&dA,(size_t)NMo*NO*K2d*sizeof(real_t));
+                    tracked_cudaMalloc(&dC,(size_t)NMo*NV*sizeof(real_t));
+                    cudaMemcpy(dA,hA.data(),(size_t)NMo*NO*K2d*sizeof(real_t),cudaMemcpyHostToDevice);
+                    for (int k=0;k<NO;++k) {
+                        const real_t beta = (k==0) ? zero : one;
+                        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,NV,NMo,K2d,&negone,
+                                    dE+(size_t)k*NV*K2d,K2d,dA+(size_t)k*K2d,NO*K2d,&beta,dC,NV);
+                    }
+                    ct62_uma.assign((size_t)NMo*NV,0.0);
+                    cudaMemcpy(ct62_uma.data(),dC,(size_t)NMo*NV*sizeof(real_t),cudaMemcpyDeviceToHost);
+                    tracked_cudaFree(dA);tracked_cudaFree(dC);
+                }
+                p62u_gpu = true;
+                // ambA==1 explicit Xb (Eq.62 X helper), all m at once:
+                //   ct62_xb[(m,j),(l,d)] = Σ_{p,bb} eriov(p,bb,l,d)·(2 siP(m,p,j,bb)−siP(m,j,p,bb))
+                //                         − Σ_{p,bb} eriov(l,bb,p,d)·siP(m,p,j,bb)
+                // Term a uses raw ERIov as [(p,bb)×(l,d)] directly (plain N,N product);
+                // term b needs the eriov(l,bb,p,d) -> [(p,bb),(l,d)] repack.
+                if (ambA == 1 && NMo > 0) {
+                    const int PB = NO*NV, MJx = NMo*NO;
+                    real_t *dC=nullptr;
+                    tracked_cudaMalloc(&dC,(size_t)MJx*P62_LD*sizeof(real_t));
+                    {   // term a: + A1·ERIov_raw
+                        std::vector<real_t> hA((size_t)MJx*PB);
+                        #pragma omp parallel for collapse(2)
+                        for (int m=0;m<NMo;++m) for (int j=0;j<NO;++j)
+                            for (int p=0;p<NO;++p) for (int bb=0;bb<NV;++bb)
+                                hA[(size_t)(m*NO+j)*PB+(p*NV+bb)] = 2.0*siP(m,p,j,bb)-siP(m,j,p,bb);
+                        real_t* dA=nullptr;
+                        tracked_cudaMalloc(&dA,(size_t)MJx*PB*sizeof(real_t));
+                        cudaMemcpy(dA,hA.data(),(size_t)MJx*PB*sizeof(real_t),cudaMemcpyHostToDevice);
+                        cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,P62_LD,MJx,PB,&one,dE,P62_LD,dA,PB,&zero,dC,P62_LD);
+                        tracked_cudaFree(dA);
+                    }
+                    {   // term b: − A2·R,  R[(p,bb),(l,d)] = eriov(l,bb,p,d)
+                        std::vector<real_t> hA((size_t)MJx*PB), hR((size_t)PB*P62_LD);
+                        #pragma omp parallel for collapse(2)
+                        for (int m=0;m<NMo;++m) for (int j=0;j<NO;++j)
+                            for (int p=0;p<NO;++p) for (int bb=0;bb<NV;++bb)
+                                hA[(size_t)(m*NO+j)*PB+(p*NV+bb)] = siP(m,p,j,bb);
+                        #pragma omp parallel for collapse(2)
+                        for (int p=0;p<NO;++p) for (int bb=0;bb<NV;++bb)
+                            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
+                                hR[(size_t)(p*NV+bb)*P62_LD+(l*NV+d)] = eriov(l,bb,p,d);
+                        real_t *dA=nullptr,*dR=nullptr;
+                        tracked_cudaMalloc(&dA,(size_t)MJx*PB*sizeof(real_t));
+                        tracked_cudaMalloc(&dR,(size_t)PB*P62_LD*sizeof(real_t));
+                        cudaMemcpy(dA,hA.data(),(size_t)MJx*PB*sizeof(real_t),cudaMemcpyHostToDevice);
+                        cudaMemcpy(dR,hR.data(),(size_t)PB*P62_LD*sizeof(real_t),cudaMemcpyHostToDevice);
+                        cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,P62_LD,MJx,PB,&negone,dR,P62_LD,dA,PB,&one,dC,P62_LD);
+                        tracked_cudaFree(dA);tracked_cudaFree(dR);
+                    }
+                    ct62_xb.assign((size_t)MJx*P62_LD,0.0);
+                    cudaMemcpy(ct62_xb.data(),dC,(size_t)MJx*P62_LD*sizeof(real_t),cudaMemcpyDeviceToHost);
+                    tracked_cudaFree(dC);
+                    p62x_gpu = true;
+                }
+                tracked_cudaFree(dE);
+            }
+            if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
+                if (p60_gpu) {
+                    real_t d1=0.0,d2=0.0,d3=0.0;
+                    for (int m=0;m<NMo;++m) for (int b=0;b<NV;b+=(NV/2>0?NV/2:1))
+                        for (int j=0;j<NO;j+=(NO/2>0?NO/2:1)) for (int c=0;c<NV;c+=(NV/2>0?NV/2:1)){
+                            real_t t1=0.0,t2=0.0,t3=0.0;
+                            for (int k=0;k<NO;++k) t1 += fov(k,c)*siP(m,k,j,b);
+                            for (int k=0;k<NO;++k) for (int l=0;l<NO;++l) t2 += wooov(l,k,j,c)*siP(m,k,l,b);
+                            for (int k=0;k<NO;++k) for (int d=0;d<NV;++d) t3 += wvovv(b,k,d,c)*siP(m,k,j,d);
+                            d1=std::max(d1,std::fabs(t1-ct60_t1[((size_t)((m*NO+j)*NV+b))*NV+c]));
+                            d2=std::max(d2,std::fabs(t2-ct60_t2[((size_t)(m*NV+b))*P60_N2+(j*NV+c)]));
+                            d3=std::max(d3,std::fabs(t3-ct60_t3[((size_t)(b*NV+c))*P60_MJ+(m*NO+j)]));
+                        }
+                    std::cout << "[W_eff_and_G self-check] paper-60 term1 GEMM vs host: max|Δ| = "
+                              << std::scientific << d1 << "; term2: " << d2 << "; term3: " << d3
+                              << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+                }
+                if (p61_gpu) {
+                    real_t d1=0.0,d2=0.0,d3=0.0;
+                    for (int e=0;e<NMv;++e) for (int b=0;b<NV;b+=(NV/2>0?NV/2:1))
+                        for (int k=0;k<NO;k+=(NO/2>0?NO/2:1)) for (int j=0;j<NO;j+=(NO/2>0?NO/2:1)){
+                            real_t t1=0.0,t2=0.0,t3=0.0;
+                            for (int d=0;d<NV;++d) t1 += fov(k,d)*seA(e,j,d,b);
+                            for (int c=0;c<NV;++c) for (int d=0;d<NV;++d) t2 += wvovv(b,k,d,c)*seA(e,j,c,d);
+                            for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) t3 += wooov(l,k,j,d)*seA(e,l,d,b);
+                            d1=std::max(d1,std::fabs(t1-ct61_t1[((size_t)((e*NO+j)*NV+b))*NO+k]));
+                            d2=std::max(d2,std::fabs(t2-ct61_w[((size_t)(b*NO+k))*P61_EJ+(e*NO+j)]));
+                            d3=std::max(d3,std::fabs(t3-ct61_t3[((size_t)(k*NO+j))*P61_EB+(e*NV+b)]));
+                        }
+                    std::cout << "[W_eff_and_G self-check] paper-61 Fov GEMM vs host: max|Δ| = "
+                              << std::scientific << d1 << "; Wvovv: " << d2 << "; Wooov: " << d3
+                              << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+                }
+                if (p62u_gpu) {
+                    real_t dma=0.0,die=0.0;
+                    for (int m=0;m<NMo;++m) for (int a=0;a<NV;a+=(NV/2>0?NV/2:1)){
+                        real_t v=0.0;
+                        for (int k=0;k<NO;++k) for (int l=0;l<NO;++l) for (int d=0;d<NV;++d)
+                            v -= eriov(k,a,l,d)*(2.0*siP(m,k,l,d)-siP(m,l,k,d));
+                        dma=std::max(dma,std::fabs(v-ct62_uma[(size_t)m*NV+a]));
+                    }
+                    for (int e=0;e<NMv;++e) for (int k=0;k<NO;k+=(NO/2>0?NO/2:1)){
+                        real_t v=0.0;
+                        for (int l=0;l<NO;++l) for (int c=0;c<NV;++c) for (int d=0;d<NV;++d)
+                            v += eriov(k,c,l,d)*(2.0*seA(e,l,c,d)-seA(e,l,d,c));
+                        die=std::max(die,std::fabs(v-ct62_uie[(size_t)e*NO+k]));
+                    }
+                    std::cout << "[W_eff_and_G self-check] paper-62 u_ma GEMM vs host: max|Δ| = "
+                              << std::scientific << dma << "; u_ie: " << die
+                              << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+                }
+                if (p62x_gpu) {
+                    real_t dx=0.0;
+                    for (int m=0;m<NMo;++m) for (int l=0;l<NO;l+=(NO/2>0?NO/2:1))
+                        for (int j=0;j<NO;j+=(NO/2>0?NO/2:1)) for (int d=0;d<NV;d+=(NV/2>0?NV/2:1)){
+                            real_t x=0.0;
+                            for (int p=0;p<NO;++p) for (int bb=0;bb<NV;++bb)
+                                x += eriov(p,bb,l,d)*(2.0*siP(m,p,j,bb)-siP(m,j,p,bb))
+                                   - eriov(l,bb,p,d)*siP(m,p,j,bb);
+                            dx=std::max(dx,std::fabs(x-ct62_xb[((size_t)(m*NO+j))*P62_LD+(l*NV+d)]));
+                        }
+                    std::cout << "[W_eff_and_G self-check] paper-62 Xb GEMM vs host: max|Δ| = "
+                              << std::scientific << dx << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
+                }
+            }
+        }
+#endif
         // (60) S^IP-linear: u_bmjc = -Σ_k Fov(k,c) s(m,k,j,b) + Σ_{k,l} Wooov(l,k,j,c) s(m,k,l,b)
         //                            - Σ_{k,d} Wvovv(b,k,d,c) s(m,k,j,d);  scatter k=occ_idx[m]
         #pragma omp parallel for schedule(static)          // distinct kf per m
         for (int m=0;m<NMo;++m){ const int kf=active_occ_idx_[m];
             for (int b=0;b<NV;++b) for (int j=0;j<NO;++j) for (int c=0;c<NV;++c){
                 real_t t=0.0;
-                for (int k=0;k<NO;++k) t -= fov(k,c)*siP(m,k,j,b);
-                for (int k=0;k<NO;++k) for (int l=0;l<NO;++l) t += wooov(l,k,j,c)*siP(m,k,l,b);
-                for (int k=0;k<NO;++k) for (int d=0;d<NV;++d) t -= wvovv(b,k,d,c)*siP(m,k,j,d);
+                if (p60_gpu) {                                          // GEMM tables
+                    t -= ct60_t1[((size_t)((m*NO+j)*NV+b))*NV+c];
+                    t += ct60_t2[((size_t)(m*NV+b))*P60_N2+(j*NV+c)];
+                    t -= ct60_t3[((size_t)(b*NV+c))*P60_MJ+(m*NO+j)];
+                } else {                                                // host fallback
+                    for (int k=0;k<NO;++k) t -= fov(k,c)*siP(m,k,j,b);
+                    for (int k=0;k<NO;++k) for (int l=0;l<NO;++l) t += wooov(l,k,j,c)*siP(m,k,l,b);
+                    for (int k=0;k<NO;++k) for (int d=0;d<NV;++d) t -= wvovv(b,k,d,c)*siP(m,k,j,d);
+                }
                 if (vsw) GPHHP(c,kf,j,b) += t; else GPHHP(b,kf,j,c) += t;
             }
         }
@@ -4557,9 +4926,15 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
             for (int e=0;e<NMv;++e){ const int cf=active_vir_idx_[e];
                 for (int k=0;k<NO;++k) for (int j=0;j<NO;++j){
                     real_t t=0.0;
-                    for (int d=0;d<NV;++d) t += fov(k,d)*seA(e,j,d,b);
-                    for (int c=0;c<NV;++c) for (int d=0;d<NV;++d) t += wvovv(b,k,d,c)*seA(e,j,c,d);
-                    for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) t -= wooov(l,k,j,d)*seA(e,l,d,b);
+                    if (p61_gpu) {                                      // GEMM tables
+                        t += ct61_t1[((size_t)((e*NO+j)*NV+b))*NO+k];
+                        t += ct61_w[((size_t)(b*NO+k))*P61_EJ+(e*NO+j)];
+                        t -= ct61_t3[((size_t)(k*NO+j))*P61_EB+(e*NV+b)];
+                    } else {                                            // host fallback
+                        for (int d=0;d<NV;++d) t += fov(k,d)*seA(e,j,d,b);
+                        for (int c=0;c<NV;++c) for (int d=0;d<NV;++d) t += wvovv(b,k,d,c)*seA(e,j,c,d);
+                        for (int l=0;l<NO;++l) for (int d=0;d<NV;++d) t -= wooov(l,k,j,d)*seA(e,l,d,b);
+                    }
                     if (vsw) GPHHP(cf,k,j,b) += t; else GPHHP(b,k,j,cf) += t;
                 }
             }
@@ -4567,6 +4942,10 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         // dressed Wovvo — old-form UAMEI convention — so build fresh bare versions):
         //   u_ma_p[m][a] = -Σ_{k,l,d} <kl|ad> s~IP ;  u_ie_p[e][k] = +Σ_{l,c,d} <kl|cd> s~EA
         std::vector<real_t> u_ma_p((size_t)NMo*NV,0.0), u_ie_p((size_t)NMv*NO,0.0);
+        if (p62u_gpu) {                                     // GEMM tables (uma carries the −Σ sign)
+            u_ma_p = ct62_uma;
+            u_ie_p = ct62_uie;
+        } else {                                            // host fallback
         #pragma omp parallel for collapse(2)
         for (int m=0;m<NMo;++m) for (int a=0;a<NV;++a){
             real_t v=0.0;
@@ -4581,6 +4960,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                 v += eriov(k,c,l,d)*(2.0*seA(e,l,c,d)-seA(e,l,d,c));
             u_ie_p[(size_t)e*NO+k]=v;
         }
+        }
         // u_bmje = +Σ_d u_ma_p(m,d) s(e,j,d,b) - Σ_k u_ie_p(e,k) s(m,k,j,b)
         //          +Σ_{k,l} Y(k,l,j) s(m,k,l,b) - Σ_{l,d} X(l,j,d) s(e,l,d,b)
         // Y (toggle B): B0 = UKLIE(k,l,j,e) [bare, matches gate winner]
@@ -4594,7 +4974,8 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
             for (int l=0;l<NO;++l) for (int j=0;j<NO;++j) for (int d=0;d<NV;++d){
                 real_t x=0.0;
                 if (ambA==0) x = UKMID(l,m,j,d);
-                else {
+                else if (p62x_gpu) x = ct62_xb[((size_t)(m*NO+j))*P62_LD+(l*NV+d)];  // GEMM table
+                else {                                                              // host fallback
                     for (int p=0;p<NO;++p) for (int bb=0;bb<NV;++bb)
                         x += eriov(p,bb,l,d)*(2.0*siP(m,p,j,bb)-siP(m,j,p,bb))
                            - eriov(l,bb,p,d)*siP(m,p,j,bb);

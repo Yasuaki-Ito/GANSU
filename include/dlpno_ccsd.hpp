@@ -57,7 +57,15 @@ class ERI;
  */
 class DLPNOCCSD {
 public:
-    DLPNOCCSD(RHF& rhf, const ERI& eri, DLPNOParams params);
+    /// `cluster` non-null (DMET×DLPNO Phase 1b) runs the whole ground-state
+    /// chain on an embedding-cluster orbital space (rectangular C, nao × nmo):
+    /// LMP2 setup goes through the cluster-aware solve_dlpno_lmp2, the T1
+    /// Brillouin source uses the cluster F_eff, and the bt back-transform
+    /// extracts the canonical virtuals from the cluster C (nvir = nmo −
+    /// nocc_full). nullptr = legacy full-molecule path (byte-identical). The
+    /// pointed-to space (and its host arrays) must outlive compute_energy().
+    DLPNOCCSD(RHF& rhf, const ERI& eri, DLPNOParams params,
+              const DLPNOClusterSpace* cluster = nullptr);
 
     /// Run the full DLPNO-CCSD calculation. Returns the correlation energy.
     /// Throws gansu::Exception while the residual is under construction
@@ -76,6 +84,7 @@ private:
     RHF& rhf_;
     const ERI& eri_;
     DLPNOParams params_;
+    const DLPNOClusterSpace* cluster_ = nullptr;  ///< non-null ⇒ embedding-cluster orbital space
     int nao_ = 0;
     int nocc_ = 0;
 };

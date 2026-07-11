@@ -230,6 +230,33 @@ private:
     // canonical_skip_wvvvv_ && RI block source && GANSU_DLPNO_EA_VVVV_RI.
     bool ri_vvvv_term_a_ = false;
 
+    // === EA RI-ladder mode (2026-07-09, pentacene wall) ======================
+    // When the dense path cannot fit (raw (ab|cd) + dressed Wvvvv = 2×nvir⁴·8B
+    // coexist during the build, and dressed Wvvvv stays resident through the
+    // Davidson solve — 2×85.2 GiB at pentacene/cc-pVDZ), NEITHER tensor is ever
+    // materialised. The σ2 particle-particle ladder Σ_cd Wvvvv[a,b,c,d]·r2[j,c,d]
+    // is evaluated per matvec from t1-dressed RI B-factors via the exact identity
+    //   Wvvvv[a,b,c,d] = Σ_P B̃[P,(a,c)]·B̃[P,(b,d)] + Σ_kl (kc|ld)·t2[k,l,a,b],
+    //   B̃[P,(a,c)]     = B[P,(a,c)] − Σ_k t1[k,a]·B[P,(k,c)],
+    // (identical tensor to the dense build, which itself assembles raw (ac|bd)
+    // from the same B-factors — differences are FP-reassociation only). The
+    // Wvvvo Σ_d Wvvvv·t1 dressing reuses the canonical-skip 4-term machinery
+    // (Term A via RI). Auto-fires via a cudaMemGetInfo probe when the dense
+    // 2×nvir⁴ footprint cannot fit; GANSU_EA_RI_LADDER=1/0 forces on/off.
+    // Requires GPU + RI block source + no slab mode + canonical-skip OFF.
+    // Default systems where the dense path fits are bit-identical (mode off).
+    bool ea_ri_ladder_ = false;
+    int  lad_naux_ = 0;             // #aux basis (Q)
+    int  lad_tj_   = 1;             // j-tile size for the per-matvec Z buffer
+    real_t* d_Bvv_lad_      = nullptr;  // [Q][nvir(a,dressed)][nvir(c)] B̃
+    real_t* d_Bvv_lad_perm_ = nullptr;  // [nvir(c)][Q][nvir(a)] B̃ permuted for GEMM2
+    real_t* d_ovov_klcd_    = nullptr;  // [nocc][nocc][nvir][nvir] (kc|ld) repack
+    real_t* d_lad_Z_        = nullptr;  // [lad_tj_][nvir(c)][Q][nvir(b)] per-matvec scratch
+    real_t* d_lad_T_        = nullptr;  // [nocc²][nocc] t2-term scratch
+    void build_ri_ladder_factors();     // build B̃ / repacks / scratch (end of build_dressed)
+    void apply_ri_ladder_sigma(void* cublas, const real_t* d_r2, real_t* d_s2,
+                               int j_begin, int j_end) const;
+
     // === Ship 12: d_eri_vvvv n-slab distribution =============================
     // For 30+ atom workloads (Pentacene NV=327 → NV⁴·8B = 91.5 GB) the bare
     // ERI vvvv tensor exceeds the free memory available on any single GPU

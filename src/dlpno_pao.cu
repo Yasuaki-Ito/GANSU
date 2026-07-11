@@ -51,6 +51,40 @@ std::vector<real_t> build_pao_global(
 }
 
 // ---------------------------------------------------------------------------
+//   C̃^{PAO,emb} = (C_vir · C_vir^T) · S — cluster-virtual projector image of
+//   the AOs (DMET×DLPNO Phase 1a). Square-C limit == I − D_occ·S exactly
+//   (D_occ + D_vir = S⁻¹); rectangular C restricts the PAO span to the
+//   cluster virtual subspace (rank nmo − nocc_full).
+// ---------------------------------------------------------------------------
+std::vector<real_t> build_pao_cluster_virtual(
+    const real_t* C_emb,
+    const real_t* S,
+    int nao, int nmo, int nocc_full)
+{
+    if (nao <= 0)
+        throw std::runtime_error("build_pao_cluster_virtual: nao must be > 0");
+    if (nmo <= 0 || nmo > nao)
+        throw std::runtime_error("build_pao_cluster_virtual: invalid nmo");
+    if (nocc_full < 0 || nocc_full >= nmo)
+        throw std::runtime_error("build_pao_cluster_virtual: invalid nocc_full");
+
+    Eigen::Map<const RowMatXd> C(C_emb, nao, nmo);
+    Eigen::Map<const RowMatXd> Smat(S, nao, nao);
+
+    const int nvir = nmo - nocc_full;
+    const auto Cv = C.rightCols(nvir);              // [nao × nvir]
+
+    // D_vir = C_vir · C_vir^T (idempotent projector form in the S metric).
+    const RowMatXd Dv = Cv * Cv.transpose();
+
+    RowMatXd Cpao = Dv * Smat;                      // [nao × nao], rank nvir
+
+    std::vector<real_t> out(static_cast<size_t>(nao) * nao);
+    Eigen::Map<RowMatXd>(out.data(), nao, nao) = Cpao;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 //   Per-domain Löwdin orthogonalisation with redundancy removal.
 // ---------------------------------------------------------------------------
 PAODomainResult orthogonalize_pao_domain(

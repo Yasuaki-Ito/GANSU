@@ -171,7 +171,10 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
         // Hybrid DLPNO-STEOM (P5b): use DLPNO-CCSD T1/T2 back-transformed to
         // canonical instead of a fresh canonical CCSD solve. Hand the operator
         // its own device copy (it takes ownership + frees in its destructor).
-        const BTAmplitudes& bt = rhf.get_dlpno_bt_amplitudes();
+        // Cluster (ctx) runs source the BT set from the context (square-C
+        // reduction: points at the RHF's stowed set; rectangular: cluster-space).
+        const BTAmplitudes& bt = (ctx && ctx->dlpno_bt) ? *ctx->dlpno_bt
+                                                        : rhf.get_dlpno_bt_amplitudes();
         if (bt.nocc != nocc_active || bt.nvir != nvir)
             throw std::runtime_error("IP-EOM-CCSD: DLPNO amplitude dims ("
                 + std::to_string(bt.nocc) + "," + std::to_string(bt.nvir)
@@ -183,7 +186,9 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
         tracked_cudaMalloc(&d_t2, t2n * sizeof(real_t));
         cudaMemcpy(d_t1, bt.T1.data(), t1n * sizeof(real_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_t2, bt.T2.data(), t2n * sizeof(real_t), cudaMemcpyHostToDevice);
-        E_CCSD = rhf.get_post_hf_energy();  // DLPNO-CCSD energy (set by stage 1)
+        E_CCSD = (ctx && ctx->dlpno_bt) ? ctx->dlpno_E
+                                        : rhf.get_post_hf_energy();  // DLPNO-CCSD energy (set by stage 1)
+        if (ctx) ctx->post_hf_energy = E_CCSD;
         std::cout << "  Using DLPNO back-transformed canonical T1/T2 (hybrid bt-PNO-STEOM P5b)." << std::endl;
     } else if (ctx && ctx->cc_ground_cached) {
         // (solve-once) reuse the cluster CCSD ground cached by an earlier stage —

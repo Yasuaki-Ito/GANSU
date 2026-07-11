@@ -523,13 +523,16 @@ inline Phase24Integrals precompute_phase24_integrals(
 
 } // anonymous namespace
 
-DLPNOCCSD::DLPNOCCSD(RHF& rhf, const ERI& eri, DLPNOParams params)
+DLPNOCCSD::DLPNOCCSD(RHF& rhf, const ERI& eri, DLPNOParams params,
+                     const DLPNOClusterSpace* cluster)
     : rhf_(rhf),
       eri_(eri),
       params_(std::move(params)),
+      cluster_(cluster),
       nao_(rhf.get_num_basis()),
       // Frozen-core aware (= total - num_frozen_core_; 0 if --frozen_core none).
-      nocc_(rhf.get_num_active_occ())
+      // Cluster mode (DMET×DLPNO Phase 1b): active occ from the embedding space.
+      nocc_(cluster ? cluster->nocc : rhf.get_num_active_occ())
 {}
 
 real_t DLPNOCCSD::compute_energy()
@@ -548,7 +551,7 @@ real_t DLPNOCCSD::compute_energy()
     // -----------------------------------------------------------------------
     using prof_clock = std::chrono::steady_clock;
     const auto t_lmp2_0 = prof_clock::now();
-    auto res = solve_dlpno_lmp2(rhf_, eri_, params_);
+    auto res = solve_dlpno_lmp2(rhf_, eri_, params_, cluster_);
     const double dt_lmp2 = std::chrono::duration<double>(
         prof_clock::now() - t_lmp2_0).count();
     if (params_.verbose >= 1) {
@@ -663,7 +666,12 @@ real_t DLPNOCCSD::compute_energy()
     // -----------------------------------------------------------------------
     rhf_.get_fock_matrix().toHost();
     rhf_.get_overlap_matrix().toHost();
-    const real_t* h_F = rhf_.get_fock_matrix().host_ptr();
+    // Cluster mode: the T1 Brillouin source f_ia = Cpair^T·(F·Ci) must use the
+    // embedding Fock in AO-covariant form (F_eff = S·C·diag(ε)·C^T·S) — the
+    // molecular AO Fock is not the cluster's effective operator. Same [nao×nao]
+    // shape, pure pointer swap; S stays the real AO overlap in both modes.
+    const real_t* h_F = cluster_ ? cluster_->h_F_eff
+                                 : rhf_.get_fock_matrix().host_ptr();
     const real_t* h_S = rhf_.get_overlap_matrix().host_ptr();
     const real_t* h_C_LMO = res.C_LMO.data();   // [nao × nocc]
 
@@ -1766,19 +1774,27 @@ real_t DLPNOCCSD::compute_energy()
         const auto t_bt_0 = prof_clock::now();
         double t_bt_fn_s = -1.0;   // back-transform function time (split from collect)
         {
-            const int num_fc        = rhf_.get_num_frozen_core();
+            // Cluster mode (DMET×DLPNO Phase 1b): canonical virtuals come from
+            // the embedding C (nao × nmo, row stride nmo), columns
+            // [num_occ_total, nmo) — nvir = nmo − num_occ_total. BTAmplitudes
+            // auto-sizes from the passed nvir, so the collected T1/T2 land in
+            // cluster dimensions for the ctx STEOM chain.
+            const int num_fc        = cluster_ ? cluster_->nfrozen
+                                               : rhf_.get_num_frozen_core();
             const int num_occ_total = nocc_ + num_fc;
-            const int nvir          = nao_ - num_occ_total;
+            const int ncol          = cluster_ ? cluster_->nmo : nao_;
+            const int nvir          = ncol - num_occ_total;
 
-            // Canonical virtual block from the full C [nao × nao] (columns
-            // [num_occ_total, nao) — accounts for frozen core).
+            // Canonical virtual block from the full C [nao × ncol] (columns
+            // [num_occ_total, ncol) — accounts for frozen core).
             rhf_.get_coefficient_matrix().toHost();
-            const real_t* C_full = rhf_.get_coefficient_matrix().host_ptr();
+            const real_t* C_full = cluster_ ? cluster_->h_C
+                                            : rhf_.get_coefficient_matrix().host_ptr();
             std::vector<real_t> C_vir(static_cast<size_t>(nao_) * nvir, 0.0);
             for (int mu = 0; mu < nao_; ++mu)
                 for (int a = 0; a < nvir; ++a)
                     C_vir[static_cast<size_t>(mu) * nvir + a] =
-                        C_full[static_cast<size_t>(mu) * nao_ + (num_occ_total + a)];
+                        C_full[static_cast<size_t>(mu) * ncol + (num_occ_total + a)];
 
             // PNO → canonical back-transform (T1 from the per-LMO PAO vector).
             BTAmplitudes bt = bt_pno_to_canonical(

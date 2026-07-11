@@ -47,6 +47,10 @@
 #include "steom_ccsd_operator.hpp"
 #include "eom_chain_context.hpp"   // DMET-STEOM: standalone cluster electronic state
 #include "dmet.hpp"                // DMET-STEOM Phase 1: cluster embedding driver
+#include "dlpno_localizer.hpp"     // DMET×DLPNO P0-3: rectangular-C localization probe
+#include "dlpno_mp2.hpp"           // DMET×DLPNO Phase 1a: cluster-space DLPNO-LMP2
+#include "dlpno_ccsd.hpp"          // DMET×DLPNO Phase 1b: cluster-space DLPNO-CCSD ground
+#include "dlpno_params.hpp"        //   (resolve_dlpno_params for the cluster DLPNO hooks)
 #include "steom_result.hpp"
 #include "davidson_solver.hpp"
 #include "device_host_memory.hpp"
@@ -757,9 +761,11 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // results + cluster CCSD T1/T2 + published bar-H, so the CIS/IP/EA dispatch
     // below no-ops (populated results) and we jump straight to the STEOM stage.
     bool ckpt_loaded = false;
+    bool ckpt_had_ea = false;   // loaded ckpt already contained the EA stage
     if (ctx) {
         if (const char* ck = std::getenv("GANSU_DMET_STEOM_CKPT")) {
             ckpt_loaded = steom_ckpt_load(*ctx, ck);
+            ckpt_had_ea = ckpt_loaded && !ctx->ea_eom_result.per_active.empty();
             if (ckpt_loaded && ctx->barh.complete()) ctx->share_barh = true;  // borrow the restored bar-H
         }
     }
@@ -914,7 +920,10 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 
     // (debug accelerator) Save the STEOM checkpoint now that CCSD+IP+EA (+bar-H when
     // sharing) are populated in ctx — a subsequent run with the same file resumes here.
-    if (ctx && !ckpt_loaded) {
+    // Also UPGRADE an IP-only checkpoint after resuming from it: EA was just
+    // recomputed (expensive), so persist it — otherwise every resume re-runs EA
+    // and the IP-only file never gains the EA stage.
+    if (ctx && (!ckpt_loaded || !ckpt_had_ea)) {
         if (const char* ck = std::getenv("GANSU_DMET_STEOM_CKPT"))
             steom_ckpt_save(*ctx, ck);
     }
@@ -1144,7 +1153,10 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     real_t* d_t2 = nullptr;
     if (ctx ? ctx->use_dlpno_amplitudes : rhf.use_dlpno_amplitudes()) {
         // Hybrid DLPNO-STEOM (P5b): inject DLPNO-CCSD T1/T2 (canonical, own copy).
-        const BTAmplitudes& bt = rhf.get_dlpno_bt_amplitudes();
+        // Cluster (ctx) runs source the BT set from the context (square-C
+        // reduction: points at the RHF's stowed set; rectangular: cluster-space).
+        const BTAmplitudes& bt = (ctx && ctx->dlpno_bt) ? *ctx->dlpno_bt
+                                                        : rhf.get_dlpno_bt_amplitudes();
         if (bt.nocc != nocc_active || bt.nvir != nvir)
             throw std::runtime_error("STEOM-CCSD: DLPNO amplitude dims ("
                 + std::to_string(bt.nocc) + "," + std::to_string(bt.nvir)
@@ -1484,6 +1496,17 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         // Target GPU: where IP's bar-H already are (choreography), else the freest
         // peer (e.g. a full-checkpoint resume that loaded all 11 onto device 0).
         int best = ctx->barh.ip_dev;
+        // (run4 wall) The bar-H device may lack room for the W^eff build working
+        // set on top of the 11 borrowed bar-H (Doxorubicin cc-pVDZ: GPU2 OOM at a
+        // 5.87 GB alloc after F_eff/hp). GANSU_STEOM_BARH_GPU=<n> forces the STEOM
+        // build (and the bar-H migration) onto GPU n instead.
+        if (const char* e = std::getenv("GANSU_STEOM_BARH_GPU")) {
+            if (e[0] >= '0' && e[0] <= '9') {
+                best = std::atoi(e);
+                std::cout << "  [DMET-STEOM share-barH] target GPU " << best
+                          << " forced (GANSU_STEOM_BARH_GPU)." << std::endl;
+            }
+        }
         if (best == saved) {
             int n_dev = 0; cudaGetDeviceCount(&n_dev);
             if (n_dev > 1) {
@@ -2166,6 +2189,192 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
     ctx.prefer_ri_block = (std::getenv("GANSU_DMET_STEOM_RI_BLOCK") != nullptr);
     ctx.level_shift     = level_shift;   // (B / denominator-only) 0 ⇒ legacy direct form
 
+    // (DMET×DLPNO P0-3 probe, env GANSU_DMET_STEOM_LOC_TEST=1 — diagnostic only,
+    // results printed and discarded). Rectangular-C make-or-break check:
+    // Pipek-Mezey-localize the cluster's correlated occupied orbitals IN THE
+    // FULL AO BASIS. The cluster MOs are genuine LCAO over the real AOs, so
+    // PM's per-atom Mulliken populations stay well defined even for
+    // non-atom-centered bath orbitals; the localizer API is shape-agnostic
+    // (C_occ [nao_ao × nocc_c] + full-AO S + atom ranges). This verifies the
+    // occupied half of the DLPNO ground pipeline on an embedding (rectangular)
+    // C without touching dlpno_mp2.cu.
+    if (const char* lt = std::getenv("GANSU_DMET_STEOM_LOC_TEST")) {
+        if (lt[0] == '1') {
+            C.toHost();
+            cfg.get_overlap_matrix().toHost();
+            const real_t* h_Cc = C.host_ptr();
+            const real_t* h_S  = cfg.get_overlap_matrix().host_ptr();
+            const int nocc_c = n_emb_occ - n_frozen;   // correlated cluster occ
+            std::vector<real_t> C_occ_c((size_t)nao * nocc_c);
+            for (int mu = 0; mu < nao; ++mu)
+                for (int i = 0; i < nocc_c; ++i)
+                    C_occ_c[(size_t)mu * nocc_c + i] =
+                        h_Cc[(size_t)mu * n_emb + (n_frozen + i)];
+            std::vector<std::pair<int,int>> atom_ranges;
+            for (const auto& r : cfg.get_atom_to_basis_range())
+                atom_ranges.emplace_back((int)r.start_index, (int)r.end_index);
+            auto loc = localize_occupied("pm", C_occ_c.data(), h_S,
+                                         /*Dx*/nullptr, /*Dy*/nullptr, /*Dz*/nullptr,
+                                         nao, nocc_c, atom_ranges,
+                                         /*max_sweep=*/200, /*conv_tol=*/1e-8,
+                                         /*verbose=*/1);
+            std::cout << "  [DMET-STEOM loc-test] PM on cluster occ (C "
+                      << nao << "x" << n_emb << (nao == n_emb ? " square" : " RECTANGULAR")
+                      << ", nocc_c=" << nocc_c << "): L "
+                      << std::fixed << std::setprecision(6) << loc.functional_initial
+                      << " -> " << loc.functional_final
+                      << "  sweeps=" << loc.n_sweeps
+                      << "  converged=" << (loc.converged ? "yes" : "NO") << std::endl;
+        }
+    }
+
+    // (DMET×DLPNO Phase 1a/1b) Cluster-space DLPNO machinery on the embedding
+    // orbital space (rectangular C):
+    //   - GANSU_DMET_STEOM_DLPNO_LMP2_TEST=1 : Phase 1a probe — run cluster
+    //     DLPNO-LMP2, print E(PAO)/E(PNO), discard. Gates: square reduction ==
+    //     plain [DLPNO-MP2] to F_eff accuracy (~1 μHa = SCF residual);
+    //     rectangular + FULL_DOMAIN + TCutPNO=0 == cluster canonical MP2
+    //     (validated Δ1.5e-10, acetone {0,1}).
+    //   - GANSU_DMET_STEOM_DLPNO=2 : Phase 1b — solve the cluster ground with
+    //     DLPNO-CCSD (cluster space) + bt-polish (canonical cluster CCSD
+    //     warm-start), stow the polished BT set on the RHF and point the ctx at
+    //     it (the P0-1-validated wiring). Mode 1 (full-molecule DLPNO ground,
+    //     square-C reduction anchor) is handled by compute_dmet_steom_ccsd.
+    const char* lmp2_test_e = std::getenv("GANSU_DMET_STEOM_DLPNO_LMP2_TEST");
+    const char* dl_mode_e   = std::getenv("GANSU_DMET_STEOM_DLPNO");
+    const bool  want_lmp2_test  = lmp2_test_e && lmp2_test_e[0] == '1';
+    const bool  want_cluster_dl = dl_mode_e && dl_mode_e[0] == '2';
+    if (want_lmp2_test || want_cluster_dl) {
+        C.toHost(); eps.toHost();
+        cfg.get_overlap_matrix().toHost();
+        const real_t* h_Cc  = C.host_ptr();
+        const real_t* h_ec  = eps.host_ptr();
+        const real_t* h_S   = cfg.get_overlap_matrix().host_ptr();
+        // F_eff = S·C·diag(eps)·C^T·S  (AO-covariant embedding Fock; == the
+        // molecular F in the square limit since F·C = S·C·eps).
+        std::vector<real_t> SC((size_t)nao * n_emb, 0.0);
+        #pragma omp parallel for
+        for (int mu = 0; mu < nao; ++mu)
+            for (int nu = 0; nu < nao; ++nu) {
+                const real_t s = h_S[(size_t)mu * nao + nu];
+                if (s == 0.0) continue;
+                for (int p = 0; p < n_emb; ++p)
+                    SC[(size_t)mu * n_emb + p] += s * h_Cc[(size_t)nu * n_emb + p];
+            }
+        std::vector<real_t> F_eff((size_t)nao * nao, 0.0);
+        #pragma omp parallel for
+        for (int mu = 0; mu < nao; ++mu)
+            for (int nu = 0; nu < nao; ++nu) {
+                real_t v = 0.0;
+                for (int p = 0; p < n_emb; ++p)
+                    v += SC[(size_t)mu * n_emb + p] * h_ec[p]
+                       * SC[(size_t)nu * n_emb + p];
+                F_eff[(size_t)mu * nao + nu] = v;
+            }
+        DLPNOClusterSpace cs;
+        cs.h_C = h_Cc; cs.h_eps = h_ec; cs.h_F_eff = F_eff.data();
+        cs.nmo = n_emb; cs.nocc = n_emb_occ - n_frozen; cs.nfrozen = n_frozen;
+        DLPNOParams p = resolve_dlpno_params(
+            cfg.get_dlpno_preset(), cfg.get_dlpno_localizer(),
+            cfg.get_dlpno_t_cut_pno(), cfg.get_dlpno_t_cut_do(),
+            cfg.get_dlpno_t_cut_pairs(), cfg.get_dlpno_t_cut_mkn(),
+            cfg.get_dlpno_t_cut_triples(), cfg.get_dlpno_t_cut_tno(),
+            cfg.get_dlpno_pair_distance_cutoff(), cfg.get_dlpno_max_iter(),
+            cfg.get_dlpno_diis_size(), cfg.get_dlpno_localizer_max_sweep(),
+            cfg.get_dlpno_localizer_conv(), cfg.get_dlpno_lmp2_max_iter(),
+            cfg.get_dlpno_lmp2_conv(), cfg.get_dlpno_sc_pno_iter(),
+            cfg.get_dlpno_pno_os_only(), cfg.get_dlpno_verbose());
+        if (want_lmp2_test) {
+            auto lm = solve_dlpno_lmp2(cfg, eri_method, p, &cs);
+            std::cout << "  [DMET-STEOM lmp2-test] cluster DLPNO-LMP2 (C "
+                      << nao << "x" << n_emb << (nao == n_emb ? " square" : " RECTANGULAR")
+                      << ", nocc_c=" << cs.nocc << ", nfrozen_c=" << cs.nfrozen
+                      << "): E(PAO) = " << std::fixed << std::setprecision(10)
+                      << lm.E_pao_total << "  E(PNO/LMP2) = " << lm.E_pno_total
+                      << " Ha" << std::endl;
+        }
+        if (want_cluster_dl) {
+            std::cout << "---- DMET-STEOM cluster-DLPNO ground (Phase 1b): "
+                         "DLPNO-CCSD on the cluster space (C " << nao << "x" << n_emb
+                      << (nao == n_emb ? " square" : " RECTANGULAR") << ") ----" << std::endl;
+            cfg.set_collect_dlpno_bt(true);
+            real_t E_dl = 0.0;
+            {
+                DLPNOCCSD drv(cfg, eri_method, p, &cs);
+                E_dl = drv.compute_energy();
+            }
+            cfg.set_collect_dlpno_bt(false);
+            if (!cfg.use_dlpno_amplitudes())
+                throw std::runtime_error("DMET-STEOM (cluster-DLPNO): cluster "
+                    "DLPNO-CCSD did not produce back-transformed amplitudes.");
+            std::cout << "  [cluster-DLPNO] E_corr(DLPNO) = " << std::fixed
+                      << std::setprecision(10) << E_dl << " Ha" << std::endl;
+            real_t E_final = E_dl;
+            // Cluster bt-polish: warm-start the CANONICAL cluster CCSD from the
+            // cluster BT amplitudes (same recipe as the plain chain's
+            // dlpno_bt_polish_stage, but in the embedding dimensions; the
+            // B-native RI path mirrors the ctx chain's fresh-solve branch).
+            const char* pe = std::getenv("GANSU_DLPNO_BT_POLISH");
+            const bool pol_on = (pe == nullptr) || (pe[0] != '0');
+            if (pol_on && gpu::gpu_available()) {
+                Timer pol_t;
+                BTAmplitudes bt = cfg.get_dlpno_bt_amplitudes();   // copy; polished below
+                const int cap = pe ? std::atoi(pe) : 0;
+                std::cout << "---- DMET-STEOM cluster bt-polish: canonical cluster CCSD "
+                             "warm-started from cluster-DLPNO amplitudes ----" << std::endl;
+                ccsd_set_initial_guess(bt.T1.data(), bt.T2.data(),
+                                       cap > 1 ? cap : -1, /*conv_override=*/1e-7);
+                real_t* d_t1p = nullptr;
+                real_t* d_t2p = nullptr;
+                const ERI_RI* pol_ri = dynamic_cast<const ERI_RI*>(&eri_method);
+                const real_t E_pol = ccsd_spatial_orbital(
+                    /*d_eri_ao=*/nullptr, C.device_ptr(), eps.device_ptr(),
+                    n_emb, n_emb_occ,
+                    /*computing_ccsd_t=*/false, /*ccsd_t_energy=*/nullptr,
+                    &d_t1p, &d_t2p, /*d_eri_mo_precomputed=*/nullptr,
+                    n_frozen, /*h_fov_active=*/nullptr,
+                    /*eri_ri=*/pol_ri, /*level_shift=*/level_shift);
+                cudaMemcpy(bt.T1.data(), d_t1p, bt.T1.size() * sizeof(real_t),
+                           cudaMemcpyDeviceToHost);
+                cudaMemcpy(bt.T2.data(), d_t2p, bt.T2.size() * sizeof(real_t),
+                           cudaMemcpyDeviceToHost);
+                tracked_cudaFree(d_t1p);
+                tracked_cudaFree(d_t2p);
+                cfg.set_dlpno_bt_amplitudes(std::move(bt));
+                E_final = E_pol;
+                std::cout << "  [cluster bt-polish] E_corr = " << std::fixed
+                          << std::setprecision(10) << E_pol << " Ha  (DLPNO was "
+                          << E_dl << ", dE = " << std::scientific << std::setprecision(2)
+                          << (E_pol - E_dl) << ";  " << std::fixed << std::setprecision(1)
+                          << pol_t.elapsed_seconds() << " s)" << std::endl;
+            } else if (pol_on) {
+                std::cout << "  [cluster bt-polish] skipped (no GPU)." << std::endl;
+            }
+            ctx.use_dlpno_amplitudes = true;
+            ctx.dlpno_bt = &cfg.get_dlpno_bt_amplitudes();
+            ctx.dlpno_E  = E_final;
+            std::cout << "  [DMET-STEOM] cluster chain consumes cluster-DLPNO "
+                         "(bt-polished) amplitudes (GANSU_DMET_STEOM_DLPNO=2)." << std::endl;
+        }
+    }
+
+    // (DMET×DLPNO P0) Cluster chain consumes DLPNO bt-polished amplitudes: the
+    // driver (compute_dmet_steom_ccsd) already ran the DLPNO ground + polish and
+    // stowed the BT set on the RHF. Point the ctx at it — the IP/EA/STEOM stages
+    // then skip the cluster canonical-CCSD re-solve (use_dlpno_amplitudes branch).
+    // Square-C reduction: the RHF's set IS the cluster's; a rectangular cluster
+    // stows a cluster-space BT set here instead (Phase 1+). Native/projected EOM
+    // stay off (per-pair PNO state is square-C bound). Default OFF = canonical.
+    if (const char* dl = std::getenv("GANSU_DMET_STEOM_DLPNO")) {
+        if (dl[0] == '1' && cfg.use_dlpno_amplitudes()) {
+            ctx.use_dlpno_amplitudes = true;
+            ctx.dlpno_bt = &cfg.get_dlpno_bt_amplitudes();
+            ctx.dlpno_E  = cfg.get_post_hf_energy();
+            std::cout << "  [DMET-STEOM] cluster chain consumes DLPNO bt-polished "
+                         "amplitudes (GANSU_DMET_STEOM_DLPNO=1)." << std::endl;
+        }
+    }
+
     compute_steom_ccsd_impl(cfg, eri_method, /*d_eri_ao=*/nullptr, n_states,
                             /*d_eri_mo_precomputed=*/d_eri_mo, &ctx);
 
@@ -2186,13 +2395,98 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
     return std::move(ctx.steom_result);
 }
 
+// ---- bt-polish (GANSU_DLPNO_BT_POLISH: DEFAULT ON since 2026-07-09; =0 to
+// disable, =N to cap iterations) ----
+// Warm-start a canonical CCSD from the back-transformed DLPNO amplitudes to
+// erase the PNO-truncation error before the EOM chain (the DLPNO-vs-canonical
+// STEOM gap is T2-truncation borne: naphthalene root0 5.08@normal /
+// 4.90@very_tight vs canonical 4.68 — singles audit, 2026-07-08). The polish
+// re-solve defaults to |dE| < 1e-7 (12 iters vs 46 at 1e-10; STEOM roots
+// agree to 4 digits — 続46/47); GANSU_CCSD_CONV overrides.
+// Few DIIS iterations from the warm start; the polished amplitudes REPLACE
+// the stored BT set, so CIS-NTO / IP / EA / STEOM all consume them (native
+// per-pair σ is defaulted OFF for consistency).
+// Shared verbatim by compute_dlpno_steom_ccsd (plain path) and the DMET
+// cluster-DLPNO mode (GANSU_DMET_STEOM_DLPNO — square-C reduction anchor).
+static void dlpno_bt_polish_stage(RHF& rhf, const ERI_RI* eri_ri, real_t E_dlpno) {
+    const char* pe = std::getenv("GANSU_DLPNO_BT_POLISH");
+    const bool pol_on = (pe == nullptr) || (pe[0] != '0');
+    if (pol_on && rhf.use_dlpno_amplitudes()
+        && gpu::gpu_available()) {
+        Timer polish_timer;
+        BTAmplitudes bt = rhf.get_dlpno_bt_amplitudes();  // copy; polished below
+        const int cap = pe ? std::atoi(pe) : 0;
+        std::cout << "---- DLPNO-STEOM bt-polish: canonical CCSD warm-started "
+                     "from DLPNO amplitudes ----" << std::endl;
+        ccsd_set_initial_guess(bt.T1.data(), bt.T2.data(),
+                               cap > 1 ? cap : -1, /*conv_override=*/1e-7);
+        real_t* d_t1p = nullptr;
+        real_t* d_t2p = nullptr;
+        const real_t E_pol = ccsd_spatial_orbital(
+            /*d_eri_ao=*/nullptr,
+            rhf.get_coefficient_matrix().device_ptr(),
+            rhf.get_orbital_energies().device_ptr(),
+            rhf.get_num_basis(), rhf.get_num_electrons() / 2,
+            /*computing_ccsd_t=*/false, /*ccsd_t_energy=*/nullptr,
+            &d_t1p, &d_t2p, /*d_eri_mo_precomputed=*/nullptr,
+            rhf.get_num_frozen_core(), /*h_fov_active=*/nullptr,
+            /*eri_ri=*/eri_ri, /*level_shift=*/0.0);
+        cudaMemcpy(bt.T1.data(), d_t1p, bt.T1.size() * sizeof(real_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(bt.T2.data(), d_t2p, bt.T2.size() * sizeof(real_t),
+                   cudaMemcpyDeviceToHost);
+        tracked_cudaFree(d_t1p);
+        tracked_cudaFree(d_t2p);
+        rhf.set_dlpno_bt_amplitudes(std::move(bt));
+        rhf.set_post_hf_energy(E_pol);
+        std::cout << "  [bt-polish] E_corr = " << std::fixed
+                  << std::setprecision(10) << E_pol << " Ha  (DLPNO was "
+                  << E_dlpno << ", dE = " << std::scientific
+                  << std::setprecision(2) << (E_pol - E_dlpno) << ";  "
+                  << std::fixed << std::setprecision(1)
+                  << polish_timer.elapsed_seconds() << " s)" << std::endl;
+    } else if (pol_on) {
+        std::cout << "  [bt-polish] skipped (no GPU or no BT amplitudes)."
+                  << std::endl;
+    }
+}
+
 // DMET-STEOM driver (RI path). Phase 1: build the chromophore fragment's
 // ground-state Schmidt bath (single-shot, μ=0) → canonical cluster → cluster
 // STEOM via steom_spatial_orbital (DMET::compute_steom). With no --dmet_fragments
 // the cluster is the whole molecule → plain STEOM bit-exact (Phase 0 anchor).
 void ERI_RI_RHF::compute_dmet_steom_ccsd(int n_states) {
+    // (DMET×DLPNO P0, env GANSU_DMET_STEOM_DLPNO=1): solve the cluster with the
+    // DLPNO-STEOM recipe instead of a fresh canonical cluster CCSD — run the
+    // DLPNO-CCSD ground (+ bt-polish), exactly as compute_dlpno_steom_ccsd
+    // stage 1, and stow the polished BT set on the RHF; steom_spatial_orbital
+    // then points the cluster ctx at it (square-C reduction: with no
+    // --dmet_fragments the cluster is the whole molecule, so this must
+    // reproduce plain dlpno_steom_ccsd). A rectangular-C cluster will instead
+    // run a cluster-space DLPNO ground here (Phase 1+). Default OFF =
+    // canonical cluster (byte-identical).
+    const char* dmet_dlpno = std::getenv("GANSU_DMET_STEOM_DLPNO");
+    const bool  dl_on  = dmet_dlpno && dmet_dlpno[0] == '1';   // mode 1: full-molecule ground (P0 anchor)
+    const bool  dl2_on = dmet_dlpno && dmet_dlpno[0] == '2';   // mode 2: cluster-space ground (Phase 1b, in steom_spatial_orbital)
+    if (dl_on) {
+        std::cout << "---- DMET-STEOM cluster-DLPNO mode: DLPNO-CCSD ground state "
+                     "(back-transformed to canonical) ----" << std::endl;
+        rhf_.set_collect_dlpno_bt(true);
+        const real_t E_dlpno = compute_dlpno_ccsd();
+        rhf_.set_collect_dlpno_bt(false);
+        rhf_.set_post_hf_energy(E_dlpno);
+        if (!rhf_.use_dlpno_amplitudes())
+            throw std::runtime_error(
+                "DMET-STEOM (cluster-DLPNO): DLPNO-CCSD did not produce "
+                "back-transformed canonical amplitudes (collect path failed).");
+        std::cout << "  DLPNO-CCSD correlation energy = " << std::fixed
+                  << std::setprecision(10) << E_dlpno
+                  << " Ha  (fed to the cluster STEOM chain)" << std::endl;
+        dlpno_bt_polish_stage(rhf_, this, E_dlpno);
+    }
     DMET dmet(rhf_, *this);
     STEOMResult r = dmet.compute_steom(*this, n_states);
+    if (dl_on || dl2_on) rhf_.clear_dlpno_amplitudes();
     // Report the cluster CCSD ground correlation energy as the post-HF correction
     // (otherwise the final summary prints 0 even though the cluster CCSD ran).
     rhf_.set_post_hf_energy(r.ground_corr_energy);
@@ -2326,48 +2620,7 @@ void ERI_RI_RHF::compute_dlpno_steom_ccsd(int n_states) {
     // Few DIIS iterations from the warm start; the polished amplitudes REPLACE
     // the stored BT set, so CIS-NTO / IP / EA / STEOM all consume them (native
     // per-pair σ is defaulted OFF above for consistency).
-    {
-        const char* pe = std::getenv("GANSU_DLPNO_BT_POLISH");
-        const bool pol_on = (pe == nullptr) || (pe[0] != '0');
-        if (pol_on && rhf_.use_dlpno_amplitudes()
-            && gpu::gpu_available()) {
-            Timer polish_timer;
-            BTAmplitudes bt = rhf_.get_dlpno_bt_amplitudes();  // copy; polished below
-            const int cap = pe ? std::atoi(pe) : 0;
-            std::cout << "---- DLPNO-STEOM bt-polish: canonical CCSD warm-started "
-                         "from DLPNO amplitudes ----" << std::endl;
-            ccsd_set_initial_guess(bt.T1.data(), bt.T2.data(),
-                                   cap > 1 ? cap : -1, /*conv_override=*/1e-7);
-            real_t* d_t1p = nullptr;
-            real_t* d_t2p = nullptr;
-            const real_t E_pol = ccsd_spatial_orbital(
-                /*d_eri_ao=*/nullptr,
-                rhf_.get_coefficient_matrix().device_ptr(),
-                rhf_.get_orbital_energies().device_ptr(),
-                rhf_.get_num_basis(), rhf_.get_num_electrons() / 2,
-                /*computing_ccsd_t=*/false, /*ccsd_t_energy=*/nullptr,
-                &d_t1p, &d_t2p, /*d_eri_mo_precomputed=*/nullptr,
-                rhf_.get_num_frozen_core(), /*h_fov_active=*/nullptr,
-                /*eri_ri=*/this, /*level_shift=*/0.0);
-            cudaMemcpy(bt.T1.data(), d_t1p, bt.T1.size() * sizeof(real_t),
-                       cudaMemcpyDeviceToHost);
-            cudaMemcpy(bt.T2.data(), d_t2p, bt.T2.size() * sizeof(real_t),
-                       cudaMemcpyDeviceToHost);
-            tracked_cudaFree(d_t1p);
-            tracked_cudaFree(d_t2p);
-            rhf_.set_dlpno_bt_amplitudes(std::move(bt));
-            rhf_.set_post_hf_energy(E_pol);
-            std::cout << "  [bt-polish] E_corr = " << std::fixed
-                      << std::setprecision(10) << E_pol << " Ha  (DLPNO was "
-                      << E_dlpno << ", dE = " << std::scientific
-                      << std::setprecision(2) << (E_pol - E_dlpno) << ";  "
-                      << std::fixed << std::setprecision(1)
-                      << polish_timer.elapsed_seconds() << " s)" << std::endl;
-        } else if (pol_on) {
-            std::cout << "  [bt-polish] skipped (no GPU or no BT amplitudes)."
-                      << std::endl;
-        }
-    }
+    dlpno_bt_polish_stage(rhf_, this, E_dlpno);
 
     // Stage B opt-in (env GANSU_DLPNO_PROJECTED_EOM=1): run the Galerkin-
     // projected DLPNO-IP-EOM and DLPNO-EA-EOM (per-pair PNO 2h1p / per-i PNO(ii)

@@ -25,6 +25,7 @@
 #include "ea_eom_result.hpp"          // EAEOMResult
 #include "steom_result.hpp"           // STEOMResult
 #include "steom_barh_cache.hpp"       // SteomBarHCache
+#include "bt_pno_backtransform.hpp"   // BTAmplitudes (cluster DLPNO amplitude source)
 
 namespace gansu {
 
@@ -97,14 +98,21 @@ struct EOMChainContext {
     real_t                   post_hf_energy = 0.0;   ///< CCSD ground re-solve energy (informational)
 
     // -------------------------------------------------------------------------
-    // Path flags — the cluster runs the CANONICAL chain, never the DLPNO/native
-    // EOM branches (which assume per-pair PNO state + square C + overlap). These
-    // are forced false so the drivers take the canonical code paths regardless
-    // of how the full-molecule RHF was configured.
+    // Path flags — default false ⇒ the cluster runs the CANONICAL chain. The
+    // native/projected EOM branches stay off (they assume per-pair PNO state +
+    // square C + overlap fetched from the RHF). `use_dlpno_amplitudes` MAY be
+    // enabled (P0, env GANSU_DMET_STEOM_DLPNO): the IP/EA/STEOM drivers then
+    // skip the cluster canonical-CCSD re-solve and consume the back-transformed
+    // (bt-polished) T1/T2 pointed to by `dlpno_bt` — the polish-default
+    // DLPNO-STEOM recipe on the cluster. On the square-C reduction test
+    // (cluster = whole molecule) `dlpno_bt` points at the RHF's stowed set; a
+    // rectangular-C cluster will stow a cluster-space BT set here instead.
     // -------------------------------------------------------------------------
     bool use_dlpno_amplitudes = false;
     bool use_dlpno_native_eom = false;
     bool use_dlpno_projected_eom = false;
+    const BTAmplitudes* dlpno_bt = nullptr;  ///< cluster-space (or square-C reduction: RHF's) BT amplitudes
+    real_t dlpno_E = 0.0;                    ///< DLPNO (bt-polished) correlation energy for reporting
 
     // -------------------------------------------------------------------------
     // Storage-free RI cluster integrals (Inc3, env GANSU_DMET_STEOM_RI_BLOCK).

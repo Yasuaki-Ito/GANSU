@@ -369,14 +369,18 @@ __global__ void ea_ring_scatter_kernel(
 //   mode 0 (hAcomb): 2·ovvv[y,d,x,c] − ovvv[y,c,x,d]
 //   mode 1 (hA)    :   ovvv[y,d,x,c]                  (x=a, y=l)
 //   mode 2 (hA4)   :   ovvv[y,c,x,d]                  (x=b, y=k)
+// Tile window [n0, n0+nt) over the NV² (x,c) rows: dst holds only the tile's
+// rows ([nt × KV] slab), so the full-size call is n0=0 / nt=NV² (byte-identical
+// gather). Lets the GEMM run in n-slabs when the dense NV²·KV transients OOM.
 __global__ void ea_wvvvo_repack_A_kernel(
-    const real_t* __restrict__ ovvv, real_t* __restrict__ dst, int NO, int NV, int mode)
+    const real_t* __restrict__ ovvv, real_t* __restrict__ dst, int NO, int NV, int mode,
+    int n0, int nt)
 {
     const size_t KV  = (size_t)NO * NV;
-    const size_t tot = (size_t)NV * NV * KV;          // NV²·KV
+    const size_t tot = (size_t)nt * KV;               // nt·KV (tile slab)
     const size_t stride = (size_t)gridDim.x * blockDim.x;
     for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < tot; idx += stride) {
-        const size_t row = idx / KV, col = idx % KV;
+        const size_t row = n0 + idx / KV, col = idx % KV;
         const int x = (int)(row / NV), c = (int)(row % NV);
         const int y = (int)(col / NV), d = (int)(col % NV);
         real_t v;
@@ -416,21 +420,24 @@ __global__ void ea_wvvvo_repack_B_kernel(
 // Accumulate coeff·M into wvvvo_big[a,b,c,j] (= ((a*NV+b)*NV+c)*NO+j):
 //   free_bc=0:  M[(a,c),(j,b)] = M[(a*NV+c)*KV + (j*NV+b)]
 //   free_bc=1:  M[(b,c),(j,a)] = M[(b*NV+c)*KV + (j*NV+a)]
+// M holds only the tile's rows [n0, n0+nt) of the NV² (x,c) dimension (a,c for
+// free_bc=0 / b,c for free_bc=1). The M-element → big-element map is a bijection,
+// so iterating over the M slab writes each covered big element exactly once —
+// identical arithmetic (one += per element) to the old full-size big iteration.
 __global__ void ea_wvvvo_scatter_kernel(
     const real_t* __restrict__ M, real_t* __restrict__ big,
-    real_t coeff, int free_bc, int NO, int NV)
+    real_t coeff, int free_bc, int NO, int NV, int n0, int nt)
 {
     const size_t KV  = (size_t)NO * NV;
-    const size_t tot = (size_t)NV * NV * NV * NO;
+    const size_t tot = (size_t)nt * KV;
     const size_t stride = (size_t)gridDim.x * blockDim.x;
     for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < tot; idx += stride) {
-        const int j = (int)(idx % NO);
-        const int c = (int)((idx / NO) % NV);
-        const int b = (int)((idx / ((size_t)NO*NV)) % NV);
-        const int a = (int)(idx / ((size_t)NO*NV*NV));
-        const size_t mo = free_bc ? ((size_t)(b*NV+c)*KV + (size_t)(j*NV+a))
-                                  : ((size_t)(a*NV+c)*KV + (size_t)(j*NV+b));
-        big[idx] += coeff * M[mo];
+        const size_t row = n0 + idx / KV, col = idx % KV;
+        const int x = (int)(row / NV), c = (int)(row % NV);
+        const int j = (int)(col / NV), e = (int)(col % NV);
+        const int a = free_bc ? e : x;
+        const int b = free_bc ? x : e;
+        big[(((size_t)a * NV + b) * NV + c) * NO + j] += coeff * M[idx];
     }
 }
 
@@ -452,6 +459,61 @@ __global__ void ea_gather_bvv_kernel(const real_t* __restrict__ B_mo,
         const int P = (int)(t / nvir);
         Bvv[idx] = B_mo[(size_t)P * nmo_full * nmo_full
                       + (size_t)(voff + a) * nmo_full + (size_t)(voff + b)];
+    }
+}
+
+// ---- EA RI-ladder gather/repack kernels (2026-07-09) -------------------
+// Bov[P][k][c] = B_mo[P, ooff+k, voff+c]  (occ×vir B-factor block; used once
+// to t1-dress the vv B-factors, freed immediately after).
+__global__ void ea_gather_bov_kernel(const real_t* __restrict__ B_mo,
+                                     real_t* __restrict__ Bov,
+                                     int naux, int nmo_full, int ooff, int voff,
+                                     int nocc, int nvir)
+{
+    const size_t total  = (size_t)naux * nocc * nvir;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += stride) {
+        const int c = (int)(idx % nvir);
+        const size_t t = idx / nvir;
+        const int k = (int)(t % nocc);
+        const int P = (int)(t / nocc);
+        Bov[idx] = B_mo[(size_t)P * nmo_full * nmo_full
+                      + (size_t)(ooff + k) * nmo_full + (size_t)(voff + c)];
+    }
+}
+
+// B̃perm[c][P][a] = B̃[P][a][c]  (second access pattern of the dressed B-factor
+// for the per-matvec ladder GEMM2 — both views need a unit-stride leading dim).
+__global__ void ea_btilde_perm_kernel(const real_t* __restrict__ Bt,
+                                      real_t* __restrict__ BtPerm,
+                                      int naux, int nvir)
+{
+    const size_t total  = (size_t)naux * nvir * nvir;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += stride) {
+        const int a = (int)(idx % nvir);
+        const size_t t = idx / nvir;
+        const int P = (int)(t % naux);
+        const int c = (int)(t / naux);
+        BtPerm[idx] = Bt[((size_t)P * nvir + a) * nvir + c];
+    }
+}
+
+// out[k][l][c][d] = ovov[k][c][l][d]  ((kc|ld) repack so the ladder t2 term is
+// a single [(kl)×(cd)] GEMM against r2).
+__global__ void ea_ovov_klcd_kernel(const real_t* __restrict__ ovov,
+                                    real_t* __restrict__ out, int NO, int NV)
+{
+    const size_t total  = (size_t)NO * NO * NV * NV;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += stride) {
+        const int d = (int)(idx % NV);
+        size_t t = idx / NV;
+        const int c = (int)(t % NV);
+        t /= NV;
+        const int l = (int)(t % NO);
+        const int k = (int)(t / NO);
+        out[idx] = ovov[(((size_t)k * NV + c) * NO + l) * NV + d];
     }
 }
 
@@ -738,10 +800,56 @@ EAEOMCCSDOperator::EAEOMCCSDOperator(
         if (canonical_skip_wvvvv_)
             std::cout << "  [EA-EOM canonical-skip] dressed Wvvvv build SKIPPED "
                          "(nvir⁴ host+device elided; Wvvvo·t1 refactored)" << std::endl;
+        // (RI ladder, 2026-07-09) When the CANONICAL-Davidson dense path cannot
+        // fit — raw (ab|cd) + dressed Wvvvv coexist during the build (2×nvir⁴·8B;
+        // 2×85.2 GiB at pentacene) and dressed Wvvvv then stays resident through
+        // the solve — elide both and evaluate the σ2 ladder per matvec from
+        // t1-dressed RI B-factors (exact identity, see header). Auto probe:
+        // fires when 2×nvir⁴·8B exceeds 85% of the memory left after the
+        // remaining common build allocations (3×[no·nv³] Wvovv/Wvvvo/ovvv-scale
+        // blocks + 6 small no²nv² blocks — charged on both paths).
+        // GANSU_EA_RI_LADDER=1/0 forces on/off. Requires GPU + RI block source,
+        // excludes canonical-skip (native σ owns the ladder there) + slab mode.
+#ifndef GANSU_CPU_ONLY
+        if (!canonical_skip_wvvvv_ && eri_vvvv_nslab_ <= 1 &&
+            eri_block_src_ != nullptr && gpu::gpu_available()) {
+            const char* fl = std::getenv("GANSU_EA_RI_LADDER");
+            if (fl && fl[0]) {
+                ea_ri_ladder_ = (fl[0] != '0');
+                if (ea_ri_ladder_)
+                    std::cout << "  [EA-EOM RI-ladder] forced ON (GANSU_EA_RI_LADDER=1)"
+                              << std::endl;
+            } else {
+                size_t free_b = 0, total_b = 0;
+                cudaMemGetInfo(&free_b, &total_b);
+                const double vvvv_b = (double)nvir * nvir * nvir * nvir * sizeof(real_t);
+                const double ovvv_b = (double)nocc * nvir * nvir * nvir * sizeof(real_t);
+                const double oovv_b = (double)nocc * nocc * nvir * nvir * sizeof(real_t);
+                const double need_dense = 2.0 * vvvv_b;
+                const double avail = (double)free_b - (3.0 * ovvv_b + 6.0 * oovv_b);
+                if (need_dense > 0.85 * avail) {
+                    ea_ri_ladder_ = true;
+                    std::cout << "  [EA-EOM RI-ladder] AUTO ON — dense raw+dressed Wvvvv "
+                              << std::fixed << std::setprecision(1)
+                              << need_dense / (1024.0*1024.0*1024.0) << " GiB > 0.85×"
+                              << avail / (1024.0*1024.0*1024.0)
+                              << " GiB projected free (GANSU_EA_RI_LADDER=0 to force dense)"
+                              << std::defaultfloat << std::endl;
+                }
+            }
+            if (ea_ri_ladder_)
+                std::cout << "  [EA-EOM RI-ladder] dressed Wvvvv + raw (ab|cd) elided; "
+                             "σ2 ladder evaluated per matvec from t1-dressed B-factors"
+                          << std::endl;
+        }
+#endif
         // (RI Term A) Evaluate the Wvvvo·t1 dressing from RI B-factors so the
         // nvir⁴ (ab|cd) block is never materialised. Requires the canonical-skip
-        // path (Wvvvo·t1 is then the sole vvvv consumer) and an RI block source.
-        ri_vvvv_term_a_ = canonical_skip_wvvvv_ && (eri_block_src_ != nullptr)
+        // path (Wvvvo·t1 is then the sole vvvv consumer) or the RI-ladder mode
+        // (which elides the same tensors under a canonical Davidson), plus an RI
+        // block source.
+        ri_vvvv_term_a_ = (canonical_skip_wvvvv_ || ea_ri_ladder_)
+                          && (eri_block_src_ != nullptr)
                           && on("GANSU_DLPNO_EA_VVVV_RI", true);
         if (ri_vvvv_term_a_)
             std::cout << "  [EA-EOM RI-Term-A] Wvvvo·t1 via RI B-factors "
@@ -855,6 +963,12 @@ EAEOMCCSDOperator::~EAEOMCCSDOperator() {
     if (d_M_ringA_)   tracked_cudaFree(d_M_ringA_);
     if (d_M_ringB_)   tracked_cudaFree(d_M_ringB_);
     if (d_M_ringC_)   tracked_cudaFree(d_M_ringC_);
+    // EA RI-ladder factors + scratch
+    if (d_Bvv_lad_)      tracked_cudaFree(d_Bvv_lad_);
+    if (d_Bvv_lad_perm_) tracked_cudaFree(d_Bvv_lad_perm_);
+    if (d_ovov_klcd_)    tracked_cudaFree(d_ovov_klcd_);
+    if (d_lad_Z_)        tracked_cudaFree(d_lad_Z_);
+    if (d_lad_T_)        tracked_cudaFree(d_lad_T_);
 #ifndef GANSU_CPU_ONLY
     // Stage EA-5: free per-device replicas (skip ws_[0], which aliases the
     // device-0 members freed above).
@@ -892,6 +1006,13 @@ void EAEOMCCSDOperator::setup_multi_gpu() {
     const char* e = std::getenv("GANSU_STEOM_EOM_GPUS");
     const int env_gpus = (e && e[0]) ? std::atoi(e) : 0;
     if (env_gpus <= 1) return;   // decoupled opt-in; default = legacy single-GPU
+    // EA RI-ladder mode is single-GPU (the σ2 ladder replicas would need the
+    // B̃/repack factors per device — not wired). Fall back with a notice.
+    if (ea_ri_ladder_) {
+        std::cout << "  [EA-EOM RI-ladder] GANSU_STEOM_EOM_GPUS>1 ignored under "
+                     "RI-ladder mode — single-GPU σ." << std::endl;
+        return;
+    }
 
     // Decouple the EA σ device count from the RI/CIS-NTO MultiGpuManager singleton,
     // which is already initialized to 1 device by the --num_gpus 1 HF/RI path
@@ -1252,7 +1373,7 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     // (line ~1927), so h_vvvv is never touched — skip its 4.7 GB host alloc + D2H
     // entirely (EA build_dressed "host alloc + D2H inputs" 4.6→~0.6 s at naphthalene).
     const bool need_h_vvvv = (eri_vvvv_nslab_ <= 1) &&
-        (!canonical_skip_wvvvv_
+        ((!canonical_skip_wvvvv_ && !ea_ri_ladder_)   // RI-ladder: raw is never materialised
          || std::getenv("GANSU_STEOM_BUILD_VALIDATE") != nullptr
          || !gpu::gpu_available());
     std::vector<real_t> h_vvvv;
@@ -1271,6 +1392,22 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     std::vector<real_t> h_f_oo(NO), h_f_vv(NV);
     cudaMemcpy(h_f_oo.data(), d_f_oo_, NO * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_f_vv.data(), d_f_vv_, NV * sizeof(real_t), cudaMemcpyDeviceToHost);
+
+#ifndef GANSU_CPU_ONLY
+    // (2026-07-10, DMET cluster wall) oooo/ooov/oovv/ovvo are never read on the
+    // device again after this D2H — every build consumer uses the host copies
+    // (h_ooov/h_oovv/...), σ/apply touches only the dressed intermediates plus
+    // raw ovov/t2, and neither the bar-H cache nor the multi-GPU replicas carry
+    // them. Free the 4 device blocks now: reclaims 2×nocc²nvir² + nocc³nvir +
+    // nocc⁴ (13.4 GiB at the Doxorubicin cc-pVDZ cluster) for the rest of the
+    // build and the whole Davidson solve. Opt-out: GANSU_EA_KEEP_RAW_BLOCKS=1.
+    if (gpu::gpu_available() && std::getenv("GANSU_EA_KEEP_RAW_BLOCKS") == nullptr) {
+        tracked_cudaFree(d_eri_oooo_); d_eri_oooo_ = nullptr;
+        tracked_cudaFree(d_eri_ooov_); d_eri_ooov_ = nullptr;
+        tracked_cudaFree(d_eri_oovv_); d_eri_oovv_ = nullptr;
+        tracked_cudaFree(d_eri_ovvo_); d_eri_ovvo_ = nullptr;
+    }
+#endif
 
     subprof("host alloc + D2H inputs");
     // ============================================================
@@ -1831,12 +1968,44 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     bool wvvvo_dev_asm = false;
     const bool wvvvo_keep_validate = (std::getenv("GANSU_STEOM_BUILD_VALIDATE") != nullptr);
 #ifndef GANSU_CPU_ONLY
-    wvvvo_dev_asm = gpu::gpu_available() && canonical_skip_wvvvv_ && eri_vvvv_nslab_ <= 1;
+    wvvvo_dev_asm = gpu::gpu_available() && (canonical_skip_wvvvv_ || ea_ri_ladder_)
+                    && eri_vvvv_nslab_ <= 1;
+    // (2026-07-10, pentacene wall #2) The device-side Wvvvo assembly keeps all 6
+    // term buffers (each nvir³·nocc) resident simultaneously for the final fused
+    // scatter kernel, then allocates a 7th for d_Wvvvo_. At pentacene scale
+    // (nvir=327 ⇒ 13.3 GB each) that ~93 GB build-time peak OOMs on top of the
+    // resident bar-H even after the RI-ladder elides the dressed Wvvvv. Probe the
+    // free memory and fall back to host assembly (one device term buffer at a
+    // time, D2H'd to host arrays; the final h_Wvvvo is assembled on the host and
+    // uploaded once — byte-identical numerics, host RAM is ample). Small systems
+    // keep the device path (bit-identical to prior runs). Force with
+    // GANSU_EA_WVVVO_HOST_ASM=1 / disable with =0.
+    if (wvvvo_dev_asm && gpu::gpu_available()) {
+        const char* force = std::getenv("GANSU_EA_WVVVO_HOST_ASM");
+        if (force && force[0]) {
+            if (force[0] != '0') { wvvvo_dev_asm = false;
+                std::cout << "  [EA-EOM] Wvvvo host-assembly forced "
+                             "(GANSU_EA_WVVVO_HOST_ASM=1)" << std::endl; }
+        } else {
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            const double keep6 = 6.0 * (double)NV * NV * NV * NO * sizeof(real_t);
+            if (keep6 > 0.55 * (double)free_b) {
+                wvvvo_dev_asm = false;
+                std::cout << "  [EA-EOM] Wvvvo device-assembly 6-buffer "
+                          << std::fixed << std::setprecision(1)
+                          << keep6 / (1024.0*1024.0*1024.0) << " GiB > 0.55×"
+                          << free_b / (1024.0*1024.0*1024.0)
+                          << " GiB free — host assembly fallback (lower build peak)"
+                          << std::defaultfloat << std::endl;
+            }
+        }
+    }
 #endif
     std::vector<real_t> wvvvv_t3;
     bool wvvvv_t3_gpu = false;
     std::vector<real_t> h_Wvvvv;
-    if (!canonical_skip_wvvvv_) {
+    if (!canonical_skip_wvvvv_ && !ea_ri_ladder_) {
 #ifndef GANSU_CPU_ONLY
         if (gpu::gpu_available()) {
             cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
@@ -1916,7 +2085,7 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     // uses an O(nocc³·nvir) or O(nocc·nvir²) scratch and runs at O(nvir⁵·nocc)
     // or less — same complexity class as the original d-loop, no extra work.
     std::vector<real_t> wvvvo_w_t1;
-    if (canonical_skip_wvvvv_) {
+    if (canonical_skip_wvvvv_ || ea_ri_ladder_) {
         const size_t wvvvo_sz_local = (size_t)NV * NV * NV * NO;
         wvvvo_w_t1.assign(wvvvo_sz_local, 0.0);
 
@@ -2404,7 +2573,7 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
 #ifndef GANSU_CPU_ONLY
     if (gpu::gpu_available()) {
         cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
-        const size_t Asz = (size_t)NV2 * KV, Bsz = (size_t)KV * KV, Msz = (size_t)NV2 * KV;
+        const size_t Bsz = (size_t)KV * KV;
         const size_t bigsz = (size_t)NV * NV * NV * NO;
         // Device-resident repack/scatter (ship 3): gather A off d_eri_ovvv_ and
         // B off d_t2_ straight on the device, GEMM, scatter-accumulate into dBig,
@@ -2412,25 +2581,62 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         // at naphthalene), the 3× dA/dB H2D, the 3× dM D2H, and the 3 host
         // scatter loops — the SUBPROF "Wvvvo term3+4" 6.7 s hotspot.  Layouts
         // mirror the validated host repacks; GEMM args unchanged.
+        //
+        // (2026-07-10, DMET cluster wall) Dense transients dA+dM (each NV²·KV =
+        // nvir³·nocc) coexist with dB + dBig — 4 buffers ≈ 3.4×nvir³·nocc. The
+        // Doxorubicin cc-pVDZ cluster (nocc=104, nvir=270) OOMs at the dBig
+        // malloc (dA+dB+dM = 36.6 GiB already taken out of 38.9 GiB free). Tile
+        // the GEMM over the NV² (n) dimension instead: dA/dM shrink to [KV × nt]
+        // slabs, peak = dB + dBig + 2 slabs. Per-element arithmetic is unchanged
+        // (one += per big element; only the cuBLAS n-extent differs, so any
+        // deviation is GEMM-shape FP re-association). nt = NV² (single tile) is
+        // the exact old call. Auto memory probe; force with GANSU_EA_BIG_TILE=1/0.
+        size_t nt = (size_t)NV2;
+        {
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            bool tile_on;
+            const char* force = std::getenv("GANSU_EA_BIG_TILE");
+            if (force && force[0]) tile_on = (force[0] != '0');
+            else tile_on = ((2.0 * (double)NV2 * KV + (double)Bsz + (double)bigsz)
+                            * sizeof(real_t) > 0.80 * (double)free_b);
+            if (tile_on) {
+                // budget the two [KV × nt] slabs to ~25% of the current free pool
+                nt = (size_t)(0.25 * (double)free_b / (2.0 * (double)KV * sizeof(real_t)));
+                nt = std::max<size_t>(std::min<size_t>(nt, (size_t)NV2), 256);
+                std::cout << "  [EA-EOM] Wvvvo term3+4 GEMM n-tiled: nt=" << nt
+                          << "/" << NV2 << " (slabs " << std::fixed << std::setprecision(1)
+                          << 2.0 * (double)nt * KV * sizeof(real_t) / (1024.0*1024.0*1024.0)
+                          << " GiB vs dense "
+                          << 2.0 * (double)NV2 * KV * sizeof(real_t) / (1024.0*1024.0*1024.0)
+                          << " GiB, free " << (double)free_b / (1024.0*1024.0*1024.0)
+                          << " GiB)" << std::defaultfloat << std::endl;
+            }
+        }
         real_t *dA = nullptr, *dB = nullptr, *dM = nullptr, *dBig = nullptr;
-        tracked_cudaMalloc(&dA,   Asz   * sizeof(real_t));
-        tracked_cudaMalloc(&dB,   Bsz   * sizeof(real_t));
-        tracked_cudaMalloc(&dM,   Msz   * sizeof(real_t));
-        tracked_cudaMalloc(&dBig, bigsz * sizeof(real_t));
+        tracked_cudaMalloc(&dA,   nt * KV * sizeof(real_t));
+        tracked_cudaMalloc(&dB,   Bsz     * sizeof(real_t));
+        tracked_cudaMalloc(&dM,   nt * KV * sizeof(real_t));
+        tracked_cudaMalloc(&dBig, bigsz   * sizeof(real_t));
         cudaMemset(dBig, 0, bigsz * sizeof(real_t));
         const real_t one = 1.0, zero = 0.0;
         const int thr = 256;
-        const int blkA = (int)std::min<size_t>((Asz   + thr - 1) / thr, 65535);
-        const int blkB = (int)std::min<size_t>((Bsz   + thr - 1) / thr, 65535);
-        const int blkS = (int)std::min<size_t>((bigsz + thr - 1) / thr, 65535);
+        const int blkB = (int)std::min<size_t>((Bsz + thr - 1) / thr, 65535);
         // All work on the legacy default stream → repack → GEMM → scatter are
         // implicitly ordered; consecutive scatters serialize their dBig RMW.
         auto gemm_scatter_dev = [&](int Amode, int Bmode, real_t coeff, int free_bc) {
-            ea_wvvvo_repack_A_kernel<<<blkA, thr>>>(d_eri_ovvv_, dA, NO, NV, Amode);
-            ea_wvvvo_repack_B_kernel<<<blkB, thr>>>(d_t2_,       dB, NO, NV, Bmode);
-            cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, KV, NV2, KV, &one,
-                        dB, KV, dA, KV, &zero, dM, KV);
-            ea_wvvvo_scatter_kernel<<<blkS, thr>>>(dM, dBig, coeff, free_bc, NO, NV);
+            ea_wvvvo_repack_B_kernel<<<blkB, thr>>>(d_t2_, dB, NO, NV, Bmode);
+            for (size_t n0 = 0; n0 < (size_t)NV2; n0 += nt) {
+                const int nt_cur = (int)std::min<size_t>(nt, (size_t)NV2 - n0);
+                const size_t tsz = (size_t)nt_cur * KV;
+                const int blkT = (int)std::min<size_t>((tsz + thr - 1) / thr, 65535);
+                ea_wvvvo_repack_A_kernel<<<blkT, thr>>>(d_eri_ovvv_, dA, NO, NV, Amode,
+                                                        (int)n0, nt_cur);
+                cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, KV, nt_cur, KV, &one,
+                            dB, KV, dA, KV, &zero, dM, KV);
+                ea_wvvvo_scatter_kernel<<<blkT, thr>>>(dM, dBig, coeff, free_bc, NO, NV,
+                                                       (int)n0, nt_cur);
+            }
         };
         gemm_scatter_dev(0, 0,  1.0, 0);   // hAcomb · hB   (term3 parts 1+3)
         gemm_scatter_dev(1, 1, -1.0, 0);   // hA     · hBp  (term3 part 2)
@@ -2443,6 +2649,20 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         }
         if (!wvvvo_dev_asm) tracked_cudaFree(dBig);
         wvvvo_big_gpu = true;
+        // (DMET cluster wall, part 2) In host-assembly mode the repack above was
+        // the LAST device consumer of the raw (ia|bc) block — the final Wvvvo
+        // assembly reads the host copy (h_ovvv, always populated), and σ/apply
+        // only touch the dressed intermediates. Free it now: reclaims nocc·nvir³
+        // (15.25 GiB at the Doxorubicin cc-pVDZ cluster) ahead of the term5/item
+        // GEMMs and the d_Wvvvo_ + ring-M uploads. The device-assembly path keeps
+        // it (ea_wvvvo_assemble_kernel reads it). Opt-out: GANSU_EA_KEEP_RAW_OVVV=1.
+        if (!wvvvo_dev_asm && d_eri_ovvv_ != nullptr
+            && std::getenv("GANSU_EA_KEEP_RAW_OVVV") == nullptr) {
+            tracked_cudaFree(d_eri_ovvv_);
+            d_eri_ovvv_ = nullptr;
+            std::cout << "  [EA-EOM] raw (ia|bc) device block freed after Wvvvo "
+                         "term3+4 (host assembly reads h_ovvv)" << std::endl;
+        }
         if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
             real_t dmax = 0.0;
             const int as[2] = {0, NV - 1};
@@ -2737,9 +2957,9 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                         for (int k = 0; k < NO; ++k)
                             v -= h_Fov[k*NV + c] * H_T2(k,j,a,b);
                     }
-                    if (canonical_skip_wvvvv_) {
-                        // P5 canonical-skip: Σ_d Wvvvv[a,b,c,d]·t1[j,d] precomputed
-                        // term-by-term above without materializing nvir⁴ Wvvvv.
+                    if (canonical_skip_wvvvv_ || ea_ri_ladder_) {
+                        // P5 canonical-skip / RI-ladder: Σ_d Wvvvv[a,b,c,d]·t1[j,d]
+                        // precomputed term-by-term above without materializing nvir⁴ Wvvvv.
                         v += wvvvo_w_t1[(((size_t)a*NV+b)*NV+c)*NO+j];
                     } else {
                         for (int d = 0; d < NV; ++d)
@@ -2771,10 +2991,11 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         tracked_cudaMalloc(&d_Wvovv_, wvovv_sz * sizeof(real_t));
         cudaMemcpy(d_Wvovv_, h_Wvovv.data(), wvovv_sz * sizeof(real_t), cudaMemcpyHostToDevice);
     }
-    if (!canonical_skip_wvvvv_) {
+    if (!canonical_skip_wvvvv_ && !ea_ri_ladder_) {
         tracked_cudaMalloc(&d_Wvvvv_, vvvv_sz  * sizeof(real_t));
         cudaMemcpy(d_Wvvvv_, h_Wvvvv.data(), vvvv_sz  * sizeof(real_t), cudaMemcpyHostToDevice);
     }  // canonical_skip: d_Wvvvv_ stays nullptr (native operator handles σ2 via per-pair PNO)
+       // RI-ladder:      d_Wvvvv_ stays nullptr (σ2 ladder from B̃ factors per matvec)
     if (!wvvvo_dev_asm) {   // stage 3: device path already built d_Wvvvo_
         tracked_cudaMalloc(&d_Wvvvo_, wvvvo_sz * sizeof(real_t));
         cudaMemcpy(d_Wvvvo_, h_Wvvvo.data(), wvvvo_sz * sizeof(real_t), cudaMemcpyHostToDevice);
@@ -2798,6 +3019,48 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
 #endif
 
     subprof("H2D uploads + ring-M kernel");
+#ifndef GANSU_CPU_ONLY
+    if (ea_ri_ladder_) {
+        build_ri_ladder_factors();
+        subprof("RI-ladder factors (B̃ + repacks)");
+        // Sampled self-check (needs the raw h_vvvv, kept only under VALIDATE):
+        // W_ri(a,b,c,d) = Σ_P B̃[P,(a,c)]·B̃[P,(b,d)] + Σ_kl (kc|ld)·t2[k,l,a,b]
+        // vs the dense dressed-Wvvvv host formula. Expect ≤1e-10 (FP reassoc).
+        if (std::getenv("GANSU_STEOM_BUILD_VALIDATE") && need_h_vvvv) {
+            const int Q = lad_naux_;
+            std::vector<real_t> h_Bt((size_t)Q * NV * NV);
+            cudaMemcpy(h_Bt.data(), d_Bvv_lad_, h_Bt.size() * sizeof(real_t),
+                       cudaMemcpyDeviceToHost);
+            real_t dmax = 0.0;
+            const int st = (NV / 4 > 0 ? NV / 4 : 1);
+            for (int a = 0; a < NV; a += st)
+                for (int b = 0; b < NV; b += st)
+                    for (int c = 0; c < NV; c += st)
+                        for (int d = 0; d < NV; d += st) {
+                            real_t w_ri = 0.0;
+                            for (int P = 0; P < Q; ++P)
+                                w_ri += h_Bt[((size_t)P*NV + a)*NV + c]
+                                      * h_Bt[((size_t)P*NV + b)*NV + d];
+                            for (int k = 0; k < NO; ++k)
+                                for (int l = 0; l < NO; ++l)
+                                    w_ri += H_OVOV(k,c,l,d) * H_T2(k,l,a,b);
+                            real_t w_ref = H_VVVV(a,c,b,d);
+                            for (int k = 0; k < NO; ++k)
+                                w_ref -= H_OVVV(k,c,b,d) * H_T1(k,a);
+                            for (int l = 0; l < NO; ++l)
+                                w_ref -= H_OVVV(l,d,a,c) * H_T1(l,b);
+                            for (int k = 0; k < NO; ++k)
+                                for (int l = 0; l < NO; ++l)
+                                    w_ref += H_OVOV(k,c,l,d)
+                                           * (H_T2(k,l,a,b) + H_T1(k,a)*H_T1(l,b));
+                            dmax = std::max(dmax, std::fabs(w_ri - w_ref));
+                        }
+            std::cout << "[EA build self-check] RI-ladder Wvvvv reconstruction vs dense: "
+                         "max|Δ| = " << std::scientific << dmax
+                      << " (expect ≤1e-10)" << std::defaultfloat << std::endl;
+        }
+    }
+#endif
     std::cout << "  EA-EOM-CCSD dressed intermediates built (PySCF EA definitions)." << std::endl;
 
     // (2026-07-09, tetracene polish OOM) The RAW (ab|cd) block d_eri_vvvv_ is a
@@ -2829,6 +3092,140 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
 #undef H_VVVV
 #undef H_T1
 #undef H_T2
+
+
+#ifndef GANSU_CPU_ONLY
+// ==================================================================
+//  EA RI-ladder mode (2026-07-09) — build the t1-dressed B-factors +
+//  repacks consumed by the per-matvec σ2 ladder. Exact identity:
+//    Wvvvv[a,b,c,d] = Σ_P B̃[P,(a,c)]·B̃[P,(b,d)] + Σ_kl (kc|ld)·t2[k,l,a,b]
+//    B̃[P,(a,c)]     = B[P,(a,c)] − Σ_k t1[k,a]·B[P,(k,c)]
+//  (expanding B̃B̃ reproduces the raw (ac|bd), both t1·ovvv dressing terms
+//  and the t1·t1 part of τ term-by-term; the residual t2 part is folded
+//  through the (kc|ld) repack). The dense build assembles raw (ac|bd)
+//  from the very same B-factors, so this evaluation is the same tensor
+//  up to FP reassociation.
+// ==================================================================
+void EAEOMCCSDOperator::build_ri_ladder_factors() {
+    const int NO = nocc_, NV = nvir_;
+    lad_naux_ = eri_block_src_->get_num_auxiliary_basis();
+    const int Q = lad_naux_;
+    const int O = frozen_off_;
+    const int voff = nocc_ + O;
+    cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+    const size_t bvv_sz = (size_t)Q * NV * NV;
+    const size_t bov_sz = (size_t)Q * NO * NV;
+    const int thr = 256;
+
+    // B̃[P][a][c] = B[P,(a,c)] − Σ_k t1[k,a]·B[P,(k,c)]  (first index dressed)
+    tracked_cudaMalloc(&d_Bvv_lad_, bvv_sz * sizeof(real_t));
+    {
+        const int blk = (int)std::min<size_t>((bvv_sz + thr - 1) / thr, 65535);
+        ea_gather_bvv_kernel<<<blk, thr>>>(d_B_mo_blocks_, d_Bvv_lad_,
+                                           Q, nmo_full_, voff, NV);
+    }
+    real_t* d_Bov = nullptr;
+    tracked_cudaMalloc(&d_Bov, bov_sz * sizeof(real_t));
+    {
+        const int blk = (int)std::min<size_t>((bov_sz + thr - 1) / thr, 65535);
+        ea_gather_bov_kernel<<<blk, thr>>>(d_B_mo_blocks_, d_Bov,
+                                           Q, nmo_full_, O, voff, NO, NV);
+    }
+    {
+        // Batched over P (col-major views): B̃_P(c,a) −= Σ_k Bov_P(c,k)·t1(a,k)ᵀ.
+        // Bov_P memory [k][c] ⇒ col-major [c×k] ld=NV; t1 memory [k][a] ⇒
+        // col-major [a×k] ld=NV, OP_T ⇒ [k×a]; C = B̃_P memory [a][c] ⇒
+        // col-major [c×a] ld=NV, beta=1 on the gathered Bvv.
+        const real_t neg1 = -1.0, one = 1.0;
+        cublasDgemmStridedBatched(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                                  NV, NV, NO, &neg1,
+                                  d_Bov, NV, (long long)NO * NV,
+                                  d_t1_, NV, 0LL,
+                                  &one,
+                                  d_Bvv_lad_, NV, (long long)NV * NV,
+                                  Q);
+    }
+    tracked_cudaFree(d_Bov);
+
+    // Permuted copy [c][P][a] (GEMM2 needs the (c,P) composite unit-stride in a).
+    tracked_cudaMalloc(&d_Bvv_lad_perm_, bvv_sz * sizeof(real_t));
+    {
+        const int blk = (int)std::min<size_t>((bvv_sz + thr - 1) / thr, 65535);
+        ea_btilde_perm_kernel<<<blk, thr>>>(d_Bvv_lad_, d_Bvv_lad_perm_, Q, NV);
+    }
+
+    // (kc|ld) repack [k][l][c][d] for the t2 ladder term.
+    const size_t ovov_sz = (size_t)NO * NV * NO * NV;
+    tracked_cudaMalloc(&d_ovov_klcd_, ovov_sz * sizeof(real_t));
+    {
+        const int blk = (int)std::min<size_t>((ovov_sz + thr - 1) / thr, 65535);
+        ea_ovov_klcd_kernel<<<blk, thr>>>(d_eri_ovov_, d_ovov_klcd_, NO, NV);
+    }
+
+    // Per-matvec scratch: Z tile ([tj][c][P][b], ≤ ~2 GiB) + T ([(kl)][j]).
+    const size_t z_per_j = (size_t)Q * NV * NV;
+    lad_tj_ = (int)std::min<size_t>((size_t)NO,
+                  std::max<size_t>(1, ((size_t)2 << 30) / (z_per_j * sizeof(real_t))));
+    tracked_cudaMalloc(&d_lad_Z_, (size_t)lad_tj_ * z_per_j * sizeof(real_t));
+    tracked_cudaMalloc(&d_lad_T_, (size_t)NO * NO * NO * sizeof(real_t));
+    cudaDeviceSynchronize();
+    std::cout << "  [EA-EOM RI-ladder] factors built: naux=" << Q
+              << ", B̃ 2×" << std::fixed << std::setprecision(2)
+              << bvv_sz * sizeof(real_t) / (1024.0*1024.0*1024.0)
+              << " GiB + ovov repack "
+              << ovov_sz * sizeof(real_t) / (1024.0*1024.0*1024.0)
+              << " GiB, Z tile j=" << lad_tj_ << " ("
+              << (size_t)lad_tj_ * z_per_j * sizeof(real_t) / (1024.0*1024.0*1024.0)
+              << " GiB)" << std::defaultfloat << std::endl;
+}
+
+// σ2 particle-particle ladder from the RI factors (replaces the dense
+// Σ_(cd) Wvvvv[(ab),(cd)]·r2[j,(cd)] GEMM; same slab semantics).
+void EAEOMCCSDOperator::apply_ri_ladder_sigma(void* cublas_v, const real_t* d_r2,
+                                              real_t* d_s2, int j_begin, int j_end) const {
+    cublasHandle_t cublas = (cublasHandle_t)cublas_v;
+    const int NO = nocc_, NV = nvir_, Q = lad_naux_;
+    const int jslab = j_end - j_begin;
+    if (jslab <= 0) return;
+    const int NV2 = NV * NV;
+    const size_t joff = (size_t)j_begin * NV2;
+    const real_t one = 1.0, zero = 0.0;
+
+    // (1) t2 term: T[(kl),j] = Σ_(cd) ovov_klcd[(kl),(cd)]·r2[j,(cd)];
+    //     s2[j,(ab)] += Σ_(kl) t2[(kl),(ab)]·T[(kl),j].
+    cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                NO * NO, jslab, NV2, &one,
+                d_ovov_klcd_, NV2,
+                d_r2 + joff,  NV2,
+                &zero, d_lad_T_, NO * NO);
+    cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                NV2, jslab, NO * NO, &one,
+                d_t2_,     NV2,
+                d_lad_T_,  NO * NO,
+                &one, d_s2 + joff, NV2);
+
+    // (2) B̃·B̃ term, j-tiled:
+    //     Z[(P,b),(jj,c)] = Σ_d B̃[(P,b),d]·r2[j0+jj,c,d]   (one GEMM per tile;
+    //       r2 slab is a contiguous [d × (jj·NV+c)] col-major view, ld=NV)
+    //     s2 row j (b,a)  += Σ_(c,P) Z_j[b,(c,P)]·B̃perm[(c,P),a]
+    //       (strided-batched over jj, C written straight into s2[j][a][b]).
+    for (int j0 = 0; j0 < jslab; j0 += lad_tj_) {
+        const int tj = (jslab - j0 < lad_tj_) ? (jslab - j0) : lad_tj_;
+        cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                    Q * NV, tj * NV, NV, &one,
+                    d_Bvv_lad_, NV,
+                    d_r2 + joff + (size_t)j0 * NV2, NV,
+                    &zero, d_lad_Z_, Q * NV);
+        cublasDgemmStridedBatched(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                    NV, NV, Q * NV, &one,
+                    d_lad_Z_,        NV, (long long)Q * NV * NV,
+                    d_Bvv_lad_perm_, NV, 0LL,
+                    &one,
+                    d_s2 + joff + (size_t)j0 * NV2, NV, (long long)NV2,
+                    tj);
+    }
+}
+#endif  // !GANSU_CPU_ONLY
 
 
 // ==================================================================
@@ -3019,14 +3416,20 @@ void EAEOMCCSDOperator::apply_sigma_gpu(
     const size_t joff = (size_t)j_begin * nvir2;   // σ2/r2 row offset for this slab
 
     // σ2 kernel over the slab [j_begin, j_end); writes its rows of the full d_s2.
+    // RI-ladder mode: the in-kernel Wvvvv term is always excluded (Wvvvv is
+    // nullptr) — the ladder is added below from the B̃ factors.
     const int blocks_2 = (jslab * nvir2 + threads - 1) / threads;
     ea_eom_sigma2_full_kernel<<<blocks_2, threads>>>(
         Lvv, Loo, Wovov, Wovvo, Wvvvv, Wvvvo,
         d_tmp_k, t2, d_r1, d_r2, d_s2, nocc_, nvir_,
-        wvvvv_gemm ? 0 : 1, ring_gemm ? 0 : 1, j_begin, j_end);
+        (wvvvv_gemm || ea_ri_ladder_) ? 0 : 1, ring_gemm ? 0 : 1, j_begin, j_end);
 
     const real_t one = 1.0;
-    if (wvvvv_gemm) {
+    if (ea_ri_ladder_) {
+        // σ2[j∈slab,(ab)] += Σ_cd Wvvvv[(ab),(cd)]·r2 evaluated from the
+        // t1-dressed B-factors + t2·(kc|ld) term (Wvvvv never materialised).
+        apply_ri_ladder_sigma((void*)cublas, d_r2, d_s2, j_begin, j_end);
+    } else if (wvvvv_gemm) {
         // slab columns only: σ2[j∈slab,(ab)] += Wvvvv·r2[j∈slab,(cd)]  (N = jslab)
         cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                     nvir2, jslab, nvir2, &one,
@@ -3206,7 +3609,7 @@ void EAEOMCCSDOperator::print_intermediate_norms(std::ostream& os) const {
        << "    ‖Wvovv‖     = " << frobenius_norm_device(d_Wvovv_, wvovv_sz) << "\n"
        << "    ‖Wvvvv‖     = "
        << (d_Wvvvv_ ? frobenius_norm_device(d_Wvvvv_, wvvvv_sz) : 0.0)
-       << (d_Wvvvv_ ? "" : "  (canonical-skip)") << "\n"
+       << (d_Wvvvv_ ? "" : (ea_ri_ladder_ ? "  (RI-ladder)" : "  (canonical-skip)")) << "\n"
        << "    ‖Wvvvo‖     = " << frobenius_norm_device(d_Wvvvo_, wvvvo_sz) << "\n";
 }
 

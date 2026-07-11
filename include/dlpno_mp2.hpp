@@ -48,13 +48,46 @@ struct DLPNOLMP2Result {
     int    sc_pno_rounds = 0;
 };
 
+/**
+ * @brief Optional embedding-cluster orbital space for solve_dlpno_lmp2
+ *        (DMET×DLPNO Phase 1a — rectangular C).
+ *
+ * The cluster MOs are genuine LCAO over the full-molecule AO basis
+ * (rectangular C, nao × nmo with nmo < nao); the AO overlap S and the
+ * atom→AO ranges still come from the RHF. Two reformulated inputs make the
+ * square-C limit EXACT (they reduce algebraically to the molecular
+ * quantities when C is the complete square MO set):
+ *   - Fock: supplied in AO-covariant effective form
+ *       F_eff = S·C·diag(eps)·C^T·S      (== F when C C^T = S⁻¹),
+ *   - PAO:  built from the cluster-VIRTUAL projector image of the AOs
+ *       C̃^PAO = (C_vir·C_vir^T)·S       (== I − D_occ·S when D_occ+D_vir=S⁻¹),
+ *     restricting the PAO span to the cluster virtual subspace
+ *     (rank nmo − nocc_full); the per-domain Löwdin (t_cut_do) removes the
+ *     redundancy as usual.
+ * Occupied localization / domains are unchanged (cluster occ MOs are real-AO
+ * LCAO, so per-atom Mulliken populations stay well defined — validated by the
+ * GANSU_DMET_STEOM_LOC_TEST probe, rectangular PM converged).
+ */
+struct DLPNOClusterSpace {
+    const real_t* h_C     = nullptr; ///< [nao × nmo] row-major cluster MO coefficients (host)
+    const real_t* h_eps   = nullptr; ///< [nmo] cluster orbital energies (host)
+    const real_t* h_F_eff = nullptr; ///< [nao × nao] S·C·diag(eps)·C^T·S (host, caller-built)
+    int nmo     = 0;                 ///< cluster MO count (columns of C, = n_emb)
+    int nocc    = 0;                 ///< cluster ACTIVE occupied count (frozen excluded)
+    int nfrozen = 0;                 ///< cluster frozen-core count (frozen = first columns)
+};
+
 /// Run all of Phase-1 (PM + PAO + BP-domain + PNO + iterate_lmp2 + SC-PNO)
 /// and return the converged pair state. Used by `DLPNOMP2::compute_energy`
 /// and by the Phase-2 DLPNO-CCSD driver as its initial pair-data setup.
+/// `cluster` non-null runs the same machinery on an embedding-cluster orbital
+/// space (rectangular C) — nullptr is the legacy full-molecule path
+/// (byte-identical).
 DLPNOLMP2Result solve_dlpno_lmp2(
     RHF& rhf,
     const ERI& eri,
-    const DLPNOParams& params);
+    const DLPNOParams& params,
+    const DLPNOClusterSpace* cluster = nullptr);
 
 /**
  * @brief DLPNO-MP2 driver (Phase 1).
