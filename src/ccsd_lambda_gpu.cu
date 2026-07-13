@@ -774,6 +774,32 @@ __global__ void m3_sub_ovvv_l2t1_k(const real_t* ovvv, const real_t* l2t1,
     m3[idx] -= v;
 }
 
+// (Λ ovvv host-stage) k-slab variant: ovvv_slab holds rows k ∈ [k0, k0+nk);
+// each slab subtracts its partial k-sum from m3 (slabs ascend, so the add
+// sequence per element is k-ascending; the slab-boundary store re-associates
+// the sum — ≤1e-15-level, same tolerance class as the GEMM ports).
+__global__ void m3_sub_ovvv_l2t1_slab_k(const real_t* ovvv_slab, const real_t* l2t1,
+                                        real_t* m3, int NO, int NV, int k0, int nk)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)NO*NO*NV*NV;
+    if (idx >= total) return;
+    int i = idx / (NO*NV*NV);
+    size_t r = idx % (NO*NV*NV);
+    int j = r / (NV*NV);
+    r %= (NV*NV);
+    int a = r / NV;
+    int b = r % NV;
+    real_t v = 0.0;
+    for (int kl = 0; kl < nk; kl++) {
+      const int k = k0 + kl;
+      for (int c = 0; c < NV; c++)
+        v += ovvv_slab[(((size_t)kl*NV + b)*NV + c)*NV + a]
+           * l2t1[(((size_t)i * NO + j) * NV + c) * NO + k];
+    }
+    m3[idx] -= v;
+}
+
 // scale by 0.5
 __global__ void scale_inplace_k(real_t* x, real_t s, size_t n) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -820,7 +846,9 @@ __global__ void compute_l2new_k(const real_t* ovov, const real_t* ovvv, const re
     v += l1[IDX2(i,a)] * v4[IDX2(j,b)];
     // reference: l2new += einsum('ic,jbca->jiba', l1, ovvv)  → at dest (j,i,b,a)... we are at (i,j,a,b).
     // Reindex (i↔j, a↔b): contribution += sum_c l1[j,c]*ovvv[i,a,c,b]
-    for (int c = 0; c < NV; c++) v += l1[IDX2(j,c)] * ovvv[IDX_OVVV(i,a,c,b)];
+    // (Λ ovvv host-stage) ovvv == nullptr ⇒ term added by the i-slab kernel.
+    if (ovvv != nullptr)
+        for (int c = 0; c < NV; c++) v += l1[IDX2(j,c)] * ovvv[IDX_OVVV(i,a,c,b)];
     // reference: l2new -= einsum('ka,jbik->ijab', l1, ovoo) — at (i,j,a,b)
     for (int k = 0; k < NO; k++) v -= l1[IDX2(k,a)] * ovoo[IDX_OVOO(j,b,i,k)];
     // wovvo and woVVo terms
@@ -908,11 +936,13 @@ __global__ void compute_l1new_k(
         v += ov1 * tmp_jb[IDX2(j,b)];
       }
     // ovvv*mvv1
-    for (int b = 0; b < NV; b++)
-      for (int c = 0; c < NV; c++) {
-        v += 2.0 * ovvv[IDX_OVVV(i,a,c,b)] * mvv1[b*NV + c];
-        v -=       ovvv[IDX_OVVV(i,b,c,a)] * mvv1[b*NV + c];
-      }
+    // (Λ ovvv host-stage) ovvv == nullptr ⇒ term added by the i-slab kernel.
+    if (ovvv != nullptr)
+      for (int b = 0; b < NV; b++)
+        for (int c = 0; c < NV; c++) {
+          v += 2.0 * ovvv[IDX_OVVV(i,a,c,b)] * mvv1[b*NV + c];
+          v -=       ovvv[IDX_OVVV(i,b,c,a)] * mvv1[b*NV + c];
+        }
     // m3 contributions
     for (int j = 0; j < NO; j++)
       for (int b = 0; b < NV; b++) {
@@ -937,10 +967,12 @@ __global__ void compute_l1new_k(
         v -=       l1[IDX2(j,b)] * oovv[IDX_OOVV(i,j,b,a)];
       }
     // l2*wvvvo, l2*woovo
-    for (int j = 0; j < NO; j++)
-      for (int b = 0; b < NV; b++)
-        for (int c = 0; c < NV; c++)
-          v -= l2[IDX4(i,j,b,c)] * wvvvo[(((size_t)b * NV + a) * NV + c) * NO + j];
+    // (Λ ovvv host-stage) wvvvo == nullptr ⇒ term added by the b-slab kernel.
+    if (wvvvo != nullptr)
+      for (int j = 0; j < NO; j++)
+        for (int b = 0; b < NV; b++)
+          for (int c = 0; c < NV; c++)
+            v -= l2[IDX4(i,j,b,c)] * wvvvo[(((size_t)b * NV + a) * NV + c) * NO + j];
     for (int k = 0; k < NO; k++)
       for (int j = 0; j < NO; j++)
         for (int c = 0; c < NV; c++)
@@ -954,6 +986,67 @@ __global__ void compute_l1new_k(
     // Semi-canonical Brillouin: l1new += fov (when fov ≠ nullptr)
     if (fov) v += fov[idx];
     l1new[idx] = v;
+}
+
+// ---- (Λ ovvv/wvvvo host-stage) slab add-kernels for the terms elided from
+//      compute_l2new_k / compute_l1new_k when their tensors live on the host.
+//      ovvv slabs are i-rows (each output's whole term sits in its own slab ⇒
+//      bit-identical grouping); the wvvvo slab is a b-contraction partial sum
+//      (slab-boundary re-association, ≤1e-15 class).
+
+// l2new[i∈slab, j, a, b] += Σ_c l1[j,c] · ovvv[i,a,c,b]
+__global__ void l2new_add_ovvv_slab_k(const real_t* ovvv_slab, const real_t* l1,
+                                      real_t* l2new, int NO, int NV, int i0, int ni)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)ni*NO*NV*NV;
+    if (idx >= total) return;
+    int il = idx / ((size_t)NO*NV*NV);
+    size_t r = idx % ((size_t)NO*NV*NV);
+    int j = r / (NV*NV);
+    r %= (NV*NV);
+    int a = r / NV;
+    int b = r % NV;
+    real_t v = 0.0;
+    for (int c = 0; c < NV; c++)
+        v += l1[IDX2(j,c)] * ovvv_slab[(((size_t)il*NV + a)*NV + c)*NV + b];
+    l2new[IDX4(i0 + il, j, a, b)] += v;
+}
+
+// l1new[i∈slab, a] += Σ_bc [2·ovvv[i,a,c,b] − ovvv[i,b,c,a]] · mvv1[b,c]
+__global__ void l1new_add_ovvv_slab_k(const real_t* ovvv_slab, const real_t* mvv1,
+                                      real_t* l1new, int NO, int NV, int i0, int ni)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= ni*NV) return;
+    int il = idx / NV;
+    int a = idx % NV;
+    real_t v = 0.0;
+    for (int b = 0; b < NV; b++)
+      for (int c = 0; c < NV; c++) {
+        v += 2.0 * ovvv_slab[(((size_t)il*NV + a)*NV + c)*NV + b] * mvv1[b*NV + c];
+        v -=       ovvv_slab[(((size_t)il*NV + b)*NV + c)*NV + a] * mvv1[b*NV + c];
+      }
+    l1new[IDX2(i0 + il, a)] += v;
+}
+
+// l1new[i,a] -= Σ_{b∈slab, c, j} l2[i,j,b,c] · wvvvo[b,a,c,j]
+__global__ void l1new_sub_wvvvo_slab_k(const real_t* wvvvo_slab, const real_t* l2,
+                                       real_t* l1new, int NO, int NV, int b0, int nb)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= NO*NV) return;
+    int i = idx / NV;
+    int a = idx % NV;
+    real_t v = 0.0;
+    // j outer / b inner mirrors the original in-kernel term's loop order
+    // (the slab restricts b; the slab-boundary store is the only re-association).
+    for (int j = 0; j < NO; j++)
+      for (int bl = 0; bl < nb; bl++)
+        for (int c = 0; c < NV; c++)
+          v += l2[IDX4(i,j,b0 + bl,c)]
+             * wvvvo_slab[(((size_t)bl * NV + a) * NV + c) * NO + j];
+    l1new[idx] -= v;
 }
 
 // Apply denominators: l1new /= eia ; l1new += l1
@@ -1376,6 +1469,59 @@ bool solve_ccsd_lambda_gpu(
         cudaDeviceSynchronize();
     }
 
+    // (Λ ovvv/wvvvo host-stage, 2026-07-13) The λ-independent intermediates
+    // above were the last consumers needing the FULL device ovvv / wvvvo.
+    // Off-load both NO·NV³ tensors to the host now and stream i-/b-slabs into
+    // the split add-kernels each iteration — removes the two largest remaining
+    // Λ residents (2×24.7 GiB at a 412-orbital DMET fragment). Auto in
+    // block-source mode when 2·NO·NV³ > 0.35×free; force GANSU_LAMBDA_OVVV_HOST=1/0.
+    bool ovvv_host = false;
+    if (eri_block_src != nullptr && d_B_mo_blocks != nullptr) {
+        size_t freeb = 0, totb = 0;
+        cudaMemGetInfo(&freeb, &totb);
+        const char* loh = std::getenv("GANSU_LAMBDA_OVVV_HOST");
+        if (loh && loh[0]) ovvv_host = (loh[0] == '1');
+        else ovvv_host = (2.0 * (double)ovvv_sz * sizeof(real_t) > 0.35 * (double)freeb);
+    }
+    std::vector<real_t> h_ovvv_stage, h_wvvvo_stage;
+    real_t *d_ovvv_slab = nullptr, *d_wvvvo_slab = nullptr;
+    int ovvv_slab_rows = 0, wvvvo_slab_rows = 0;
+    if (ovvv_host) {
+        h_ovvv_stage.resize(ovvv_sz);
+        h_wvvvo_stage.resize((size_t)NV*NV*NV*NO);
+        cudaMemcpy(h_ovvv_stage.data(), d_ovvv, ovvv_sz * sizeof(real_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_wvvvo_stage.data(), d_wvvvo,
+                   (size_t)NV*NV*NV*NO * sizeof(real_t), cudaMemcpyDeviceToHost);
+        cudaHostRegister(h_ovvv_stage.data(), ovvv_sz * sizeof(real_t),
+                         cudaHostRegisterDefault);
+        cudaHostRegister(h_wvvvo_stage.data(),
+                         (size_t)NV*NV*NV*NO * sizeof(real_t),
+                         cudaHostRegisterDefault);
+        tracked_cudaFree(d_ovvv);  d_ovvv  = nullptr;
+        tracked_cudaFree(d_wvvvo); d_wvvvo = nullptr;
+        size_t freeb = 0, totb = 0;
+        cudaMemGetInfo(&freeb, &totb);
+        const size_t ovvv_row  = (size_t)NV*NV*NV * sizeof(real_t);   // i-row
+        const size_t wvvvo_row = (size_t)NV*NV*NO * sizeof(real_t);   // b-row
+        ovvv_slab_rows  = (int)std::min<size_t>((size_t)NO,
+            std::max<size_t>(1, (size_t)(0.10 * freeb) / ovvv_row));
+        wvvvo_slab_rows = (int)std::min<size_t>((size_t)NV,
+            std::max<size_t>(1, (size_t)(0.10 * freeb) / wvvvo_row));
+        if (const char* ls = std::getenv("GANSU_LAMBDA_OVVV_SLAB"))
+            if (std::atoi(ls) > 0) {
+                ovvv_slab_rows  = std::min(NO, std::atoi(ls));
+                wvvvo_slab_rows = std::min(NV, std::atoi(ls));
+            }
+        tracked_cudaMalloc(&d_ovvv_slab,  (size_t)ovvv_slab_rows  * ovvv_row);
+        tracked_cudaMalloc(&d_wvvvo_slab, (size_t)wvvvo_slab_rows * wvvvo_row);
+        std::fprintf(stderr,
+            "  [CCSD-Lambda] ovvv+wvvvo host-staged (%.1f GiB off device; "
+            "slabs %d/%d i-rows, %d/%d b-rows per iter)\n",
+            2.0 * ovvv_sz * sizeof(real_t) / (1024.0*1024.0*1024.0),
+            ovvv_slab_rows, NO, wvvvo_slab_rows, NV);
+    }
+
     if (verbose > 0) {
         std::cout << "CCSD Lambda solver (GPU): nocc=" << NO << " nvir=" << NV
                   << " max_iter=" << max_iter << " tol=" << std::scientific << tol
@@ -1437,16 +1583,43 @@ bool solve_ccsd_lambda_gpu(
             auto p3 = launch((size_t)NO*NO*NV*NO);
             compute_l2t1_k<<<p3.first, p3.second>>>(d_lambda2, d_t1, d_l2t1, NO, NV);
             cudaDeviceSynchronize();
-            m3_sub_ovvv_l2t1_k<<<p.first, p.second>>>(d_ovvv, d_l2t1, d_m3, NO, NV);
+            if (!ovvv_host) {
+                m3_sub_ovvv_l2t1_k<<<p.first, p.second>>>(d_ovvv, d_l2t1, d_m3, NO, NV);
+            } else {
+                const size_t orow = (size_t)NV*NV*NV;
+                for (int k0 = 0; k0 < NO; k0 += ovvv_slab_rows) {
+                    const int nk = std::min(ovvv_slab_rows, NO - k0);
+                    cudaMemcpy(d_ovvv_slab, h_ovvv_stage.data() + (size_t)k0*orow,
+                               (size_t)nk*orow*sizeof(real_t), cudaMemcpyHostToDevice);
+                    m3_sub_ovvv_l2t1_slab_k<<<p.first, p.second>>>(
+                        d_ovvv_slab, d_l2t1, d_m3, NO, NV, k0, nk);
+                    cudaDeviceSynchronize();
+                }
+            }
         }
         // l2new (pre-symmetrization, pre-denominator), into d_l2new_pre
         {
             auto p = launch(l2_sz);
-            compute_l2new_k<<<p.first, p.second>>>(d_ovov, d_ovvv, d_ovoo,
+            compute_l2new_k<<<p.first, p.second>>>(d_ovov,
+                                                   ovvv_host ? nullptr : d_ovvv,
+                                                   d_ovoo,
                                                    d_lambda1, d_lambda2,
                                                    d_v1, d_v2, d_v4, d_mvv1, d_moo1,
                                                    d_wovvo, d_woVVo,
                                                    d_l2new_pre, NO, NV);
+            if (ovvv_host) {
+                // elided ovvv term, added per i-slab (bit-identical grouping)
+                const size_t orow = (size_t)NV*NV*NV;
+                for (int i0 = 0; i0 < NO; i0 += ovvv_slab_rows) {
+                    const int ni = std::min(ovvv_slab_rows, NO - i0);
+                    cudaMemcpy(d_ovvv_slab, h_ovvv_stage.data() + (size_t)i0*orow,
+                               (size_t)ni*orow*sizeof(real_t), cudaMemcpyHostToDevice);
+                    auto ps = launch((size_t)ni*NO*NV*NV);
+                    l2new_add_ovvv_slab_k<<<ps.first, ps.second>>>(
+                        d_ovvv_slab, d_lambda1, d_l2new_pre, NO, NV, i0, ni);
+                    cudaDeviceSynchronize();
+                }
+            }
             // l2new += m3
             real_t one = 1.0;
             cublasDaxpy(gpu::GPUHandle::cublas(), (int)l2_sz, &one, d_m3, 1, d_l2new_pre, 1);
@@ -1456,13 +1629,39 @@ bool solve_ccsd_lambda_gpu(
             auto p = launch(NO*NV);
             compute_l1new_tmp_k<<<p.first, p.second>>>(d_t1, d_lambda1, d_theta, d_mvv1, d_moo, d_tmp_jb, NO, NV);
             cudaDeviceSynchronize();
-            compute_l1new_k<<<p.first, p.second>>>(d_ovov, d_ovoo, d_ovvv, d_ovvo, d_oovv,
+            compute_l1new_k<<<p.first, p.second>>>(d_ovov, d_ovoo,
+                                                   ovvv_host ? nullptr : d_ovvv,
+                                                   d_ovvo, d_oovv,
                                                    d_lambda1, d_lambda2, d_v1, d_v2, d_v4,
                                                    d_mvv, d_mvv1, d_moo, d_moo1,
-                                                   d_wovvo, d_woovo, d_wvvvo, d_w3,
+                                                   d_wovvo, d_woovo,
+                                                   ovvv_host ? nullptr : d_wvvvo,
+                                                   d_w3,
                                                    d_m3, d_t1, d_tmp_jb,
                                                    d_fov_active,
                                                    d_l1new, NO, NV);
+            if (ovvv_host) {
+                cudaDeviceSynchronize();
+                const size_t orow = (size_t)NV*NV*NV;
+                for (int i0 = 0; i0 < NO; i0 += ovvv_slab_rows) {
+                    const int ni = std::min(ovvv_slab_rows, NO - i0);
+                    cudaMemcpy(d_ovvv_slab, h_ovvv_stage.data() + (size_t)i0*orow,
+                               (size_t)ni*orow*sizeof(real_t), cudaMemcpyHostToDevice);
+                    auto ps = launch((size_t)ni*NV);
+                    l1new_add_ovvv_slab_k<<<ps.first, ps.second>>>(
+                        d_ovvv_slab, d_mvv1, d_l1new, NO, NV, i0, ni);
+                    cudaDeviceSynchronize();
+                }
+                const size_t wrow = (size_t)NV*NV*NO;
+                for (int b0 = 0; b0 < NV; b0 += wvvvo_slab_rows) {
+                    const int nb = std::min(wvvvo_slab_rows, NV - b0);
+                    cudaMemcpy(d_wvvvo_slab, h_wvvvo_stage.data() + (size_t)b0*wrow,
+                               (size_t)nb*wrow*sizeof(real_t), cudaMemcpyHostToDevice);
+                    l1new_sub_wvvvo_slab_k<<<p.first, p.second>>>(
+                        d_wvvvo_slab, d_lambda2, d_l1new, NO, NV, b0, nb);
+                    cudaDeviceSynchronize();
+                }
+            }
         }
         // Apply denominators
         {
@@ -1515,7 +1714,14 @@ bool solve_ccsd_lambda_gpu(
     }
 
     // Cleanup
-    tracked_cudaFree(d_ovov); tracked_cudaFree(d_ovoo); tracked_cudaFree(d_ovvv);
+    tracked_cudaFree(d_ovov); tracked_cudaFree(d_ovoo);
+    if (d_ovvv) tracked_cudaFree(d_ovvv);
+    if (d_ovvv_slab)  tracked_cudaFree(d_ovvv_slab);
+    if (d_wvvvo_slab) tracked_cudaFree(d_wvvvo_slab);
+    if (ovvv_host) {
+        cudaHostUnregister(h_ovvv_stage.data());
+        cudaHostUnregister(h_wvvvo_stage.data());
+    }
     tracked_cudaFree(d_oovv); tracked_cudaFree(d_ovvo); tracked_cudaFree(d_oooo);
     if (d_vvvv)      tracked_cudaFree(d_vvvv);
     if (d_vvvv_slab) tracked_cudaFree(d_vvvv_slab);
@@ -1525,7 +1731,8 @@ bool solve_ccsd_lambda_gpu(
     tracked_cudaFree(d_v1); tracked_cudaFree(d_v2); tracked_cudaFree(d_v4); tracked_cudaFree(d_v5); tracked_cudaFree(d_w3);
     tracked_cudaFree(d_woooo); tracked_cudaFree(d_v4o); tracked_cudaFree(d_v4v);
     tracked_cudaFree(d_wOVvo); tracked_cudaFree(d_woVVo); tracked_cudaFree(d_wovvo);
-    tracked_cudaFree(d_woovo); tracked_cudaFree(d_wvvvo);
+    tracked_cudaFree(d_woovo);
+    if (d_wvvvo) tracked_cudaFree(d_wvvvo);
     tracked_cudaFree(d_mvv); tracked_cudaFree(d_moo); tracked_cudaFree(d_mvv1); tracked_cudaFree(d_moo1);
     tracked_cudaFree(d_m3); tracked_cudaFree(d_l2tau); tracked_cudaFree(d_l2t1);
     tracked_cudaFree(d_tmp_jb); tracked_cudaFree(d_l1new); tracked_cudaFree(d_l2new_pre);

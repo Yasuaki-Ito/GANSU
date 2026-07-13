@@ -159,14 +159,61 @@ __global__ void ea_eom_sigma1_full_kernel(
         }
 
     // + Σ_{l,c,d} (2 Wvovv[a,l,c,d] - Wvovv[a,l,d,c]) r2[l,c,d]
+    // (EA σ host-stage) Wvovv == nullptr ⇒ term added by the a-slab kernel.
+    if (Wvovv != nullptr)
+        for (int l = 0; l < nocc; ++l)
+            for (int c = 0; c < nvir; ++c)
+                for (int d = 0; d < nvir; ++d) {
+                    real_t w1 = Wvovv[(((size_t)a * nocc + l) * nvir + c) * nvir + d];
+                    real_t w2 = Wvovv[(((size_t)a * nocc + l) * nvir + d) * nvir + c];
+                    s += (2.0 * w1 - w2) * r2[((size_t)l * nvir + c) * nvir + d];
+                }
+    sigma1[a] = s;
+}
+
+// (EA σ host-stage) a-slab variant of the σ1 Wvovv term: the slab holds rows
+// a ∈ [a0, a0+na) of [a,l,c,d]; each σ1[a] receives its FULL l,c,d sum from
+// its own slab (output-slab — the only re-association is the split of the σ1
+// register sum into base + this add, ≤1e-16 class).
+__global__ void ea_sigma1_wvovv_slab_kernel(
+    const real_t* __restrict__ Wvovv_slab,
+    const real_t* __restrict__ r2,
+    real_t* __restrict__ sigma1,
+    int nocc, int nvir, int a0, int na)
+{
+    int al = blockIdx.x * blockDim.x + threadIdx.x;
+    if (al >= na) return;
+    real_t s = 0.0;
     for (int l = 0; l < nocc; ++l)
         for (int c = 0; c < nvir; ++c)
             for (int d = 0; d < nvir; ++d) {
-                real_t w1 = Wvovv[(((size_t)a * nocc + l) * nvir + c) * nvir + d];
-                real_t w2 = Wvovv[(((size_t)a * nocc + l) * nvir + d) * nvir + c];
+                real_t w1 = Wvovv_slab[(((size_t)al * nocc + l) * nvir + c) * nvir + d];
+                real_t w2 = Wvovv_slab[(((size_t)al * nocc + l) * nvir + d) * nvir + c];
                 s += (2.0 * w1 - w2) * r2[((size_t)l * nvir + c) * nvir + d];
             }
-    sigma1[a] = s;
+    sigma1[a0 + al] += s;
+}
+
+// (EA σ host-stage) a-slab variant of the σ2 Wvvvo·r1 term: the slab holds
+// rows a ∈ [a0, a0+na) of [a,b,c,j]; outputs σ2[j, a∈slab, b] each receive
+// their full Σ_c from their own slab (output-slab).
+__global__ void ea_sigma2_wvvvo_slab_kernel(
+    const real_t* __restrict__ Wvvvo_slab,
+    const real_t* __restrict__ r1,
+    real_t* __restrict__ sigma2,
+    int nocc, int nvir, int a0, int na, int j_begin, int jslab)
+{
+    size_t lidx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t slabtot = (size_t)jslab * na * nvir;
+    if (lidx >= slabtot) return;
+    int b = (int)(lidx % nvir);
+    size_t t = lidx / nvir;
+    int al = (int)(t % na);
+    int j = j_begin + (int)(t / na);
+    real_t s = 0.0;
+    for (int c = 0; c < nvir; ++c)
+        s += Wvvvo_slab[(((size_t)al * nvir + b) * nvir + c) * nocc + j] * r1[c];
+    sigma2[((size_t)j * nvir + (a0 + al)) * nvir + b] += s;
 }
 
 
@@ -231,9 +278,11 @@ __global__ void ea_eom_sigma2_full_kernel(
     real_t s = 0.0;
 
     // +Σ_c Wvvvo[a,b,c,j] r1[c]   layout: ((a*nvir+b)*nvir+c)*nocc + j
-    for (int c = 0; c < nvir; ++c) {
-        s += Wvvvo[(((size_t)a * nvir + b) * nvir + c) * nocc + j] * r1[c];
-    }
+    // (EA σ host-stage) Wvvvo == nullptr ⇒ term added by the a-slab kernel.
+    if (Wvvvo != nullptr)
+        for (int c = 0; c < nvir; ++c) {
+            s += Wvvvo[(((size_t)a * nvir + b) * nvir + c) * nocc + j] * r1[c];
+        }
 
     // +Σ_c Lvv[a,c] r2[j,c,b]
     for (int c = 0; c < nvir; ++c) {
@@ -992,6 +1041,23 @@ EAEOMCCSDOperator::~EAEOMCCSDOperator() {
         if (d_Wvvvv_)     tracked_cudaFree(d_Wvvvv_);
         if (d_Wvvvo_)     tracked_cudaFree(d_Wvvvo_);
     }
+    // (EA σ host-stage) slab buffer + staged host tensors. When published to
+    // the bar-H cache, MOVE the (pinned) host stages there — the vector move
+    // preserves the registered data pointer, so the cache's free() can
+    // cudaHostUnregister it; otherwise unregister and release here.
+    if (d_w_slab_) tracked_cudaFree(d_w_slab_);
+    if (ea_w_host_stage_) {
+        if (barh_published_ && barh_cache_ != nullptr) {
+            barh_cache_->h_Wvovv_stage = std::move(h_wvovv_stage_);
+            barh_cache_->h_Wvvvo_stage = std::move(h_wvvvo_stage_);
+            barh_cache_->w_host_staged = true;
+        } else {
+#ifndef GANSU_CPU_ONLY
+            if (!h_wvovv_stage_.empty()) cudaHostUnregister(h_wvovv_stage_.data());
+            if (!h_wvvvo_stage_.empty()) cudaHostUnregister(h_wvvvo_stage_.data());
+#endif
+        }
+    }
     if (d_M_ringA_)   tracked_cudaFree(d_M_ringA_);
     if (d_M_ringB_)   tracked_cudaFree(d_M_ringB_);
     if (d_M_ringC_)   tracked_cudaFree(d_M_ringC_);
@@ -1043,6 +1109,13 @@ void EAEOMCCSDOperator::setup_multi_gpu() {
     if (ea_ri_ladder_) {
         std::cout << "  [EA-EOM RI-ladder] GANSU_STEOM_EOM_GPUS>1 ignored under "
                      "RI-ladder mode — single-GPU σ." << std::endl;
+        return;
+    }
+    // (EA σ host-stage) the per-device replication below copies the full
+    // Wvovv/Wvvvo — exactly the tensors the host-stage elides. Single-GPU σ.
+    if (ea_w_host_stage_) {
+        std::cout << "  [EA-EOM] GANSU_STEOM_EOM_GPUS>1 ignored — Wvovv/Wvvvo "
+                     "host-staged (single-GPU σ streams a-slabs)." << std::endl;
         return;
     }
 
@@ -3250,9 +3323,34 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     cudaMemcpy(d_Wovov_, h_Wovov.data(), ovov_sz  * sizeof(real_t), cudaMemcpyHostToDevice);
     tracked_cudaMalloc(&d_Wovvo_, ovvo_sz  * sizeof(real_t));
     cudaMemcpy(d_Wovvo_, h_Wovvo.data(), ovvo_sz  * sizeof(real_t), cudaMemcpyHostToDevice);
+    // (EA σ host-stage) decision point: both NV³·NO tensors go to the host
+    // (pinned) and the σ path streams a-slabs per matvec — both σ terms are
+    // pure output-slabs over a (bit-identical per element). Auto when the
+    // pending d_Wvvvo_ upload would not fit; force GANSU_EA_W_HOST=1/0.
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) {
+        size_t freeb = 0, totb = 0;
+        cudaMemGetInfo(&freeb, &totb);
+        const char* ewh = std::getenv("GANSU_EA_W_HOST");
+        if (ewh && ewh[0]) ea_w_host_stage_ = (ewh[0] == '1');
+        else ea_w_host_stage_ =
+            ((double)wvvvo_sz * sizeof(real_t) > 0.5 * (double)freeb);
+    }
+#endif
     if (!wvovv_on_device) {   // stage 1: device path already built d_Wvovv_
-        tracked_cudaMalloc(&d_Wvovv_, wvovv_sz * sizeof(real_t));
-        cudaMemcpy(d_Wvovv_, h_Wvovv.data(), wvovv_sz * sizeof(real_t), cudaMemcpyHostToDevice);
+        if (!ea_w_host_stage_) {
+            tracked_cudaMalloc(&d_Wvovv_, wvovv_sz * sizeof(real_t));
+            cudaMemcpy(d_Wvovv_, h_Wvovv.data(), wvovv_sz * sizeof(real_t), cudaMemcpyHostToDevice);
+        } else {
+            h_wvovv_stage_ = std::move(h_Wvovv);
+        }
+    } else if (ea_w_host_stage_) {
+        // device-assembled Wvovv → pull down and release the 30 GiB resident
+        h_wvovv_stage_.resize(wvovv_sz);
+        cudaMemcpy(h_wvovv_stage_.data(), d_Wvovv_, wvovv_sz * sizeof(real_t),
+                   cudaMemcpyDeviceToHost);
+        tracked_cudaFree(d_Wvovv_);
+        d_Wvovv_ = nullptr;
     }
     if (!canonical_skip_wvvvv_ && !ea_ri_ladder_) {
         tracked_cudaMalloc(&d_Wvvvv_, vvvv_sz  * sizeof(real_t));
@@ -3260,9 +3358,40 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     }  // canonical_skip: d_Wvvvv_ stays nullptr (native operator handles σ2 via per-pair PNO)
        // RI-ladder:      d_Wvvvv_ stays nullptr (σ2 ladder from B̃ factors per matvec)
     if (!wvvvo_dev_asm) {   // stage 3: device path already built d_Wvvvo_
-        tracked_cudaMalloc(&d_Wvvvo_, wvvvo_sz * sizeof(real_t));
-        cudaMemcpy(d_Wvvvo_, h_Wvvvo.data(), wvvvo_sz * sizeof(real_t), cudaMemcpyHostToDevice);
+        if (!ea_w_host_stage_) {
+            tracked_cudaMalloc(&d_Wvvvo_, wvvvo_sz * sizeof(real_t));
+            cudaMemcpy(d_Wvvvo_, h_Wvvvo.data(), wvvvo_sz * sizeof(real_t), cudaMemcpyHostToDevice);
+        } else {
+            h_wvvvo_stage_ = std::move(h_Wvvvo);
+        }
+    } else if (ea_w_host_stage_) {
+        h_wvvvo_stage_.resize(wvvvo_sz);
+        cudaMemcpy(h_wvvvo_stage_.data(), d_Wvvvo_, wvvvo_sz * sizeof(real_t),
+                   cudaMemcpyDeviceToHost);
+        tracked_cudaFree(d_Wvvvo_);
+        d_Wvvvo_ = nullptr;
     }
+#ifndef GANSU_CPU_ONLY
+    if (ea_w_host_stage_) {
+        cudaHostRegister(h_wvovv_stage_.data(), wvovv_sz * sizeof(real_t),
+                         cudaHostRegisterDefault);
+        cudaHostRegister(h_wvvvo_stage_.data(), wvvvo_sz * sizeof(real_t),
+                         cudaHostRegisterDefault);
+        size_t freeb = 0, totb = 0;
+        cudaMemGetInfo(&freeb, &totb);
+        const size_t row_bytes = (size_t)NO * NV * NV * sizeof(real_t);
+        w_slab_rows_ = (int)std::min<size_t>((size_t)NV,
+            std::max<size_t>(1, (size_t)(0.10 * freeb) / row_bytes));
+        if (const char* ws = std::getenv("GANSU_EA_W_SLAB"))
+            if (std::atoi(ws) > 0) w_slab_rows_ = std::min(NV, std::atoi(ws));
+        tracked_cudaMalloc(&d_w_slab_, (size_t)w_slab_rows_ * row_bytes);
+        std::fprintf(stderr,
+            "  [EA-EOM] Wvovv+Wvvvo host-staged (%.1f GiB off device; σ streams "
+            "%d/%d a-rows per matvec)\n",
+            2.0 * wvvvo_sz * sizeof(real_t) / (1024.0*1024.0*1024.0),
+            w_slab_rows_, NV);
+    }
+#endif
 
 #ifndef GANSU_CPU_ONLY
     // Precompute the 3 reorganized ring matrices (M_A/M_B/M_C, each [NO·NV × NO·NV])
@@ -3653,6 +3782,21 @@ void EAEOMCCSDOperator::apply_sigma_gpu(
         const int blocks_1 = (p_dim_ + threads - 1) / threads;
         ea_eom_sigma1_full_kernel<<<blocks_1, threads>>>(
             Lvv, Fov, Wvovv, d_r1, d_r2, d_s1, nocc_, nvir_);
+        // (EA σ host-stage) stream the Wvovv term in a-slabs (output-slab —
+        // each σ1[a] gets its full l,c,d sum from its own slab).
+        if (ea_w_host_stage_) {
+            const size_t wrow = (size_t)nocc_ * nvir_ * nvir_;
+            for (int a0 = 0; a0 < nvir_; a0 += w_slab_rows_) {
+                const int na = std::min(w_slab_rows_, nvir_ - a0);
+                cudaMemcpy(d_w_slab_, h_wvovv_stage_.data() + (size_t)a0 * wrow,
+                           (size_t)na * wrow * sizeof(real_t),
+                           cudaMemcpyHostToDevice);
+                const int nb1 = (na + threads - 1) / threads;
+                ea_sigma1_wvovv_slab_kernel<<<nb1, threads>>>(
+                    d_w_slab_, d_r2, d_s1, nocc_, nvir_, a0, na);
+                cudaDeviceSynchronize();
+            }
+        }
     }
     if (jslab <= 0) return;
 
@@ -3686,6 +3830,21 @@ void EAEOMCCSDOperator::apply_sigma_gpu(
         Lvv, Loo, Wovov, Wovvo, Wvvvv, Wvvvo,
         d_tmp_k, t2, d_r1, d_r2, d_s2, nocc_, nvir_,
         (wvvvv_gemm || ea_ri_ladder_) ? 0 : 1, ring_gemm ? 0 : 1, j_begin, j_end);
+    // (EA σ host-stage) stream the Wvvvo·r1 term in a-slabs (output-slab).
+    if (ea_w_host_stage_) {
+        const size_t wrow = (size_t)nvir_ * nvir_ * nocc_;
+        for (int a0 = 0; a0 < nvir_; a0 += w_slab_rows_) {
+            const int na = std::min(w_slab_rows_, nvir_ - a0);
+            cudaMemcpy(d_w_slab_, h_wvvvo_stage_.data() + (size_t)a0 * wrow,
+                       (size_t)na * wrow * sizeof(real_t),
+                       cudaMemcpyHostToDevice);
+            const size_t tot2 = (size_t)jslab * na * nvir_;
+            const int nb2 = (int)((tot2 + threads - 1) / threads);
+            ea_sigma2_wvvvo_slab_kernel<<<nb2, threads>>>(
+                d_w_slab_, d_r1, d_s2, nocc_, nvir_, a0, na, j_begin, jslab);
+            cudaDeviceSynchronize();
+        }
+    }
 
     const real_t one = 1.0;
     if (ea_ri_ladder_) {

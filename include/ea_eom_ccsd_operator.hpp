@@ -163,6 +163,17 @@ private:
     real_t* d_Wvvvv_  = nullptr;  // [nvir^4]
     real_t* d_Wvvvo_  = nullptr;  // [nvir · nvir · nvir · nocc]
 
+    // === (EA σ host-stage, 2026-07-13) ===
+    // When the two NV³·NO dressed tensors do not fit on device (p-DDPA
+    // n_emb=490: the d_Wvvvo_ upload was the terminal OOM), they are staged on
+    // the HOST (pinned) and the σ path streams a-slabs per matvec — both σ
+    // terms are pure output-slabs over the leading a axis (bit-identical).
+    // Force with GANSU_EA_W_HOST=1/0; auto when the Wvvvo upload would not fit.
+    bool ea_w_host_stage_ = false;
+    std::vector<real_t> h_wvovv_stage_, h_wvvvo_stage_;
+    real_t* d_w_slab_    = nullptr;   // shared slab buffer (row = NO·NV² for both)
+    int     w_slab_rows_ = 0;
+
     // === (A) shared bar-H publishing ===
     // When barh_cache_ != nullptr, build_dressed_intermediates publishes the 3
     // EA-unique intermediates (Wvovv/Wvvvv/Wvvvo) into the cache (IP already

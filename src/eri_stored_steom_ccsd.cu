@@ -830,27 +830,45 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     }
 #ifndef GANSU_CPU_ONLY
     // (perf) EA-solve device relief (user request): with share-barH, IP's 8 published
-    // bar-H (~16 GB) pin device 0 and OOM the EA Davidson subspace there (log174/175:
-    // needed 13.55 GB, 2.42 free). IP's operator is already destroyed (the cache owns
-    // the buffers — no alias), so move the 8 to the freest peer GPU now; EA then
-    // builds+solves on device 0 with room. STEOM later pulls EA's 3 onto the same GPU
-    // (barh.ip_dev) and builds there. Only under sharing + a complete IP set + >1 GPU.
+    // bar-H (~27 GB at n_emb=490) pin the EA-solve device and OOM the EA Davidson
+    // subspace there (log174/175; p-DDPA {0-29}: needed 17.24 GB, 1.66 free). IP's
+    // operator is already destroyed (the cache owns the buffers — no alias), so move
+    // the 8 to the freest peer GPU now; EA then builds+solves on its device with room.
+    // STEOM later pulls EA's 3 onto the same GPU (barh.ip_dev) and builds there.
+    // Only under sharing + a complete IP set + >1 GPU.
+    //
+    // (2026-07-13) Generalized from the hardcoded `ip_dev == 0`: in mode-2 the EA
+    // operator builds+solves on the CLUSTER device (GANSU_DMET_STEOM_CLUSTER_GPU,
+    // e.g. GPU 1 — device 0 keeps the RI 3c), and IP publishes its bar-H there too,
+    // so IP+EA co-reside and OOM the Davidson. Target = the current device (the EA
+    // solve device); migrate IP's bar-H to the freest OTHER GPU. Plain path
+    // (cluster device == 0) is byte-unchanged.
     if (ctx && ctx->share_barh && gpu::gpu_available()
-        && ctx->barh.has_ip && !ctx->barh.has_ea && ctx->barh.ip_dev == 0) {
+        && ctx->barh.has_ip && !ctx->barh.has_ea) {
+        int ea_dev = 0; cudaGetDevice(&ea_dev);   // EA builds+solves here
         int n_dev = 0; cudaGetDeviceCount(&n_dev);
-        if (n_dev > 1) {
-            int saved = 0; cudaGetDevice(&saved);
+        if (n_dev > 1 && ctx->barh.ip_dev == ea_dev) {
             std::vector<size_t> freeb(n_dev, 0);
-            for (int d = 1; d < n_dev; ++d) { cudaSetDevice(d); size_t fb=0,tb=0;
-                if (cudaMemGetInfo(&fb,&tb) == cudaSuccess) freeb[d] = fb; }
-            cudaSetDevice(saved);
-            int D = 1; size_t bf = freeb[1];
-            for (int d = 2; d < n_dev; ++d) if (freeb[d] > bf) { bf = freeb[d]; D = d; }
-            ctx->barh.migrate_ip_to(D);
-            std::cout << "  [DMET-STEOM share-barH] moved IP bar-H (8) off device 0 → GPU "
-                      << D << " (free=" << std::fixed << std::setprecision(1)
-                      << (bf/(1024.0*1024.0*1024.0)) << " GB) so the EA solve has room on device 0."
-                      << std::defaultfloat << std::endl;
+            for (int d = 0; d < n_dev; ++d) {
+                if (d == ea_dev) continue;
+                cudaSetDevice(d); size_t fb=0,tb=0;
+                if (cudaMemGetInfo(&fb,&tb) == cudaSuccess) freeb[d] = fb;
+            }
+            cudaSetDevice(ea_dev);
+            int D = -1; size_t bf = 0;
+            for (int d = 0; d < n_dev; ++d) {
+                if (d == ea_dev) continue;
+                if (D < 0 || freeb[d] > bf) { bf = freeb[d]; D = d; }
+            }
+            if (D >= 0) {
+                ctx->barh.migrate_ip_to(D);
+                std::cout << "  [DMET-STEOM share-barH] moved IP bar-H (8) off the "
+                             "EA-solve device " << ea_dev << " → GPU " << D
+                          << " (free=" << std::fixed << std::setprecision(1)
+                          << (bf/(1024.0*1024.0*1024.0))
+                          << " GB) so the EA Davidson has room." << std::defaultfloat
+                          << std::endl;
+            }
         }
     }
     // (mode-2 / fresh-run relief) The DLPNO per-pair fan-out (or any earlier

@@ -122,6 +122,16 @@ void SteomBarHCache::free() {
     tracked_cudaFree(d_Wvovv);
     tracked_cudaFree(d_Wvvvv);
     tracked_cudaFree(d_Wvvvo);
+    // (EA σ host-stage) release the pinned host stages moved here by the EA dtor.
+#ifndef GANSU_CPU_ONLY
+    if (w_host_staged) {
+        if (!h_Wvovv_stage.empty()) cudaHostUnregister(h_Wvovv_stage.data());
+        if (!h_Wvvvo_stage.empty()) cudaHostUnregister(h_Wvvvo_stage.data());
+    }
+#endif
+    h_Wvovv_stage.clear(); h_Wvovv_stage.shrink_to_fit();
+    h_Wvvvo_stage.clear(); h_Wvvvo_stage.shrink_to_fit();
+    w_host_staged = false;
     reset_pointers();
 }
 

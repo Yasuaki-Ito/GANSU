@@ -45,6 +45,8 @@
 #include "multi_gpu_manager.hpp"
 #include "ccsd_lambda.hpp"
 #include "utils.hpp"
+#include "dlpno_mp2.hpp"    // (DMET DLPNO-warm) DLPNOClusterSpace + OmpThreadCapGuard
+#include "dlpno_ccsd.hpp"   // (DMET DLPNO-warm) cluster DLPNO-CCSD ground for warm start
 
 namespace gansu {
 
@@ -60,6 +62,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             const real_t* h_fov_active = nullptr,
                             const ERI_RI* eri_ri = nullptr,
                             const real_t level_shift = 0.0);
+// Warm-start side channel of ccsd_spatial_orbital (defined in eri_stored.cu):
+// staged host amplitudes replace the MP2 initial guess on the NEXT call.
+void ccsd_set_initial_guess(const real_t* h_t1, const real_t* h_t2,
+                            int max_iter_override, real_t conv_override);
 
 // RAII guard: redirect std::cout to a discarded sink for the lifetime of the
 // object. Used to silence ccsd_spatial_orbital's per-iteration output during
@@ -1787,8 +1793,16 @@ real_t DMET::compute_energy(bool with_triples) {
         // anyway; small-fragment runs should keep the default dense path).
         static const bool dmet_bnative =
             (std::getenv("GANSU_DMET_CCSD_BNATIVE") != nullptr);
+        // (DMET DLPNO-warm, 2026-07-13) GANSU_DMET_CCSD_DLPNO=1 (implies
+        // B-native): warm-start each fragment's canonical CCSD from a
+        // cluster-space DLPNO-CCSD ground (mode-2 recipe: DLPNOClusterSpace on
+        // C_ao(μ) with the UN-shifted semi-canonical ε; f_ov is ignored by the
+        // DLPNO ground — the warm-started canonical solve carries it exactly).
+        static const bool dmet_dlpno_warm =
+            (std::getenv("GANSU_DMET_CCSD_DLPNO") != nullptr);
         const ERI_RI* bnat_ri =
-            dmet_bnative ? dynamic_cast<const ERI_RI*>(&eri_) : nullptr;
+            (dmet_bnative || dmet_dlpno_warm)
+                ? dynamic_cast<const ERI_RI*>(&eri_) : nullptr;
         if (dmet_bnative && bnat_ri == nullptr)
             std::cout << "  [DMET B-native] requested but the ERI backend is not "
                          "RI — falling back to the dense path." << std::endl;
@@ -2017,6 +2031,13 @@ real_t DMET::compute_energy(bool with_triples) {
                         (std::getenv("GANSU_DMET_NOFOV") != nullptr);
                     const real_t* fov_ptr = nofov_env ? nullptr : h_fov_active.data();
 
+                    // (DMET DLPNO-warm) keep the UN-shifted semi-canonical ε —
+                    // the DLPNO ground must see the true spectrum (mode-2
+                    // un-shift lesson); the canonical CCSD keeps the shifted
+                    // denominators below.
+                    std::vector<real_t> h_eps_unshifted;
+                    if (bnat_ri && dmet_dlpno_warm) h_eps_unshifted = h_eps;
+
                     // Level shift on virtual ε (small clusters with tiny gap).
                     // Affects only CCSD denominators, not the physical Hamiltonian.
                     if (no > 0 && no < ne) {
@@ -2043,7 +2064,9 @@ real_t DMET::compute_energy(bool with_triples) {
                         tracked_cudaMalloc(&d_eri_mo, h_eri.size() * sizeof(real_t));
                         cudaMemcpy(d_eri_mo, h_eri.data(),
                                    h_eri.size() * sizeof(real_t), cudaMemcpyHostToDevice);
-                    } else {
+                    }
+                    std::vector<real_t> h_C_mu_host;   // kept for the DLPNO warm start
+                    if (bnat_ri != nullptr) {
                         // C_ao(μ) = C_emb · U_new  [nao × ne] (row-major).
                         using RowMatB = Eigen::Matrix<real_t, Eigen::Dynamic,
                             Eigen::Dynamic, Eigen::RowMajor>;
@@ -2054,6 +2077,70 @@ real_t DMET::compute_energy(bool with_triples) {
                         cudaMemcpy(d_C_mu, C_ao_mu.data(),
                                    (size_t)nao * ne * sizeof(real_t),
                                    cudaMemcpyHostToDevice);
+                        if (dmet_dlpno_warm)
+                            h_C_mu_host.assign(C_ao_mu.data(),
+                                               C_ao_mu.data() + (size_t)nao * ne);
+                    }
+
+                    // (DMET DLPNO-warm) cluster-space DLPNO-CCSD ground → bt →
+                    // warm start for the canonical B-native CCSD below (mode-2
+                    // recipe). Serialized loop (B-native) ⇒ the shared RHF bt
+                    // stash is race-free.
+                    BTAmplitudes warm_bt;
+                    if (bnat_ri && dmet_dlpno_warm) {
+                        OmpThreadCapGuard warm_cap(rhf_.get_dlpno_cpu_threads());
+                        rhf_.get_overlap_matrix().toHost();
+                        const real_t* h_S = rhf_.get_overlap_matrix().host_ptr();
+                        // F_eff = S·C·diag(ε_unshifted)·Cᵀ·S  (AO-covariant embedding Fock)
+                        std::vector<real_t> SC((size_t)nao * ne, 0.0);
+                        #pragma omp parallel for
+                        for (int mu2 = 0; mu2 < nao; ++mu2)
+                            for (int nu2 = 0; nu2 < nao; ++nu2) {
+                                const real_t s = h_S[(size_t)mu2 * nao + nu2];
+                                if (s == 0.0) continue;
+                                for (int p2 = 0; p2 < ne; ++p2)
+                                    SC[(size_t)mu2 * ne + p2] +=
+                                        s * h_C_mu_host[(size_t)nu2 * ne + p2];
+                            }
+                        std::vector<real_t> F_eff((size_t)nao * nao, 0.0);
+                        #pragma omp parallel for
+                        for (int mu2 = 0; mu2 < nao; ++mu2)
+                            for (int nu2 = 0; nu2 < nao; ++nu2) {
+                                real_t vv2 = 0.0;
+                                for (int p2 = 0; p2 < ne; ++p2)
+                                    vv2 += SC[(size_t)mu2 * ne + p2]
+                                         * h_eps_unshifted[p2]
+                                         * SC[(size_t)nu2 * ne + p2];
+                                F_eff[(size_t)mu2 * nao + nu2] = vv2;
+                            }
+                        DLPNOClusterSpace cs;
+                        cs.h_C = h_C_mu_host.data();
+                        cs.h_eps = h_eps_unshifted.data();
+                        cs.h_F_eff = F_eff.data();
+                        cs.nmo = ne; cs.nocc = no_act; cs.nfrozen = nf;
+                        DLPNOParams pw = resolve_dlpno_params(
+                            rhf_.get_dlpno_preset(), rhf_.get_dlpno_localizer(),
+                            rhf_.get_dlpno_t_cut_pno(), rhf_.get_dlpno_t_cut_do(),
+                            rhf_.get_dlpno_t_cut_pairs(), rhf_.get_dlpno_t_cut_mkn(),
+                            rhf_.get_dlpno_t_cut_triples(), rhf_.get_dlpno_t_cut_tno(),
+                            rhf_.get_dlpno_pair_distance_cutoff(), rhf_.get_dlpno_max_iter(),
+                            rhf_.get_dlpno_diis_size(), rhf_.get_dlpno_localizer_max_sweep(),
+                            rhf_.get_dlpno_localizer_conv(), rhf_.get_dlpno_lmp2_max_iter(),
+                            rhf_.get_dlpno_lmp2_conv(), rhf_.get_dlpno_sc_pno_iter(),
+                            rhf_.get_dlpno_pno_os_only(), rhf_.get_dlpno_verbose());
+                        rhf_.set_collect_dlpno_bt(true);
+                        real_t E_dl = 0.0;
+                        {
+                            DLPNOCCSD warm_drv(rhf_, eri_, std::move(pw), &cs);
+                            E_dl = warm_drv.compute_energy();
+                        }
+                        rhf_.set_collect_dlpno_bt(false);
+                        warm_bt = rhf_.get_dlpno_bt_amplitudes();   // copy, kept alive
+                        ccsd_set_initial_guess(warm_bt.T1.data(), warm_bt.T2.data(),
+                                               -1, /*conv_override=*/-1.0);
+                        std::fprintf(stderr,
+                            "[DMET DLPNO-warm] frag %d: E_corr(DLPNO) = %.10f Ha "
+                            "→ canonical CCSD warm-started\n", f, E_dl);
                     }
 
                     // CCSD with non-canonical (semi-canonical) f_ov.

@@ -995,7 +995,11 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
     // top of that function): with all 11 dressed intermediates borrowed the raw
     // (ab|cd) block has no consumer in this operator — at tetracene/cc-pVDZ this
     // 39.6 GB alloc was pure dead weight in the bt-polish chain.
+    // (EA σ host-stage) w_host_staged ⇒ the cache's Wvovv/Wvvvo are HOST
+    // vectors (device ptrs null) — the STEOM consumers are not host-wired yet,
+    // so treat the cache as not-borrowable (falls through to a full build).
     const bool barh_will_borrow = barh_cache_ && barh_cache_->complete()
+        && !barh_cache_->w_host_staged
         && barh_cache_->nocc == nocc_active_ && barh_cache_->nvir == nvir_
         && barh_cache_->canonical_skip_wvvvv == canonical_skip_wvvvv_;
     // (2026-07-10, DMET cluster W_eff wall) Under a full bar-H borrow the five
@@ -1198,7 +1202,12 @@ void STEOMCCSDOperator::build_dressed_intermediates() {
     // mismatch falls through to a full build. d_f_oo_/d_f_vv_ are already
     // allocated (ctor) and simply go unused; downstream build_F_eff_*/
     // build_W_eff_and_G read the borrowed bar-H, not the raw Fock diagonals.
+    if (barh_cache_ && barh_cache_->complete() && barh_cache_->w_host_staged)
+        std::cout << "  [STEOM share-barH] EA host-staged Wvovv/Wvvvo — borrow "
+                     "disabled (STEOM host consumers not wired yet); building "
+                     "own bar-H." << std::endl;
     if (barh_cache_ && barh_cache_->complete()
+        && !barh_cache_->w_host_staged
         && barh_cache_->nocc == nocc_active_ && barh_cache_->nvir == nvir_
         && barh_cache_->canonical_skip_wvvvv == canonical_skip_wvvvv_) {
         d_Loo_   = barh_cache_->d_Loo;

@@ -56,6 +56,8 @@
 
 #include "types.hpp"
 
+#include <vector>
+
 namespace gansu {
 
 /// Shared dressed bar-H intermediate cache (see file header). Owns the device
@@ -80,6 +82,17 @@ struct SteomBarHCache {
     real_t* d_Wvovv = nullptr;   // [nvir·nocc·nvir·nvir] (EA-side)
     real_t* d_Wvvvv = nullptr;   // [nvir⁴] — nullptr under canonical-skip (EA-side)
     real_t* d_Wvvvo = nullptr;   // [nvir³·nocc] (EA-side)
+
+    // --- (EA σ host-stage, 2026-07-13) ---
+    // When the EA operator host-stages Wvovv/Wvvvo (device copies never exist
+    // at large NV³·NO), the PINNED host buffers are moved here at EA
+    // destruction (a vector move preserves the cudaHostRegister'ed data
+    // pointer). d_Wvovv/d_Wvvvo stay nullptr; STEOM must consume the host
+    // stages (not yet wired — the borrow site treats w_host_staged as
+    // incomplete and rebuilds until then). free() unregisters + releases.
+    std::vector<real_t> h_Wvovv_stage;
+    std::vector<real_t> h_Wvvvo_stage;
+    bool w_host_staged = false;
 
     // --- population flags (Wvvvv may legitimately be nullptr) ---
     bool has_ip = false;   ///< IP published Loo/Lvv/Fov/Woooo/Wooov/Wovov/Wovvo/Wovoo
