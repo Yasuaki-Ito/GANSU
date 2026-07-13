@@ -1053,9 +1053,14 @@ void DavidsonSolver::restart_subspace() {
     int num_keep = std::min(2 * config_.num_eigenvalues, subspace_dim_);
 
     if (!gpu::gpu_available()) {
-        // CPU implementation using Eigen
-        real_t* temp;
-        tracked_cudaMalloc(&temp, static_cast<size_t>(dim_) * num_keep * sizeof(real_t));
+        // CPU implementation using Eigen.
+        // (2026-07-11) Scratch = d_sigma_vectors_: the caller invalidates every
+        // sigma after a restart (sigma_computed_ = 0, all recomputed for the new
+        // basis), so its dim × max_subspace storage is free to borrow — and
+        // num_keep ≤ max_subspace always holds. Avoids a dim × num_keep
+        // allocation at the moment of peak memory pressure (Doxorubicin EA:
+        // 1.24 GiB restart transient OOM'd with the Davidson pool resident).
+        real_t* temp = d_sigma_vectors_;
 
         // Copy already-computed Ritz vectors for the first num_eigenvalues
         int n_from_eigvecs = std::min(config_.num_eigenvalues, num_keep);
@@ -1077,7 +1082,6 @@ void DavidsonSolver::restart_subspace() {
         cudaMemcpy(d_subspace_vectors_, temp,
                    static_cast<size_t>(dim_) * num_keep * sizeof(real_t),
                    cudaMemcpyDeviceToDevice);
-        tracked_cudaFree(temp);
 
         subspace_dim_ = num_keep;
         // (2026-07-10) Re-orthonormalize the restart basis. For a NON-Hermitian
@@ -1097,9 +1101,12 @@ void DavidsonSolver::restart_subspace() {
     // GPU implementation
     cublasHandle_t handle = gansu::gpu::GPUHandle::cublas();
 
-    // Allocate temporary buffer
-    real_t* d_temp;
-    tracked_cudaMalloc(&d_temp, static_cast<size_t>(dim_) * num_keep * sizeof(real_t));
+    // (2026-07-11) Scratch = d_sigma_vectors_ (dim × max_subspace ≥ dim × num_keep):
+    // every sigma is invalidated/recomputed after a restart, so borrowing it here
+    // is free — and avoids a dim × num_keep tracked_cudaMalloc at the moment of
+    // peak pressure (Doxorubicin EA: the 1.24 GiB restart transient OOM'd with
+    // the Davidson pool resident).
+    real_t* d_temp = d_sigma_vectors_;
 
     // Copy already-computed Ritz vectors for the first num_eigenvalues
     int n_from_eigvecs = std::min(config_.num_eigenvalues, num_keep);
@@ -1126,7 +1133,6 @@ void DavidsonSolver::restart_subspace() {
     cudaMemcpy(d_subspace_vectors_, d_temp,
                static_cast<size_t>(dim_) * num_keep * sizeof(real_t),
                cudaMemcpyDeviceToDevice);
-    tracked_cudaFree(d_temp);
 
     subspace_dim_ = num_keep;
     // (2026-07-10) Re-orthonormalize the restart basis — see the CPU-path note

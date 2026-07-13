@@ -733,6 +733,31 @@ STEOMCCSDOperator::STEOMCCSDOperator(
                       << std::setprecision(3) << s << " s" << std::defaultfloat << std::endl;
         };
         tphase("extract_eri_blocks",        [&]{ extract_eri_blocks(d_eri_mo); });
+#ifndef GANSU_CPU_ONLY
+        // (STEOM storage-free, mirrors the IP/EA-EOM sites) extract_eri_blocks
+        // was the last consumer of the distributed-RI AO-B replicas — with
+        // bar-H fully borrowed the W^eff assembly reads only bar-H + t1/t2 +
+        // the extracted ovov. Release the replicas now (~naux·nao² per GPU;
+        // 17.24 GiB ×4 at Doxorubicin cc-pVDZ) instead of waiting for the
+        // dense-diag reclaim AFTER the build: at n_emb=420 (NTO-bath +8) the
+        // phph assemble's 16.65 GiB buffer OOM'd on the bar-H GPU with the
+        // replicas still resident. Lazy re-replication restores them if a
+        // later build_B_mo needs AO-B. Same opt-out knob as the other sites.
+        if (eri_block_src_ != nullptr && gpu::gpu_available()
+            && !std::getenv("GANSU_STEOM_KEEP_B_REPLICA")) {
+            int dev_saved = 0; cudaGetDevice(&dev_saved);
+            const size_t before = GlobalGpuMemoryTracker::get_current();
+            eri_block_src_->release_bmo_ao_replica();
+            const size_t after = GlobalGpuMemoryTracker::get_current();
+            cudaSetDevice(dev_saved);          // free path may reset the device
+            gpu::GPUHandle::reset();
+            if (before > after)
+                std::cout << "  [STEOM] released RI AO-B replicas after extract: "
+                          << std::fixed << std::setprecision(2)
+                          << ((before - after) / (1024.0*1024.0*1024.0))
+                          << " GB reclaimed (global)." << std::defaultfloat << std::endl;
+        }
+#endif
         tphase("build_dressed_intermediates", [&]{ build_dressed_intermediates(); });
 
         // Sub-phase 3.4: build X(MI), X(EA) then F^eff_oo + F^eff_vv per

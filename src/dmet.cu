@@ -1777,6 +1777,31 @@ real_t DMET::compute_energy(bool with_triples) {
         // bisection summary line per fragment is printed in-order afterwards.
         int n_threads = std::min((int)unique_fragments.size(), num_gpus);
         if (n_threads < 1) n_threads = 1;
+        // (DMET B-native, 2026-07-13) GANSU_DMET_CCSD_BNATIVE=1: solve each
+        // fragment's CCSD(+T) and Λ from the RI half-transform (B_mo built for
+        // the μ-rotated cluster C_ao(μ) = C_emb·U_can·V_blk) — the ne⁴ MO ERI
+        // is never materialized on DEVICE (the host h_eri stays for the E
+        // formulas / CPU-Λ fallback). Since build_B_mo's workspace cache is a
+        // single shared slot on the ERI object, the fragment loop is
+        // SERIALIZED in this mode (the target — one big fragment — is serial
+        // anyway; small-fragment runs should keep the default dense path).
+        static const bool dmet_bnative =
+            (std::getenv("GANSU_DMET_CCSD_BNATIVE") != nullptr);
+        const ERI_RI* bnat_ri =
+            dmet_bnative ? dynamic_cast<const ERI_RI*>(&eri_) : nullptr;
+        if (dmet_bnative && bnat_ri == nullptr)
+            std::cout << "  [DMET B-native] requested but the ERI backend is not "
+                         "RI — falling back to the dense path." << std::endl;
+        if (bnat_ri) {
+            n_threads = 1;
+            static bool bnat_announced = false;   // once per process, not per μ
+            if (!bnat_announced) {
+                bnat_announced = true;
+                std::cout << "  [DMET B-native] fragment CCSD(+T)/Λ built from the RI "
+                             "half-transform (ne⁴ device tensor elided; fragment loop "
+                             "serialized)." << std::endl;
+            }
+        }
 
         // Force OMP team size and disable dynamic adjustment. Eigen serial is
         // set BEFORE the parallel region to avoid its internal OMP setting
@@ -2009,10 +2034,27 @@ real_t DMET::compute_energy(bool with_triples) {
                                cudaMemcpyHostToDevice);
 
                     // h_eri is the eri_can_initial rotated by V_blk (μ-dependent).
+                    // (DMET B-native) the device copy is skipped — CCSD and Λ
+                    // pull their sub-blocks from B_mo built for C_ao(μ); h_eri
+                    // (host) stays for the fragment-energy formulas.
                     real_t* d_eri_mo = nullptr;
-                    tracked_cudaMalloc(&d_eri_mo, h_eri.size() * sizeof(real_t));
-                    cudaMemcpy(d_eri_mo, h_eri.data(),
-                               h_eri.size() * sizeof(real_t), cudaMemcpyHostToDevice);
+                    real_t* d_C_mu  = nullptr;
+                    if (bnat_ri == nullptr) {
+                        tracked_cudaMalloc(&d_eri_mo, h_eri.size() * sizeof(real_t));
+                        cudaMemcpy(d_eri_mo, h_eri.data(),
+                                   h_eri.size() * sizeof(real_t), cudaMemcpyHostToDevice);
+                    } else {
+                        // C_ao(μ) = C_emb · U_new  [nao × ne] (row-major).
+                        using RowMatB = Eigen::Matrix<real_t, Eigen::Dynamic,
+                            Eigen::Dynamic, Eigen::RowMajor>;
+                        Eigen::Map<const RowMatB> Cemb_m(bd.C_emb.data(), nao, ne);
+                        Eigen::Map<const RowMatB> Unew_m(h_eigvecs.data(), ne, ne);
+                        RowMatB C_ao_mu = Cemb_m * Unew_m;
+                        tracked_cudaMalloc(&d_C_mu, (size_t)nao * ne * sizeof(real_t));
+                        cudaMemcpy(d_C_mu, C_ao_mu.data(),
+                                   (size_t)nao * ne * sizeof(real_t),
+                                   cudaMemcpyHostToDevice);
+                    }
 
                     // CCSD with non-canonical (semi-canonical) f_ov.
                     // d_C_emb is unused when d_eri_mo_precomputed is supplied and
@@ -2025,10 +2067,10 @@ real_t DMET::compute_energy(bool with_triples) {
                     real_t E_T_frag = 0.0;
                     auto t_ccsd_start = std::chrono::steady_clock::now();
                     real_t E_CCSD = ccsd_spatial_orbital(
-                        nullptr, nullptr, d_eigvals,
+                        nullptr, d_C_mu, d_eigvals,
                         ne, no, compute_T_here, &E_T_frag, &d_t1, &d_t2,
                         d_eri_mo, bd.n_frozen,
-                        fov_ptr);
+                        fov_ptr, /*eri_ri=*/bnat_ri);
                     (void)E_CCSD;
                     const double t_ccsd_sec = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - t_ccsd_start).count();
@@ -2063,11 +2105,17 @@ real_t DMET::compute_energy(bool with_triples) {
                                    cudaMemcpyHostToDevice);
                     }
                     auto t_lambda_start = std::chrono::steady_clock::now();
+                    // (DMET B-native) Λ pulls its 7 sub-blocks from B_mo built
+                    // for the same C_ao(μ) as the CCSD (cached inside the ERI).
+                    const real_t* d_Bmo_lambda = nullptr;
+                    if (bnat_ri)
+                        d_Bmo_lambda = bnat_ri->build_B_mo(d_C_mu, ne);
                     bool lambda_ok = solve_ccsd_lambda_gpu(
                         no, nv, d_eigvals, d_eri_mo,
                         d_t1, d_t2, d_l1, d_l2,
                         300, 1e-5, /*verbose=*/0,
-                        d_fov_dev);
+                        d_fov_dev,
+                        bnat_ri, d_Bmo_lambda, ne);
 
                     // Download relaxed Λ for downstream CPU 2-RDM / energy.
                     std::vector<real_t> h_l1(t1sz), h_l2(t2sz);
@@ -2181,7 +2229,8 @@ real_t DMET::compute_energy(bool with_triples) {
                     solved[f] = true;
 
                     tracked_cudaFree(d_t1); tracked_cudaFree(d_t2);
-                    tracked_cudaFree(d_eri_mo);
+                    if (d_eri_mo) tracked_cudaFree(d_eri_mo);
+                    if (d_C_mu)   tracked_cudaFree(d_C_mu);
                     tracked_cudaFree(d_eigvals);
 
                     // Per-fragment heartbeat: total wall time and the per-fragment

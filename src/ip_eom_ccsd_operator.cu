@@ -408,6 +408,31 @@ IPEOMCCSDOperator::IPEOMCCSDOperator(
                       << std::setprecision(3) << s << " s" << std::defaultfloat << std::endl;
         };
         tphase("extract_eri_blocks",          [&]{ extract_eri_blocks(d_eri_mo); });
+#ifndef GANSU_CPU_ONLY
+        // (IP storage-free) extract_eri_blocks was the last consumer that could
+        // trigger the distributed-RI AO-B replication (build_B_mo); from here
+        // the build/σ pull only the extracted raws + per-k MO slices via
+        // mo_eri_block_into (B_mo factors — NOT the AO replica). Release the
+        // AO replicas now (~naux·nao² per GPU ≈ 17 GiB ×4 at p-DDPA {0-29});
+        // a later build_B_mo (EA stage / STEOM choreography) lazily
+        // re-replicates. Same opt-out knob as the driver-side reliefs.
+        // NOTE: a release BEFORE extract is useless — extract's own build_B_mo
+        // immediately re-replicates (measured, 2026-07-11).
+        if (eri_block_src_ != nullptr && gpu::gpu_available()
+            && !std::getenv("GANSU_STEOM_KEEP_B_REPLICA")) {
+            int dev_saved = 0; cudaGetDevice(&dev_saved);
+            const size_t before = GlobalGpuMemoryTracker::get_current();
+            eri_block_src_->release_bmo_ao_replica();
+            const size_t after = GlobalGpuMemoryTracker::get_current();
+            cudaSetDevice(dev_saved);          // free path may reset the device
+            gpu::GPUHandle::reset();
+            if (before > after)
+                std::cout << "  [IP-EOM] released RI AO-B replicas after extract: "
+                          << std::fixed << std::setprecision(2)
+                          << ((before - after) / (1024.0*1024.0*1024.0))
+                          << " GB reclaimed (global)." << std::defaultfloat << std::endl;
+        }
+#endif
         tphase("build_dressed_intermediates", [&]{ build_dressed_intermediates(); });
         // (A) shared bar-H: publish the 8 IP-side intermediates and relinquish
         // ownership (dtor will skip freeing them). EA later adds Wvovv/Wvvvv/
@@ -842,6 +867,8 @@ __global__ void ip_ctovov_buildB(real_t* __restrict__ dB,
         dB[((size_t)(c*NO+l))*NOib + (i*NV+b)] = t2[(((size_t)i*NO+l)*NV+c)*NV+b];
     }
 }
+// (IP storage-free) Either output may be nullptr — the build serializes the
+// A1/B1 and A2/B2 pairs (two passes) so only one NO²NV² pair is resident.
 __global__ void ip_ctovvo_buildA12(real_t* __restrict__ dA1, real_t* __restrict__ dA2,
                                    const real_t* __restrict__ ovov, int NO, int NV) {
     // dA1[(k,c),(l,d)] = 2·ovov[k,c,l,d] − ovov[k,d,l,c];  dA2 = ovov[k,c,l,d];  enumerate (k,c,l,d)
@@ -852,9 +879,12 @@ __global__ void ip_ctovvo_buildA12(real_t* __restrict__ dA1, real_t* __restrict_
         const int l = t % NO; t /= NO;
         const int c = t % NV; const int k = (int)(t / NV);
         const real_t kcld = ovov[(((size_t)k*NV+c)*NO+l)*NV+d];
-        const real_t kdlc = ovov[(((size_t)k*NV+d)*NO+l)*NV+c];
         const size_t o = ((size_t)(k*NV+c))*Nld + (l*NV+d);
-        dA1[o] = 2.0*kcld - kdlc;  dA2[o] = kcld;
+        if (dA1) {
+            const real_t kdlc = ovov[(((size_t)k*NV+d)*NO+l)*NV+c];
+            dA1[o] = 2.0*kcld - kdlc;
+        }
+        if (dA2) dA2[o] = kcld;
     }
 }
 __global__ void ip_ctovvo_buildB12(real_t* __restrict__ dB1, real_t* __restrict__ dB2,
@@ -867,8 +897,8 @@ __global__ void ip_ctovvo_buildB12(real_t* __restrict__ dB1, real_t* __restrict_
         const int Y = t % NO; t /= NO;
         const int d = t % NV; const int l = (int)(t / NV);
         const size_t o = ((size_t)(l*NV+d))*Nyx + (Y*NV+X);
-        dB1[o] = t2[(((size_t)Y*NO+l)*NV+X)*NV+d];
-        dB2[o] = t2[(((size_t)l*NO+Y)*NV+X)*NV+d];
+        if (dB1) dB1[o] = t2[(((size_t)Y*NO+l)*NV+X)*NV+d];
+        if (dB2) dB2[o] = t2[(((size_t)l*NO+Y)*NV+X)*NV+d];
     }
 }
 // [IP build device-build] Wovoo Σ_ld ooov·t2 GEMM-input builders — fill the 4+2
@@ -1010,6 +1040,22 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
     }
     cudaMemcpy(h_oooo.data(), d_eri_oooo_,  oooo_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
 
+    // (IP storage-free, mirrors the EA raw-block release) Free raw device ERI
+    // blocks at their LAST device consumer instead of the destructor: at
+    // p-DDPA {0-29} (NO=108, NV=334) they otherwise pin 33 GiB through the
+    // whole build+solve, and the build scratch on top OOM'd the cluster device.
+    // The σ-path consumers (d_eri_oovv_, d_t2_) are NEVER freed here. Gated off
+    // under GANSU_STEOM_BUILD_VALIDATE; opt-out GANSU_IP_KEEP_RAW_BLOCKS=1.
+    const bool ip_free_raw_early =
+        !std::getenv("GANSU_STEOM_BUILD_VALIDATE") &&
+        !std::getenv("GANSU_IP_KEEP_RAW_BLOCKS");
+    auto free_raw_early = [&](real_t*& p){
+        if (ip_free_raw_early && p) { tracked_cudaFree(p); p = nullptr; }
+    };
+    // d_eri_ovvo_ has NO device consumer at all after its D2H (build terms read
+    // h_ovvo on host; σ reads the dressed d_Wovvo_) — release it immediately.
+    free_raw_early(d_eri_ovvo_);
+
     std::vector<real_t> h_f_oo(NO), h_f_vv(NV);
     cudaMemcpy(h_f_oo.data(), d_f_oo_, NO * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_f_vv.data(), d_f_vv_, NV * sizeof(real_t), cudaMemcpyDeviceToHost);
@@ -1063,27 +1109,33 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
         const real_t one = 1.0, zero = 0.0;
         const size_t M_foo = (size_t)NO * NV * NV;   // (l,c,d)
         const size_t M_fvv = (size_t)NO * NO * NV;   // (k,l,d)
+        // (IP storage-free) The Foo and Fvv scratch pairs are SERIALIZED (each
+        // pair is built by its own kernel and consumed by its own GEMM): peak
+        // drops from 4×NO²NV² to 2×NO²NV² (38.8→19.4 GiB at p-DDPA {0-29}) —
+        // this very cluster was the 490-cluster OOM site. Same kernels / same
+        // GEMM calls in the same order ⇒ bit-identical.
         real_t *dAfoo=nullptr,*dBfoo=nullptr,*dCfoo=nullptr,*dAfvv=nullptr,*dBfvv=nullptr,*dCfvv=nullptr;
+        // A[x,(l,c,d)] = 2 ovov[x,c,l,d] − ovov[x,d,l,c];  B[x,(l,c,d)] = t2[x,l,c,d] + t1[x,c] t1[l,d]  (Foo)
+        // A[x,(k,l,d)] = 2 ovov[k,x,l,d] − ovov[k,d,l,x];  B[x,(k,l,d)] = t2[k,l,x,d] + t1[k,x] t1[l,d]  (Fvv)
         tracked_cudaMalloc(&dAfoo,(size_t)NO*M_foo*sizeof(real_t));
         tracked_cudaMalloc(&dBfoo,(size_t)NO*M_foo*sizeof(real_t));
         tracked_cudaMalloc(&dCfoo,(size_t)NO*NO*sizeof(real_t));
+        { const size_t n=(size_t)NO*M_foo; const unsigned NB=(unsigned)((n+255)/256);
+          ip_foo_buildAB<<<NB,256>>>(dAfoo, dBfoo, d_eri_ovov_, d_t2_, d_t1_, NO, NV); }
+        // ct_foo[k,i] = Σ_m A_foo[k,m] B_foo[i,m]  (row-major [NO×NO], elem k*NO+i).
+        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,NO,NO,(int)M_foo,&one,dBfoo,(int)M_foo,dAfoo,(int)M_foo,&zero,dCfoo,NO);
+        ct_foo.assign((size_t)NO*NO,0.0);
+        cudaMemcpy(ct_foo.data(),dCfoo,(size_t)NO*NO*sizeof(real_t),cudaMemcpyDeviceToHost);
+        tracked_cudaFree(dAfoo);tracked_cudaFree(dBfoo);tracked_cudaFree(dCfoo);
         tracked_cudaMalloc(&dAfvv,(size_t)NV*M_fvv*sizeof(real_t));
         tracked_cudaMalloc(&dBfvv,(size_t)NV*M_fvv*sizeof(real_t));
         tracked_cudaMalloc(&dCfvv,(size_t)NV*NV*sizeof(real_t));
-        // A[x,(l,c,d)] = 2 ovov[x,c,l,d] − ovov[x,d,l,c];  B[x,(l,c,d)] = t2[x,l,c,d] + t1[x,c] t1[l,d]  (Foo)
-        // A[x,(k,l,d)] = 2 ovov[k,x,l,d] − ovov[k,d,l,x];  B[x,(k,l,d)] = t2[k,l,x,d] + t1[k,x] t1[l,d]  (Fvv)
-        { const size_t n=(size_t)NO*M_foo; const unsigned NB=(unsigned)((n+255)/256);
-          ip_foo_buildAB<<<NB,256>>>(dAfoo, dBfoo, d_eri_ovov_, d_t2_, d_t1_, NO, NV); }
         { const size_t n=(size_t)NV*M_fvv; const unsigned NB=(unsigned)((n+255)/256);
           ip_fvv_buildAB<<<NB,256>>>(dAfvv, dBfvv, d_eri_ovov_, d_t2_, d_t1_, NO, NV); }
-        // ct_foo[k,i] = Σ_m A_foo[k,m] B_foo[i,m]  (row-major [NO×NO], elem k*NO+i).
-        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,NO,NO,(int)M_foo,&one,dBfoo,(int)M_foo,dAfoo,(int)M_foo,&zero,dCfoo,NO);
         // ct_fvv[a,c] = Σ_m B_fvv[a,m] A_fvv[c,m]  (row-major [NV×NV], elem a*NV+c).
         cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,NV,NV,(int)M_fvv,&one,dAfvv,(int)M_fvv,dBfvv,(int)M_fvv,&zero,dCfvv,NV);
-        ct_foo.assign((size_t)NO*NO,0.0); ct_fvv.assign((size_t)NV*NV,0.0);
-        cudaMemcpy(ct_foo.data(),dCfoo,(size_t)NO*NO*sizeof(real_t),cudaMemcpyDeviceToHost);
+        ct_fvv.assign((size_t)NV*NV,0.0);
         cudaMemcpy(ct_fvv.data(),dCfvv,(size_t)NV*NV*sizeof(real_t),cudaMemcpyDeviceToHost);
-        tracked_cudaFree(dAfoo);tracked_cudaFree(dBfoo);tracked_cudaFree(dCfoo);
         tracked_cudaFree(dAfvv);tracked_cudaFree(dBfvv);tracked_cudaFree(dCfvv);
         foo_fvv_gpu = true;
         if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
@@ -1280,27 +1332,34 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
         // copy of ovvv) is built per-k slice (NV³) instead of materialised whole —
         // see the Wovoo GEMM below. Dense mode keeps the single full reorder.
         const bool tile_av = (eri_block_src_ != nullptr);
+        // (IP storage-free) The Σcd cluster is SERIALIZED: the (dAo,dB)→dCo GEMM
+        // runs and frees its inputs before (dB2,dCv) exist. Same kernels / same
+        // GEMM order ⇒ bit-identical; scratch peak drops from 4×NO²NV²-class
+        // buffers to 2 (33.8→~21 GiB at p-DDPA {0-29}, block mode).
+        const int TPB = 256;
+        auto NB = [&](size_t n){ return (unsigned)((n + TPB - 1) / TPB); };
         tracked_cudaMalloc(&dB,(size_t)VV_K*OO_N*sizeof(real_t));
-        tracked_cudaMalloc(&dB2,(size_t)VV_K*OO_N*sizeof(real_t));
         tracked_cudaMalloc(&dAo,(size_t)OOkl_M*VV_K*sizeof(real_t));
-        if (!tile_av) tracked_cudaMalloc(&dAv,(size_t)OVkb_M*VV_K*sizeof(real_t));
         tracked_cudaMalloc(&dCo,(size_t)OOkl_M*OO_N*sizeof(real_t));
-        tracked_cudaMalloc(&dCv,(size_t)OVkb_M*OO_N*sizeof(real_t));
-        blap("  Woooo Σcd cudaMalloc");
+        blap("  Woooo Σcd cudaMalloc (o-pair)");
         // Device-build the GEMM inputs directly from the resident ERI/T2/T1
         // blocks (eliminates the host hAo/hAv/hB/hB2 reorder + their H2D).
-        {
-            const int TPB = 256;
-            auto NB = [&](size_t n){ return (unsigned)((n + TPB - 1) / TPB); };
-            ip_woooo_build_Ao<<<NB((size_t)OOkl_M*VV_K), TPB>>>(dAo, d_eri_ovov_, NO, NV);
-            if (!tile_av)
-                ip_woooo_build_Av<<<NB((size_t)OVkb_M*VV_K), TPB>>>(dAv, d_eri_ovvv_, NO, NV);
-            ip_woooo_build_B <<<NB((size_t)VV_K*OO_N),   TPB>>>(dB,  d_t2_, d_t1_, NO, NV, false);
-            ip_woooo_build_B <<<NB((size_t)VV_K*OO_N),   TPB>>>(dB2, d_t2_, d_t1_, NO, NV, true);
-            cudaDeviceSynchronize();
-        }
-        blap("  Woooo Σcd device-build inputs (Ao/Av/B/B2)");
+        ip_woooo_build_Ao<<<NB((size_t)OOkl_M*VV_K), TPB>>>(dAo, d_eri_ovov_, NO, NV);
+        ip_woooo_build_B <<<NB((size_t)VV_K*OO_N),   TPB>>>(dB,  d_t2_, d_t1_, NO, NV, false);
+        cudaDeviceSynchronize();
+        blap("  Woooo Σcd device-build inputs (Ao/B)");
         cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,OO_N,OOkl_M,VV_K,&one,dB, OO_N,dAo,VV_K,&zero,dCo,OO_N);
+        cudaDeviceSynchronize();
+        tracked_cudaFree(dB); dB = nullptr;
+        tracked_cudaFree(dAo); dAo = nullptr;
+        tracked_cudaMalloc(&dB2,(size_t)VV_K*OO_N*sizeof(real_t));
+        if (!tile_av) tracked_cudaMalloc(&dAv,(size_t)OVkb_M*VV_K*sizeof(real_t));
+        tracked_cudaMalloc(&dCv,(size_t)OVkb_M*OO_N*sizeof(real_t));
+        if (!tile_av)
+            ip_woooo_build_Av<<<NB((size_t)OVkb_M*VV_K), TPB>>>(dAv, d_eri_ovvv_, NO, NV);
+        ip_woooo_build_B <<<NB((size_t)VV_K*OO_N),   TPB>>>(dB2, d_t2_, d_t1_, NO, NV, true);
+        cudaDeviceSynchronize();
+        blap("  Woooo Σcd device-build inputs (Av/B2)");
         if (!tile_av) {
             cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,OO_N,OVkb_M,VV_K,&one,dB2,OO_N,dAv,VV_K,&zero,dCv,OO_N);
         } else {
@@ -1327,7 +1386,7 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
         ct_woooo.assign((size_t)OOkl_M*OO_N,0.0); ct_wovoo.assign((size_t)OVkb_M*OO_N,0.0);
         cudaMemcpy(ct_woooo.data(),dCo,(size_t)OOkl_M*OO_N*sizeof(real_t),cudaMemcpyDeviceToHost);
         cudaMemcpy(ct_wovoo.data(),dCv,(size_t)OVkb_M*OO_N*sizeof(real_t),cudaMemcpyDeviceToHost);
-        tracked_cudaFree(dB);tracked_cudaFree(dB2);tracked_cudaFree(dAo);if(!tile_av)tracked_cudaFree(dAv);tracked_cudaFree(dCv);
+        tracked_cudaFree(dB2);if(!tile_av)tracked_cudaFree(dAv);tracked_cudaFree(dCv);
         d_ct_woooo = dCo;   // keep Σcd output on device for ip_woooo_assemble
         blap("  Woooo Σcd GEMM+D2H+malloc/free");
         oooo_wovoo_gpu = true;
@@ -1398,6 +1457,10 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
         tracked_cudaFree(d_ct_woooo);    d_ct_woooo = nullptr;
         tracked_cudaFree(d_ct_woooo_t1); d_ct_woooo_t1 = nullptr;
         woooo_dev_assembled = true;
+        // (IP storage-free) d_eri_oooo_'s only device consumer is the assemble
+        // kernel above (σ reads d_Woooo_; the host Wovoo terms read h_oooo) —
+        // release it now: −NO⁴ (1.0 GiB).
+        free_raw_early(d_eri_oooo_);
     }
 #endif
     blap("  Woooo ct_t1 GEMM + dev-asm");
@@ -1472,24 +1535,37 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
             cudaMemcpy(ct_ovov.data(),dC,(size_t)IP_MO_kd*IP_NO_ib*sizeof(real_t),cudaMemcpyDeviceToHost);
             tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
         }
-        {   // ct_ovvo: C[(k,c),(Y,X)] = A1·B1 − A2·B2 — inputs device-built
+        {   // ct_ovvo: C[(k,c),(Y,X)] = A1·B1 − A2·B2 — inputs device-built.
+            // (IP storage-free) The A1/B1 and A2/B2 pairs are SERIALIZED (the
+            // builder kernels take an optional second output): GEMM1 runs, its
+            // inputs are freed, then A2/B2 are built for the β=1 accumulate.
+            // Same kernels / same GEMM order ⇒ bit-identical; scratch peak
+            // drops from 5×NO²NV² to 3×NO²NV² (48.5→29.1 GiB at p-DDPA {0-29}).
             real_t *dA1=nullptr,*dB1=nullptr,*dA2=nullptr,*dB2=nullptr,*dC=nullptr;
+            const size_t nel=(size_t)NO*NV*NO*NV; const unsigned NB=(unsigned)((nel+255)/256);
+            tracked_cudaMalloc(&dC, (size_t)IP_M_kc*IP_N_yx*sizeof(real_t));
             tracked_cudaMalloc(&dA1,(size_t)IP_M_kc*IP_K_ld*sizeof(real_t));
             tracked_cudaMalloc(&dB1,(size_t)IP_K_ld*IP_N_yx*sizeof(real_t));
-            tracked_cudaMalloc(&dA2,(size_t)IP_M_kc*IP_K_ld*sizeof(real_t));
-            tracked_cudaMalloc(&dB2,(size_t)IP_K_ld*IP_N_yx*sizeof(real_t));
-            tracked_cudaMalloc(&dC, (size_t)IP_M_kc*IP_N_yx*sizeof(real_t));
-            const size_t nel=(size_t)NO*NV*NO*NV; const unsigned NB=(unsigned)((nel+255)/256);
-            ip_ctovvo_buildA12<<<NB,256>>>(dA1, dA2, d_eri_ovov_, NO, NV);
-            ip_ctovvo_buildB12<<<NB,256>>>(dB1, dB2, d_t2_, NO, NV);
+            ip_ctovvo_buildA12<<<NB,256>>>(dA1, nullptr, d_eri_ovov_, NO, NV);
+            ip_ctovvo_buildB12<<<NB,256>>>(dB1, nullptr, d_t2_, NO, NV);
             cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,IP_N_yx,IP_M_kc,IP_K_ld,&one,
                         dB1,IP_N_yx,dA1,IP_K_ld,&zero,dC,IP_N_yx);
+            cudaDeviceSynchronize();
+            tracked_cudaFree(dA1);tracked_cudaFree(dB1);
+            tracked_cudaMalloc(&dA2,(size_t)IP_M_kc*IP_K_ld*sizeof(real_t));
+            tracked_cudaMalloc(&dB2,(size_t)IP_K_ld*IP_N_yx*sizeof(real_t));
+            ip_ctovvo_buildA12<<<NB,256>>>(nullptr, dA2, d_eri_ovov_, NO, NV);
+            ip_ctovvo_buildB12<<<NB,256>>>(nullptr, dB2, d_t2_, NO, NV);
             cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,IP_N_yx,IP_M_kc,IP_K_ld,&negone,
                         dB2,IP_N_yx,dA2,IP_K_ld,&one,dC,IP_N_yx);
             ct_ovvo.assign((size_t)IP_M_kc*IP_N_yx,0.0);
             cudaMemcpy(ct_ovvo.data(),dC,(size_t)IP_M_kc*IP_N_yx*sizeof(real_t),cudaMemcpyDeviceToHost);
-            tracked_cudaFree(dA1);tracked_cudaFree(dB1);tracked_cudaFree(dA2);tracked_cudaFree(dB2);tracked_cudaFree(dC);
+            tracked_cudaFree(dA2);tracked_cudaFree(dB2);tracked_cudaFree(dC);
         }
+        // (IP storage-free) d_eri_ovov_'s last device consumer is the ct_ovvo
+        // A-builder above (σ reads none; the remaining Wovov/Wovvo/Wovoo terms
+        // read the HOST h_ovov) — release it now: −NO²NV² (9.7 GiB).
+        free_raw_early(d_eri_ovov_);
         ip_ct_gpu = true;
         if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
             real_t d1 = 0.0, d2 = 0.0;
@@ -1864,6 +1940,12 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
     }
 #endif
     blap("  Wovoo ct_6 ooov·t2 (prep+GEMM)");
+#ifndef GANSU_CPU_ONLY
+    // (IP storage-free) d_eri_ooov_'s last device consumer is the ct_6 builder
+    // above (the σ path reads only h-side/dressed) — release it now: −NO³·NV
+    // (3.1 GiB at p-DDPA {0-29}) off the uploads/σ-phase residency.
+    free_raw_early(d_eri_ooov_);
+#endif
 
     // (perf) GEMM the 4 remaining O(N⁵) host contractions of the Wovoo assembly
     // (~85 s memory-bound bulk: reads W1ovov/W1ovvo/Woooo 3.9 GB arrays w/ poor reuse).

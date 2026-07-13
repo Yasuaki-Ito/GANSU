@@ -36,6 +36,7 @@
 #include "gpu_manager.hpp"
 #include "device_host_memory.hpp"
 #include "progress.hpp"
+#include "eri.hpp"   // (DMET B-native) ERI_RI::mo_eri_block_into block source
 
 #include <iostream>
 #include <iomanip>
@@ -1166,7 +1167,10 @@ bool solve_ccsd_lambda_gpu(
     int max_iter,
     real_t tol,
     int verbose,
-    const real_t* d_fov_active)  // [NO × NV] semi-canonical f_ov, nullptr for canonical
+    const real_t* d_fov_active,  // [NO × NV] semi-canonical f_ov, nullptr for canonical
+    const ERI_RI* eri_block_src, // (DMET B-native) optional RI block source
+    const real_t* d_B_mo_blocks,
+    int nmo_full)
 {
     const int NO = nocc, NV = nvir, NA = nocc + nvir;
     const size_t l1_sz = (size_t)NO * NV;
@@ -1193,7 +1197,20 @@ bool solve_ccsd_lambda_gpu(
     int B = 256;
     auto launch = [&](size_t n) { return std::pair<int,int>{(int)((n + B - 1) / B), B}; };
 
-    {
+    if (eri_block_src != nullptr && d_B_mo_blocks != nullptr) {
+        // (DMET B-native) Build the 7 chemist sub-blocks straight from the
+        // half-transformed RI factors — the full NA⁴ MO tensor is never
+        // materialized on device. Index ranges mirror the extract kernels
+        // below exactly (all relative to the orbital set B_mo was built from;
+        // nmo_full must equal NA = NO+NV).
+        eri_block_src->mo_eri_block_into(d_B_mo_blocks, nmo_full, 0,NO, NO,NV, 0,NO,  NO,NV, d_ovov);
+        eri_block_src->mo_eri_block_into(d_B_mo_blocks, nmo_full, 0,NO, NO,NV, 0,NO,  0,NO,  d_ovoo);
+        eri_block_src->mo_eri_block_into(d_B_mo_blocks, nmo_full, 0,NO, NO,NV, NO,NV, NO,NV, d_ovvv);
+        eri_block_src->mo_eri_block_into(d_B_mo_blocks, nmo_full, 0,NO, 0,NO,  NO,NV, NO,NV, d_oovv);
+        eri_block_src->mo_eri_block_into(d_B_mo_blocks, nmo_full, 0,NO, NO,NV, NO,NV, 0,NO,  d_ovvo);
+        eri_block_src->mo_eri_block_into(d_B_mo_blocks, nmo_full, 0,NO, 0,NO,  0,NO,  0,NO,  d_oooo);
+        eri_block_src->mo_eri_block_into(d_B_mo_blocks, nmo_full, NO,NV, NO,NV, NO,NV, NO,NV, d_vvvv);
+    } else {
         auto p = launch(ovov_sz);  extract_ovov_k<<<p.first, p.second>>>(d_eri_mo, d_ovov, NA, NO, NV);
         p = launch(ovoo_sz);       extract_ovoo_k<<<p.first, p.second>>>(d_eri_mo, d_ovoo, NA, NO, NV);
         p = launch(ovvv_sz);       extract_ovvv_k<<<p.first, p.second>>>(d_eri_mo, d_ovvv, NA, NO, NV);

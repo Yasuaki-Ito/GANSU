@@ -23,6 +23,8 @@
 
 #include "types.hpp"
 
+namespace gansu { class ERI_RI; }   // eri.hpp — optional RI block source (DMET B-native)
+
 namespace gansu {
 
 /**
@@ -92,7 +94,8 @@ void transform_density_mo_to_ao_cpu(
 bool solve_ccsd_lambda_gpu(
     int nocc, int nvir,
     const real_t* d_eps,        // [nao]
-    const real_t* d_eri_mo,     // [nao^4] full MO ERI (chemist (pq|rs))
+    const real_t* d_eri_mo,     // [nao^4] full MO ERI (chemist (pq|rs));
+                                //   may be nullptr when eri_block_src is given
     const real_t* d_t1,         // [nocc*nvir]
     const real_t* d_t2,         // [nocc^2 * nvir^2]
     real_t* d_lambda1,          // [nocc*nvir] — output
@@ -100,7 +103,15 @@ bool solve_ccsd_lambda_gpu(
     int max_iter = 100,
     real_t tol = 1e-8,
     int verbose = 1,
-    const real_t* d_fov_active = nullptr);  // [nocc*nvir] semi-canonical f_ov, nullptr for canonical
+    const real_t* d_fov_active = nullptr,  // [nocc*nvir] semi-canonical f_ov, nullptr for canonical
+    // (DMET B-native, 2026-07-13) Optional RI block source: when both are set,
+    // the 7 MO-ERI sub-blocks are built on the fly from the half-transformed
+    // B_mo (ERI_RI::mo_eri_block_into) — the full NA⁴ tensor is never
+    // materialized on device. nmo_full must equal nocc+nvir (the orbital set
+    // B_mo was built from). Identical block index ranges to the dense extract.
+    const ERI_RI* eri_block_src = nullptr,
+    const real_t* d_B_mo_blocks = nullptr,
+    int nmo_full = 0);
 
 /**
  * @brief Build CCSD 1-RDM in MO basis on GPU.

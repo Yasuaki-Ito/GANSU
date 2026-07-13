@@ -2728,10 +2728,14 @@ real_t ERI_RI_RHF::compute_dlpno_ccsd() {
     return driver.compute_energy();
 }
 
-real_t ERI_RI_RHF::compute_dlpno_ccsd_capture(DLPNOLMP2Result& lmp2_out) {
+real_t ERI_RI_RHF::compute_dlpno_ccsd_capture(DLPNOLMP2Result& lmp2_out,
+                                              const DLPNOClusterSpace* cluster) {
     // Same as compute_dlpno_ccsd() but captures the converged LMP2 pair state
     // (pre-CCSD-dressing) into lmp2_out so the (T) driver can reuse it instead
     // of re-solving LMP2 — bit-exact, ~LMP2-time saved.
+    // (DMET×DLPNO Phase A) `cluster` forwards to the DLPNOCCSD ctor so the
+    // ground solve runs on the embedded cluster space; the captured res
+    // (pairs/C_LMO/F_LMO/nocc) is then cluster-aware for the (T) loop.
     OmpThreadCapGuard omp_cap(rhf_.get_dlpno_cpu_threads());
     DLPNOParams p = resolve_dlpno_params(
         rhf_.get_dlpno_preset(),
@@ -2752,7 +2756,7 @@ real_t ERI_RI_RHF::compute_dlpno_ccsd_capture(DLPNOLMP2Result& lmp2_out) {
         rhf_.get_dlpno_sc_pno_iter(),
         rhf_.get_dlpno_pno_os_only(),
         rhf_.get_dlpno_verbose());
-    DLPNOCCSD driver(rhf_, *this, std::move(p));
+    DLPNOCCSD driver(rhf_, *this, std::move(p), cluster);
     driver.capture_lmp2_ = true;
     const real_t e = driver.compute_energy();
     lmp2_out = std::move(driver.lmp2_snapshot_);
@@ -3414,6 +3418,10 @@ real_t run_phase33_triple_loop(const DLPNOLMP2Result& res,
 } // anonymous namespace
 
 real_t ERI_RI_RHF::compute_dlpno_ccsd_t() {
+    return compute_dlpno_ccsd_t_impl(nullptr);
+}
+
+real_t ERI_RI_RHF::compute_dlpno_ccsd_t_impl(const DLPNOClusterSpace* cluster) {
     // Cap OpenMP threads across the whole (T) driver (the inner
     // compute_dlpno_ccsd re-applies the same cap harmlessly). Keeps the
     // per-triple TNOBuilder eigensolves' Eigen->OpenBLAS calls under the 128
@@ -3424,7 +3432,7 @@ real_t ERI_RI_RHF::compute_dlpno_ccsd_t() {
     // second solve_dlpno_lmp2 that previously cost ~one full LMP2 solve.
     // Bit-exact: the old re-solve used the same thresholds (only verbose=0).
     DLPNOLMP2Result res;
-    const real_t e_ccsd = compute_dlpno_ccsd_capture(res);
+    const real_t e_ccsd = compute_dlpno_ccsd_capture(res, cluster);
 
     // Phase 3.3 multi-GPU framework: detect distributed B at this level so
     // the per-GPU OpenMP triple loop can run on `num_gpus` threads. The
@@ -3440,9 +3448,19 @@ real_t ERI_RI_RHF::compute_dlpno_ccsd_t() {
     }
 #endif // GANSU_MULTI_GPU
     // Phase 3.2.0: TNO basis builder needs AO-basis Fock and overlap.
-    rhf_.get_fock_matrix().toHost();
+    // (DMET×DLPNO Phase A) In cluster mode the AO-covariant embedding Fock
+    // F_eff = S·C·diag(ε)·Cᵀ·S replaces the molecular RHF Fock — exactly the
+    // swap the ground solver makes (DLPNOCCSD ctor / dlpno_ccsd.cu h_F site).
+    // The TNOBuilder's semi-canonical eps_tno then carries the cluster
+    // (un-shifted) spectrum; h_S is the genuine AO overlap in both modes.
+    const real_t* h_F = nullptr;
+    if (cluster != nullptr) {
+        h_F = cluster->h_F_eff;
+    } else {
+        rhf_.get_fock_matrix().toHost();
+        h_F = rhf_.get_fock_matrix().host_ptr();
+    }
     rhf_.get_overlap_matrix().toHost();
-    const real_t* h_F = rhf_.get_fock_matrix().host_ptr();
     const real_t* h_S = rhf_.get_overlap_matrix().host_ptr();
 
     // Phase 3.2.2b: extract global RI tensors needed by build_eri_in_tno.

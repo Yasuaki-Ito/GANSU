@@ -853,6 +853,32 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                       << std::defaultfloat << std::endl;
         }
     }
+    // (mode-2 / fresh-run relief) The DLPNO per-pair fan-out (or any earlier
+    // build_mo_eri) may have replicated the FULL AO-basis B to every GPU
+    // (naux·nao² ≈ 12.8 GB at Doxorubicin). From here on the cluster chain pulls
+    // MO-ERI exclusively from the cluster B_mo (ctx->d_B_mo_blocks, which
+    // survives — release_bmo_ao_replica frees only the lazy AO replicas), so
+    // the AO copies are dead weight on the EA device: run8 measured projected
+    // free −1.2 GiB vs +11.5 canonical — exactly the EA-Davidson OOM margin.
+    // A later build_B_mo (e.g. the STEOM choreography's rebuild on the bar-H
+    // GPU) lazily re-replicates from d_B_local_. Opt-out with
+    // GANSU_STEOM_KEEP_B_REPLICA (same knob as the dense-diag reclaim).
+    if (ctx && ctx->eri_block_src && gpu::gpu_available()
+        && !std::getenv("GANSU_STEOM_KEEP_B_REPLICA")) {
+        if (ERI_RI* rel_ri = dynamic_cast<ERI_RI*>(&eri_method)) {
+            int dev_saved = 0; cudaGetDevice(&dev_saved);
+            const size_t before = GlobalGpuMemoryTracker::get_current();
+            rel_ri->release_bmo_ao_replica();
+            const size_t after = GlobalGpuMemoryTracker::get_current();
+            // free_replicated_B may reset the current device — restore + rebind.
+            cudaSetDevice(dev_saved);
+            gpu::GPUHandle::reset();
+            if (before > after)
+                std::cout << "  [DMET-STEOM] released RI AO-B replicas before the EA stage: "
+                          << CudaMemoryManager<real_t>::format_bytes(before - after)
+                          << " reclaimed (global)." << std::endl;
+        }
+    }
 #endif
     const bool need_ea = ctx ? ctx->ea_eom_result.per_active.empty()
                               : rhf.get_ea_eom_result().per_active.empty();
@@ -2245,11 +2271,42 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
     const bool  want_lmp2_test  = lmp2_test_e && lmp2_test_e[0] == '1';
     const bool  want_cluster_dl = dl_mode_e && dl_mode_e[0] == '2';
     if (want_lmp2_test || want_cluster_dl) {
+        // Cap OpenMP threads for the whole cluster-DLPNO section — the plain
+        // entry points (compute_dlpno_ccsd/_t) apply this guard, but this
+        // direct DLPNOCCSD construction bypassed them: on a >128-core host
+        // (s177 nproc=128) the per-pair OpenBLAS calls then exceed the
+        // library's 128 per-caller-thread buffer limit and abort (the known
+        // dlpno_cpu_threads crash; previously masked by OMP_NUM_THREADS=64 in
+        // the run recipes).
+        OmpThreadCapGuard dl_omp_cap(cfg.get_dlpno_cpu_threads());
+#ifndef GANSU_CPU_ONLY
+        // The DLPNO machinery below (per-pair build_mo_eri fan-out,
+        // replicate_B_to_all_gpus, distributed polish) leaves the CUDA current
+        // device wherever its last multi-GPU loop ended (typically 0). Without a
+        // restore, the whole downstream chain (CIS/IP/EA/STEOM) silently runs on
+        // GPU 0 instead of the GANSU_DMET_STEOM_CLUSTER_GPU target — run9 audit:
+        // GPU0 peak 113 GB (vs 15 GB canonical) and the EA Davidson OOM'd there
+        // while GPU1 sat at 124.9 GB free. Save/restore + handle rebind.
+        int dl_dev_saved = 0;
+        if (gpu::gpu_available()) cudaGetDevice(&dl_dev_saved);
+#endif
         C.toHost(); eps.toHost();
         cfg.get_overlap_matrix().toHost();
         const real_t* h_Cc  = C.host_ptr();
-        const real_t* h_ec  = eps.host_ptr();
         const real_t* h_S   = cfg.get_overlap_matrix().host_ptr();
+        // UN-SHIFT the cluster ε for the DLPNO ground: the ctx eps carry the
+        // DMET stability level shift (+s on virtuals). Shifted denominators
+        // systematically shrink the pair energies AND misguide the PNO
+        // selection — run8 (dox, s=0.1553) measured E_corr(DLPNO) −2.455 vs
+        // true −2.746 (−291 mHa), so the warm start bought nothing (polish
+        // 1706 s ≈ cold 1777 s). The DLPNO ground must see the TRUE spectrum
+        // (same convention as the "ε un-shifted (−s)" EOM operators); the
+        // bt-polish below keeps the SHIFTED denominators + denominator-only
+        // correction exactly like the canonical cluster CCSD.
+        std::vector<real_t> eps_c(eps.host_ptr(), eps.host_ptr() + n_emb);
+        if (level_shift != 0.0)
+            for (int p1 = n_emb_occ; p1 < n_emb; ++p1) eps_c[p1] -= level_shift;
+        const real_t* h_ec = eps_c.data();
         // F_eff = S·C·diag(eps)·C^T·S  (AO-covariant embedding Fock; == the
         // molecular F in the square limit since F·C = S·C·eps).
         std::vector<real_t> SC((size_t)nao * n_emb, 0.0);
@@ -2316,6 +2373,16 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
             // B-native RI path mirrors the ctx chain's fresh-solve branch).
             const char* pe = std::getenv("GANSU_DLPNO_BT_POLISH");
             const bool pol_on = (pe == nullptr) || (pe[0] != '0');
+            // (DMET×DLPNO Phase A) cluster-(T) validation hook:
+            //   GANSU_DMET_STEOM_CLUSTER_T = canonical | dlpno | both
+            // "canonical" evaluates the (T) correction inside the polish's
+            // canonical cluster CCSD (converged amplitudes; run with the polish
+            // cap OFF for a clean reference). "dlpno" runs the cluster-space
+            // DLPNO-CCSD(T) (compute_dlpno_ccsd_t_impl(&cs); re-solves the
+            // ground internally — validation-grade). Results are printed only;
+            // the STEOM chain is unaffected.
+            const char* tket = std::getenv("GANSU_DMET_STEOM_CLUSTER_T");
+            const bool want_T_can = tket && (tket[0] == 'c' || tket[0] == 'b');
             if (pol_on && gpu::gpu_available()) {
                 Timer pol_t;
                 BTAmplitudes bt = cfg.get_dlpno_bt_amplitudes();   // copy; polished below
@@ -2326,14 +2393,21 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
                                        cap > 1 ? cap : -1, /*conv_override=*/1e-7);
                 real_t* d_t1p = nullptr;
                 real_t* d_t2p = nullptr;
+                real_t E_T_can = 0.0;
                 const ERI_RI* pol_ri = dynamic_cast<const ERI_RI*>(&eri_method);
                 const real_t E_pol = ccsd_spatial_orbital(
                     /*d_eri_ao=*/nullptr, C.device_ptr(), eps.device_ptr(),
                     n_emb, n_emb_occ,
-                    /*computing_ccsd_t=*/false, /*ccsd_t_energy=*/nullptr,
+                    /*computing_ccsd_t=*/want_T_can,
+                    /*ccsd_t_energy=*/want_T_can ? &E_T_can : nullptr,
                     &d_t1p, &d_t2p, /*d_eri_mo_precomputed=*/nullptr,
                     n_frozen, /*h_fov_active=*/nullptr,
                     /*eri_ri=*/pol_ri, /*level_shift=*/level_shift);
+                if (want_T_can)
+                    std::cout << "  [cluster (T) canonical] E(CCSD) = " << std::fixed
+                              << std::setprecision(10) << E_pol << "  E((T)) = "
+                              << E_T_can << "  E(total) = " << E_pol + E_T_can
+                              << " Ha" << std::endl;
                 cudaMemcpy(bt.T1.data(), d_t1p, bt.T1.size() * sizeof(real_t),
                            cudaMemcpyDeviceToHost);
                 cudaMemcpy(bt.T2.data(), d_t2p, bt.T2.size() * sizeof(real_t),
@@ -2355,7 +2429,53 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
             ctx.dlpno_E  = E_final;
             std::cout << "  [DMET-STEOM] cluster chain consumes cluster-DLPNO "
                          "(bt-polished) amplitudes (GANSU_DMET_STEOM_DLPNO=2)." << std::endl;
+            // (DMET×DLPNO Phase A) cluster DLPNO-CCSD(T) validation hook — see
+            // the GANSU_DMET_STEOM_CLUSTER_T note above. Prints E(CCSD)/E((T)).
+            if (tket && (tket[0] == 'd' || tket[0] == 'b')) {
+                if (auto* ri_rhf = dynamic_cast<ERI_RI_RHF*>(&eri_method)) {
+                    std::cout << "---- DMET-STEOM cluster DLPNO-(T) "
+                                 "(validation hook, ground re-solved) ----" << std::endl;
+                    const real_t e_tot = ri_rhf->compute_dlpno_ccsd_t_impl(&cs);
+                    std::cout << "  [cluster DLPNO-(T)] E(CCSD)+E((T)) = " << std::fixed
+                              << std::setprecision(10) << e_tot << " Ha" << std::endl;
+                } else {
+                    std::cout << "  [cluster DLPNO-(T)] skipped (non-RI ERI backend)."
+                              << std::endl;
+                }
+            }
         }
+#ifndef GANSU_CPU_ONLY
+        // Release the DLPNO fan-out's AO-B replicas (naux·nao² per GPU ≈ 12.2 GB
+        // ×4 at Doxorubicin) right here: the ground + polish are done with them,
+        // and leaving them resident collided with the checkpoint bar-H restore
+        // (run11: 1.24 GB alloc OOM at global 211 GB right after ckpt load,
+        // which happens BEFORE the EA-stage relief). The chain's build_B_mo
+        // lazily re-replicates on demand. Same opt-out knob as the other sites.
+        if (gpu::gpu_available() && !std::getenv("GANSU_STEOM_KEEP_B_REPLICA")) {
+            if (ERI_RI* dl_ri = dynamic_cast<ERI_RI*>(&eri_method)) {
+                const size_t before = GlobalGpuMemoryTracker::get_current();
+                dl_ri->release_bmo_ao_replica();
+                const size_t after = GlobalGpuMemoryTracker::get_current();
+                if (before > after)
+                    std::cout << "  [DMET-STEOM] released RI AO-B replicas after the "
+                                 "cluster-DLPNO ground: "
+                              << CudaMemoryManager<real_t>::format_bytes(before - after)
+                              << " reclaimed (global)." << std::endl;
+            }
+        }
+        // Re-pin the cluster device for the downstream chain (see note above;
+        // release_bmo_ao_replica may also reset the current device).
+        if (gpu::gpu_available()) {
+            int dl_dev_now = 0; cudaGetDevice(&dl_dev_now);
+            if (dl_dev_now != dl_dev_saved) {
+                cudaSetDevice(dl_dev_saved);
+                gpu::GPUHandle::reset();
+                std::cout << "  [DMET-STEOM] restored cluster device " << dl_dev_saved
+                          << " after the DLPNO ground stage (was left on GPU "
+                          << dl_dev_now << ")." << std::endl;
+            }
+        }
+#endif
     }
 
     // (DMET×DLPNO P0) Cluster chain consumes DLPNO bt-polished amplitudes: the

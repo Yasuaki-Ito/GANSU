@@ -44,6 +44,7 @@ class Convergence_RHF;
 class Convergence_RHF_Damping;
 class Convergence_RHF_DIIS;
 struct DLPNOLMP2Result;   // dlpno_mp2.hpp — by-ref param of compute_dlpno_ccsd_capture
+struct DLPNOClusterSpace; // dlpno_mp2.hpp — embedded-cluster hook (DMET×DLPNO)
 
 /**
  * @brief RHF class
@@ -1027,8 +1028,19 @@ private:
     // Non-virtual variant that also hands back the converged LMP2 pair state
     // (pre-CCSD-dressing) so compute_dlpno_ccsd_t can reuse it instead of
     // re-solving LMP2. Returns the CCSD correlation energy.
-    real_t compute_dlpno_ccsd_capture(DLPNOLMP2Result& lmp2_out);
+    // (DMET×DLPNO Phase A) `cluster` runs the ground solve on an embedded
+    // cluster orbital space (rectangular C) — same hook as the DLPNOCCSD ctor.
+    real_t compute_dlpno_ccsd_capture(DLPNOLMP2Result& lmp2_out,
+                                      const DLPNOClusterSpace* cluster = nullptr);
     real_t compute_dlpno_ccsd_t() override;  // DLPNO Phase 3 (skeleton)
+    // (DMET×DLPNO Phase A) cluster-space DLPNO-CCSD(T): the (T) machinery is
+    // PNO/TNO/LMO/AO-space only, so the cluster generalization is the ground
+    // capture + the TNOBuilder Fock (cluster->h_F_eff instead of the RHF AO
+    // Fock). cluster == nullptr reproduces compute_dlpno_ccsd_t exactly.
+    // Public: called by the DMET-STEOM driver's cluster-(T) validation hook.
+public:
+    real_t compute_dlpno_ccsd_t_impl(const DLPNOClusterSpace* cluster);
+private:
 
     void compute_fock_matrix() override {
         const DeviceHostMatrix<real_t>& density_matrix = rhf_.get_density_matrix();
