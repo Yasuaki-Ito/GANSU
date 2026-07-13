@@ -37,6 +37,7 @@
 #include "device_host_memory.hpp"
 #include "progress.hpp"
 #include "eri.hpp"   // (DMET B-native) ERI_RI::mo_eri_block_into block source
+#include <cstdio>    // (Λ vvvv host-stage) stderr marker past the CoutSilencer
 
 #include <iostream>
 #include <iomanip>
@@ -1038,6 +1039,29 @@ __global__ void m3_l2_vvvv_k(const real_t* l2, const real_t* vvvv,
     m3_out[idx] = v;
 }
 
+// (Λ vvvv host-stage) slab variant of m3_l2_vvvv_k: vvvv_slab holds the a-rows
+// [a0, a0+na) of the [a,c,b,d] block; the m3 rows at the GLOBAL a are written.
+// Same per-element c,d loop and read order ⇒ bit-identical to the full kernel.
+__global__ void m3_l2_vvvv_slab_k(const real_t* l2, const real_t* vvvv_slab,
+                                  real_t* m3_out, int NO, int NV, int a0, int na)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)NO*NO*na*NV;
+    if (idx >= total) return;
+    int i = idx / ((size_t)NO*na*NV);
+    size_t r = idx % ((size_t)NO*na*NV);
+    int j = r / ((size_t)na*NV);
+    r %= ((size_t)na*NV);
+    int al = r / NV;
+    int b = r % NV;
+    const int a = a0 + al;
+    real_t v = 0.0;
+    for (int c = 0; c < NV; c++)
+      for (int d = 0; d < NV; d++)
+        v += l2[IDX4(i,j,c,d)] * vvvv_slab[(((size_t)al*NV + c)*NV + b)*NV + d];
+    m3_out[IDX4(i,j,a,b)] = v;
+}
+
 // ============================================================================
 //  1-RDM (gpu) — direct port from CPU build_ccsd_1rdm_mo_cpu
 // ============================================================================
@@ -1183,6 +1207,24 @@ bool solve_ccsd_lambda_gpu(
     const size_t oooo_sz = (size_t)NO * NO * NO * NO;
     const size_t vvvv_sz = (size_t)NV * NV * NV * NV;
 
+    // (Λ vvvv host-stage, 2026-07-13) In block-source mode the NV⁴ dressed
+    // ladder block can be staged on the HOST (built once from B in a-slabs,
+    // then streamed slab-by-slab each iteration into the slab variant of the
+    // m3 kernel — bit-identical adds). Removes the largest Λ device resident
+    // (72 GiB at a 412-orbital DMET fragment). Auto when NV⁴ > 0.35×free;
+    // force with GANSU_LAMBDA_VVVV_HOST=1 / disable with =0.
+    bool vvvv_host = false;
+    if (eri_block_src != nullptr && d_B_mo_blocks != nullptr) {
+        size_t freeb = 0, totb = 0;
+        cudaMemGetInfo(&freeb, &totb);
+        const char* lvh = std::getenv("GANSU_LAMBDA_VVVV_HOST");
+        if (lvh && lvh[0]) vvvv_host = (lvh[0] == '1');
+        else vvvv_host = ((double)vvvv_sz * sizeof(real_t) > 0.35 * (double)freeb);
+    }
+    std::vector<real_t> h_vvvv_stage;
+    real_t* d_vvvv_slab = nullptr;
+    int vvvv_slab_rows = 0;
+
     // Allocate sub-blocks
     real_t *d_ovov=nullptr, *d_ovoo=nullptr, *d_ovvv=nullptr;
     real_t *d_oovv=nullptr, *d_ovvo=nullptr, *d_oooo=nullptr, *d_vvvv=nullptr;
@@ -1192,7 +1234,8 @@ bool solve_ccsd_lambda_gpu(
     tracked_cudaMalloc(&d_oovv, oovv_sz * sizeof(real_t));
     tracked_cudaMalloc(&d_ovvo, ovvo_sz * sizeof(real_t));
     tracked_cudaMalloc(&d_oooo, oooo_sz * sizeof(real_t));
-    tracked_cudaMalloc(&d_vvvv, vvvv_sz * sizeof(real_t));
+    if (!vvvv_host)
+        tracked_cudaMalloc(&d_vvvv, vvvv_sz * sizeof(real_t));
 
     int B = 256;
     auto launch = [&](size_t n) { return std::pair<int,int>{(int)((n + B - 1) / B), B}; };
@@ -1209,7 +1252,41 @@ bool solve_ccsd_lambda_gpu(
         eri_block_src->mo_eri_block_into(d_B_mo_blocks, nmo_full, 0,NO, 0,NO,  NO,NV, NO,NV, d_oovv);
         eri_block_src->mo_eri_block_into(d_B_mo_blocks, nmo_full, 0,NO, NO,NV, NO,NV, 0,NO,  d_ovvo);
         eri_block_src->mo_eri_block_into(d_B_mo_blocks, nmo_full, 0,NO, 0,NO,  0,NO,  0,NO,  d_oooo);
-        eri_block_src->mo_eri_block_into(d_B_mo_blocks, nmo_full, NO,NV, NO,NV, NO,NV, NO,NV, d_vvvv);
+        if (!vvvv_host) {
+            eri_block_src->mo_eri_block_into(d_B_mo_blocks, nmo_full, NO,NV, NO,NV, NO,NV, NO,NV, d_vvvv);
+        } else {
+            // Host-stage: build vvvv once in a-slabs (rows of the [(a,c),(b,d)]
+            // block are contiguous, so each slab D2H lands at offset a0·NV³),
+            // register the host buffer for fast per-iteration H2D streaming.
+            h_vvvv_stage.resize(vvvv_sz);
+            size_t freeb = 0, totb = 0;
+            cudaMemGetInfo(&freeb, &totb);
+            const size_t row_bytes = (size_t)NV * NV * NV * sizeof(real_t);
+            vvvv_slab_rows = (int)std::min<size_t>((size_t)NV,
+                std::max<size_t>(1, (size_t)(0.15 * freeb) / row_bytes));
+            // Override (validation / tuning): force the slab width.
+            if (const char* lvs = std::getenv("GANSU_LAMBDA_VVVV_SLAB"))
+                if (std::atoi(lvs) > 0)
+                    vvvv_slab_rows = std::min(NV, std::atoi(lvs));
+            tracked_cudaMalloc(&d_vvvv_slab,
+                               (size_t)vvvv_slab_rows * row_bytes);
+            for (int a0 = 0; a0 < NV; a0 += vvvv_slab_rows) {
+                const int na = std::min(vvvv_slab_rows, NV - a0);
+                eri_block_src->mo_eri_block_into(d_B_mo_blocks, nmo_full,
+                    NO + a0, na, NO, NV, NO, NV, NO, NV, d_vvvv_slab);
+                cudaMemcpy(h_vvvv_stage.data() + (size_t)a0 * NV * NV * NV,
+                           d_vvvv_slab, (size_t)na * row_bytes,
+                           cudaMemcpyDeviceToHost);
+            }
+            cudaHostRegister(h_vvvv_stage.data(),
+                             vvvv_sz * sizeof(real_t), cudaHostRegisterDefault);
+            // stderr: visible even under the DMET fragment loop's CoutSilencer.
+            std::fprintf(stderr,
+                "  [CCSD-Lambda] vvvv host-staged (%.1f GiB off device; "
+                "slab %d/%d rows/iter)\n",
+                vvvv_sz * sizeof(real_t) / (1024.0*1024.0*1024.0),
+                vvvv_slab_rows, NV);
+        }
     } else {
         auto p = launch(ovov_sz);  extract_ovov_k<<<p.first, p.second>>>(d_eri_mo, d_ovov, NA, NO, NV);
         p = launch(ovoo_sz);       extract_ovoo_k<<<p.first, p.second>>>(d_eri_mo, d_ovoo, NA, NO, NV);
@@ -1324,7 +1401,23 @@ bool solve_ccsd_lambda_gpu(
         // m3: l2.vvvv (kernel) + l2.woooo + 0.5*scale + ovov*l2tau, then -= ovvv*l2t1
         {
             auto p = launch(l2_sz);
-            m3_l2_vvvv_k<<<p.first, p.second>>>(d_lambda2, d_vvvv, d_m3, NO, NV);
+            if (!vvvv_host) {
+                m3_l2_vvvv_k<<<p.first, p.second>>>(d_lambda2, d_vvvv, d_m3, NO, NV);
+            } else {
+                // (Λ vvvv host-stage) stream the staged block slab-by-slab.
+                const size_t row_elems = (size_t)NV * NV * NV;
+                for (int a0 = 0; a0 < NV; a0 += vvvv_slab_rows) {
+                    const int na = std::min(vvvv_slab_rows, NV - a0);
+                    cudaMemcpy(d_vvvv_slab,
+                               h_vvvv_stage.data() + (size_t)a0 * row_elems,
+                               (size_t)na * row_elems * sizeof(real_t),
+                               cudaMemcpyHostToDevice);
+                    auto ps = launch((size_t)NO * NO * na * NV);
+                    m3_l2_vvvv_slab_k<<<ps.first, ps.second>>>(
+                        d_lambda2, d_vvvv_slab, d_m3, NO, NV, a0, na);
+                    cudaDeviceSynchronize();
+                }
+            }
             // m3 += l2.woooo  via reuse of m3_woooo kernel (which OVERWRITES, so accumulate into temp)
             // Use d_l2new_pre as temp scratch (overwritten later anyway):
             compute_m3_woooo_k<<<p.first, p.second>>>(d_lambda2, d_woooo, d_l2new_pre, NO, NV);
@@ -1423,7 +1516,11 @@ bool solve_ccsd_lambda_gpu(
 
     // Cleanup
     tracked_cudaFree(d_ovov); tracked_cudaFree(d_ovoo); tracked_cudaFree(d_ovvv);
-    tracked_cudaFree(d_oovv); tracked_cudaFree(d_ovvo); tracked_cudaFree(d_oooo); tracked_cudaFree(d_vvvv);
+    tracked_cudaFree(d_oovv); tracked_cudaFree(d_ovvo); tracked_cudaFree(d_oooo);
+    if (d_vvvv)      tracked_cudaFree(d_vvvv);
+    if (d_vvvv_slab) tracked_cudaFree(d_vvvv_slab);
+    if (vvvv_host && !h_vvvv_stage.empty())
+        cudaHostUnregister(h_vvvv_stage.data());
     tracked_cudaFree(d_tau); tracked_cudaFree(d_theta);
     tracked_cudaFree(d_v1); tracked_cudaFree(d_v2); tracked_cudaFree(d_v4); tracked_cudaFree(d_v5); tracked_cudaFree(d_w3);
     tracked_cudaFree(d_woooo); tracked_cudaFree(d_v4o); tracked_cudaFree(d_v4v);
