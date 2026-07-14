@@ -1677,8 +1677,32 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // (only viable for small total_dim).
     const char* geev_host_env = std::getenv("GANSU_STEOM_GEEV_HOST");
     const bool  geev_host = (geev_host_env != nullptr) && (std::atoi(geev_host_env) != 0);
+    // (2026-07-14) Dense geev hard ceiling: GANSU_STEOM_DENSE_DIAG=1 forces dense
+    // past `dense_auto_max`, but the GPU cusolverXgeev is infeasible at large
+    // total_dim regardless of nominal free memory — it allocates d_G_cm + all
+    // right-evecs + d_A + d_VR (4×total_dim² doubles) PLUS an unpredictable
+    // internal device workspace, on a device whose placement is entangled with
+    // the Ship-15 build_W redirect (d_G_ on the balanced GPU, the dense path may
+    // restore to the bar-H GPU). At n_emb=490 (total_dim=36072) this OOM'd at a
+    // 9.7 GiB buffer even with ~120 GiB nominally free, and the O(total_dim³)
+    // cost is itself prohibitive. So a plain `DENSE_DIAG=1` auto-falls-back to
+    // Davidson above a hard ceiling (a memory probe can't capture the true need).
+    // GANSU_STEOM_DENSE_DIAG=2 bypasses the ceiling (force dense at any size);
+    // the CPU geev path (GANSU_STEOM_GEEV_HOST) is exempt (no device workspace).
+    const char* dd_env = std::getenv("GANSU_STEOM_DENSE_DIAG");
+    const bool  dense_hard_force = (dd_env && dd_env[0] == '2');   // =2 → force dense
+    const int   dense_force_max  = 20000;   // force_dense ceiling (dense infeasible above)
+    const bool  dense_mem_ok = geev_host || dense_hard_force
+                               || total_dim <= dense_force_max;
+    if (force_dense && !dense_mem_ok)
+        std::cout << "  [STEOM] GANSU_STEOM_DENSE_DIAG=1 set but total_dim=" << total_dim
+                  << " > " << dense_force_max << " hard ceiling (dense geev needs "
+                  << "4×total_dim²·8 B + large cusolver workspace + O(n³) time) → "
+                  << "auto-fallback to Davidson (set GANSU_STEOM_DENSE_DIAG=2 to force)."
+                  << std::endl;
     const bool dense_diag = (steom_op.get_G_device() != nullptr)
                             && !force_davidson
+                            && dense_mem_ok
                             && (force_dense || total_dim <= dense_auto_max);
 
     std::vector<real_t> eigenvalues;
@@ -1906,11 +1930,19 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                                     + " ≤ " + std::to_string(dense_auto_max))
                   << ")" << std::endl;
     } else {
-        if (steom_op.get_G_device() != nullptr && !force_davidson)
-            std::cout << "  STEOM-CCSD: total_dim=" << total_dim << " > " << dense_auto_max
-                      << " → iterative non-Hermitian Davidson (dense geev too large; "
-                      << "note Davidson may miss/over-shoot roots — force dense with "
-                      << "GANSU_STEOM_DENSE_DIAG=1 if affordable)." << std::endl;
+        if (steom_op.get_G_device() != nullptr && !force_davidson) {
+            if (!dense_mem_ok)
+                std::cout << "  STEOM-CCSD: total_dim=" << total_dim
+                          << " → iterative non-Hermitian Davidson (GANSU_STEOM_DENSE_DIAG "
+                          << "set but dense geev exceeds device free memory; note Davidson "
+                          << "may miss/over-shoot roots — GANSU_STEOM_DENSE_DIAG=2 forces "
+                          << "dense past the guard)." << std::endl;
+            else
+                std::cout << "  STEOM-CCSD: total_dim=" << total_dim << " > " << dense_auto_max
+                          << " → iterative non-Hermitian Davidson (dense geev too large; "
+                          << "note Davidson may miss/over-shoot roots — force dense with "
+                          << "GANSU_STEOM_DENSE_DIAG=1 if affordable)." << std::endl;
+        }
         DavidsonConfig config;
         config.num_eigenvalues       = n_states_to_compute;
         config.convergence_threshold = rhf.get_steom_d_tol();
