@@ -521,7 +521,18 @@ bool steom_ckpt_load(EOMChainContext& ctx, const char* path){
       b.d_Woooo = ckpt_rd_dev(f); b.d_Wooov = ckpt_rd_dev(f); b.d_Wovov = ckpt_rd_dev(f);
       b.d_Wovvo = ckpt_rd_dev(f); b.d_Wovoo = ckpt_rd_dev(f); b.d_Wvovv = ckpt_rd_dev(f);
       b.d_Wvvvv = ckpt_rd_dev(f); b.d_Wvvvo = ckpt_rd_dev(f);
-      b.has_ip = (hip != 0); b.has_ea = (hea != 0); }
+      b.has_ip = (hip != 0); b.has_ea = (hea != 0);
+      // (2026-07-13) ckpt_rd_dev allocates on the CURRENT device — record it as
+      // ip_dev/ea_dev so the EA-solve relief and the STEOM bring-back
+      // choreography know where the restored bar-H physically lives. Without
+      // this ip_dev kept its default 0, so on a mode-2 resume (bar-H loaded on
+      // the cluster GPU) the relief's `ip_dev == ea_dev` test silently failed
+      // and IP bar-H stayed co-resident with the EA operator → Davidson OOM.
+      int ld_dev = 0;
+#ifndef GANSU_CPU_ONLY
+      if (gpu::gpu_available()) cudaGetDevice(&ld_dev);
+#endif
+      b.ip_dev = ld_dev; b.ea_dev = ld_dev; }
     const bool ip_done = !ctx.ip_eom_result.per_active.empty();
     const bool ea_done = !ctx.ea_eom_result.per_active.empty();
     std::cout << "  [STEOM ckpt] loaded from " << path << " — skip CCSD"

@@ -986,6 +986,13 @@ EAEOMCCSDOperator::EAEOMCCSDOperator(
             barh_cache_->canonical_skip_wvvvv = canonical_skip_wvvvv_;
             if (barh_cache_->nocc == 0) { barh_cache_->nocc = nocc_; barh_cache_->nvir = nvir_; }
             barh_cache_->has_ea  = true;
+            // (2026-07-14) Record the device the EA bar-H live on (current =
+            // cluster device) so the STEOM bring-back's migrate_ea_to reads the
+            // correct source. Mirrors the IP publish + ckpt-load ip_dev/ea_dev.
+#ifndef GANSU_CPU_ONLY
+            { int cur = 0; if (gpu::gpu_available()) cudaGetDevice(&cur);
+              barh_cache_->ea_dev = cur; }
+#endif
             barh_published_      = true;
             std::cout << "  [STEOM share-barH] EA published 3 bar-H intermediates "
                          "(Wvovv/Wvvvv/Wvvvo; canonical_skip_wvvvv="
@@ -3397,7 +3404,16 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     // Precompute the 3 reorganized ring matrices (M_A/M_B/M_C, each [NO·NV × NO·NV])
     // used to GEMM-ify the σ2 ring contractions in apply().  GPU only; on the CPU
     // path the per-thread loops in apply() handle the ring terms directly.
-    if (gpu::gpu_available()) {
+    // (2026-07-13) Gate the ALLOCATION on GANSU_EA_RING_GEMM: with =0 the σ path
+    // does the ring terms in the per-thread kernel (bit-identical), so the 3×
+    // NO²·NV² matrices (29 GiB at p-DDPA n_emb=490) are pure dead weight — at
+    // large clusters they pinned the EA-solve device and OOM'd the Davidson
+    // subspace. Default on (byte-unchanged); =0 frees 29 GiB for the solve.
+    const bool ring_gemm_alloc = [] {
+        const char* e = std::getenv("GANSU_EA_RING_GEMM");
+        return !(e && e[0] == '0');
+    }();
+    if (gpu::gpu_available() && ring_gemm_alloc) {
         const size_t M_sz = (size_t)NO * NV * NO * NV;
         tracked_cudaMalloc(&d_M_ringA_, M_sz * sizeof(real_t));
         tracked_cudaMalloc(&d_M_ringB_, M_sz * sizeof(real_t));

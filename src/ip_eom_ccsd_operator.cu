@@ -449,6 +449,16 @@ IPEOMCCSDOperator::IPEOMCCSDOperator(
             barh_cache_->nocc    = nocc_;
             barh_cache_->nvir    = nvir_;
             barh_cache_->has_ip  = true;
+            // (2026-07-14) Record the device the 8 bar-H physically live on (the
+            // current = cluster/EA-solve device). Without this ip_dev kept its
+            // default 0, so on a FRESH mode-2 run (bar-H built on the cluster GPU
+            // ≠ 0) the EA-solve relief's `ip_dev == ea_dev` test silently failed
+            // and IP bar-H stayed co-resident with the EA build → extract OOM.
+            // Mirrors the ckpt-load fix (eri_stored_steom_ccsd.cu b.ip_dev=ld_dev).
+#ifndef GANSU_CPU_ONLY
+            { int cur = 0; if (gpu::gpu_available()) cudaGetDevice(&cur);
+              barh_cache_->ip_dev = cur; }
+#endif
             barh_published_      = true;
             std::cout << "  [STEOM share-barH] IP published 8 bar-H intermediates "
                          "(Loo/Lvv/Fov/Woooo/Wooov/Wovov/Wovvo/Wovoo)." << std::endl;

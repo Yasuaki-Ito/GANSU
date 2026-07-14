@@ -995,11 +995,12 @@ void STEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
     // top of that function): with all 11 dressed intermediates borrowed the raw
     // (ab|cd) block has no consumer in this operator — at tetracene/cc-pVDZ this
     // 39.6 GB alloc was pure dead weight in the bt-polish chain.
-    // (EA σ host-stage) w_host_staged ⇒ the cache's Wvovv/Wvvvo are HOST
-    // vectors (device ptrs null) — the STEOM consumers are not host-wired yet,
-    // so treat the cache as not-borrowable (falls through to a full build).
+    // (EA σ host-stage, 2026-07-13) w_host_staged ⇒ the cache's Wvovv/Wvvvo are
+    // HOST vectors (device ptrs null). STEOM now consumes the host Wvovv stage
+    // (a-slab GEMMs / direct host reads) and elides dead Wvvvo, so the cache is
+    // STILL fully borrowable — build_dressed is skipped and, crucially, the
+    // dead raw o-block extraction (incl. the 32 GB ovvv) is skipped too.
     const bool barh_will_borrow = barh_cache_ && barh_cache_->complete()
-        && !barh_cache_->w_host_staged
         && barh_cache_->nocc == nocc_active_ && barh_cache_->nvir == nvir_
         && barh_cache_->canonical_skip_wvvvv == canonical_skip_wvvvv_;
     // (2026-07-10, DMET cluster W_eff wall) Under a full bar-H borrow the five
@@ -1202,12 +1203,7 @@ void STEOMCCSDOperator::build_dressed_intermediates() {
     // mismatch falls through to a full build. d_f_oo_/d_f_vv_ are already
     // allocated (ctor) and simply go unused; downstream build_F_eff_*/
     // build_W_eff_and_G read the borrowed bar-H, not the raw Fock diagonals.
-    if (barh_cache_ && barh_cache_->complete() && barh_cache_->w_host_staged)
-        std::cout << "  [STEOM share-barH] EA host-staged Wvovv/Wvvvo — borrow "
-                     "disabled (STEOM host consumers not wired yet); building "
-                     "own bar-H." << std::endl;
     if (barh_cache_ && barh_cache_->complete()
-        && !barh_cache_->w_host_staged
         && barh_cache_->nocc == nocc_active_ && barh_cache_->nvir == nvir_
         && barh_cache_->canonical_skip_wvvvv == canonical_skip_wvvvv_) {
         d_Loo_   = barh_cache_->d_Loo;
@@ -1218,12 +1214,48 @@ void STEOMCCSDOperator::build_dressed_intermediates() {
         d_Wovov_ = barh_cache_->d_Wovov;
         d_Wovvo_ = barh_cache_->d_Wovvo;
         d_Wovoo_ = barh_cache_->d_Wovoo;
-        d_Wvovv_ = barh_cache_->d_Wvovv;
         d_Wvvvv_ = barh_cache_->d_Wvvvv;   // nullptr under canonical-skip (consistent)
-        d_Wvvvo_ = barh_cache_->d_Wvvvo;
+        if (barh_cache_->w_host_staged) {
+            // (EA σ host-stage) Wvovv/Wvvvo device copies never existed. Consume
+            // the pinned host Wvovv stage (a-slab GEMMs in build_W_eff_and_G,
+            // direct host reads in build_F_eff_vv); Wvvvo is DEAD in STEOM (no
+            // consumer) so leave it null and skip its 32 GB rebuild+upload.
+            d_Wvovv_ = nullptr;
+            d_Wvvvo_ = nullptr;
+            wvovv_host_staged_ = true;
+            h_wvovv_stage_ = &barh_cache_->h_Wvovv_stage;
+            std::cout << "  [STEOM share-barH] borrowed 9 device bar-H + host-staged "
+                         "Wvovv (a-slab stream); Wvvvo elided (no STEOM consumer) — "
+                         "build_dressed_intermediates SKIPPED." << std::endl;
+        } else {
+            d_Wvovv_ = barh_cache_->d_Wvovv;
+            // Wvvvo has NO STEOM consumer (dead weight, NV³·NO ≈ 32 GB). On the
+            // device borrow path (e.g. resume-from-ckpt restored it to device, or
+            // EA built it on device) it just squats on the bar-H GPU and starves
+            // the W^eff phph/g_phhp transients. STEOM is the terminal cache user,
+            // so free it now + null the cache entry (cache->free() is null-safe).
+            // Opt out with GANSU_STEOM_KEEP_WVVVO=1.
+            d_Wvvvo_ = barh_cache_->d_Wvvvo;
+#ifndef GANSU_CPU_ONLY
+            if (d_Wvvvo_ != nullptr && gpu::gpu_available()
+                && !std::getenv("GANSU_STEOM_KEEP_WVVVO")) {
+                const size_t before = GlobalGpuMemoryTracker::get_current();
+                tracked_cudaFree(d_Wvvvo_);
+                barh_cache_->d_Wvvvo = nullptr;
+                d_Wvvvo_ = nullptr;
+                const size_t after = GlobalGpuMemoryTracker::get_current();
+                if (before > after)
+                    std::cout << "  [STEOM share-barH] freed dead borrowed Wvvvo (no "
+                                 "STEOM consumer): " << std::fixed << std::setprecision(2)
+                              << ((before - after) / (1024.0*1024.0*1024.0))
+                              << " GB reclaimed." << std::defaultfloat << std::endl;
+            }
+#endif
+            std::cout << "  [STEOM share-barH] borrowed all 11 bar-H from IP+EA "
+                         "(Wvvvo freed as dead) — build_dressed_intermediates SKIPPED."
+                      << std::endl;
+        }
         barh_borrowed_ = true;
-        std::cout << "  [STEOM share-barH] borrowed all 11 bar-H from IP+EA — "
-                     "build_dressed_intermediates SKIPPED." << std::endl;
         return;
     }
     const int NO = nocc_active_;
@@ -3567,13 +3599,23 @@ void STEOMCCSDOperator::build_F_eff_vv() {
 
     // Pull bar-H + R2_EA + Lvv back to host.
     std::vector<real_t> h_Fov(fov_sz);
-    std::vector<real_t> h_Wvovv(wvovv_sz);
     std::vector<real_t> h_Lvv((size_t)NV * NV);
     std::vector<real_t> h_R2_EA((size_t)n_act_vir_ * r2_per_e);
+    // Wvovv: host-staged borrow reads the pinned EA stage directly (no D2H, no
+    // 32 GB device copy); device-resident borrow pulls it to host as before.
+    std::vector<real_t> h_Wvovv;
+    const real_t* wvovv_ptr = nullptr;
+    if (wvovv_host_staged_) {
+        wvovv_ptr = h_wvovv_stage_->data();
+    } else {
+        h_Wvovv.resize(wvovv_sz);
+        wvovv_ptr = h_Wvovv.data();
+    }
 #ifndef GANSU_CPU_ONLY
     if (gpu::gpu_available()) {
         cudaMemcpy(h_Fov.data(),   d_Fov_,   fov_sz   * sizeof(real_t), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_Wvovv.data(), d_Wvovv_, wvovv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+        if (!wvovv_host_staged_)
+            cudaMemcpy(h_Wvovv.data(), d_Wvovv_, wvovv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
         cudaMemcpy(h_Lvv.data(),   d_Lvv_,   (size_t)NV*NV * sizeof(real_t), cudaMemcpyDeviceToHost);
         cudaMemcpy(h_R2_EA.data(), d_R2_EA_,
                    h_R2_EA.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
@@ -3581,7 +3623,8 @@ void STEOMCCSDOperator::build_F_eff_vv() {
 #endif
     {
         for (size_t i = 0; i < fov_sz;   ++i) h_Fov[i]   = d_Fov_[i];
-        for (size_t i = 0; i < wvovv_sz; ++i) h_Wvovv[i] = d_Wvovv_[i];
+        if (!wvovv_host_staged_)
+            for (size_t i = 0; i < wvovv_sz; ++i) h_Wvovv[i] = d_Wvovv_[i];
         for (size_t i = 0; i < (size_t)NV*NV; ++i) h_Lvv[i] = d_Lvv_[i];
         for (size_t i = 0; i < h_R2_EA.size(); ++i) h_R2_EA[i] = d_R2_EA_[i];
     }
@@ -3606,7 +3649,7 @@ void STEOMCCSDOperator::build_F_eff_vv() {
                        + (size_t)a * NV + b];
     };
     auto W = [&](int a, int l, int c, int d) -> real_t {
-        return h_Wvovv[((size_t)a * NO + l) * NV * NV + (size_t)c * NV + d];
+        return wvovv_ptr[((size_t)a * NO + l) * NV * NV + (size_t)c * NV + d];
     };
 
     #pragma omp parallel for collapse(2) if (n_act_vir_ * NV > 16)
@@ -3719,7 +3762,36 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     std::vector<real_t> Loo   = pull(d_Loo_,   (size_t)NO*NO);
     std::vector<real_t> Lvv   = pull(d_Lvv_,   (size_t)NV*NV);
     std::vector<real_t> Wooov = pull(d_Wooov_, (size_t)NO*NO*NO*NV);
-    std::vector<real_t> Wvovv = pull(d_Wvovv_, (size_t)NV*NO*NV*NV);
+    // Wvovv: host-staged borrow references the pinned EA stage (no D2H, no 32 GB
+    // host pull); the device GEMM sites below stream it to device in a-slabs.
+    std::vector<real_t> Wvovv;
+    const real_t* wvovv_src = nullptr;
+    if (wvovv_host_staged_) {
+        wvovv_src = h_wvovv_stage_->data();
+    } else {
+        Wvovv = pull(d_Wvovv_, (size_t)NV*NO*NV*NV); wvovv_src = Wvovv.data();
+#ifndef GANSU_CPU_ONLY
+        // The device Wvovv (bar-H borrow / rebuild, NV³·NO ≈ 32 GB on the bar-H
+        // GPU) now lives in the host `Wvovv` vector; every device consumer below
+        // streams it from there via the a-slab. The device copy is dead weight —
+        // free it + null the cache (STEOM is the terminal cache user). This is the
+        // resume-path relief: it frees the 32 GB that the packed bar-H GPU needed
+        // for the phph dA1/dA2 transients. Opt out with GANSU_STEOM_KEEP_WVOVV.
+        if (d_Wvovv_ != nullptr && gpu::gpu_available()
+            && !std::getenv("GANSU_STEOM_KEEP_WVOVV")) {
+            const size_t before = GlobalGpuMemoryTracker::get_current();
+            tracked_cudaFree(d_Wvovv_);
+            if (barh_cache_) barh_cache_->d_Wvovv = nullptr;
+            d_Wvovv_ = nullptr;
+            const size_t after = GlobalGpuMemoryTracker::get_current();
+            if (before > after)
+                std::cout << "  [STEOM] device Wvovv freed post-pull (GEMMs stream from "
+                             "host): " << std::fixed << std::setprecision(2)
+                          << ((before - after) / (1024.0*1024.0*1024.0))
+                          << " GB reclaimed." << std::defaultfloat << std::endl;
+        }
+#endif
+    }
     std::vector<real_t> Wovoo = pull(d_Wovoo_, (size_t)NO*NV*NO*NO);
     std::vector<real_t> Wovov = pull(d_Wovov_, (size_t)NO*NV*NO*NV);
     std::vector<real_t> Wovvo = pull(d_Wovvo_, (size_t)NO*NV*NV*NO);
@@ -3734,13 +3806,46 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     auto loo  = [&](int i,int j){ return Loo[(size_t)i*NO+j]; };
     auto lvv  = [&](int a,int b){ return Lvv[(size_t)a*NV+b]; };
     auto wooov= [&](int k,int l,int i,int d){ return Wooov[(((size_t)k*NO+l)*NO+i)*NV+d]; };
-    auto wvovv= [&](int a,int l,int c,int d){ return Wvovv[(((size_t)a*NO+l)*NV+c)*NV+d]; };
+    auto wvovv= [&](int a,int l,int c,int d){ return wvovv_src[(((size_t)a*NO+l)*NV+c)*NV+d]; };
     auto wovoo= [&](int k,int c,int l,int i){ return Wovoo[(((size_t)k*NV+c)*NO+l)*NO+i]; };
     auto wovov= [&](int k,int b,int i,int d){ return Wovov[(((size_t)k*NV+b)*NO+i)*NV+d]; };
     auto wovvo= [&](int k,int b,int c,int j){ return Wovvo[(((size_t)k*NV+b)*NV+c)*NO+j]; };
     auto eriov= [&](int k,int b,int i,int d){ return ERIov[(((size_t)k*NV+b)*NO+i)*NV+d]; };
     auto r2ip = [&](int m,int i,int j,int a){ return R2IP[(((size_t)m*NO+i)*NO+j)*NV+a]; };
     auto r2ea = [&](int e,int i,int a,int b){ return R2EA[(((size_t)e*NO+i)*NV+a)*NV+b]; };
+
+    // Reusable device a-slab for the three Wvovv device GEMM sites below
+    // (UAKEI-T4, Eq.60 term3, Eq.61). ALWAYS used (host-staged AND device-borrow/
+    // rebuild): the slab reads from the host `wvovv_src` (stage or D2H pull), so
+    // the whole GEMM section is host-sourced and RELOCATABLE — it can run on the
+    // Ship-15 device-balanced peer GPU without touching the bar-H GPU's device
+    // Wvovv. Bounding to `wvovv_slab_rows` a-rows also elides the two full NV³·NO
+    // ≈ 32 GB device copies (UAKEI operand + Eq.60/61 dW) that OOM'd the packed
+    // bar-H GPU. Sized like EA's σ streamer (~10% free / a-row). Freed at exit.
+    real_t* d_wvovv_slab = nullptr;
+    int     wvovv_slab_rows = 0;
+    const size_t wvovv_row = (size_t)NO * NV * NV;   // elems per a-row
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available() && wvovv_src != nullptr) {
+        size_t freeb = 0, totb = 0; cudaMemGetInfo(&freeb, &totb);
+        const size_t row_bytes = wvovv_row * sizeof(real_t);
+        wvovv_slab_rows = (int)std::min<size_t>((size_t)NV,
+            std::max<size_t>(1, (size_t)(0.10 * (double)freeb) / row_bytes));
+        if (const char* ws = std::getenv("GANSU_STEOM_W_SLAB"))
+            if (std::atoi(ws) > 0) wvovv_slab_rows = std::min(NV, std::atoi(ws));
+        tracked_cudaMalloc(&d_wvovv_slab, (size_t)wvovv_slab_rows * row_bytes);
+        std::cout << "  [STEOM] Wvovv device GEMMs streamed (host-sourced, relocatable) in "
+                  << wvovv_slab_rows << "/" << NV << " a-row slabs ("
+                  << std::fixed << std::setprecision(2)
+                  << ((double)wvovv_slab_rows * row_bytes / (1024.0*1024.0*1024.0))
+                  << " GiB slab buffer)." << std::defaultfloat << std::endl;
+    }
+    // Upload a-slab [a0,a0+na) of the pinned host Wvovv into d_wvovv_slab.
+    auto upload_wvovv_slab = [&](int a0, int na) {
+        cudaMemcpy(d_wvovv_slab, wvovv_src + (size_t)a0 * wvovv_row,
+                   (size_t)na * wvovv_row * sizeof(real_t), cudaMemcpyHostToDevice);
+    };
+#endif
 
     // ---- s_IP[m][i,j,a] = -Σ_λ R2_IP[λ][i,j,a]·X_IP[m,λ] ; s_EA[e][i,a,b] = +Σ_λ R2_EA[λ]·X_EA[e,λ]
     //  (X_IP[m_NTO,λ] = rinv_IP[λ,m_NTO] from build_x_matrices, matching build_normalized_s.)
@@ -4108,7 +4213,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     std::vector<real_t> uakei_t4;   // [NV·NO × NMv·NO] = u_akei layout
     bool uakei_t4_gpu = false;
 #ifndef GANSU_CPU_ONLY
-    if (gpu::gpu_available() && d_Wvovv_ != nullptr) {
+    if (gpu::gpu_available() && d_wvovv_slab != nullptr) {
         cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
         const int M = NV * NO, Ncol = NMv * NO, K = NV * NV;
         real_t *d_seA = nullptr, *d_out = nullptr;
@@ -4116,8 +4221,16 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         tracked_cudaMalloc(&d_out, (size_t)M * Ncol * sizeof(real_t));
         cudaMemcpy(d_seA, sEA.data(), sEA.size() * sizeof(real_t), cudaMemcpyHostToDevice);
         const real_t one = 1.0, zero = 0.0;
-        cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, Ncol, M, K, &one,
-                    d_seA, K, d_Wvovv_, K, &zero, d_out, Ncol);
+        // Always stream Wvovv a-slabs from host `wvovv_src` — each covers the
+        // M-row band [a0·NO, (a0+na)·NO) of the [(a,k)×(c,d)] operand → C column
+        // band. Host-sourced ⇒ relocatable + no 32 GB device Wvovv operand.
+        for (int a0 = 0; a0 < NV; a0 += wvovv_slab_rows) {
+            const int na = std::min(wvovv_slab_rows, NV - a0);
+            upload_wvovv_slab(a0, na);
+            cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N, Ncol, na * NO, K, &one,
+                        d_seA, K, d_wvovv_slab, K, &zero,
+                        d_out + (size_t)a0 * NO * Ncol, Ncol);
+        }
         uakei_t4.assign((size_t)M * Ncol, 0.0);
         cudaMemcpy(uakei_t4.data(), d_out, (size_t)M * Ncol * sizeof(real_t),
                    cudaMemcpyDeviceToHost);
@@ -4684,12 +4797,10 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                 cudaMemcpy(ct60_t2.data(),dC,(size_t)M2*P60_N2*sizeof(real_t),cudaMemcpyDeviceToHost);
                 tracked_cudaFree(dA);tracked_cudaFree(dB);tracked_cudaFree(dC);
             }
-            // ---- raw Wvovv uploaded ONCE, shared by Eq.60 term3 and the Eq.61 Wvovv term ----
+            // ---- raw Wvovv: ALWAYS streamed a-slab from host `wvovv_src` (no
+            //      full NV³·NO device copy) — shared by Eq.60 term3 + Eq.61 ----
             {
                 const int P60_KD = NO*NV;   // Eq.60 term3 contraction block (k,d)
-                real_t* dW=nullptr;
-                tracked_cudaMalloc(&dW,Wvovv.size()*sizeof(real_t));
-                cudaMemcpy(dW,Wvovv.data(),Wvovv.size()*sizeof(real_t),cudaMemcpyHostToDevice);
                 // Eq.60 term3: ct60_t3[(b,c),(m,j)] = Σ_{k,d} wvovv(b,k,d,c)·siP(m,k,j,d).
                 // Per-b GEMM on the raw slice Wvovv[b] = [(k,d)×c] (col-major NV×KD, OP_T).
                 if (NMo > 0) {
@@ -4702,10 +4813,14 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                     tracked_cudaMalloc(&dB,(size_t)P60_MJ*P60_KD*sizeof(real_t));
                     tracked_cudaMalloc(&dC,(size_t)NV*NV*P60_MJ*sizeof(real_t));
                     cudaMemcpy(dB,hB.data(),(size_t)P60_MJ*P60_KD*sizeof(real_t),cudaMemcpyHostToDevice);
-                    for (int b=0;b<NV;++b)
-                        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_T,P60_MJ,NV,P60_KD,&one,
-                                    dB,P60_KD,dW+(size_t)b*P60_KD*NV,NV,&zero,
-                                    dC+(size_t)b*NV*P60_MJ,P60_MJ);
+                    for (int a0=0;a0<NV;a0+=wvovv_slab_rows) {
+                        const int na=std::min(wvovv_slab_rows,NV-a0);
+                        upload_wvovv_slab(a0,na);
+                        for (int b=a0;b<a0+na;++b)
+                            cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_T,P60_MJ,NV,P60_KD,&one,
+                                        dB,P60_KD,d_wvovv_slab+(size_t)(b-a0)*P60_KD*NV,NV,&zero,
+                                        dC+(size_t)b*NV*P60_MJ,P60_MJ);
+                    }
                     ct60_t3.assign((size_t)NV*NV*P60_MJ,0.0);
                     cudaMemcpy(ct60_t3.data(),dC,(size_t)NV*NV*P60_MJ*sizeof(real_t),cudaMemcpyDeviceToHost);
                     tracked_cudaFree(dB);tracked_cudaFree(dC);
@@ -4714,7 +4829,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                 // Eq.61 Wvovv term: ct61_w[(b,k),(e,j)] = Σ_{c,d} wvovv(b,k,d,c)·seA(e,j,c,d).
                 // Raw Wvovv is already [(b,k)×(d,c)] with the contraction pair LAST -> no repack.
                 if (NMv > 0) {
-                    const int BK = NV*NO, DC = NV*NV;
+                    const int DC = NV*NV;
                     std::vector<real_t> hB((size_t)P61_EJ*DC);
                     #pragma omp parallel for collapse(2)
                     for (int e=0;e<NMv;++e) for (int j=0;j<NO;++j)
@@ -4722,14 +4837,19 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                             hB[(size_t)(e*NO+j)*DC+(d*NV+c)] = seA(e,j,c,d);
                     real_t *dB=nullptr,*dC=nullptr;
                     tracked_cudaMalloc(&dB,(size_t)P61_EJ*DC*sizeof(real_t));
-                    tracked_cudaMalloc(&dC,(size_t)BK*P61_EJ*sizeof(real_t));
+                    tracked_cudaMalloc(&dC,(size_t)NV*NO*P61_EJ*sizeof(real_t));
                     cudaMemcpy(dB,hB.data(),(size_t)P61_EJ*DC*sizeof(real_t),cudaMemcpyHostToDevice);
-                    cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,P61_EJ,BK,DC,&one,dB,DC,dW,DC,&zero,dC,P61_EJ);
-                    ct61_w.assign((size_t)BK*P61_EJ,0.0);
-                    cudaMemcpy(ct61_w.data(),dC,(size_t)BK*P61_EJ*sizeof(real_t),cudaMemcpyDeviceToHost);
+                    for (int a0=0;a0<NV;a0+=wvovv_slab_rows) {
+                        const int na=std::min(wvovv_slab_rows,NV-a0);
+                        upload_wvovv_slab(a0,na);
+                        cublasDgemm(cublas,CUBLAS_OP_T,CUBLAS_OP_N,P61_EJ,na*NO,DC,&one,
+                                    dB,DC,d_wvovv_slab,DC,&zero,
+                                    dC+(size_t)a0*NO*P61_EJ,P61_EJ);
+                    }
+                    ct61_w.assign((size_t)NV*NO*P61_EJ,0.0);
+                    cudaMemcpy(ct61_w.data(),dC,(size_t)NV*NO*P61_EJ*sizeof(real_t),cudaMemcpyDeviceToHost);
                     tracked_cudaFree(dB);tracked_cudaFree(dC);
                 }
-                tracked_cudaFree(dW);
             }
             // ---- Eq.61 term1: ct61_t1[(e,j,b),k] = Σ_d fov(k,d)·seA(e,j,d,b) ----
             if (NMv > 0) {
@@ -5236,6 +5356,11 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                   << (triplet_ ? "." : "  (H2O sto-3g singlet ref ~0.433 after route fix).")
                   << std::endl;
     }
+#ifndef GANSU_CPU_ONLY
+    // (EA σ host-stage) release the reusable Wvovv a-slab buffer (no consumer
+    // beyond the g_phph/g_phhp GEMMs above).
+    if (d_wvovv_slab) { tracked_cudaFree(d_wvovv_slab); d_wvovv_slab = nullptr; }
+#endif
 }
 
 #undef H_OVOV

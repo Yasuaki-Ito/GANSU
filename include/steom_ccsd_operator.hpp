@@ -281,6 +281,18 @@ private:
     SteomBarHCache* barh_cache_ = nullptr;
     bool barh_borrowed_ = false;
 
+    // === (A') EA σ host-stage borrow (2026-07-13) ===
+    // When EA host-staged Wvovv/Wvvvo (cache->w_host_staged: their device
+    // copies never existed at large NV³·NO), STEOM still borrows the 9
+    // device-resident bar-H (8 IP + Wvvvv) and consumes the pinned host Wvovv
+    // stage instead of rebuilding a 32 GB device copy: host-loop sites
+    // (build_F_eff_vv, build_W_eff_and_G host reads) index h_wvovv_stage_
+    // directly; the three device GEMM sites in build_W_eff_and_G stream it in
+    // a-slabs. Wvvvo has NO STEOM consumer → left nullptr, rebuild elided.
+    // h_wvovv_stage_ is borrowed (points into the cache), not owned.
+    bool wvovv_host_staged_ = false;
+    const std::vector<real_t>* h_wvovv_stage_ = nullptr;
+
     // === Fock diagonals (for bar-H build) ===
     real_t* d_f_oo_  = nullptr;  // [nocc_active]
     real_t* d_f_vv_  = nullptr;  // [nvir]
