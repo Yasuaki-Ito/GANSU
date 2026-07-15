@@ -98,6 +98,7 @@ public:
 
     // --- LinearOperator interface ---
     void apply(const real_t* d_input, real_t* d_output) const override;
+    void apply_batch(const real_t* d_inputs, real_t* d_outputs, int n_vec) const override;
     void apply_preconditioner(const real_t* d_input, real_t* d_output) const override;
     const real_t* get_diagonal_device() const override { return d_diagonal_; }
     int dimension() const override { return total_dim_; }
@@ -319,7 +320,10 @@ private:
                          const real_t* M_ringC, void* cublas,
                          int j_begin, int j_end, bool do_sigma1,
                          real_t* scr_tmp_k = nullptr, real_t* scr_r2T = nullptr,
-                         real_t* scr_tmp = nullptr) const;  // EA-5d: persistent scratch (else malloc)
+                         real_t* scr_tmp = nullptr,
+                         bool skip_host_stage = false) const;  // EA-5d: persistent scratch (else malloc)
+                                                               // skip_host_stage: defer the two host-staged
+                                                               // Wvovv/Wvvvo slab sweeps (apply_batch shares them)
     void apply_multi(const real_t* d_input, real_t* d_output) const;  // EA-5b/5c
 };
 

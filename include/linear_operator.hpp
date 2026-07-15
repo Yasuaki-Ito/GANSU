@@ -83,6 +83,30 @@ public:
     virtual void apply(const real_t* d_input, real_t* d_output) const = 0;
 
     /**
+     * @brief Apply the operator to a contiguous batch of vectors
+     *
+     * Computes d_outputs[:,v] = Op * d_inputs[:,v] for v in [0, n_vec).  The
+     * vectors are stored contiguously with stride dimension() (column-major
+     * block, matching the Davidson subspace/sigma buffers).
+     *
+     * The default implementation simply loops apply() over the batch, so it is
+     * bit-identical to per-vector application.  Operators whose matvec streams a
+     * large out-of-core intermediate (e.g. host-staged EA-EOM σ) override this
+     * to load each slab once and reuse it across all n_vec vectors, amortizing
+     * the H2D traffic by n_vec while keeping every kernel call byte-identical.
+     *
+     * @param d_inputs  Device pointer to n_vec input vectors (stride dimension())
+     * @param d_outputs Device pointer to n_vec output vectors (stride dimension())
+     * @param n_vec     Number of vectors in the batch (>= 1)
+     */
+    virtual void apply_batch(const real_t* d_inputs, real_t* d_outputs, int n_vec) const {
+        const size_t dim = static_cast<size_t>(dimension());
+        for (int v = 0; v < n_vec; ++v)
+            apply(d_inputs + static_cast<size_t>(v) * dim,
+                  d_outputs + static_cast<size_t>(v) * dim);
+    }
+
+    /**
      * @brief Get the dimension of the operator
      *
      * Returns the size of the vector space on which this operator acts.

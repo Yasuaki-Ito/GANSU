@@ -3770,6 +3770,104 @@ void EAEOMCCSDOperator::apply(const real_t* d_input, real_t* d_output) const {
     }
 }
 
+// ==================================================================
+//  apply_batch — batched matvec that shares the host-staged W slabs.
+//
+//  Only the host-staged single-GPU σ path benefits: it streams ~120 GiB
+//  (Wvovv+Wvvvo) per matvec.  Instead of re-streaming that for every one of
+//  the n_vec Davidson trial vectors, we (1) run the resident-only σ per vector
+//  (skip_host_stage=true), then (2)/(3) sweep each a-slab ONCE and fire the
+//  slab kernel for all n_vec vectors against the resident slab.  H2D traffic is
+//  amortized by n_vec with zero extra device memory (the single d_w_slab_ is
+//  reused).  Every slab kernel call is byte-identical to the per-vector path and
+//  writes disjoint output rows (a0+al); only the (vector, slab) loop nesting is
+//  swapped.  σ1 is bit-identical (no GEMM tail — Wvovv is the last addend either
+//  way).  σ2's Wvvvo += is deferred past the wvvvv/ring GEMM tail, so the SET of
+//  addends per σ2 element is unchanged but their summation order shifts by ≤1
+//  ULP (same re-association class the host-stage slab kernels already introduce
+//  vs the fully-resident path — comment on ea_sigma1_wvovv_slab_kernel).  The
+//  STEOM roots are unaffected to their printed precision; regress roots-to-8-
+//  digits, not raw bytes.  All other paths (device-resident W, multi-GPU, CPU,
+//  stub) fall back to per-vector apply().
+// ==================================================================
+void EAEOMCCSDOperator::apply_batch(const real_t* d_inputs, real_t* d_outputs,
+                                    int n_vec) const {
+#ifndef GANSU_CPU_ONLY
+    // GANSU_EA_BATCH=0 → legacy per-vector streaming (each Davidson trial vector
+    // re-streams the full host-staged W).  Default on.  Kept as a switch so the
+    // batched vs legacy EA-Davidson cost can be measured on the SAME binary +
+    // checkpoint, and as a regression safety valve.
+    static const bool batch_enabled = [] {
+        const char* e = std::getenv("GANSU_EA_BATCH");
+        return !(e && e[0] == '0');
+    }();
+    const bool batchable = batch_enabled && ea_w_host_stage_ && !use_gpu_multi_ &&
+                           n_vec > 1 && d_Lvv_ != nullptr && gpu::gpu_available();
+    if (batchable) {
+        const size_t td = (size_t)total_dim_;
+        cublasHandle_t cublas = (cublasHandle_t)gansu::gpu::GPUHandle::cublas();
+        const int threads = 256;
+
+        // (1) per-vector resident σ (everything EXCEPT the two host-staged sweeps).
+        for (int v = 0; v < n_vec; ++v) {
+            const real_t* r = d_inputs  + (size_t)v * td;
+            real_t*       s = d_outputs + (size_t)v * td;
+            apply_sigma_gpu(r, r + p_dim_, s, s + p_dim_,
+                            d_Lvv_, d_Loo_, d_Fov_, d_Wovov_, d_Wovvo_, d_Wvovv_,
+                            d_Wvvvo_, d_Wvvvv_, d_t2_, d_eri_ovov_,
+                            d_M_ringA_, d_M_ringB_, d_M_ringC_, (void*)cublas,
+                            /*j_begin=*/0, /*j_end=*/nocc_, /*do_sigma1=*/true,
+                            /*scr_tmp_k=*/nullptr, /*scr_r2T=*/nullptr,
+                            /*scr_tmp=*/nullptr, /*skip_host_stage=*/true);
+        }
+
+        // (2) shared Wvovv a-slab sweep → σ1 (load once per slab, all vectors).
+        {
+            const size_t wrow = (size_t)nocc_ * nvir_ * nvir_;
+            for (int a0 = 0; a0 < nvir_; a0 += w_slab_rows_) {
+                const int na = std::min(w_slab_rows_, nvir_ - a0);
+                cudaMemcpy(d_w_slab_, h_wvovv_stage_.data() + (size_t)a0 * wrow,
+                           (size_t)na * wrow * sizeof(real_t),
+                           cudaMemcpyHostToDevice);
+                const int nb1 = (na + threads - 1) / threads;
+                for (int v = 0; v < n_vec; ++v) {
+                    const real_t* r2 = d_inputs  + (size_t)v * td + p_dim_;
+                    real_t*       s1 = d_outputs + (size_t)v * td;
+                    ea_sigma1_wvovv_slab_kernel<<<nb1, threads>>>(
+                        d_w_slab_, r2, s1, nocc_, nvir_, a0, na);
+                }
+                cudaDeviceSynchronize();   // d_w_slab_ reused next slab
+            }
+        }
+
+        // (3) shared Wvvvo a-slab sweep → σ2 (single-GPU: full j range [0,nocc)).
+        {
+            const size_t wrow = (size_t)nvir_ * nvir_ * nocc_;
+            const int jslab = nocc_;
+            for (int a0 = 0; a0 < nvir_; a0 += w_slab_rows_) {
+                const int na = std::min(w_slab_rows_, nvir_ - a0);
+                cudaMemcpy(d_w_slab_, h_wvvvo_stage_.data() + (size_t)a0 * wrow,
+                           (size_t)na * wrow * sizeof(real_t),
+                           cudaMemcpyHostToDevice);
+                const size_t tot2 = (size_t)jslab * na * nvir_;
+                const int nb2 = (int)((tot2 + threads - 1) / threads);
+                for (int v = 0; v < n_vec; ++v) {
+                    const real_t* r1 = d_inputs  + (size_t)v * td;
+                    real_t*       s2 = d_outputs + (size_t)v * td + p_dim_;
+                    ea_sigma2_wvvvo_slab_kernel<<<nb2, threads>>>(
+                        d_w_slab_, r1, s2, nocc_, nvir_, a0, na, /*j_begin=*/0, jslab);
+                }
+                cudaDeviceSynchronize();
+            }
+        }
+        return;
+    }
+#endif
+    // Fallback: per-vector application (default LinearOperator semantics).
+    for (int v = 0; v < n_vec; ++v)
+        apply(d_inputs + (size_t)v * total_dim_, d_outputs + (size_t)v * total_dim_);
+}
+
 #ifndef GANSU_CPU_ONLY
 // ==================================================================
 //  Device-parametric GPU σ (Stage EA-5b).  Identical numerics to the
@@ -3786,7 +3884,8 @@ void EAEOMCCSDOperator::apply_sigma_gpu(
     const real_t* eri_ovov, const real_t* M_ringA, const real_t* M_ringB,
     const real_t* M_ringC, void* cublas_v,
     int j_begin, int j_end, bool do_sigma1,
-    real_t* scr_tmp_k, real_t* scr_r2T, real_t* scr_tmp) const
+    real_t* scr_tmp_k, real_t* scr_r2T, real_t* scr_tmp,
+    bool skip_host_stage) const
 {
     cublasHandle_t cublas = (cublasHandle_t)cublas_v;
     const int threads = 256;
@@ -3800,7 +3899,8 @@ void EAEOMCCSDOperator::apply_sigma_gpu(
             Lvv, Fov, Wvovv, d_r1, d_r2, d_s1, nocc_, nvir_);
         // (EA σ host-stage) stream the Wvovv term in a-slabs (output-slab —
         // each σ1[a] gets its full l,c,d sum from its own slab).
-        if (ea_w_host_stage_) {
+        // skip_host_stage: apply_batch defers this to a batch-shared slab sweep.
+        if (ea_w_host_stage_ && !skip_host_stage) {
             const size_t wrow = (size_t)nocc_ * nvir_ * nvir_;
             for (int a0 = 0; a0 < nvir_; a0 += w_slab_rows_) {
                 const int na = std::min(w_slab_rows_, nvir_ - a0);
@@ -3847,7 +3947,8 @@ void EAEOMCCSDOperator::apply_sigma_gpu(
         d_tmp_k, t2, d_r1, d_r2, d_s2, nocc_, nvir_,
         (wvvvv_gemm || ea_ri_ladder_) ? 0 : 1, ring_gemm ? 0 : 1, j_begin, j_end);
     // (EA σ host-stage) stream the Wvvvo·r1 term in a-slabs (output-slab).
-    if (ea_w_host_stage_) {
+    // skip_host_stage: apply_batch defers this to a batch-shared slab sweep.
+    if (ea_w_host_stage_ && !skip_host_stage) {
         const size_t wrow = (size_t)nvir_ * nvir_ * nocc_;
         for (int a0 = 0; a0 < nvir_; a0 += w_slab_rows_) {
             const int na = std::min(w_slab_rows_, nvir_ - a0);

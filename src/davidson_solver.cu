@@ -263,9 +263,14 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
         {
             int n_new = subspace_dim_ - sigma_computed_;
             auto t_start = std::chrono::high_resolution_clock::now();
-            for (int i = sigma_computed_; i < subspace_dim_; ++i) {
-                linear_op_.apply(&d_subspace_vectors_[static_cast<size_t>(i) * dim_],
-                               &d_sigma_vectors_[static_cast<size_t>(i) * dim_]);
+            // Batched matvec: apply the operator to all n_new NEW vectors at once.
+            // Default apply_batch loops apply() (bit-identical); operators with a
+            // streamed out-of-core intermediate (host-staged EA σ) share each slab
+            // across the batch, amortizing H2D by n_new.
+            if (n_new > 0) {
+                linear_op_.apply_batch(&d_subspace_vectors_[static_cast<size_t>(sigma_computed_) * dim_],
+                                       &d_sigma_vectors_[static_cast<size_t>(sigma_computed_) * dim_],
+                                       n_new);
             }
             sigma_computed_ = subspace_dim_;
             cudaDeviceSynchronize();
@@ -391,9 +396,10 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
             // Detect eigenvalue collapse after restart for non-Hermitian problems
             if (config_.min_eigenvalue > 0.0) {
                 // Recompute sigma and subspace matrix to check new eigenvalues
-                for (int ii = sigma_computed_; ii < subspace_dim_; ++ii) {
-                    linear_op_.apply(&d_subspace_vectors_[static_cast<size_t>(ii) * dim_],
-                                   &d_sigma_vectors_[static_cast<size_t>(ii) * dim_]);
+                if (subspace_dim_ - sigma_computed_ > 0) {
+                    linear_op_.apply_batch(&d_subspace_vectors_[static_cast<size_t>(sigma_computed_) * dim_],
+                                           &d_sigma_vectors_[static_cast<size_t>(sigma_computed_) * dim_],
+                                           subspace_dim_ - sigma_computed_);
                 }
                 sigma_computed_ = subspace_dim_;
                 cudaDeviceSynchronize();
