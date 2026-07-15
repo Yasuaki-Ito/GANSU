@@ -70,6 +70,7 @@ DavidsonSolver::DavidsonSolver(const LinearOperator& linear_op,
       d_sigma_vectors_(nullptr),
       d_subspace_matrix_(nullptr),
       d_subspace_eigenvalues_(nullptr),
+      d_subspace_eigenvalues_imag_(nullptr),
       d_subspace_eigenvectors_(nullptr),
       d_residuals_(nullptr),
       d_eigenvectors_(nullptr)
@@ -109,6 +110,7 @@ DavidsonSolver::DavidsonSolver(const LinearOperator& linear_op,
 
     // Allocate host memory
     h_eigenvalues_.resize(config_.num_eigenvalues);
+    h_eigenvalues_imag_.assign(config_.num_eigenvalues, 0.0);
     residual_norms_.resize(config_.num_eigenvalues);
 
     // Allocate GPU memory
@@ -167,8 +169,10 @@ void DavidsonSolver::allocate_memory() {
     tracked_cudaMalloc(&d_subspace_matrix_,
                        static_cast<size_t>(config_.max_subspace_size) * config_.max_subspace_size * sizeof(real_t));
 
-    // Subspace eigenvalues: max_subspace_size
+    // Subspace eigenvalues: max_subspace_size (+ imag parts, non-Hermitian FULL mode)
     tracked_cudaMalloc(&d_subspace_eigenvalues_,
+                       config_.max_subspace_size * sizeof(real_t));
+    tracked_cudaMalloc(&d_subspace_eigenvalues_imag_,
                        config_.max_subspace_size * sizeof(real_t));
 
     // Subspace eigenvectors: max_subspace_size × max_subspace_size
@@ -203,6 +207,7 @@ void DavidsonSolver::free_memory() {
     if (d_sigma_vectors_) tracked_cudaFree(d_sigma_vectors_);
     if (d_subspace_matrix_) tracked_cudaFree(d_subspace_matrix_);
     if (d_subspace_eigenvalues_) tracked_cudaFree(d_subspace_eigenvalues_);
+    if (d_subspace_eigenvalues_imag_) tracked_cudaFree(d_subspace_eigenvalues_imag_);
     if (d_subspace_eigenvectors_) tracked_cudaFree(d_subspace_eigenvectors_);
     if (d_residuals_) tracked_cudaFree(d_residuals_);
     if (d_eigenvectors_) tracked_cudaFree(d_eigenvectors_);
@@ -211,6 +216,7 @@ void DavidsonSolver::free_memory() {
     d_sigma_vectors_ = nullptr;
     d_subspace_matrix_ = nullptr;
     d_subspace_eigenvalues_ = nullptr;
+    d_subspace_eigenvalues_imag_ = nullptr;
     d_subspace_eigenvectors_ = nullptr;
     d_residuals_ = nullptr;
     d_eigenvectors_ = nullptr;
@@ -434,6 +440,22 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
     if (!converged && config_.verbose > 0) {
         std::cout << "  Warning: Davidson did not converge in "
                  << config_.max_iterations << " iterations" << std::endl;
+    }
+
+    // (FULL mode) Unresolved complex Ritz pairs at exit: the reported real part
+    // is only the pair's real projection — flag it (the legacy path silently
+    // returned a garbage 1e30 root here instead).
+    if (!config_.symmetric) {
+        for (int i = 0; i < config_.num_eigenvalues; ++i) {
+            if (std::abs(h_eigenvalues_imag_[i]) > 1e-8) {
+                std::cout << "  Warning: Davidson root " << i << " is part of a complex"
+                          << " Ritz pair at exit (" << std::scientific << std::setprecision(6)
+                          << h_eigenvalues_[i] << " ± " << std::abs(h_eigenvalues_imag_[i])
+                          << "i) — the operator is non-normal/near-defective here; treat"
+                          << " this root's energy as unresolved." << std::defaultfloat
+                          << std::endl;
+            }
+        }
     }
 
     if (config_.verbose > 0) {
@@ -803,11 +825,18 @@ void DavidsonSolver::solve_subspace_eigenproblem() {
             subspace_dim_
         );
     } else {
+        // FULL mode (imag array passed): complex Ritz pairs are KEPT sorted by
+        // real part instead of dropped-to-1e30 with zero eigenvectors (the drop
+        // made zero Ritz vectors → residual 0 → fake convergence on garbage
+        // roots; see d_subspace_eigenvalues_imag_ in the header).  Purely-real
+        // subspace spectra are bit-identical (real roots have Im = 0 exactly).
         status = gpu::eigenDecompositionNonSymmetric(
             d_subspace_matrix_,
             d_subspace_eigenvalues_,
             d_subspace_eigenvectors_,
-            subspace_dim_
+            subspace_dim_,
+            /*force_host=*/false,
+            d_subspace_eigenvalues_imag_
         );
     }
 
@@ -819,6 +848,13 @@ void DavidsonSolver::solve_subspace_eigenproblem() {
     cudaMemcpy(h_eigenvalues_.data(), d_subspace_eigenvalues_,
                config_.num_eigenvalues * sizeof(real_t),
                cudaMemcpyDeviceToHost);
+    if (config_.symmetric) {
+        std::fill(h_eigenvalues_imag_.begin(), h_eigenvalues_imag_.end(), 0.0);
+    } else {
+        cudaMemcpy(h_eigenvalues_imag_.data(), d_subspace_eigenvalues_imag_,
+                   config_.num_eigenvalues * sizeof(real_t),
+                   cudaMemcpyDeviceToHost);
+    }
 
     if (config_.verbose > 2) {
         std::cout << "Subspace eigenvalues:" << std::endl;

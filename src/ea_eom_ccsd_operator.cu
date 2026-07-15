@@ -194,6 +194,41 @@ __global__ void ea_sigma1_wvovv_slab_kernel(
     sigma1[a0 + al] += s;
 }
 
+// (2026-07-15 block-reduce) One BLOCK per slab row al, grid-stride over the
+// nocc·nvir² (l,c,d) sum + shared-memory tree reduction.  The thread-per-row
+// variant above runs na (≈61 at 490) threads TOTAL on the device — the σ per-
+// vector hotspot after ring GEMM.  Fixed blockDim ⇒ deterministic summation
+// shape (reassoc vs the sequential loop is the usual ≤1 ULP class; roots-to-8-
+// digits regression, not raw bytes).  Gate: GANSU_EA_BLOCK_REDUCE=0 → legacy.
+__global__ void ea_sigma1_wvovv_slab_block_kernel(
+    const real_t* __restrict__ Wvovv_slab,
+    const real_t* __restrict__ r2,
+    real_t* __restrict__ sigma1,
+    int nocc, int nvir, int a0)
+{
+    const int al = blockIdx.x;                       // one block per slab row
+    const size_t n = (size_t)nocc * nvir * nvir;     // (l,c,d) flattened, d fastest
+    const real_t* w = Wvovv_slab + (size_t)al * n;
+    __shared__ real_t sh[256];
+    real_t s = 0.0;
+    for (size_t idx = threadIdx.x; idx < n; idx += blockDim.x) {
+        const int d = (int)(idx % nvir);
+        const size_t t = idx / nvir;
+        const int c = (int)(t % nvir);
+        const int l = (int)(t / nvir);
+        const real_t w1 = w[idx];                                    // [l,c,d]
+        const real_t w2 = w[((size_t)l * nvir + d) * nvir + c];      // [l,d,c]
+        s += (2.0 * w1 - w2) * r2[idx];
+    }
+    sh[threadIdx.x] = s;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if ((int)threadIdx.x < off) sh[threadIdx.x] += sh[threadIdx.x + off];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) sigma1[a0 + al] += sh[0];
+}
+
 // (EA σ host-stage) a-slab variant of the σ2 Wvvvo·r1 term: the slab holds
 // rows a ∈ [a0, a0+na) of [a,b,c,j]; outputs σ2[j, a∈slab, b] each receive
 // their full Σ_c from their own slab (output-slab).
@@ -237,6 +272,49 @@ __global__ void ea_eom_sigma2_tmp_k_kernel(
                 s += (2.0 * w_kcld - w_kdlc) * r2[((size_t)l * nvir + c) * nvir + d];
             }
     tmp_k[k] = s;
+}
+
+// (2026-07-15 block-reduce) One BLOCK per k, grid-stride over the nocc·nvir²
+// (l,c,d) sum + shared-memory tree reduction.  The thread-per-k variant above
+// runs nocc (108 at 490) threads TOTAL — a σ per-vector hotspot after the ring
+// GEMM offload.  Deterministic shape; ≤1 ULP reassoc vs the sequential loop.
+// Gate: GANSU_EA_BLOCK_REDUCE=0 → legacy.
+__global__ void ea_eom_sigma2_tmp_k_block_kernel(
+    const real_t* __restrict__ ovov,
+    const real_t* __restrict__ r2,
+    real_t* __restrict__ tmp_k,
+    int nocc, int nvir)
+{
+    const int k = blockIdx.x;                        // one block per k
+    const size_t n = (size_t)nocc * nvir * nvir;     // (l,c,d) flattened, d fastest
+    __shared__ real_t sh[256];
+    real_t s = 0.0;
+    for (size_t idx = threadIdx.x; idx < n; idx += blockDim.x) {
+        const int d = (int)(idx % nvir);
+        const size_t t = idx / nvir;
+        const int c = (int)(t % nvir);
+        const int l = (int)(t / nvir);
+        const real_t w_kcld = ovov[(((size_t)k * nvir + c) * nocc + l) * nvir + d];
+        const real_t w_kdlc = ovov[(((size_t)k * nvir + d) * nocc + l) * nvir + c];
+        s += (2.0 * w_kcld - w_kdlc) * r2[idx];      // r2[l,c,d] = linear idx
+    }
+    sh[threadIdx.x] = s;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if ((int)threadIdx.x < off) sh[threadIdx.x] += sh[threadIdx.x + off];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) tmp_k[k] = sh[0];
+}
+
+// (2026-07-15) Gate for the two block-reduce kernels above (default on;
+// GANSU_EA_BLOCK_REDUCE=0 → legacy thread-per-index kernels, regression triage).
+static bool ea_block_reduce() {
+    static const bool on = [] {
+        const char* e = std::getenv("GANSU_EA_BLOCK_REDUCE");
+        return !(e && e[0] == '0');
+    }();
+    return on;
 }
 
 
@@ -3946,12 +4024,17 @@ void EAEOMCCSDOperator::apply_batch(const real_t* d_inputs, real_t* d_outputs,
                 cudaMemcpy(d_w_slab_, h_wvovv_stage_.data() + (size_t)a0 * wrow,
                            (size_t)na * wrow * sizeof(real_t),
                            cudaMemcpyHostToDevice);
-                const int nb1 = (na + threads - 1) / threads;
                 for (int v = 0; v < n_vec; ++v) {
                     const real_t* r2 = d_inputs  + (size_t)v * td + p_dim_;
                     real_t*       s1 = d_outputs + (size_t)v * td;
-                    ea_sigma1_wvovv_slab_kernel<<<nb1, threads>>>(
-                        d_w_slab_, r2, s1, nocc_, nvir_, a0, na);
+                    if (ea_block_reduce()) {
+                        ea_sigma1_wvovv_slab_block_kernel<<<na, threads>>>(
+                            d_w_slab_, r2, s1, nocc_, nvir_, a0);
+                    } else {
+                        const int nb1 = (na + threads - 1) / threads;
+                        ea_sigma1_wvovv_slab_kernel<<<nb1, threads>>>(
+                            d_w_slab_, r2, s1, nocc_, nvir_, a0, na);
+                    }
                 }
                 cudaDeviceSynchronize();   // d_w_slab_ reused next slab
             }
@@ -4024,9 +4107,14 @@ void EAEOMCCSDOperator::apply_sigma_gpu(
                 cudaMemcpy(d_w_slab_, h_wvovv_stage_.data() + (size_t)a0 * wrow,
                            (size_t)na * wrow * sizeof(real_t),
                            cudaMemcpyHostToDevice);
-                const int nb1 = (na + threads - 1) / threads;
-                ea_sigma1_wvovv_slab_kernel<<<nb1, threads>>>(
-                    d_w_slab_, d_r2, d_s1, nocc_, nvir_, a0, na);
+                if (ea_block_reduce()) {
+                    ea_sigma1_wvovv_slab_block_kernel<<<na, threads>>>(
+                        d_w_slab_, d_r2, d_s1, nocc_, nvir_, a0);
+                } else {
+                    const int nb1 = (na + threads - 1) / threads;
+                    ea_sigma1_wvovv_slab_kernel<<<nb1, threads>>>(
+                        d_w_slab_, d_r2, d_s1, nocc_, nvir_, a0, na);
+                }
                 cudaDeviceSynchronize();
             }
         }
@@ -4037,9 +4125,14 @@ void EAEOMCCSDOperator::apply_sigma_gpu(
     // EA-5d: use persistent scratch when provided (multi path) to avoid per-matvec malloc.
     real_t* d_tmp_k = scr_tmp_k;
     if (!d_tmp_k) tracked_cudaMalloc(&d_tmp_k, (size_t)nocc_ * sizeof(real_t));
-    const int blocks_tmp = (nocc_ + threads - 1) / threads;
-    ea_eom_sigma2_tmp_k_kernel<<<blocks_tmp, threads>>>(
-        eri_ovov, d_r2, d_tmp_k, nocc_, nvir_);
+    if (ea_block_reduce()) {
+        ea_eom_sigma2_tmp_k_block_kernel<<<nocc_, threads>>>(
+            eri_ovov, d_r2, d_tmp_k, nocc_, nvir_);
+    } else {
+        const int blocks_tmp = (nocc_ + threads - 1) / threads;
+        ea_eom_sigma2_tmp_k_kernel<<<blocks_tmp, threads>>>(
+            eri_ovov, d_r2, d_tmp_k, nocc_, nvir_);
+    }
 
     // Wvvvv·r2 and ring terms via GEMM (env-gated, same as legacy).
     static const bool wvvvv_gemm = [] {

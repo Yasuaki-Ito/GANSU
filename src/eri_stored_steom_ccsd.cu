@@ -1944,7 +1944,17 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                           << "GANSU_STEOM_DENSE_DIAG=1 if affordable)." << std::endl;
         }
         DavidsonConfig config;
-        config.num_eigenvalues       = n_states_to_compute;
+        // (2026-07-15 complex-Ritz selection) The FULL-mode subspace geev keeps
+        // complex Ritz pairs (the legacy drop→1e30+zero-vector made the solver
+        // die on them — 490 p-DDPA iter-2 sentinel collapse).  A near-defective
+        // G can put complex pairs BELOW the physical real roots (490: the whole
+        // lowest 5 slots were pair real-parts, displacing the 6.47–9.44 eV real
+        // states the legacy run reported).  So solve a buffered set and select
+        // the lowest n_states REAL roots afterwards — mirroring the dense-geev
+        // selection policy above (real first, collapsed complex pairs as filler
+        // with the recovery warning).
+        const int nev_solve = std::min(total_dim, 2 * n_states_to_compute + 2);
+        config.num_eigenvalues       = nev_solve;
         config.convergence_threshold = rhf.get_steom_d_tol();
         config.max_subspace_size     = std::min(total_dim, std::max(80, 20 * n_states_to_compute));
         config.max_iterations        = rhf.get_steom_max_iter();
@@ -1959,8 +1969,57 @@ static void compute_steom_ccsd_impl(RHF& rhf,
             std::cout << "Warning: STEOM-CCSD Davidson did not converge for all roots." << std::endl;
         }
 
-        eigenvalues = solver.get_eigenvalues();
-        solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+        const std::vector<real_t>& ev  = solver.get_eigenvalues();
+        const std::vector<real_t>& evi = solver.get_eigenvalues_imag();
+        const double imag_tol = 1e-6;
+        std::vector<int>  sel;          sel.reserve(n_states_to_compute);
+        std::vector<char> sel_complex;  sel_complex.reserve(n_states_to_compute);
+        for (int i = 0; i < nev_solve && (int)sel.size() < n_states_to_compute; ++i)
+            if (std::abs(evi[i]) <= imag_tol) { sel.push_back(i); sel_complex.push_back(0); }
+        const int n_real_found = (int)sel.size();
+        if (n_real_found < n_states_to_compute) {
+            // Not enough real roots in the solved window: fall back to collapsed
+            // complex-conjugate pairs (keep one member per pair), flagged below.
+            for (int i = 0; i < nev_solve && (int)sel.size() < n_states_to_compute; ++i) {
+                if (std::abs(evi[i]) <= imag_tol) continue;
+                if (i > 0 && std::abs(evi[i-1]) > imag_tol && ev[i] == ev[i-1] &&
+                    std::abs(evi[i]) == std::abs(evi[i-1])) continue;   // pair 2nd member
+                sel.push_back(i); sel_complex.push_back(1);
+            }
+        }
+        {
+            int n_cplx = 0;  real_t max_imag = 0.0;
+            for (size_t n = 0; n < sel.size(); ++n)
+                if (sel_complex[n]) { ++n_cplx; max_imag = std::max(max_imag, std::abs(evi[sel[n]])); }
+            if (n_cplx > 0)
+                std::cout << "  [STEOM complex-root recovery] " << n_cplx << "/" << sel.size()
+                          << " reported states are complex-conjugate pairs collapsed to their "
+                             "real part (near-defective G — handle with care; max|Im|="
+                          << std::scientific << std::setprecision(2) << max_imag << " Ha = "
+                          << std::fixed << std::setprecision(3) << (max_imag * 27.2114)
+                          << " eV)." << std::endl;
+            else if (n_real_found >= n_states_to_compute) {
+                int n_skipped = sel.empty() ? 0 : (sel.back() + 1 - (int)sel.size());
+                if (n_skipped > 0)
+                    std::cout << "  [STEOM Davidson] skipped " << n_skipped << " complex Ritz "
+                                 "pair member(s) below the selected real roots (near-defective "
+                                 "G; real roots reported)." << std::endl;
+            }
+        }
+        if ((int)sel.size() < n_states_to_compute)
+            std::cout << "Warning: STEOM Davidson window yielded only " << sel.size() << "/"
+                      << n_states_to_compute << " selectable roots." << std::endl;
+
+        eigenvalues.assign(n_states_to_compute, 1e30);
+        for (int n = 0; n < (int)sel.size(); ++n) eigenvalues[n] = ev[sel[n]];
+        {
+            std::vector<real_t> h_all((size_t)nev_solve * total_dim);
+            solver.copy_eigenvectors_to_host(h_all.data());
+            for (int n = 0; n < (int)sel.size(); ++n)
+                std::memcpy(&h_eigenvectors[(size_t)n * total_dim],
+                            &h_all[(size_t)sel[n] * total_dim],
+                            (size_t)total_dim * sizeof(real_t));
+        }
 
         std::cout << "  STEOM-CCSD solve time: " << std::fixed << std::setprecision(3)
                   << solve_timer.elapsed_seconds() << " s" << std::endl;

@@ -227,6 +227,18 @@ public:
     const std::vector<real_t>& get_eigenvalues() const { return h_eigenvalues_; }
 
     /**
+     * @brief Imag parts of the computed eigenvalues (non-Hermitian FULL mode)
+     *
+     * All-zero for symmetric problems.  A nonzero entry marks a complex Ritz
+     * pair kept by the FULL-mode subspace solve — the paired members carry the
+     * same real part; callers selecting physical roots should filter on
+     * |imag| ≤ tol (see the STEOM Davidson real-root selection).
+     *
+     * @pre solve() must have been called
+     */
+    const std::vector<real_t>& get_eigenvalues_imag() const { return h_eigenvalues_imag_; }
+
+    /**
      * @brief Get computed eigenvectors (device memory pointer)
      *
      * Returns device pointer to eigenvectors stored in column-major order:
@@ -283,12 +295,26 @@ private:
     real_t* d_sigma_vectors_;           ///< Operator-applied vectors (dim × max_subspace_size)
     real_t* d_subspace_matrix_;         ///< Subspace matrix H_ij (max_subspace × max_subspace)
     real_t* d_subspace_eigenvalues_;    ///< Subspace eigenvalues (max_subspace)
+    // (2026-07-15) Imag parts of the subspace eigenvalues (non-Hermitian FULL
+    // mode).  The non-symmetric subspace geev used to DROP complex Ritz pairs
+    // (|Im| ≥ 1e-6 → eigenvalue 1e30 + ZERO eigenvector) — a zero Ritz vector
+    // gives residual 0 → the root counted as "converged" with a garbage 1e30
+    // energy (490 DMET-STEOM: near-defective G flips a near-degenerate pair
+    // real↔complex under FP-level perturbations; the run then died at iter 2).
+    // FULL mode keeps every eigenvalue by real part; a complex pair's members
+    // carry Re(v)/Im(v) as subspace vectors, so the Ritz residual is
+    // −Im(λ)·V·Im(c) ≠ 0 — the root stays unconverged and the correction
+    // enriches the subspace until the pair resolves to real (or max_iter hits
+    // with an honest warning).  Purely-real subspaces are bit-identical
+    // (real roots carry Im = 0 exactly in dgeev/Xgeev).
+    real_t* d_subspace_eigenvalues_imag_;  ///< Imag parts (max_subspace, FULL mode)
     real_t* d_subspace_eigenvectors_;   ///< Subspace eigenvectors (max_subspace × max_subspace)
     real_t* d_residuals_;               ///< Residual vectors (dim × num_eigenvalues)
     real_t* d_eigenvectors_;            ///< Final Ritz vectors (dim × num_eigenvalues)
 
     // Host memory
-    std::vector<real_t> h_eigenvalues_;    ///< Computed eigenvalues
+    std::vector<real_t> h_eigenvalues_;      ///< Computed eigenvalues (real parts)
+    std::vector<real_t> h_eigenvalues_imag_; ///< Imag parts of the first nev roots
     std::vector<real_t> residual_norms_;   ///< Residual norms
 
     // ========== Private Methods ==========
