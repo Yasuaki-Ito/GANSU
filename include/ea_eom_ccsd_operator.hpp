@@ -193,6 +193,17 @@ private:
     real_t* d_M_ringA_ = nullptr;
     real_t* d_M_ringB_ = nullptr;
     real_t* d_M_ringC_ = nullptr;
+    // (2026-07-15 ring-peer) When the 3 M_ring (31 GiB at p-DDPA n_emb=490) do
+    // not fit next to the solve, they are built on the freest peer GPU and the
+    // 3 ring GEMMs run there per matvec (the in-kernel fallback is ~99% of the
+    // σ2 kernel work — 460 s/Davidson-iter at 490).  ring_peer_dev_ = -1 →
+    // resident path (byte-identical legacy).  Opt-out: GANSU_EA_RING_PEER=0.
+    int     ring_peer_dev_ = -1;
+    void*   ring_cublas_   = nullptr;   // cuBLAS handle created on ring_peer_dev_
+    real_t* d_ring_r2_     = nullptr;   // peer σ scratch, each [p2h_dim]
+    real_t* d_ring_r2T_    = nullptr;
+    real_t* d_ring_tmp_    = nullptr;
+    real_t* d_ring_s2_     = nullptr;
 
     // === Diagonal & denominators ===
     real_t* d_D_p_   = nullptr;  // [nvir]            ≈ +ε_a

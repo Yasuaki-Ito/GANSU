@@ -1068,6 +1068,18 @@ EAEOMCCSDOperator::~EAEOMCCSDOperator() {
     if (d_M_ringA_)   tracked_cudaFree(d_M_ringA_);
     if (d_M_ringB_)   tracked_cudaFree(d_M_ringB_);
     if (d_M_ringC_)   tracked_cudaFree(d_M_ringC_);
+#ifndef GANSU_CPU_ONLY
+    // (ring-peer) peer σ scratch + the peer-bound cuBLAS handle.
+    // tracked_cudaFree is cross-device safe; cublasDestroy needs the guard.
+    if (ring_peer_dev_ >= 0) {
+        MultiGpuManager::DeviceGuard guard(ring_peer_dev_);
+        if (d_ring_r2_)  tracked_cudaFree(d_ring_r2_);
+        if (d_ring_r2T_) tracked_cudaFree(d_ring_r2T_);
+        if (d_ring_tmp_) tracked_cudaFree(d_ring_tmp_);
+        if (d_ring_s2_)  tracked_cudaFree(d_ring_s2_);
+        if (ring_cublas_) cublasDestroy((cublasHandle_t)ring_cublas_);
+    }
+#endif
     // EA RI-ladder factors + scratch
     if (d_Bvv_lad_)      tracked_cudaFree(d_Bvv_lad_);
     if (d_Bvv_lad_perm_) tracked_cudaFree(d_Bvv_lad_perm_);
@@ -1123,6 +1135,15 @@ void EAEOMCCSDOperator::setup_multi_gpu() {
     if (ea_w_host_stage_) {
         std::cout << "  [EA-EOM] GANSU_STEOM_EOM_GPUS>1 ignored — Wvovv/Wvvvo "
                      "host-staged (single-GPU σ streams a-slabs)." << std::endl;
+        return;
+    }
+    // (ring-peer) the replica copy below assumes device-0 sources (repl uses
+    // cudaMemcpyPeer src=0); M_ring lives on ring_peer_dev_. Single-GPU σ —
+    // the peer already carries the dominant ring cost.
+    if (ring_peer_dev_ >= 0) {
+        std::cout << "  [EA-EOM] GANSU_STEOM_EOM_GPUS>1 ignored — ring-peer "
+                     "active (M_ring on GPU " << ring_peer_dev_
+                  << "); single-GPU σ with peer ring GEMMs." << std::endl;
         return;
     }
 
@@ -3409,20 +3430,116 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     // NO²·NV² matrices (29 GiB at p-DDPA n_emb=490) are pure dead weight — at
     // large clusters they pinned the EA-solve device and OOM'd the Davidson
     // subspace. Default on (byte-unchanged); =0 frees 29 GiB for the solve.
+    // (2026-07-15 ring-peer) The in-kernel ring fallback is ~99% of the σ2
+    // kernel work (3×NO·NV inner iterations per element ≈ 460 s/Davidson-iter
+    // at 490).  So instead of dropping to in-kernel when M_ring does not fit
+    // next to the solve, build it on the freest PEER GPU (Ship-15 idiom) and
+    // run the 3 ring GEMMs there per matvec.  Local if it comfortably fits
+    // (<50% of free — byte-identical legacy path, e.g. naph 0.3 GiB); peer
+    // opt-out with GANSU_EA_RING_PEER=0; neither fits → in-kernel fallback
+    // (graceful, no OOM).
     const bool ring_gemm_alloc = [] {
         const char* e = std::getenv("GANSU_EA_RING_GEMM");
         return !(e && e[0] == '0');
     }();
     if (gpu::gpu_available() && ring_gemm_alloc) {
-        const size_t M_sz = (size_t)NO * NV * NO * NV;
-        tracked_cudaMalloc(&d_M_ringA_, M_sz * sizeof(real_t));
-        tracked_cudaMalloc(&d_M_ringB_, M_sz * sizeof(real_t));
-        tracked_cudaMalloc(&d_M_ringC_, M_sz * sizeof(real_t));
-        const int thr = 256;
-        const int blk = (int)((M_sz + thr - 1) / thr);
-        ea_build_ring_M_kernel<<<blk, thr>>>(d_Wovov_, d_Wovvo_,
-                                             d_M_ringA_, d_M_ringB_, d_M_ringC_, NO, NV);
-        cudaDeviceSynchronize();
+        const size_t M_sz   = (size_t)NO * NV * NO * NV;
+        const size_t M_need = 3 * M_sz * sizeof(real_t);
+        size_t freeb = 0, totb = 0;
+        cudaMemGetInfo(&freeb, &totb);
+        const bool local_ok = ((double)M_need < 0.5 * (double)freeb);
+        const bool peer_enabled = [] {
+            const char* e = std::getenv("GANSU_EA_RING_PEER");
+            return !(e && e[0] == '0');
+        }();
+        auto build_local = [&] {
+            tracked_cudaMalloc(&d_M_ringA_, M_sz * sizeof(real_t));
+            tracked_cudaMalloc(&d_M_ringB_, M_sz * sizeof(real_t));
+            tracked_cudaMalloc(&d_M_ringC_, M_sz * sizeof(real_t));
+            const int thr = 256;
+            const int blk = (int)((M_sz + thr - 1) / thr);
+            ea_build_ring_M_kernel<<<blk, thr>>>(d_Wovov_, d_Wovvo_,
+                                                 d_M_ringA_, d_M_ringB_, d_M_ringC_, NO, NV);
+            cudaDeviceSynchronize();
+        };
+        if (local_ok) {
+            build_local();
+        } else if (peer_enabled) {
+            // Pick the peer with the most free memory.  Peak peer need = the 3
+            // M_ring + 2 temp Wovov/Wovvo copies (freed after the build kernel)
+            // + 4 per-matvec σ scratch buffers ([p2h] each).
+            int cur = -1;  cudaGetDevice(&cur);
+            int ndev = 0;  cudaGetDeviceCount(&ndev);
+            const size_t scratch = 4 * (size_t)p2h_dim_ * sizeof(real_t);
+            const size_t peak = M_need + 2 * M_sz * sizeof(real_t) + scratch;
+            int best = -1;  size_t best_free = 0;
+            for (int d = 0; d < ndev; ++d) {
+                if (d == cur) continue;
+                MultiGpuManager::DeviceGuard g(d);
+                size_t f = 0, t = 0;
+                if (cudaMemGetInfo(&f, &t) != cudaSuccess) continue;
+                if (f > best_free) { best_free = f; best = d; }
+            }
+            if (best >= 0 && (double)best_free > 1.15 * (double)peak) {
+                MultiGpuManager::DeviceGuard g(best);
+                tracked_cudaMalloc(&d_M_ringA_, M_sz * sizeof(real_t));
+                tracked_cudaMalloc(&d_M_ringB_, M_sz * sizeof(real_t));
+                tracked_cudaMalloc(&d_M_ringC_, M_sz * sizeof(real_t));
+                real_t* d_tmp_ovov = nullptr;
+                real_t* d_tmp_ovvo = nullptr;
+                tracked_cudaMalloc(&d_tmp_ovov, M_sz * sizeof(real_t));
+                tracked_cudaMalloc(&d_tmp_ovvo, M_sz * sizeof(real_t));
+                cudaMemcpyPeer(d_tmp_ovov, best, d_Wovov_, cur, M_sz * sizeof(real_t));
+                cudaMemcpyPeer(d_tmp_ovvo, best, d_Wovvo_, cur, M_sz * sizeof(real_t));
+                const int thr = 256;
+                const int blk = (int)((M_sz + thr - 1) / thr);
+                ea_build_ring_M_kernel<<<blk, thr>>>(d_tmp_ovov, d_tmp_ovvo,
+                                                     d_M_ringA_, d_M_ringB_, d_M_ringC_, NO, NV);
+                cudaDeviceSynchronize();
+                tracked_cudaFree(d_tmp_ovov);
+                tracked_cudaFree(d_tmp_ovvo);
+                tracked_cudaMalloc(&d_ring_r2_,  (size_t)p2h_dim_ * sizeof(real_t));
+                tracked_cudaMalloc(&d_ring_r2T_, (size_t)p2h_dim_ * sizeof(real_t));
+                tracked_cudaMalloc(&d_ring_tmp_, (size_t)p2h_dim_ * sizeof(real_t));
+                tracked_cudaMalloc(&d_ring_s2_,  (size_t)p2h_dim_ * sizeof(real_t));
+                cublasHandle_t rh = nullptr;
+                cublasCreate(&rh);          // created (and later destroyed) on the peer
+                ring_cublas_   = (void*)rh;
+                ring_peer_dev_ = best;
+                std::fprintf(stderr,
+                    "  [EA-EOM ring-peer] M_ring (%.1f GiB) > 50%% of device %d free "
+                    "(%.1f GiB) — built on peer GPU %d (free %.1f GiB); ring GEMMs run "
+                    "there per matvec\n",
+                    M_need / (1024.0*1024.0*1024.0), cur,
+                    freeb / (1024.0*1024.0*1024.0), best,
+                    best_free / (1024.0*1024.0*1024.0));
+            } else {
+                std::fprintf(stderr,
+                    "  [EA-EOM ring-peer] M_ring (%.1f GiB) > 50%% of %.1f GiB local "
+                    "free and no peer holds peak %.1f GiB (best free %.1f GiB)\n",
+                    M_need / (1024.0*1024.0*1024.0), freeb / (1024.0*1024.0*1024.0),
+                    peak / (1024.0*1024.0*1024.0), best_free / (1024.0*1024.0*1024.0));
+            }
+        }
+        // No comfortable local fit and no peer: keep the LEGACY behavior for
+        // configs that used to work — a tight local alloc still beats the
+        // in-kernel ring fallback (~100× on the ring term).  Only a genuine
+        // no-fit leaves M_ring null (in-kernel, graceful — pre-2026-07-15 this
+        // OOM'd unless GANSU_EA_RING_GEMM=0 was set by hand).
+        if (d_M_ringA_ == nullptr && ring_peer_dev_ < 0) {
+            if ((double)M_need < 0.9 * (double)freeb) {
+                std::fprintf(stderr,
+                    "  [EA-EOM ring-peer] tight local M_ring alloc (%.1f of %.1f GiB "
+                    "free — legacy placement)\n",
+                    M_need / (1024.0*1024.0*1024.0), freeb / (1024.0*1024.0*1024.0));
+                build_local();
+            } else {
+                std::fprintf(stderr,
+                    "  [EA-EOM ring-peer] M_ring (%.1f GiB) fits nowhere (local free "
+                    "%.1f GiB) — ring terms stay in-kernel\n",
+                    M_need / (1024.0*1024.0*1024.0), freeb / (1024.0*1024.0*1024.0));
+            }
+        }
     }
 #endif
 
@@ -3979,27 +4096,63 @@ void EAEOMCCSDOperator::apply_sigma_gpu(
         const int NK = nocc_ * nvir_;
         const int mrows = jslab * nvir_;                 // slab output rows (jb)/(ja)
         const size_t moff = (size_t)j_begin * nvir_ * NK; // M_ring row offset
-        // R_B: σ2[(ja),b] -= M_B[slab rows]·r2[(lc),b]
-        cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                    nvir_, mrows, NK, &neg, d_r2, nvir_, M_ringB + moff, NK,
-                    &one, d_s2 + joff, nvir_);
-        // R_A + R_C → tmp[(jb),a] slab → scatter
-        real_t* d_r2T = scr_r2T;
-        real_t* d_tmp = scr_tmp;
-        if (!d_r2T) tracked_cudaMalloc(&d_r2T, (size_t)p2h_dim_ * sizeof(real_t));
-        if (!d_tmp) tracked_cudaMalloc(&d_tmp, (size_t)p2h_dim_ * sizeof(real_t));
         const int blocks_r2 = (p2h_dim_ + threads - 1) / threads;
-        ea_r2_swap_vir_kernel<<<blocks_r2, threads>>>(d_r2, d_r2T, nocc_, nvir_);  // full (input)
-        cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                    nvir_, mrows, NK, &one, d_r2T, nvir_, M_ringA + moff, NK,
-                    &zero, d_tmp + joff, nvir_);
-        cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                    nvir_, mrows, NK, &neg, d_r2, nvir_, M_ringC + moff, NK,
-                    &one, d_tmp + joff, nvir_);
         const int blocks_sc = (jslab * nvir2 + threads - 1) / threads;
-        ea_ring_scatter_kernel<<<blocks_sc, threads>>>(d_tmp, d_s2, nocc_, nvir_, j_begin, j_end);
-        if (!scr_r2T) tracked_cudaFree(d_r2T);   // free only if locally allocated
-        if (!scr_tmp) tracked_cudaFree(d_tmp);
+        if (ring_peer_dev_ >= 0 && M_ringA == d_M_ringA_) {
+            // (ring-peer) the operator-owned M_ring lives on ring_peer_dev_ —
+            // run the SAME op sequence there on peer copies of r2 + the s2 slab
+            // (r2 full: the GEMM K dim spans all (l,c) rows).  cudaMemcpyPeer is
+            // fully synchronizing (waits for prior work on both devices), so the
+            // σ2 kernel / Wvvvv GEMM writes to d_s2 are complete before the push
+            // and the peer results are complete before the copy-back.  Same-arch
+            // GEMMs + identical operation order ⇒ bit-identical to the resident
+            // path; traffic is 2×p2h + slab ≈ 0.3 GB/vector.
+            int cur = -1;
+            cudaGetDevice(&cur);
+            const size_t slab_cnt = (size_t)jslab * nvir2;
+            MultiGpuManager::DeviceGuard g(ring_peer_dev_);
+            cudaMemcpyPeer(d_ring_r2_, ring_peer_dev_, d_r2, cur,
+                           (size_t)p2h_dim_ * sizeof(real_t));
+            cudaMemcpyPeer(d_ring_s2_ + joff, ring_peer_dev_, d_s2 + joff, cur,
+                           slab_cnt * sizeof(real_t));
+            cublasHandle_t rc = (cublasHandle_t)ring_cublas_;
+            // R_B: σ2[(ja),b] -= M_B[slab rows]·r2[(lc),b]
+            cublasDgemm(rc, CUBLAS_OP_N, CUBLAS_OP_N,
+                        nvir_, mrows, NK, &neg, d_ring_r2_, nvir_, d_M_ringB_ + moff, NK,
+                        &one, d_ring_s2_ + joff, nvir_);
+            // R_A + R_C → tmp[(jb),a] slab → scatter
+            ea_r2_swap_vir_kernel<<<blocks_r2, threads>>>(d_ring_r2_, d_ring_r2T_, nocc_, nvir_);
+            cublasDgemm(rc, CUBLAS_OP_N, CUBLAS_OP_N,
+                        nvir_, mrows, NK, &one, d_ring_r2T_, nvir_, d_M_ringA_ + moff, NK,
+                        &zero, d_ring_tmp_ + joff, nvir_);
+            cublasDgemm(rc, CUBLAS_OP_N, CUBLAS_OP_N,
+                        nvir_, mrows, NK, &neg, d_ring_r2_, nvir_, d_M_ringC_ + moff, NK,
+                        &one, d_ring_tmp_ + joff, nvir_);
+            ea_ring_scatter_kernel<<<blocks_sc, threads>>>(d_ring_tmp_, d_ring_s2_,
+                                                           nocc_, nvir_, j_begin, j_end);
+            cudaMemcpyPeer(d_s2 + joff, cur, d_ring_s2_ + joff, ring_peer_dev_,
+                           slab_cnt * sizeof(real_t));
+        } else {
+            // R_B: σ2[(ja),b] -= M_B[slab rows]·r2[(lc),b]
+            cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                        nvir_, mrows, NK, &neg, d_r2, nvir_, M_ringB + moff, NK,
+                        &one, d_s2 + joff, nvir_);
+            // R_A + R_C → tmp[(jb),a] slab → scatter
+            real_t* d_r2T = scr_r2T;
+            real_t* d_tmp = scr_tmp;
+            if (!d_r2T) tracked_cudaMalloc(&d_r2T, (size_t)p2h_dim_ * sizeof(real_t));
+            if (!d_tmp) tracked_cudaMalloc(&d_tmp, (size_t)p2h_dim_ * sizeof(real_t));
+            ea_r2_swap_vir_kernel<<<blocks_r2, threads>>>(d_r2, d_r2T, nocc_, nvir_);  // full (input)
+            cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                        nvir_, mrows, NK, &one, d_r2T, nvir_, M_ringA + moff, NK,
+                        &zero, d_tmp + joff, nvir_);
+            cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                        nvir_, mrows, NK, &neg, d_r2, nvir_, M_ringC + moff, NK,
+                        &one, d_tmp + joff, nvir_);
+            ea_ring_scatter_kernel<<<blocks_sc, threads>>>(d_tmp, d_s2, nocc_, nvir_, j_begin, j_end);
+            if (!scr_r2T) tracked_cudaFree(d_r2T);   // free only if locally allocated
+            if (!scr_tmp) tracked_cudaFree(d_tmp);
+        }
     }
     if (!scr_tmp_k) tracked_cudaFree(d_tmp_k);
 }
