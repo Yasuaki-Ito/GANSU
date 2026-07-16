@@ -886,6 +886,14 @@ EAEOMCCSDOperator::EAEOMCCSDOperator(
       frozen_off_(frozen_off),
       barh_cache_(barh_cache)
 {
+    // (2026-07-16) Capture the ctor-entry device: the driver device-balanced,
+    // uploaded t1/t2 and built B_mo just before constructing us, so THIS is the
+    // authoritative operator device.  Re-asserted before the extract's ~76 GB
+    // of block allocations (helpers in between have historically drifted it).
+    int ctor_dev = -1;
+#ifndef GANSU_CPU_ONLY
+    if (gpu::gpu_available()) cudaGetDevice(&ctor_dev);
+#endif
     // Ship 12 — take ownership of per-device d_eri_vvvv slabs allocated +
     // extracted by the driver (compute_ea_eom_ccsd_impl).  Slab boundaries
     // are uniform along the outermost a-axis; the consumer GEMM
@@ -1029,6 +1037,55 @@ EAEOMCCSDOperator::EAEOMCCSDOperator(
             std::cout << "  [EA-EOM build-PROF] " << name << " = " << std::fixed
                       << std::setprecision(3) << s << " s" << std::defaultfloat << std::endl;
         };
+#ifndef GANSU_CPU_ONLY
+        // (2026-07-16) Placement guard for the ~76 GB of block allocations in
+        // extract: helpers between the driver's device balance and this point
+        // (lazy B re-replication, B_mo build, bt-T2 upload) have historically
+        // moved the current device (the task-B disease).  Log the placement so
+        // an OOM here is diagnosable, and re-pin to the balanced device if it
+        // drifted (the driver set it just before constructing this operator).
+        if (gpu::gpu_available()) {
+            int cur = -1;
+            cudaGetDevice(&cur);
+            if (ctor_dev >= 0 && cur != ctor_dev) {
+                cudaSetDevice(ctor_dev);
+                gpu::GPUHandle::reset();
+                std::cout << "  [EA-EOM extract] current device drifted to " << cur
+                          << " — re-pinned to operator device " << ctor_dev
+                          << " (handles rebuilt)" << std::endl;
+                cur = ctor_dev;
+            }
+            // (2026-07-16) Release the RI AO-B replicas BEFORE the extract's
+            // ~76 GB of block allocations, not after: every mo_eri_block_into
+            // reads the MO-transformed d_B_mo_blocks_ (built by the driver just
+            // before this ctor), never the AO-basis replica — the post-extract
+            // release below (kept as a no-op safety) was merely conservative
+            // placement.  At 490+NTO-bath (nvir=351) the extract needs 73.9 GB
+            // + ws while the balanced device had 68.5 GB free with the 17.7 GB
+            // AO replica still resident — reclaiming it first is the difference
+            // between fitting and the OOM.  Same opt-out knob.
+            if (eri_block_src_ != nullptr
+                && !std::getenv("GANSU_STEOM_KEEP_B_REPLICA")) {
+                const size_t before = GlobalGpuMemoryTracker::get_current();
+                eri_block_src_->release_bmo_ao_replica();
+                const size_t after = GlobalGpuMemoryTracker::get_current();
+                cudaSetDevice(cur);            // free path may reset the device
+                gpu::GPUHandle::reset();
+                if (before > after)
+                    std::cout << "  [EA-EOM] released RI AO-B replicas before extract: "
+                              << std::fixed << std::setprecision(2)
+                              << ((before - after) / (1024.0*1024.0*1024.0))
+                              << " GB reclaimed (global)." << std::defaultfloat
+                              << std::endl;
+            }
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            std::cout << "  [EA-EOM extract] device " << cur << " free "
+                      << std::fixed << std::setprecision(2)
+                      << (fb / (1024.0*1024.0*1024.0)) << " GB before block allocations"
+                      << std::defaultfloat << std::endl;
+        }
+#endif
         tphase("extract_eri_blocks",          [&]{ extract_eri_blocks(d_eri_mo); });
 #ifndef GANSU_CPU_ONLY
         // (EA storage-free, mirrors the IP-EOM site) extract_eri_blocks was the
@@ -2710,7 +2767,28 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
             const size_t result_sz = (size_t)NV * NV * NV * NO;
             bool termC_gpu = false;
 #ifndef GANSU_CPU_ONLY
+            // (2026-07-16 OOM guard) Term C's u_C is NO²NV² (9.9 GiB at
+            // 490+NTO-bath) and must coexist with the full build residency —
+            // at nvir=338 the alloc hit 11.2 GiB free and died (OOM site #5).
+            // When it does not fit, keep termC_gpu=false → the bit-identical
+            // host loops below (same policy as the wt1 accumulator guard).
+            bool termC_fit = false;
             if (gpu::gpu_available()) {
+                size_t fbC = 0, tbC = 0;
+                cudaMemGetInfo(&fbC, &tbC);
+                const size_t needC = u_C_sz * sizeof(real_t)
+                    + (wt1_host_accum ? ((size_t)3 << 30) : result_sz * sizeof(real_t))
+                    + ((size_t)2 << 30);
+                termC_fit = (fbC >= needC);
+                if (!termC_fit)
+                    std::cout << "  [EA-EOM] wvvvo Term C GPU scratch skipped ("
+                              << std::fixed << std::setprecision(1)
+                              << fbC / (1024.0*1024.0*1024.0) << " GiB free < "
+                              << needC / (1024.0*1024.0*1024.0)
+                              << " GiB) — bit-identical host fallback."
+                              << std::defaultfloat << std::endl;
+            }
+            if (termC_fit) {
                 cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
                 real_t *d_t1_dev = nullptr, *d_u_C = nullptr, *d_result = nullptr;
                 tracked_cudaMalloc(&d_t1_dev, (size_t)NO * NV * sizeof(real_t));
@@ -2846,34 +2924,56 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                 cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
                 real_t *d_u = nullptr, *d_tau = nullptr, *d_C = nullptr;
                 tracked_cudaMalloc(&d_u,   u_klcj_sz   * sizeof(real_t));
-                tracked_cudaMalloc(&d_tau, tau_klab_sz * sizeof(real_t));
-                if (!wt1_host_accum)
+                // (2026-07-16, OOM site #6) In host-accum mode the full d_tau
+                // (NO²NV² = 9.9 GiB at 490+NTO-bath) no longer fits next to the
+                // build residency.  The slab GEMM below only reads tau's column
+                // window [n0, n0+nn) per iteration — stage each window from the
+                // host with a strided cudaMemcpy2D into a tile ((nn × NO²)
+                // col-major, ld nn) instead of holding the full tensor.  Same
+                // logical operands (ldb changes NV²→nn, so cuBLAS may split the
+                // reduction differently — ≤1 ULP reassoc class, same as every
+                // host-accum reorder in this build); tau crosses PCIe once
+                // either way.
+                if (!wt1_host_accum) {
+                    tracked_cudaMalloc(&d_tau, tau_klab_sz * sizeof(real_t));
+                    cudaMemcpy(d_tau, h_tau_klab.data(), tau_klab_sz * sizeof(real_t), cudaMemcpyHostToDevice);
                     tracked_cudaMalloc(&d_C,   termD_sz    * sizeof(real_t));
+                }
                 cudaMemcpy(d_u,   h_u_klcj.data(),   u_klcj_sz   * sizeof(real_t), cudaMemcpyHostToDevice);
-                cudaMemcpy(d_tau, h_tau_klab.data(), tau_klab_sz * sizeof(real_t), cudaMemcpyHostToDevice);
                 const real_t one = 1.0, zero = 0.0;
                 if (wt1_host_accum) {
-                    // (EA storage-free) column-slab over (a,b) (d_tau + n0).
+                    // (EA storage-free) column-slab over (a,b); tau tile-staged.
                     const size_t M = (size_t)NV * NO;
                     const int TN = wt1_slab_cols(M, NV * NV);
                     real_t* d_slab = nullptr;
+                    real_t* d_tau_tile = nullptr;
                     tracked_cudaMalloc(&d_slab, (size_t)TN * M * sizeof(real_t));
+                    tracked_cudaMalloc(&d_tau_tile,
+                                       (size_t)TN * NO * NO * sizeof(real_t));
                     for (int n0 = 0; n0 < NV * NV; n0 += TN) {
                         const int nn = std::min(TN, NV * NV - n0);
+                        // tau tile: element [q + p*nn] = h_tau[(p)*NV² + n0+q]
+                        // (p < NO² rows of op(B), q < nn columns of the window).
+                        cudaMemcpy2D(d_tau_tile, (size_t)nn * sizeof(real_t),
+                                     h_tau_klab.data() + n0, (size_t)NV * NV * sizeof(real_t),
+                                     (size_t)nn * sizeof(real_t), (size_t)NO * NO,
+                                     cudaMemcpyHostToDevice);
                         cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
                                     NV*NO, nn, NO*NO, &one,
-                                    d_u, NV*NO, d_tau + n0, NV*NV,
+                                    d_u, NV*NO, d_tau_tile, nn,
                                     &zero, d_slab, NV*NO);
                         wt1_host_scatter(d_slab, (size_t)n0 * M,
                                          (size_t)nn * M, 1.0, 0);
                     }
                     tracked_cudaFree(d_slab);
+                    tracked_cudaFree(d_tau_tile);
                 } else {
                     cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
                                 NV*NO, NV*NV, NO*NO, &one,
                                 d_u, NV*NO, d_tau, NV*NV, &zero, d_C, NV*NO);
                 }
-                tracked_cudaFree(d_u); tracked_cudaFree(d_tau);
+                tracked_cudaFree(d_u);
+                if (d_tau) tracked_cudaFree(d_tau);
                 termD_gpu = true;
                 if (std::getenv("GANSU_STEOM_BUILD_VALIDATE") && d_C != nullptr) {
                     std::vector<real_t> h_termD(termD_sz, 0.0);

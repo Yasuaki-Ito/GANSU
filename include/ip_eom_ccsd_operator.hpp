@@ -212,7 +212,18 @@ private:
     mutable real_t* d_R2sw_   = nullptr;  // r2(l,x,d)
     mutable real_t* d_out1_   = nullptr;  // Wovvo(A+B) + Wovov(C) → [i,(a,j)]
     mutable real_t* d_out2_   = nullptr;  // Wovov(D)             → [j,(a,i)]
-    void ensure_sigma_gemm_scratch() const;   // lazy alloc + WA/WVA repack (device 0)
+    // (2026-07-15 gemm-peer, mirrors the EA ring-peer) When the two WA/WVA
+    // repacks (2×(nocc·nvir)² = 21.4 GiB at 490+NTO-bath nvir=351) no longer
+    // fit next to the bar-H on the solve device, build them on the freest peer
+    // GPU and run the Wovvo/Wovov GEMMs there per matvec (r2 in 33 MB, out1/2
+    // back 66 MB — negligible; the Woooo GEMM stays on the solve device).
+    // ip_gemm_peer_dev_ = -1 → resident path (byte-identical legacy).
+    mutable int     ip_gemm_peer_dev_ = -1;
+    mutable void*   ip_gemm_cublas_   = nullptr;  // cuBLAS handle on the peer
+    mutable real_t* d_peer_r2_    = nullptr;      // peer copy of r2 [h2p]
+    mutable real_t* d_out1_stage_ = nullptr;      // solve-device staging for peer out1/out2
+    mutable real_t* d_out2_stage_ = nullptr;
+    void ensure_sigma_gemm_scratch() const;   // lazy alloc + WA/WVA repack (device 0 or peer)
     // Device-0 GEMMs for the big σ2 terms (Woooo + Wovvo + Wovov), added into d_s2.
     void add_big_terms_gemm(const real_t* d_r2, real_t* d_s2) const;
     // Compare GEMM-path σ2 vs the legacy full kernel (GANSU_IP_SIGMA_GEMM_VALIDATE).

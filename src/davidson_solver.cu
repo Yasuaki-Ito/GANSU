@@ -319,6 +319,22 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
 
             real_t max_res = *std::max_element(residual_norms_.begin(), residual_norms_.end());
 
+            // (2026-07-15 hardening) A complex Ritz pair among the reported
+            // roots is NOT an eigenvalue approximation — its real part can sit
+            // perfectly stable while the residual stalls (490 STEOM: artifacts
+            // at max|r|=4e-2 were accepted by the stability fallbacks and the
+            // dense geev later showed they were nowhere in the true spectrum).
+            // Stability-based acceptance therefore requires an all-real window;
+            // a persistent complex pair runs to max_iterations and reports an
+            // honest non-convergence (+ per-root complex warnings at exit).
+            // Purely-real spectra are unaffected (Im = 0 exactly).
+            bool any_complex = false;
+            for (int i = 0; i < config_.num_eigenvalues; ++i) {
+                if (config_.min_eigenvalue > 0.0 && h_eigenvalues_[i] < config_.min_eigenvalue)
+                    continue;
+                if (std::abs(h_eigenvalues_imag_[i]) > 1e-8) { any_complex = true; break; }
+            }
+
             if (max_eval_change < config_.convergence_threshold &&
                 max_res < 10.0 * config_.convergence_threshold) {
                 eigenvalue_stable_count++;
@@ -326,7 +342,7 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
                 eigenvalue_stable_count = 0;
             }
 
-            if (eigenvalue_stable_count >= eigenvalue_stable_required) {
+            if (eigenvalue_stable_count >= eigenvalue_stable_required && !any_complex) {
                 converged = true;
             }
 
@@ -338,7 +354,7 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
             } else {
                 eigenvalue_only_stable_count = 0;
             }
-            if (!converged &&
+            if (!converged && !any_complex &&
                 eigenvalue_only_stable_count >= eigenvalue_only_stable_required) {
                 if (config_.verbose > 0) {
                     std::cout << "  Davidson: eigenvalues stable for "

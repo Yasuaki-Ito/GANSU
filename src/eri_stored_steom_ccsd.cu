@@ -36,6 +36,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <sstream>
 #include <vector>
 #include <limits>
@@ -1732,14 +1733,38 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                     std::cout << "  [STEOM dense diag] released RI AO-B replica before geev: "
                               << CudaMemoryManager<real_t>::format_bytes(before - after)
                               << " reclaimed (global)." << std::endl;
-#ifndef GANSU_CPU_ONLY
-                // free_replicated_B resets the current device to 0; when the operator +
-                // G live on a device-balanced GPU, restore it so the geev below runs on
-                // the device that holds d_G_ (else cusolverXgeev fails, info=-1).
-                if (steom_dev_balance_active) cudaSetDevice(steom_dev_balance_target);
-#endif
             }
         }
+#ifndef GANSU_CPU_ONLY
+        // (2026-07-15 dense-device fix) Pin the dense diag to the device that
+        // actually OWNS d_G_.  Two independent balance decisions may have moved
+        // things by now: the caller-level STEOM device-balance above (operator /
+        // bar-H device = steom_dev_balance_target) and the operator-internal
+        // Ship 15 W_eff-balance (which relocates build_W_eff_and_G + d_G_ to the
+        // freest GPU at G-build time).  The old restore here used
+        // steom_dev_balance_target — the FORMER — so with both active (490:
+        // operator on GPU 3, d_G_ on GPU 2) the geev buffers landed on a device
+        // without G and cusolverXgeev failed (info=-1) under DENSE_DIAG=2.
+        // Also needed when free_replicated_B above reset the device to 0.
+        // Querying the pointer's owner is robust against any balance layout;
+        // GPUHandle::reset rebinds cuBLAS/cuSOLVER to that device (established
+        // idiom — Ship 15 does the same on redirect).
+        if (gpu::gpu_available() && steom_op.get_G_device() != nullptr) {
+            cudaPointerAttributes gattr{};
+            if (cudaPointerGetAttributes(&gattr, steom_op.get_G_device()) == cudaSuccess
+                && gattr.type == cudaMemoryTypeDevice) {
+                int cur = -1;
+                cudaGetDevice(&cur);
+                if (cur != gattr.device) {
+                    cudaSetDevice(gattr.device);
+                    gpu::GPUHandle::reset();
+                    std::cout << "  [STEOM dense diag] pinned to GPU " << gattr.device
+                              << " (owner of d_G_; was on GPU " << cur
+                              << "; cuBLAS/cuSOLVER handles rebuilt)." << std::endl;
+                }
+            }
+        }
+#endif
 
         // eigenDecompositionNonSymmetric expects column-major input. d_G_ is
         // row-major [total_dim × total_dim]; its linear buffer is exactly the
@@ -2009,6 +2034,20 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         if ((int)sel.size() < n_states_to_compute)
             std::cout << "Warning: STEOM Davidson window yielded only " << sel.size() << "/"
                       << n_states_to_compute << " selectable roots." << std::endl;
+
+        // Report ascending by energy (real-first selection puts complex filler
+        // last — re-sort so the table matches the dense-geev ordering).
+        {
+            std::vector<int> ord((int)sel.size());
+            std::iota(ord.begin(), ord.end(), 0);
+            std::stable_sort(ord.begin(), ord.end(),
+                             [&](int a, int b) { return ev[sel[a]] < ev[sel[b]]; });
+            std::vector<int>  sel2;          sel2.reserve(sel.size());
+            std::vector<char> sel_complex2;  sel_complex2.reserve(sel.size());
+            for (int o : ord) { sel2.push_back(sel[o]); sel_complex2.push_back(sel_complex[o]); }
+            sel.swap(sel2);
+            sel_complex.swap(sel_complex2);
+        }
 
         eigenvalues.assign(n_states_to_compute, 1e30);
         for (int n = 0; n < (int)sel.size(); ++n) eigenvalues[n] = ev[sel[n]];

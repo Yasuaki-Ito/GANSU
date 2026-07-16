@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -472,13 +473,23 @@ IPEOMCCSDOperator::IPEOMCCSDOperator(
 }
 
 IPEOMCCSDOperator::~IPEOMCCSDOperator() {
-    // (perf) GEMM σ2 path scratch (device 0).
+    // (perf) GEMM σ2 path scratch (device 0 or gemm-peer; tracked_cudaFree is
+    // cross-device safe, cublasDestroy needs the owning device current).
     if (d_WA_)     tracked_cudaFree(d_WA_);
     if (d_WVA_)    tracked_cudaFree(d_WVA_);
     if (d_R2comb_) tracked_cudaFree(d_R2comb_);
     if (d_R2sw_)   tracked_cudaFree(d_R2sw_);
     if (d_out1_)   tracked_cudaFree(d_out1_);
     if (d_out2_)   tracked_cudaFree(d_out2_);
+#ifndef GANSU_CPU_ONLY
+    if (ip_gemm_peer_dev_ >= 0) {
+        MultiGpuManager::DeviceGuard guard(ip_gemm_peer_dev_);
+        if (d_peer_r2_)    tracked_cudaFree(d_peer_r2_);
+        if (ip_gemm_cublas_) cublasDestroy((cublasHandle_t)ip_gemm_cublas_);
+    }
+    if (d_out1_stage_) tracked_cudaFree(d_out1_stage_);
+    if (d_out2_stage_) tracked_cudaFree(d_out2_stage_);
+#endif
     if (d_t1_)        tracked_cudaFree(d_t1_);
     if (d_t2_)        tracked_cudaFree(d_t2_);
     if (d_D_h_)       tracked_cudaFree(d_D_h_);
@@ -2321,16 +2332,88 @@ void IPEOMCCSDOperator::ensure_sigma_gemm_scratch() const {
     if (d_WA_ != nullptr) return;   // already built
     const size_t Wsz   = (size_t)nocc_ * nvir_ * nvir_ * nocc_;   // WA / WVA
     const size_t h2p   = (size_t)h2p_dim_;
-    tracked_cudaMalloc(&d_WA_,     Wsz * sizeof(real_t));
-    tracked_cudaMalloc(&d_WVA_,    Wsz * sizeof(real_t));
-    tracked_cudaMalloc(&d_R2comb_, h2p * sizeof(real_t));
-    tracked_cudaMalloc(&d_R2sw_,   h2p * sizeof(real_t));
-    tracked_cudaMalloc(&d_out1_,   h2p * sizeof(real_t));
-    tracked_cudaMalloc(&d_out2_,   h2p * sizeof(real_t));
     const int threads = 256;
     const size_t wblocks = (Wsz + threads - 1) / threads;
-    ip_repack_wovvo_kernel<<<wblocks, threads>>>(d_Wovvo_, d_WA_,  nocc_, nvir_);
-    ip_repack_wovov_kernel<<<wblocks, threads>>>(d_Wovov_, d_WVA_, nocc_, nvir_);
+    // (2026-07-15 gemm-peer, mirrors the EA ring-peer) The two repacks are
+    // 2×(nocc·nvir)² — 21.4 GiB at 490+NTO-bath (nvir=351), which OOM'd next to
+    // the resident bar-H on the solve device.  If they do not comfortably fit
+    // locally, build them on the freest peer GPU and run the Wovvo/Wovov GEMMs
+    // there per matvec.  Local path is byte-identical legacy.
+    bool use_peer = false;
+    int  best = -1;
+    {
+        size_t freeb = 0, totb = 0;
+        cudaMemGetInfo(&freeb, &totb);
+        const size_t need_local = 2 * Wsz * sizeof(real_t);
+        const bool peer_enabled = [] {
+            const char* e = std::getenv("GANSU_IP_GEMM_PEER");
+            return !(e && e[0] == '0');
+        }();
+        if ((double)need_local >= 0.5 * (double)freeb && peer_enabled) {
+            int cur = -1;  cudaGetDevice(&cur);
+            int ndev = 0;  cudaGetDeviceCount(&ndev);
+            // Peak peer need: WA + WVA + 1 repack temp (freed) + r2 copy +
+            // R2comb/R2sw/out1/out2.
+            const size_t peak = 3 * Wsz * sizeof(real_t) + 5 * h2p * sizeof(real_t);
+            size_t best_free = 0;
+            for (int d = 0; d < ndev; ++d) {
+                if (d == cur) continue;
+                MultiGpuManager::DeviceGuard g(d);
+                size_t f = 0, t = 0;
+                if (cudaMemGetInfo(&f, &t) != cudaSuccess) continue;
+                if (f > best_free) { best_free = f; best = d; }
+            }
+            if (best >= 0 && (double)best_free > 1.15 * (double)peak) {
+                use_peer = true;
+                std::fprintf(stderr,
+                    "  [IP-EOM gemm-peer] WA/WVA (%.1f GiB) > 50%% of device %d free "
+                    "(%.1f GiB) — built on peer GPU %d (free %.1f GiB); Wovvo/Wovov "
+                    "GEMMs run there per matvec\n",
+                    need_local / (1024.0*1024.0*1024.0), cur,
+                    freeb / (1024.0*1024.0*1024.0), best,
+                    best_free / (1024.0*1024.0*1024.0));
+            }
+        }
+    }
+    if (!use_peer) {
+        tracked_cudaMalloc(&d_WA_,     Wsz * sizeof(real_t));
+        tracked_cudaMalloc(&d_WVA_,    Wsz * sizeof(real_t));
+        tracked_cudaMalloc(&d_R2comb_, h2p * sizeof(real_t));
+        tracked_cudaMalloc(&d_R2sw_,   h2p * sizeof(real_t));
+        tracked_cudaMalloc(&d_out1_,   h2p * sizeof(real_t));
+        tracked_cudaMalloc(&d_out2_,   h2p * sizeof(real_t));
+        ip_repack_wovvo_kernel<<<wblocks, threads>>>(d_Wovvo_, d_WA_,  nocc_, nvir_);
+        ip_repack_wovov_kernel<<<wblocks, threads>>>(d_Wovov_, d_WVA_, nocc_, nvir_);
+        return;
+    }
+    // Peer build: WA/WVA + per-matvec scratch live on the peer; the repack
+    // sources (Wovvo/Wovov) are peer-copied one at a time into a temp (freed).
+    int cur = -1;  cudaGetDevice(&cur);
+    tracked_cudaMalloc(&d_out1_stage_, h2p * sizeof(real_t));   // solve-device staging
+    tracked_cudaMalloc(&d_out2_stage_, h2p * sizeof(real_t));
+    {
+        MultiGpuManager::DeviceGuard g(best);
+        tracked_cudaMalloc(&d_WA_,     Wsz * sizeof(real_t));
+        tracked_cudaMalloc(&d_WVA_,    Wsz * sizeof(real_t));
+        tracked_cudaMalloc(&d_R2comb_, h2p * sizeof(real_t));
+        tracked_cudaMalloc(&d_R2sw_,   h2p * sizeof(real_t));
+        tracked_cudaMalloc(&d_out1_,   h2p * sizeof(real_t));
+        tracked_cudaMalloc(&d_out2_,   h2p * sizeof(real_t));
+        tracked_cudaMalloc(&d_peer_r2_, h2p * sizeof(real_t));
+        real_t* d_tmp = nullptr;
+        tracked_cudaMalloc(&d_tmp, Wsz * sizeof(real_t));
+        cudaMemcpyPeer(d_tmp, best, d_Wovvo_, cur, Wsz * sizeof(real_t));
+        ip_repack_wovvo_kernel<<<wblocks, threads>>>(d_tmp, d_WA_,  nocc_, nvir_);
+        cudaDeviceSynchronize();
+        cudaMemcpyPeer(d_tmp, best, d_Wovov_, cur, Wsz * sizeof(real_t));
+        ip_repack_wovov_kernel<<<wblocks, threads>>>(d_tmp, d_WVA_, nocc_, nvir_);
+        cudaDeviceSynchronize();
+        tracked_cudaFree(d_tmp);
+        cublasHandle_t h = nullptr;
+        cublasCreate(&h);
+        ip_gemm_cublas_   = (void*)h;
+        ip_gemm_peer_dev_ = best;
+    }
 }
 
 // (perf) Device-0 cuBLAS GEMMs for the three big σ2 terms (skipped in the kernel when
@@ -2351,13 +2434,44 @@ void IPEOMCCSDOperator::add_big_terms_gemm(const real_t* d_r2, real_t* d_s2) con
     cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
     const real_t one = 1.0, negone = -1.0, zero = 0.0;
 
-    // Woooo term (accumulate directly into σ2).
+    // Woooo term (accumulate directly into σ2; always on the solve device —
+    // Woooo is only nocc⁴ and lives next to d_s2).
     cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T, nvir_, P, P,
                 &one, d_r2, nvir_, d_Woooo_, P, &one, d_s2, nvir_);
 
-    // Reshaped r2 views for the Wovvo/Wovov GEMMs.
     const int threads = 256;
     const size_t blocks = ((size_t)h2p_dim_ + threads - 1) / threads;
+    if (ip_gemm_peer_dev_ >= 0) {
+        // (gemm-peer) WA/WVA + scratch live on the peer: ship r2 (33 MB), run
+        // the views kernel + 3 GEMMs there (same op sequence, same-arch GEMMs ⇒
+        // bit-identical), bring out1/out2 back (66 MB), transpose-add locally.
+        // cudaMemcpyPeer is fully synchronizing on both devices.
+        int curdev = -1;
+        cudaGetDevice(&curdev);
+        {
+            MultiGpuManager::DeviceGuard g(ip_gemm_peer_dev_);
+            cudaMemcpyPeer(d_peer_r2_, ip_gemm_peer_dev_, d_r2, curdev,
+                           (size_t)h2p_dim_ * sizeof(real_t));
+            ip_build_r2_views_kernel<<<blocks, threads>>>(d_peer_r2_, d_R2comb_, d_R2sw_,
+                                                          nocc_, nvir_);
+            cublasHandle_t pc = (cublasHandle_t)ip_gemm_cublas_;
+            cublasDgemm(pc, CUBLAS_OP_N, CUBLAS_OP_N, AJ, MO, KLD,
+                        &one,    d_WA_,  AJ, d_R2comb_,  KLD, &zero, d_out1_, AJ);
+            cublasDgemm(pc, CUBLAS_OP_N, CUBLAS_OP_N, AJ, MO, KLD,
+                        &negone, d_WVA_, AJ, d_peer_r2_, KLD, &one,  d_out1_, AJ);
+            cublasDgemm(pc, CUBLAS_OP_N, CUBLAS_OP_N, AJ, MO, KLD,
+                        &negone, d_WVA_, AJ, d_R2sw_,    KLD, &zero, d_out2_, AJ);
+            cudaMemcpyPeer(d_out1_stage_, curdev, d_out1_, ip_gemm_peer_dev_,
+                           (size_t)h2p_dim_ * sizeof(real_t));
+            cudaMemcpyPeer(d_out2_stage_, curdev, d_out2_, ip_gemm_peer_dev_,
+                           (size_t)h2p_dim_ * sizeof(real_t));
+        }
+        ip_sigma2_transpose_add_kernel<<<blocks, threads>>>(d_s2, d_out1_stage_,
+                                                            d_out2_stage_, nocc_, nvir_);
+        return;
+    }
+
+    // Reshaped r2 views for the Wovvo/Wovov GEMMs.
     ip_build_r2_views_kernel<<<blocks, threads>>>(d_r2, d_R2comb_, d_R2sw_, nocc_, nvir_);
 
     // out1 = R2comb·WA − R2b·WVA  (rows i=MO, cols (a,j)=AJ, contract (l,d)=KLD).
