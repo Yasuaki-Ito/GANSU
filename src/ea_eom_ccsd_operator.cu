@@ -526,14 +526,21 @@ __global__ void ea_wvvvo_repack_A_kernel(
 //   mode 0 (hB) : t2[p,q,d,e]   (p=l, q=j, e=b)
 //   mode 1 (hBp): t2[p,q,e,d]   (p=l, q=j, e=b)
 //   mode 2 (hB4): t2[q,p,d,e]   (p=k, q=j, e=a)
+// (2026-07-16 k-tile) k0/kcols window over the GEMM contraction dim (= the
+// kernel "row" index (p,d)): dst holds only rows [k0, k0+kcols) — the full
+// matrix is k0=0 / kcols=KV (byte-identical fill).  Lets the term3+4 GEMM run
+// with a windowed B operand when the dense KV² (9.9 GiB at 490+NTO-bath)
+// no longer fits next to the build residency (OOM site #7).
 __global__ void ea_wvvvo_repack_B_kernel(
-    const real_t* __restrict__ t2, real_t* __restrict__ dst, int NO, int NV, int mode)
+    const real_t* __restrict__ t2, real_t* __restrict__ dst, int NO, int NV, int mode,
+    int k0, int kcols)
 {
     const size_t KV  = (size_t)NO * NV;
-    const size_t tot = KV * KV;
+    const size_t tot = (size_t)kcols * KV;
     const size_t stride = (size_t)gridDim.x * blockDim.x;
     for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < tot; idx += stride) {
-        const size_t row = idx / KV, col = idx % KV;
+        const size_t row = (size_t)k0 + idx / KV;
+        const size_t col = idx % KV;
         const int p = (int)(row / NV), d = (int)(row % NV);
         const int q = (int)(col / NV), e = (int)(col % NV);
         real_t v;
@@ -2491,50 +2498,109 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                     // Two GEMMs over the contiguous [naux×nvir²] B_vv block; the
                     // nvir⁴ (ab|cd) tensor is never formed. d_interA layout is
                     // identical to the dense GEMM below ⇒ scatter is unchanged.
+                    // (2026-07-16, OOM site #3 final) At 490+τ=0.01 (nvir=351)
+                    // even the B̃ factors (naux·NV² = 3.1 GiB) no longer fit next
+                    // to the build residency, and this branch has NO host
+                    // fallback (the raw vvvv is elided).  All inputs are B_mo +
+                    // t1 → in host-scatter mode relocate the whole Term A to the
+                    // freest peer GPU (B_mo copied once; the per-slab D2H
+                    // scatter is device-agnostic).  Same ops, same order.
                     cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
                     const int naux = eri_block_src_->get_num_auxiliary_basis();
                     const int voff = NO + frozen_off_;
-                    real_t *d_Bvv = nullptr, *d_Y = nullptr, *d_t1_dev = nullptr;
-                    tracked_cudaMalloc(&d_Bvv,    (size_t)naux * NV * NV * sizeof(real_t));
-                    tracked_cudaMalloc(&d_Y,      (size_t)naux * NV * NO * sizeof(real_t));
-                    tracked_cudaMalloc(&d_t1_dev, (size_t)NO   * NV      * sizeof(real_t));
-                    cudaMemcpy(d_t1_dev, h_t1.data(), (size_t)NO * NV * sizeof(real_t),
-                               cudaMemcpyHostToDevice);
-                    { const int thr = 256;
-                      const size_t tot = (size_t)naux * NV * NV;
-                      int blk = (int)((tot + thr - 1) / thr); if (blk > 65535) blk = 65535;
-                      ea_gather_bvv_kernel<<<blk, thr>>>(d_B_mo_blocks_, d_Bvv,
-                                                         naux, nmo_full_, voff, NV); }
-                    const real_t one = 1.0, zero = 0.0;
-                    // GEMM1: Y[(P,c),j] = Σ_d B_vv[(P,c),d]·t1[j,d]  (mirrors dense Term A shape)
-                    cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                                NO, naux * NV, NV, &one,
-                                d_t1_dev, NV, d_Bvv, NV, &zero, d_Y, NO);
+                    int curA = -1;
+                    cudaGetDevice(&curA);
+                    int devA = curA;
+                    const real_t* bmo_src = d_B_mo_blocks_;
+                    real_t* d_bmo_peer = nullptr;
+                    cublasHandle_t peer_hdl = nullptr;
                     if (wt1_host_accum) {
-                        // GEMM2 column-slab (cols = (a,b); B-operand row offset
-                        // d_Bvv + n0) → D2H → host scatter. Output split only ⇒
-                        // per-element dot products unchanged.
-                        const size_t M = (size_t)NV * NO;
-                        const int TN = wt1_slab_cols(M, NV * NV);
-                        real_t* d_slab = nullptr;
-                        tracked_cudaMalloc(&d_slab, (size_t)TN * M * sizeof(real_t));
-                        for (int n0 = 0; n0 < NV * NV; n0 += TN) {
-                            const int nn = std::min(TN, NV * NV - n0);
-                            cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
-                                        NV * NO, nn, naux, &one,
-                                        d_Y, NV * NO, d_Bvv + n0, NV * NV,
-                                        &zero, d_slab, NV * NO);
-                            wt1_host_scatter(d_slab, (size_t)n0 * M,
-                                             (size_t)nn * M, 1.0, 1);
+                        size_t fbA = 0, tbA = 0;
+                        cudaMemGetInfo(&fbA, &tbA);
+                        const size_t needA = ((size_t)naux * NV * NV
+                                              + (size_t)naux * NV * NO) * sizeof(real_t)
+                                             + ((size_t)3 << 30);
+                        if (fbA < needA) {
+                            const size_t bmo_bytes = (size_t)naux * nmo_full_ * nmo_full_
+                                                     * sizeof(real_t);
+                            int ndev = 0;
+                            cudaGetDeviceCount(&ndev);
+                            int best = -1;  size_t best_free = 0;
+                            for (int d = 0; d < ndev; ++d) {
+                                if (d == curA) continue;
+                                MultiGpuManager::DeviceGuard g(d);
+                                size_t f = 0, t = 0;
+                                if (cudaMemGetInfo(&f, &t) != cudaSuccess) continue;
+                                if (f > best_free) { best_free = f; best = d; }
+                            }
+                            if (best >= 0
+                                && (double)best_free > 1.15 * (double)(needA + bmo_bytes)) {
+                                devA = best;
+                                std::cout << "  [EA-EOM] wvvvo Term A (RI) relocated to peer "
+                                             "GPU " << best << " (local free "
+                                          << std::fixed << std::setprecision(1)
+                                          << fbA / (1024.0*1024.0*1024.0) << " GiB < "
+                                          << needA / (1024.0*1024.0*1024.0)
+                                          << " GiB; B_mo copied once)."
+                                          << std::defaultfloat << std::endl;
+                            }
                         }
-                        tracked_cudaFree(d_slab);
-                    } else {
-                        // GEMM2: d_interA[(a,b),(c,j)] = Σ_P B_vv[P,(a,b)]·Y[P,(c,j)]
-                        cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
-                                    NV * NO, NV * NV, naux, &one,
-                                    d_Y, NV * NO, d_Bvv, NV * NV, &zero, d_interA, NV * NO);
                     }
-                    tracked_cudaFree(d_Bvv); tracked_cudaFree(d_Y); tracked_cudaFree(d_t1_dev);
+                    {
+                        MultiGpuManager::DeviceGuard gA(devA);
+                        if (devA != curA) {
+                            const size_t bmo_bytes = (size_t)naux * nmo_full_ * nmo_full_
+                                                     * sizeof(real_t);
+                            tracked_cudaMalloc(&d_bmo_peer, bmo_bytes);
+                            cudaMemcpyPeer(d_bmo_peer, devA, d_B_mo_blocks_, curA, bmo_bytes);
+                            bmo_src = d_bmo_peer;
+                            cublasCreate(&peer_hdl);
+                            cublas = peer_hdl;
+                        }
+                        real_t *d_Bvv = nullptr, *d_Y = nullptr, *d_t1_dev = nullptr;
+                        tracked_cudaMalloc(&d_Bvv,    (size_t)naux * NV * NV * sizeof(real_t));
+                        tracked_cudaMalloc(&d_Y,      (size_t)naux * NV * NO * sizeof(real_t));
+                        tracked_cudaMalloc(&d_t1_dev, (size_t)NO   * NV      * sizeof(real_t));
+                        cudaMemcpy(d_t1_dev, h_t1.data(), (size_t)NO * NV * sizeof(real_t),
+                                   cudaMemcpyHostToDevice);
+                        { const int thr = 256;
+                          const size_t tot = (size_t)naux * NV * NV;
+                          int blk = (int)((tot + thr - 1) / thr); if (blk > 65535) blk = 65535;
+                          ea_gather_bvv_kernel<<<blk, thr>>>(bmo_src, d_Bvv,
+                                                             naux, nmo_full_, voff, NV); }
+                        const real_t one = 1.0, zero = 0.0;
+                        // GEMM1: Y[(P,c),j] = Σ_d B_vv[(P,c),d]·t1[j,d]  (mirrors dense Term A shape)
+                        cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                    NO, naux * NV, NV, &one,
+                                    d_t1_dev, NV, d_Bvv, NV, &zero, d_Y, NO);
+                        if (wt1_host_accum) {
+                            // GEMM2 column-slab (cols = (a,b); B-operand row offset
+                            // d_Bvv + n0) → D2H → host scatter. Output split only ⇒
+                            // per-element dot products unchanged.
+                            const size_t M = (size_t)NV * NO;
+                            const int TN = wt1_slab_cols(M, NV * NV);
+                            real_t* d_slab = nullptr;
+                            tracked_cudaMalloc(&d_slab, (size_t)TN * M * sizeof(real_t));
+                            for (int n0 = 0; n0 < NV * NV; n0 += TN) {
+                                const int nn = std::min(TN, NV * NV - n0);
+                                cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                                            NV * NO, nn, naux, &one,
+                                            d_Y, NV * NO, d_Bvv + n0, NV * NV,
+                                            &zero, d_slab, NV * NO);
+                                wt1_host_scatter(d_slab, (size_t)n0 * M,
+                                                 (size_t)nn * M, 1.0, 1);
+                            }
+                            tracked_cudaFree(d_slab);
+                        } else {
+                            // GEMM2: d_interA[(a,b),(c,j)] = Σ_P B_vv[P,(a,b)]·Y[P,(c,j)]
+                            cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                                        NV * NO, NV * NV, naux, &one,
+                                        d_Y, NV * NO, d_Bvv, NV * NV, &zero, d_interA, NV * NO);
+                        }
+                        tracked_cudaFree(d_Bvv); tracked_cudaFree(d_Y); tracked_cudaFree(d_t1_dev);
+                        if (d_bmo_peer) tracked_cudaFree(d_bmo_peer);
+                        if (peer_hdl)   cublasDestroy(peer_hdl);
+                    }
                     termA_gpu = true;
                 } else if (eri_vvvv_nslab_ > 1) {
                     h_inter.assign(inter_sz, 0.0);
@@ -2657,7 +2723,26 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
             const size_t result_sz = (size_t)NV * NV * NV * NO;
             bool termB_gpu = false;
 #ifndef GANSU_CPU_ONLY
+            // (2026-07-16 OOM guard, mirrors Term C) d_inter1 is NO²NV²
+            // (10.7 GiB at 490+τ=0.01) — fall back to the bit-identical host
+            // loops when it does not fit next to the build residency.
+            bool termB_fit = false;
             if (gpu::gpu_available()) {
+                size_t fbB = 0, tbB = 0;
+                cudaMemGetInfo(&fbB, &tbB);
+                const size_t needB = inter1_sz * sizeof(real_t)
+                    + (wt1_host_accum ? ((size_t)3 << 30) : result_sz * sizeof(real_t))
+                    + ((size_t)2 << 30);
+                termB_fit = (fbB >= needB);
+                if (!termB_fit)
+                    std::cout << "  [EA-EOM] wvvvo Term B GPU scratch skipped ("
+                              << std::fixed << std::setprecision(1)
+                              << fbB / (1024.0*1024.0*1024.0) << " GiB free < "
+                              << needB / (1024.0*1024.0*1024.0)
+                              << " GiB) — bit-identical host fallback."
+                              << std::defaultfloat << std::endl;
+            }
+            if (termB_fit) {
                 cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
                 real_t *d_t1_dev = nullptr, *d_inter1 = nullptr, *d_result = nullptr;
                 tracked_cudaMalloc(&d_t1_dev, (size_t)NO * NV * sizeof(real_t));
@@ -2922,6 +3007,43 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                                 h_tau_klab[(((size_t)k*NO+l)*NV+a)*NV+b] =
                                     H_T2(k,l,a,b) + H_T1(k,a)*H_T1(l,b);
                 cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
+                // (2026-07-16) Placement: in host-scatter mode this whole GPU
+                // section is self-contained — inputs are the two host arrays
+                // above, outputs leave via per-slab D2H — so relocate to the
+                // freest peer when d_u + the tau tile no longer fit locally
+                // (490+τ=0.01: the build device is down to ~2-4 GiB here).
+                int curD = -1;
+                cudaGetDevice(&curD);
+                int devD = curD;
+                cublasHandle_t peerD = nullptr;
+                if (wt1_host_accum) {
+                    size_t fbD = 0, tbD = 0;
+                    cudaMemGetInfo(&fbD, &tbD);
+                    const size_t needD = u_klcj_sz * sizeof(real_t) + ((size_t)5 << 30);
+                    if (fbD < needD) {
+                        int ndev = 0;
+                        cudaGetDeviceCount(&ndev);
+                        int best = -1;  size_t bf = 0;
+                        for (int d = 0; d < ndev; ++d) {
+                            if (d == curD) continue;
+                            MultiGpuManager::DeviceGuard g(d);
+                            size_t f = 0, t = 0;
+                            if (cudaMemGetInfo(&f, &t) != cudaSuccess) continue;
+                            if (f > bf) { bf = f; best = d; }
+                        }
+                        if (best >= 0 && (double)bf > 1.15 * (double)needD) {
+                            devD = best;
+                            std::cout << "  [EA-EOM] wvvvo Term D relocated to peer GPU "
+                                      << best << " (local free " << std::fixed
+                                      << std::setprecision(1)
+                                      << fbD / (1024.0*1024.0*1024.0) << " GiB < "
+                                      << needD / (1024.0*1024.0*1024.0) << " GiB)."
+                                      << std::defaultfloat << std::endl;
+                        }
+                    }
+                }
+                MultiGpuManager::DeviceGuard gD(devD);
+                if (devD != curD) { cublasCreate(&peerD); cublas = peerD; }
                 real_t *d_u = nullptr, *d_tau = nullptr, *d_C = nullptr;
                 tracked_cudaMalloc(&d_u,   u_klcj_sz   * sizeof(real_t));
                 // (2026-07-16, OOM site #6) In host-accum mode the full d_tau
@@ -2974,6 +3096,7 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                 }
                 tracked_cudaFree(d_u);
                 if (d_tau) tracked_cudaFree(d_tau);
+                if (peerD) cublasDestroy(peerD);
                 termD_gpu = true;
                 if (std::getenv("GANSU_STEOM_BUILD_VALIDATE") && d_C != nullptr) {
                     std::vector<real_t> h_termD(termD_sz, 0.0);
@@ -3131,9 +3254,33 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                           << " GiB dBig elided; per-tile D2H + host scatter)."
                           << std::defaultfloat << std::endl;
         }
+        // (2026-07-16, OOM site #7) The dense B operand (KV² = 9.9 GiB at
+        // 490+NTO-bath) no longer fits after the A/M slabs.  Window it over the
+        // GEMM contraction dim: per (tile, k0) repack rows [k0, k0+kt) off the
+        // resident d_t2_ and accumulate split-k GEMMs (β = k0>0) — logical
+        // operands unchanged; split-k accumulation is the usual ≤1 ULP reassoc
+        // class of this memory-tight mode.  kt = KV (single window) keeps the
+        // exact legacy call structure (repack once per mode, β=0).
+        size_t kt = (size_t)KV;
+        {
+            size_t fb3 = 0, tb3 = 0;
+            cudaMemGetInfo(&fb3, &tb3);
+            if (((double)Bsz + 2.0 * (double)nt * KV) * sizeof(real_t)
+                > 0.80 * (double)fb3) {
+                kt = (size_t)(0.25 * (double)fb3 / ((double)KV * sizeof(real_t)));
+                kt = std::max<size_t>(std::min<size_t>(kt, (size_t)KV), 512);
+                std::cout << "  [EA-EOM] Wvvvo term3+4 B k-tiled: kt=" << kt
+                          << "/" << KV << " (window " << std::fixed << std::setprecision(1)
+                          << (double)kt * KV * sizeof(real_t) / (1024.0*1024.0*1024.0)
+                          << " GiB vs dense "
+                          << (double)Bsz * sizeof(real_t) / (1024.0*1024.0*1024.0)
+                          << " GiB, free " << (double)fb3 / (1024.0*1024.0*1024.0)
+                          << " GiB)" << std::defaultfloat << std::endl;
+            }
+        }
         real_t *dA = nullptr, *dB = nullptr, *dM = nullptr, *dBig = nullptr;
         tracked_cudaMalloc(&dA,   nt * KV * sizeof(real_t));
-        tracked_cudaMalloc(&dB,   Bsz     * sizeof(real_t));
+        tracked_cudaMalloc(&dB,   kt * KV * sizeof(real_t));
         tracked_cudaMalloc(&dM,   nt * KV * sizeof(real_t));
         std::vector<real_t> h_tileM;
         if (big_host) {
@@ -3149,15 +3296,28 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         // All work on the legacy default stream → repack → GEMM → scatter are
         // implicitly ordered; consecutive scatters serialize their dBig RMW.
         auto gemm_scatter_dev = [&](int Amode, int Bmode, real_t coeff, int free_bc) {
-            ea_wvvvo_repack_B_kernel<<<blkB, thr>>>(d_t2_, dB, NO, NV, Bmode);
+            if (kt == (size_t)KV)   // legacy: one full repack per mode
+                ea_wvvvo_repack_B_kernel<<<blkB, thr>>>(d_t2_, dB, NO, NV, Bmode,
+                                                        0, KV);
             for (size_t n0 = 0; n0 < (size_t)NV2; n0 += nt) {
                 const int nt_cur = (int)std::min<size_t>(nt, (size_t)NV2 - n0);
                 const size_t tsz = (size_t)nt_cur * KV;
                 const int blkT = (int)std::min<size_t>((tsz + thr - 1) / thr, 65535);
                 ea_wvvvo_repack_A_kernel<<<blkT, thr>>>(d_eri_ovvv_, dA, NO, NV, Amode,
                                                         (int)n0, nt_cur);
-                cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, KV, nt_cur, KV, &one,
-                            dB, KV, dA, KV, &zero, dM, KV);
+                if (kt == (size_t)KV) {
+                    cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, KV, nt_cur, KV, &one,
+                                dB, KV, dA, KV, &zero, dM, KV);
+                } else {
+                    for (size_t k0 = 0; k0 < (size_t)KV; k0 += kt) {
+                        const int kc = (int)std::min<size_t>(kt, (size_t)KV - k0);
+                        ea_wvvvo_repack_B_kernel<<<blkB, thr>>>(d_t2_, dB, NO, NV, Bmode,
+                                                                (int)k0, kc);
+                        const real_t* beta_k = (k0 == 0) ? &zero : &one;
+                        cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, KV, nt_cur, kc, &one,
+                                    dB, KV, dA + k0, KV, beta_k, dM, KV);
+                    }
+                }
                 if (!big_host) {
                     ea_wvvvo_scatter_kernel<<<blkT, thr>>>(dM, dBig, coeff, free_bc, NO, NV,
                                                            (int)n0, nt_cur);
@@ -3252,18 +3412,57 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
         tracked_cudaMalloc(&dA,(size_t)JC_M5*KL_K5*sizeof(real_t));
         tracked_cudaMalloc(&dB,(size_t)KL_K5*BA_N5*sizeof(real_t));
-        tracked_cudaMalloc(&dC,(size_t)JC_M5*BA_N5*sizeof(real_t));
         cudaMemcpy(dA,hA.data(),(size_t)JC_M5*KL_K5*sizeof(real_t),cudaMemcpyHostToDevice);
         cudaMemcpy(dB,hB.data(),(size_t)KL_K5*BA_N5*sizeof(real_t),cudaMemcpyHostToDevice);
         const real_t one=1.0,zero=0.0;
-        cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,BA_N5,JC_M5,KL_K5,&one,dB,BA_N5,dA,KL_K5,&zero,dC,BA_N5);
-        tracked_cudaFree(dA);tracked_cudaFree(dB);
-        if (wvvvo_dev_asm) d_t5_keep = dC;   // stage 3: keep for device assembly
-        if (!wvvvo_dev_asm || wvvvo_keep_validate) {
-            wvvvo_t5.assign((size_t)JC_M5*BA_N5,0.0);
-            cudaMemcpy(wvvvo_t5.data(),dC,(size_t)JC_M5*BA_N5*sizeof(real_t),cudaMemcpyDeviceToHost);
+        // (2026-07-16, OOM site #8) dC = NV²·(NO·NV) — 31 GiB at 490+NTO-bath —
+        // no longer fits after dA/dB.  When the result is host-bound anyway
+        // (no device assembly), slab the GEMM over the (j,c) columns and D2H
+        // each slab straight into wvvvo_t5: the host layout [(j,c)·BA + (b,a)]
+        // IS the col-major (BA × JC) matrix, so each column slab lands
+        // contiguously.  Same operands per column ⇒ GEMM-shape reassoc only.
+        bool t5_slab = false;
+        if (!wvvvo_dev_asm) {
+            size_t fb5 = 0, tb5 = 0;
+            cudaMemGetInfo(&fb5, &tb5);
+            t5_slab = ((double)JC_M5 * BA_N5 * sizeof(real_t) > 0.80 * (double)fb5);
+            if (t5_slab)
+                std::cout << "  [EA-EOM] Wvvvo term5 output slabbed ("
+                          << std::fixed << std::setprecision(1)
+                          << (double)JC_M5 * BA_N5 * sizeof(real_t) / (1024.0*1024.0*1024.0)
+                          << " GiB dC elided; free " << (double)fb5 / (1024.0*1024.0*1024.0)
+                          << " GiB) — per-slab D2H into wvvvo_t5."
+                          << std::defaultfloat << std::endl;
         }
-        if (!wvvvo_dev_asm) tracked_cudaFree(dC);
+        if (t5_slab) {
+            wvvvo_t5.assign((size_t)JC_M5*BA_N5,0.0);
+            size_t fb5 = 0, tb5 = 0;
+            cudaMemGetInfo(&fb5, &tb5);
+            int TN5 = (int)std::min<size_t>((size_t)JC_M5,
+                          std::max<size_t>(256, (size_t)(0.25 * (double)fb5
+                              / ((double)BA_N5 * sizeof(real_t)))));
+            real_t* dCs = nullptr;
+            tracked_cudaMalloc(&dCs,(size_t)TN5*BA_N5*sizeof(real_t));
+            for (int n0 = 0; n0 < JC_M5; n0 += TN5) {
+                const int nn = std::min(TN5, JC_M5 - n0);
+                cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,BA_N5,nn,KL_K5,&one,
+                            dB,BA_N5,dA+(size_t)n0*KL_K5,KL_K5,&zero,dCs,BA_N5);
+                cudaMemcpy(wvvvo_t5.data()+(size_t)n0*BA_N5,dCs,
+                           (size_t)nn*BA_N5*sizeof(real_t),cudaMemcpyDeviceToHost);
+            }
+            tracked_cudaFree(dCs);
+            tracked_cudaFree(dA);tracked_cudaFree(dB);
+        } else {
+            tracked_cudaMalloc(&dC,(size_t)JC_M5*BA_N5*sizeof(real_t));
+            cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,BA_N5,JC_M5,KL_K5,&one,dB,BA_N5,dA,KL_K5,&zero,dC,BA_N5);
+            tracked_cudaFree(dA);tracked_cudaFree(dB);
+            if (wvvvo_dev_asm) d_t5_keep = dC;   // stage 3: keep for device assembly
+            if (!wvvvo_dev_asm || wvvvo_keep_validate) {
+                wvvvo_t5.assign((size_t)JC_M5*BA_N5,0.0);
+                cudaMemcpy(wvvvo_t5.data(),dC,(size_t)JC_M5*BA_N5*sizeof(real_t),cudaMemcpyDeviceToHost);
+            }
+            if (!wvvvo_dev_asm) tracked_cudaFree(dC);
+        }
         wvvvo_t5_gpu = true;
         if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
             real_t dmax=0.0;
@@ -3303,6 +3502,40 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     if (gpu::gpu_available()) {
         cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
         const real_t one = 1.0, zero = 0.0;
+        // (2026-07-16, OOM sites #9-11 pre-empt) Each item's dense dC is
+        // NV³·NO (31 GiB at 490+NTO-bath) and the results are host-bound (no
+        // device assembly).  When dC does not fit, run the GEMM in (n=M)
+        // column slabs D2H'd straight into the host result — the host layout
+        // IS the col-major (N × M) matrix, so slabs land contiguously.  Same
+        // operands per column ⇒ GEMM-shape reassoc only.  Returns false (→
+        // legacy dense body) when memory suffices or device assembly needs dC.
+        auto gemm_to_host_slabbed = [&](real_t* dB_, real_t* dA_, std::vector<real_t>& out,
+                                        int N_, int M_, int K_, const char* tag) -> bool {
+            if (wvvvo_dev_asm) return false;
+            size_t fbs = 0, tbs = 0;
+            cudaMemGetInfo(&fbs, &tbs);
+            if ((double)N_ * M_ * sizeof(real_t) <= 0.80 * (double)fbs) return false;
+            std::cout << "  [EA-EOM] Wvvvo " << tag << " output slabbed ("
+                      << std::fixed << std::setprecision(1)
+                      << (double)N_ * M_ * sizeof(real_t) / (1024.0*1024.0*1024.0)
+                      << " GiB dC elided; free " << (double)fbs / (1024.0*1024.0*1024.0)
+                      << " GiB)." << std::defaultfloat << std::endl;
+            out.assign((size_t)N_ * M_, 0.0);
+            const int TNs = std::max(1, (int)std::min<size_t>((size_t)M_,
+                                (size_t)(0.25 * (double)fbs
+                                    / ((double)N_ * sizeof(real_t)))));
+            real_t* dCs = nullptr;
+            tracked_cudaMalloc(&dCs, (size_t)TNs * N_ * sizeof(real_t));
+            for (int n0 = 0; n0 < M_; n0 += TNs) {
+                const int nn = std::min(TNs, M_ - n0);
+                cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, N_, nn, K_, &one,
+                            dB_, N_, dA_ + (size_t)n0 * K_, K_, &zero, dCs, N_);
+                cudaMemcpy(out.data() + (size_t)n0 * N_, dCs,
+                           (size_t)nn * N_ * sizeof(real_t), cudaMemcpyDeviceToHost);
+            }
+            tracked_cudaFree(dCs);
+            return true;
+        };
         // --- Item 1: A[b,l] = T1(l,b); B = h_W1ovov direct (stride l = N_w1) ---
         {
             std::vector<real_t> hA((size_t)M_w1*K_w1);
@@ -3312,17 +3545,21 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
             real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
             tracked_cudaMalloc(&dA,(size_t)M_w1*K_w1*sizeof(real_t));
             tracked_cudaMalloc(&dB,(size_t)K_w1*N_w1*sizeof(real_t));
-            tracked_cudaMalloc(&dC,(size_t)M_w1*N_w1*sizeof(real_t));
             cudaMemcpy(dA,hA.data(),(size_t)M_w1*K_w1*sizeof(real_t),cudaMemcpyHostToDevice);
             cudaMemcpy(dB,h_W1ovov.data(),(size_t)K_w1*N_w1*sizeof(real_t),cudaMemcpyHostToDevice);
-            cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,N_w1,M_w1,K_w1,&one,dB,N_w1,dA,K_w1,&zero,dC,N_w1);
-            tracked_cudaFree(dA);tracked_cudaFree(dB);
-            if (wvvvo_dev_asm) d_ct1_keep = dC;   // stage 3: keep for device assembly
-            if (!wvvvo_dev_asm || wvvvo_keep_validate) {
-                ct_wvvvo_1.assign((size_t)M_w1*N_w1, 0.0);
-                cudaMemcpy(ct_wvvvo_1.data(),dC,(size_t)M_w1*N_w1*sizeof(real_t),cudaMemcpyDeviceToHost);
+            if (gemm_to_host_slabbed(dB, dA, ct_wvvvo_1, N_w1, M_w1, K_w1, "item1")) {
+                tracked_cudaFree(dA);tracked_cudaFree(dB);
+            } else {
+                tracked_cudaMalloc(&dC,(size_t)M_w1*N_w1*sizeof(real_t));
+                cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,N_w1,M_w1,K_w1,&one,dB,N_w1,dA,K_w1,&zero,dC,N_w1);
+                tracked_cudaFree(dA);tracked_cudaFree(dB);
+                if (wvvvo_dev_asm) d_ct1_keep = dC;   // stage 3: keep for device assembly
+                if (!wvvvo_dev_asm || wvvvo_keep_validate) {
+                    ct_wvvvo_1.assign((size_t)M_w1*N_w1, 0.0);
+                    cudaMemcpy(ct_wvvvo_1.data(),dC,(size_t)M_w1*N_w1*sizeof(real_t),cudaMemcpyDeviceToHost);
+                }
+                if (!wvvvo_dev_asm) tracked_cudaFree(dC);
             }
-            if (!wvvvo_dev_asm) tracked_cudaFree(dC);
             wvvvo_1_gpu = true;
             if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
                 real_t dmax = 0.0;
@@ -3348,17 +3585,21 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
             real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
             tracked_cudaMalloc(&dA,(size_t)M_w2*K_w2*sizeof(real_t));
             tracked_cudaMalloc(&dB,(size_t)K_w2*N_w2*sizeof(real_t));
-            tracked_cudaMalloc(&dC,(size_t)M_w2*N_w2*sizeof(real_t));
             cudaMemcpy(dA,hA.data(),(size_t)M_w2*K_w2*sizeof(real_t),cudaMemcpyHostToDevice);
             cudaMemcpy(dB,h_W1ovvo.data(),(size_t)K_w2*N_w2*sizeof(real_t),cudaMemcpyHostToDevice);
-            cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,N_w2,M_w2,K_w2,&one,dB,N_w2,dA,K_w2,&zero,dC,N_w2);
-            tracked_cudaFree(dA);tracked_cudaFree(dB);
-            if (wvvvo_dev_asm) d_ct2_keep = dC;   // stage 3: keep for device assembly
-            if (!wvvvo_dev_asm || wvvvo_keep_validate) {
-                ct_wvvvo_2.assign((size_t)M_w2*N_w2, 0.0);
-                cudaMemcpy(ct_wvvvo_2.data(),dC,(size_t)M_w2*N_w2*sizeof(real_t),cudaMemcpyDeviceToHost);
+            if (gemm_to_host_slabbed(dB, dA, ct_wvvvo_2, N_w2, M_w2, K_w2, "item2")) {
+                tracked_cudaFree(dA);tracked_cudaFree(dB);
+            } else {
+                tracked_cudaMalloc(&dC,(size_t)M_w2*N_w2*sizeof(real_t));
+                cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,N_w2,M_w2,K_w2,&one,dB,N_w2,dA,K_w2,&zero,dC,N_w2);
+                tracked_cudaFree(dA);tracked_cudaFree(dB);
+                if (wvvvo_dev_asm) d_ct2_keep = dC;   // stage 3: keep for device assembly
+                if (!wvvvo_dev_asm || wvvvo_keep_validate) {
+                    ct_wvvvo_2.assign((size_t)M_w2*N_w2, 0.0);
+                    cudaMemcpy(ct_wvvvo_2.data(),dC,(size_t)M_w2*N_w2*sizeof(real_t),cudaMemcpyDeviceToHost);
+                }
+                if (!wvvvo_dev_asm) tracked_cudaFree(dC);
             }
-            if (!wvvvo_dev_asm) tracked_cudaFree(dC);
             wvvvo_2_gpu = true;
             if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
                 real_t dmax = 0.0;
@@ -3384,17 +3625,21 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
             real_t *dA=nullptr,*dB=nullptr,*dC=nullptr;
             tracked_cudaMalloc(&dA,(size_t)M_w5*K_w5*sizeof(real_t));
             tracked_cudaMalloc(&dB,(size_t)K_w5*N_w5*sizeof(real_t));
-            tracked_cudaMalloc(&dC,(size_t)M_w5*N_w5*sizeof(real_t));
             cudaMemcpy(dA,hA.data(),(size_t)M_w5*K_w5*sizeof(real_t),cudaMemcpyHostToDevice);
             cudaMemcpy(dB,h_t2.data(),(size_t)K_w5*N_w5*sizeof(real_t),cudaMemcpyHostToDevice);
-            cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,N_w5,M_w5,K_w5,&one,dB,N_w5,dA,K_w5,&zero,dC,N_w5);
-            tracked_cudaFree(dA);tracked_cudaFree(dB);
-            if (wvvvo_dev_asm) d_ct5_keep = dC;   // stage 3: keep for device assembly
-            if (!wvvvo_dev_asm || wvvvo_keep_validate) {
-                ct_wvvvo_5.assign((size_t)M_w5*N_w5, 0.0);
-                cudaMemcpy(ct_wvvvo_5.data(),dC,(size_t)M_w5*N_w5*sizeof(real_t),cudaMemcpyDeviceToHost);
+            if (gemm_to_host_slabbed(dB, dA, ct_wvvvo_5, N_w5, M_w5, K_w5, "item5")) {
+                tracked_cudaFree(dA);tracked_cudaFree(dB);
+            } else {
+                tracked_cudaMalloc(&dC,(size_t)M_w5*N_w5*sizeof(real_t));
+                cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,N_w5,M_w5,K_w5,&one,dB,N_w5,dA,K_w5,&zero,dC,N_w5);
+                tracked_cudaFree(dA);tracked_cudaFree(dB);
+                if (wvvvo_dev_asm) d_ct5_keep = dC;   // stage 3: keep for device assembly
+                if (!wvvvo_dev_asm || wvvvo_keep_validate) {
+                    ct_wvvvo_5.assign((size_t)M_w5*N_w5, 0.0);
+                    cudaMemcpy(ct_wvvvo_5.data(),dC,(size_t)M_w5*N_w5*sizeof(real_t),cudaMemcpyDeviceToHost);
+                }
+                if (!wvvvo_dev_asm) tracked_cudaFree(dC);
             }
-            if (!wvvvo_dev_asm) tracked_cudaFree(dC);
             wvvvo_5_gpu = true;
             if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
                 real_t dmax = 0.0;
@@ -3717,6 +3962,28 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                     "%.1f GiB) — ring terms stay in-kernel\n",
                     M_need / (1024.0*1024.0*1024.0), freeb / (1024.0*1024.0*1024.0));
             }
+        }
+        // (2026-07-16, Davidson-fit) Once the ring GEMMs own R_A/R_B/R_C, the
+        // dressed Wovov/Wovvo device copies have NO σ-time consumer left: the
+        // σ2 kernel reads them only on the in-kernel ring path (include_ring=0
+        // now) and tmp_k reads the raw ovov block.  In the host-stage regime
+        // free EA's own copies (2×(nocc·nvir)² = 23 GiB at 490+τ=0.01 — the
+        // bar-H cache holds IP's separate copies) so the Davidson subspace
+        // fits (it needed 30.1 GiB vs 24.1 free).  Opt-out:
+        // GANSU_EA_KEEP_RING_SOURCES=1.
+        if (d_M_ringA_ != nullptr && ea_w_host_stage_
+            && std::getenv("GANSU_EA_KEEP_RING_SOURCES") == nullptr) {
+            size_t reclaimed = 0;
+            if (d_Wovov_) { reclaimed += ovov_sz * sizeof(real_t);
+                            tracked_cudaFree(d_Wovov_); d_Wovov_ = nullptr; }
+            if (d_Wovvo_) { reclaimed += ovvo_sz * sizeof(real_t);
+                            tracked_cudaFree(d_Wovvo_); d_Wovvo_ = nullptr; }
+            if (reclaimed > 0)
+                std::fprintf(stderr,
+                    "  [EA-EOM] dressed Wovov/Wovvo freed after ring-M build "
+                    "(%.1f GiB reclaimed; ring GEMMs own the ring terms, tmp_k "
+                    "reads raw ovov)\n",
+                    reclaimed / (1024.0*1024.0*1024.0));
         }
     }
 #endif
