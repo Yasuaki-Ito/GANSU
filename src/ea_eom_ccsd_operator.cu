@@ -44,6 +44,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <ostream>
 #include <stdexcept>
@@ -824,6 +825,44 @@ __global__ void ea_wvovv_assemble_kernel(
         const real_t cv   = ct[(size_t)al*Nv + ((size_t)c*NO*NV + l*NV + d)];
         wvovv[idx] = bare - cv;
     }
+}
+
+// l-window variant for the ovvv-host mode (C2: raw (ia|bc) released right
+// after its host copy): `ovvv_slab` holds rows l ∈ [l0, l0+nl) of the raw
+// block, streamed from h_ovvv. Same FP expressions and one write per element
+// as the full kernel above → the assembled Wvovv is bit-identical.
+__global__ void ea_wvovv_assemble_lwin_kernel(
+    const real_t* __restrict__ ovvv_slab, const real_t* __restrict__ ct,
+    real_t* __restrict__ wvovv, int NO, int NV, int a0, int na, int l0, int nl)
+{
+    const size_t tot = (size_t)na * nl * NV * NV;
+    const size_t Nv  = (size_t)NV * NO * NV;   // ct column dim = (c,l,d)
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < tot; idx += stride) {
+        const int d  = (int)(idx % NV);
+        const int c  = (int)((idx / NV) % NV);
+        const int ll = (int)((idx / ((size_t)NV*NV)) % nl);
+        const int al = (int)(idx / ((size_t)nl*NV*NV));
+        const int a  = a0 + al;                            // global a (ovvv read)
+        const int l  = l0 + ll;                            // global l (ct read + write)
+        const real_t bare = ovvv_slab[(((size_t)(ll*NV+d))*NV + a)*NV + c];
+        const real_t cv   = ct[(size_t)al*Nv + ((size_t)c*NO*NV + l*NV + d)];
+        wvovv[(size_t)al*NO*NV*NV + ((size_t)l*NV + c)*NV + d] = bare - cv;
+    }
+}
+
+// (C2) shared l-slab width for the h_ovvv streaming consumers: ~10% of the
+// current free pool, floor 1 row, override GANSU_EA_OVVV_SLAB=N (validation).
+static inline int ea_ovvv_slab_rows(int NO, int NV)
+{
+    size_t fb = 0, tb = 0;
+    cudaMemGetInfo(&fb, &tb);
+    const size_t row = (size_t)NV * NV * NV * sizeof(real_t);
+    int ns = (int)std::min<size_t>((size_t)NO,
+                 std::max<size_t>(1, (size_t)(0.10 * fb) / row));
+    if (const char* e = std::getenv("GANSU_EA_OVVV_SLAB"))
+        if (std::atoi(e) > 0) ns = std::min(NO, std::atoi(e));
+    return ns;
 }
 
 // ---- Wvvvo device assembly (broader refactor stage 3, canonical-skip path) ----
@@ -1682,6 +1721,37 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         tracked_cudaFree(d_eri_oovv_); d_eri_oovv_ = nullptr;
         tracked_cudaFree(d_eri_ovvo_); d_eri_ovvo_ = nullptr;
     }
+    // (EA storage-free, C2) Release the raw (ia|bc) block right after its host
+    // copy too: every remaining device consumer (ct_wovov / ct_wovvo / the
+    // Wvovv assemble / Terms B & C stage-1 / the term3+4 A-gather) has an
+    // h_ovvv-streamed l-slab path keyed on d_eri_ovvv_ == nullptr, so the
+    // nocc·nvir³ block then only exists transiently at extract time and the
+    // whole dressed build runs without it (490: 35.1 GiB off the residency;
+    // the binding peak moves to the extract-time block set). The Wvvvo
+    // device-assembly path needs the device block → its gate requires
+    // d_eri_ovvv_ != nullptr. GANSU_EA_OVVV_HOST: unset = auto (fires when
+    // ovvv > 20% of device memory), 2 = force this mode, 1 = term3+4 host
+    // A-gather only, 0 = off. GANSU_EA_KEEP_RAW_OVVV=1 disables.
+    if (gpu::gpu_available() && d_eri_ovvv_ != nullptr
+        && std::getenv("GANSU_EA_KEEP_RAW_OVVV") == nullptr) {
+        bool dev_free = false;
+        const char* fo = std::getenv("GANSU_EA_OVVV_HOST");
+        if (fo && fo[0]) dev_free = (fo[0] == '2');
+        else {
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            dev_free = ((double)ovvv_sz * sizeof(real_t) > 0.20 * (double)tb);
+        }
+        if (dev_free) {
+            tracked_cudaFree(d_eri_ovvv_);
+            d_eri_ovvv_ = nullptr;
+            std::cout << "  [EA-EOM] raw (ia|bc) released right after its host copy ("
+                      << std::fixed << std::setprecision(1)
+                      << (double)ovvv_sz * sizeof(real_t) / (1024.0*1024.0*1024.0)
+                      << " GiB; dressed-build consumers stream h_ovvv l-slabs)."
+                      << std::defaultfloat << std::endl;
+        }
+    }
 #endif
 
     subprof("host alloc + D2H inputs");
@@ -2031,11 +2101,30 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         const size_t cw_sz = (size_t)NO*NO*NV*NV;   // [k,i,(b,d)]
         real_t* dC=nullptr; tracked_cudaMalloc(&dC, cw_sz*sizeof(real_t));
         const real_t one=1.0, zero=0.0;
-        cublasDgemmStridedBatched(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-            NV*NV, NO, NV, &one,
-            d_eri_ovvv_, NV*NV, (long long)NV*NV*NV,
-            d_t1_,       NV,    0LL,
-            &zero, dC, NV*NV, (long long)NO*NV*NV, NO);
+        if (d_eri_ovvv_) {
+            cublasDgemmStridedBatched(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                NV*NV, NO, NV, &one,
+                d_eri_ovvv_, NV*NV, (long long)NV*NV*NV,
+                d_t1_,       NV,    0LL,
+                &zero, dC, NV*NV, (long long)NO*NV*NV, NO);
+        } else {
+            // (C2) same per-k batched GEMM, batches windowed over streamed
+            // h_ovvv k-slabs (per-batch operands unchanged → bit-identical).
+            real_t* d_sl = nullptr;
+            const int ns = ea_ovvv_slab_rows(NO, NV);
+            tracked_cudaMalloc(&d_sl, (size_t)ns*NV*NV*NV*sizeof(real_t));
+            for (int k0 = 0; k0 < NO; k0 += ns) {
+                const int nk = std::min(ns, NO - k0);
+                cudaMemcpy(d_sl, h_ovvv.data() + (size_t)k0*NV*NV*NV,
+                           (size_t)nk*NV*NV*NV*sizeof(real_t), cudaMemcpyHostToDevice);
+                cublasDgemmStridedBatched(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                    NV*NV, NO, NV, &one,
+                    d_sl,  NV*NV, (long long)NV*NV*NV,
+                    d_t1_, NV,    0LL,
+                    &zero, dC + (size_t)k0*NO*NV*NV, NV*NV, (long long)NO*NV*NV, nk);
+            }
+            tracked_cudaFree(d_sl);
+        }
         ct_wovov.assign(cw_sz, 0.0);
         cudaMemcpy(ct_wovov.data(), dC, cw_sz*sizeof(real_t), cudaMemcpyDeviceToHost);
         tracked_cudaFree(dC);
@@ -2119,9 +2208,26 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         tracked_cudaMalloc(&dC, cw_sz*sizeof(real_t));
         cudaMemcpy(dT,hT.data(),(size_t)NV*NO*sizeof(real_t),cudaMemcpyHostToDevice);
         const real_t one=1.0, zero=0.0;
-        cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-            NO, NO*NV*NV, NV, &one,
-            dT, NO, d_eri_ovvv_, NV, &zero, dC, NO);
+        if (d_eri_ovvv_) {
+            cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                NO, NO*NV*NV, NV, &one,
+                dT, NO, d_eri_ovvv_, NV, &zero, dC, NO);
+        } else {
+            // (C2) n-columns windowed over streamed h_ovvv k-slabs (output
+            // column split only; per-column dot unchanged → bit-identical).
+            real_t* d_sl = nullptr;
+            const int ns = ea_ovvv_slab_rows(NO, NV);
+            tracked_cudaMalloc(&d_sl, (size_t)ns*NV*NV*NV*sizeof(real_t));
+            for (int k0 = 0; k0 < NO; k0 += ns) {
+                const int nk = std::min(ns, NO - k0);
+                cudaMemcpy(d_sl, h_ovvv.data() + (size_t)k0*NV*NV*NV,
+                           (size_t)nk*NV*NV*NV*sizeof(real_t), cudaMemcpyHostToDevice);
+                cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                    NO, nk*NV*NV, NV, &one,
+                    dT, NO, d_sl, NV, &zero, dC + (size_t)k0*NV*NV*NO, NO);
+            }
+            tracked_cudaFree(d_sl);
+        }
         ct_wovvo.assign(cw_sz, 0.0);
         cudaMemcpy(ct_wovvo.data(), dC, cw_sz*sizeof(real_t), cudaMemcpyDeviceToHost);
         tracked_cudaFree(dT); tracked_cudaFree(dC);
@@ -2188,13 +2294,32 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         // d_eri_ovvv_ (30 GiB) + d_Wvovv_ (30 GiB) OOM'd the EA device (this
         // was the 490 EA build OOM site #2). Column-slab of the same GEMM
         // (output split, contraction untouched) + slab-offset assemble; the
-        // VALIDATE self-check below compares the assembled d_Wvovv_ vs host.
-        tracked_cudaMalloc(&d_Wvovv_, wvovv_sz * sizeof(real_t));
+        // VALIDATE self-check below compares the assembled Wvovv vs host.
+        //
+        // (490 sites #14/#15 →) With σ host-stage FORCED (GANSU_EA_W_HOST=1)
+        // the full NV³·NO d_Wvovv_ is never allocated at all: each a-slab is
+        // assembled on device and immediately D2H'd into h_wvovv_stage_ (σ
+        // streams it back per matvec anyway, and the uploads-stage pull-down
+        // becomes a no-op: d_Wvovv_ stays null). This removes the ovvv+Wvovv
+        // DOUBLE residency (~75 GiB at 490) that is the EA build's binding
+        // peak. Unforced/auto systems keep the device build byte-identical
+        // (the uploads-stage probe decides the staging there).
+        const char* ewh_wv = std::getenv("GANSU_EA_W_HOST");
+        const bool wv_build_to_host = (ewh_wv && ewh_wv[0] == '1');
+        real_t *d_wv_slab = nullptr;
+        if (wv_build_to_host) {
+            ea_w_host_stage_ = true;
+            h_wvovv_stage_.resize(wvovv_sz);
+        } else {
+            tracked_cudaMalloc(&d_Wvovv_, wvovv_sz * sizeof(real_t));
+        }
         int TA = Mv;
         {
             size_t freeb = 0, totb = 0;
             if (cudaMemGetInfo(&freeb, &totb) == cudaSuccess) {
-                const size_t row_bytes = (size_t)Nv * sizeof(real_t);
+                // build-to-host needs two slabs (dC + d_wv_slab) of Nv per row.
+                const size_t row_bytes = (size_t)Nv * sizeof(real_t)
+                                         * (wv_build_to_host ? 2 : 1);
                 // Floor is 1 row, not a fixed batch: right after the d_Wvovv_
                 // alloc the device can be sub-GiB free, and an 8-row floor then
                 // forces a dC larger than the remaining memory (490 nvir=352 EA
@@ -2208,23 +2333,59 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         }
         tracked_cudaMalloc(&dC, (size_t)TA*Nv*sizeof(real_t));
         const size_t slab_out = (size_t)NO*NV*NV;   // wvovv elements per a-row
+        if (wv_build_to_host)
+            tracked_cudaMalloc(&d_wv_slab, (size_t)TA*slab_out*sizeof(real_t));
+        // (C2) raw ovvv already released → the bare term streams h_ovvv l-slabs
+        // (lwin kernel, bit-identical element map; re-streamed per a-slab).
+        real_t* d_ovvv_ls = nullptr;
+        int wv_ls = 0;
+        if (!d_eri_ovvv_) {
+            wv_ls = ea_ovvv_slab_rows(NO, NV);
+            tracked_cudaMalloc(&d_ovvv_ls, (size_t)wv_ls*NV*NV*NV*sizeof(real_t));
+        }
         for (int a0 = 0; a0 < Mv; a0 += TA) {
             const int na = std::min(TA, Mv - a0);
             cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, Nv, na, Kv, &one,
                         d_eri_ovov_, Nv, dA + (size_t)a0*Kv, Kv, &zero, dC, Nv);
             const int thr = 256;
-            const size_t nel = (size_t)na * slab_out;
-            const int blk = (int)std::min<size_t>((nel + thr - 1) / thr, 65535);
-            ea_wvovv_assemble_kernel<<<blk, thr>>>(d_eri_ovvv_, dC,
-                d_Wvovv_ + (size_t)a0*slab_out, NO, NV, a0, na);
+            real_t* const wv_dst = wv_build_to_host ? d_wv_slab
+                                                    : d_Wvovv_ + (size_t)a0*slab_out;
+            if (d_eri_ovvv_) {
+                const size_t nel = (size_t)na * slab_out;
+                const int blk = (int)std::min<size_t>((nel + thr - 1) / thr, 65535);
+                ea_wvovv_assemble_kernel<<<blk, thr>>>(d_eri_ovvv_, dC, wv_dst,
+                                                       NO, NV, a0, na);
+            } else {
+                for (int l0 = 0; l0 < NO; l0 += wv_ls) {
+                    const int nl = std::min(wv_ls, NO - l0);
+                    cudaMemcpy(d_ovvv_ls, h_ovvv.data() + (size_t)l0*NV*NV*NV,
+                               (size_t)nl*NV*NV*NV*sizeof(real_t), cudaMemcpyHostToDevice);
+                    const size_t nel = (size_t)na * nl * NV * NV;
+                    const int blk = (int)std::min<size_t>((nel + thr - 1) / thr, 65535);
+                    ea_wvovv_assemble_lwin_kernel<<<blk, thr>>>(d_ovvv_ls, dC, wv_dst,
+                                                                NO, NV, a0, na, l0, nl);
+                }
+            }
+            if (wv_build_to_host)
+                cudaMemcpy(h_wvovv_stage_.data() + (size_t)a0*slab_out, d_wv_slab,
+                           (size_t)na*slab_out*sizeof(real_t), cudaMemcpyDeviceToHost);
         }
         cudaDeviceSynchronize();
         tracked_cudaFree(dA);
+        if (d_ovvv_ls) tracked_cudaFree(d_ovvv_ls);
+        if (d_wv_slab) tracked_cudaFree(d_wv_slab);
         wvovv_gpu = true;
         wvovv_on_device = true;
         if (std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
-            std::vector<real_t> h_chk(wvovv_sz);
-            cudaMemcpy(h_chk.data(), d_Wvovv_, wvovv_sz*sizeof(real_t), cudaMemcpyDeviceToHost);
+            std::vector<real_t> h_chk_own;
+            const real_t* h_chk = nullptr;
+            if (wv_build_to_host) {
+                h_chk = h_wvovv_stage_.data();
+            } else {
+                h_chk_own.resize(wvovv_sz);
+                cudaMemcpy(h_chk_own.data(), d_Wvovv_, wvovv_sz*sizeof(real_t), cudaMemcpyDeviceToHost);
+                h_chk = h_chk_own.data();
+            }
             real_t dmax = 0.0;
             for (int a=0;a<NV;a+=(NV/2>0?NV/2:1))
                 for (int l=0;l<NO;l+=(NO/2>0?NO/2:1))
@@ -2239,31 +2400,13 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                       << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
         }
         tracked_cudaFree(dC);
-        // (EA storage-free, 490 site #15) With σ host-stage FORCED, pull Wvovv
-        // down NOW instead of at the uploads stage: σ is the only device
-        // consumer of d_Wvovv_ (no build-internal reader between here and the
-        // uploads block), so releasing the NV³·NO resident (~30 GiB at 490)
-        // here hands the whole Wvvvo term build that much headroom — at
-        // nvir=352 the build otherwise starves at sub-GiB free. Same D2H+free
-        // the uploads-stage path would do (which then skips: d_Wvovv_ null).
-        // Forced-only (env =1): the auto decision needs the uploads-time free
-        // probe, and auto systems stay byte-identical.
-        {
-            const char* ewh = std::getenv("GANSU_EA_W_HOST");
-            if (ewh && ewh[0] == '1') {
-                ea_w_host_stage_ = true;
-                h_wvovv_stage_.resize(wvovv_sz);
-                cudaMemcpy(h_wvovv_stage_.data(), d_Wvovv_, wvovv_sz * sizeof(real_t),
-                           cudaMemcpyDeviceToHost);
-                tracked_cudaFree(d_Wvovv_);
-                d_Wvovv_ = nullptr;
-                std::cout << "  [EA-EOM] Wvovv host-staged early (build-time): "
-                          << std::fixed << std::setprecision(1)
-                          << (double)wvovv_sz * sizeof(real_t) / (1024.0*1024.0*1024.0)
-                          << " GiB released before the Wvvvo terms." << std::defaultfloat
-                          << std::endl;
-            }
-        }
+        if (wv_build_to_host)
+            std::cout << "  [EA-EOM] Wvovv assembled straight to host stage: "
+                      << std::fixed << std::setprecision(1)
+                      << (double)wvovv_sz * sizeof(real_t) / (1024.0*1024.0*1024.0)
+                      << " GiB device residency elided (ovvv+Wvovv double residency"
+                         " removed; Wvvvo terms inherit the headroom)." << std::defaultfloat
+                      << std::endl;
     }
 #endif
     if (!wvovv_gpu) {
@@ -2305,7 +2448,8 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     const bool wvvvo_keep_validate = (std::getenv("GANSU_STEOM_BUILD_VALIDATE") != nullptr);
 #ifndef GANSU_CPU_ONLY
     wvvvo_dev_asm = gpu::gpu_available() && (canonical_skip_wvvvv_ || ea_ri_ladder_)
-                    && eri_vvvv_nslab_ <= 1;
+                    && eri_vvvv_nslab_ <= 1
+                    && d_eri_ovvv_ != nullptr;   // (C2) dev-asm bare term reads the raw device block
     // (2026-07-10, pentacene wall #2) The device-side Wvvvo assembly keeps all 6
     // term buffers (each nvir³·nocc) resident simultaneously for the final fused
     // scatter kernel, then allocates a 7th for d_Wvvvo_. At pentacene scale
@@ -2781,12 +2925,32 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                 cudaMemcpy(d_t1_dev, h_t1.data(), (size_t)NO * NV * sizeof(real_t), cudaMemcpyHostToDevice);
                 const real_t one = 1.0, zero = 0.0;
                 // Stage 1
-                cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                            NO, NO*NV*NV, NV, &one,
-                            d_t1_dev,    NV,
-                            d_eri_ovvv_, NV,
-                            &zero,
-                            d_inter1,    NO);
+                if (d_eri_ovvv_) {
+                    cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                NO, NO*NV*NV, NV, &one,
+                                d_t1_dev,    NV,
+                                d_eri_ovvv_, NV,
+                                &zero,
+                                d_inter1,    NO);
+                } else {
+                    // (C2) n-columns windowed over streamed h_ovvv k-slabs
+                    // (column split only → bit-identical).
+                    real_t* d_sl = nullptr;
+                    const int ns = ea_ovvv_slab_rows(NO, NV);
+                    tracked_cudaMalloc(&d_sl, (size_t)ns*NV*NV*NV*sizeof(real_t));
+                    for (int k0 = 0; k0 < NO; k0 += ns) {
+                        const int nk = std::min(ns, NO - k0);
+                        cudaMemcpy(d_sl, h_ovvv.data() + (size_t)k0*NV*NV*NV,
+                                   (size_t)nk*NV*NV*NV*sizeof(real_t), cudaMemcpyHostToDevice);
+                        cublasDgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                    NO, nk*NV*NV, NV, &one,
+                                    d_t1_dev, NV,
+                                    d_sl,     NV,
+                                    &zero,
+                                    d_inter1 + (size_t)k0*NV*NV*NO, NO);
+                    }
+                    tracked_cudaFree(d_sl);
+                }
                 // Stage 2
                 if (wt1_host_accum) {
                     // (EA storage-free) column-slab over a (B-operand row offset
@@ -2911,15 +3075,38 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                     tracked_cudaMalloc(&d_result, result_sz    * sizeof(real_t));
                 cudaMemcpy(d_t1_dev, h_t1.data(), (size_t)NO * NV * sizeof(real_t), cudaMemcpyHostToDevice);
                 const real_t one = 1.0, zero = 0.0;
-                cublasDgemmStridedBatched(
-                    cublas, CUBLAS_OP_T, CUBLAS_OP_T,
-                    NO, NV*NV, NV,
-                    &one,
-                    d_t1_dev, NV, /*strideA=*/0,
-                    d_eri_ovvv_, NV*NV, /*strideB=*/(long long)NV*NV*NV,
-                    &zero,
-                    d_u_C, NO, /*strideC=*/(long long)NV*NV*NO,
-                    NO);
+                if (d_eri_ovvv_) {
+                    cublasDgemmStridedBatched(
+                        cublas, CUBLAS_OP_T, CUBLAS_OP_T,
+                        NO, NV*NV, NV,
+                        &one,
+                        d_t1_dev, NV, /*strideA=*/0,
+                        d_eri_ovvv_, NV*NV, /*strideB=*/(long long)NV*NV*NV,
+                        &zero,
+                        d_u_C, NO, /*strideC=*/(long long)NV*NV*NO,
+                        NO);
+                } else {
+                    // (C2) per-l batches windowed over streamed h_ovvv l-slabs
+                    // (per-batch operands unchanged → bit-identical).
+                    real_t* d_sl = nullptr;
+                    const int ns = ea_ovvv_slab_rows(NO, NV);
+                    tracked_cudaMalloc(&d_sl, (size_t)ns*NV*NV*NV*sizeof(real_t));
+                    for (int l0 = 0; l0 < NO; l0 += ns) {
+                        const int nl = std::min(ns, NO - l0);
+                        cudaMemcpy(d_sl, h_ovvv.data() + (size_t)l0*NV*NV*NV,
+                                   (size_t)nl*NV*NV*NV*sizeof(real_t), cudaMemcpyHostToDevice);
+                        cublasDgemmStridedBatched(
+                            cublas, CUBLAS_OP_T, CUBLAS_OP_T,
+                            NO, NV*NV, NV,
+                            &one,
+                            d_t1_dev, NV, /*strideA=*/0,
+                            d_sl, NV*NV, /*strideB=*/(long long)NV*NV*NV,
+                            &zero,
+                            d_u_C + (size_t)l0*NV*NV*NO, NO, /*strideC=*/(long long)NV*NV*NO,
+                            nl);
+                    }
+                    tracked_cudaFree(d_sl);
+                }
                 if (wt1_host_accum) {
                     // (EA storage-free) column-slab over b (d_t1_dev + n0).
                     const size_t M = (size_t)NV * NV * NO;
@@ -3224,6 +3411,67 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         cublasHandle_t cublas = gansu::gpu::GPUHandle::cublas();
         const size_t Bsz = (size_t)KV * KV;
         const size_t bigsz = (size_t)NV * NV * NV * NO;
+        // (EA storage-free, C1) A-gather from HOST + early raw-ovvv release.
+        // When the dense term3+4 transients would not fit (the same probe that
+        // triggers the n-tiling below), gather the three A matrices on the host
+        // from h_ovvv — hA_t[mode][(x,c)·KV + (y,d)] holds exactly what
+        // ea_wvvvo_repack_A_kernel would write (identical FP expressions, so the
+        // A operand is bit-identical; it merely arrives via a contiguous H2D per
+        // tile instead of a device gather) — and free d_eri_ovvv_ NOW instead of
+        // after term3+4: in host-assembly mode term3+4 is its last device
+        // consumer, so the nocc·nvir³ block (30 GiB at 490) is reclaimed BEFORE
+        // the nt/kt/dBig probes below, letting them run dense. Terms B/C above
+        // already consumed it (their own guards handle tightness there).
+        // Force GANSU_EA_OVVV_HOST=1/0; GANSU_EA_KEEP_RAW_OVVV=1 disables.
+        bool ovvv_host_A = false;
+        if (!wvvvo_dev_asm && d_eri_ovvv_ == nullptr) {
+            // (C2) the raw block was already released after its host copy —
+            // the host A-gather is the only source left (mandatory).
+            ovvv_host_A = true;
+        } else if (!wvvvo_dev_asm && d_eri_ovvv_ != nullptr
+            && std::getenv("GANSU_EA_KEEP_RAW_OVVV") == nullptr) {
+            size_t fA = 0, tA = 0;
+            cudaMemGetInfo(&fA, &tA);
+            const char* fo = std::getenv("GANSU_EA_OVVV_HOST");
+            if (fo && fo[0]) ovvv_host_A = (fo[0] != '0');
+            else ovvv_host_A = ((2.0 * (double)NV2 * KV + (double)Bsz + (double)bigsz)
+                                * sizeof(real_t) > 0.80 * (double)fA);
+        }
+        std::vector<real_t> hA_t[3];
+        if (ovvv_host_A) {
+            const size_t asz = (size_t)NV2 * KV;
+            hA_t[1].resize(asz);
+            hA_t[2].resize(asz);
+            #pragma omp parallel for collapse(2)
+            for (int x = 0; x < NV; ++x)
+                for (int y = 0; y < NO; ++y) {
+                    const size_t db = (size_t)x * NV * KV + (size_t)y * NV;
+                    for (int c = 0; c < NV; ++c) {
+                        // hA1[x,c,y,d] = ovvv[y,d,x,c]   (mode 1; d-strided source)
+                        const size_t d1 = db + (size_t)c * KV;
+                        const size_t s1 = (((size_t)y * NV) * NV + x) * NV + c;
+                        for (int d = 0; d < NV; ++d)
+                            hA_t[1][d1 + d] = h_ovvv[s1 + (size_t)d * NV * NV];
+                        // hA2[x,c,y,d] = ovvv[y,c,x,d]   (mode 2; contiguous source row)
+                        std::memcpy(&hA_t[2][d1],
+                                    &h_ovvv[(((size_t)y * NV + c) * NV + x) * NV],
+                                    (size_t)NV * sizeof(real_t));
+                    }
+                }
+            hA_t[0].resize(asz);
+            #pragma omp parallel for
+            for (long long i = 0; i < (long long)asz; ++i)
+                hA_t[0][i] = 2.0 * hA_t[1][i] - hA_t[2][i];   // mode 0 = 2·T1 − T2 (same expr as kernel)
+            if (d_eri_ovvv_) {   // (C2 already released it right after extract)
+                tracked_cudaFree(d_eri_ovvv_);
+                d_eri_ovvv_ = nullptr;
+                std::cout << "  [EA-EOM] raw (ia|bc) freed BEFORE term3+4 ("
+                          << std::fixed << std::setprecision(1)
+                          << (double)ovvv_sz * sizeof(real_t) / (1024.0*1024.0*1024.0)
+                          << " GiB reclaimed; A-gather host-sourced from h_ovvv transposes)."
+                          << std::defaultfloat << std::endl;
+            }
+        }
         // Device-resident repack/scatter (ship 3): gather A off d_eri_ovvv_ and
         // B off d_t2_ straight on the device, GEMM, scatter-accumulate into dBig,
         // one final D2H.  Eliminates the 7 host repack arrays (~4.9 GB host RAM
@@ -3332,8 +3580,12 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                 const int nt_cur = (int)std::min<size_t>(nt, (size_t)NV2 - n0);
                 const size_t tsz = (size_t)nt_cur * KV;
                 const int blkT = (int)std::min<size_t>((tsz + thr - 1) / thr, 65535);
-                ea_wvvvo_repack_A_kernel<<<blkT, thr>>>(d_eri_ovvv_, dA, NO, NV, Amode,
-                                                        (int)n0, nt_cur);
+                if (ovvv_host_A)
+                    cudaMemcpy(dA, hA_t[Amode].data() + (size_t)n0 * KV,
+                               tsz * sizeof(real_t), cudaMemcpyHostToDevice);
+                else
+                    ea_wvvvo_repack_A_kernel<<<blkT, thr>>>(d_eri_ovvv_, dA, NO, NV, Amode,
+                                                            (int)n0, nt_cur);
                 if (kt == (size_t)KV) {
                     cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, KV, nt_cur, KV, &one,
                                 dB, KV, dA, KV, &zero, dM, KV);
