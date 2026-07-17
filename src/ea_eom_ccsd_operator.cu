@@ -2195,8 +2195,12 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
             size_t freeb = 0, totb = 0;
             if (cudaMemGetInfo(&freeb, &totb) == cudaSuccess) {
                 const size_t row_bytes = (size_t)Nv * sizeof(real_t);
+                // Floor is 1 row, not a fixed batch: right after the d_Wvovv_
+                // alloc the device can be sub-GiB free, and an 8-row floor then
+                // forces a dC larger than the remaining memory (490 nvir=352 EA
+                // build OOM site #14). Output-split only — contraction untouched.
                 TA = (int)std::min<size_t>((size_t)Mv,
-                         std::max<size_t>(8, (size_t)(0.25 * freeb) / row_bytes));
+                         std::max<size_t>(1, (size_t)(0.25 * freeb) / row_bytes));
             }
             if (TA < Mv)
                 std::cout << "  [EA-EOM Wvovv] ct GEMM slabbed over a: " << TA
@@ -2235,6 +2239,31 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                       << std::scientific << dmax << " (expect ≤1e-11)" << std::defaultfloat << std::endl;
         }
         tracked_cudaFree(dC);
+        // (EA storage-free, 490 site #15) With σ host-stage FORCED, pull Wvovv
+        // down NOW instead of at the uploads stage: σ is the only device
+        // consumer of d_Wvovv_ (no build-internal reader between here and the
+        // uploads block), so releasing the NV³·NO resident (~30 GiB at 490)
+        // here hands the whole Wvvvo term build that much headroom — at
+        // nvir=352 the build otherwise starves at sub-GiB free. Same D2H+free
+        // the uploads-stage path would do (which then skips: d_Wvovv_ null).
+        // Forced-only (env =1): the auto decision needs the uploads-time free
+        // probe, and auto systems stay byte-identical.
+        {
+            const char* ewh = std::getenv("GANSU_EA_W_HOST");
+            if (ewh && ewh[0] == '1') {
+                ea_w_host_stage_ = true;
+                h_wvovv_stage_.resize(wvovv_sz);
+                cudaMemcpy(h_wvovv_stage_.data(), d_Wvovv_, wvovv_sz * sizeof(real_t),
+                           cudaMemcpyDeviceToHost);
+                tracked_cudaFree(d_Wvovv_);
+                d_Wvovv_ = nullptr;
+                std::cout << "  [EA-EOM] Wvovv host-staged early (build-time): "
+                          << std::fixed << std::setprecision(1)
+                          << (double)wvovv_sz * sizeof(real_t) / (1024.0*1024.0*1024.0)
+                          << " GiB released before the Wvvvo terms." << std::defaultfloat
+                          << std::endl;
+            }
+        }
     }
 #endif
     if (!wvovv_gpu) {
@@ -3795,8 +3824,9 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         } else {
             h_wvovv_stage_ = std::move(h_Wvovv);
         }
-    } else if (ea_w_host_stage_) {
+    } else if (ea_w_host_stage_ && d_Wvovv_) {
         // device-assembled Wvovv → pull down and release the 30 GiB resident
+        // (skipped when the forced host-stage already staged it at build time)
         h_wvovv_stage_.resize(wvovv_sz);
         cudaMemcpy(h_wvovv_stage_.data(), d_Wvovv_, wvovv_sz * sizeof(real_t),
                    cudaMemcpyDeviceToHost);
