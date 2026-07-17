@@ -256,6 +256,10 @@ public:
     double get_dmet_threshold() const { return dmet_threshold_; }
     /// DMET: refine μ with CCSD-relaxed density after HF stage (2-stage μ optimization)
     bool get_dmet_mu_refine_ccsd() const { return dmet_mu_refine_ccsd_; }
+    /// DMET-STEOM cluster ground-state solver: "canonical" (exact cluster CCSD)
+    /// or "dlpno" (cluster-space DLPNO-CCSD + bt-polish; ~500-orbital production
+    /// mode). Env GANSU_DMET_STEOM_DLPNO overrides when set.
+    const std::string& get_dmet_cluster_solver() const { return dmet_cluster_solver_; }
     /// DMET: bisection tolerance on |Σ N_frag − N_elec|. Default 1e-5 (tight, GANSU native).
     /// Vayesta-compat: 4.2e-3 for benzene/STO-3G (= 1e-4 × 42, matches Vayesta's max_elec_err).
     double get_dmet_n_tol() const { return dmet_n_tol_; }
@@ -300,6 +304,9 @@ public:
     bool   get_dlpno_pno_os_only()   const { return dlpno_pno_os_only_; }
     int    get_dlpno_verbose() const { return dlpno_verbose_; }
     int    get_dlpno_cpu_threads() const { return dlpno_cpu_threads_; }
+    /// bt-polish setting: -1 = full polish to convergence (default ON), 0 = off,
+    /// N>=1 = cap at N iterations. Env GANSU_DLPNO_BT_POLISH overrides when set.
+    int    get_dlpno_bt_polish() const { return dlpno_bt_polish_; }
     bool   get_dlpno_compute_density() const { return dlpno_compute_density_; }
     /// Sub-phase 2X.2c+: enable full F-eff dressing in the DLPNO-CCSD Λ
     /// iteration (phase24-based cross-pair dF_ki + per-pair DF). Default
@@ -662,6 +669,7 @@ protected:
     std::string dmet_fragments_str_;    ///< DMET fragment specification string
     double dmet_threshold_ = 1e-6;     ///< SVD threshold for DMET bath orbital selection
     bool dmet_mu_refine_ccsd_ = false;  ///< DMET: refine μ with CCSD-relaxed density
+    std::string dmet_cluster_solver_ = "canonical";  ///< DMET-STEOM cluster ground solver: canonical | dlpno
     double dmet_n_tol_ = 1e-5;  ///< DMET: bisection tolerance on |Σ N_frag − N_elec|
     int opt_max_iter_ = 200;    ///< Geometry optimization max iterations
     double opt_grad_threshold_ = 3.0e-4;
@@ -703,6 +711,7 @@ protected:
     bool   dlpno_pno_os_only_ = false;
     int    dlpno_verbose_ = 1;
     int    dlpno_cpu_threads_ = 0;  ///< Cap on OpenMP threads for DLPNO per-pair CPU loops; 0 = auto min(cores,64). Bounds OpenBLAS per-caller-thread buffer use (128 limit) on many-core machines.
+    int    dlpno_bt_polish_ = -1;   ///< bt-polish: -1 = full (default ON), 0 = off, N>=1 = cap N iterations
     bool   dlpno_compute_density_ = false;  ///< Sub-phase 1+: build Λ + 1-RDM after MP2/CCSD
     bool   dlpno_lambda_full_dressing_ = false;  ///< Sub-phase 2X.2c: full Λ F-eff dressing
 

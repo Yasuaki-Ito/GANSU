@@ -84,6 +84,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"dmet_fragments", ""},                            // string: fragment specification e.g. "{0,1,2} {3,4,5}"
         {"dmet_threshold", "1e-6"},                        // real_t: SVD threshold for bath orbital selection
         {"dmet_mu_refine_ccsd", "0"},                      // bool (0/1): refine μ with CCSD-relaxed density after HF stage
+        {"dmet_cluster_solver", "canonical"},              // string: dmet_steom cluster ground-state solver — "canonical" (exact cluster CCSD) or "dlpno" (cluster-space DLPNO-CCSD + bt-polish; the ~500-orbital-cluster production mode, formerly env GANSU_DMET_STEOM_DLPNO=2 which still overrides when set)
         {"dmet_n_tol", "1e-5"},                            // real_t: bisection tol on |Σ N_frag − N_elec| (Vayesta-compat: 4.2e-3 for benzene)
         {"opt_max_iter", "200"},                           // int: maximum geometry optimization iterations
         {"opt_grad_threshold", "3.0e-4"},                  // real_t: max gradient component (Hartree/Bohr)
@@ -122,6 +123,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"dlpno_pno_os_only", "0"},                        // bool: PNO selection from opposite-spin amplitudes only (D = T^T T + T T^T). Default 0 = use full LMP2 density (Riplinger 2013, T̃^T T + T̃ T^T) which slightly outperforms the OS-only form for full closed-shell MP2 energy evaluation. Set to 1 only when pairing with SOS-MP2 (c_os scaling, SS dropped).
         {"dlpno_verbose", "1"},                            // int: 0=summary, 1=phase, 2=per-pair, 3=residual
         {"dlpno_cpu_threads", "0"},                        // int: cap on OpenMP threads for DLPNO per-pair CPU loops (each calls Eigen->OpenBLAS; OpenBLAS has a 128 per-caller-thread buffer limit, so on >128-core machines the uncapped default crashes). 0 = auto = min(cores, 64). GPU-dispatch regions keep num_threads(num_gpus).
+        {"dlpno_bt_polish", "-1"},                         // int: bt-polish (canonical CCSD warm-started from back-transformed DLPNO amplitudes; shared by dlpno_steom_ccsd and the DMET cluster-DLPNO solver). -1 = full polish to convergence (default ON), 0 = off (raw DLPNO amplitudes), N>=1 = cap at N iterations (e.g. 3 = the dox "cap3" recipe). Env GANSU_DLPNO_BT_POLISH still overrides when set.
         {"dlpno_compute_density", "0"},                    // bool: build DLPNO Λ + 1-RDM after MP2/CCSD energy (Sub-phase 1+ of DLPNO-CCSD-Λ project). Default 0 = energy only (no extra cost). Set 1 for DMET / properties / dipole; print sanity block + dipole when combined with dlpno_verbose >= 1.
         {"dlpno_lambda_full_dressing", "0"},               // bool: Sub-phase 2X.2c. Enable full F-eff dressing (phase24-based dF_ki + DF_per_pair) in the DLPNO-CCSD Λ iteration. Default 0 = LMP2-limit closed-form Λ_2 = 2 Y - Y^T (agrees with canonical CCSD oo/vv to ~1e-5). Set 1 to engage the full Path A dressing to close the 6.3% off-canonical dipole gap; iteration costs ~50% more than closed-form. See DLPNO_Lambda.md §12.
         // ----- CIS NTO active space (bt-PNO-STEOM Phase P0) -----

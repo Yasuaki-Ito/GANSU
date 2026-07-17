@@ -2300,6 +2300,19 @@ void ERI_RI_RHF::compute_steom_ccsd(int n_states) {
 }
 
 // DMET-STEOM standalone cluster entry (declared in eom_chain_context.hpp). Wraps
+// bt-polish setting, shared by the 4 gates below (plain dlpno_steom stage-1,
+// the DMET mode-1/mode-2 cluster polish, and the NATIVE_EOM default logic):
+// env GANSU_DLPNO_BT_POLISH overrides the dlpno_bt_polish parameter.
+// Returns -1 = full polish to convergence (default ON), 0 = off, N>=1 = cap.
+static int dlpno_bt_polish_setting(const HF& hf) {
+    if (const char* pe = std::getenv("GANSU_DLPNO_BT_POLISH")) {
+        if (pe[0] == '0') return 0;
+        const int n = std::atoi(pe);
+        return n > 0 ? n : -1;   // non-numeric / "1" → full (legacy cap>1 rule)
+    }
+    return hf.get_dlpno_bt_polish();
+}
+
 // the raw cluster arrays in an EOMChainContext + DeviceHostMatrix views and runs
 // the canonical STEOM chain over the precomputed cluster MO-ERI. The full chain
 // (CIS-NTO/IP/EA/STEOM) reads its electronic state from ctx, never from `cfg`
@@ -2428,7 +2441,9 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
     const char* lmp2_test_e = std::getenv("GANSU_DMET_STEOM_DLPNO_LMP2_TEST");
     const char* dl_mode_e   = std::getenv("GANSU_DMET_STEOM_DLPNO");
     const bool  want_lmp2_test  = lmp2_test_e && lmp2_test_e[0] == '1';
-    const bool  want_cluster_dl = dl_mode_e && dl_mode_e[0] == '2';
+    // --dmet_cluster_solver dlpno == mode 2; the env (when set) overrides.
+    const bool  want_cluster_dl = dl_mode_e ? (dl_mode_e[0] == '2')
+                                : (cfg.get_dmet_cluster_solver() == "dlpno");
     if (want_lmp2_test || want_cluster_dl) {
         // Cap OpenMP threads for the whole cluster-DLPNO section — the plain
         // entry points (compute_dlpno_ccsd/_t) apply this guard, but this
@@ -2530,8 +2545,8 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
             // cluster BT amplitudes (same recipe as the plain chain's
             // dlpno_bt_polish_stage, but in the embedding dimensions; the
             // B-native RI path mirrors the ctx chain's fresh-solve branch).
-            const char* pe = std::getenv("GANSU_DLPNO_BT_POLISH");
-            const bool pol_on = (pe == nullptr) || (pe[0] != '0');
+            const int  pol_set = dlpno_bt_polish_setting(cfg);   // env > --dlpno_bt_polish
+            const bool pol_on  = (pol_set != 0);
             // (DMET×DLPNO Phase A) cluster-(T) validation hook:
             //   GANSU_DMET_STEOM_CLUSTER_T = canonical | dlpno | both
             // "canonical" evaluates the (T) correction inside the polish's
@@ -2545,7 +2560,7 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
             if (pol_on && gpu::gpu_available()) {
                 Timer pol_t;
                 BTAmplitudes bt = cfg.get_dlpno_bt_amplitudes();   // copy; polished below
-                const int cap = pe ? std::atoi(pe) : 0;
+                const int cap = pol_set;
                 std::cout << "---- DMET-STEOM cluster bt-polish: canonical cluster CCSD "
                              "warm-started from cluster-DLPNO amplitudes ----" << std::endl;
                 ccsd_set_initial_guess(bt.T1.data(), bt.T2.data(),
@@ -2587,7 +2602,7 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
             ctx.dlpno_bt = &cfg.get_dlpno_bt_amplitudes();
             ctx.dlpno_E  = E_final;
             std::cout << "  [DMET-STEOM] cluster chain consumes cluster-DLPNO "
-                         "(bt-polished) amplitudes (GANSU_DMET_STEOM_DLPNO=2)." << std::endl;
+                         "(bt-polished) amplitudes (dmet_cluster_solver=dlpno)." << std::endl;
             // (DMET×DLPNO Phase A) cluster DLPNO-CCSD(T) validation hook — see
             // the GANSU_DMET_STEOM_CLUSTER_T note above. Prints E(CCSD)/E((T)).
             if (tket && (tket[0] == 'd' || tket[0] == 'b')) {
@@ -2688,13 +2703,13 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
 // Shared verbatim by compute_dlpno_steom_ccsd (plain path) and the DMET
 // cluster-DLPNO mode (GANSU_DMET_STEOM_DLPNO — square-C reduction anchor).
 static void dlpno_bt_polish_stage(RHF& rhf, const ERI_RI* eri_ri, real_t E_dlpno) {
-    const char* pe = std::getenv("GANSU_DLPNO_BT_POLISH");
-    const bool pol_on = (pe == nullptr) || (pe[0] != '0');
+    const int  pol_set = dlpno_bt_polish_setting(rhf);   // env > --dlpno_bt_polish
+    const bool pol_on  = (pol_set != 0);
     if (pol_on && rhf.use_dlpno_amplitudes()
         && gpu::gpu_available()) {
         Timer polish_timer;
         BTAmplitudes bt = rhf.get_dlpno_bt_amplitudes();  // copy; polished below
-        const int cap = pe ? std::atoi(pe) : 0;
+        const int cap = pol_set;
         std::cout << "---- DLPNO-STEOM bt-polish: canonical CCSD warm-started "
                      "from DLPNO amplitudes ----" << std::endl;
         ccsd_set_initial_guess(bt.T1.data(), bt.T2.data(),
@@ -2745,8 +2760,11 @@ void ERI_RI_RHF::compute_dmet_steom_ccsd(int n_states) {
     // run a cluster-space DLPNO ground here (Phase 1+). Default OFF =
     // canonical cluster (byte-identical).
     const char* dmet_dlpno = std::getenv("GANSU_DMET_STEOM_DLPNO");
-    const bool  dl_on  = dmet_dlpno && dmet_dlpno[0] == '1';   // mode 1: full-molecule ground (P0 anchor)
-    const bool  dl2_on = dmet_dlpno && dmet_dlpno[0] == '2';   // mode 2: cluster-space ground (Phase 1b, in steom_spatial_orbital)
+    const bool  dl_on  = dmet_dlpno && dmet_dlpno[0] == '1';   // mode 1: full-molecule ground (P0 anchor; env-only validation hook)
+    // mode 2: cluster-space ground (Phase 1b, in steom_spatial_orbital) —
+    // --dmet_cluster_solver dlpno, or env GANSU_DMET_STEOM_DLPNO=2 (overrides).
+    const bool  dl2_on = dmet_dlpno ? (dmet_dlpno[0] == '2')
+                       : (rhf_.get_dmet_cluster_solver() == "dlpno");
     if (dl_on) {
         std::cout << "---- DMET-STEOM cluster-DLPNO mode: DLPNO-CCSD ground state "
                      "(back-transformed to canonical) ----" << std::endl;
@@ -2799,8 +2817,7 @@ void ERI_RI_RHF::compute_dlpno_steom_ccsd(int n_states) {
         // consume the UNPOLISHED per-pair DLPNO state. Default the native path
         // OFF under polish so IP/EA/STEOM consistently consume the polished
         // canonical amplitudes (explicit GANSU_DLPNO_NATIVE_EOM=1 overrides).
-        const char* pol = std::getenv("GANSU_DLPNO_BT_POLISH");
-        const bool polish_on = (pol == nullptr) || (pol[0] != '0');   // DEFAULT ON (2026-07-09)
+        const bool polish_on = (dlpno_bt_polish_setting(rhf_) != 0);   // DEFAULT ON (2026-07-09); env > --dlpno_bt_polish
         const char* nat_def = polish_on ? "0" : "1";
 #ifdef _WIN32
         _putenv_s("GANSU_DLPNO_NATIVE_EOM", nat_def);

@@ -122,6 +122,11 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     dmet_fragments_str_ = parameters.get<std::string>("dmet_fragments");
     dmet_threshold_ = parameters.get<double>("dmet_threshold");
     dmet_mu_refine_ccsd_ = parameters.get<bool>("dmet_mu_refine_ccsd");
+    dmet_cluster_solver_ = toLowerCase(parameters.get<std::string>("dmet_cluster_solver"));
+    if (dmet_cluster_solver_ != "canonical" && dmet_cluster_solver_ != "dlpno") {
+        throw std::runtime_error("Invalid dmet_cluster_solver: '" + dmet_cluster_solver_ +
+                                 "'. Must be 'canonical' or 'dlpno'.");
+    }
     dmet_n_tol_ = parameters.get<double>("dmet_n_tol");
     opt_max_iter_ = parameters.get<int>("opt_max_iter");
     opt_grad_threshold_ = parameters.get<double>("opt_grad_threshold");
@@ -194,6 +199,7 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     dlpno_pno_os_only_           = parameters.get<bool>("dlpno_pno_os_only");
     dlpno_verbose_               = parameters.get<int>("dlpno_verbose");
     dlpno_cpu_threads_           = parameters.get<int>("dlpno_cpu_threads");
+    dlpno_bt_polish_             = parameters.get<int>("dlpno_bt_polish");
     dlpno_compute_density_       = parameters.get<bool>("dlpno_compute_density");
     dlpno_lambda_full_dressing_  = parameters.get<bool>("dlpno_lambda_full_dressing");
 
