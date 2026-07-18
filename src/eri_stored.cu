@@ -9229,6 +9229,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // Host L^k_i build (legacy path + ③ Lki self-check reference). Mirrored
         // byte-for-byte by ccsd_Lki_kernel.
         auto host_Lki = [&](std::vector<real_t>& out) {
+            #pragma omp parallel for collapse(2) schedule(static)
             for (int k = 0; k < nocc; k++)
                 for (int i = 0; i < nocc; i++) {
                     real_t val = Fki[k*nocc+i];   // pure cc_Foo (no fov)
@@ -9258,6 +9259,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // Host L^a_c build (legacy path + ③ Lac self-check reference). Mirrored
         // byte-for-byte by ccsd_Lac_kernel (which reads the resident w_ovvv_R).
         auto host_Lac = [&](std::vector<real_t>& out) {
+            #pragma omp parallel for collapse(2) schedule(static)
             for (int a = 0; a < nvir; a++)
                 for (int c = 0; c < nvir; c++) {
                     real_t val = Fac[a*nvir+c];   // pure cc_Fvv (no fov)
@@ -9315,6 +9317,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         } else {
             cudaMemcpy(Wklij.data(), d_Wklij, oo * oo * sizeof(double), cudaMemcpyDeviceToHost);
             // Add remaining terms on CPU: v_oooo + t1 terms
+            #pragma omp parallel for collapse(2) schedule(static)
             for (int k = 0; k < nocc; k++)
                 for (int l = 0; l < nocc; l++)
                     for (int i = 0; i < nocc; i++)
@@ -9457,6 +9460,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             }
         } else {
         // CPU: single-index terms for Wakic and Wakci (d-sum replaced by DGEMM result lookup)
+        #pragma omp parallel for schedule(static)
         for (int a = 0; a < nvir; a++)
             for (int k = 0; k < nocc; k++) {
                 for (int i = 0; i < nocc; i++)
@@ -9553,6 +9557,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         } else {
             std::vector<real_t> eff_t2_R(OV2);
             std::vector<real_t> t2_C(OV2);
+            #pragma omp parallel for collapse(2) schedule(static)
             for (int l = 0; l < nocc; l++)
                 for (int d = 0; d < nvir; d++)
                     for (int i = 0; i < nocc; i++)
@@ -9631,6 +9636,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // Host T1 update (legacy path + ⑦-4 self-check reference). Mirrored
         // byte-for-byte by ccsd_t1_update_kernel.
         auto host_T1 = [&](std::vector<real_t>& out) {
+            #pragma omp parallel for collapse(2) schedule(static)
             for (int i = 0; i < nocc; i++)
                 for (int a = 0; a < nvir; a++) {
                     real_t val = 0.0;
@@ -10010,6 +10016,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             std::vector<real_t> t2_R1(OV2), t2_R3(OV2), t2_R4(OV2);
 
             // Build reshaped W intermediates
+            #pragma omp parallel for collapse(2) schedule(static)
             for (int a = 0; a < nvir; a++)
                 for (int i = 0; i < nocc; i++)
                     for (int k = 0; k < nocc; k++)
@@ -10021,6 +10028,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             Weff[row*ov + col] = 2.0*wic - wci;
                             Wakic_R[row*ov + col] = wic;
                         }
+            #pragma omp parallel for collapse(2) schedule(static)
             for (int b = 0; b < nvir; b++)
                 for (int i = 0; i < nocc; i++)
                     for (int k = 0; k < nocc; k++)
@@ -10029,6 +10037,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                                 Wakci[((size_t)b*nocc+k)*nvir*nocc + (size_t)c*nocc+i];
 
             // Build reshaped t2
+            #pragma omp parallel for collapse(2) schedule(static)
             for (int k = 0; k < nocc; k++)
                 for (int c = 0; c < nvir; c++)
                     for (int j = 0; j < nocc; j++)
@@ -10038,6 +10047,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                             t2_R1[row*ov + col] = t2v[T2(k,j,c,b)];
                             t2_R3[row*ov + col] = t2v[T2(k,j,b,c)];
                         }
+            #pragma omp parallel for collapse(2) schedule(static)
             for (int k = 0; k < nocc; k++)
                 for (int c = 0; c < nvir; c++)
                     for (int j = 0; j < nocc; j++)
@@ -10085,6 +10095,9 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // byte-for-byte by ccsd_Zbuild_kernel.
         auto host_Z = [&](std::vector<real_t>& out) {
             std::copy(v_vvov.begin(), v_vvov.end(), out.begin());
+            // (host-parallel) independent over (a,b) — each writes a disjoint z_idx
+            // block; the inner k-sum stays serial ⇒ bitwise identical to the serial loop.
+            #pragma omp parallel for collapse(2) schedule(static)
             for (int a = 0; a < nvir; a++)
                 for (int b = 0; b < nvir; b++)
                     for (int i = 0; i < nocc; i++)
@@ -10165,6 +10178,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
 
             // Build Q (small: O(nocc² × vv))
             std::vector<real_t> Q(vv * oo);
+            #pragma omp parallel for collapse(2) schedule(static)
             for (int a = 0; a < nvir; a++)
                 for (int b = 0; b < nvir; b++)
                     for (int i = 0; i < nocc; i++)
@@ -10176,6 +10190,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                         }
 
             // Reduced inner loop: only O(nocc) per (i,j,a,b) — Lac×t2 and Z×t1 done via DGEMM
+            #pragma omp parallel for collapse(2) schedule(static)
             for (int i = 0; i < nocc; i++)
                 for (int j = 0; j < nocc; j++)
                     for (int a = 0; a < nvir; a++)
@@ -10550,6 +10565,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 pf_d2h += std::chrono::duration<double>(pf_cpu() - _ph0).count();
             }
         } else {
+            #pragma omp parallel for collapse(2) schedule(static)
             for (int i = 0; i < nocc; i++)
                 for (int j = 0; j < nocc; j++)
                     for (int a = 0; a < nvir; a++)
