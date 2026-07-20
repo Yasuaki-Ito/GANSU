@@ -628,16 +628,28 @@ static void compute_steom_ccsd_impl(RHF& rhf,
             && envon("GANSU_DLPNO_CANONICAL_SKIP", true)
             && envon("GANSU_DLPNO_EA_VVVV_RI", true);
         if (have && ng >= 2 && !ri_handles_vvvv && vvvv_bytes > static_cast<size_t>(0.40 * min_total)) {
-            const std::string ns = std::to_string(ng);
-            setenv("GANSU_EA_VVVV_NSLAB", ns.c_str(), 0);
-            setenv("GANSU_STEOM_OPERATOR_DEVICE_BALANCING", "1", 0);
-            setenv("GANSU_STEOM_BUILD_GPUS", ns.c_str(), 0);
+            // The vvvv (nvir⁴) block is a memory wall and the native per-pair σ is
+            // OFF — i.e. this is the canonical (bt-polish) Davidson path. Do NOT
+            // distribute via the vvvv slab: slab mode forces canonical_skip_wvvvv_
+            // (dressed Wvvvv elided, σ handed to the NATIVE per-pair operator), but
+            // the canonical Davidson calls EAEOMCCSDOperator::apply directly, which
+            // aborts when Wvvvv is elided ("should be wrapped by the native operator";
+            // pentacene bt-polish crash, 2026-07-20). The polish-compatible
+            // vvvv-avoidance is the RI-ladder: it elides BOTH the raw (ab|cd) and the
+            // dressed Wvvvv and evaluates the σ2 ladder per matvec from t1-dressed RI
+            // B-factors — an exact identity under the canonical Davidson, single-GPU.
+            // Force it on (the RI driver's operators always have a B block source);
+            // mirrors the proven native RI-path branch below — single-GPU build,
+            // share-barH stays ON, no slab, no device-balancing. setenv(overwrite=0):
+            // explicit env wins.
+            setenv("GANSU_EA_RI_LADDER", "1", 0);
             std::cout << "  [STEOM auto-scale] d_eri_vvvv = " << std::fixed
                       << std::setprecision(1) << vvvv_bytes / 1e9
                       << " GB > 0.40×total " << (0.40 * min_total) / 1e9
-                      << " GB → auto-enabling NSLAB=" << ng
-                      << " + device-balancing + STEOM_BUILD_GPUS=" << ng
-                      << " (explicit env overrides)." << std::defaultfloat << std::endl;
+                      << " GB, native σ OFF (canonical/bt-polish Davidson) → forcing EA "
+                         "RI-ladder (exact σ from B-factors, single-GPU, no dressed Wvvvv); "
+                         "NO vvvv slab (slab needs the native σ path). "
+                         "explicit env overrides." << std::defaultfloat << std::endl;
         } else if (have && ng >= 2 && ri_handles_vvvv
                    && vvvv_bytes > static_cast<size_t>(0.40 * min_total)) {
             std::cout << "  [STEOM auto-scale] d_eri_vvvv = " << std::fixed
