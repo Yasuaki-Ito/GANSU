@@ -673,11 +673,22 @@ void IPEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
     const size_t ovvo_size = (size_t)nocc * nvir * nvir * nocc;
     const size_t ovvv_size = (size_t)nocc * nvir * nvir * nvir;
 
+    // M1 (PNO-local wedge, 2026-07-20): the dense ovvo (nocc²·nvir² = 25 GB at
+    // nvir=612) has only a HOST consumer — the Wovoo "bare" seed H_OVVO in
+    // build_dressed_intermediates; its device block is freed right after the D2H
+    // (see :~1078). When a B block source is present, skip the dense device alloc
+    // entirely and rebuild the host mirror per occupied-k from B slices there
+    // (bit-identical; mirrors the proven ovvv tiling). d_eri_ovvo_ stays null ⇒
+    // build_dressed detects it and tiles. Opt-out GANSU_IP_KEEP_RAW_BLOCKS=1 /
+    // forced dense under GANSU_STEOM_BUILD_VALIDATE (host self-check reads it).
+    const bool tile_ovvo = (eri_block_src_ != nullptr)
+                           && (std::getenv("GANSU_STEOM_BUILD_VALIDATE") == nullptr)
+                           && (std::getenv("GANSU_IP_KEEP_RAW_BLOCKS") == nullptr);
     tracked_cudaMalloc(&d_eri_ovov_, ovov_size * sizeof(real_t));
     tracked_cudaMalloc(&d_eri_ooov_, ooov_size * sizeof(real_t));
     tracked_cudaMalloc(&d_eri_oooo_, oooo_size * sizeof(real_t));
     tracked_cudaMalloc(&d_eri_oovv_, oovv_size * sizeof(real_t));
-    tracked_cudaMalloc(&d_eri_ovvo_, ovvo_size * sizeof(real_t));
+    if (!tile_ovvo) tracked_cudaMalloc(&d_eri_ovvo_, ovvo_size * sizeof(real_t));
     // Inc4(b): in block mode every ovvv consumer builds per-k slices from B (the
     // tiled Wovov/Wovvo/Woooo/Lvv paths), so the dense ovvv block (nocc·nvir³ =
     // 46 GB at nvir=334) is never read — skip it unless the host self-check needs
@@ -698,7 +709,8 @@ void IPEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
         eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         O,nocc,nocc+O,nvir,      d_eri_ooov_); // (ji|kb)
         eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    O,nocc,nocc+O,nvir,      d_eri_ovov_); // (ia|jb)
         eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         nocc+O,nvir,nocc+O,nvir, d_eri_oovv_); // (ij|ab)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,O,nocc,      d_eri_ovvo_); // (ia|bj)
+        if (!tile_ovvo)
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,O,nocc,      d_eri_ovvo_); // (ia|bj)
         if (need_ovvv)
             eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,nocc+O,nvir, d_eri_ovvv_); // (ia|bc)
         cudaDeviceSynchronize();
@@ -1054,7 +1066,25 @@ void IPEOMCCSDOperator::build_dressed_intermediates() {
     cudaMemcpy(h_ovov.data(), d_eri_ovov_,  ovov_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_ooov.data(), d_eri_ooov_,  ooov_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_oovv.data(), d_eri_oovv_,  oovv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ovvo.data(), d_eri_ovvo_,  ovvo_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    if (d_eri_ovvo_) {
+        cudaMemcpy(h_ovvo.data(), d_eri_ovvo_,  ovvo_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    } else {
+        // M1 (PNO-local wedge): the dense device ovvo was skipped in
+        // extract_eri_blocks. Rebuild the host mirror h_ovvo per occupied k from a
+        // B slice (nvir²·nocc transient ≈ 0.3 GB at nvir=612 vs the 25 GB dense
+        // block) — bit-identical: the (O+k,1)|v|v|o slice equals
+        // d_eri_ovvo_[k·NV·NV·NO]. Mirrors the ovvv per-k tiling below.
+        const int M = nmo_full_, O = frozen_off_;
+        real_t* d_ovvo_k = nullptr;
+        tracked_cudaMalloc(&d_ovvo_k, (size_t)NV * NV * NO * sizeof(real_t));
+        for (int k = 0; k < NO; ++k) {
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M,
+                O + k, 1, NO + O, NV, NO + O, NV, O, NO, d_ovvo_k);   // (k a | b j)
+            cudaMemcpy(h_ovvo.data() + (size_t)k * NV * NV * NO, d_ovvo_k,
+                       (size_t)NV * NV * NO * sizeof(real_t), cudaMemcpyDeviceToHost);
+        }
+        tracked_cudaFree(d_ovvo_k);
+    }
     if (eri_block_src_ == nullptr || std::getenv("GANSU_STEOM_BUILD_VALIDATE")) {
         h_ovvv.resize(ovvv_sz);
         cudaMemcpy(h_ovvv.data(), d_eri_ovvv_, ovvv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);

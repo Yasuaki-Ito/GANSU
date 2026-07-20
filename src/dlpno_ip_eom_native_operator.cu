@@ -1487,6 +1487,18 @@ void DLPNOIPEOMNativeOperator::compute_sigma2(
             }
         }
 
+    // M2 (PNO-local σ, 2026-07-20): evaluate the T8b term
+    //   acc[a] -= Σ_c tmp_c[c] t2[oi,oj,c,a]
+    // from the per-pair PNO amplitude instead of the dense canonical t2
+    // (h_t2_lmo_, nocc²·nvir²). Since t2[oi,oj] = U_ij Y' U_ijᵀ (Y' = Y for the
+    // (i,j) orientation, Yᵀ for (j,i)), the term collapses in PNO space to
+    //   s_pno -= Y'ᵀ · (U_ijᵀ tmp_c)   (bit-identical to the canonical path iff
+    // canonical t2 equals the PNO congruence; with truncation this is the intended
+    // PNO-local approximation). Removes one nocc²·nvir² borrow. Gated; requires the
+    // dressed-PNO path. Opt-in GANSU_DLPNO_IP_T8_PNO.
+    const bool t8_pno = use_dressed_pno_
+                        && (std::getenv("GANSU_DLPNO_IP_T8_PNO") != nullptr);
+
     for (int idx = 0; idx < n_pairs; ++idx) {
         const int n = packing_.n_pno[idx];
         if (n == 0) continue;
@@ -1534,8 +1546,10 @@ void DLPNOIPEOMNativeOperator::compute_sigma2(
                     if (w != 0.0) acc.noalias() += w * r2c(k, l);
                 }
             // T8b: acc[a] -= Σ_c tmp_c[c] t2_lmo[oi,oj,c,a]    (GPU on Stage 3b)
-            //   t2 layout ((i*nocc+j)*nvir+c)*nvir+a.
-            if (!skip_t8) {
+            //   t2 layout ((i*nocc+j)*nvir+c)*nvir+a. Skipped under t8_pno — the
+            //   PNO-local form is applied to s directly in the use_dressed_pno_
+            //   block below (no canonical t2 needed).
+            if (!skip_t8 && !t8_pno) {
                 const size_t base = (static_cast<size_t>(oi) * nocc + oj) * nvir;  // [oi,oj,*,*]
                 for (int a = 0; a < nvir; ++a) {
                     real_t s = 0.0;
@@ -1625,6 +1639,18 @@ void DLPNOIPEOMNativeOperator::compute_sigma2(
                     }
                 }
                 }  // if (!skip_phl)
+
+                // M2 T8b (PNO-local): s -= Y'ᵀ · (U_ijᵀ tmp_c), Y' = Y for the
+                // (i,j) orientation (oi==i), Yᵀ for (j,i). Replaces the canonical
+                // Σ_c tmp_c[c] t2[oi,oj,c,a] with the pair PNO amplitude congruence.
+                if (t8_pno && !skip_t8) {
+                    const Eigen::VectorXd w = U_ij.transpose() * tmp_c;   // [n]
+                    Eigen::Map<const RowMatXd> Ymat(res_.pairs[idx].Y.data(), n, n);
+                    // t2[oi,oj] = U Y' Uᵀ ⇒ s -= Y'ᵀ w. Y'=Y (oi==i) → Yᵀ w;
+                    // Y'=Yᵀ (oi==j) → Y w.
+                    if (oi == i) s.noalias() -= Ymat.transpose() * w;
+                    else         s.noalias() -= Ymat * w;
+                }
             }  // if (use_dressed_pno_)
             real_t* dst = packed_sigma2.data() + (off - nocc_);
             for (int a = 0; a < n; ++a) dst[a] += s(a);
