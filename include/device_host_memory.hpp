@@ -1119,6 +1119,10 @@ inline cudaError_t tracked_cudaMalloc(T** ptr, size_t size) {
         CudaMemoryManager<T>::track_allocation(size, dev);
     } else {
         size_t current_mem = GlobalGpuMemoryTracker::get_current();
+        // (OOM diagnostic) dump the live tracked allocations so the failing site's
+        // memory context (which device, what else is resident) is visible. This is
+        // the fatal crash path, so the extra output is strictly helpful.
+        dump_tracked_allocations("OOM failure (tracked_cudaMalloc)");
         std::ostringstream oss;
         oss << "tracked_cudaMalloc failed: " << cudaGetErrorString(err) << "\n"
             << "  Attempted to allocate: " << CudaMemoryManager<T>::format_bytes(size) << "\n"

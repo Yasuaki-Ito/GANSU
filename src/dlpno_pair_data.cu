@@ -85,12 +85,57 @@ void build_pair_data(const PairSetup& s,
     if (n_pao == 0) return;
 
     auto pno = build_pno_from_T(T_pao.data(), diag, n_pao, t_cut_pno, os_only);
-    const int n_pno = pno.n_kept;
+    int n_pno = pno.n_kept;
     out.n_pno = n_pno;
     if (n_pno == 0) return;
 
+    // PNO basis matrix in the (orthonormal) semi-canonical PAO basis. Owned
+    // copy (identical layout/content to pno.d_pno) so the NTO augmentation
+    // below can append columns; with the feature off every downstream use is
+    // bit-identical to mapping pno.d_pno directly.
+    RowMatXd Dpno = Eigen::Map<const RowMatXd>(pno.d_pno.data(), n_pao, n_pno);
+
+    // --- Excited-state-aware PNO augmentation (env GANSU_DLPNO_NTO_AUG,
+    // default off). Append the in-domain component of each state-averaged
+    // CIS-NTO particle orbital that the ground-state PNO truncation
+    // discarded: r = (P_domain − P_PNO)·v_m, kept when ‖r‖² > nto_aug_tau.
+    // Guarantees the pair's retained virtual space spans the low excitations'
+    // particle character (the DLPNO analogue of the DMET-STEOM NTO-bath
+    // augmentation; fixes bt-PNO-STEOM low-root dropout without globally
+    // tightening t_cut_pno). Appended columns are MGS-orthonormalized against
+    // the kept PNOs, so the enlarged basis stays orthonormal and every
+    // downstream step (semi-canonicalization, LMP2/CCSD, back-transform)
+    // works unchanged in the larger space.
+    if (s.n_nto > 0 && s.nto_aug_tau > 0.0
+        && static_cast<int>(s.nto_pao.size()) == n_pao * s.n_nto) {
+        Eigen::Map<const RowMatXd> Wnto(s.nto_pao.data(), n_pao, s.n_nto);
+        const int max_tot = n_pao;   // augmented span cannot exceed the domain
+        RowMatXd Dext(n_pao, std::min(max_tot, n_pno + s.n_nto));
+        Dext.leftCols(n_pno) = Dpno;
+        int n_tot = n_pno;
+        for (int m = 0; m < s.n_nto && n_tot < max_tot; ++m) {
+            Eigen::VectorXd r = Wnto.col(m);
+            // Two MGS passes against all current columns (numerical hygiene).
+            for (int pass = 0; pass < 2; ++pass)
+                r -= Dext.leftCols(n_tot)
+                     * (Dext.leftCols(n_tot).transpose() * r);
+            const real_t r2 = r.squaredNorm();
+            if (r2 <= s.nto_aug_tau) continue;  // captured well enough / absent
+            r /= std::sqrt(r2);
+            // Deterministic sign convention (matches build_pno_from_T).
+            Eigen::Index rmax = 0;
+            r.cwiseAbs().maxCoeff(&rmax);
+            if (r(rmax) < 0.0) r = -r;
+            Dext.col(n_tot++) = r;
+        }
+        if (n_tot > n_pno) {
+            Dpno = Dext.leftCols(n_tot);
+            n_pno = n_tot;
+            out.n_pno = n_pno;
+        }
+    }
+
     Eigen::Map<const RowMatXd> Vmat(s.V.data(), n_pao, n_pao);
-    Eigen::Map<const RowMatXd> Dpno(pno.d_pno.data(), n_pao, n_pno);
 
     const RowMatXd Vd    = Vmat * Dpno;             // (n_pao × n_pno)
     const RowMatXd K_pno = Dpno.transpose() * Vd;   // (n_pno × n_pno)
@@ -101,9 +146,9 @@ void build_pair_data(const PairSetup& s,
         for (int bb = 0; bb < n_pno; ++bb) {
             real_t sum = 0.0;
             for (int a = 0; a < n_pao; ++a)
-                sum += pno.d_pno[a * n_pno + aa]
+                sum += Dpno(a, aa)
                      * s.eps_a[a]
-                     * pno.d_pno[a * n_pno + bb];
+                     * Dpno(a, bb);
             F_pno(aa, bb) = sum;
         }
     F_pno = 0.5 * (F_pno + F_pno.transpose());

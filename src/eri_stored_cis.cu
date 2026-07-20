@@ -25,6 +25,8 @@
 #include <iostream>
 #include <vector>
 #include <cmath>
+#include <cstdlib>
+#include <algorithm>
 
 #include <Eigen/Dense>
 #include "rhf.hpp"
@@ -371,99 +373,93 @@ void ERI_RI_RHF::compute_cis_ri_impl(int n_states, std::vector<real_t>* out_eige
     // B_full_mo(Q,pq) would be naux×nao², but we only need ov, oo, vv blocks.
     // Strategy: transform both indices to get B_mo(Q,p,q), then extract blocks.
     // For memory efficiency, transform to B_mo(Q,nao,nao) temporarily.
-    real_t* d_B_mo = nullptr;   // (naux, nao, nao)
-    real_t* d_B_tmp = nullptr;  // workspace
-    tracked_cudaMalloc(&d_B_mo, (size_t)naux * nao * nao * sizeof(real_t));
-    tracked_cudaMalloc(&d_B_tmp, (size_t)naux * nao * nao * sizeof(real_t));
-
-    // B_tmp(Q,μ,q) = Σ_ν B(Q,μ,ν) C(ν,q)
-    // B(Q,μ,ν) stored as (naux, nao*nao), each Q-slice is (nao, nao) row-major
-    // For all Q at once: reshape as (naux*nao, nao) × C(nao, nao) → (naux*nao, nao)
+    // (large-basis memory) The full AO→MO transform buffers d_B_mo + d_B_tmp are
+    // each naux·nao² — at cc-pVDZ on a ~113-atom molecule (nao≈1185, naux≈5508)
+    // that is ~62 GB EACH, which (with the gathered whole-molecule B and the
+    // B_ov/B_oo/B_vv outputs) OOMs device 0 during the DMET-STEOM gauge / NTO-bath
+    // full-system CIS-NTO.  Each Q-slice of the transform is independent, so we
+    // tile over the auxiliary index Q: only a small device batch buffer
+    // (2·qb·nao²) lives at once, and the full B_mo is assembled on the host
+    // (h_B_mo, naux·nao² — cheap in system RAM) for the extraction below.  Small
+    // systems pick qb=naux (single batch ⇒ byte-identical to the legacy all-Q
+    // transform).  GANSU_CIS_RI_QBATCH=<N> forces the batch size.
+    std::vector<real_t> h_B_mo((size_t)naux * nao * nao);
     if (!gpu::gpu_available()) {
-        // CPU fallback: two-step MO transformation using Eigen
+        // CPU fallback: full host-backed transform (unchanged math), staged into h_B_mo.
         using Eigen::Map;
         using Eigen::MatrixXd;
-        const real_t alpha = 1.0, beta = 0.0;
-
-        // Step 1: B_tmp(Q*nao+μ, q) = Σ_ν B(Q*nao+μ, ν) × C(ν, q)
-        // = (naux*nao, nao) × (nao, nao)
-        Map<const MatrixXd> B_mat(d_B, nao, naux * nao);   // col-major view
-        Map<const MatrixXd> C_mat(d_C, nao, nao);           // col-major view
+        real_t* d_B_mo = nullptr; real_t* d_B_tmp = nullptr;
+        tracked_cudaMalloc(&d_B_mo,  (size_t)naux * nao * nao * sizeof(real_t));
+        tracked_cudaMalloc(&d_B_tmp, (size_t)naux * nao * nao * sizeof(real_t));
+        Map<const MatrixXd> B_mat(d_B, nao, naux * nao);
+        Map<const MatrixXd> C_mat(d_C, nao, nao);
         Map<MatrixXd> Tmp_mat(d_B_tmp, nao, naux * nao);
-        // col-major: result(nao, naux*nao) = C_cm × B_cm = C_rm^T × B_rm^T (as col-major)
         Tmp_mat.noalias() = C_mat * B_mat;
-
-        // Step 2: B_mo_Q(p,q) = C^T × B_tmp_Q for each Q
-        // In col-major: B_mo_cm = B_tmp_cm × C_cm^T  per Q-slice
         for (int Q = 0; Q < naux; Q++) {
             Map<const MatrixXd> Bq(d_B_tmp + (size_t)Q * nao * nao, nao, nao);
             Map<MatrixXd> Mq(d_B_mo + (size_t)Q * nao * nao, nao, nao);
             Mq.noalias() = Bq * C_mat.transpose();
         }
+        cudaMemcpy(h_B_mo.data(), d_B_mo, h_B_mo.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+        tracked_cudaFree(d_B_mo); tracked_cudaFree(d_B_tmp);
     } else {
         const real_t alpha = 1.0, beta = 0.0;
         cublasHandle_t handle = gpu::GPUHandle::cublas();
-        // cuBLAS col-major: B_cm(nao, naux*nao) × C_cm(nao, nao)
-        // = (naux*nao, nao)_rm × C_rm(nao, nao) → result (naux*nao, nao)_rm
-        // cublasDgemm(N, N, nao, naux*nao, nao, ...)
-        cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                    nao, naux * nao, nao, &alpha,
-                    d_C, nao,
-                    d_B, nao,
-                    &beta, d_B_tmp, nao);
-        // B_tmp: cuBLAS col-major (nao, naux*nao) = row-major (naux*nao, nao)
-        // B_tmp[Q*nao+μ, q] = Σ_ν C(q,ν) B(Q,μ,ν) — but this is C^T × B, not B × C
-        // Actually in col-major: C_cm × B_cm where B_cm is col-major (nao, naux*nao).
-        // Row-major B(naux*nao, nao) viewed as col-major = (nao, naux*nao).
-        // C_cm(nao, nao) = C_rm^T.
-        // Result(nao, naux*nao) = C_rm^T × (naux*nao slices of B_rm^T each (nao, nao))
-        // This gives: result_cm(q, Q*nao+μ) = Σ_ν C_rm(ν,q) × B_rm(Q*nao+μ, ν) = Σ_ν C(ν,q) B(Q,μ,ν)
-        // row-major result(Q*nao+μ, q) = Σ_ν C(ν,q) B(Q,μ,ν) = B_tmp(Q,μ,q) ✓
-
-        // B_mo(Q,p,q) = Σ_μ C(μ,p) × B_tmp(Q,μ,q)
-        // Reshape: C^T(p,μ) × B_tmp(Q-blocks of (μ,q))
-        // All Q: C^T(nao, nao) × B_tmp(naux*nao, nao) — but C^T operates on μ dimension.
-        // Need to sum over μ: B_mo(Q,p,q) = Σ_μ C(μ,p) B_tmp(Q,μ,q)
-        // B_tmp viewed as (naux, nao, nao) — for each Q, (nao, nao) matrix.
-        // B_mo(Q,p,q) = C^T × B_tmp_Q  for each Q.
-        // Batched: B_tmp is (naux*nao, nao) row-major. We need to multiply C^T on the left
-        // for each Q-slice independently.
-        // Alternative: transpose B_tmp to (naux, q, μ), then multiply.
-        // Simplest: B_tmp_reshaped(naux*nao, nao) — stride nao in Q*nao+μ.
-        // We want: for each (Q,q), B_mo(Q,:,q) = C^T × B_tmp(Q,:,q)
-        // If we group by q: B_mo(:,q) = C^T × B_tmp(:,q) where sizes (naux*nao, 1) per q.
-        // Not efficient. Use batched DGEMM or a different approach.
-
-        // Actually: all-at-once DGEMM.
-        // B_tmp is (naux, nao, nao) row-major = for each Q: M_Q(μ, q) shape (nao, nao).
-        // B_mo_Q(p, q) = Σ_μ C(μ,p) M_Q(μ,q) = C^T × M_Q
-        // For all Q at once: stack M_Q as (naux*nao, nao). B_mo stacked as (naux*nao, nao).
-        // This is NOT a single DGEMM because C^T operates on the μ index within each Q-block.
-
-        // Use cublasDgemmStridedBatched:
-        // A = C^T (nao, nao), stride=0 (same for all Q)
-        // B = B_tmp_Q (nao, nao) per Q, stride=nao*nao
-        // C = B_mo_Q (nao, nao) per Q, stride=nao*nao
-        // cublasDgemmStridedBatched(handle, T, N, nao, nao, nao, alpha,
-        //   C, nao, 0, B_tmp, nao, nao*nao, beta, B_mo, nao, nao*nao, naux)
-        // In cuBLAS col-major: C_cm = C_rm^T. CUBLAS_OP_T of C_cm = C_rm.
-        // B_tmp_cm(nao, nao) per Q = B_tmp_rm^T. CUBLAS_OP_N.
-        // Result_cm = C_rm × B_tmp_rm^T → Result_rm = B_tmp_rm × C_rm^T = B_tmp_rm × C^T_rm ≠ what we want.
-        // We want B_mo = C^T × B_tmp per Q.
-        // col-major: B_mo_cm = B_tmp_cm × C_cm^T = B_tmp_rm^T × C_rm = (C_rm^T × B_tmp_rm)^T
-        // This gives B_mo_cm(q,p) = (C^T × B_tmp)^T = B_tmp^T × C.
-        // So B_mo_rm(p,q) = B_mo_cm(q,p) = (C^T B_tmp)_pq. ✓
-        // cublasDgemmStridedBatched(handle, N, T, nao, nao, nao, alpha,
-        //   B_tmp, nao, nao*nao, C, nao, 0, beta, B_mo, nao, nao*nao, naux)
-        cublasDgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-            nao, nao, nao, &alpha,
-            d_B_tmp, nao, (long long)nao * nao,
-            d_C, nao, 0,
-            &beta,
-            d_B_mo, nao, (long long)nao * nao,
-            naux);
+        // Choose a Q-batch that keeps the two transform buffers within a fraction
+        // of free device memory (single batch = naux when it comfortably fits).
+        int qb = naux;
+        {
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            const size_t per_q = (size_t)2 * nao * nao * sizeof(real_t); // d_B_mo_b + d_B_tmp_b per Q
+            const size_t budget = (size_t)(0.20 * (double)free_b);
+            size_t qb_fit = per_q ? (budget / per_q) : (size_t)naux;
+            if (qb_fit < 1) qb_fit = 1;
+            if ((size_t)qb > qb_fit) qb = (int)qb_fit;
+            if (const char* e = std::getenv("GANSU_CIS_RI_QBATCH")) { int f = std::atoi(e); if (f > 0) qb = std::min(f, naux); }
+            if (qb < naux)
+                std::cout << "  [CIS-RI] tiling AO->MO transform over Q in batches of "
+                          << qb << " (naux=" << naux << ", nao=" << nao
+                          << ") to cap the naux*nao^2 buffer." << std::endl;
+        }
+        real_t *d_B_mo_b = nullptr, *d_B_tmp_b = nullptr;
+        tracked_cudaMalloc(&d_B_mo_b,  (size_t)qb * nao * nao * sizeof(real_t));
+        tracked_cudaMalloc(&d_B_tmp_b, (size_t)qb * nao * nao * sizeof(real_t));
+        for (int q0 = 0; q0 < naux; q0 += qb) {
+            const int nb = std::min(qb, naux - q0);
+            // B_tmp_b(Q,μ,q) = Σ_ν B(Q,μ,ν) C(ν,q) for the Q-columns [q0,q0+nb) of the
+            // col-major (nao, naux*nao) view of B — same math as the legacy all-Q GEMM.
+            cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                        nao, nb * nao, nao, &alpha,
+                        d_C, nao,
+                        d_B + (size_t)q0 * nao * nao, nao,
+                        &beta, d_B_tmp_b, nao);
+            // B_mo_b(Q,p,q) = Σ_μ C(μ,p) B_tmp_b(Q,μ,q), strided-batched over the nb Q's.
+            cublasDgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                nao, nao, nao, &alpha,
+                d_B_tmp_b, nao, (long long)nao * nao,
+                d_C, nao, 0,
+                &beta,
+                d_B_mo_b, nao, (long long)nao * nao,
+                nb);
+            cudaMemcpy(h_B_mo.data() + (size_t)q0 * nao * nao, d_B_mo_b,
+                       (size_t)nb * nao * nao * sizeof(real_t), cudaMemcpyDeviceToHost);
+        }
+        tracked_cudaFree(d_B_mo_b); tracked_cudaFree(d_B_tmp_b);
     }
-    tracked_cudaFree(d_B_tmp);
+
+    // (large-basis memory) The gathered whole-molecule B (cis_B_override_, ~80 GB on
+    // device 0 for a 150-atom cc-pVDZ DMET-STEOM gauge) was the ONLY consumer of the
+    // AO→MO transform just completed into h_B_mo.  Free it NOW — before the
+    // naux·nvir² B_vv block below — so device 0 has room for the CIS outputs (else
+    // gather + B_vv coexist and OOM: Q10 cc-pVDZ gauge, device-0 120→175 GB).  The
+    // distributed compute_cis[_nto] wrapper that set it frees guarded (skips if this
+    // nulled it).  Single-GPU (override==nullptr) uses the persistent member B — do
+    // NOT free that here.
+    if (cis_B_override_ != nullptr) {
+        tracked_cudaFree(const_cast<real_t*>(cis_B_override_));
+        cis_B_override_ = nullptr;
+    }
 
     // Extract B_ov, B_oo, B_vv from B_mo(Q, p, q)
     // B_mo is (naux, nao, nao) row-major. B_mo[Q*nao*nao + p*nao + q]
@@ -476,11 +472,8 @@ void ERI_RI_RHF::compute_cis_ri_impl(int n_states, std::vector<real_t>* out_eige
     tracked_cudaMalloc(&d_B_oo, (size_t)naux * nocc * nocc * sizeof(real_t));
     tracked_cudaMalloc(&d_B_vv, (size_t)naux * nvir * nvir * sizeof(real_t));
 
-    // Extract on host (simple, nao is small for RI systems)
+    // Extract on host from the (Q-tiled) transform result already staged in h_B_mo.
     {
-        std::vector<real_t> h_B_mo((size_t)naux * nao * nao);
-        cudaMemcpy(h_B_mo.data(), d_B_mo, h_B_mo.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
-
         std::vector<real_t> h_B_ov((size_t)naux * nocc * nvir);
         std::vector<real_t> h_B_oo((size_t)naux * nocc * nocc);
         std::vector<real_t> h_B_vv((size_t)naux * nvir * nvir);
@@ -515,7 +508,6 @@ void ERI_RI_RHF::compute_cis_ri_impl(int n_states, std::vector<real_t>* out_eige
         cudaMemcpy(d_B_oo, h_B_oo.data(), h_B_oo.size() * sizeof(real_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_B_vv, h_B_vv.data(), h_B_vv.size() * sizeof(real_t), cudaMemcpyHostToDevice);
     }
-    tracked_cudaFree(d_B_mo);
 
     // Step 2: Build RI CIS operator and solve. The diagonal kernel reads eps[i] (occ) and
     // eps[nocc+a] (vir); offsetting the energy pointer by num_frozen makes eps[i] →

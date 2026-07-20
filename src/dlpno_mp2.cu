@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -286,6 +287,73 @@ DLPNOLMP2Result solve_dlpno_lmp2(
 
     Eigen::Map<const RowMatXd> Fmat(h_F, nao_, nao_);
 
+    // -----------------------------------------------------------------------
+    // Excited-state-aware PNO: NTO projection setup (env-gated, default off).
+    //   GANSU_DLPNO_NTO_AUG=<tau> : append state-averaged CIS-NTO particle
+    //       orbitals to each pair's PNO space when their uncaptured in-domain
+    //       weight exceeds tau (build_pair_data does the append).
+    //   GANSU_DLPNO_NTO_GAUGE=1   : report per-NTO PNO-space coverage after
+    //       the LMP2/SC-PNO rounds (diagnoses silent low-excitation dropout).
+    // Requires a CIS-NTO result on the RHF (the DLPNO-STEOM driver hoists the
+    // CIS-NTO stage before the DLPNO ground when either env is set); without
+    // it, or in DMET cluster mode (which has its own NTO-bath machinery),
+    // the feature silently stays off. Default: no-op, byte-identical.
+    // -----------------------------------------------------------------------
+    const real_t nto_aug_tau = []() -> real_t {
+        const char* e = std::getenv("GANSU_DLPNO_NTO_AUG");
+        return e ? static_cast<real_t>(std::atof(e)) : real_t(0);
+    }();
+    const bool nto_gauge = []() {
+        const char* e = std::getenv("GANSU_DLPNO_NTO_GAUGE");
+        return e && e[0] == '1';
+    }();
+    int n_nto = 0;
+    std::vector<real_t> SVnto;        // [nao × n_nto], column m = S_AO · v_m
+    std::vector<real_t> nto_occ_w;    // NTO occupations (gauge report)
+    if ((nto_aug_tau > 0.0 || nto_gauge) && !cluster) {
+        const CISNTOResult& cn = rhf.get_cis_nto_result();
+        const int nvir_can = nao_ - nocc_full;
+        if (cn.n_act_vir <= 0 || cn.U_vir.empty()) {
+            std::cout << "[DLPNO NTO-aug] env set but no CIS-NTO result is "
+                         "available (run via DLPNO-STEOM, which hoists the "
+                         "CIS-NTO stage) — feature skipped." << std::endl;
+        } else if (cn.nvir != nvir_can || cn.nocc_active != nocc_) {
+            std::cout << "[DLPNO NTO-aug] CIS-NTO dimensions (nocc_active="
+                      << cn.nocc_active << ", nvir=" << cn.nvir
+                      << ") do not match the DLPNO orbital window (nocc="
+                      << nocc_ << ", nvir=" << nvir_can
+                      << ") — feature skipped." << std::endl;
+        } else {
+            n_nto = cn.n_act_vir;
+            if (const char* e = std::getenv("GANSU_DLPNO_NTO_MAX")) {
+                const int cap = std::atoi(e);
+                if (cap > 0 && cap < n_nto) n_nto = cap;
+            }
+            // v_m[μ] = Σ_a C[μ, nocc_full + a] · U_vir[a·nvir + m]  (AO basis,
+            // S-normalized since C is S-orthonormal and U_vir orthogonal), then
+            // SVnto = S_AO · v — the metric half of the per-pair projection
+            //   w^{(ij)} = C_can_pair^T · S · v = C_can_pair^T · SVnto.
+            Eigen::Map<const RowMatXd> Cfull(h_C, nao_, nao_);
+            Eigen::Map<const RowMatXd> Uv(cn.U_vir.data(), nvir_can, nvir_can);
+            Eigen::Map<const RowMatXd> Smat_nto(h_S, nao_, nao_);
+            const RowMatXd Vnto =
+                Cfull.block(0, nocc_full, nao_, nvir_can) * Uv.leftCols(n_nto);
+            SVnto.assign(static_cast<size_t>(nao_) * n_nto, 0.0);
+            Eigen::Map<RowMatXd>(SVnto.data(), nao_, n_nto).noalias() =
+                Smat_nto * Vnto;
+            nto_occ_w.assign(cn.nto_vir_occupations.begin(),
+                             cn.nto_vir_occupations.begin() + n_nto);
+            std::cout << "[DLPNO NTO-" << (nto_aug_tau > 0.0 ? "aug" : "gauge")
+                      << "] state-averaged CIS-NTO particle orbitals: n_nto="
+                      << n_nto;
+            if (nto_aug_tau > 0.0)
+                std::cout << "  aug_tau=" << std::scientific
+                          << std::setprecision(2) << nto_aug_tau
+                          << std::defaultfloat;
+            std::cout << std::endl;
+        }
+    }
+
     // Step 6.3 — Force build_mo_eri to use the replicated single-GPU path
     // for the per-pair pair_setup loop (otherwise the multi-GPU distributed
     // path adds ~5–10 ms NCCL/peer/sync overhead per pair × 465 pairs).
@@ -385,6 +453,17 @@ DLPNOLMP2Result solve_dlpno_lmp2(
         s.C_can_pair.assign(static_cast<size_t>(nao_) * n_pao, 0.0);
         Eigen::Map<RowMatXd>(s.C_can_pair.data(), nao_, n_pao) = C_can_pair;
         s.eps_a = std::move(fdec.eigvals);
+
+        // NTO projection into this pair's semi-canonical PAO basis (feature
+        // off ⇒ n_nto == 0 ⇒ untouched defaults, byte-identical).
+        if (n_nto > 0) {
+            s.n_nto = n_nto;
+            s.nto_aug_tau = nto_aug_tau;
+            s.nto_pao.assign(static_cast<size_t>(n_pao) * n_nto, 0.0);
+            Eigen::Map<const RowMatXd> SV(SVnto.data(), nao_, n_nto);
+            Eigen::Map<RowMatXd>(s.nto_pao.data(), n_pao, n_nto).noalias() =
+                C_can_pair.transpose() * SV;
+        }
 
         setups[static_cast<size_t>(idx)] = std::move(s);
     }
@@ -785,6 +864,80 @@ DLPNOLMP2Result solve_dlpno_lmp2(
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 6b. Excited-state coverage gauge (env GANSU_DLPNO_NTO_GAUGE / implied by
+    //     GANSU_DLPNO_NTO_AUG; default off). For each state-averaged CIS-NTO
+    //     particle orbital v_m, measure how much of its in-domain weight the
+    //     FINAL retained per-pair PNO spaces capture:
+    //       w^{(ij)} = C_can_pair^T S v_m   (in-domain component, ‖w‖² ≤ 1)
+    //       cap      = ‖M^{(ij)T} w‖²       (M columns orthonormal, span = PNOs)
+    //       unc      = ‖w‖² − cap           (weight the PNO truncation dropped)
+    //     Large unc ⇒ the excitation's particle character was discarded by the
+    //     ground-state PNO selection ⇒ that CIS state risks silent dropout /
+    //     blueshift in bt-PNO-STEOM (the DLPNO analogue of the DMET-STEOM
+    //     uncaptured gauge). With augmentation on this verifies the recovery
+    //     (unc → ~0). Runs after the last SC-PNO round = the spaces CCSD uses.
+    // -----------------------------------------------------------------------
+    if (n_nto > 0) {
+        const real_t warn_tau = []() -> real_t {
+            const char* e = std::getenv("GANSU_DLPNO_NTO_WARN");
+            return e ? static_cast<real_t>(std::atof(e)) : real_t(0.10);
+        }();
+        std::vector<real_t> dom_max(n_nto, 0.0), unc_max(n_nto, 0.0);
+        std::vector<real_t> w2_sum(n_nto, 0.0), unc_sum(n_nto, 0.0);
+        for (size_t idx = 0; idx < setups.size(); ++idx) {
+            const PairSetup& s = setups[idx];
+            const PairData&  p = pairs[idx];
+            if (s.n_pao == 0 || p.n_pno == 0 || s.nto_pao.empty()) continue;
+            Eigen::Map<const RowMatXd> Wm(s.nto_pao.data(), s.n_pao, n_nto);
+            Eigen::Map<const RowMatXd> M(p.M.data(), s.n_pao, p.n_pno);
+            const RowMatXd caps = M.transpose() * Wm;   // (n_pno × n_nto)
+            for (int m = 0; m < n_nto; ++m) {
+                const real_t w2  = Wm.col(m).squaredNorm();
+                const real_t cap = caps.col(m).squaredNorm();
+                const real_t unc = std::max(w2 - cap, real_t(0));
+                dom_max[m] = std::max(dom_max[m], w2);
+                unc_max[m] = std::max(unc_max[m], unc);
+                w2_sum[m]  += s.pair_factor * w2;
+                unc_sum[m] += s.pair_factor * unc;
+            }
+        }
+        real_t worst_unc = 0.0;
+        int    worst_m   = 0;
+        std::cout << "[DLPNO NTO-gauge] PNO-space coverage of the state-averaged"
+                     " CIS-NTO particle orbitals (final PNO spaces"
+                  << (nto_aug_tau > 0.0 ? ", NTO-augmented" : "") << "):\n"
+                  << "    m    n_occ(NTO)   dom_max    unc_max    unc_frac\n";
+        for (int m = 0; m < n_nto; ++m) {
+            const real_t frac = w2_sum[m] > 0.0 ? unc_sum[m] / w2_sum[m]
+                                                : real_t(0);
+            const bool warn = unc_max[m] > warn_tau;
+            if (unc_max[m] > worst_unc) { worst_unc = unc_max[m]; worst_m = m; }
+            std::cout << "   " << std::setw(2) << m
+                      << "  " << std::fixed << std::setprecision(6)
+                      << std::setw(11) << nto_occ_w[m]
+                      << "  " << std::setw(9) << std::setprecision(4) << dom_max[m]
+                      << "  " << std::setw(9) << unc_max[m]
+                      << "  " << std::setw(9) << frac
+                      << (warn ? "   ⚠ UNCAPTURED" : "")
+                      << "\n";
+        }
+        const bool ok = worst_unc <= warn_tau;
+        std::cout << "[DLPNO NTO-gauge] verdict: "
+                  << (ok ? "SUFFICIENT" : "INSUFFICIENT")
+                  << "  (worst unc_max=" << std::fixed << std::setprecision(4)
+                  << worst_unc << " at NTO " << worst_m
+                  << ", warn threshold=" << warn_tau << ")" << std::endl;
+        if (!ok && nto_aug_tau <= 0.0)
+            std::cout << "[DLPNO NTO-gauge] low CIS states whose particle "
+                         "character sits on the dropped weight risk silent "
+                         "dropout/blueshift in DLPNO-STEOM. Set "
+                         "GANSU_DLPNO_NTO_AUG=<tau> (e.g. 0.02) to append the "
+                         "uncaptured NTO components to the PNO spaces."
+                      << std::endl;
+        std::cout << std::defaultfloat;
     }
 
     // -----------------------------------------------------------------------

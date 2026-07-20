@@ -2831,6 +2831,27 @@ void ERI_RI_RHF::compute_dlpno_steom_ccsd(int n_states) {
                   << std::endl;
     }
 
+    // --- Stage 0 (opt-in): hoist the CIS-NTO active-space build BEFORE the
+    // DLPNO ground so the PNO construction can consume the state-averaged
+    // CIS-NTO particle orbitals — GANSU_DLPNO_NTO_AUG=<tau> (excited-state-
+    // aware PNO augmentation) and/or GANSU_DLPNO_NTO_GAUGE=1 (per-NTO PNO
+    // coverage report; diagnoses silent low-excitation dropout). CIS is
+    // HF-level (needs no T amplitudes), so running it early is safe and
+    // yields the identical CIS-NTO result; stage 2's need_cis check then
+    // reuses it instead of recomputing. Both env unset: no-op, byte-identical.
+    {
+        const char* ea = std::getenv("GANSU_DLPNO_NTO_AUG");
+        const char* eg = std::getenv("GANSU_DLPNO_NTO_GAUGE");
+        const bool want = (ea && std::atof(ea) > 0.0) || (eg && eg[0] == '1');
+        if (want && rhf_.get_cis_nto_result().n_act_occ == 0) {
+            int n_cis = rhf_.get_steom_n_root_cis();
+            if (n_cis <= 0) n_cis = n_states + 4;   // STEOM.md §7.3 default
+            std::cout << "---- DLPNO-STEOM stage 0: CIS-NTO active space "
+                         "(hoisted for excited-state-aware PNO) ----" << std::endl;
+            compute_cis_nto(n_cis);
+        }
+    }
+
     // MPI Step 4 stage-1 broadcast (OPT-IN, GANSU_STEOM_STAGE1_BCAST=1): rank 0
     // alone computes the DLPNO-CCSD ground at full node threads while rank 1
     // waits, then ships the canonical ground state so rank 1 skips stage-1 —

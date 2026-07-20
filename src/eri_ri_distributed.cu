@@ -3008,8 +3008,13 @@ void ERI_RI_Distributed_RHF::compute_cis(int n_states) {
     real_t* d_B_full = gather_full_B_device0();
     cis_B_override_ = d_B_full;
     ERI_RI_RHF::compute_cis(n_states);
-    cis_B_override_ = nullptr;
-    tracked_cudaFree(d_B_full);
+    // compute_cis_ri_impl frees the gather + nulls the member right after the AO→MO
+    // transform (its only consumer) to free device-0 memory before the CIS outputs.
+    // Free here only if it did not (guard against the double-free).
+    if (cis_B_override_ != nullptr) {
+        tracked_cudaFree(const_cast<real_t*>(cis_B_override_));
+        cis_B_override_ = nullptr;
+    }
 }
 
 void ERI_RI_Distributed_RHF::compute_cis_nto(int n_states_cis) {
@@ -3017,8 +3022,10 @@ void ERI_RI_Distributed_RHF::compute_cis_nto(int n_states_cis) {
     real_t* d_B_full = gather_full_B_device0();
     cis_B_override_ = d_B_full;
     ERI_RI_RHF::compute_cis_nto(n_states_cis);
-    cis_B_override_ = nullptr;
-    tracked_cudaFree(d_B_full);
+    if (cis_B_override_ != nullptr) {
+        tracked_cudaFree(const_cast<real_t*>(cis_B_override_));
+        cis_B_override_ = nullptr;
+    }
 }
 
 } // namespace gansu

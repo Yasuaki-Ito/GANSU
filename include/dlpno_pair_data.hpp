@@ -68,6 +68,23 @@ struct PairSetup {
     std::vector<real_t> C_can_pair;       ///< [nao × n_pao] semi-canonical PAOs in AO basis
     std::vector<real_t> eps_a;            ///< [n_pao] semi-canonical PAO orbital energies
     std::vector<real_t> V;                ///< [n_pao × n_pao] (ia|jb) in semi-canonical PAO basis
+
+    /// --- Excited-state-aware PNO (env GANSU_DLPNO_NTO_AUG / _NTO_GAUGE;
+    /// default off = byte-identical) ---
+    /// State-averaged CIS-NTO particle (virtual) orbitals projected into this
+    /// pair's semi-canonical PAO basis:
+    ///   nto_pao[a*n_nto + m] = Σ_μν C_can_pair[μ,a] · S_AO[μ,ν] · v_m[ν]
+    /// with v_m the m-th active vir NTO in AO basis (S-normalized, ‖v_m‖_S=1),
+    /// so ‖column m‖² ≤ 1 is the NTO's weight inside this pair's PAO domain.
+    /// Filled by solve_dlpno_lmp2 only when the feature is on; consumed by
+    /// build_pair_data (augmentation) and the coverage gauge.
+    std::vector<real_t> nto_pao;          ///< [n_pao × n_nto]
+    int n_nto = 0;
+    /// Augmentation threshold: after the ground-state PNO truncation, an NTO
+    /// whose in-domain residual weight (norm² of its component orthogonal to
+    /// the kept PNO span) exceeds nto_aug_tau is appended to the PNO basis
+    /// (MGS-orthonormalized). 0 = gauge-only, no augmentation.
+    real_t nto_aug_tau = 0.0;
 };
 
 /**
