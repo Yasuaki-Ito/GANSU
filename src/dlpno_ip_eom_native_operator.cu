@@ -177,6 +177,40 @@ void rotate_occ2_gpu(cublasHandle_t cublas, const real_t* d_in, const real_t* d_
     tracked_cudaFree(d_out);
 }
 
+// (PNO-local lean, 2026-07-21) rotate_occ2_gpu for a HOST-resident source: used
+// when the canonical IP operator elided its dense device oovv (native-bare lean
+// mode) and exposes the host mirror instead. Same two GEMM calls (same dims,
+// same order) on the same input bytes as rotate_occ2_gpu ⇒ bit-identical
+// result; staged so at most two nocc²·ntrail device buffers co-reside (the
+// upload is freed before the output buffer is allocated).
+void rotate_occ2_gpu_hostsrc(cublasHandle_t cublas, const real_t* h_in, const real_t* d_U,
+                             std::vector<real_t>& out, int nocc, int ntrail) {
+    const size_t n2t = static_cast<size_t>(nocc) * nocc * ntrail;
+    out.assign(n2t, 0.0);
+    if (h_in == nullptr) return;
+    real_t *d_in = nullptr, *d_M1 = nullptr, *d_out = nullptr;
+    tracked_cudaMalloc(&d_in, n2t * sizeof(real_t));
+    cudaMemcpy(d_in, h_in, n2t * sizeof(real_t), cudaMemcpyHostToDevice);
+    tracked_cudaMalloc(&d_M1, n2t * sizeof(real_t));
+    const real_t one = 1.0, zero = 0.0;
+    const long long strideIO = static_cast<long long>(nocc) * ntrail;
+    cublasDgemmStridedBatched(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+        ntrail, nocc, nocc, &one,
+        d_in, ntrail, strideIO,
+        d_U,  nocc,   0,
+        &zero, d_M1, ntrail, strideIO, nocc);
+    cudaDeviceSynchronize();
+    tracked_cudaFree(d_in);
+    tracked_cudaMalloc(&d_out, n2t * sizeof(real_t));
+    const int LT = nocc * ntrail;
+    cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+        LT, nocc, nocc, &one,
+        d_M1, LT, d_U, nocc, &zero, d_out, LT);
+    cudaMemcpy(out.data(), d_out, n2t * sizeof(real_t), cudaMemcpyDeviceToHost);
+    tracked_cudaFree(d_M1);
+    tracked_cudaFree(d_out);
+}
+
 // Max-abs diff reporter for the B-a.6g rotation self-check (VALIDATE only).
 void rot_check_report(const char* tag, const char* nm,
                       const std::vector<real_t>& ref, const std::vector<real_t>& got) {
@@ -429,26 +463,46 @@ DLPNOIPEOMNativeOperator::DLPNOIPEOMNativeOperator(
 
     // T8: eri_oovv (Woovv) and CCSD T2, each with the 2 leading occ indices
     // rotated canonical→LMO (copy for localizer none). Both are [nocc²·nvir²].
+    // (PNO-local lean, 2026-07-21) the canonical operator may have elided its
+    // dense device oovv (native-bare lean mode) — it then exposes a persistent
+    // HOST mirror with the same bytes; borrow from that instead. t2 is always
+    // device-resident (caller-owned). Non-lean runs take the exact old paths.
     {
         const size_t sz = static_cast<size_t>(nocc_) * nocc_ * nvir_ * nvir_;
+        const real_t* d_oovv = ip_op.get_eri_oovv_device();
+        const std::vector<real_t>& h_oovv_mirror = ip_op.get_eri_oovv_host();
+        if (d_oovv == nullptr && h_oovv_mirror.size() != sz)
+            throw std::runtime_error(
+                "DLPNOIPEOMNativeOperator: canonical oovv elided but no host "
+                "mirror exposed (lean-mode wiring bug).");
         if (uloc_is_identity(U_loc_, nocc_)) {
-            std::vector<real_t> h_Woovv(sz, 0.0), h_t2(sz, 0.0);
-            pull_device(ip_op.get_eri_oovv_device(), h_Woovv);
-            pull_device(ip_op.get_t2_device(),       h_t2);
-            h_Woovv_lmo_ = std::move(h_Woovv);
-            h_t2_lmo_    = std::move(h_t2);
+            if (d_oovv) {
+                std::vector<real_t> h_Woovv(sz, 0.0);
+                pull_device(d_oovv, h_Woovv);
+                h_Woovv_lmo_ = std::move(h_Woovv);
+            } else {
+                h_Woovv_lmo_ = h_oovv_mirror;   // same bytes as the dense pull
+            }
+            std::vector<real_t> h_t2(sz, 0.0);
+            pull_device(ip_op.get_t2_device(), h_t2);
+            h_t2_lmo_ = std::move(h_t2);
 #ifndef GANSU_CPU_ONLY
         } else if (use_gpu_rot) {
             // B-a.6g: rotate the 2 leading occ indices on device (cuBLAS) instead
             // of nvir²-many tiny Eigen GEMMs. Reads ip_op's resident buffers
             // directly; result D2H'd → downstream byte-identical (≈1e-13 drift).
-            rotate_occ2_gpu(cublas_rot, ip_op.get_eri_oovv_device(), d_U_rot,
-                            h_Woovv_lmo_, nocc_, nvir_ * nvir_);
+            if (d_oovv)
+                rotate_occ2_gpu(cublas_rot, d_oovv, d_U_rot,
+                                h_Woovv_lmo_, nocc_, nvir_ * nvir_);
+            else   // (lean) H2D-staged source, identical GEMMs ⇒ bit-identical
+                rotate_occ2_gpu_hostsrc(cublas_rot, h_oovv_mirror.data(), d_U_rot,
+                                        h_Woovv_lmo_, nocc_, nvir_ * nvir_);
             rotate_occ2_gpu(cublas_rot, ip_op.get_t2_device(), d_U_rot,
                             h_t2_lmo_, nocc_, nvir_ * nvir_);
             if (rot_selfcheck) {
                 std::vector<real_t> h_Woovv(sz, 0.0), h_t2(sz, 0.0), ref;
-                pull_device(ip_op.get_eri_oovv_device(), h_Woovv);
+                if (d_oovv) pull_device(d_oovv, h_Woovv);
+                else        h_Woovv = h_oovv_mirror;
                 pull_device(ip_op.get_t2_device(),       h_t2);
                 rotate_occ2(h_Woovv, ref, U_loc_, nocc_, nvir_ * nvir_);
                 rot_check_report("IP-ROT-CHK", "Woovv_lmo", ref, h_Woovv_lmo_);
@@ -458,7 +512,8 @@ DLPNOIPEOMNativeOperator::DLPNOIPEOMNativeOperator(
 #endif
         } else {
             std::vector<real_t> h_Woovv(sz, 0.0), h_t2(sz, 0.0);
-            pull_device(ip_op.get_eri_oovv_device(), h_Woovv);
+            if (d_oovv) pull_device(d_oovv, h_Woovv);
+            else        h_Woovv = h_oovv_mirror;
             pull_device(ip_op.get_t2_device(),       h_t2);
             rotate_occ2(h_Woovv, h_Woovv_lmo_, U_loc_, nocc_, nvir_ * nvir_);
             rotate_occ2(h_t2,    h_t2_lmo_,    U_loc_, nocc_, nvir_ * nvir_);

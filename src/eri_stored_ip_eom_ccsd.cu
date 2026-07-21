@@ -235,6 +235,93 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
         }
     }
 
+#ifndef GANSU_CPU_ONLY
+    // (PNO-local lean follow-up, 2026-07-21) IP-stage device balancing. At
+    // decacene scale the home device still holds ~110 GB of ground/phase24/CIS
+    // residue while the IP build's transient GEMM scratch peaks at ~3×nocc²·
+    // nvir² (+ resident T2) — and the peer GPUs are near-empty. When the home
+    // device cannot fit that working set and a peer has more free memory, run
+    // the WHOLE IP stage (operator build + native σ + Davidson) there: migrate
+    // T1/T2 in place, copy ε/C, rebuild the B_mo block source on the peer, and
+    // switch the thread's device + cuBLAS/cuSOLVER handles (same validated
+    // idiom as the DMET-STEOM share-barH balance in eri_stored_steom_ccsd.cu).
+    // share-barH publish is skipped when redirected (cross-device bar-H borrow
+    // is unverified; the STEOM operator's borrow is fail-safe → own build).
+    // Restored at impl exit. AUTO: fires only under real memory pressure
+    // (small systems byte-identical); GANSU_IP_OPERATOR_DEVICE_BALANCING=1
+    // forces the redirect, =0 disables it.
+    int ip_bal_restore = -1;
+    real_t* d_eps_bal = nullptr;
+    real_t* d_C_bal   = nullptr;
+    // NOTE: gate on the PHYSICAL device count, not rhf.get_num_gpus() — the
+    // STEOM stage-2 driver forces --num_gpus 1 for CIS-NTO, but the process
+    // already holds contexts (and residue) on every physical GPU, and those
+    // peers are exactly where the free memory is.
+    if (!ctx && gpu::gpu_available() && eri_block_src != nullptr) {
+        const char* e_bal = std::getenv("GANSU_IP_OPERATOR_DEVICE_BALANCING");
+        const bool force_on  = e_bal && e_bal[0] == '1';
+        const bool force_off = e_bal && e_bal[0] == '0';
+        int n_dev = 0; cudaGetDeviceCount(&n_dev);
+        const int ng = n_dev;
+        if (!force_off && ng >= 2) {
+            int saved = 0; cudaGetDevice(&saved);
+            size_t free_cur = 0, tot_cur = 0;
+            cudaMemGetInfo(&free_cur, &tot_cur);
+            // Estimated IP-stage device peak: largest transient GEMM-scratch
+            // cluster (ct_ovov/ct_ovvo: 3×NO²NV²) + resident T2 (NO²NV²) + the
+            // rebuilt B_mo blocks + slack ⇒ ~4.8×NO²NV² + NO³NV.
+            const size_t no2nv2 = (size_t)nocc_active * nocc_active
+                                * (size_t)nvir * nvir * sizeof(real_t);
+            const size_t need = (size_t)(4.8 * (double)no2nv2)
+                              + (size_t)nocc_active * nocc_active * nocc_active
+                                * (size_t)nvir * sizeof(real_t);
+            int best = saved; size_t best_free = free_cur;
+            for (int d = 0; d < ng; ++d) {
+                if (d == saved) continue;
+                cudaSetDevice(d);
+                size_t fb = 0, tb = 0;
+                if (cudaMemGetInfo(&fb, &tb) == cudaSuccess && fb > best_free) {
+                    best = d; best_free = fb;
+                }
+            }
+            cudaSetDevice(saved);
+            if (best != saved && (force_on || free_cur < need)) {
+                std::cout << "  [IP-EOM balance] home GPU " << saved << " free "
+                          << std::fixed << std::setprecision(1) << free_cur / 1e9
+                          << " GB < est. IP working set " << need / 1e9
+                          << " GB → running the IP stage on GPU " << best
+                          << " (free " << best_free / 1e9 << " GB); T1/T2 "
+                          << "migrated, B_mo rebuilt there; share-barH publish "
+                          << "skipped." << std::defaultfloat << std::endl;
+                auto move_dev = [&](real_t*& p, size_t n) {   // in-place peer migrate
+                    if (!p) return;
+                    cudaSetDevice(best);
+                    real_t* np = nullptr;
+                    tracked_cudaMalloc(&np, n * sizeof(real_t));
+                    cudaMemcpyPeer(np, best, p, saved, n * sizeof(real_t));
+                    tracked_cudaFree(p);
+                    p = np;
+                    cudaSetDevice(saved);
+                };
+                move_dev(d_t1, (size_t)nocc_active * nvir);
+                move_dev(d_t2, (size_t)nocc_active * nocc_active
+                               * (size_t)nvir * nvir);
+                cudaSetDevice(best);
+                tracked_cudaMalloc(&d_eps_bal, (size_t)num_basis * sizeof(real_t));
+                cudaMemcpyPeer(d_eps_bal, best, d_eps, saved,
+                               (size_t)num_basis * sizeof(real_t));
+                const size_t c_sz = (size_t)num_basis * num_basis;
+                tracked_cudaMalloc(&d_C_bal, c_sz * sizeof(real_t));
+                cudaMemcpyPeer(d_C_bal, best, d_C, saved, c_sz * sizeof(real_t));
+                gpu::GPUHandle::reset();   // cuBLAS/cuSOLVER handles now on best
+                d_eps = d_eps_bal;   // ε for the operator (+ frozen offset below)
+                d_C   = d_C_bal;     // the build_B_mo rebuild below reads C on best
+                ip_bal_restore = saved;
+            }
+        }
+    }
+#endif
+
     // Step 2: Build MO ERI (matches EE-EOM pattern) and trim for frozen core.
     // Phase 0: eri_block_src (single-GPU RI DLPNO) builds the operator's blocks
     // on the fly from B_mo — skip the full nmo⁴ tensor entirely.
@@ -325,13 +412,20 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
         const real_t* Br = eri_block_src->build_B_mo(d_C, num_basis);
         if (Br) d_B_for_op = Br;
     }
+    // (A) shared bar-H: publish 8 IP-side intermediates. Skipped when the IP
+    // stage was device-balanced off the home GPU (cross-device bar-H borrow is
+    // unverified; the STEOM borrow is fail-safe → builds its own).
+    SteomBarHCache* ip_barh_arg =
+        (ctx ? ctx->share_barh : rhf.steom_share_barh())
+            ? (ctx ? &ctx->barh : &rhf.steom_barh_cache()) : nullptr;
+#ifndef GANSU_CPU_ONLY
+    if (ip_bal_restore >= 0) ip_barh_arg = nullptr;
+#endif
     IPEOMCCSDOperator ip_op(d_eri_for_op, d_eps_for_op,
                             d_t1, d_t2,
                             nocc_active, nvir, nao_active,
                             eri_block_src, d_B_for_op, num_basis, eom_gpus,
-                            // (A) shared bar-H: publish 8 IP-side intermediates
-                            (ctx ? ctx->share_barh : rhf.steom_share_barh())
-                                ? (ctx ? &ctx->barh : &rhf.steom_barh_cache()) : nullptr,
+                            ip_barh_arg,
                             // Frozen core: block ranges read [num_frozen, num_basis)
                             // of the full-C B_mo (only used on the block path).
                             num_frozen);
@@ -411,6 +505,19 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
         // GANSU_DLPNO_NATIVE_EOM_SOLVE1=1 force single / =0 force multi.
         int eom_solve_gpus = rhf.get_num_gpus();
 #ifndef GANSU_CPU_ONLY
+        // IP-stage device balancing: the multi-GPU native solve hard-wires its
+        // primary to physical device 0 (DeviceGuard(0) sites in
+        // dlpno_ip_eom_native_operator.cu), but under balance the operator +
+        // Davidson live on the redirected GPU — mixed-device GEMMs fail
+        // (cuBLAS EXECUTION_FAILED, decacene run4). Force the single-GPU
+        // grouped solve (everything current-device); it is also the faster
+        // path whenever it fits.
+        if (native && eom_solve_gpus > 1 && ip_bal_restore >= 0) {
+            eom_solve_gpus = 1;
+            std::cout << "[bt-PNO auto-solve IP] single-GPU grouped solve forced "
+                         "(IP stage device-balanced; multi-GPU solve assumes "
+                         "primary = GPU 0)" << std::endl;
+        }
         if (native && eom_solve_gpus > 1) {
             const char* e = std::getenv("GANSU_DLPNO_NATIVE_EOM_SOLVE1");
             const int forced = e ? (e[0] == '0' ? -1 : 1) : 0;
@@ -610,6 +717,19 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
     }
     result.report = os.str();
     std::cout << result.report;
+
+#ifndef GANSU_CPU_ONLY
+    // IP-stage device balancing: free the ε/C peer copies and restore the
+    // caller's device + handles (the EA/STEOM stages decide their own
+    // placement). ip_op is destroyed after this — its frees are cross-device
+    // safe (tracked_cudaFree).
+    if (ip_bal_restore >= 0) {
+        if (d_eps_bal) tracked_cudaFree(d_eps_bal);
+        if (d_C_bal)   tracked_cudaFree(d_C_bal);
+        cudaSetDevice(ip_bal_restore);
+        gpu::GPUHandle::reset();
+    }
+#endif
 
     if (ctx) { ctx->excited_state_report += result.report;
                ctx->ip_eom_result = std::move(result); }

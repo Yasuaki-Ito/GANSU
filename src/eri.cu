@@ -965,6 +965,15 @@ const real_t* ERI_RI::build_B_mo_impl(const real_t* d_B_ao_src,
         &beta, d_B_mo, nmo);
 
     cudaDeviceSynchronize();
+    // The two half-transform temporaries are internal to this call — only the
+    // returned ws_B_mo is contract-bound ("valid until the next build_B_mo").
+    // Keeping them cached pinned 2×naux·nao·nmo (26 GiB at decacene cc-pVDZ)
+    // through the whole downstream stage (the IP-EOM build OOM'd on exactly
+    // this dead weight); free them now — the next build_B_mo re-allocates in
+    // milliseconds. Pure allocation lifecycle: results are byte-identical.
+    tracked_cudaFree(ws_B_tmp);  ws_B_tmp  = nullptr;
+    tracked_cudaFree(ws_B_tmp2); ws_B_tmp2 = nullptr;
+    ws_B_tmp_bytes = 0;
     return d_B_mo;
 #endif
 }
@@ -1152,11 +1161,17 @@ void ERI_RI::mo_eri_block_into(const real_t* d_B_mo, int nmo,
     }
     const size_t need_bra = (size_t)naux * nPQ * sizeof(real_t);
     const size_t need_ket = (size_t)naux * nRS * sizeof(real_t);
-    if (need_bra > ws_bra_bytes) {
+    // Grow on demand, but also SHRINK when the cache is ≥4× oversized for the
+    // current request: the per-k slice pumps alternate between ovvv-pair kets
+    // (naux·nvir², 8.7 GiB at decacene) and ovov-pair kets (naux·nocc·nvir,
+    // 1.5 GiB) in long same-size phases, so without the shrink the largest
+    // request pins its buffer through phases that only need a fraction of it
+    // (part of the IP-EOM build OOM budget). Same gathers/GEMM → byte-identical.
+    if (need_bra > ws_bra_bytes || need_bra * 4 < ws_bra_bytes) {
         if (ws_bra) tracked_cudaFree(ws_bra);
         tracked_cudaMalloc(&ws_bra, need_bra); ws_bra_bytes = need_bra;
     }
-    if (need_ket > ws_ket_bytes) {
+    if (need_ket > ws_ket_bytes || need_ket * 4 < ws_ket_bytes) {
         if (ws_ket) tracked_cudaFree(ws_ket);
         tracked_cudaMalloc(&ws_ket, need_ket); ws_ket_bytes = need_ket;
     }

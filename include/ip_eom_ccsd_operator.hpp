@@ -120,6 +120,11 @@ public:
     const real_t* get_eri_ovov_device() const { return d_eri_ovov_; }  // [nocc·nvir·nocc·nvir] (ov|ov), raw ERI
     const real_t* get_eri_ovvo_device() const { return d_eri_ovvo_; }  // [nocc·nvir·nvir·nocc] (ov|vo), raw ERI
     const real_t* get_t2_device()     const { return d_t2_; }    // [nocc²·nvir²]
+    /// (PNO-local lean) Host mirror of the raw oovv block, populated ONLY when
+    /// the dense device block was elided (native-bare lean mode; see
+    /// extract_eri_blocks). The native operator borrows it as the Woovv_lmo
+    /// seed instead of get_eri_oovv_device(). Empty in every other mode.
+    const std::vector<real_t>& get_eri_oovv_host() const { return h_oovv_mirror_; }
 
     /// Print intermediate Frobenius norms (used by ip_eom_verbose ≥ 2 for
     /// PySCF cross-validation in sub-phases 1.3-1.6). Sub-phase 1.0+1.1
@@ -181,6 +186,16 @@ private:
     const real_t* d_B_mo_blocks_ = nullptr;
     int nmo_full_ = 0;
     int frozen_off_ = 0;   // frozen-core MO offset for block ranges (0 = none)
+    // (PNO-local lean, 2026-07-21) Under the production native-bare σ path the
+    // canonical apply() is never called, so the two nocc²·nvir² raw device
+    // blocks (ovov/oovv — the IP extract OOM site at nvir≳600) are needed only
+    // as build-time inputs. When set: extract skips their dense device allocs,
+    // build_dressed feeds every consumer from per-k B slices (host mirrors +
+    // per-k GEMM-input builders, bit-identical buffers → unchanged GEMMs), and
+    // oovv persists as a host mirror the native operator borrows. apply() throws
+    // (the native operator must wrap this one). Set once in the constructor.
+    bool lean_raw_blocks_ = false;
+    std::vector<real_t> h_oovv_mirror_;   // persistent host oovv (lean mode only)
     void extract_eri_blocks(const real_t* d_eri_mo);
     void compute_denominators_and_fock(const real_t* d_orbital_energies);
     void build_diagonal();
