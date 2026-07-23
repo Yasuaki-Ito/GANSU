@@ -915,6 +915,7 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
     // extraction (dmet_steom_auto_fragment) > whole molecule (full-system reduction).
     DMETFragment chromo;
     int auto_n_cis_used = 0;   // >0 ⇒ CIS-NTO already computed by auto extraction (reuse below)
+    bool auto_mode = false, auto_budget_hit = false;   // for the post-bath size classification
     const std::string& spec = rhf_.get_dmet_fragments_str();
     auto build_chromo_from_atoms = [&](const std::vector<int>& sel_atoms) {
         chromo = DMETFragment{};
@@ -932,6 +933,8 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
         DMETAutoFragmentResult ar = dmet_steom_auto_extract_fragment(
             rhf_, eri_method, n_states, num_atoms_, nao, nocc);
         auto_n_cis_used = ar.n_cis_used;
+        auto_mode = true;
+        auto_budget_hit = ar.budget_hit;
         build_chromo_from_atoms(ar.atoms);
         if ((int)ar.atoms.size() == num_atoms_)
             std::cout << "  [auto-frag] whole molecule selected → DMET degenerates to plain STEOM."
@@ -1071,6 +1074,43 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
         std::cout << "  n_frag=" << chromo.n_frag << " n_bath=" << n_bath
                   << " n_emb=" << n_emb << " n_emb_occ=" << n_emb_occ
                   << " n_frozen=" << n_frozen << std::endl;
+    }
+
+    // ---- Fragment-size classification (auto mode): is a large cluster required
+    // or over-selected? A big cluster is fine IF the excitation genuinely needs
+    // it; the concern is only over-selection. Distinguish via the bath gauge:
+    //   • BUDGET-CAPPED (selection stopped by the orbital budget) → the excitation
+    //     needs more than budget; result may be under-converged.
+    //   • bath SUFFICIENT with ample slack (uncaptured ≪ 0.02) → OVER-SELECTED,
+    //     the coverage/floor could be tightened to shrink the cluster.
+    //   • otherwise → RIGHT-SIZED: required for the excitation; shrinking loses
+    //     accuracy even though the cluster is large (accept it).
+    if (auto_mode && !C_emb.empty()) {
+        std::vector<char> is_frag(nao, 0);
+        for (int p : chromo.ao_indices) is_frag[p] = 1;
+        DMETBathGaugeResult ga = dmet_steom_bath_gauge(
+            rhf_, S_half.data(), h_C, nao, nocc, num_atoms_, C_emb.data(), n_emb, is_frag);
+        const int budget = rhf_.get_dmet_steom_auto_budget() > 0
+                         ? rhf_.get_dmet_steom_auto_budget() : dmet_steom_default_budget(rhf_);
+        std::cout << "  [auto-frag size] " << chromo.atom_indices.size() << " atoms, n_emb="
+                  << n_emb << "/" << budget << " budget, bath " << ga.verdict
+                  << " (uncaptured=" << std::fixed << std::setprecision(4) << ga.wunc
+                  << ")" << std::defaultfloat << std::endl;
+        if (auto_budget_hit)
+            std::cout << "  [auto-frag size] → BUDGET-CAPPED: the excitation needs more than the "
+                         "orbital budget; result may be under-converged (raise dmet_steom_auto_budget, "
+                         "use --dmet_cluster_solver dlpno, or accept the reduced coverage)." << std::endl;
+        else if (std::strcmp(ga.verdict, "SUFFICIENT") == 0 && ga.wunc < 0.005)
+            std::cout << "  [auto-frag size] → possibly OVER-SELECTED: the bath has ample slack "
+                         "(uncaptured " << std::fixed << std::setprecision(4) << ga.wunc
+                      << std::defaultfloat << " ≪ 0.02); tighten dmet_steom_auto_coverage / "
+                         "raise dmet_steom_auto_atom_floor to shrink the cluster with little accuracy loss."
+                      << std::endl;
+        else
+            std::cout << "  [auto-frag size] → RIGHT-SIZED: this fragment is required for the "
+                         "excitation (bath " << ga.verdict << "); a large cluster here is inherent to "
+                         "the excitation's extent, not over-selection — shrinking would lose accuracy."
+                      << std::endl;
     }
 
     // ------------------------------------------------------------------------
