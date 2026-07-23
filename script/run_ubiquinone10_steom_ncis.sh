@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CoenzymeQ10 DMET-DLPNO-STEOM — n_cis-enlarged rerun.
+# ubiquinone10 DMET-DLPNO-STEOM — n_cis-enlarged rerun.
 # log213 (default n_cis) gave 3/5 roots with η<0.96: k2/k3/k4 had low %act_o
 # (occupied active space too small).  Raise steom_n_root_cis to enlarge the
 # state-averaged CIS-NTO density -> larger occupied active space (dox/490 protocol).
@@ -7,7 +7,7 @@
 set -euo pipefail
 
 GANSU=./gansu
-XYZ=../xyz/large_molecular/CoenzymeQ10.xyz
+XYZ=../xyz/large_molecular/ubiquinone10.xyz
 AUX=../auxiliary_basis/cc-pvdz-rifit.gbs
 FRAG="{0,1,2,3,46,50,51,53,54,55}"
 
@@ -15,8 +15,8 @@ export GANSU_DMET_LEVEL_SHIFT_DENOM_ONLY=1
 export GANSU_CCSD_CONV=1e-7
 export GANSU_STEOM_DENSE_DIAG=2
 
-LOG=/tmp/q10_steom_631g_ncis20.log
-echo ">>> DMET-STEOM CoenzymeQ10 quinone / 6-31g / n_cis=20  -> $LOG"
+LOG=/tmp/ubiquinone10_steom_631g_ncis20.log
+echo ">>> DMET-STEOM ubiquinone10 quinone / 6-31g / n_cis=20  -> $LOG"
 $GANSU -x $XYZ -g 6-31g \
   --eri_method ri -ag $AUX \
   --post_hf_method dmet_steom \

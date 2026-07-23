@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Taxol benzamide / 6-31g — gauge (in-domain) diagnostic + NTO-bath augmentation.
+# paclitaxel benzamide / 6-31g — gauge (in-domain) diagnostic + NTO-bath augmentation.
 # The cc-pVDZ diagnostic (log217) OOM'd: BATH_DIAG builds the FULL-molecule CIS-NTO
 # (nocc=226, nvir=959, dim=216734 at cc-pVDZ -> 50.8 GB alloc on top of 172 GB).
 # 6-31g shrinks the full-system CIS (nvir 434, dim ~98k) so the leakage analysis fits.
@@ -9,7 +9,7 @@
 set -euo pipefail
 
 GANSU=./gansu
-XYZ=../xyz/large_molecular/Taxol.xyz
+XYZ=../xyz/large_molecular/paclitaxel.xyz
 AUX=../auxiliary_basis/cc-pvdz-rifit.gbs
 FRAG="{47,48,49,56,57,58,59,60,61}"
 
@@ -20,8 +20,8 @@ export GANSU_DMET_STEOM_BATH_DIAG=1       # print gauge (in-domain check)
 export GANSU_DMET_STEOM_NTO_BATH=0.01     # tau_vir  (virtual NTO-bath augmentation)
 export GANSU_DMET_STEOM_NTO_BATH_OCC=0.5  # tau_occ  (occupied NTO-bath augmentation)
 
-LOG=/tmp/taxol_steom_631g_diag.log
-echo ">>> DMET-STEOM Taxol benzamide / 6-31g / gauge+NTO-bath  -> $LOG"
+LOG=/tmp/paclitaxel_steom_631g_diag.log
+echo ">>> DMET-STEOM paclitaxel benzamide / 6-31g / gauge+NTO-bath  -> $LOG"
 $GANSU -x $XYZ -g 6-31g \
   --eri_method ri -ag $AUX \
   --post_hf_method dmet_steom \

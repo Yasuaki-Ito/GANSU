@@ -452,7 +452,7 @@ void ERI_RI_RHF::compute_cis_ri_impl(int n_states, std::vector<real_t>* out_eige
     // device 0 for a 150-atom cc-pVDZ DMET-STEOM gauge) was the ONLY consumer of the
     // AO→MO transform just completed into h_B_mo.  Free it NOW — before the
     // naux·nvir² B_vv block below — so device 0 has room for the CIS outputs (else
-    // gather + B_vv coexist and OOM: Q10 cc-pVDZ gauge, device-0 120→175 GB).  The
+    // gather + B_vv coexist and OOM: ubiquinone-10 cc-pVDZ gauge, device-0 120→175 GB).  The
     // distributed compute_cis[_nto] wrapper that set it frees guarded (skips if this
     // nulled it).  Single-GPU (override==nullptr) uses the persistent member B — do
     // NOT free that here.

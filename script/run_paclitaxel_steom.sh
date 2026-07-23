@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# DMET-STEOM electronic excitation of Taxol (C47H51NO14, 113 atoms)
+# DMET-STEOM electronic excitation of paclitaxel (C47H51NO14, 113 atoms)
 # Target chromophore = BENZAMIDE (N-benzoyl): phenyl {56-61} + amide C48=O49 + N47
 # Cut bond = N47-C46 (amide-N to sp3 C-3', clean single bond)
 # Run on remote GPU box (s177: H200x4).  cd ~/GANSU/build first.
 set -euo pipefail
 
 GANSU=./gansu
-XYZ=../xyz/large_molecular/Taxol.xyz
+XYZ=../xyz/large_molecular/paclitaxel.xyz
 AUX=../auxiliary_basis/cc-pvdz-rifit.gbs
 FRAG="{47,48,49,56,57,58,59,60,61}"          # benzamide chromophore (0-based)
 
@@ -22,8 +22,8 @@ export GANSU_CCSD_CONV=1e-7          # CCSD tail cutoff: iter ~4x fewer, root im
 
 # ---- Stage 1: 6-31g smoke test (fast, proven money-shot path like dox) ----
 BASIS=6-31g
-LOG=/tmp/taxol_steom_631g.log
-echo ">>> Stage 1: DMET-STEOM Taxol benzamide / $BASIS  -> $LOG"
+LOG=/tmp/paclitaxel_steom_631g.log
+echo ">>> Stage 1: DMET-STEOM paclitaxel benzamide / $BASIS  -> $LOG"
 $GANSU -x $XYZ -g $BASIS \
   --eri_method ri -ag $AUX \
   --post_hf_method dmet_steom \
@@ -42,7 +42,7 @@ $GANSU -x $XYZ -g $BASIS \
 # so cc-pVDZ should fit on one H200 without the heavy EA-host env recipe.
 # Uncomment to run:
 # BASIS=cc-pvdz
-# LOG=/tmp/taxol_steom_ccpvdz.log
+# LOG=/tmp/paclitaxel_steom_ccpvdz.log
 # GANSU_STEOM_DENSE_DIAG=2 \
 # GANSU_DMET_LEVEL_SHIFT_DENOM_ONLY=1 GANSU_CCSD_CONV=1e-7 \
 # $GANSU -x $XYZ -g $BASIS \

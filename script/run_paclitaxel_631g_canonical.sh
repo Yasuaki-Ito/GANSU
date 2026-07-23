@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Taxol benzamide / 6-31g — PLAIN CANONICAL DMET-STEOM (the validated path).
+# paclitaxel benzamide / 6-31g — PLAIN CANONICAL DMET-STEOM (the validated path).
 # This is the baseline that should have been run FIRST: canonical cluster CCSD
 # (the ORCA-validated DMET-STEOM solver), NO DLPNO, NO bt-polish, NO NTO-bath.
 # n_emb=157 is small -> canonical is cheap.  Establishes the clean reference before
@@ -8,7 +8,7 @@
 set -euo pipefail
 
 GANSU=./gansu
-XYZ=../xyz/large_molecular/Taxol.xyz
+XYZ=../xyz/large_molecular/paclitaxel.xyz
 AUX=../auxiliary_basis/cc-pvdz-rifit.gbs
 FRAG="{47,48,49,56,57,58,59,60,61}"
 
@@ -16,8 +16,8 @@ export GANSU_DMET_LEVEL_SHIFT_DENOM_ONLY=1   # correctness (un-shift), unchanged
 export GANSU_CCSD_CONV=1e-7
 export GANSU_STEOM_DENSE_DIAG=2
 
-LOG=/tmp/taxol_steom_631g_canonical.log
-echo ">>> DMET-STEOM Taxol benzamide / 6-31g / CANONICAL (validated baseline)  -> $LOG"
+LOG=/tmp/paclitaxel_steom_631g_canonical.log
+echo ">>> DMET-STEOM paclitaxel benzamide / 6-31g / CANONICAL (validated baseline)  -> $LOG"
 $GANSU -x $XYZ -g 6-31g \
   --eri_method ri -ag $AUX \
   --post_hf_method dmet_steom \

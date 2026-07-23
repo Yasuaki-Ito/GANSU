@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# DMET-DLPNO-STEOM-CCSD excited states of Taxol / cc-pVDZ (DZP) — production.
-# Benzamide chromophore fragment {47,48,49,56,57,58,59,60,61} (see run_taxol_steom.sh).
+# DMET-DLPNO-STEOM-CCSD excited states of paclitaxel / cc-pVDZ (DZP) — production.
+# Benzamide chromophore fragment {47,48,49,56,57,58,59,60,61} (see run_paclitaxel_steom.sh).
 # Run on remote GPU box (s177: H200x4).  cd ~/GANSU/build first.
-# ⚠ Needs the 4 GPUs free — do NOT launch while the Q10 job is still running
+# ⚠ Needs the 4 GPUs free — do NOT launch while the ubiquinone-10 job is still running
 #   (s177 GPUs are Exclusive_Process; a held GPU makes cuSOLVER handle init fail).
 set -euo pipefail
 
 GANSU=./gansu
-XYZ=../xyz/large_molecular/Taxol.xyz
+XYZ=../xyz/large_molecular/paclitaxel.xyz
 AUX=../auxiliary_basis/cc-pvdz-rifit.gbs
 FRAG="{47,48,49,56,57,58,59,60,61}"
 
-# correctness-critical (see run_taxol_steom.sh): denominator-only shift + ε un-shift
+# correctness-critical (see run_paclitaxel_steom.sh): denominator-only shift + ε un-shift
 export GANSU_DMET_LEVEL_SHIFT_DENOM_ONLY=1
 export GANSU_CCSD_CONV=1e-7
 export GANSU_STEOM_DENSE_DIAG=2          # force deterministic dense geev (avoid Davidson artifact)
 
-LOG=/tmp/taxol_steom_ccpvdz.log
-echo ">>> DMET-STEOM Taxol benzamide / cc-pVDZ  -> $LOG"
+LOG=/tmp/paclitaxel_steom_ccpvdz.log
+echo ">>> DMET-STEOM paclitaxel benzamide / cc-pVDZ  -> $LOG"
 $GANSU -x $XYZ -g cc-pvdz \
   --eri_method ri -ag $AUX \
   --post_hf_method dmet_steom \

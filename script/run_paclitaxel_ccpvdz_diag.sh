@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Taxol benzamide / cc-pVDZ — gauge (in-domain) diagnostic + NTO-bath augmentation.
+# paclitaxel benzamide / cc-pVDZ — gauge (in-domain) diagnostic + NTO-bath augmentation.
 # Hypothesis (log214/216): the benzamide fragment is NOT in-domain — the cluster
 # CIS lowest root sits at ~7.95 eV in BOTH bases, ~2-3 eV above benzamide's true
 # lowest pi->pi* (~4.6-5.5 eV), so the low state is outside fragment+bath and STEOM
@@ -13,7 +13,7 @@
 set -euo pipefail
 
 GANSU=./gansu
-XYZ=../xyz/large_molecular/Taxol.xyz
+XYZ=../xyz/large_molecular/paclitaxel.xyz
 AUX=../auxiliary_basis/cc-pvdz-rifit.gbs
 FRAG="{47,48,49,56,57,58,59,60,61}"
 
@@ -24,8 +24,8 @@ export GANSU_DMET_STEOM_BATH_DIAG=1       # print gauge (in-domain check)
 export GANSU_DMET_STEOM_NTO_BATH=0.01     # tau_vir  (virtual NTO-bath augmentation)
 export GANSU_DMET_STEOM_NTO_BATH_OCC=0.5  # tau_occ  (occupied NTO-bath augmentation)
 
-LOG=/tmp/taxol_steom_ccpvdz_diag.log
-echo ">>> DMET-STEOM Taxol benzamide / cc-pVDZ / gauge+NTO-bath  -> $LOG"
+LOG=/tmp/paclitaxel_steom_ccpvdz_diag.log
+echo ">>> DMET-STEOM paclitaxel benzamide / cc-pVDZ / gauge+NTO-bath  -> $LOG"
 $GANSU -x $XYZ -g cc-pvdz \
   --eri_method ri -ag $AUX \
   --post_hf_method dmet_steom \
