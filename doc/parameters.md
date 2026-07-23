@@ -613,6 +613,40 @@ Bisection of μ stops when |Σ_F N_frag(μ) − N_elec| < `dmet_n_tol`. Default 
 * **false** (default): single-stage CCSD-density bisection. Runs CCSD/Lambda/dm1 at every μ evaluation; the relaxed dm1 trace defines `N_frag(μ)`.
 * **true**: two-stage refinement. Stage 1 performs HF-density bisection (fast, μ-continuous). Stage 2 refines around `μ_HF*` using CCSD-relaxed dm1 in a tight bracket. Falls back to Stage 1 result if Stage 2 hits a discontinuity (e.g. heteroatom OH fragments). Recommended only for paper-quality match with external DMET implementations; default is sufficient for most uses.
 
+### DMET-STEOM CIS-guided automatic fragment extraction
+
+For the excited-state driver (`post_hf_method=dmet_steom`), the chromophore fragment can be
+extracted automatically from the excitation itself instead of being specified by hand. A
+full-system state-averaged CIS-NTO is computed up front; each atom is scored by its
+occupation-weighted hole+particle NTO Löwdin population, and the chromophore is the greedy
+set of atoms that reaches the coverage target (capped by the cluster orbital budget). This is
+distinct from the ground-state `dmet_fragments` above — it is only consulted on the
+`dmet_steom` path, and an explicit `dmet_fragments` always takes priority.
+
+| Parameter | Description | Type | Default |
+| --- | --- | --- | --- |
+| dmet_steom_auto_fragment | Auto-extract the chromophore fragment from CIS-NTO per-atom weights | bool | false |
+| dmet_steom_auto_coverage | Cumulative per-atom NTO coverage target T | double | 0.92 |
+| dmet_steom_auto_atom_floor | Per-atom NTO weight floor f (atoms below this are not candidates) | double | 0.01 |
+| dmet_steom_auto_budget | Cluster orbital budget B (est. n_emb); 0 = auto per solver (canonical 460 / dlpno 700) | int | 0 |
+| dmet_steom_auto_include_h | Attach bonded H to selected heavy atoms (default off: env C–H σ is covered by the Schmidt bath) | bool | false |
+| dmet_steom_auto_n_cis | CIS state count for the extraction; 0 = auto (`max(steom_n_root_cis, n_excited_states+4)`) | int | 0 |
+| dmet_steom_auto_max_expand | Max gauge-triggered fragment-expansion rounds (Phase B) | int | 1 |
+
+The extraction prints a per-atom NTO weight table, the selected atoms with achieved coverage,
+and warnings when the selection is floor-sensitive, hits the orbital budget, is delocalized
+(above-floor atoms cannot reach the target → degenerates toward full STEOM), or spans more
+than three disconnected regions (likely a mix of spatially distinct excitations). The
+hoisted CIS-NTO is reused by the downstream NTO-bath gauge/augmentation (no recompute).
+
+```bash
+# CIS-guided auto fragment for DMET-STEOM (no manual --dmet_fragments)
+./gansu -x ../xyz/large_molecular/Doxorubicin.xyz -g cc-pvdz --eri_method ri \
+    -ag ../auxiliary_basis/cc-pvdz-rifit.gbs \
+    --post_hf_method dmet_steom --n_excited_states 5 \
+    --dmet_steom_auto_fragment 1 --dmet_cluster_solver dlpno --num_gpus 4
+```
+
 ```bash
 # Auto fragment detection, default tight tol
 ./gansu -x ../xyz/Benzene.xyz -g sto-3g --eri_method ri \

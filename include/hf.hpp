@@ -263,6 +263,15 @@ public:
     /// DMET: bisection tolerance on |Σ N_frag − N_elec|. Default 1e-5 (tight, GANSU native).
     /// Vayesta-compat: 4.2e-3 for benzene/STO-3G (= 1e-4 × 42, matches Vayesta's max_elec_err).
     double get_dmet_n_tol() const { return dmet_n_tol_; }
+    /// DMET-STEOM CIS-guided automatic fragment extraction (excitation-driven,
+    /// real-space atomic fragment). Only consulted on the dmet_steom path.
+    bool   get_dmet_steom_auto_fragment()   const { return dmet_steom_auto_fragment_; }
+    double get_dmet_steom_auto_coverage()   const { return dmet_steom_auto_coverage_; }
+    double get_dmet_steom_auto_atom_floor() const { return dmet_steom_auto_atom_floor_; }
+    int    get_dmet_steom_auto_budget()     const { return dmet_steom_auto_budget_; }
+    bool   get_dmet_steom_auto_include_h()  const { return dmet_steom_auto_include_h_; }
+    int    get_dmet_steom_auto_n_cis()      const { return dmet_steom_auto_n_cis_; }
+    int    get_dmet_steom_auto_max_expand() const { return dmet_steom_auto_max_expand_; }
     /// Geometry optimization parameters (used in optimize_geometry path)
     int get_opt_max_iter() const { return opt_max_iter_; }
     double get_opt_grad_threshold() const { return opt_grad_threshold_; }
@@ -671,6 +680,13 @@ protected:
     bool dmet_mu_refine_ccsd_ = false;  ///< DMET: refine μ with CCSD-relaxed density
     std::string dmet_cluster_solver_ = "canonical";  ///< DMET-STEOM cluster ground solver: canonical | dlpno
     double dmet_n_tol_ = 1e-5;  ///< DMET: bisection tolerance on |Σ N_frag − N_elec|
+    bool   dmet_steom_auto_fragment_   = false;  ///< DMET-STEOM: CIS-guided auto fragment extraction
+    double dmet_steom_auto_coverage_   = 0.92;   ///< cumulative NTO per-atom coverage target T
+    double dmet_steom_auto_atom_floor_ = 0.01;   ///< per-atom NTO weight floor f
+    int    dmet_steom_auto_budget_     = 0;      ///< cluster orbital budget B (0 = auto per solver)
+    bool   dmet_steom_auto_include_h_  = false;  ///< attach bonded H to selected heavy atoms
+    int    dmet_steom_auto_n_cis_      = 0;      ///< CIS state count for extraction (0 = auto)
+    int    dmet_steom_auto_max_expand_ = 1;      ///< max gauge-triggered expansion rounds (Phase B)
     int opt_max_iter_ = 200;    ///< Geometry optimization max iterations
     double opt_grad_threshold_ = 3.0e-4;
     double opt_rms_grad_threshold_ = 2.0e-4;

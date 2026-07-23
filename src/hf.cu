@@ -128,6 +128,13 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
                                  "'. Must be 'canonical' or 'dlpno'.");
     }
     dmet_n_tol_ = parameters.get<double>("dmet_n_tol");
+    dmet_steom_auto_fragment_   = parameters.get<bool>("dmet_steom_auto_fragment");
+    dmet_steom_auto_coverage_   = parameters.get<double>("dmet_steom_auto_coverage");
+    dmet_steom_auto_atom_floor_ = parameters.get<double>("dmet_steom_auto_atom_floor");
+    dmet_steom_auto_budget_     = parameters.get<int>("dmet_steom_auto_budget");
+    dmet_steom_auto_include_h_  = parameters.get<bool>("dmet_steom_auto_include_h");
+    dmet_steom_auto_n_cis_      = parameters.get<int>("dmet_steom_auto_n_cis");
+    dmet_steom_auto_max_expand_ = parameters.get<int>("dmet_steom_auto_max_expand");
     opt_max_iter_ = parameters.get<int>("opt_max_iter");
     opt_grad_threshold_ = parameters.get<double>("opt_grad_threshold");
     opt_rms_grad_threshold_ = parameters.get<double>("opt_rms_grad_threshold");

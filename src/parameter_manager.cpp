@@ -86,6 +86,16 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"dmet_mu_refine_ccsd", "0"},                      // bool (0/1): refine μ with CCSD-relaxed density after HF stage
         {"dmet_cluster_solver", "canonical"},              // string: dmet_steom cluster ground-state solver — "canonical" (exact cluster CCSD) or "dlpno" (cluster-space DLPNO-CCSD + bt-polish; the ~500-orbital-cluster production mode, formerly env GANSU_DMET_STEOM_DLPNO=2 which still overrides when set)
         {"dmet_n_tol", "1e-5"},                            // real_t: bisection tol on |Σ N_frag − N_elec| (Vayesta-compat: 4.2e-3 for benzene)
+        // CIS-guided automatic fragment extraction for DMET-STEOM (excitation-driven,
+        // real-space atomic fragment). Distinct from the ground-state dmet_fragments
+        // group above. Only active for post_hf_method=dmet_steom.
+        {"dmet_steom_auto_fragment", "0"},                 // bool (0/1): auto-extract the chromophore fragment from full-system CIS-NTO per-atom weights (ignored if dmet_fragments is given)
+        {"dmet_steom_auto_coverage", "0.92"},              // real_t: cumulative NTO per-atom coverage target T for greedy atom selection
+        {"dmet_steom_auto_atom_floor", "0.01"},            // real_t: per-atom NTO weight floor f (atoms below this are not selected)
+        {"dmet_steom_auto_budget", "0"},                   // int: cluster orbital budget B (est. n_emb); 0 = auto per solver (canonical 460 / dlpno 700)
+        {"dmet_steom_auto_include_h", "0"},                // bool (0/1): attach bonded H to selected heavy atoms (default off: env H C-H σ is covered by the Schmidt bath)
+        {"dmet_steom_auto_n_cis", "0"},                    // int: CIS state count for the extraction; 0 = auto (max(steom_n_root_cis, n_excited_states+4))
+        {"dmet_steom_auto_max_expand", "1"},               // int: max gauge-triggered fragment-expansion rounds (Phase B)
         {"opt_max_iter", "200"},                           // int: maximum geometry optimization iterations
         {"opt_grad_threshold", "3.0e-4"},                  // real_t: max gradient component (Hartree/Bohr)
         {"opt_rms_grad_threshold", "2.0e-4"},              // real_t: RMS gradient (Hartree/Bohr)

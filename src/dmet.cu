@@ -24,6 +24,7 @@
 #include <numeric>
 #include <tuple>
 #include <map>
+#include <set>
 #include <utility>
 #include <omp.h>
 #include <Eigen/Dense>
@@ -37,6 +38,7 @@
 #endif
 
 #include "dmet.hpp"
+#include "dmet_auto_fragment.hpp"   // CIS-guided auto fragment extraction (dmet_steom_auto_*)
 #include "rhf.hpp"
 #include "eri.hpp"
 #include "eom_chain_context.hpp"   // steom_spatial_orbital (DMET-STEOM, Phase 1)
@@ -908,21 +910,38 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
     std::cout << "\n==== DMET-STEOM-CCSD (Phase 1: single-shot μ=0 embedding) ====" << std::endl;
     std::cout << "  nao=" << nao << " nocc=" << nocc << " num_atoms=" << num_atoms_ << std::endl;
 
-    // Chromophore fragment selection. With explicit --dmet_fragments, fragment 0
-    // is the chromophore (the rest enters via its Schmidt bath; only fragment 0 is
-    // solved). With no fragments, use the whole molecule → full-system reduction.
+    // Chromophore fragment selection. Priority: explicit --dmet_fragments (fragment
+    // 0 is the chromophore; the rest enters via its Schmidt bath) > CIS-guided auto
+    // extraction (dmet_steom_auto_fragment) > whole molecule (full-system reduction).
     DMETFragment chromo;
+    int auto_n_cis_used = 0;   // >0 ⇒ CIS-NTO already computed by auto extraction (reuse below)
     const std::string& spec = rhf_.get_dmet_fragments_str();
-    if (spec.empty() || fragments_.empty()) {
-        std::cout << "  No --dmet_fragments given → whole-molecule cluster "
-                     "(plain STEOM reduction)." << std::endl;
-        chromo.atom_indices.resize(num_atoms_);
-        for (int a = 0; a < num_atoms_; ++a) chromo.atom_indices[a] = a;
+    auto build_chromo_from_atoms = [&](const std::vector<int>& sel_atoms) {
+        chromo = DMETFragment{};
+        chromo.atom_indices = sel_atoms;
         const auto& a2b = rhf_.get_atom_to_basis_range();
-        for (int a = 0; a < num_atoms_; ++a)
+        for (int a : chromo.atom_indices)
             for (size_t mu = a2b[a].start_index; mu < a2b[a].end_index; ++mu)
                 chromo.ao_indices.push_back((int)mu);
         chromo.n_frag = (int)chromo.ao_indices.size();
+    };
+    if (spec.empty() && rhf_.get_dmet_steom_auto_fragment()) {
+        // Excitation-driven fragment: full-system CIS-NTO is hoisted here (before
+        // fragment selection). Its result is cached on rhf_ and reused by the
+        // NTO-bath gauge/augmentation below (no second compute_cis_nto).
+        DMETAutoFragmentResult ar = dmet_steom_auto_extract_fragment(
+            rhf_, eri_method, n_states, num_atoms_, nao, nocc);
+        auto_n_cis_used = ar.n_cis_used;
+        build_chromo_from_atoms(ar.atoms);
+        if ((int)ar.atoms.size() == num_atoms_)
+            std::cout << "  [auto-frag] whole molecule selected → DMET degenerates to plain STEOM."
+                      << std::endl;
+    } else if (spec.empty() || fragments_.empty()) {
+        std::cout << "  No --dmet_fragments given → whole-molecule cluster "
+                     "(plain STEOM reduction)." << std::endl;
+        std::vector<int> all(num_atoms_);
+        std::iota(all.begin(), all.end(), 0);
+        build_chromo_from_atoms(all);
     } else {
         if (fragments_.size() > 1)
             std::cout << "  [DMET-STEOM] " << fragments_.size() << " fragments parsed; "
@@ -968,6 +987,74 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
                 S_half[mu * nao + nu] = vh; S_half[nu * nao + mu] = vh;
                 S_inv_half[mu * nao + nu] = vi; S_inv_half[nu * nao + mu] = vi;
             }
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase B: gauge-triggered fragment expansion (auto mode only). If the bare
+    // Schmidt bath for the extracted fragment does not capture the excitation
+    // (bath-sufficiency gauge ≠ SUFFICIENT), attribute the uncaptured active-NTO
+    // residual to environment atoms and grow the fragment by the top-scoring
+    // atom, then re-gauge — the excitation-driven closed loop. HF/CIS/NTO are
+    // cached (auto extraction, auto_n_cis_used>0); each round rebuilds only the
+    // Schmidt bath. Bounded by dmet_steom_auto_max_expand rounds and the orbital
+    // budget. (η-driven active-space insufficiency is a separate axis — reported
+    // after the solve as an n_cis-increase recommendation, not expanded here.)
+    // ------------------------------------------------------------------------
+    if (auto_n_cis_used > 0 && rhf_.get_dmet_steom_auto_max_expand() > 0
+        && (int)chromo.atom_indices.size() < num_atoms_) {
+        const int max_expand = rhf_.get_dmet_steom_auto_max_expand();
+        int budget = rhf_.get_dmet_steom_auto_budget();
+        if (budget <= 0) budget = (rhf_.get_dmet_cluster_solver() == "dlpno") ? 700 : 460;
+        const auto& a2b = rhf_.get_atom_to_basis_range();
+        for (int round = 1; round <= max_expand; ++round) {
+            std::vector<real_t> C_probe;
+            {   // silence build_bath_orbitals' per-call SVD dump during probing
+                CoutSilencer hush(true);
+                auto probe = build_bath_orbitals(
+                    chromo, h_C, S_inv_half.data(), S_half.data(), nao, nocc);
+                C_probe = std::move(std::get<0>(probe));
+            }
+            if (C_probe.empty()) break;   // fragment already spans the full system
+            const int n_emb_probe = (int)(C_probe.size() / nao);
+            std::vector<char> is_frag(nao, 0);
+            for (int p : chromo.ao_indices) is_frag[p] = 1;
+            DMETBathGaugeResult gg = dmet_steom_bath_gauge(
+                rhf_, S_half.data(), h_C, nao, nocc, num_atoms_,
+                C_probe.data(), n_emb_probe, is_frag);
+            std::cout << "  [DMET-STEOM Phase B] round " << round << "/" << max_expand
+                      << ": " << chromo.atom_indices.size() << " atoms, bath " << gg.verdict
+                      << " (uncaptured=" << std::fixed << std::setprecision(4) << gg.wunc
+                      << ")" << std::defaultfloat << std::endl;
+            if (std::strcmp(gg.verdict, "SUFFICIENT") == 0) break;
+            // Highest-uncaptured environment atom not yet in the fragment.
+            std::set<int> inset(chromo.atom_indices.begin(), chromo.atom_indices.end());
+            int best = -1; double best_s = 0.0;
+            for (int A = 0; A < num_atoms_; ++A)
+                if (!inset.count(A) && gg.atom_uncaptured[A] > best_s) { best_s = gg.atom_uncaptured[A]; best = A; }
+            if (best < 0) {
+                std::cout << "  [DMET-STEOM Phase B] no environment atom carries residual "
+                             "uncaptured character → stop (bath " << gg.verdict << ")." << std::endl;
+                break;
+            }
+            const int add_ao = (int)(a2b[best].end_index - a2b[best].start_index);
+            if (2 * (chromo.n_frag + add_ao) + 30 > budget) {
+                std::cout << "  [DMET-STEOM Phase B] adding atom " << best << " would exceed budget "
+                          << budget << " → stop (bath " << gg.verdict << ", excitation may not be "
+                             "embeddable within budget)." << std::endl;
+                break;
+            }
+            chromo.atom_indices.push_back(best);
+            std::sort(chromo.atom_indices.begin(), chromo.atom_indices.end());
+            chromo.ao_indices.clear();
+            for (int A : chromo.atom_indices)
+                for (size_t mu = a2b[A].start_index; mu < a2b[A].end_index; ++mu)
+                    chromo.ao_indices.push_back((int)mu);
+            chromo.n_frag = (int)chromo.ao_indices.size();
+            std::cout << "  [DMET-STEOM Phase B] expand += atom " << best
+                      << " (residual attribution " << std::fixed << std::setprecision(4) << best_s
+                      << std::defaultfloat << ") → " << chromo.atom_indices.size()
+                      << " atoms, n_frag_ao=" << chromo.n_frag << std::endl;
+        }
     }
 
     // Schmidt bath for the chromophore (μ-independent).
@@ -1021,11 +1108,18 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
         // EOMChainContext) — see eom_chain_context.hpp.
         int n_cis = rhf_.get_steom_n_root_cis();
         if (n_cis <= 0) n_cis = n_states + 4;
+        // Reuse the CIS-NTO already computed by the hoisted auto-fragment extraction
+        // (same n_cis, still cached on rhf_) instead of recomputing it.
+        if (auto_n_cis_used > 0) n_cis = auto_n_cis_used;
         std::cout << "  [DMET-STEOM bath] full-system CIS-NTO (n_cis=" << n_cis
                   << ", leak τ_vir=" << std::scientific << std::setprecision(2) << leak_vir
                   << " τ_occ=" << leak_occ << std::defaultfloat
                   << ") for environment-leakage analysis..." << std::endl;
-        eri_method.compute_cis_nto(n_cis);
+        if (auto_n_cis_used == n_cis && auto_n_cis_used > 0)
+            std::cout << "  [DMET-STEOM bath] reusing hoisted auto-fragment CIS-NTO (no recompute)."
+                      << std::endl;
+        else
+            eri_method.compute_cis_nto(n_cis);
         const CISNTOResult& nto = rhf_.get_cis_nto_result();
         const int nocc_act_full = nto.nocc_active;   // full-system active occupied count
         const int nfz_full      = nto.num_frozen;

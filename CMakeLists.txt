@@ -323,6 +323,7 @@ set(SOURCES
     src/multi_gpu_manager.cu
     src/eri_ri_distributed.cu
     src/dmet.cu
+    src/dmet_auto_fragment.cu
     src/thc_grid.cu
     src/thc_collocation.cu
     src/thc_decomposition.cu
