@@ -634,6 +634,13 @@ distinct from the ground-state `dmet_fragments` above — it is only consulted o
 | dmet_steom_auto_max_expand | Max gauge-triggered fragment-expansion rounds (Phase B) | int | 1 |
 | dmet_steom_auto_focus_states | Build the extraction NTO from only the lowest N CIS roots (0 = average over all n_cis); focuses the fragment on the target π→π*, avoiding n→π* contamination (RI path only) | int | 0 |
 | dmet_steom_auto_json | Path to write per-state per-atom NTO localization as JSON (Phase C: for external state grouping / job splitting); empty = off (RI path only) | string | "" |
+| dmet_steom_auto_xyz | Path to write the auto-selected chromophore fragment as an `.xyz` (paper / visualization); empty = off | string | "" |
+
+The `dmet_steom_auto_json` output is consumed by `script/dmet_steom_group_states.py`, which
+clusters the excited states by where they localize (cosine similarity of the per-atom vectors),
+writes one fragment `.xyz` per spatial group, and emits a separate DMET-STEOM job per group — so
+spatially distinct excitations (e.g. an anthraquinone π→π* and a remote n→π*) are solved in
+independent clean clusters instead of one scattered state-average fragment.
 
 The extraction prints a per-atom NTO weight table, the selected atoms with achieved coverage,
 and warnings when the selection is floor-sensitive, hits the orbital budget, is delocalized

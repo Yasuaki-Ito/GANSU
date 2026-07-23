@@ -1024,6 +1024,9 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
             std::cout << "  [DMET-STEOM Phase B] round " << round << "/" << max_expand
                       << ": " << chromo.atom_indices.size() << " atoms, bath " << gg.verdict
                       << " (uncaptured=" << std::fixed << std::setprecision(4) << gg.wunc
+                      << "; virtual-space tail uncaptured=" << gg.wunc_vir_ext
+                      << " over " << gg.n_vir_ext << " particle NTOs"
+                      << (gg.wunc_vir_ext > gg.wunc_vir + 0.05 ? " ⚠ virtual space truncates the correlating tail" : "")
                       << ")" << std::defaultfloat << std::endl;
             if (std::strcmp(gg.verdict, "SUFFICIENT") == 0) break;
             // Highest-uncaptured environment atom not yet in the fragment.

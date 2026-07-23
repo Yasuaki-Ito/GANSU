@@ -98,6 +98,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"dmet_steom_auto_max_expand", "1"},               // int: max gauge-triggered fragment-expansion rounds (Phase B)
         {"dmet_steom_auto_focus_states", "0"},             // int: build the extraction NTO from only the lowest N CIS roots (0 = state-average over all n_cis). Focuses the fragment on the target (e.g. π→π*) excitation, avoiding n→π* contamination from the full average (RI path only)
         {"dmet_steom_auto_json", ""},                      // string: path to write per-state per-atom NTO localization scores as JSON (Phase C: lets an external driver group states and split jobs). Empty = off. RI path only
+        {"dmet_steom_auto_xyz", ""},                       // string: path to write the auto-selected chromophore fragment as an .xyz (paper / visualization). Empty = off
         {"opt_max_iter", "200"},                           // int: maximum geometry optimization iterations
         {"opt_grad_threshold", "3.0e-4"},                  // real_t: max gradient component (Hartree/Bohr)
         {"opt_rms_grad_threshold", "2.0e-4"},              // real_t: RMS gradient (Hartree/Bohr)

@@ -357,6 +357,28 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
                       << " regions (e.g. donor…acceptor) — expected for charge-transfer." << std::endl;
     }
 
+    // ---- Write the selected chromophore fragment as .xyz (optional) --------
+    // Paper / visualization: the auto-extracted fragment geometry in Ångström.
+    const std::string& xyz_path = rhf.get_dmet_steom_auto_xyz();
+    if (!xyz_path.empty()) {
+        const double bohr2ang = 1.0 / 1.8897259886;
+        std::ofstream fx(xyz_path);
+        fx << out.atoms.size() << "\n"
+           << "DMET-STEOM auto-selected chromophore fragment (coverage="
+           << std::fixed << std::setprecision(4) << out.coverage << ", "
+           << out.atoms.size() << " atoms)\n";
+        for (int A : out.atoms) {
+            const auto& c = atoms[A].coordinate;
+            fx << std::setw(2) << atomic_number_to_element_name(atoms[A].atomic_number)
+               << " " << std::setw(14) << std::setprecision(8) << c.x * bohr2ang
+               << " " << std::setw(14) << c.y * bohr2ang
+               << " " << std::setw(14) << c.z * bohr2ang << "\n";
+        }
+        fx.close();
+        std::cout << "  [auto-frag] wrote selected fragment geometry → " << xyz_path
+                  << " (" << out.atoms.size() << " atoms)." << std::endl;
+    }
+
     // ---- Phase C: per-state per-atom localization JSON (optional) ----------
     // For each CIS root n, s_A^(n) = Σ_ia |C^n_ia|² (pop_occ_A(i) + pop_vir_A(a))
     // — where the excitation lives per atom, per state. An external driver reads
@@ -390,6 +412,14 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
             js << "{\n  \"n_states\": " << n_have << ",\n  \"num_atoms\": " << num_atoms << ",\n";
             js << "  \"elements\": [";
             for (int A = 0; A < num_atoms; ++A) js << (A ? "," : "") << "\"" << atomic_number_to_element_name(atoms[A].atomic_number) << "\"";
+            js << "],\n";
+            const double bohr2ang = 1.0 / 1.8897259886;
+            js << "  \"coords_angstrom\": [";
+            for (int A = 0; A < num_atoms; ++A) {
+                const auto& c = atoms[A].coordinate;
+                js << (A ? "," : "") << "[" << std::fixed << std::setprecision(6)
+                   << c.x * bohr2ang << "," << c.y * bohr2ang << "," << c.z * bohr2ang << "]";
+            }
             js << "],\n  \"per_state\": [\n";
             for (int n = 0; n < n_have; ++n) {
                 const real_t* C = amp.data() + (size_t)n * per;
@@ -512,6 +542,27 @@ DMETBathGaugeResult dmet_steom_bath_gauge(
     g.wunc_occ = sw_occ > 0.0 ? swu_occ / sw_occ : 0.0;
     g.wunc     = std::max(g.wunc_vir, g.wunc_occ);   // η-aligned (worse side)
     g.verdict  = g.wunc < 0.02 ? "SUFFICIENT" : g.wunc < 0.10 ? "MARGINAL" : "INSUFFICIENT";
+
+    // Virtual-space sufficiency: extend the particle scan past the active set to
+    // occupation 1e-4 (the correlating tail). Capture-only (no atom attribution).
+    const double ext_floor = 1e-4;
+    int n_ext = 0;
+    for (int a = 0; a < nvir && a < (int)nto.nto_vir_occupations.size(); ++a)
+        if ((double)nto.nto_vir_occupations[a] > ext_floor) ++n_ext;
+    double sw_ext = 0.0, swu_ext = 0.0;
+    for (int k = 0; k < n_ext; ++k) {
+        const double w = (double)nto.nto_vir_occupations[k];
+        std::vector<double> phi = build_nto(false, k);
+        double cap = 0.0;
+        for (int p = 0; p < n_emb; ++p) {
+            double d = 0.0;
+            for (int mu = 0; mu < nao; ++mu) d += C_emb_lo[(size_t)mu * n_emb + p] * phi[mu];
+            cap += d * d;
+        }
+        sw_ext += w; swu_ext += w * std::max(0.0, 1.0 - cap);
+    }
+    g.wunc_vir_ext = sw_ext > 0.0 ? swu_ext / sw_ext : 0.0;
+    g.n_vir_ext    = n_ext;
     return g;
 }
 

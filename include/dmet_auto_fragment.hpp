@@ -85,6 +85,16 @@ struct DMETBathGaugeResult {
     double wunc_occ = 0.0;
     const char* verdict = "SUFFICIENT";     ///< "SUFFICIENT" (<0.02) / "MARGINAL" (<0.10) / "INSUFFICIENT"
     std::vector<double> atom_uncaptured;    ///< [num_atoms] environment residual attribution
+    // Virtual-space sufficiency (extended particle coverage). The gauge above
+    // weights only the leading ACTIVE particle NTOs; this extends the scan down
+    // to occupation 1e-4 so the correlating particle TAIL is included. A tail
+    // uncaptured markedly above the active one flags a cluster that spans the
+    // leading excitation but truncates the virtual (particle) space it needs —
+    // a genuine virtual-space deficiency. (It does NOT catch the mean-field
+    // embedding error that blueshifts fully-delocalized excitations even when
+    // both active and tail coverage are high — that is outside DMET's domain.)
+    double wunc_vir_ext = 0.0;              ///< occupation-weighted uncaptured over the extended virtual-NTO tail
+    int    n_vir_ext    = 0;                ///< number of virtual NTOs in the extended set (occupation > 1e-4)
 };
 
 DMETBathGaugeResult dmet_steom_bath_gauge(
