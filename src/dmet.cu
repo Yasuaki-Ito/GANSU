@@ -1004,7 +1004,7 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
         && (int)chromo.atom_indices.size() < num_atoms_) {
         const int max_expand = rhf_.get_dmet_steom_auto_max_expand();
         int budget = rhf_.get_dmet_steom_auto_budget();
-        if (budget <= 0) budget = (rhf_.get_dmet_cluster_solver() == "dlpno") ? 700 : 460;
+        if (budget <= 0) budget = dmet_steom_default_budget(rhf_);
         const auto& a2b = rhf_.get_atom_to_basis_range();
         for (int round = 1; round <= max_expand; ++round) {
             std::vector<real_t> C_probe;

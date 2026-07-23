@@ -60,6 +60,12 @@ struct DMETAutoFragmentResult {
 /// @param num_atoms  Atom count.
 /// @param nao        Number of AO basis functions.
 /// @param nocc       Number of occupied MOs (full system).
+/// Default cluster orbital budget (est. n_emb ceiling) when dmet_steom_auto_budget
+/// is 0. dlpno cluster solver → 700, canonical → 460 (measured ceilings). Honors
+/// both the --dmet_cluster_solver parameter and the GANSU_DMET_STEOM_DLPNO=2 env
+/// override (the production scripts select the dlpno solver via the env).
+int dmet_steom_default_budget(const RHF& rhf);
+
 DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
     RHF& rhf, ERI& eri, int n_states, int num_atoms, int nao, int nocc);
 

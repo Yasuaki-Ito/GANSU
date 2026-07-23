@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <cstdlib>   // std::getenv
 #include <vector>
 #include <set>
 #include <Eigen/Dense>
@@ -111,6 +112,12 @@ int connected_components(const std::vector<int>& atoms, const Atoms& all,
 
 } // anonymous namespace
 
+int dmet_steom_default_budget(const RHF& rhf) {
+    bool dlpno = (rhf.get_dmet_cluster_solver() == "dlpno");
+    if (const char* e = std::getenv("GANSU_DMET_STEOM_DLPNO")) if (e[0] == '2') dlpno = true;
+    return dlpno ? 700 : 460;
+}
+
 DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
     RHF& rhf, ERI& eri, int n_states, int num_atoms, int nao, int nocc)
 {
@@ -121,8 +128,7 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
     const double floor      = rhf.get_dmet_steom_auto_atom_floor();
     const bool   include_h  = rhf.get_dmet_steom_auto_include_h();
     int          budget     = rhf.get_dmet_steom_auto_budget();
-    if (budget <= 0)
-        budget = (rhf.get_dmet_cluster_solver() == "dlpno") ? 700 : 460;
+    if (budget <= 0) budget = dmet_steom_default_budget(rhf);
 
     int n_cis = rhf.get_dmet_steom_auto_n_cis();
     if (n_cis <= 0) {
