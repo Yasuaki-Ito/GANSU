@@ -29,6 +29,8 @@
 #include <cstdlib>   // std::getenv
 #include <vector>
 #include <set>
+#include <fstream>   // per-state JSON (Phase C)
+#include <string>
 #include <Eigen/Dense>
 
 #include "dmet_auto_fragment.hpp"
@@ -144,7 +146,44 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
 
     // ---- Full-system state-averaged CIS-NTO (cached on rhf for reuse) ------
     eri.compute_cis_nto(n_cis);
-    const CISNTOResult& nto = rhf.get_cis_nto_result();
+
+    // Optionally FOCUS the extraction NTO on the lowest `focus_states` CIS roots
+    // (0/1 per-state weights) instead of averaging over all n_cis. The full
+    // state-average mixes π→π* with n→π*; for a molecule with low-lying lone-pair
+    // excitations (e.g. dox: extra carbonyl oxygens outrank the ring carbons in the
+    // average) this pulls the wrong atoms into the fragment. Focusing on the target
+    // (lowest, typically the bright π→π*) states cleans the chromophore. The cached
+    // state-averaged NTO on rhf is left untouched (the downstream NTO-bath gauge/
+    // augmentation still uses the full average). RI path only (needs stashed amps).
+    CISNTOResult focused;
+    bool use_focused = false;
+    const int focus = rhf.get_dmet_steom_auto_focus_states();
+    if (focus > 0) {
+        const CISNTOResult& savg = rhf.get_cis_nto_result();
+        const std::vector<real_t>& amp = rhf.get_last_cis_amplitudes();
+        const int noa = savg.nocc_active, nvr = savg.nvir, nfzc = savg.num_frozen;
+        const size_t per = (size_t)noa * nvr;
+        const int n_have = (per > 0) ? (int)(amp.size() / per) : 0;
+        if (n_have <= 0) {
+            std::cout << "  [auto-frag] focus_states=" << focus << " set but no stashed CIS "
+                         "amplitudes (non-RI path?) → using state-averaged NTO." << std::endl;
+        } else {
+            const int nf = std::min(focus, n_have);
+            std::vector<real_t> w(n_have, 0.0);
+            for (int n = 0; n < nf; ++n) w[n] = 1.0;
+            CISNTOActiveSpace::Params p;
+            p.o_thresh = (real_t)rhf.get_cis_nto_o_thresh();
+            p.v_thresh = (real_t)rhf.get_cis_nto_v_thresh();
+            p.verbose  = 0;
+            p.weights  = w;
+            focused = CISNTOActiveSpace::compute(amp.data(), n_have, noa, nvr, nfzc, p);
+            use_focused = true;
+            std::cout << "  [auto-frag] focusing extraction on the lowest " << nf
+                      << " CIS root(s): n_act_occ " << savg.n_act_occ << "→" << focused.n_act_occ
+                      << ", n_act_vir " << savg.n_act_vir << "→" << focused.n_act_vir << std::endl;
+        }
+    }
+    const CISNTOResult& nto = use_focused ? focused : rhf.get_cis_nto_result();
     const int nocc_act = nto.nocc_active;
     const int nfz      = nto.num_frozen;
     const int nvir     = nto.nvir;
@@ -316,6 +355,68 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
         else if (out.n_components > 1)
             std::cout << "  [auto-frag] note: selected atoms span " << out.n_components
                       << " regions (e.g. donor…acceptor) — expected for charge-transfer." << std::endl;
+    }
+
+    // ---- Phase C: per-state per-atom localization JSON (optional) ----------
+    // For each CIS root n, s_A^(n) = Σ_ia |C^n_ia|² (pop_occ_A(i) + pop_vir_A(a))
+    // — where the excitation lives per atom, per state. An external driver reads
+    // this to cluster states by cosine similarity and split them into separate
+    // fragment jobs (the dox case where the state-average scatters over regions).
+    const std::string& json_path = rhf.get_dmet_steom_auto_json();
+    if (!json_path.empty()) {
+        const std::vector<real_t>& amp = rhf.get_last_cis_amplitudes();
+        const size_t per = (size_t)nocc_act * nvir;
+        const int n_have = (per > 0) ? (int)(amp.size() / per) : 0;
+        if (n_have <= 0) {
+            std::cout << "  [auto-frag] dmet_steom_auto_json set but no stashed CIS amplitudes "
+                         "(non-RI path?) → skipping JSON." << std::endl;
+        } else {
+            // Per-atom Löwdin populations of the active-occ / virtual MOs.
+            std::vector<std::vector<double>> pop_occ(num_atoms, std::vector<double>(nocc_act, 0.0));
+            std::vector<std::vector<double>> pop_vir(num_atoms, std::vector<double>(nvir, 0.0));
+            for (int A = 0; A < num_atoms; ++A) {
+                for (int i = 0; i < nocc_act; ++i) {
+                    double s = 0.0;
+                    for (size_t mu = a2b[A].start_index; mu < a2b[A].end_index; ++mu) s += Cocc_lo((int)mu, i) * Cocc_lo((int)mu, i);
+                    pop_occ[A][i] = s;
+                }
+                for (int a = 0; a < nvir; ++a) {
+                    double s = 0.0;
+                    for (size_t mu = a2b[A].start_index; mu < a2b[A].end_index; ++mu) s += Cvir_lo((int)mu, a) * Cvir_lo((int)mu, a);
+                    pop_vir[A][a] = s;
+                }
+            }
+            std::ofstream js(json_path);
+            js << "{\n  \"n_states\": " << n_have << ",\n  \"num_atoms\": " << num_atoms << ",\n";
+            js << "  \"elements\": [";
+            for (int A = 0; A < num_atoms; ++A) js << (A ? "," : "") << "\"" << atomic_number_to_element_name(atoms[A].atomic_number) << "\"";
+            js << "],\n  \"per_state\": [\n";
+            for (int n = 0; n < n_have; ++n) {
+                const real_t* C = amp.data() + (size_t)n * per;
+                std::vector<double> hole(nocc_act, 0.0), part(nvir, 0.0);
+                for (int i = 0; i < nocc_act; ++i)
+                    for (int a = 0; a < nvir; ++a) {
+                        const double c2 = (double)C[(size_t)i * nvir + a] * C[(size_t)i * nvir + a];
+                        hole[i] += c2; part[a] += c2;
+                    }
+                std::vector<double> s_atom(num_atoms, 0.0);
+                double tot = 0.0;
+                for (int A = 0; A < num_atoms; ++A) {
+                    double s = 0.0;
+                    for (int i = 0; i < nocc_act; ++i) s += hole[i] * pop_occ[A][i];
+                    for (int a = 0; a < nvir; ++a) s += part[a] * pop_vir[A][a];
+                    s_atom[A] = s; tot += s;
+                }
+                if (tot > 0.0) for (double& v : s_atom) v /= tot;
+                js << "    {\"state\": " << n << ", \"atom_scores\": [";
+                for (int A = 0; A < num_atoms; ++A) { js << (A ? "," : ""); js << std::fixed << std::setprecision(5) << s_atom[A]; }
+                js << "]}" << (n + 1 < n_have ? "," : "") << "\n";
+            }
+            js << "  ]\n}\n";
+            js.close();
+            std::cout << "  [auto-frag] wrote per-state per-atom localization → " << json_path
+                      << " (" << n_have << " states × " << num_atoms << " atoms) for external grouping (Phase C)." << std::endl;
+        }
     }
 
     return out;

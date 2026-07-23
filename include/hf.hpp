@@ -272,6 +272,8 @@ public:
     bool   get_dmet_steom_auto_include_h()  const { return dmet_steom_auto_include_h_; }
     int    get_dmet_steom_auto_n_cis()      const { return dmet_steom_auto_n_cis_; }
     int    get_dmet_steom_auto_max_expand() const { return dmet_steom_auto_max_expand_; }
+    int    get_dmet_steom_auto_focus_states() const { return dmet_steom_auto_focus_states_; }
+    const std::string& get_dmet_steom_auto_json() const { return dmet_steom_auto_json_; }
     /// Geometry optimization parameters (used in optimize_geometry path)
     int get_opt_max_iter() const { return opt_max_iter_; }
     double get_opt_grad_threshold() const { return opt_grad_threshold_; }
@@ -687,6 +689,8 @@ protected:
     bool   dmet_steom_auto_include_h_  = false;  ///< attach bonded H to selected heavy atoms
     int    dmet_steom_auto_n_cis_      = 0;      ///< CIS state count for extraction (0 = auto)
     int    dmet_steom_auto_max_expand_ = 1;      ///< max gauge-triggered expansion rounds (Phase B)
+    int    dmet_steom_auto_focus_states_ = 0;    ///< extract NTO from lowest N CIS roots (0 = state-average all)
+    std::string dmet_steom_auto_json_;           ///< path to write per-state per-atom scores (Phase C); empty = off
     int opt_max_iter_ = 200;    ///< Geometry optimization max iterations
     double opt_grad_threshold_ = 3.0e-4;
     double opt_rms_grad_threshold_ = 2.0e-4;

@@ -135,6 +135,8 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     dmet_steom_auto_include_h_  = parameters.get<bool>("dmet_steom_auto_include_h");
     dmet_steom_auto_n_cis_      = parameters.get<int>("dmet_steom_auto_n_cis");
     dmet_steom_auto_max_expand_ = parameters.get<int>("dmet_steom_auto_max_expand");
+    dmet_steom_auto_focus_states_ = parameters.get<int>("dmet_steom_auto_focus_states");
+    dmet_steom_auto_json_       = parameters.get<std::string>("dmet_steom_auto_json");
     opt_max_iter_ = parameters.get<int>("opt_max_iter");
     opt_grad_threshold_ = parameters.get<double>("opt_grad_threshold");
     opt_rms_grad_threshold_ = parameters.get<double>("opt_rms_grad_threshold");
