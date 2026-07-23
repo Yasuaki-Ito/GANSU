@@ -429,17 +429,24 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
                         const double c2 = (double)C[(size_t)i * nvir + a] * C[(size_t)i * nvir + a];
                         hole[i] += c2; part[a] += c2;
                     }
-                std::vector<double> s_atom(num_atoms, 0.0);
+                // Separate hole (occupied) and particle (virtual) per-atom weight
+                // so a charge-transfer state (hole on the donor, particle on the
+                // acceptor) is visible as spatially disjoint hole/particle regions.
+                std::vector<double> s_hole(num_atoms, 0.0), s_part(num_atoms, 0.0), s_atom(num_atoms, 0.0);
                 double tot = 0.0;
                 for (int A = 0; A < num_atoms; ++A) {
-                    double s = 0.0;
-                    for (int i = 0; i < nocc_act; ++i) s += hole[i] * pop_occ[A][i];
-                    for (int a = 0; a < nvir; ++a) s += part[a] * pop_vir[A][a];
-                    s_atom[A] = s; tot += s;
+                    double sh = 0.0, sp = 0.0;
+                    for (int i = 0; i < nocc_act; ++i) sh += hole[i] * pop_occ[A][i];
+                    for (int a = 0; a < nvir; ++a)     sp += part[a] * pop_vir[A][a];
+                    s_hole[A] = sh; s_part[A] = sp; s_atom[A] = sh + sp; tot += sh + sp;
                 }
-                if (tot > 0.0) for (double& v : s_atom) v /= tot;
+                if (tot > 0.0) for (int A = 0; A < num_atoms; ++A) { s_hole[A] /= tot; s_part[A] /= tot; s_atom[A] /= tot; }
                 js << "    {\"state\": " << n << ", \"atom_scores\": [";
                 for (int A = 0; A < num_atoms; ++A) { js << (A ? "," : ""); js << std::fixed << std::setprecision(5) << s_atom[A]; }
+                js << "], \"hole_scores\": [";
+                for (int A = 0; A < num_atoms; ++A) { js << (A ? "," : ""); js << std::setprecision(5) << s_hole[A]; }
+                js << "], \"part_scores\": [";
+                for (int A = 0; A < num_atoms; ++A) { js << (A ? "," : ""); js << std::setprecision(5) << s_part[A]; }
                 js << "]}" << (n + 1 < n_have ? "," : "") << "\n";
             }
             js << "  ]\n}\n";

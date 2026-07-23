@@ -127,6 +127,19 @@ def main():
     vectors = [s["atom_scores"] for s in per_state]
     n_atoms = d["num_atoms"]
 
+    def top_atoms(v, k=3):
+        o = sorted(range(len(v)), key=lambda i: -v[i])[:k]
+        return "+".join(f"{i}{elements[i]}" for i in o if v[i] > 0.03)
+
+    # Charge-transfer character per state: hole (occupied) vs particle (virtual)
+    # per-atom weight. A low hole–particle cosine means the excitation moves charge
+    # between spatially disjoint regions (donor -> acceptor).
+    ct_info = {}
+    if per_state and "hole_scores" in per_state[0]:
+        for s in per_state:
+            c = cosine(s["hole_scores"], s["part_scores"])
+            ct_info[s["state"]] = (c < 0.5, c, top_atoms(s["hole_scores"]), top_atoms(s["part_scores"]))
+
     # Geometry: prefer coordinates embedded in the JSON, else read the .xyz.
     comment = "fragment"
     if "coords_angstrom" in d:
@@ -158,6 +171,13 @@ def main():
         summary.append((gi, states, idx, cum, sig_str))
         print(f"#  group {gi}: states {states} -> {len(idx)} atoms "
               f"({sig_str}, coverage {cum:.3f}): {brace_spec(idx)}")
+        if ct_info:
+            ct_states = [s for s in states if ct_info.get(s, (False,))[0]]
+            if ct_states:
+                s0 = ct_states[0]
+                _, c, don, acc = ct_info[s0]
+                print(f"#    charge-transfer states {ct_states}: donor {don} -> acceptor {acc} "
+                      f"(state {s0} hole-particle cos {c:.2f})")
 
         if atoms is not None:
             xyz_path = os.path.join(args.outdir, f"fragment_{gi}.xyz")
