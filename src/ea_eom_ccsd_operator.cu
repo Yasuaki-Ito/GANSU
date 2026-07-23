@@ -773,6 +773,66 @@ __global__ void ea_ccfvv_buildB(real_t* __restrict__ dB,
         dB[y] = 2.0*kcld - kdlc;
     }
 }
+// (EA PNO-lean, 2026-07-21) Per-occupied-k variants of the four ovov-reading
+// GEMM-input builders above. In lean mode the dense d_eri_ovov_ is never
+// materialised; the SAME output buffers are filled from a per-k device slice
+// ovov_k = (k a|j b) [NV·NO·NV] built from B (bitwise-equal to the elided
+// d_eri_ovov_[k·NV·NO·NV]). Identical arithmetic on identical inputs → the
+// downstream GEMMs (unchanged) are bit-identical (mirrors the IP *_k set).
+__global__ void ea_ctovov_buildA_k(real_t* __restrict__ dA,
+                                   const real_t* __restrict__ ovov_k, int NO, int NV, int k) {
+    // dA[(k,d),(c,l)] = ovov[k,c,l,d] for the fixed k;  enumerate (d,c,l)
+    const size_t tot = (size_t)NV*NV*NO, KOcl = (size_t)NV*NO;
+    for (size_t i = (size_t)blockIdx.x*blockDim.x + threadIdx.x; i < tot;
+         i += (size_t)gridDim.x*blockDim.x) {
+        const int l = (int)(i % NO); size_t t = i / NO;
+        const int c = (int)(t % NV); const int d = (int)(t / NV);
+        dA[((size_t)(k*NV+d))*KOcl + (c*NO+l)] = ovov_k[((size_t)c*NO+l)*NV+d];
+    }
+}
+__global__ void ea_ctovvo_buildA12_k(real_t* __restrict__ dA1, real_t* __restrict__ dA2,
+                                     const real_t* __restrict__ ovov_k, int NO, int NV, int k) {
+    // dA1[(k,c),(l,d)] = 2·ovov[k,c,l,d] − ovov[k,d,l,c];  dA2 = ovov[k,c,l,d];  fixed k
+    const size_t tot = (size_t)NV*NO*NV, Nld = (size_t)NO*NV;
+    for (size_t i = (size_t)blockIdx.x*blockDim.x + threadIdx.x; i < tot;
+         i += (size_t)gridDim.x*blockDim.x) {
+        const int d = (int)(i % NV); size_t t = i / NV;
+        const int l = (int)(t % NO); const int c = (int)(t / NO);
+        const real_t kcld = ovov_k[((size_t)c*NO+l)*NV+d];
+        const size_t o = ((size_t)(k*NV+c))*Nld + (l*NV+d);
+        if (dA1) {
+            const real_t kdlc = ovov_k[((size_t)d*NO+l)*NV+c];
+            dA1[o] = 2.0*kcld - kdlc;
+        }
+        if (dA2) dA2[o] = kcld;
+    }
+}
+__global__ void ea_ccfoo_buildA_k(real_t* __restrict__ dA,
+                                  const real_t* __restrict__ ovov_k, int NO, int NV, int k) {
+    // dA[k*Kf + (l*NV+c)*NV+d] = 2 ovov[k,c,l,d] − ovov[k,d,l,c];  fixed k, enumerate (l,c,d)
+    const size_t Kf = (size_t)NO*NV*NV;
+    for (size_t m = (size_t)blockIdx.x*blockDim.x + threadIdx.x; m < Kf;
+         m += (size_t)gridDim.x*blockDim.x) {
+        const int d = (int)(m % NV); size_t t = m / NV;
+        const int c = (int)(t % NV); const int l = (int)(t / NV);
+        const real_t kcld = ovov_k[((size_t)c*NO+l)*NV+d];
+        const real_t kdlc = ovov_k[((size_t)d*NO+l)*NV+c];
+        dA[(size_t)k*Kf + m] = 2.0*kcld - kdlc;
+    }
+}
+__global__ void ea_ccfvv_buildB_k(real_t* __restrict__ dB,
+                                  const real_t* __restrict__ ovov_k, int NO, int NV, int k) {
+    // dB[((k*NO+l)*NV+d)*NV + c] = 2 ovov[k,c,l,d] − ovov[k,d,l,c];  fixed k, enumerate (l,d,c)
+    const size_t tot = (size_t)NO*NV*NV;
+    for (size_t m = (size_t)blockIdx.x*blockDim.x + threadIdx.x; m < tot;
+         m += (size_t)gridDim.x*blockDim.x) {
+        const int c = (int)(m % NV); size_t t = m / NV;
+        const int d = (int)(t % NV); const int l = (int)(t / NV);
+        const real_t kcld = ovov_k[((size_t)c*NO+l)*NV+d];
+        const real_t kdlc = ovov_k[((size_t)d*NO+l)*NV+c];
+        dB[((size_t)k*NO + l)*NV*NV + (size_t)d*NV + c] = 2.0*kcld - kdlc;
+    }
+}
 
 // ---- canonical-skip wvvvo_w_t1 device-resident scatter (Term A/B/C/D) ----
 // Accumulate coeff·src into wt1[a,b,c,j] (= ((a*NV+b)*NV+c)*NO+j), reading the
@@ -1045,6 +1105,24 @@ EAEOMCCSDOperator::EAEOMCCSDOperator(
         if (ri_vvvv_term_a_)
             std::cout << "  [EA-EOM RI-Term-A] Wvvvo·t1 via RI B-factors "
                          "(d_eri_vvvv nvir⁴ not materialised)" << std::endl;
+        // (EA PNO-lean, 2026-07-21 — mirrors the IP lean_raw_blocks_) Under the
+        // production native-bare σ the canonical apply() never runs, so the three
+        // raw nocc²·nvir² blocks (ovov/oovv/ovvo — the decacene EA extract OOM
+        // site, 3×25.7 GB) are pure build-time inputs. Elide their dense allocs
+        // at extract; build_dressed rebuilds ovov TRANSIENTLY (bytes identical →
+        // whole build unchanged → bit-identical) and frees it at build end,
+        // oovv/ovvo become per-k host mirrors, and ovov persists as a host
+        // mirror the native operator borrows (T_tmp). GANSU_EA_PNO_LEAN=0,
+        // BUILD_VALIDATE or GANSU_EA_KEEP_RAW_BLOCKS force the dense path.
+        lean_raw_blocks_ = (eri_block_src_ != nullptr) && gpu::gpu_available()
+            && on("GANSU_DLPNO_NATIVE_EOM", false)
+            && on("GANSU_DLPNO_NATIVE_DRESSED", true)
+            && on("GANSU_DLPNO_NATIVE_RING", true)
+            && on("GANSU_DLPNO_NATIVE_BARE", true)
+            && on("GANSU_DLPNO_CANONICAL_SKIP", true)
+            && on("GANSU_EA_PNO_LEAN", true)
+            && !std::getenv("GANSU_STEOM_BUILD_VALIDATE")
+            && !std::getenv("GANSU_EA_KEEP_RAW_BLOCKS");
     }
     // Ship 12: vvvv slab mode requires canonical-skip ON.  The legacy
     // non-skip code path D2H's d_eri_vvvv_ (nullptr in slab mode) and reads
@@ -1392,7 +1470,8 @@ void EAEOMCCSDOperator::setup_multi_gpu() {
             repl(&w.d_Wvvvv, d_Wvvvv_, vvvv_sz);
         // else: canonical-skip → canonical σ2 not invoked, replica unused
         repl(&w.d_t2,    d_t2_,    t2_sz);
-        repl(&w.d_eri_ovov, d_eri_ovov_, ovov_sz);
+        // (lean) raw ovov freed after build — canonical σ never runs there.
+        if (d_eri_ovov_) repl(&w.d_eri_ovov, d_eri_ovov_, ovov_sz); else w.d_eri_ovov = nullptr;
         repl(&w.d_M_ringA, d_M_ringA_, ovov_sz);
         repl(&w.d_M_ringB, d_M_ringB_, ovov_sz);
         repl(&w.d_M_ringC, d_M_ringC_, ovov_sz);
@@ -1480,12 +1559,24 @@ void EAEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
     const size_t ovvv_sz = (size_t)nocc * nvir * nvir * nvir;
     const size_t vvvv_sz = (size_t)nvir * nvir * nvir * nvir;
 
+    // (EA PNO-lean) native-bare: skip the dense device ovov/oovv/ovvo (3×nocc²·
+    // nvir², the decacene extract OOM site) AND ovvv (nocc·nvir³ = 176 GB at
+    // nvir=612). build_dressed rebuilds ovov transiently + the host mirrors per
+    // occupied k from B slices; every ovvv consumer already has the h_ovvv
+    // l-slab path keyed on d_eri_ovvv_ == nullptr (the C2 machinery).
+    if (lean_raw_blocks_)
+        std::cout << "  [EA-EOM lean] raw ovov/oovv/ovvo/ovvv dense device blocks "
+                     "ELIDED (native-bare; per-k B tiles + host mirrors feed the "
+                     "build; canonical σ is delegated to the native operator)."
+                  << std::endl;
     tracked_cudaMalloc(&d_eri_oooo_, oooo_sz * sizeof(real_t));
     tracked_cudaMalloc(&d_eri_ooov_, ooov_sz * sizeof(real_t));
-    tracked_cudaMalloc(&d_eri_ovov_, ovov_sz * sizeof(real_t));
-    tracked_cudaMalloc(&d_eri_oovv_, oovv_sz * sizeof(real_t));
-    tracked_cudaMalloc(&d_eri_ovvo_, ovvo_sz * sizeof(real_t));
-    tracked_cudaMalloc(&d_eri_ovvv_, ovvv_sz * sizeof(real_t));
+    if (!lean_raw_blocks_) {
+        tracked_cudaMalloc(&d_eri_ovov_, ovov_sz * sizeof(real_t));
+        tracked_cudaMalloc(&d_eri_oovv_, oovv_sz * sizeof(real_t));
+        tracked_cudaMalloc(&d_eri_ovvo_, ovvo_sz * sizeof(real_t));
+        tracked_cudaMalloc(&d_eri_ovvv_, ovvv_sz * sizeof(real_t));
+    }
     // Ship 12: in slab mode d_eri_vvvv_ stays null; each device owns its
     // slab via d_eri_vvvv_slabs_[d] allocated below in the P4b branch.
     // (RI Term A) skip the nvir⁴ alloc entirely when Wvvvo·t1 is evaluated from
@@ -1508,10 +1599,12 @@ void EAEOMCCSDOperator::extract_eri_blocks(const real_t* d_eri_mo) {
         const int O = frozen_off_;
         eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         O,nocc,O,nocc,           d_eri_oooo_); // (ij|kl)
         eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         O,nocc,nocc+O,nvir,      d_eri_ooov_); // (ji|kb)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    O,nocc,nocc+O,nvir,      d_eri_ovov_); // (ia|jb)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         nocc+O,nvir,nocc+O,nvir, d_eri_oovv_); // (ij|ab)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,O,nocc,      d_eri_ovvo_); // (ia|bj)
-        eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,nocc+O,nvir, d_eri_ovvv_); // (ia|bc)
+        if (!lean_raw_blocks_) {
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    O,nocc,nocc+O,nvir,      d_eri_ovov_); // (ia|jb)
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,O,nocc,         nocc+O,nvir,nocc+O,nvir, d_eri_oovv_); // (ij|ab)
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,O,nocc,      d_eri_ovvo_); // (ia|bj)
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M, O,nocc,nocc+O,nvir,    nocc+O,nvir,nocc+O,nvir, d_eri_ovvv_); // (ia|bc)
+        }
 
         // Ship 12: in slab mode the d_eri_vvvv slabs are already allocated
         // and populated by the driver (compute_ea_eom_ccsd_impl) before this
@@ -1672,7 +1765,13 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     };
 
     std::vector<real_t> h_t1(t1_sz), h_t2(t2_sz);
-    std::vector<real_t> h_ovov(ovov_sz), h_ooov(ooov_sz), h_oovv(oovv_sz);
+    // (EA PNO-lean) h_ovov persists as the member mirror when the raw device
+    // block was elided — the native operator borrows it (T_tmp seed) after this
+    // build. Other modes keep the function-local vector.
+    std::vector<real_t> h_ovov_local, h_ooov(ooov_sz), h_oovv(oovv_sz);
+    if (lean_raw_blocks_) h_ovov_mirror_.assign(ovov_sz, 0.0);
+    else                  h_ovov_local.assign(ovov_sz, 0.0);
+    std::vector<real_t>& h_ovov = lean_raw_blocks_ ? h_ovov_mirror_ : h_ovov_local;
     std::vector<real_t> h_ovvo(ovvo_sz), h_ovvv(ovvv_sz);
     // Ship 12: in slab mode the bare vvvv tensor lives in per-device device
     // buffers (d_eri_vvvv_slabs_); the only consumer that needs h_vvvv (host)
@@ -1693,13 +1792,93 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     std::vector<real_t> h_vvvv;
     if (need_h_vvvv) h_vvvv.assign(vvvv_sz, 0.0);
 
+    // (EA PNO-lean) per-k ovov slice pump: builds the (O+k,1)|v|o|v slice
+    // (k a|j b) [NV·NO·NV] on device from B — bitwise-equal to the elided
+    // d_eri_ovov_[k·NV·NO·NV] — and hands it to fn(k, d_slice). Serves the
+    // host-mirror rebuild AND the per-k GEMM-input builders (mirrors the IP
+    // lean_ovov_slices; the dense block is NEVER materialised, which is what
+    // lets the ct-cluster scratch fit at decacene scale).
+    auto lean_ovov_slices = [&](auto&& fn) {
+#ifndef GANSU_CPU_ONLY
+        const int M = nmo_full_, O = frozen_off_;
+        real_t* d_ovov_k = nullptr;
+        tracked_cudaMalloc(&d_ovov_k, (size_t)NV * NO * NV * sizeof(real_t));
+        for (int k = 0; k < NO; ++k) {
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M,
+                O + k, 1, NO + O, NV, O, NO, NO + O, NV, d_ovov_k);
+            fn(k, d_ovov_k);
+        }
+        tracked_cudaFree(d_ovov_k);
+#else
+        (void)fn;
+#endif
+    };
     cudaMemcpy(h_t1.data(),   d_t1_,        t1_sz   * sizeof(real_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_t2.data(),   d_t2_,        t2_sz   * sizeof(real_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ovov.data(), d_eri_ovov_,  ovov_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    if (d_eri_ovov_) {
+        cudaMemcpy(h_ovov.data(), d_eri_ovov_,  ovov_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    } else {
+        // (lean) rebuild the ovov host mirror per occupied k (dense elided);
+        // persists as h_ovov_mirror_ for the native T_tmp borrow.
+        lean_ovov_slices([&](int k, const real_t* d_k){
+            cudaMemcpy(h_ovov.data() + (size_t)k * NV * NO * NV, d_k,
+                       (size_t)NV * NO * NV * sizeof(real_t), cudaMemcpyDeviceToHost);
+        });
+    }
     cudaMemcpy(h_ooov.data(), d_eri_ooov_,  ooov_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_oovv.data(), d_eri_oovv_,  oovv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ovvo.data(), d_eri_ovvo_,  ovvo_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ovvv.data(), d_eri_ovvv_,  ovvv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    if (d_eri_oovv_) {
+        cudaMemcpy(h_oovv.data(), d_eri_oovv_,  oovv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    } else {
+#ifndef GANSU_CPU_ONLY
+        // (lean) per-k host mirror: (O+k,1)|o|v|v slice == d_eri_oovv_[k·NO·NV·NV]
+        const int M = nmo_full_, O = frozen_off_;
+        real_t* d_blk_k = nullptr;
+        tracked_cudaMalloc(&d_blk_k, (size_t)NO * NV * NV * sizeof(real_t));
+        for (int k = 0; k < NO; ++k) {
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M,
+                O + k, 1, O, NO, NO + O, NV, NO + O, NV, d_blk_k);   // (k j | a b)
+            cudaMemcpy(h_oovv.data() + (size_t)k * NO * NV * NV, d_blk_k,
+                       (size_t)NO * NV * NV * sizeof(real_t), cudaMemcpyDeviceToHost);
+        }
+        tracked_cudaFree(d_blk_k);
+#endif
+    }
+    if (d_eri_ovvo_) {
+        cudaMemcpy(h_ovvo.data(), d_eri_ovvo_,  ovvo_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    } else {
+#ifndef GANSU_CPU_ONLY
+        // (lean) per-k host mirror: (O+k,1)|v|v|o slice == d_eri_ovvo_[k·NV·NV·NO]
+        const int M = nmo_full_, O = frozen_off_;
+        real_t* d_blk_k = nullptr;
+        tracked_cudaMalloc(&d_blk_k, (size_t)NV * NV * NO * sizeof(real_t));
+        for (int k = 0; k < NO; ++k) {
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M,
+                O + k, 1, NO + O, NV, NO + O, NV, O, NO, d_blk_k);   // (k a | b j)
+            cudaMemcpy(h_ovvo.data() + (size_t)k * NV * NV * NO, d_blk_k,
+                       (size_t)NV * NV * NO * sizeof(real_t), cudaMemcpyDeviceToHost);
+        }
+        tracked_cudaFree(d_blk_k);
+#endif
+    }
+    if (d_eri_ovvv_) {
+        cudaMemcpy(h_ovvv.data(), d_eri_ovvv_,  ovvv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
+    } else {
+#ifndef GANSU_CPU_ONLY
+        // (lean) per-k host mirror: (O+k,1)|v|v|v slice == d_eri_ovvv_[k·NV³];
+        // all device consumers take the h_ovvv l-slab paths (C2, keyed on
+        // d_eri_ovvv_ == nullptr).
+        const int M = nmo_full_, O = frozen_off_;
+        real_t* d_blk_k = nullptr;
+        tracked_cudaMalloc(&d_blk_k, (size_t)NV * NV * NV * sizeof(real_t));
+        for (int k = 0; k < NO; ++k) {
+            eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, M,
+                O + k, 1, NO + O, NV, NO + O, NV, NO + O, NV, d_blk_k);   // (k a | b c)
+            cudaMemcpy(h_ovvv.data() + (size_t)k * NV * NV * NV, d_blk_k,
+                       (size_t)NV * NV * NV * sizeof(real_t), cudaMemcpyDeviceToHost);
+        }
+        tracked_cudaFree(d_blk_k);
+#endif
+    }
     if (need_h_vvvv)
         cudaMemcpy(h_vvvv.data(), d_eri_vvvv_,  vvvv_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
 
@@ -1716,10 +1895,11 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     // nocc⁴ (13.4 GiB at the Doxorubicin cc-pVDZ cluster) for the rest of the
     // build and the whole Davidson solve. Opt-out: GANSU_EA_KEEP_RAW_BLOCKS=1.
     if (gpu::gpu_available() && std::getenv("GANSU_EA_KEEP_RAW_BLOCKS") == nullptr) {
-        tracked_cudaFree(d_eri_oooo_); d_eri_oooo_ = nullptr;
-        tracked_cudaFree(d_eri_ooov_); d_eri_ooov_ = nullptr;
-        tracked_cudaFree(d_eri_oovv_); d_eri_oovv_ = nullptr;
-        tracked_cudaFree(d_eri_ovvo_); d_eri_ovvo_ = nullptr;
+        // (lean) oovv/ovvo were never device-allocated — null-safe frees.
+        if (d_eri_oooo_) { tracked_cudaFree(d_eri_oooo_); d_eri_oooo_ = nullptr; }
+        if (d_eri_ooov_) { tracked_cudaFree(d_eri_ooov_); d_eri_ooov_ = nullptr; }
+        if (d_eri_oovv_) { tracked_cudaFree(d_eri_oovv_); d_eri_oovv_ = nullptr; }
+        if (d_eri_ovvo_) { tracked_cudaFree(d_eri_ovvo_); d_eri_ovvo_ = nullptr; }
     }
     // (EA storage-free, C2) Release the raw (ia|bc) block right after its host
     // copy too: every remaining device consumer (ct_wovov / ct_wovvo / the
@@ -1797,8 +1977,18 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
             tracked_cudaMalloc(&dA,(size_t)Mf*Kf*sizeof(real_t));
             tracked_cudaMalloc(&dB,(size_t)Kf*Nf*sizeof(real_t));
             tracked_cudaMalloc(&dC,(size_t)Mf*Nf*sizeof(real_t));
-            { const size_t n=(size_t)NO*NO*NV*NV; const unsigned NB=(unsigned)((n+255)/256);
+            if (d_eri_ovov_) {
+              const size_t n=(size_t)NO*NO*NV*NV; const unsigned NB=(unsigned)((n+255)/256);
               ea_ccfoo_buildA<<<NB,256>>>(dA, d_eri_ovov_, NO, NV);
+            } else {
+              // (lean) per-k row blocks of dA from B-built ovov slices; GEMM unchanged.
+              const size_t nk=(size_t)NO*NV*NV; const unsigned NBk=(unsigned)((nk+255)/256);
+              lean_ovov_slices([&](int k, const real_t* d_k){
+                  ea_ccfoo_buildA_k<<<NBk,256>>>(dA, d_k, NO, NV, k);
+                  cudaDeviceSynchronize();
+              });
+            }
+            { const size_t n=(size_t)NO*NO*NV*NV; const unsigned NB=(unsigned)((n+255)/256);
               ea_ccfoo_buildB<<<NB,256>>>(dB, d_t2_, d_t1_, NO, NV); }
             cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,Nf,Mf,Kf,&one,dB,Nf,dA,Kf,&zero,dC,Nf);
             std::vector<real_t> hC((size_t)Mf*Nf);
@@ -1816,8 +2006,18 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
             tracked_cudaMalloc(&dB,(size_t)Kv*Nv*sizeof(real_t));
             tracked_cudaMalloc(&dC,(size_t)Mv*Nv*sizeof(real_t));
             { const size_t n=(size_t)NV*NO*NO*NV; const unsigned NB=(unsigned)((n+255)/256);
-              ea_ccfvv_buildA<<<NB,256>>>(dA, d_t2_, d_t1_, NO, NV);
-              ea_ccfvv_buildB<<<NB,256>>>(dB, d_eri_ovov_, NO, NV); }
+              ea_ccfvv_buildA<<<NB,256>>>(dA, d_t2_, d_t1_, NO, NV); }
+            if (d_eri_ovov_) {
+              const size_t n=(size_t)NV*NO*NO*NV; const unsigned NB=(unsigned)((n+255)/256);
+              ea_ccfvv_buildB<<<NB,256>>>(dB, d_eri_ovov_, NO, NV);
+            } else {
+              // (lean) per-k (k,·,·) stripes of dB from B-built ovov slices.
+              const size_t nk=(size_t)NO*NV*NV; const unsigned NBk=(unsigned)((nk+255)/256);
+              lean_ovov_slices([&](int k, const real_t* d_k){
+                  ea_ccfvv_buildB_k<<<NBk,256>>>(dB, d_k, NO, NV, k);
+                  cudaDeviceSynchronize();
+              });
+            }
             cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,Nv,Mv,Kv,&one,dB,Nv,dA,Kv,&zero,dC,Nv);
             std::vector<real_t> hC((size_t)Mv*Nv);
             cudaMemcpy(hC.data(),dC,(size_t)Mv*Nv*sizeof(real_t),cudaMemcpyDeviceToHost);
@@ -1944,15 +2144,28 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         real_t* dC = nullptr;
         tracked_cudaMalloc(&dC, ct_sz * sizeof(real_t));
         const real_t one = 1.0, zero = 0.0;
-        cublasDgemmStridedBatched(
-            cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-            NO*NV, NO, NV,
-            &one,
-            d_eri_ovov_, NO*NV, (long long)NV*NO*NV,
-            d_t1_,       NV,    0LL,
-            &zero,
-            dC,          NO*NV, (long long)NO*NO*NV,
-            NO);
+        if (d_eri_ovov_) {
+            cublasDgemmStridedBatched(
+                cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                NO*NV, NO, NV,
+                &one,
+                d_eri_ovov_, NO*NV, (long long)NV*NO*NV,
+                d_t1_,       NV,    0LL,
+                &zero,
+                dC,          NO*NV, (long long)NO*NO*NV,
+                NO);
+        } else {
+            // (lean) same per-batch GEMM, one per k from a B-built ovov slice
+            // (each batch of the strided call was exactly this problem).
+            lean_ovov_slices([&](int k, const real_t* d_k){
+                cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                    NO*NV, NO, NV, &one,
+                    d_k,   NO*NV,
+                    d_t1_, NV,
+                    &zero, dC + (size_t)k*NO*NO*NV, NO*NV);
+                cudaDeviceSynchronize();
+            });
+        }
         std::vector<real_t> ct(ct_sz);
         cudaMemcpy(ct.data(), dC, ct_sz * sizeof(real_t), cudaMemcpyDeviceToHost);
         tracked_cudaFree(dC);
@@ -2014,7 +2227,15 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
             tracked_cudaMalloc(&dB,(size_t)EA_KO_cl*EA_NO_ib*sizeof(real_t));
             tracked_cudaMalloc(&dC,(size_t)EA_MO_kd*EA_NO_ib*sizeof(real_t));
             const size_t nel=(size_t)NO*NV*NV*NO; const unsigned NB=(unsigned)((nel+255)/256);
-            ea_ctovov_buildA<<<NB,256>>>(dA, d_eri_ovov_, NO, NV);
+            if (d_eri_ovov_) {
+                ea_ctovov_buildA<<<NB,256>>>(dA, d_eri_ovov_, NO, NV);
+            } else {
+                const size_t nk=(size_t)NV*NV*NO; const unsigned NBk=(unsigned)((nk+255)/256);
+                lean_ovov_slices([&](int k, const real_t* d_k){
+                    ea_ctovov_buildA_k<<<NBk,256>>>(dA, d_k, NO, NV, k);
+                    cudaDeviceSynchronize();
+                });
+            }
             ea_ctovov_buildB<<<NB,256>>>(dB, d_t2_, NO, NV);
             cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,EA_NO_ib,EA_MO_kd,EA_KO_cl,&one,
                         dB,EA_NO_ib,dA,EA_KO_cl,&zero,dC,EA_NO_ib);
@@ -2034,7 +2255,15 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
             tracked_cudaMalloc(&dC, (size_t)EA_M_kc*EA_N_jb*sizeof(real_t));
             tracked_cudaMalloc(&dA1,(size_t)EA_M_kc*EA_K_ld*sizeof(real_t));
             tracked_cudaMalloc(&dB1,(size_t)EA_K_ld*EA_N_jb*sizeof(real_t));
-            ea_ctovvo_buildA12<<<NB,256>>>(dA1, nullptr, d_eri_ovov_, NO, NV);
+            if (d_eri_ovov_) {
+                ea_ctovvo_buildA12<<<NB,256>>>(dA1, nullptr, d_eri_ovov_, NO, NV);
+            } else {
+                const size_t nk=(size_t)NV*NO*NV; const unsigned NBk=(unsigned)((nk+255)/256);
+                lean_ovov_slices([&](int k, const real_t* d_k){
+                    ea_ctovvo_buildA12_k<<<NBk,256>>>(dA1, nullptr, d_k, NO, NV, k);
+                    cudaDeviceSynchronize();
+                });
+            }
             ea_ctovvo_buildB12<<<NB,256>>>(dB1, nullptr, d_t2_, NO, NV);
             cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,EA_N_jb,EA_M_kc,EA_K_ld,&one,
                         dB1,EA_N_jb,dA1,EA_K_ld,&zero,dC,EA_N_jb);
@@ -2042,7 +2271,15 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
             tracked_cudaFree(dA1);tracked_cudaFree(dB1);
             tracked_cudaMalloc(&dA2,(size_t)EA_M_kc*EA_K_ld*sizeof(real_t));
             tracked_cudaMalloc(&dB2,(size_t)EA_K_ld*EA_N_jb*sizeof(real_t));
-            ea_ctovvo_buildA12<<<NB,256>>>(nullptr, dA2, d_eri_ovov_, NO, NV);
+            if (d_eri_ovov_) {
+                ea_ctovvo_buildA12<<<NB,256>>>(nullptr, dA2, d_eri_ovov_, NO, NV);
+            } else {
+                const size_t nk=(size_t)NV*NO*NV; const unsigned NBk=(unsigned)((nk+255)/256);
+                lean_ovov_slices([&](int k, const real_t* d_k){
+                    ea_ctovvo_buildA12_k<<<NBk,256>>>(nullptr, dA2, d_k, NO, NV, k);
+                    cudaDeviceSynchronize();
+                });
+            }
             ea_ctovvo_buildB12<<<NB,256>>>(nullptr, dB2, d_t2_, NO, NV);
             cublasDgemm(cublas,CUBLAS_OP_N,CUBLAS_OP_N,EA_N_jb,EA_M_kc,EA_K_ld,&negone,
                         dB2,EA_N_jb,dA2,EA_K_ld,&one,dC,EA_N_jb);
@@ -2343,10 +2580,26 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
             wv_ls = ea_ovvv_slab_rows(NO, NV);
             tracked_cudaMalloc(&d_ovvv_ls, (size_t)wv_ls*NV*NV*NV*sizeof(real_t));
         }
+        // (EA PNO-lean) this ct GEMM contracts the LEADING occ index of ovov
+        // (K = NO) — per-k slicing would split the reduction (not bit-identical).
+        // Rebuild the full block as a SHORT-LIVED transient (bytes identical,
+        // per-k B fills straight into the buffer), freed right after the a0
+        // loop — it never coexists with the ct-cluster scratch phases.
+        real_t* d_ovov_tr = nullptr;
+        const real_t* d_ovov_src = d_eri_ovov_;
+        if (!d_ovov_src) {
+            const int Mfull = nmo_full_, Ofz = frozen_off_;
+            tracked_cudaMalloc(&d_ovov_tr, (size_t)NO*NV*NO*NV*sizeof(real_t));
+            for (int k = 0; k < NO; ++k)
+                eri_block_src_->mo_eri_block_into(d_B_mo_blocks_, Mfull,
+                    Ofz + k, 1, NO + Ofz, NV, Ofz, NO, NO + Ofz, NV,
+                    d_ovov_tr + (size_t)k * NV * NO * NV);
+            d_ovov_src = d_ovov_tr;
+        }
         for (int a0 = 0; a0 < Mv; a0 += TA) {
             const int na = std::min(TA, Mv - a0);
             cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, Nv, na, Kv, &one,
-                        d_eri_ovov_, Nv, dA + (size_t)a0*Kv, Kv, &zero, dC, Nv);
+                        d_ovov_src, Nv, dA + (size_t)a0*Kv, Kv, &zero, dC, Nv);
             const int thr = 256;
             real_t* const wv_dst = wv_build_to_host ? d_wv_slab
                                                     : d_Wvovv_ + (size_t)a0*slab_out;
@@ -2372,6 +2625,7 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         }
         cudaDeviceSynchronize();
         tracked_cudaFree(dA);
+        if (d_ovov_tr) tracked_cudaFree(d_ovov_tr);   // (lean) short-lived ovov
         if (d_ovvv_ls) tracked_cudaFree(d_ovvv_ls);
         if (d_wv_slab) tracked_cudaFree(d_wv_slab);
         wvovv_gpu = true;
@@ -4147,7 +4401,11 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         const char* e = std::getenv("GANSU_EA_RING_GEMM");
         return !(e && e[0] == '0');
     }();
-    if (gpu::gpu_available() && ring_gemm_alloc) {
+    // (EA PNO-lean) the 3 M_ring matrices serve ONLY the canonical σ ring GEMMs
+    // — dead weight (3×nocc²·nvir², 77 GB at decacene) under native-bare where
+    // canonical apply never runs (and throws). Skip; the σ fallback checks
+    // d_M_ringA_ == nullptr anyway.
+    if (gpu::gpu_available() && ring_gemm_alloc && !lean_raw_blocks_) {
         const size_t M_sz   = (size_t)NO * NV * NO * NV;
         const size_t M_need = 3 * M_sz * sizeof(real_t);
         size_t freeb = 0, totb = 0;
@@ -4330,6 +4588,19 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                      "(dressed Wvvvv retained for sigma/share-barH)." << std::endl;
     }
 
+    // (EA PNO-lean) the transiently rebuilt raw (ia|jb) is a build-time-only
+    // input in this mode — native-bare σ never reads it (the native operator
+    // borrows the persistent HOST mirror h_ovov_mirror_ instead) and canonical
+    // apply throws. Free it: −nocc²·nvir² off the solve residency.
+#ifndef GANSU_CPU_ONLY
+    if (lean_raw_blocks_ && d_eri_ovov_) {
+        tracked_cudaFree(d_eri_ovov_);
+        d_eri_ovov_ = nullptr;
+        std::cout << "  [EA-EOM lean] transient raw (ia|jb) freed after build "
+                     "(native operator borrows the host mirror)." << std::endl;
+    }
+#endif
+
     #undef H_WOOOV
     #undef H_W1OVOV
     #undef H_W1OVVO
@@ -4495,6 +4766,14 @@ void EAEOMCCSDOperator::apply(const real_t* d_input, real_t* d_output) const {
         throw std::runtime_error(
             "EAEOMCCSDOperator::apply called with canonical-skip Wvvvv elided — "
             "this operator's σ should be wrapped by the native DLPNO-EA-EOM operator.");
+    }
+    // (EA PNO-lean) raw ovov elided/freed — the canonical σ (which reads
+    // d_eri_ovov_ in its ring terms) cannot run; the native operator must wrap
+    // this one. GANSU_EA_PNO_LEAN=0 / GANSU_EA_KEEP_RAW_BLOCKS=1 to restore.
+    if (lean_raw_blocks_ && d_Lvv_ != nullptr && d_eri_ovov_ == nullptr) {
+        throw std::runtime_error(
+            "EAEOMCCSDOperator::apply: raw ovov elided (native-bare lean mode) — "
+            "canonical σ must be wrapped by the native operator.");
     }
     // (a) Stub path: intermediates not built → diagonal-only matvec.
     if (d_Lvv_ == nullptr) {

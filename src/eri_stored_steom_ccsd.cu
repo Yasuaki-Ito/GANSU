@@ -793,6 +793,31 @@ static void compute_steom_ccsd_impl(RHF& rhf,
             if (ckpt_loaded && ctx->barh.complete()) ctx->share_barh = true;  // borrow the restored bar-H
         }
     }
+    // (plain-path stage ckpt, 2026-07-22 — user request) The same accelerator for
+    // the non-DMET chain: GANSU_STEOM_CKPT=<path> restores the CIS-NTO/IP/EA
+    // results into the RHF result slots, so the dispatch below no-ops those
+    // stages and the run jumps from the (recomputed, ~minutes) DLPNO ground
+    // straight to STEOM — a decacene probe drops from ~2.5 h to ~20 min. The
+    // cluster-CCSD T1/T2 and bar-H slots in the file are ignored on the plain
+    // path (stages re-derive from the stowed bt amplitudes; bar-H is rebuilt or
+    // borrowed per the share flags) and freed right after load.
+    if (!ctx) {
+        if (const char* ck = std::getenv("GANSU_STEOM_CKPT")) {
+            EOMChainContext tmp;
+            if (steom_ckpt_load(tmp, ck)) {
+                ckpt_loaded = true;
+                ckpt_had_ea = !tmp.ea_eom_result.per_active.empty();
+                rhf.set_cis_nto_result(std::move(tmp.cis_nto_result));
+                rhf.set_ip_eom_result(std::move(tmp.ip_eom_result));
+                rhf.set_ea_eom_result(std::move(tmp.ea_eom_result));
+                if (tmp.cc_t1) { tracked_cudaFree(tmp.cc_t1); tmp.cc_t1 = nullptr; }
+                if (tmp.cc_t2) { tracked_cudaFree(tmp.cc_t2); tmp.cc_t2 = nullptr; }
+                tmp.barh.free();
+                std::cout << "  [STEOM ckpt] plain-path resume: CIS/IP/EA results "
+                             "restored — dispatch jumps to the STEOM stage." << std::endl;
+            }
+        }
+    }
 
     // Stage 1/3 — CIS-NTO active space.
     if (!mpi_steom) {
@@ -851,6 +876,17 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     if (ctx && !ckpt_loaded) {
         if (const char* ck = std::getenv("GANSU_DMET_STEOM_CKPT"))
             steom_ckpt_save(*ctx, ck);
+    }
+    // (plain-path stage ckpt) after-IP save — resume past CCSD+CIS+IP even if EA
+    // later dies; the after-EA save below overwrites with the full state.
+    if (!ctx && !ckpt_loaded) {
+        if (const char* ck = std::getenv("GANSU_STEOM_CKPT")) {
+            EOMChainContext tmp;
+            tmp.cis_nto_result = rhf.get_cis_nto_result();
+            tmp.ip_eom_result  = rhf.get_ip_eom_result();
+            tmp.ea_eom_result  = rhf.get_ea_eom_result();
+            steom_ckpt_save(tmp, ck);
+        }
     }
 #ifndef GANSU_CPU_ONLY
     // (perf) EA-solve device relief (user request): with share-barH, IP's 8 published
@@ -994,6 +1030,17 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     if (ctx && (!ckpt_loaded || !ckpt_had_ea)) {
         if (const char* ck = std::getenv("GANSU_DMET_STEOM_CKPT"))
             steom_ckpt_save(*ctx, ck);
+    }
+    // (plain-path stage ckpt) after-EA save / IP-only-file upgrade — the resume
+    // target the user iterates from while hardening the STEOM stage.
+    if (!ctx && (!ckpt_loaded || !ckpt_had_ea)) {
+        if (const char* ck = std::getenv("GANSU_STEOM_CKPT")) {
+            EOMChainContext tmp;
+            tmp.cis_nto_result = rhf.get_cis_nto_result();
+            tmp.ip_eom_result  = rhf.get_ip_eom_result();
+            tmp.ea_eom_result  = rhf.get_ea_eom_result();
+            steom_ckpt_save(tmp, ck);
+        }
     }
 
     // Sanity check — both per_active vectors must now have entries.

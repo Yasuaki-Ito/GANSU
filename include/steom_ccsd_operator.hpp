@@ -194,6 +194,10 @@ private:
     // fly from the RI B-factors, so d_eri_vvvv_ is never materialised. Gated on
     // canonical_skip_wvvvv_ && RI block source && GANSU_DLPNO_EA_VVVV_RI.
     bool ri_vvvv_term_a_ = false;
+    // (STEOM PNO-lean, 2026-07-22) block mode: the raw (ia|bc) dense device
+    // block is elided — h_ovvv is rebuilt per-k from B and the three device
+    // consumers use per-k/per-l/per-j slices (bit-identical). Set in extract.
+    bool lean_raw_ovvv_ = false;
 
     // === Active NTO ↔ MO index maps (host-side, copied in constructor) ===
     std::vector<int> active_occ_idx_;   // [n_act_occ]   (each ∈ [0, nocc_active))
@@ -292,6 +296,12 @@ private:
     // h_wvovv_stage_ is borrowed (points into the cache), not owned.
     bool wvovv_host_staged_ = false;
     const std::vector<real_t>* h_wvovv_stage_ = nullptr;
+    // (STEOM PNO-lean Step 2) self-build variant of the host stage: the dressed
+    // Wvovv built by build_dressed_intermediates is MOVED here instead of being
+    // uploaded (nocc·nvir³ device residency elided); h_wvovv_stage_ then points
+    // at this owned vector and the same a-slab W^eff consumers run unchanged.
+    // Wvvvo has no post-build consumer in this mode → its upload is skipped too.
+    std::vector<real_t> h_wvovv_own_;
 
     // === Fock diagonals (for bar-H build) ===
     real_t* d_f_oo_  = nullptr;  // [nocc_active]

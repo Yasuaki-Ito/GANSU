@@ -578,7 +578,18 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
         const size_t ovov_sz = static_cast<size_t>(nocc_) * nvir_ * nocc_ * nvir_;
         const size_t t2_sz   = static_cast<size_t>(nocc_) * nocc_ * nvir_ * nvir_;
         std::vector<real_t> h_ovov(ovov_sz, 0.0), h_t2(t2_sz, 0.0);
-        pull_device(ea_op.get_eri_ovov_device(), h_ovov);
+        // (EA PNO-lean) the canonical operator may have elided/freed its raw
+        // device ovov (native-bare lean) — it then exposes a persistent host
+        // mirror with the same bytes; borrow from that instead.
+        if (ea_op.get_eri_ovov_device() != nullptr) {
+            pull_device(ea_op.get_eri_ovov_device(), h_ovov);
+        } else if (ea_op.get_eri_ovov_host().size() == ovov_sz) {
+            h_ovov = ea_op.get_eri_ovov_host();
+        } else {
+            throw std::runtime_error(
+                "DLPNOEAEOMNativeOperator: canonical ovov elided but no host "
+                "mirror exposed (lean-mode wiring bug).");
+        }
         pull_device(ea_op.get_t2_device(),       h_t2);
         if (uloc_is_identity(U_loc_, nocc_)) {
             h_ovov_Llmo_ = std::move(h_ovov);
@@ -1020,6 +1031,46 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
                 tracked_cudaMalloc(&d_Wvvvo_r1_, wsz * sizeof(real_t));
                 cudaMemcpy(d_Wvvvo_r1_, h_Wvvvo_r1.data(), wsz * sizeof(real_t),
                            cudaMemcpyHostToDevice);
+            } else {
+                // (M5c-a, 2026-07-22) HOST T_r1 fallback (GANSU_DLPNO_NATIVE_GPU_TR1=0
+                // — the nocc·nvir³ device upload cannot fit at decacene scale).
+                // The [(a,b,c),j] layout gathers with stride nocc per c: one
+                // serial matvec walked ~1.3 TB of cache lines and pinned the EA
+                // Davidson at 100% single-core (decacene run10). Pre-transpose
+                // ONCE to [j][a][b][c] (contiguous reads, same transform as the
+                // device path above) so the per-matvec term becomes a parallel
+                // sequential sweep in compute_sigma2. Host-RAM: +nocc·nvir³
+                // (alongside h_Wvvvo_lmo_; identical values, identical per-
+                // element summation order → bit-identical σ).
+                const size_t wsz = static_cast<size_t>(nocc_) * nvir_ * nvir_ * nvir_;
+                h_Wvvvo_r1_host_.assign(wsz, 0.0);
+                const int nv = nvir_, no = nocc_;
+                // Tiled transpose: per (a,b) the job is an [c×j] → [j×c] panel
+                // transpose (in: stride no in c / contiguous j; out: stride nv³
+                // in j / contiguous c). Tiling c keeps both sides cache-resident
+                // — the naive j-outer loop walked ~1.3 TB of cache lines (~1 h
+                // at decacene); this is a plain permutation copy (numerics-free).
+                {
+                    constexpr int CT = 16;   // c-tile
+                    #pragma omp parallel for collapse(2) schedule(dynamic)
+                    for (int a = 0; a < nv; ++a)
+                        for (int b = 0; b < nv; ++b) {
+                            const size_t in_ab  = (static_cast<size_t>(a) * nv + b) * nv;      // ·no + j 残り
+                            const size_t out_ab = (static_cast<size_t>(a) * nv + b) * nv;      // c 残り
+                            for (int c0 = 0; c0 < nv; c0 += CT) {
+                                const int c1 = (c0 + CT < nv) ? c0 + CT : nv;
+                                for (int j = 0; j < no; ++j) {
+                                    real_t* dst = h_Wvvvo_r1_host_.data()
+                                                + static_cast<size_t>(j) * nv * nv * nv + out_ab;
+                                    for (int c = c0; c < c1; ++c)
+                                        dst[c] = h_Wvvvo_lmo_[(in_ab + c) * no + j];
+                                }
+                            }
+                        }
+                }
+                std::cout << "[bt-PNO EA M5c-a] host T_r1 pre-transposed to [j,a,b,c] "
+                             "(tiled; contiguous + OpenMP per matvec; device upload elided)"
+                          << std::endl;
             }
             // Stage 3c T_r1 / Stage 4 σ1 Lvv·r1: the r1 upload scratch (shared).
             if ((use_gpu_tr1_ || use_gpu_s1lvv_) && !d_r1_)
@@ -1831,15 +1882,32 @@ void DLPNOEAEOMNativeOperator::compute_sigma2(
             acc.noalias() += r2c[j] * Lvv.transpose();   // T_Lvv_b
         }
         // T_r1: acc[a,b] += Σ_c Wvvvo_lmo[a,b,c,j] r1[c]   (GPU on Stage 3c)
-        if (!skip_tr1)
-            for (int a = 0; a < nvir; ++a)
-                for (int b = 0; b < nvir; ++b) {
-                    const size_t base = (static_cast<size_t>(a) * nvir + b) * nvir;
-                    real_t s = 0.0;
-                    for (int c = 0; c < nvir; ++c)
-                        s += h_Wvvvo_lmo_[(base + c) * nocc + j] * r1[c];
-                    acc(a, b) += s;
-                }
+        if (!skip_tr1) {
+            if (!h_Wvvvo_r1_host_.empty()) {
+                // (M5c-a) contiguous pre-transposed [j,a,b,c] read + OpenMP over a.
+                // Same per-(a,b) summation order over c → bit-identical.
+                const real_t* Wj = h_Wvvvo_r1_host_.data()
+                                 + static_cast<size_t>(j) * nvir * nvir * nvir;
+                #pragma omp parallel for
+                for (int a = 0; a < nvir; ++a)
+                    for (int b = 0; b < nvir; ++b) {
+                        const real_t* w = Wj + (static_cast<size_t>(a) * nvir + b) * nvir;
+                        real_t s = 0.0;
+                        for (int c = 0; c < nvir; ++c)
+                            s += w[c] * r1[c];
+                        acc(a, b) += s;
+                    }
+            } else {
+                for (int a = 0; a < nvir; ++a)
+                    for (int b = 0; b < nvir; ++b) {
+                        const size_t base = (static_cast<size_t>(a) * nvir + b) * nvir;
+                        real_t s = 0.0;
+                        for (int c = 0; c < nvir; ++c)
+                            s += h_Wvvvo_lmo_[(base + c) * nocc + j] * r1[c];
+                        acc(a, b) += s;
+                    }
+            }
+        }
         // Cross-pair (B-EA.3): source occ l, lifted r2c[l].
         //   T_Loo: acc -= Σ_l Loo_lmo[l,j] r2c[l]
         //   T_ph1: acc[a,b] += Σ_{l,d} (2 Wovvo_lmo[l,b,d,j] - Wovov_lmo[l,b,j,d]) r2c[l][a,d]

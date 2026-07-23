@@ -680,6 +680,19 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
         // GANSU_DLPNO_NATIVE_EOM_SOLVE1=1 force single / =0 force multi.
         int eom_solve_gpus = rhf.get_num_gpus();
 #ifndef GANSU_CPU_ONLY
+        // (EA PNO-lean follow-up, 2026-07-21) When the native operator was
+        // Ship-13 device-balanced onto a free GPU, force the single-GPU grouped
+        // solve: the multi-GPU slab solve hard-wires its primary to physical
+        // GPU 0 and replicates canonical-space buffers (163.95 GB = 6·nocc²nvir²
+        // per device at decacene → OOM), exactly the IP run4 pathology. The
+        // native-bare packed operator lives entirely on the balanced GPU.
+        if (native && eom_solve_gpus > 1 && ea_native_dev_balance_active) {
+            eom_solve_gpus = 1;
+            std::cout << "[bt-PNO auto-solve EA] single-GPU grouped solve forced "
+                         "(native operator Ship-13 device-balanced; multi-GPU slab "
+                         "assumes primary = GPU 0 + replicates canonical buffers)"
+                      << std::endl;
+        }
         if (native && eom_solve_gpus > 1) {
             const char* e = std::getenv("GANSU_DLPNO_NATIVE_EOM_SOLVE1");
             const int forced = e ? (e[0] == '0' ? -1 : 1) : 0;
@@ -689,7 +702,20 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
                           << "(GANSU_DLPNO_NATIVE_EOM_SOLVE1)" << std::endl;
             } else if (forced == 0) {   // auto: balanced-device footprint vs free memory
                 const size_t nv = static_cast<size_t>(nvir), no = static_cast<size_t>(nocc_active);
-                const size_t est = (nv*nv*nv*nv + 4*no*no*nv*nv) * sizeof(real_t)
+                // (EA PNO-lean) the native-bare / RI-ladder path NEVER materialises
+                // the dense nvir⁴ Wvvvv (Wvvvo·t1 from RI B-factors), so charging
+                // it here (1122 GB at decacene) wrongly forces the fragile
+                // multi-GPU slab solve. The packed native operator footprint is
+                // the per-pair PNO packs (~4·nocc²nvir² upper bound) + the RI
+                // ladder factors, not nvir⁴. Drop the nvir⁴ term for the native
+                // path; the dense (projected) path keeps the full estimate.
+                const bool native_bare_solve =
+                    rhf.use_dlpno_native_eom()
+                    && [](const char* n, bool d){ const char* e = std::getenv(n);
+                        return (!e || !e[0]) ? d : (e[0] != '0'); }
+                        ("GANSU_DLPNO_CANONICAL_SKIP", true);
+                const size_t est = ((native_bare_solve ? 0 : nv*nv*nv*nv)
+                                    + 4*no*no*nv*nv) * sizeof(real_t)
                                  + static_cast<size_t>(2) * 1024 * 1024 * 1024;  // d_eri_vvvv + packs + 2 GB
                 // Probe the device the native operator + Davidson will ACTUALLY run
                 // on, i.e. the current device — which is the Ship 13 native-balance

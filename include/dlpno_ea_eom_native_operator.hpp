@@ -238,6 +238,11 @@ private:
     std::vector<real_t> h_Fov_;       // [nocc·nvir]            σ1
     std::vector<real_t> h_Wvovv_;     // [nvir·nocc·nvir·nvir]  σ1
     std::vector<real_t> h_Wvvvo_lmo_; // [nvir·nvir·nvir·nocc]  σ2 T_r1 (occ j rotated → LMO)
+    // (M5c-a) host T_r1 fallback (GANSU_DLPNO_NATIVE_GPU_TR1=0 — the nocc·nvir³
+    // device upload cannot fit): h_Wvvvo_lmo_ pre-transposed ONCE to [j,a,b,c]
+    // so the per-matvec T_r1 reads contiguously under OpenMP. Empty when the
+    // TR1 stage runs on the GPU (byte-identical default).
+    std::vector<real_t> h_Wvvvo_r1_host_;
     std::vector<real_t> h_Loo_lmo_;   // [nocc²]                σ2 T_Loo (U_locᵀ Loo U_loc)
     std::vector<real_t> h_Wovvo_lmo_; // [nocc·nvir·nvir·nocc]  σ2 ph (occ pos 0,3 rotated → LMO)
     std::vector<real_t> h_Wovov_lmo_; // [nocc·nvir·nocc·nvir]  σ2 ph (occ pos 0,2 rotated → LMO)

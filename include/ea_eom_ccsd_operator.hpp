@@ -123,6 +123,10 @@ public:
     const real_t* get_Wvvvo_device() const { return d_Wvvvo_; }  // [nvir·nvir·nvir·nocc]
     const real_t* get_eri_ovov_device() const { return d_eri_ovov_; }  // [nocc·nvir·nocc·nvir] (kc|ld) → tmp_k
     const real_t* get_t2_device()     const { return d_t2_; }    // [nocc²·nvir²]
+    /// (EA PNO-lean) Host mirror of the raw ovov block, populated ONLY when the
+    /// dense device block was elided (native-bare lean mode). The native
+    /// operator borrows it (T_tmp seed) instead of get_eri_ovov_device().
+    const std::vector<real_t>& get_eri_ovov_host() const { return h_ovov_mirror_; }
 
     /// Print intermediate Frobenius norms (used by ea_eom_verbose ≥ 2 for
     /// PySCF cross-validation in sub-phases 2.3-2.6). Sub-phase 2.0+2.1
@@ -244,6 +248,14 @@ private:
     // Wvvvo's Σ_d Wvvvv[a,b,c,d]·t1[j,d] is recomputed term-by-term without a nvir⁴
     // intermediate (build_dressed_intermediates fused refactor). Default off → bit-exact.
     bool canonical_skip_wvvvv_ = false;
+
+    // (EA PNO-lean, 2026-07-21 — mirrors the IP lean_raw_blocks_) native-bare:
+    // extract elides the raw ovov/oovv/ovvo/ovvv dense device blocks; the build
+    // rebuilds ovov transiently (freed at build end), oovv/ovvo/ovvv become
+    // per-k host mirrors, ovov persists as h_ovov_mirror_ for the native borrow,
+    // and the σ-only M_ring build is skipped. apply() throws (native wraps).
+    bool lean_raw_blocks_ = false;
+    std::vector<real_t> h_ovov_mirror_;   // persistent host ovov (lean mode only)
 
     // (RI Term A) When true, the Wvvvo·t1 dressing (the sole canonical-skip
     // consumer of the nvir⁴ (ab|cd) block) is evaluated on the fly from the RI
