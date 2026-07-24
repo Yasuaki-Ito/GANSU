@@ -551,7 +551,10 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
             // its own disjoint [L,J] panel (M is per-iteration local; Uloc/h_W*
             // read-only) — this pair of serial Eigen loops walked 2×27.6 GB and
             // was a visible slice of the decacene EA-operator ctor wall.
-            #pragma omp parallel for collapse(2)
+            // num_threads(64): the per-pair Eigen products delegate to OpenBLAS,
+            // whose per-caller buffer pool crashes past 128 concurrent callers on
+            // the 192-core host (same pitfall as dlpno_cpu_threads).
+            #pragma omp parallel for collapse(2) num_threads(64)
             for (int a = 0; a < nvir_; ++a)
                 for (int d = 0; d < nvir_; ++d) {
                     RowMatXd M(nocc_, nocc_);
@@ -563,7 +566,10 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
                         for (int j = 0; j < nocc_; ++j)
                             h_Wovvo_lmo_[((static_cast<size_t>(l) * nvir_ + a) * nvir_ + d) * nocc_ + j] = C(l, j);
                 }
-            #pragma omp parallel for collapse(2)
+            // num_threads(64): the per-pair Eigen products delegate to OpenBLAS,
+            // whose per-caller buffer pool crashes past 128 concurrent callers on
+            // the 192-core host (same pitfall as dlpno_cpu_threads).
+            #pragma omp parallel for collapse(2) num_threads(64)
             for (int a = 0; a < nvir_; ++a)
                 for (int d = 0; d < nvir_; ++d) {
                     RowMatXd M(nocc_, nocc_);
@@ -1939,7 +1945,10 @@ void DLPNOEAEOMNativeOperator::compute_sigma2(
     // is auto-ignored under nesting. This was the EA host-round-trip matvec
     // bottleneck (sigma2(host acc) = 1.14 s of a 1.25 s naph matvec; ~90% of a
     // 190 s solve — per-j serial overhead, not FLOPs).
-    #pragma omp parallel for schedule(dynamic)
+    // num_threads(64): the non-export tail's Eigen projections delegate to
+    // OpenBLAS (128-caller buffer cap on the 192-core host — dlpno_cpu_threads
+    // pitfall); per-j arithmetic is unchanged by the cap.
+    #pragma omp parallel for schedule(dynamic) num_threads(64)
     for (int j = 0; j < nocc; ++j) {
         const int n = packing_.n_pno_ii[j];
         if (n == 0) continue;
