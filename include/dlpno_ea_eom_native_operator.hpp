@@ -424,6 +424,13 @@ private:
     bool use_gpu_s1wvovv_ = false;
     real_t* d_Fov_         = nullptr;    ///< [nocc·nvir] σ1 Fov
     real_t* d_Wvovv_       = nullptr;    ///< [nvir·nocc·nvir·nvir] σ1 Wvovv
+    // (M5c-c) σ1 Wvovv a-slab streaming: when the full d_Wvovv_ upload does not
+    // fit, h_Wvovv_ stays on host and add_sigma1_gpu H2Ds slab-rows per GEMV
+    // column chunk (independent dot products per a → bit-identical to resident).
+    bool    s1wvovv_stream_    = false;
+    bool    s1wvovv_pinned_    = false;   // h_Wvovv_ cudaHostRegister'd (M5c-c2)
+    int     s1wvovv_slab_rows_ = 0;
+    real_t* d_wvovv_slab_      = nullptr;
     real_t* d_sigma1_      = nullptr;    ///< [nvir] σ1 device accumulator
     real_t* d_r2c_sym_lcd_ = nullptr;    ///< [nocc·nvir·nvir] (l,c,d)-ordered 2R-Rᵀ for Wvovv·r2
 

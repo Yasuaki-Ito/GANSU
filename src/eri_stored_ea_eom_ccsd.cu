@@ -738,6 +738,11 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
             }
         }
 #endif
+        // (EA solve-time split, 2026-07-24) "solve time" historically lumped the
+        // native-operator CONSTRUCTION (host borrows/rotations/uploads — ~45% of
+        // the decacene wall) together with the Davidson loop; print the split so
+        // the next optimization target is unambiguous.
+        const double _t_pre_ctor = solve_timer.elapsed_seconds();
         if (native)
             dlpno_op = std::make_unique<DLPNOEAEOMNativeOperator>(
                 ea_op, dres, pack, dres.U_loc, C_vir, h_S, num_basis, nvir, eps_v,
@@ -746,12 +751,19 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
             dlpno_op = std::make_unique<DLPNOEAEOMProjectedOperator>(
                 ea_op, dres, pack, dres.U_loc, C_vir, h_S, num_basis, eps_v);
         LinearOperator& dop = *dlpno_op;
+        const double _t_post_ctor = solve_timer.elapsed_seconds();
+        std::cout << "  [EA solve-split] native/projected operator ctor = "
+                  << std::fixed << std::setprecision(1)
+                  << (_t_post_ctor - _t_pre_ctor) << " s" << std::endl;
 
         DavidsonConfig pcfg = config;
         pcfg.max_subspace_size = std::min(dop.dimension(), std::max(80, 20 * n_roots_to_compute));
         DavidsonSolver solver(dop, pcfg);
         converged = solver.solve();
         eigenvalues = solver.get_eigenvalues();
+        std::cout << "  [EA solve-split] Davidson loop = "
+                  << std::fixed << std::setprecision(1)
+                  << (solve_timer.elapsed_seconds() - _t_post_ctor) << " s" << std::endl;
 
         const int pdim = dop.dimension();
         std::vector<real_t> packed_evec((size_t)n_roots_to_compute * pdim);

@@ -545,11 +545,16 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
             h_Wovov_lmo_ = std::move(h_Wovov);
         } else {
             Eigen::Map<const RowMatXd> Uloc(U_loc_.data(), nocc_, nocc_);
-            RowMatXd M(nocc_, nocc_);
             h_Wovvo_lmo_.assign(wvvo_sz, 0.0);
             h_Wovov_lmo_.assign(wovv_sz, 0.0);
+            // (2026-07-24) parallel over (a,d): each pair gathers/rotates/scatters
+            // its own disjoint [L,J] panel (M is per-iteration local; Uloc/h_W*
+            // read-only) — this pair of serial Eigen loops walked 2×27.6 GB and
+            // was a visible slice of the decacene EA-operator ctor wall.
+            #pragma omp parallel for collapse(2)
             for (int a = 0; a < nvir_; ++a)
                 for (int d = 0; d < nvir_; ++d) {
+                    RowMatXd M(nocc_, nocc_);
                     for (int L = 0; L < nocc_; ++L)
                         for (int J = 0; J < nocc_; ++J)
                             M(L, J) = h_Wovvo[((static_cast<size_t>(L) * nvir_ + a) * nvir_ + d) * nocc_ + J];
@@ -558,8 +563,10 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
                         for (int j = 0; j < nocc_; ++j)
                             h_Wovvo_lmo_[((static_cast<size_t>(l) * nvir_ + a) * nvir_ + d) * nocc_ + j] = C(l, j);
                 }
+            #pragma omp parallel for collapse(2)
             for (int a = 0; a < nvir_; ++a)
                 for (int d = 0; d < nvir_; ++d) {
+                    RowMatXd M(nocc_, nocc_);
                     for (int L = 0; L < nocc_; ++L)
                         for (int J = 0; J < nocc_; ++J)
                             M(L, J) = h_Wovov[((static_cast<size_t>(L) * nvir_ + a) * nocc_ + J) * nvir_ + d];
@@ -1085,8 +1092,61 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
             }
             if (use_gpu_s1wvovv_) {
                 const size_t wsz = static_cast<size_t>(nvir_) * nocc_ * nvir_ * nvir_;
-                tracked_cudaMalloc(&d_Wvovv_, wsz * sizeof(real_t));
-                cudaMemcpy(d_Wvovv_, h_Wvovv_.data(), wsz * sizeof(real_t), cudaMemcpyHostToDevice);
+                // (M5c-c, 2026-07-23) When the full nvir·nocc·nvir² Wvovv upload
+                // does not fit (163.95 GB at decacene — the reason S1WVOVV used
+                // to be forced to the ~80 meV-divergent host σ1 fallback), STREAM
+                // it: keep h_Wvovv_ on host and H2D an a-slab per GEMV chunk in
+                // add_sigma1_gpu. A GEMV column chunk is an independent dot
+                // product per output a ⇒ arithmetic is IDENTICAL to the resident
+                // single GEMV (bit-identical, not approximate). Auto by free
+                // memory; GANSU_DLPNO_NATIVE_S1WVOVV_STREAM=1/0 forces.
+                bool stream = false;
+                {
+                    const char* e = std::getenv("GANSU_DLPNO_NATIVE_S1WVOVV_STREAM");
+                    if (e && e[0]) stream = (e[0] == '1');
+                    else {
+                        size_t fb = 0, tb = 0;
+                        cudaMemGetInfo(&fb, &tb);
+                        stream = ((double)wsz * sizeof(real_t) > 0.5 * (double)fb);
+                    }
+                }
+                if (stream) {
+                    const size_t M = static_cast<size_t>(nocc_) * nvir_ * nvir_;
+                    s1wvovv_slab_rows_ = std::max<int>(1,
+                        (int)(((size_t)2 << 30) / (M * sizeof(real_t))));
+                    if (s1wvovv_slab_rows_ > nvir_) s1wvovv_slab_rows_ = nvir_;
+                    tracked_cudaMalloc(&d_wvovv_slab_,
+                        (size_t)s1wvovv_slab_rows_ * M * sizeof(real_t));
+                    s1wvovv_stream_ = true;
+                    // (M5c-c2) PIN the host Wvovv once: pageable H2D crawls at
+                    // ~6-15 GB/s through the driver bounce buffer (164 GB/matvec
+                    // = 22-27 s at decacene, the dominant EA matvec cost);
+                    // page-locked transfers run at PCIe line rate (~55 GB/s →
+                    // ~3 s). Registration is a one-off (~tens of s at 164 GB);
+                    // failure (e.g. not enough lockable memory) just keeps the
+                    // pageable path — numerics identical either way.
+                    {
+                        cudaError_t rc = cudaHostRegister(
+                            h_Wvovv_.data(), wsz * sizeof(real_t),
+                            cudaHostRegisterPortable);
+                        if (rc == cudaSuccess) {
+                            s1wvovv_pinned_ = true;
+                        } else {
+                            cudaGetLastError();   // clear the sticky error
+                            std::cout << "[bt-PNO EA M5c-c2] h_Wvovv pin failed ("
+                                      << cudaGetErrorString(rc)
+                                      << ") — keeping pageable H2D." << std::endl;
+                        }
+                    }
+                    std::cout << "[bt-PNO EA M5c-c] sigma1 Wvovv·r2 STREAMED from host "
+                                 "(a-slab " << s1wvovv_slab_rows_ << " rows/GEMV chunk"
+                              << (s1wvovv_pinned_ ? ", host PINNED" : "")
+                              << "; full device upload elided — bit-identical to resident)"
+                              << std::endl;
+                } else {
+                    tracked_cudaMalloc(&d_Wvovv_, wsz * sizeof(real_t));
+                    cudaMemcpy(d_Wvovv_, h_Wvovv_.data(), wsz * sizeof(real_t), cudaMemcpyHostToDevice);
+                }
                 tracked_cudaMalloc(&d_r2c_sym_lcd_,
                                    static_cast<size_t>(nocc_) * nvir_ * nvir_ * sizeof(real_t));
             }
@@ -1726,6 +1786,8 @@ DLPNOEAEOMNativeOperator::~DLPNOEAEOMNativeOperator() {
     if (d_r1_)             tracked_cudaFree(d_r1_);
     if (d_Fov_)            tracked_cudaFree(d_Fov_);
     if (d_Wvovv_)          tracked_cudaFree(d_Wvovv_);
+    if (d_wvovv_slab_)     tracked_cudaFree(d_wvovv_slab_);
+    if (s1wvovv_pinned_)   cudaHostUnregister(const_cast<real_t*>(h_Wvovv_.data()));
     if (d_sigma1_)         tracked_cudaFree(d_sigma1_);
     if (d_r2c_sym_lcd_)    tracked_cudaFree(d_r2c_sym_lcd_);
     // Stage 5c: free the per-device σ2 replicas (d>0 only; ws_[0] aliases the device-0
@@ -1871,6 +1933,13 @@ void DLPNOEAEOMNativeOperator::compute_sigma2(
         tmp[K] = s;
       }
 
+    // (M5c-b, 2026-07-23) OUTER j parallelism: each j writes only its own local
+    // acc and its disjoint acc_export / packed_sigma2 block; every shared input
+    // (r2c/Uall/tmp/h_* borrows) is read-only here. The inner T_r1 omp pragma
+    // is auto-ignored under nesting. This was the EA host-round-trip matvec
+    // bottleneck (sigma2(host acc) = 1.14 s of a 1.25 s naph matvec; ~90% of a
+    // 190 s solve — per-j serial overhead, not FLOPs).
+    #pragma omp parallel for schedule(dynamic)
     for (int j = 0; j < nocc; ++j) {
         const int n = packing_.n_pno_ii[j];
         if (n == 0) continue;
@@ -2550,8 +2619,20 @@ void DLPNOEAEOMNativeOperator::add_sigma1_gpu(
         const int M = nocc_ * nv * nv;
         const int threads = 256, blocks = (M + threads - 1) / threads;
         dlpno_ea_native_r2c_sym_lcd_kernel<<<blocks, threads>>>(d_r2c_all_, d_r2c_sym_lcd_, nocc_, nv);
-        cublasDgemv(cublas, CUBLAS_OP_T, M, nv, &one, d_Wvovv_, M,
-                    d_r2c_sym_lcd_, 1, &one, d_sigma1_, 1);
+        if (s1wvovv_stream_) {
+            // (M5c-c) a-slab streamed GEMV: each column chunk is the same set of
+            // independent dot products as the resident single GEMV → bit-identical.
+            for (int a0 = 0; a0 < nv; a0 += s1wvovv_slab_rows_) {
+                const int na = std::min(s1wvovv_slab_rows_, nv - a0);
+                cudaMemcpy(d_wvovv_slab_, h_Wvovv_.data() + (size_t)a0 * M,
+                           (size_t)na * M * sizeof(real_t), cudaMemcpyHostToDevice);
+                cublasDgemv(cublas, CUBLAS_OP_T, M, na, &one, d_wvovv_slab_, M,
+                            d_r2c_sym_lcd_, 1, &one, d_sigma1_ + a0, 1);
+            }
+        } else {
+            cublasDgemv(cublas, CUBLAS_OP_T, M, nv, &one, d_Wvovv_, M,
+                        d_r2c_sym_lcd_, 1, &one, d_sigma1_, 1);
+        }
     }
     if (resident_) return;   // d_sigma1_ holds the full σ1; caller copies it D2D
     std::vector<real_t> add(static_cast<size_t>(nv), 0.0);
@@ -2799,6 +2880,19 @@ void DLPNOEAEOMNativeOperator::apply(const real_t* d_input, real_t* d_output) co
     std::vector<real_t> r1(h_in.begin(), h_in.begin() + nvir_);
     std::vector<real_t> packed_r2(h_in.begin() + nvir_, h_in.end());
 
+    // (M5c-b diagnostics) section timer for the host round-trip matvec —
+    // GANSU_EOM_PROGRESS=1 prints σ1 / lift / σ2-host / proj walls per matvec.
+    auto _sect0 = std::chrono::high_resolution_clock::now();
+    auto _sect = [&](const char* nm) {
+        if (!ea_progress) return;
+        const auto now = std::chrono::high_resolution_clock::now();
+        std::cout << "    [EA matvec-SECT] " << nm << " = " << std::fixed
+                  << std::setprecision(3)
+                  << std::chrono::duration<double>(now - _sect0).count() << " s"
+                  << std::endl;
+        _sect0 = now;
+    };
+
     // σ1: host builds the non-GPU terms (skip flags default false → byte-unchanged);
     // when σ1 GPU is on (⊂ use_gpu_xpair_), add_sigma1_gpu fills the skipped terms
     // below, after the lift has populated d_r2c_all_.
@@ -2806,6 +2900,7 @@ void DLPNOEAEOMNativeOperator::apply(const real_t* d_input, real_t* d_output) co
     compute_sigma1(r1, packed_r2, sigma1,
                    /*skip_lvv=*/use_gpu_s1lvv_, /*skip_fov=*/use_gpu_s1fov_,
                    /*skip_wvovv=*/use_gpu_s1wvovv_);
+    _sect("sigma1(host)");
 
     std::vector<real_t> packed_sigma2;
     if (use_gpu_xpair_) {
@@ -2814,10 +2909,12 @@ void DLPNOEAEOMNativeOperator::apply(const real_t* d_input, real_t* d_output) co
         // adds T_vvvv. NUMERICS-PRESERVING — the self-check confirms it bit-for-bit.
         std::vector<real_t> r2c_all(static_cast<size_t>(nocc_) * nvir_ * nvir_, 0.0);
         lift_r2c_gpu(packed_r2, r2c_all);
+        _sect("lift(gpu)");
         // σ1 (Stage 4): the lift just populated d_r2c_all_; add the enabled GPU σ1
         // terms onto the host-built sigma1 (which omitted them). NUMERICS-PRESERVING.
         if (use_gpu_s1lvv_) {
             add_sigma1_gpu(r1, sigma1);
+            _sect("sigma1-gpu(incl. Wvovv stream)");
             if (gpu_selfcheck_) {
                 std::vector<real_t> ref1;
                 compute_sigma1(r1, packed_r2, ref1);   // full host σ1
@@ -2836,8 +2933,10 @@ void DLPNOEAEOMNativeOperator::apply(const real_t* d_input, real_t* d_output) co
                        /*skip_loo=*/true, /*skip_ph2=*/use_gpu_ph2_, /*skip_ph3=*/use_gpu_ph3_,
                        /*skip_ph1=*/use_gpu_ph1_, /*skip_tmp=*/use_gpu_tmp_,
                        /*skip_tlvv=*/use_gpu_tlvv_, /*skip_tr1=*/use_gpu_tr1_);
+        _sect("sigma2(host acc)");
         packed_sigma2.assign(static_cast<size_t>(total_dim_ - nvir_), 0.0);
         apply_xpair_projection_gpu(r1, acc_all, packed_r2, packed_sigma2);
+        _sect("xpair+proj(gpu)");
         if (gpu_selfcheck_) {
             std::vector<real_t> ref;
             compute_sigma2(r1, packed_r2, ref, /*skip_tvvvv=*/false);  // full host
