@@ -806,6 +806,12 @@ static void compute_steom_ccsd_impl(RHF& rhf,
             EOMChainContext tmp;
             if (steom_ckpt_load(tmp, ck)) {
                 ckpt_loaded = true;
+                // (EA re-run probe) GANSU_STEOM_CKPT_IGNORE_EA=1 discards the
+                // restored EA stage so the EA solve re-runs from the resumed
+                // CIS/IP state (e.g. NATIVE_PROF ctor breakdown on a full-state
+                // ckpt with no after-IP file left). Default (unset): full restore.
+                if (const char* ig = std::getenv("GANSU_STEOM_CKPT_IGNORE_EA"))
+                    if (std::atoi(ig) != 0) tmp.ea_eom_result = EAEOMResult{};
                 ckpt_had_ea = !tmp.ea_eom_result.per_active.empty();
                 rhf.set_cis_nto_result(std::move(tmp.cis_nto_result));
                 rhf.set_ip_eom_result(std::move(tmp.ip_eom_result));
