@@ -254,6 +254,35 @@ void rotate_last_occ_gpu(cublasHandle_t cublas, const real_t* d_in, const real_t
     tracked_cudaFree(d_out);
 }
 
+// (2026-07-26) Host-source variant of rotate_last_occ_gpu for the W_HOST-staged
+// Wvvvo (device ptr null, bytes in the host stage): slab over the leading m axis,
+// per slab H2D → the SAME GEMM shape restricted to those columns → D2H. In the
+// col-major GEMM each output column is an independent U·in_col product, so the
+// m-chunking is bit-identical to the one-shot device GEMM. ~1 GiB slabs.
+void rotate_last_occ_gpu_hostsrc(cublasHandle_t cublas, const std::vector<real_t>& h_in,
+                                 const real_t* d_U, std::vector<real_t>& out,
+                                 size_t nlead, int nocc) {
+    const size_t sz = nlead * nocc;
+    out.assign(sz, 0.0);
+    const size_t slab_m = std::max<size_t>(
+        1, std::min<size_t>(nlead, (size_t(1) << 30) / (sizeof(real_t) * nocc)));
+    real_t *d_in = nullptr, *d_out = nullptr;
+    tracked_cudaMalloc(&d_in,  slab_m * nocc * sizeof(real_t));
+    tracked_cudaMalloc(&d_out, slab_m * nocc * sizeof(real_t));
+    const real_t one = 1.0, zero = 0.0;
+    for (size_t m0 = 0; m0 < nlead; m0 += slab_m) {
+        const size_t mact = std::min(slab_m, nlead - m0);
+        cudaMemcpy(d_in, h_in.data() + m0 * nocc, mact * nocc * sizeof(real_t),
+                   cudaMemcpyHostToDevice);
+        cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+            nocc, static_cast<int>(mact), nocc, &one,
+            d_U, nocc, d_in, nocc, &zero, d_out, nocc);
+        cudaMemcpy(out.data() + m0 * nocc, d_out, mact * nocc * sizeof(real_t),
+                   cudaMemcpyDeviceToHost);
+    }
+    tracked_cudaFree(d_in); tracked_cudaFree(d_out);
+}
+
 // Max-abs diff reporter for the B-a.6g rotation self-check (VALIDATE only).
 void rot_check_report(const char* tag, const char* nm,
                       const std::vector<real_t>& ref, const std::vector<real_t>& got) {
@@ -414,18 +443,63 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
     h_Wvovv_.assign(static_cast<size_t>(nvir_) * nocc_ * nvir_ * nvir_, 0.0);
     pull_device(ea_op.get_Lvv_device(),   h_Lvv_);
     pull_device(ea_op.get_Fov_device(),   h_Fov_);
-    pull_device(ea_op.get_Wvovv_device(), h_Wvovv_);
+    // (2026-07-26 fix) Under GANSU_EA_W_HOST=1 the canonical d_Wvovv_ is NEVER
+    // allocated (the σ host-stage owns the bytes) — pull_device() then silently
+    // zero-filled h_Wvovv_ and the σ1 Wvovv term vanished (naph native +2.5 eV
+    // shift; decacene production roots wrong). Borrow the host stage instead —
+    // it holds the SAME bytes the device build would (on-device a-slab assembly,
+    // D2H'd), so downstream σ1 streaming is bit-identical to the unstaged path.
+    if (ea_op.get_Wvovv_device() != nullptr) {
+        pull_device(ea_op.get_Wvovv_device(), h_Wvovv_);
+    } else if (ea_op.get_wvovv_host_stage().size() == h_Wvovv_.size()) {
+        std::copy(ea_op.get_wvovv_host_stage().begin(),
+                  ea_op.get_wvovv_host_stage().end(), h_Wvovv_.begin());
+        std::cout << "[EA-native] sigma1 Wvovv borrowed from the W_HOST host stage "
+                     "(device ptr null; bytes identical to the device build)" << std::endl;
+    } else if (gpu::gpu_available()) {
+        throw std::runtime_error(
+            "DLPNOEAEOMNativeOperator: canonical Wvovv neither on device nor "
+            "host-staged (size mismatch) — refusing the silent zero borrow.");
+    } else {
+        pull_device(nullptr, h_Wvovv_);   // CPU-only legacy path: zero-fill
+    }
+    _npmark("pre-dressed: sigma1 borrow (Lvv/Fov/Wvovv pull)");
 
     // Wvvvo [nvir·nvir·nvir·nocc], occ index j (4th) rotated canonical→LMO for T_r1:
     //   Wvvvo_lmo[a,b,c,j] = Σ_J U_loc[J,j] Wvvvo[a,b,c,J]   (single-occ; copy for none)
     // Layout ((a*nvir+b)*nvir+c)*nocc + j.
     {
         const size_t sz = static_cast<size_t>(nvir_) * nvir_ * nvir_ * nocc_;
+        // (2026-07-26 fix) Same silent-zero hazard as Wvovv: under W_HOST staging
+        // d_Wvvvo_ is null (pull_device zero-fills; rotate_last_occ_gpu returns
+        // zeros on null) → the T_r1 term vanished. Source the host stage instead.
+        const real_t* d_wvvvo = ea_op.get_Wvvvo_device();
+        const bool wvvvo_staged =
+            (d_wvvvo == nullptr) && (ea_op.get_wvvvo_host_stage().size() == sz);
+        if (d_wvvvo == nullptr && !wvvvo_staged && gpu::gpu_available())
+            throw std::runtime_error(
+                "DLPNOEAEOMNativeOperator: canonical Wvvvo neither on device nor "
+                "host-staged (size mismatch) — refusing the silent zero borrow.");
+        if (wvvvo_staged)
+            std::cout << "[EA-native] T_r1 Wvvvo borrowed from the W_HOST host stage "
+                         "(device ptr null; bytes identical to the device build)"
+                      << std::endl;
         if (uloc_is_identity(U_loc_, nocc_)) {
-            std::vector<real_t> h_Wvvvo(sz, 0.0);
-            pull_device(ea_op.get_Wvvvo_device(), h_Wvvvo);
-            h_Wvvvo_lmo_ = std::move(h_Wvvvo);
+            if (wvvvo_staged) {
+                h_Wvvvo_lmo_ = ea_op.get_wvvvo_host_stage();
+            } else {
+                std::vector<real_t> h_Wvvvo(sz, 0.0);
+                pull_device(d_wvvvo, h_Wvvvo);
+                h_Wvvvo_lmo_ = std::move(h_Wvvvo);
+            }
 #ifndef GANSU_CPU_ONLY
+        } else if (use_gpu_rot && wvvvo_staged) {
+            // Chunked host-source GEMM — bit-identical per column to the
+            // one-shot device GEMM below (independent U·in_col products).
+            rotate_last_occ_gpu_hostsrc(cublas_rot, ea_op.get_wvvvo_host_stage(),
+                                        d_U_rot, h_Wvvvo_lmo_,
+                                        static_cast<size_t>(nvir_) * nvir_ * nvir_,
+                                        nocc_);
         } else if (use_gpu_rot) {
             // B-a.6g: rotate the trailing occ index J→j on device (single cuBLAS
             // GEMM over m=(a,b,c)) instead of the host omp loop. Reads ea_op's
@@ -452,7 +526,11 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
 #endif
         } else {
             std::vector<real_t> h_Wvvvo(sz, 0.0);
-            pull_device(ea_op.get_Wvvvo_device(), h_Wvvvo);
+            if (wvvvo_staged)
+                std::copy(ea_op.get_wvvvo_host_stage().begin(),
+                          ea_op.get_wvvvo_host_stage().end(), h_Wvvvo.begin());
+            else
+                pull_device(d_wvvvo, h_Wvvvo);
             h_Wvvvo_lmo_.assign(sz, 0.0);
             const int nv = nvir_, no = nocc_;
             #pragma omp parallel for
@@ -468,6 +546,7 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
                 }
         }
     }
+    _npmark("pre-dressed: Wvvvo pull+rotate");
 
     // T_Loo: Loo [nocc²] both occ rotated canonical→LMO (U_locᵀ Loo U_loc; copy none).
     {
@@ -506,8 +585,27 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
     // redirected to another device → cross-device f5b is UNVERIFIED. Disable f5b
     // there (fall back to the validated F5 host-rotation path) until validated.
     const bool device_balancing = env_on("GANSU_STEOM_OPERATOR_DEVICE_BALANCING", false);
-    const bool f5b_active = use_native_bare_ && use_gpu_resident_ && !gpu_selfcheck_
-                            && !device_balancing;
+    // (2026-07-25) GANSU_EA_F5B_FORCE=1: opt-in relaxation of the two f5b blockers
+    // for the decacene production env (TR1=0 kills use_gpu_resident_; BALANCING=1
+    // trips the conservative cross-device guard). Structural requirements verified:
+    //  - ph1/ph2/ph3 all on GPU ⇒ BOTH d_Wovov_lmo_/d_Wovvo_re_ are allocated at
+    //    Stage 3b (the f5b call-site null guard can't half-fire) and the host
+    //    T_ph path in compute_sigma2 never runs, so h_W*_lmo_ have no reader.
+    //  - num_gpus_==1 ⇒ the multi-GPU slab gather (the only true device-0
+    //    dependence) is inactive. Under balancing the canonical EA op, this
+    //    operator, and cublas_ are all built on the SAME (current) device, so
+    //    borrow_ph_to_device_f5b's D2D/kernels/GEMMs are single-device.
+    // Default (unset) keeps the original gate — byte-identical.
+    const bool f5b_force = env_on("GANSU_EA_F5B_FORCE", false)
+                           && use_native_bare_ && !gpu_selfcheck_
+                           && use_gpu_ph1_ && use_gpu_ph2_ && use_gpu_ph3_
+                           && num_gpus_ == 1;
+    const bool f5b_active = (use_native_bare_ && use_gpu_resident_ && !gpu_selfcheck_
+                             && !device_balancing) || f5b_force;
+    if (f5b_force)
+        std::cout << "[bt-PNO B-a.6f EA F5b] FORCE gate on (env): on-device ph "
+                     "rotation despite resident-off/balancing (single-device verified)"
+                  << std::endl;
 
     // ph-ladder: Wovvo[l,b,d,j] (occ pos 0,3) and Wovov[l,b,j,d] (occ pos 0,2),
     // each with its two occ indices rotated canonical→LMO (copy none). Borrowed
@@ -583,6 +681,7 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
                 }
         }
     }
+    _npmark("pre-dressed: ph borrow (Wovvo/Wovov pull+rotate)");
 
     // T_tmp: eri_ovov [nocc·nvir·nocc·nvir] with the L (3rd, occ) index rotated
     // canonical→LMO; and CCSD T2 with the 2nd occ index rotated. Copy for none.
@@ -637,6 +736,7 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
                         }
         }
     }
+    _npmark("pre-dressed: T_tmp (ovov/t2 borrow+rotate)");
 
     // T_vvvv: Wvvvv [nvir⁴] is occ-free → borrow as-is. SKIPPED under the
     // B-EA.6e true-scaling bare path (Wvvvv^(jj) = W_pair + native_ring, no
@@ -1084,6 +1184,82 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
                 std::cout << "[bt-PNO EA M5c-a] host T_r1 pre-transposed to [j,a,b,c] "
                              "(tiled; contiguous + OpenMP per matvec; device upload elided)"
                           << std::endl;
+                // (M6b, 2026-07-26) Peer shard of the pre-transposed Wvvvo_r1: the
+                // per-j GEMV acc[j] += M_j·r1 is independent across j, so parking
+                // disjoint j-blocks on the other GPUs computes exactly the device
+                // T_r1 (add_tr1_gpu) — the term that TR1=0 pushed onto the host and
+                // that reads 176 GB of host RAM EVERY matvec. All-or-nothing: if
+                // some j has no home, keep the (validated) host path untouched.
+                // NOTE: enabling use_gpu_tr1_ HERE (after the env block computed
+                // use_gpu_resident_) deliberately leaves residency OFF — only the
+                // T_r1 term moves to the device, everything else is unchanged.
+                if (env_on("GANSU_EA_PEER_SHARD", false) && gpu::gpu_available()) {
+                    int ndev = 0; cudaGetDeviceCount(&ndev);
+                    int cur = 0;  cudaGetDevice(&cur);
+                    const size_t jblk = static_cast<size_t>(nvir_) * nvir_ * nvir_;
+                    const size_t jbytes = jblk * sizeof(real_t);
+                    std::vector<int> order;
+                    for (int d = 0; d < ndev; ++d) if (d != cur) order.push_back(d);
+                    order.push_back(cur);
+                    int j0 = 0;
+                    for (int d : order) {
+                        if (j0 >= nocc_) break;
+                        cudaSetDevice(d);
+                        size_t fb = 0, tb = 0;
+                        if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) continue;
+                        const double keep = (d == cur) ? 0.30 : 0.80;
+                        const size_t avail = (size_t)(keep * (double)fb);
+                        if (avail <= jbytes) continue;
+                        int nj = (int)std::min<size_t>((size_t)(nocc_ - j0), avail / jbytes);
+                        if (nj <= 0) continue;
+                        real_t *buf = nullptr, *rb = nullptr, *yb = nullptr;
+                        if (cudaMalloc(&buf, (size_t)nj * jbytes) != cudaSuccess) {
+                            cudaGetLastError(); continue;
+                        }
+                        if (cudaMalloc(&rb, (size_t)nvir_ * sizeof(real_t)) != cudaSuccess ||
+                            cudaMalloc(&yb, (size_t)nj * nvir_ * nvir_ * sizeof(real_t)) != cudaSuccess) {
+                            cudaGetLastError();
+                            if (rb) cudaFree(rb);
+                            cudaFree(buf); continue;
+                        }
+                        cudaMemcpy(buf, h_Wvvvo_r1_host_.data() + (size_t)j0 * jblk,
+                                   (size_t)nj * jbytes, cudaMemcpyHostToDevice);
+                        cublasHandle_t hs = nullptr; cublasCreate(&hs);
+                        tr1_devs_.push_back(d);   tr1_buf_.push_back(buf);
+                        tr1_r1_.push_back(rb);    tr1_y_.push_back(yb);
+                        tr1_cublas_.push_back(hs);
+                        tr1_j0_.push_back(j0);    tr1_nj_.push_back(nj);
+                        j0 += nj;
+                    }
+                    cudaSetDevice(cur);
+                    if (j0 >= nocc_) {
+                        tr1_peer_ = true;
+                        use_gpu_tr1_ = true;   // route T_r1 to add_tr1_gpu (sharded)
+                        tracked_cudaMalloc(&d_tr1_stage_,
+                            static_cast<size_t>(nocc_) * nvir_ * nvir_ * sizeof(real_t));
+                        if (!d_r1_)
+                            tracked_cudaMalloc(&d_r1_, static_cast<size_t>(nvir_) * sizeof(real_t));
+                        std::cout << "[bt-PNO EA M6b] T_r1 Wvvvo PEER-SHARDED over "
+                                  << tr1_devs_.size() << " GPU(s): ";
+                        for (size_t s = 0; s < tr1_devs_.size(); ++s)
+                            std::cout << "GPU" << tr1_devs_[s] << "[j " << tr1_j0_[s] << "+"
+                                      << tr1_nj_[s] << ", " << std::fixed << std::setprecision(1)
+                                      << (double)tr1_nj_[s] * jbytes / 1e9 << " GB] ";
+                        std::cout << "— host T_r1 sweep eliminated" << std::defaultfloat << std::endl;
+                        std::vector<real_t>().swap(h_Wvvvo_r1_host_);   // 176 GB host back
+                    } else if (!tr1_devs_.empty()) {
+                        for (size_t s = 0; s < tr1_devs_.size(); ++s) {
+                            cudaSetDevice(tr1_devs_[s]);
+                            cudaFree(tr1_buf_[s]); cudaFree(tr1_r1_[s]); cudaFree(tr1_y_[s]);
+                            cublasDestroy(reinterpret_cast<cublasHandle_t>(tr1_cublas_[s]));
+                        }
+                        cudaSetDevice(cur);
+                        tr1_devs_.clear(); tr1_buf_.clear(); tr1_r1_.clear();
+                        tr1_y_.clear(); tr1_cublas_.clear(); tr1_j0_.clear(); tr1_nj_.clear();
+                        std::cout << "[bt-PNO EA M6b] T_r1 peer shard ABORTED (only " << j0
+                                  << "/" << nocc_ << " j-blocks fit) — host path kept" << std::endl;
+                    }
+                }
             }
             // Stage 3c T_r1 / Stage 4 σ1 Lvv·r1: the r1 upload scratch (shared).
             if ((use_gpu_tr1_ || use_gpu_s1lvv_) && !d_r1_)
@@ -1118,11 +1294,74 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
                 }
                 if (stream) {
                     const size_t M = static_cast<size_t>(nocc_) * nvir_ * nvir_;
+                    // (M6a) Peer shard first: park as many a-rows as fit on the
+                    // OTHER GPUs (and the spare room here); only the remainder
+                    // keeps the per-matvec host stream. Row-disjoint ⇒ every
+                    // σ1[a] is the same dot product ⇒ bit-identical.
+                    s1w_host_rows_ = nvir_;
+                    if (env_on("GANSU_EA_PEER_SHARD", false)) {
+                        int ndev = 0; cudaGetDeviceCount(&ndev);
+                        int cur = 0;  cudaGetDevice(&cur);
+                        const size_t row_bytes = M * sizeof(real_t);
+                        // Peers first (the primary still hosts the ph buffers,
+                        // packs and Davidson subspace), then whatever is left here.
+                        std::vector<int> order;
+                        for (int d = 0; d < ndev; ++d) if (d != cur) order.push_back(d);
+                        order.push_back(cur);
+                        int a0 = 0;
+                        for (int d : order) {
+                            if (a0 >= nvir_) break;
+                            cudaSetDevice(d);
+                            size_t fb = 0, tb = 0;
+                            if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) continue;
+                            // reserve the per-shard x/y + working headroom
+                            const double keep = (d == cur) ? 0.35 : 0.80;
+                            const size_t avail = (size_t)(keep * (double)fb);
+                            if (avail <= row_bytes * 2) continue;
+                            int rows = (int)std::min<size_t>((size_t)(nvir_ - a0),
+                                                             (avail - row_bytes) / row_bytes);
+                            if (rows <= 0) continue;
+                            real_t *buf = nullptr, *xb = nullptr, *yb = nullptr;
+                            if (cudaMalloc(&buf, (size_t)rows * row_bytes) != cudaSuccess) {
+                                cudaGetLastError(); continue;
+                            }
+                            if (cudaMalloc(&xb, row_bytes) != cudaSuccess ||
+                                cudaMalloc(&yb, (size_t)rows * sizeof(real_t)) != cudaSuccess) {
+                                cudaGetLastError();
+                                if (xb) cudaFree(xb);
+                                cudaFree(buf); continue;
+                            }
+                            cudaMemcpy(buf, h_Wvovv_.data() + (size_t)a0 * M,
+                                       (size_t)rows * row_bytes, cudaMemcpyHostToDevice);
+                            cublasHandle_t hs = nullptr; cublasCreate(&hs);
+                            s1w_devs_.push_back(d);      s1w_buf_.push_back(buf);
+                            s1w_x_.push_back(xb);        s1w_y_.push_back(yb);
+                            s1w_cublas_.push_back(hs);
+                            s1w_a0_.push_back(a0);       s1w_na_.push_back(rows);
+                            a0 += rows;
+                        }
+                        cudaSetDevice(cur);
+                        if (!s1w_devs_.empty()) {
+                            s1w_peer_ = true;
+                            s1w_host_rows_ = nvir_ - a0;
+                            tracked_cudaMalloc(&d_s1w_stage_,
+                                               (size_t)nvir_ * sizeof(real_t));
+                            std::cout << "[bt-PNO EA M6a] sigma1 Wvovv PEER-SHARDED over "
+                                      << s1w_devs_.size() << " GPU(s): ";
+                            for (size_t s = 0; s < s1w_devs_.size(); ++s)
+                                std::cout << "GPU" << s1w_devs_[s] << "[" << s1w_na_[s]
+                                          << " rows, " << std::fixed << std::setprecision(1)
+                                          << (double)s1w_na_[s] * row_bytes / 1e9 << " GB] ";
+                            std::cout << "| host-stream rows = " << s1w_host_rows_
+                                      << std::defaultfloat << std::endl;
+                        }
+                    }
                     s1wvovv_slab_rows_ = std::max<int>(1,
                         (int)(((size_t)2 << 30) / (M * sizeof(real_t))));
                     if (s1wvovv_slab_rows_ > nvir_) s1wvovv_slab_rows_ = nvir_;
-                    tracked_cudaMalloc(&d_wvovv_slab_,
-                        (size_t)s1wvovv_slab_rows_ * M * sizeof(real_t));
+                    if (s1w_host_rows_ > 0)
+                        tracked_cudaMalloc(&d_wvovv_slab_,
+                            (size_t)std::min(s1wvovv_slab_rows_, s1w_host_rows_) * M * sizeof(real_t));
                     s1wvovv_stream_ = true;
                     // (M5c-c2) PIN the host Wvovv once: pageable H2D crawls at
                     // ~6-15 GB/s through the driver bounce buffer (164 GB/matvec
@@ -1131,7 +1370,7 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
                     // ~3 s). Registration is a one-off (~tens of s at 164 GB);
                     // failure (e.g. not enough lockable memory) just keeps the
                     // pageable path — numerics identical either way.
-                    {
+                    if (s1w_host_rows_ > 0) {
                         cudaError_t rc = cudaHostRegister(
                             h_Wvovv_.data(), wsz * sizeof(real_t),
                             cudaHostRegisterPortable);
@@ -1793,6 +2032,32 @@ DLPNOEAEOMNativeOperator::~DLPNOEAEOMNativeOperator() {
     if (d_Fov_)            tracked_cudaFree(d_Fov_);
     if (d_Wvovv_)          tracked_cudaFree(d_Wvovv_);
     if (d_wvovv_slab_)     tracked_cudaFree(d_wvovv_slab_);
+    if (d_s1w_stage_)      tracked_cudaFree(d_s1w_stage_);
+    if (d_tr1_stage_)      tracked_cudaFree(d_tr1_stage_);
+    if (tr1_peer_) {   // (M6b) release the per-device Wvvvo_r1 shards
+        int cur = 0; cudaGetDevice(&cur);
+        for (size_t s = 0; s < tr1_devs_.size(); ++s) {
+            cudaSetDevice(tr1_devs_[s]);
+            if (tr1_buf_[s]) cudaFree(tr1_buf_[s]);
+            if (tr1_r1_[s])  cudaFree(tr1_r1_[s]);
+            if (tr1_y_[s])   cudaFree(tr1_y_[s]);
+            if (tr1_cublas_[s])
+                cublasDestroy(reinterpret_cast<cublasHandle_t>(tr1_cublas_[s]));
+        }
+        cudaSetDevice(cur);
+    }
+    if (s1w_peer_) {   // (M6a) release the per-device Wvovv shards
+        int cur = 0; cudaGetDevice(&cur);
+        for (size_t s = 0; s < s1w_devs_.size(); ++s) {
+            cudaSetDevice(s1w_devs_[s]);
+            if (s1w_buf_[s]) cudaFree(s1w_buf_[s]);
+            if (s1w_x_[s])   cudaFree(s1w_x_[s]);
+            if (s1w_y_[s])   cudaFree(s1w_y_[s]);
+            if (s1w_cublas_[s])
+                cublasDestroy(reinterpret_cast<cublasHandle_t>(s1w_cublas_[s]));
+        }
+        cudaSetDevice(cur);
+    }
     if (s1wvovv_pinned_)   cudaHostUnregister(const_cast<real_t*>(h_Wvovv_.data()));
     if (d_sigma1_)         tracked_cudaFree(d_sigma1_);
     if (d_r2c_sym_lcd_)    tracked_cudaFree(d_r2c_sym_lcd_);
@@ -2567,6 +2832,49 @@ void DLPNOEAEOMNativeOperator::add_tlvv_gpu() const {
 void DLPNOEAEOMNativeOperator::add_tr1_gpu(const std::vector<real_t>& r1) const {
 #ifndef GANSU_CPU_ONLY
     cublasHandle_t cublas = reinterpret_cast<cublasHandle_t>(cublas_);
+    if (tr1_peer_) {
+        // (M6b) j-block shards: each device runs the SAME per-j GEMV on its own
+        // blocks (β=0 into a local y), the disjoint results are gathered on the
+        // primary and added in one axpy — arithmetic identical to the resident
+        // per-j GEMV loop below.
+        int cur = 0; cudaGetDevice(&cur);
+        if (!resident_)
+            cudaMemcpy(d_r1_, r1.data(), static_cast<size_t>(nvir_) * sizeof(real_t),
+                       cudaMemcpyHostToDevice);
+        const real_t* r1src = resident_ ? d_r1_src_ : d_r1_;
+        const int nv = nvir_;
+        const size_t nv2 = static_cast<size_t>(nv) * nv;
+        const real_t one_l = 1.0, zero_l = 0.0;
+        cudaMemsetAsync(d_tr1_stage_, 0, (size_t)nocc_ * nv2 * sizeof(real_t));
+        cudaDeviceSynchronize();   // r1 source ready before the peers read it
+        for (size_t s = 0; s < tr1_devs_.size(); ++s) {
+            cudaSetDevice(tr1_devs_[s]);
+            cudaMemcpyPeer(tr1_r1_[s], tr1_devs_[s], r1src, cur,
+                           static_cast<size_t>(nv) * sizeof(real_t));
+            for (int t = 0; t < tr1_nj_[s]; ++t) {
+                const int j = tr1_j0_[s] + t;
+                if (packing_.n_pno_ii[j] == 0) {
+                    cudaMemsetAsync(tr1_y_[s] + (size_t)t * nv2, 0, nv2 * sizeof(real_t));
+                    continue;
+                }
+                cublasDgemv(reinterpret_cast<cublasHandle_t>(tr1_cublas_[s]),
+                            CUBLAS_OP_T, nv, nv * nv, &one_l,
+                            tr1_buf_[s] + (size_t)t * nv2 * nv, nv,
+                            tr1_r1_[s], 1, &zero_l,
+                            tr1_y_[s] + (size_t)t * nv2, 1);
+            }
+        }
+        for (size_t s = 0; s < tr1_devs_.size(); ++s) {
+            cudaSetDevice(tr1_devs_[s]);
+            cudaDeviceSynchronize();
+            cudaMemcpyPeer(d_tr1_stage_ + (size_t)tr1_j0_[s] * nv2, cur, tr1_y_[s],
+                           tr1_devs_[s], (size_t)tr1_nj_[s] * nv2 * sizeof(real_t));
+        }
+        cudaSetDevice(cur);
+        const int total = static_cast<int>((size_t)nocc_ * nv2);
+        cublasDaxpy(cublas, total, &one_l, d_tr1_stage_, 1, d_acc_all_, 1);
+        return;
+    }
     if (!resident_)
         cudaMemcpy(d_r1_, r1.data(), static_cast<size_t>(nvir_) * sizeof(real_t), cudaMemcpyHostToDevice);
     const real_t* r1src = resident_ ? d_r1_src_ : d_r1_;   // r1 device source
@@ -2628,7 +2936,40 @@ void DLPNOEAEOMNativeOperator::add_sigma1_gpu(
         const int M = nocc_ * nv * nv;
         const int threads = 256, blocks = (M + threads - 1) / threads;
         dlpno_ea_native_r2c_sym_lcd_kernel<<<blocks, threads>>>(d_r2c_all_, d_r2c_sym_lcd_, nocc_, nv);
-        if (s1wvovv_stream_) {
+        if (s1w_peer_) {
+            // (M6a) Peer-resident a-row shards: broadcast the (l,c,d) vector once
+            // per device, GEMV locally (β=0 into the shard's own y), then gather
+            // the disjoint σ1 slices and add them in one axpy. Same per-a dot
+            // product as the single resident GEMV ⇒ bit-identical.
+            int cur = 0; cudaGetDevice(&cur);
+            cudaMemsetAsync(d_s1w_stage_, 0, (size_t)nv * sizeof(real_t));
+            const real_t zero = 0.0;
+            cudaDeviceSynchronize();   // d_r2c_sym_lcd_ ready before the peer reads
+            for (size_t s = 0; s < s1w_devs_.size(); ++s) {
+                cudaSetDevice(s1w_devs_[s]);
+                cudaMemcpyPeer(s1w_x_[s], s1w_devs_[s], d_r2c_sym_lcd_, cur,
+                               M * sizeof(real_t));
+                cublasDgemv(reinterpret_cast<cublasHandle_t>(s1w_cublas_[s]),
+                            CUBLAS_OP_T, M, s1w_na_[s], &one, s1w_buf_[s], M,
+                            s1w_x_[s], 1, &zero, s1w_y_[s], 1);
+            }
+            for (size_t s = 0; s < s1w_devs_.size(); ++s) {
+                cudaSetDevice(s1w_devs_[s]);
+                cudaDeviceSynchronize();
+                cudaMemcpyPeer(d_s1w_stage_ + s1w_a0_[s], cur, s1w_y_[s],
+                               s1w_devs_[s], (size_t)s1w_na_[s] * sizeof(real_t));
+            }
+            cudaSetDevice(cur);
+            // Remainder rows (if any) keep the host stream, straight into d_sigma1_.
+            for (int a0 = nv - s1w_host_rows_; a0 < nv; a0 += s1wvovv_slab_rows_) {
+                const int na = std::min(s1wvovv_slab_rows_, nv - a0);
+                cudaMemcpy(d_wvovv_slab_, h_Wvovv_.data() + (size_t)a0 * M,
+                           (size_t)na * M * sizeof(real_t), cudaMemcpyHostToDevice);
+                cublasDgemv(cublas, CUBLAS_OP_T, M, na, &one, d_wvovv_slab_, M,
+                            d_r2c_sym_lcd_, 1, &one, d_sigma1_ + a0, 1);
+            }
+            cublasDaxpy(cublas, nv, &one, d_s1w_stage_, 1, d_sigma1_, 1);
+        } else if (s1wvovv_stream_) {
             // (M5c-c) a-slab streamed GEMV: each column chunk is the same set of
             // independent dot products as the resident single GEMV → bit-identical.
             for (int a0 = 0; a0 < nv; a0 += s1wvovv_slab_rows_) {

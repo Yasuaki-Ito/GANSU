@@ -431,6 +431,36 @@ private:
     bool    s1wvovv_pinned_    = false;   // h_Wvovv_ cudaHostRegister'd (M5c-c2)
     int     s1wvovv_slab_rows_ = 0;
     real_t* d_wvovv_slab_      = nullptr;
+    // (M6a peer shard, 2026-07-26) Instead of streaming the whole 176 GB Wvovv
+    // from host EVERY matvec (3+ s at decacene = the EA Davidson's dominant
+    // cost), park disjoint a-row blocks on the OTHER GPUs once and run a local
+    // GEMV per shard. Each output element σ1[a] is the same single dot product
+    // over the same (l,c,d) vector — row partitioning cannot change it, so the
+    // result is bit-identical (same argument the M5c-c column chunking uses).
+    // Rows that do not fit anywhere fall back to the host stream (hybrid).
+    // env GANSU_EA_PEER_SHARD=1 opts in; unset ⇒ byte-identical legacy path.
+    bool                 s1w_peer_        = false;
+    std::vector<int>     s1w_devs_;       ///< shard device ids
+    std::vector<real_t*> s1w_buf_;        ///< [na×M] Wvovv rows resident on that device
+    std::vector<real_t*> s1w_x_;          ///< [M] per-device copy of d_r2c_sym_lcd_
+    std::vector<real_t*> s1w_y_;          ///< [na] per-device partial σ1
+    std::vector<void*>   s1w_cublas_;     ///< per-device cublas handle
+    std::vector<int>     s1w_a0_, s1w_na_;
+    int                  s1w_host_rows_   = 0;        ///< rows left on the host stream
+    real_t*              d_s1w_stage_     = nullptr;  ///< [nvir] primary-side gather buffer
+    // (M6b, 2026-07-26) The same peer shard for the T_r1 Wvvvo tensor, which the
+    // decacene env computes on the HOST every matvec (TR1=0 forced because the
+    // 176 GB never fit one device). Sharded by occupied j — the per-j GEMV
+    // acc[j] += Wvvvo_r1[j]·r1 is independent, so the partition changes nothing.
+    // All-or-nothing: enabled only when every j finds a home (no host hybrid).
+    bool                 tr1_peer_        = false;
+    std::vector<int>     tr1_devs_;
+    std::vector<real_t*> tr1_buf_;        ///< [nj×nvir³] Wvvvo_r1 j-blocks on that device
+    std::vector<real_t*> tr1_r1_;         ///< [nvir] per-device r1 copy
+    std::vector<real_t*> tr1_y_;          ///< [nj×nvir²] per-device partial acc
+    std::vector<void*>   tr1_cublas_;
+    std::vector<int>     tr1_j0_, tr1_nj_;
+    real_t*              d_tr1_stage_     = nullptr;  ///< [nocc·nvir²] primary gather buffer
     real_t* d_sigma1_      = nullptr;    ///< [nvir] σ1 device accumulator
     real_t* d_r2c_sym_lcd_ = nullptr;    ///< [nocc·nvir·nvir] (l,c,d)-ordered 2R-Rᵀ for Wvovv·r2
 

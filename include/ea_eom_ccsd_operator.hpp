@@ -127,6 +127,14 @@ public:
     /// dense device block was elided (native-bare lean mode). The native
     /// operator borrows it (T_tmp seed) instead of get_eri_ovov_device().
     const std::vector<real_t>& get_eri_ovov_host() const { return h_ovov_mirror_; }
+    /// (EA σ host-stage) Full host copies of the two NV³·NO dressed tensors when
+    /// GANSU_EA_W_HOST staged them (the device ptrs are null then). Byte-identical
+    /// to the elided device builds (same on-device a-slab assembly, D2H'd into the
+    /// stage). The native operator MUST borrow these when the device ptrs are null:
+    /// pull_device() zero-fills on null — that silent zero was the naph +2.5 eV /
+    /// decacene wrong-roots bug under W_HOST=1 (2026-07-26).
+    const std::vector<real_t>& get_wvovv_host_stage() const { return h_wvovv_stage_; }
+    const std::vector<real_t>& get_wvvvo_host_stage() const { return h_wvvvo_stage_; }
 
     /// Print intermediate Frobenius norms (used by ea_eom_verbose ≥ 2 for
     /// PySCF cross-validation in sub-phases 2.3-2.6). Sub-phase 2.0+2.1
