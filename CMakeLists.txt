@@ -50,6 +50,17 @@ if(ENABLE_GPU)
     # comparison guards against CMake 3.24+'s autodetect leaving the variable
     # set to an unhelpful default — we want our 80;86;90 to win in fresh
     # builds while still letting the wheel CI pass 80;86;89;90;100;120.
+    #
+    # `native` MUST stay on this list (2026-07-27: verified the hard way).
+    # CMake resolves `native` by creating a CUDA context to query the local
+    # device; on a box whose GPUs are all in Exclusive_Process mode and busy,
+    # that query fails and CMake silently writes a fallback (observed: 75) into
+    # the cache. The build then succeeds and produces a binary that cannot run
+    # on the machine that built it ("no kernel image is available"). Letting
+    # `native` through is therefore not user-friendliness, it is a trap.
+    # Users targeting another card should pass the number explicitly, e.g.
+    # -DCMAKE_CUDA_ARCHITECTURES=120 for a consumer Blackwell (sm_120) board;
+    # explicit numeric values are never overridden here.
     if(NOT CMAKE_CUDA_ARCHITECTURES OR
        CMAKE_CUDA_ARCHITECTURES STREQUAL "" OR
        CMAKE_CUDA_ARCHITECTURES STREQUAL "native" OR

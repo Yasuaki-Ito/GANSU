@@ -1665,6 +1665,66 @@ DLPNOEAEOMNativeOperator::DLPNOEAEOMNativeOperator(
                          "(on-device rotation; transient ctor peak also avoided)"
                       << std::endl;
         }
+        // (M6c, 2026-07-27) Wvovv shard TOP-UP. The M6a pass runs early, while the
+        // build's transient buffers still occupy the peers (decacene: GPU1/GPU3 had
+        // < 2 GB free then, so 219 of 612 rows stayed on the host stream = 63 GB of
+        // H2D per matvec). Everything transient is released by now, so retry the
+        // leftover rows against the CURRENT free memory. Row-disjoint ⇒ still
+        // bit-identical; a failed placement simply leaves the rows streaming.
+        if (s1w_peer_ && s1w_host_rows_ > 0 && !h_Wvovv_.empty()) {
+            const size_t M = static_cast<size_t>(nocc_) * nvir_ * nvir_;
+            const size_t row_bytes = M * sizeof(real_t);
+            int ndev = 0; cudaGetDeviceCount(&ndev);
+            int cur = 0;  cudaGetDevice(&cur);
+            const int before = s1w_host_rows_;
+            int a0 = nvir_ - s1w_host_rows_;
+            std::vector<int> order;
+            for (int d = 0; d < ndev; ++d) if (d != cur) order.push_back(d);
+            order.push_back(cur);
+            for (int d : order) {
+                if (s1w_host_rows_ <= 0) break;
+                cudaSetDevice(d);
+                size_t fb = 0, tb = 0;
+                if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) continue;
+                const double keep = (d == cur) ? 0.30 : 0.75;
+                const size_t avail = (size_t)(keep * (double)fb);
+                if (avail <= row_bytes * 2) continue;
+                int rows = (int)std::min<size_t>((size_t)s1w_host_rows_,
+                                                 (avail - row_bytes) / row_bytes);
+                if (rows <= 0) continue;
+                real_t *buf = nullptr, *xb = nullptr, *yb = nullptr;
+                if (cudaMalloc(&buf, (size_t)rows * row_bytes) != cudaSuccess) {
+                    cudaGetLastError(); continue;
+                }
+                if (cudaMalloc(&xb, row_bytes) != cudaSuccess ||
+                    cudaMalloc(&yb, (size_t)rows * sizeof(real_t)) != cudaSuccess) {
+                    cudaGetLastError();
+                    if (xb) cudaFree(xb);
+                    cudaFree(buf); continue;
+                }
+                cudaMemcpy(buf, h_Wvovv_.data() + (size_t)a0 * M,
+                           (size_t)rows * row_bytes, cudaMemcpyHostToDevice);
+                cublasHandle_t hs = nullptr; cublasCreate(&hs);
+                s1w_devs_.push_back(d);   s1w_buf_.push_back(buf);
+                s1w_x_.push_back(xb);     s1w_y_.push_back(yb);
+                s1w_cublas_.push_back(hs);
+                s1w_a0_.push_back(a0);    s1w_na_.push_back(rows);
+                a0 += rows;  s1w_host_rows_ -= rows;
+            }
+            cudaSetDevice(cur);
+            if (s1w_host_rows_ < before) {
+                std::cout << "[bt-PNO EA M6c] Wvovv shard top-up: host-stream rows "
+                          << before << " → " << s1w_host_rows_
+                          << " (transient build buffers freed; "
+                          << std::fixed << std::setprecision(1)
+                          << (double)(before - s1w_host_rows_) * row_bytes / 1e9
+                          << " GB/matvec of H2D removed)" << std::defaultfloat << std::endl;
+                if (s1w_host_rows_ == 0 && s1wvovv_pinned_) {
+                    cudaHostUnregister(const_cast<real_t*>(h_Wvovv_.data()));
+                    s1wvovv_pinned_ = false;
+                }
+            }
+        }
     } else {
         use_gpu_ = false; gpu_selfcheck_ = false; use_gpu_proj_ = false;
         use_gpu_lift_ = false; use_gpu_xpair_ = false;
