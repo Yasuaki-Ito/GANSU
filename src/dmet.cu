@@ -749,13 +749,25 @@ STEOMResult DMET::solve_fragment_steom(
         const int nfz       = rhf_.get_num_frozen_core();
         const real_t* d_C   = rhf_.get_coefficient_matrix().device_ptr();
         const real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
-        real_t* d_eri_mo = eri_method.build_mo_eri(d_C, nao);
         std::cout << "  [DMET-STEOM] full-system cluster (n_emb = nao = " << nao
-                  << ") → plain STEOM reduction." << std::endl;
-        STEOMResult r = steom_spatial_orbital(rhf_, eri_method, d_C, d_eps, d_eri_mo,
-                                              /*nao=*/nao, /*n_emb=*/nao,
-                                              /*n_emb_occ=*/full_occ, n_states, nfz);
-        tracked_cudaFree(d_eri_mo);
+                  << ") → plain reduction (" << rhf_.get_dmet_excited_method() << ")." << std::endl;
+        // Full RHF ε are physical (no level shift) → valid for ADC(2) directly.
+        STEOMResult r;
+        if (rhf_.get_dmet_excited_method() == "adc2") {
+            const bool adc2_dense = (std::getenv("GANSU_DMET_ADC2_DENSE") != nullptr);
+            const bool adc2_ri = !adc2_dense && gpu::gpu_available()
+                                 && (dynamic_cast<ERI_RI*>(&eri_method) != nullptr);
+            real_t* d_eri_mo = adc2_ri ? nullptr : eri_method.build_mo_eri(d_C, nao);
+            r = adc2_spatial_orbital(rhf_, eri_method, d_C, d_eps, d_eri_mo,
+                                     /*nao=*/nao, /*n_emb=*/nao, /*n_emb_occ=*/full_occ, n_states, nfz);
+            if (d_eri_mo) tracked_cudaFree(d_eri_mo);
+        } else {
+            real_t* d_eri_mo = eri_method.build_mo_eri(d_C, nao);
+            r = steom_spatial_orbital(rhf_, eri_method, d_C, d_eps, d_eri_mo,
+                                      /*nao=*/nao, /*n_emb=*/nao,
+                                      /*n_emb_occ=*/full_occ, n_states, nfz);
+            tracked_cudaFree(d_eri_mo);
+        }
         return r;
     }
 
@@ -800,10 +812,12 @@ STEOMResult DMET::solve_fragment_steom(
     // (raw -= s·t2, val -= s·t1) and converges to the TRUE unshifted energy instead of
     // the biased one (~0.075 Ha on the {0-9} cluster). Off ⇒ legacy biased direct form.
     real_t cluster_level_shift = 0.0;
+    std::vector<real_t> h_eps_phys;   // PHYSICAL (un-shifted) cluster ε — for the ADC(2) path
     const bool denom_only_ls = (std::getenv("GANSU_DMET_LEVEL_SHIFT_DENOM_ONLY") != nullptr);
     {
         std::vector<real_t> h_eps(n_emb);
         cudaMemcpy(h_eps.data(), d_eigvals, n_emb * sizeof(real_t), cudaMemcpyDeviceToHost);
+        h_eps_phys = h_eps;   // raw ε, before any level shift (line ~857 shifts h_eps in place)
 
         // (ii) DMET frozen-core propagation. --frozen_core sets the *molecular* core
         // count, but the DMET embedding rebuilds the all-electron cluster (incoming
@@ -888,18 +902,37 @@ STEOMResult DMET::solve_fragment_steom(
     //    steom_spatial_orbital reads the same env into ctx.prefer_ri_block, so
     //    passing d_eri_mo == nullptr routes the whole chain through the cluster B.
     //    Default off ⇒ dense build_mo_eri ⇒ byte-identical.
-    const bool ri_block = (std::getenv("GANSU_DMET_STEOM_RI_BLOCK") != nullptr)
-                          && gpu::gpu_available()
-                          && (dynamic_cast<ERI_RI*>(&eri_method) != nullptr);
-    real_t* d_eri_mo = ri_block ? nullptr : eri_method.build_mo_eri(d_C_can, n_emb);
-    STEOMResult r = steom_spatial_orbital(rhf_, eri_method, d_C_can, d_eigvals, d_eri_mo,
-                                          /*nao=*/nao, /*n_emb=*/n_emb,
-                                          /*n_emb_occ=*/n_emb_occ, n_states, n_frozen,
-                                          /*level_shift=*/cluster_level_shift);
+    STEOMResult r;
+    if (rhf_.get_dmet_excited_method() == "adc2") {
+        // ADC(2) on the cluster. Uses the PHYSICAL (un-shifted) ε. With an RI
+        // engine, adc2_spatial_orbital builds the ovov/vvov/ooov/oovv blocks from
+        // the cluster B (no dense n_emb⁴) → pass d_eri_mo = nullptr. Only for a
+        // non-RI engine (or GANSU_DMET_ADC2_DENSE=1) do we build the dense tensor.
+        real_t* d_eps_phys = nullptr;
+        tracked_cudaMalloc(&d_eps_phys, n_emb * sizeof(real_t));
+        cudaMemcpy(d_eps_phys, h_eps_phys.data(), n_emb * sizeof(real_t), cudaMemcpyHostToDevice);
+        const bool adc2_dense = (std::getenv("GANSU_DMET_ADC2_DENSE") != nullptr);
+        const bool adc2_ri = !adc2_dense && gpu::gpu_available()
+                             && (dynamic_cast<ERI_RI*>(&eri_method) != nullptr);
+        real_t* d_eri_mo = adc2_ri ? nullptr : eri_method.build_mo_eri(d_C_can, n_emb);
+        r = adc2_spatial_orbital(rhf_, eri_method, d_C_can, d_eps_phys, d_eri_mo,
+                                 nao, n_emb, n_emb_occ, n_states, n_frozen);
+        tracked_cudaFree(d_eps_phys);
+        if (d_eri_mo) tracked_cudaFree(d_eri_mo);
+    } else {
+        const bool ri_block = (std::getenv("GANSU_DMET_STEOM_RI_BLOCK") != nullptr)
+                              && gpu::gpu_available()
+                              && (dynamic_cast<ERI_RI*>(&eri_method) != nullptr);
+        real_t* d_eri_mo = ri_block ? nullptr : eri_method.build_mo_eri(d_C_can, n_emb);
+        r = steom_spatial_orbital(rhf_, eri_method, d_C_can, d_eigvals, d_eri_mo,
+                                  /*nao=*/nao, /*n_emb=*/n_emb,
+                                  /*n_emb_occ=*/n_emb_occ, n_states, n_frozen,
+                                  /*level_shift=*/cluster_level_shift);
+        if (d_eri_mo) tracked_cudaFree(d_eri_mo);
+    }
 
     tracked_cudaFree(d_eigvals); tracked_cudaFree(d_eigvecs);
     tracked_cudaFree(d_C_can);
-    if (d_eri_mo) tracked_cudaFree(d_eri_mo);
     return r;
 }
 
@@ -907,7 +940,9 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
     const int nao  = num_basis_;
     const int nocc = num_occ_;
 
-    std::cout << "\n==== DMET-STEOM-CCSD (Phase 1: single-shot μ=0 embedding) ====" << std::endl;
+    const std::string excited_label =
+        (rhf_.get_dmet_excited_method() == "adc2") ? "DMET-ADC(2)" : "DMET-STEOM-CCSD";
+    std::cout << "\n==== " << excited_label << " (Phase 1: single-shot μ=0 embedding) ====" << std::endl;
     std::cout << "  nao=" << nao << " nocc=" << nocc << " num_atoms=" << num_atoms_ << std::endl;
 
     // Chromophore fragment selection. Priority: explicit --dmet_fragments (fragment

@@ -508,10 +508,13 @@ int partialEigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, rea
         // Eigenvalues are ascending by default in Eigen
         Eigen::Map<Eigen::VectorXd>(d_eigenvalues, num_eigenvalues) = solver.eigenvalues().head(num_eigenvalues);
 
-        // Store eigenvectors (same convention as eigenDecomposition: column j = eigvec j)
-        using RowMajorMatrixXd = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-        Eigen::Map<RowMajorMatrixXd> evecs(d_eigenvectors, size, size);
-        evecs = solver.eigenvectors(); // NOT transpose
+        // Store the lowest num_eigenvalues eigenvectors as CONTIGUOUS ROWS:
+        // d_eigenvectors[k*size + i] = (eigvec k)_i. This matches the GPU path below
+        // and the schur solvers' row-k extraction. (The old code wrote the whole n×n
+        // with a column-j convention, which the row-k consumers then read scrambled.)
+        for (int k = 0; k < num_eigenvalues; ++k)
+            Eigen::Map<Eigen::VectorXd>(d_eigenvectors + (size_t)k * size, size) =
+                solver.eigenvectors().col(k);
 
         return 0;
 #ifndef GANSU_CPU_ONLY
@@ -567,12 +570,15 @@ int partialEigenDecomposition(const real_t* d_matrix, real_t* d_eigenvalues, rea
         d_info
     );
 
-    // Copy eigenvectors: first h_meig columns of d_temp_matrix → d_eigenvectors
-    // Store as full n×n to maintain same layout as eigenDecomposition
-    cudaMemcpy(d_eigenvectors, d_temp_matrix, (size_t)size * size * sizeof(real_t), cudaMemcpyDeviceToDevice);
-
-    // Transpose eigenvectors (same convention as eigenDecomposition)
-    transposeMatrixInPlace(d_eigenvectors, size);
+    // cusolverDnXsyevdx (RANGE_I) writes the lowest-k eigenvectors into the FIRST
+    // k columns of d_temp_matrix (col-major); the remaining columns are uncomputed
+    // workspace. A col-major column k is already the CONTIGUOUS k-th eigenvector, so
+    // copy just those k columns verbatim → d_eigenvectors[k*size + i] = (eigvec k)_i,
+    // i.e. eigenvector k in contiguous row k. Do NOT transpose the full n×n: that
+    // mixed valid columns with uncomputed garbage (the historical layout bug). This
+    // is exactly the row-k layout the schur solvers extract; rows ≥ k are untouched.
+    cudaMemcpy(d_eigenvectors, d_temp_matrix,
+               (size_t)num_eigenvalues * size * sizeof(real_t), cudaMemcpyDeviceToDevice);
 
     int h_info_val;
     cudaMemcpy(&h_info_val, d_info, sizeof(int), cudaMemcpyDeviceToHost);

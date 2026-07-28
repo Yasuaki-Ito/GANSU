@@ -127,6 +127,11 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
         throw std::runtime_error("Invalid dmet_cluster_solver: '" + dmet_cluster_solver_ +
                                  "'. Must be 'canonical' or 'dlpno'.");
     }
+    dmet_excited_method_ = toLowerCase(parameters.get<std::string>("dmet_excited_method"));
+    if (dmet_excited_method_ != "steom" && dmet_excited_method_ != "adc2") {
+        throw std::runtime_error("Invalid dmet_excited_method: '" + dmet_excited_method_ +
+                                 "'. Must be 'steom' or 'adc2'.");
+    }
     dmet_n_tol_ = parameters.get<double>("dmet_n_tol");
     dmet_steom_auto_fragment_   = parameters.get<bool>("dmet_steom_auto_fragment");
     dmet_steom_auto_coverage_   = parameters.get<double>("dmet_steom_auto_coverage");

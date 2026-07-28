@@ -85,6 +85,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"dmet_threshold", "1e-6"},                        // real_t: SVD threshold for bath orbital selection
         {"dmet_mu_refine_ccsd", "0"},                      // bool (0/1): refine μ with CCSD-relaxed density after HF stage
         {"dmet_cluster_solver", "canonical"},              // string: dmet_steom cluster ground-state solver — "canonical" (exact cluster CCSD) or "dlpno" (cluster-space DLPNO-CCSD + bt-polish; the ~500-orbital-cluster production mode, formerly env GANSU_DMET_STEOM_DLPNO=2 which still overrides when set)
+        {"dmet_excited_method", "steom"},                  // string: DMET cluster excited-state solver on the embedded cluster — "steom" (default; STEOM-CCSD chain) or "adc2" (ADC(2), cheaper, supports triplets). Shares the same auto-fragment / bath machinery.
         {"dmet_n_tol", "1e-5"},                            // real_t: bisection tol on |Σ N_frag − N_elec| (Vayesta-compat: 4.2e-3 for benzene)
         // CIS-guided automatic fragment extraction for DMET-STEOM (excitation-driven,
         // real-space atomic fragment). Distinct from the ground-state dmet_fragments

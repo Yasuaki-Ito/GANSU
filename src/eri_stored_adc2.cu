@@ -33,11 +33,14 @@
 
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>   // std::getenv (GANSU_ADC2_OMEGA_REFINE)
 
 #include "rhf.hpp"
+#include "eri.hpp"
 #include "adc2_operator.hpp"
 #include "adc2_full_operator.hpp"
 #include "davidson_solver.hpp"
@@ -47,6 +50,7 @@
 #include "utils.hpp"
 #include "profiler.hpp"
 #include "oscillator_strength.hpp"
+#include "eom_chain_context.hpp"   // STEOMResult + adc2_spatial_orbital declaration
 
 namespace gansu {
 
@@ -75,7 +79,10 @@ static void solve_schur_static(
 
     { double v[] = {0.0}; report_progress("schur", 0, 1, v); }  // diagonalization
     adc2_op.build_M_eff_matrix(0.0, d_M_eff);
-    gpu::eigenDecomposition(d_M_eff, d_eigenvalues, d_eigenvectors, singles_dim);
+    // Only the n_states lowest roots are needed — a full syevd of the singles×singles
+    // M_eff computes ALL eigenpairs (O(singles³): ~an hour at singles≈30k). The partial
+    // solver (syevdx, lowest n_states) is O(singles²·n_states) → minutes.
+    gpu::partialEigenDecomposition(d_M_eff, d_eigenvalues, d_eigenvectors, singles_dim, n_states);
 
     std::vector<real_t> h_eigenvalues(singles_dim);
     cudaMemcpy(h_eigenvalues.data(), d_eigenvalues,
@@ -125,9 +132,9 @@ static void solve_schur_omega(
     tracked_cudaMalloc(&d_eigenvectors, (size_t)singles_dim * singles_dim * sizeof(real_t));
 
     // Phase 1: Initial solve with ω=0 (= schur_static) for initial guesses
-    // Use partial eigendecomposition (cusolverDnXsyevdx) — only need n_states lowest.
+    // Partial eigendecomposition (cusolverDnXsyevdx) — only need n_states lowest.
     adc2_op.build_M_eff_matrix(0.0, d_M_eff);
-    gpu::eigenDecomposition(d_M_eff, d_eigenvalues, d_eigenvectors, singles_dim);
+    gpu::partialEigenDecomposition(d_M_eff, d_eigenvalues, d_eigenvectors, singles_dim, n_states);
 
     std::vector<real_t> h_eigenvalues(singles_dim);
     cudaMemcpy(h_eigenvalues.data(), d_eigenvalues,
@@ -145,7 +152,7 @@ static void solve_schur_omega(
 
         for (int iter = 0; iter < max_omega_iter; iter++) {
             adc2_op.build_M_eff_matrix(omega, d_M_eff);
-            gpu::eigenDecomposition(d_M_eff, d_eigenvalues, d_eigenvectors, singles_dim);
+            gpu::partialEigenDecomposition(d_M_eff, d_eigenvalues, d_eigenvectors, singles_dim, n_states);
 
             cudaMemcpy(h_eigenvalues.data(), d_eigenvalues,
                        n_states * sizeof(real_t), cudaMemcpyDeviceToHost);
@@ -244,6 +251,101 @@ static void solve_full_davidson(
 
 
 // ========================================================================
+//  Solver mode: schur_davidson — matrix-free Davidson on the folded M_eff(ω)
+//  For large clusters (singles ≳ 10⁴) where a dense diagonalisation of the
+//  singles×singles M_eff is prohibitive (O(singles³) tridiagonalisation ≈ hours
+//  at singles≈30k, even for a partial eigensolver — syevdx only trims the
+//  eigenvector back-transform, not the tridiagonalisation). M_eff(ω) is symmetric
+//  and ADC2Operator::apply() already applies it matrix-free (M11·x kernel-folded
+//  through the diagonal doubles block), so a symmetric Davidson needs only a
+//  handful of O(singles) vectors and fast matvecs — minutes instead of hours.
+//  Solves at ω=0 (schur_static quality, ~0.005–0.02 Ha); an optional ω-refinement
+//  loop (warm-started, cheap because ω barely moves) tightens it toward exact.
+// ========================================================================
+static void solve_schur_davidson(
+    ADC2Operator& adc2_op, int n_states, int singles_dim,
+    std::vector<real_t>& excitation_energies,
+    std::vector<real_t>& h_final_eigenvectors,
+    bool omega_refine)
+{
+    std::cout << "  Solving with matrix-free Davidson on M_eff(ω)"
+              << (omega_refine ? " + ω-refinement" : " (ω=0, schur_static quality)")
+              << " — no dense eig..." << std::endl;
+
+    // Solve for a BUFFER of extra roots and keep the lowest n_states. Near-degenerate
+    // dark/bright manifolds (e.g. naphthalene ~7 eV) let a random-init Davidson skip a
+    // root and converge to {1,2,4}; the buffer makes the lowest n_states robust.
+    const int nev = std::min(singles_dim, n_states + std::max(3, n_states));
+
+    DavidsonConfig config;
+    config.num_eigenvalues       = nev;
+    config.symmetric             = true;   // the folded M_eff(ω) is symmetric
+    config.use_preconditioner    = true;
+    config.convergence_threshold = 1e-6;
+    config.max_iterations        = 300;
+    config.max_subspace_size     = std::max(30, 4 * nev);
+    config.min_eigenvalue        = 1e-4;   // skip any spurious ~0 root
+    config.verbose               = 1;
+
+    // Phase 1: ω = 0 (matrix-free equivalent of schur_static).
+    adc2_op.set_omega(0.0);
+    adc2_op.update_diagonal();             // preconditioner diagonal for M_eff(0)
+    DavidsonSolver solver(adc2_op, config);
+    bool converged = solver.solve();
+    if (!converged)
+        std::cout << "  Warning: Davidson (ω=0) did not fully converge" << std::endl;
+
+    // Keep the lowest n_states (eigenvalues ascending; vectors contiguous per root).
+    excitation_energies.assign(solver.get_eigenvalues().begin(),
+                               solver.get_eigenvalues().begin() + n_states);
+    h_final_eigenvectors.resize((size_t)n_states * singles_dim);
+    {
+        std::vector<real_t> h_all((size_t)nev * singles_dim);
+        solver.copy_eigenvectors_to_host(h_all.data());
+        std::copy(h_all.begin(), h_all.begin() + (size_t)n_states * singles_dim,
+                  h_final_eigenvectors.begin());
+    }
+
+    if (!omega_refine) {
+        std::cout << "  (approximate: ~0.005-0.02 Ha ω=0 Schur error vs. exact ADC(2))"
+                  << std::endl;
+        return;
+    }
+
+    // Phase 2: per-root ω self-consistency. M_eff depends on ω through the diagonal
+    // doubles denominators; ω barely moves between iterations, so warm-starting each
+    // Davidson from the previous Ritz vectors converges in a few matvecs.
+    const double omega_threshold = 1e-7;
+    const int    max_omega_iter  = 12;
+    std::vector<real_t> h_warm((size_t)nev * singles_dim);   // dav returns nev vectors
+    for (int k = 0; k < n_states; k++) {
+        real_t omega = excitation_energies[k];
+        for (int iter = 0; iter < max_omega_iter; iter++) {
+            adc2_op.set_omega(omega);
+            adc2_op.update_diagonal();
+            DavidsonSolver dav(adc2_op, config);
+            dav.solve(solver.get_eigenvectors_device());   // warm start from ω=0 Ritz vectors
+            real_t omega_new = dav.get_eigenvalues()[k];
+            real_t delta = std::abs(omega_new - omega);
+            std::cout << "  Root " << k + 1 << " ω-iter " << std::setw(2) << iter + 1
+                      << ": omega=" << std::fixed << std::setprecision(8) << omega_new
+                      << ", d_omega=" << std::scientific << std::setprecision(2) << delta
+                      << std::defaultfloat << std::endl;
+            omega = omega_new;
+            if (delta < omega_threshold) {
+                dav.copy_eigenvectors_to_host(h_warm.data());
+                std::copy(&h_warm[(size_t)k * singles_dim],
+                          &h_warm[(size_t)(k + 1) * singles_dim],
+                          &h_final_eigenvectors[(size_t)k * singles_dim]);
+                break;
+            }
+        }
+        excitation_energies[k] = omega;
+    }
+}
+
+
+// ========================================================================
 //  Main entry point: compute_adc2
 // ========================================================================
 
@@ -266,7 +368,11 @@ static void compute_adc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, re
     // Auto solver selection: schur_static is fastest but inaccurate with frozen core.
     // Frozen core: use full Davidson (Schur complement approximation breaks down).
     if (solver_mode == "auto") {
-        if (num_frozen > 0) {
+        if (singles_dim > 10000) {
+            // Dense M_eff diag is prohibitive at this size — matrix-free Davidson.
+            solver_mode = "schur_davidson";
+            std::cout << "  Auto solver: schur_davidson (large singles=" << singles_dim << ")" << std::endl;
+        } else if (num_frozen > 0) {
             solver_mode = "full";
             std::cout << "  Auto solver: full (frozen core)" << std::endl;
         } else {
@@ -337,6 +443,10 @@ static void compute_adc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, re
     if (solver_mode == "schur_static") {
         solve_schur_static(adc2_op, n_states, singles_dim,
                            excitation_energies, h_final_eigenvectors);
+    } else if (solver_mode == "schur_davidson") {
+        solve_schur_davidson(adc2_op, n_states, singles_dim,
+                             excitation_energies, h_final_eigenvectors,
+                             /*omega_refine=*/std::getenv("GANSU_ADC2_OMEGA_REFINE") != nullptr);
     } else if (solver_mode == "full") {
         solve_full_davidson(adc2_op, n_states, singles_dim,
                             excitation_energies, h_final_eigenvectors);
@@ -379,6 +489,177 @@ static void compute_adc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, re
     rhf.set_excited_state_report(es_result.report);
 
     // Cleanup: ADC2Operator handles its own memory via RAII
+}
+
+// ============================================================================
+//  DMET-cluster ADC(2) entry — ADC(2) analogue of steom_spatial_orbital.
+//  Runs ADC(2) on the embedded cluster MO space; the ADC2Operator math is
+//  already RHF-free, so this is the compute_adc2_impl body with the RHF-sourced
+//  orbital space (num_basis/full_occ/frozen/C/eps) replaced by cluster params.
+//  ⚠ d_eps MUST be the PHYSICAL (un-shifted) cluster ε — ADC(2) denominators
+//  (ε_a+ε_b−ε_i−ε_j) require the true energies, unlike the STEOM chain which
+//  carries the level shift and un-shifts internally.
+// ============================================================================
+STEOMResult adc2_spatial_orbital(RHF& cfg, ERI& eri_method,
+                                 const real_t* d_C_can, const real_t* d_eps,
+                                 real_t* d_eri_mo,
+                                 int nao, int n_emb, int n_emb_occ,
+                                 int n_states, int n_frozen)
+{
+    (void)eri_method; (void)d_C_can; (void)nao;   // integrals already in MO basis (d_eri_mo)
+    const int num_occ = n_emb_occ - n_frozen;     // active occupied
+    const int num_vir = n_emb - n_emb_occ;
+    const int singles_dim = num_occ * num_vir;
+    const bool is_triplet = cfg.is_triplet();
+
+    std::string solver_mode = cfg.get_adc2_solver();
+    if (solver_mode == "auto") {
+        // Full Davidson stores the O(singles²) doubles subspace explicitly, so for a
+        // large DMET cluster it blows past GPU memory (n_emb=427 → ~1.3 TB). The
+        // ADC(2) doubles–doubles block is diagonal, so schur_omega folds it EXACTLY
+        // (same roots as full Davidson) at only O(singles²) for the M_eff matrix.
+        // Prefer full only when its footprint comfortably fits; otherwise schur_omega.
+        const size_t total_dim = (size_t)singles_dim + (size_t)singles_dim * singles_dim;
+        const size_t subspace  = std::min(total_dim, (size_t)std::max(100, 10 * n_states));
+        const size_t est_full  = (size_t)(2.5 * total_dim * subspace * sizeof(real_t));
+        size_t free_b = 0, tot_b = 0;
+        if (gpu::gpu_available()) cudaMemGetInfo(&free_b, &tot_b);
+        const bool full_fits = tot_b > 0 && est_full < (size_t)(0.5 * tot_b);
+        // When full won't fit, fold the (diagonal) doubles into a singles×singles
+        // M_eff. Both Schur solvers dense-diagonalise M_eff (O(singles³) each); the
+        // ω-iterative variant repeats it per root, so it is only affordable while
+        // that diag is cheap. Past ~1e4 singles a single 30k×30k eig is already
+        // ~25 min, so fall back to the one-shot ω=0 static Schur (approximate but
+        // tractable). schur_omega/full remain available via explicit --adc2_solver.
+        // Past ~10⁴ singles a dense M_eff diag (even partial syevdx) is prohibitive
+        // (O(singles³) tridiagonalisation), so use the matrix-free Davidson on the
+        // folded M_eff — minutes instead of hours, same ω=0 Schur accuracy.
+        if (full_fits)                 solver_mode = "full";
+        else if (singles_dim <= 10000) solver_mode = "schur_omega";
+        else                           solver_mode = "schur_davidson";
+        std::cout << "  [ADC(2) auto-solver] full-Davidson footprint ~"
+                  << (est_full >> 30) << " GB vs GPU " << (tot_b >> 30)
+                  << " GB, singles=" << singles_dim << " → " << solver_mode << std::endl;
+    }
+
+    if (n_states > singles_dim) n_states = singles_dim;
+
+    // Prefer the RI-block path: build the cluster B_mo (naux·n_emb²) and pull the
+    // four ADC(2) sub-blocks (ovov/vvov/ooov/oovv) from it via mo_eri_block_into,
+    // never materialising the dense n_emb⁴ MO-ERI (247 GB for n_emb=427). Only
+    // when the caller passed a dense d_eri_mo (non-RI / forced) do we use it.
+    ERI_RI* eri_ri = dynamic_cast<ERI_RI*>(&eri_method);
+    const bool ri_block = (d_eri_mo == nullptr) && (eri_ri != nullptr) && gpu::gpu_available();
+
+    std::cout << "\n---- DMET-cluster ADC(2) " << (is_triplet ? "triplet" : "singlet")
+              << " ---- n_emb=" << n_emb << " nocc_act=" << num_occ << " nvir=" << num_vir
+              << " n_frozen=" << n_frozen << " singles=" << singles_dim
+              << " solver=" << solver_mode << " ERI=" << (ri_block ? "RI-block" : "dense")
+              << " nstates=" << n_states << std::endl;
+
+    real_t *d_ovov = nullptr, *d_vvov = nullptr, *d_ooov = nullptr, *d_oovv = nullptr;
+    ADC2Operator* op = nullptr;
+    if (ri_block) {
+        const int O = n_frozen, V = n_emb_occ;   // active-occ start, virtual start
+        tracked_cudaMalloc(&d_ovov, (size_t)num_occ*num_vir*num_occ*num_vir*sizeof(real_t));
+        tracked_cudaMalloc(&d_vvov, (size_t)num_vir*num_vir*num_occ*num_vir*sizeof(real_t));
+        tracked_cudaMalloc(&d_ooov, (size_t)num_occ*num_occ*num_occ*num_vir*sizeof(real_t));
+        tracked_cudaMalloc(&d_oovv, (size_t)num_occ*num_occ*num_vir*num_vir*sizeof(real_t));
+        // (pq|rs) blocks — ranges match build_adc2_blocks' scatter layout exactly.
+        // Rebuild B_mo right before each consume: the B_mo workspace is transient and
+        // mo_eri_block_into consumes it (matches the STEOM RI-block pattern; calling
+        // build_B_mo once and consuming it four times corrupts the 2nd–4th blocks).
+        eri_ri->mo_eri_block_into(eri_ri->build_B_mo(d_C_can, n_emb), n_emb, O, num_occ, V, num_vir, O, num_occ, V, num_vir, d_ovov);
+        eri_ri->mo_eri_block_into(eri_ri->build_B_mo(d_C_can, n_emb), n_emb, V, num_vir, V, num_vir, O, num_occ, V, num_vir, d_vvov);
+        eri_ri->mo_eri_block_into(eri_ri->build_B_mo(d_C_can, n_emb), n_emb, O, num_occ, O, num_occ, O, num_occ, V, num_vir, d_ooov);
+        eri_ri->mo_eri_block_into(eri_ri->build_B_mo(d_C_can, n_emb), n_emb, O, num_occ, O, num_occ, V, num_vir, V, num_vir, d_oovv);
+        // Block ctor takes COMPACTED ε (active occ then vir, no offsets) = d_eps + n_frozen.
+        // The ctor copies ovov/vvov/ooov and consumes oovv into M11, so the source
+        // blocks can be freed immediately — keeps the solve working set off the peak.
+        op = new ADC2Operator(d_ovov, d_vvov, d_ooov, d_oovv, d_eps + n_frozen,
+                              num_occ, num_vir, num_occ + num_vir, is_triplet);
+        tracked_cudaFree(d_ovov); d_ovov = nullptr;
+        tracked_cudaFree(d_vvov); d_vvov = nullptr;
+        tracked_cudaFree(d_ooov); d_ooov = nullptr;
+        tracked_cudaFree(d_oovv); d_oovv = nullptr;
+    } else {
+        // Dense path (occ_offset = n_frozen, vir_start = n_emb_occ into the full ε).
+        op = new ADC2Operator(d_eri_mo, d_eps, num_occ, num_vir, n_emb,
+                              is_triplet, /*occ_offset=*/n_frozen, /*vir_start=*/n_emb_occ);
+    }
+
+    // Sanity diagnostics (cheap; skippable via GANSU_ADC2_NO_DIAG). Two failure
+    // modes to catch before an opaque "subspace eig failed": (a) NaN in a block /
+    // M11 (indexing bug at this scale), (b) wrong frozen-core ε convention →
+    // zeros in D2 → 1/(ω−D2) = inf on the very first apply.
+    if (!std::getenv("GANSU_ADC2_NO_DIAG")) {
+        auto finite_probe = [](const real_t* d, size_t n, const char* nm) {
+            // chunked asum: cublasDasum takes int n, and vvov (2.4e9) exceeds it
+            double total = 0.0; bool ok = true;
+            const size_t chunk = 1u << 30;
+            for (size_t off = 0; off < n; off += chunk) {
+                int len = (int)std::min(chunk, n - off);
+                real_t s = 0.0;
+                cublasDasum(gpu::GPUHandle::cublas(), len, d + off, 1, &s);
+                if (!std::isfinite(s)) ok = false;
+                total += s;
+            }
+            std::cout << "  [ADC2 diag] " << nm << " asum=" << std::scientific
+                      << total << (ok ? "" : "  *** NON-FINITE ***")
+                      << std::defaultfloat << std::endl;
+        };
+        finite_probe(op->get_M11(), (size_t)singles_dim * singles_dim, "M11");
+        finite_probe(op->get_D2(), (size_t)op->get_doubles_dim(), "D2");
+        finite_probe(op->get_eri_vvov(), (size_t)num_vir * num_vir * num_occ * num_vir, "vvov");
+        finite_probe(op->get_diagonal_device(), (size_t)singles_dim, "diagonal");
+        // ε convention check: with the shifted pointer the active HOMO is entry
+        // num_occ-1 and the LUMO is entry num_occ; their gap must equal the
+        // cluster HOMO-LUMO gap printed above (0.34 Ha for dox), NOT ~0.
+        std::vector<real_t> h_eps2(2);
+        cudaMemcpy(h_eps2.data(), d_eps + n_frozen + num_occ - 1, 2 * sizeof(real_t),
+                   cudaMemcpyDeviceToHost);
+        std::cout << "  [ADC2 diag] active HOMO=" << h_eps2[0] << " LUMO=" << h_eps2[1]
+                  << " gap=" << (h_eps2[1] - h_eps2[0]) << " Ha" << std::endl;
+    }
+
+    std::vector<real_t> exc, evec;
+    if (solver_mode == "schur_static")
+        solve_schur_static(*op, n_states, singles_dim, exc, evec);
+    else if (solver_mode == "schur_davidson")
+        solve_schur_davidson(*op, n_states, singles_dim, exc, evec,
+                             /*omega_refine=*/std::getenv("GANSU_ADC2_OMEGA_REFINE") != nullptr);
+    else if (solver_mode == "full")
+        solve_full_davidson(*op, n_states, singles_dim, exc, evec);
+    else
+        solve_schur_omega(*op, n_states, singles_dim, exc, evec);
+
+    delete op;
+    if (d_ovov) tracked_cudaFree(d_ovov);
+    if (d_vvov) tracked_cudaFree(d_vvov);
+    if (d_ooov) tracked_cudaFree(d_ooov);
+    if (d_oovv) tracked_cudaFree(d_oovv);
+
+    // Package into a STEOMResult (energies only; η/R1/oscillator not defined for
+    // the cluster ADC(2) path in this v1).
+    STEOMResult r;
+    r.nocc_active = num_occ;
+    r.nvir       = num_vir;
+    r.num_frozen = n_frozen;
+    r.n_states   = (int)exc.size();
+    std::ostringstream rep;
+    rep << "  DMET-cluster ADC(2) excited-state energies:\n"
+        << "   k   omega (Ha)        omega (eV)\n";
+    for (int k = 0; k < (int)exc.size(); ++k) {
+        STEOMResult::PerRoot pr;
+        pr.omega = exc[k];
+        r.per_root.push_back(pr);
+        rep << "   " << std::setw(2) << k << "   "
+            << std::fixed << std::setprecision(8) << std::setw(12) << exc[k] << "   "
+            << std::setprecision(4) << std::setw(9) << exc[k] * 27.211386245988 << "\n";
+    }
+    r.report = rep.str();
+    std::cout << r.report;
+    return r;
 }
 
 void ERI_Stored_RHF::compute_adc2(int n_states) {
@@ -510,8 +791,9 @@ static void compute_adc2_from_blocks(
     const bool is_triplet = rhf.is_triplet();
 
     if (solver_mode == "auto") {
-        solver_mode = "schur_static";
-        std::cout << "  Auto solver: schur_static" << std::endl;
+        solver_mode = (singles_dim > 10000) ? "schur_davidson" : "schur_static";
+        std::cout << "  Auto solver: " << solver_mode
+                  << (singles_dim > 10000 ? " (large singles)" : "") << std::endl;
     }
 
     std::string spin_label = is_triplet ? "triplet" : "singlet";
@@ -537,6 +819,10 @@ static void compute_adc2_from_blocks(
     if (solver_mode == "schur_static") {
         solve_schur_static(adc2_op, n_states, singles_dim,
                            excitation_energies, h_final_eigenvectors);
+    } else if (solver_mode == "schur_davidson") {
+        solve_schur_davidson(adc2_op, n_states, singles_dim,
+                             excitation_energies, h_final_eigenvectors,
+                             /*omega_refine=*/std::getenv("GANSU_ADC2_OMEGA_REFINE") != nullptr);
     } else if (solver_mode == "full") {
         solve_full_davidson(adc2_op, n_states, singles_dim,
                             excitation_energies, h_final_eigenvectors);

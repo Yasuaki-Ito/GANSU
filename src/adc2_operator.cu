@@ -42,6 +42,7 @@
  */
 
 #include <cstdio>
+#include <cstdlib>   // std::getenv (GANSU_ADC2_DEBUG stage probes)
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -948,8 +949,10 @@ __global__ void adc2_apply_M21_x1_kernel(
     int C = rem / nvir;
     int D = rem % nvir;
 
-    int ov = nocc * nvir;
-    int vov = nvir * ov;
+    // size_t strides: d_eri_vvov has nvir³·nocc elements (2.4e9 at dox scale) and the
+    // flat index E·vov+… overflows int32 — must be 64-bit (naphthalene stayed under).
+    size_t ov = (size_t)nocc * nvir;
+    size_t vov = (size_t)nvir * ov;
 
     real_t val = 0.0;
 
@@ -989,14 +992,16 @@ __global__ void adc2_apply_M12_x2_kernel(
     int nocc, int nvir)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int ov = nocc * nvir;
-    if (idx >= ov) return;
+    int ov_i = nocc * nvir;
+    if (idx >= ov_i) return;
 
     int K = idx / nvir;
     int E = idx % nvir;
 
-    int vov = nvir * ov;
-    int vv = nvir * nvir;
+    // size_t strides: d_eri_vvov flat index (E·vov+…) overflows int32 at dox scale.
+    size_t ov = (size_t)nocc * nvir;
+    size_t vov = (size_t)nvir * ov;
+    size_t vv = (size_t)nvir * nvir;
 
     real_t val = 0.0;
 
@@ -1149,6 +1154,12 @@ ADC2Operator::ADC2Operator(
     : nocc_(nocc), nvir_(nvir), nao_(nao),
       singles_dim_(nocc * nvir),
       doubles_dim_(nocc * nocc * nvir * nvir),
+      // Compacted-ε convention: eps[i] = active occ i, eps[nocc+a] = vir a.
+      // These MUST be set here — they were previously left uninitialized in this
+      // ctor (heap garbage), so the t2/D2 kernels read eps[garbage+i] out of
+      // bounds: zero denominators → t2 = inf → M11/diagonal NaN. Small runs got
+      // lucky with zero-ish garbage; dox group-0 (n_frozen=38) exposed it.
+      occ_offset_(0), vir_start_(nocc),
       omega_(0.0), is_triplet_(is_triplet),
       d_eri_ovov_(nullptr), d_eri_vvov_(nullptr), d_eri_ooov_(nullptr),
       d_t2_(nullptr), d_M11_(nullptr), d_M12_(nullptr), d_M21_(nullptr),
@@ -1330,16 +1341,35 @@ void ADC2Operator::build_M11_from_blocks(
 
     int blocks = (matrix_size + threads - 1) / threads;
 
+    // Stage probe (GANSU_ADC2_DEBUG): asum per build stage to localise a NaN.
+    const bool dbg = std::getenv("GANSU_ADC2_DEBUG") != nullptr;
+    auto probe = [&](const real_t* d, size_t n, const char* nm) {
+        if (!dbg) return;
+        double total = 0.0;
+        const size_t chunk = 1u << 30;
+        for (size_t off = 0; off < n; off += chunk) {
+            real_t s = 0.0;
+            cublasDasum(gpu::GPUHandle::cublas(), (int)std::min(chunk, n - off), d + off, 1, &s);
+            total += s;
+        }
+        printf("  [M11 probe] %-12s asum=%.6e\n", nm, total);
+    };
+    probe(d_eri_ovov, matrix_size, "in:ovov");
+    probe(d_eri_oovv, matrix_size, "in:oovv");
+    probe(d_t2_, (size_t)doubles_dim_, "in:t2");
+
     adc2_build_cis_matrix_from_blocks_kernel<<<blocks, threads>>>(
         d_eri_ovov, d_eri_oovv, d_orbital_energies, d_M11_,
         nocc_, nvir_, is_triplet_);
     cudaDeviceSynchronize();
+    probe(d_M11_, matrix_size, "post:CIS");
 
     real_t* d_ISR_corr = nullptr;
     tracked_cudaMalloc(&d_ISR_corr, matrix_size * sizeof(real_t));
     adc2_build_M11_ISR_correction_kernel<<<blocks, threads>>>(
         d_t2_, d_eri_ovov_, d_ISR_corr, nocc_, nvir_, is_triplet_);
     cudaDeviceSynchronize();
+    probe(d_ISR_corr, matrix_size, "ISR_corr");
 
     const real_t one = 1.0;
     cublasDaxpy(gpu::GPUHandle::cublas(), matrix_size, &one, d_ISR_corr, 1, d_M11_, 1);
@@ -1352,6 +1382,7 @@ void ADC2Operator::build_M11_from_blocks(
         adc2_compute_sigma_oo_kernel<<<blk, threads>>>(d_t2_, d_eri_ovov_, d_sigma_oo, nocc_, nvir_);
         cudaDeviceSynchronize();
     }
+    probe(d_sigma_oo, (size_t)nocc_ * nocc_, "sigma_oo");
 
     real_t* d_sigma_vv = nullptr;
     tracked_cudaMalloc(&d_sigma_vv, (size_t)nvir_ * nvir_ * sizeof(real_t));
@@ -1360,9 +1391,11 @@ void ADC2Operator::build_M11_from_blocks(
         adc2_compute_sigma_vv_kernel<<<blk, threads>>>(d_t2_, d_eri_ovov_, d_sigma_vv, nocc_, nvir_);
         cudaDeviceSynchronize();
     }
+    probe(d_sigma_vv, (size_t)nvir_ * nvir_, "sigma_vv");
 
     adc2_add_self_energy_to_M11_kernel<<<blocks, threads>>>(d_sigma_oo, d_sigma_vv, d_M11_, nocc_, nvir_);
     cudaDeviceSynchronize();
+    probe(d_M11_, matrix_size, "final:M11");
 
     tracked_cudaFree(d_sigma_oo);
     tracked_cudaFree(d_sigma_vv);

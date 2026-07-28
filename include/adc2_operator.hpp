@@ -143,8 +143,11 @@ private:
     int nao_;
     int singles_dim_;   // nocc * nvir
     int doubles_dim_;   // nocc * nocc * nvir * nvir
-    int occ_offset_;    // frozen core offset (0 = no frozen core)
-    int vir_start_;     // virtual orbital start in MO-ERI indices
+    // Defaults = compacted-ε convention (occ at [0,nocc), vir at [nocc,...)) so a
+    // ctor that forgets these in its init list gets sane values, not heap garbage
+    // (the block ctor once did — OOB eps reads → zero denominators → t2 = inf).
+    int occ_offset_ = 0;   // frozen core offset (0 = no frozen core)
+    int vir_start_ = -1;   // virtual orbital start in MO-ERI indices (-1 → set by ctor)
 
     real_t omega_ = 0.0;
     bool is_triplet_ = false;    // true for triplet excited states

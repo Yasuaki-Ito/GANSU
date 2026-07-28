@@ -260,6 +260,8 @@ public:
     /// or "dlpno" (cluster-space DLPNO-CCSD + bt-polish; ~500-orbital production
     /// mode). Env GANSU_DMET_STEOM_DLPNO overrides when set.
     const std::string& get_dmet_cluster_solver() const { return dmet_cluster_solver_; }
+    /// DMET cluster excited-state solver: "steom" (STEOM-CCSD) or "adc2" (ADC(2)).
+    const std::string& get_dmet_excited_method() const { return dmet_excited_method_; }
     /// DMET: bisection tolerance on |Σ N_frag − N_elec|. Default 1e-5 (tight, GANSU native).
     /// Vayesta-compat: 4.2e-3 for benzene/STO-3G (= 1e-4 × 42, matches Vayesta's max_elec_err).
     double get_dmet_n_tol() const { return dmet_n_tol_; }
@@ -682,6 +684,7 @@ protected:
     double dmet_threshold_ = 1e-6;     ///< SVD threshold for DMET bath orbital selection
     bool dmet_mu_refine_ccsd_ = false;  ///< DMET: refine μ with CCSD-relaxed density
     std::string dmet_cluster_solver_ = "canonical";  ///< DMET-STEOM cluster ground solver: canonical | dlpno
+    std::string dmet_excited_method_ = "steom";      ///< DMET cluster excited solver: steom | adc2
     double dmet_n_tol_ = 1e-5;  ///< DMET: bisection tolerance on |Σ N_frag − N_elec|
     bool   dmet_steom_auto_fragment_   = false;  ///< DMET-STEOM: CIS-guided auto fragment extraction
     double dmet_steom_auto_coverage_   = 0.92;   ///< cumulative NTO per-atom coverage target T

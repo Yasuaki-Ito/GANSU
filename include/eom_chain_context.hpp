@@ -201,6 +201,20 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
                                   int n_states, int n_frozen,
                                   real_t level_shift = 0.0);
 
+// DMET-cluster ADC(2) entry — the ADC(2) analogue of steom_spatial_orbital.
+// Runs ADC(2) on the embedded cluster (physical, UN-shifted ε required):
+//   d_C_can  [nao × n_emb]  cluster canonical MO coefficients (unused by ADC2 math; kept for signature parity)
+//   d_eps    [n_emb]        cluster orbital energies — PHYSICAL (not level-shifted)
+//   d_eri_mo [n_emb⁴]       dense cluster MO-ERI (ADC2 has no RI-block path yet)
+// Returns a STEOMResult with per_root.omega = ADC(2) excitation energies (η/R1 unused).
+// Defined in src/eri_stored_adc2.cu.
+STEOMResult adc2_spatial_orbital(RHF& cfg, ERI& eri_method,
+                                 const real_t* d_C_can,
+                                 const real_t* d_eps,
+                                 real_t* d_eri_mo,
+                                 int nao, int n_emb, int n_emb_occ,
+                                 int n_states, int n_frozen);
+
 } // namespace gansu
 
 #endif // GANSU_EOM_CHAIN_CONTEXT_HPP
