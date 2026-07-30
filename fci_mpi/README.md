@@ -1,7 +1,6 @@
 # GPU-Accelerated Full Configuration Interaction for 1.7 Trillion Determinants
 
-This directory contains the implementation accompanying the manuscript entitled
-"GPU-Accelerated Full Configuration Interaction for 1.7 Trillion Determinants".
+This repository contains the source code, build instructions, example input files, and output energies for a distributed GPU-accelerated full configuration interaction (FCI) implementation capable of trillion-determinant-scale calculations.
 
 The implementation provides a distributed-memory Full Configuration Interaction (FCI) solver accelerated by NVIDIA GPUs using CUDA, cuBLAS, NCCL, and MPI.
 
