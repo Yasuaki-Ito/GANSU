@@ -34,6 +34,40 @@ FRAG="{4,5,8,9,10,16,17,23,25,26,27,30,31,32,33,34,35,36,37}"   # dox group-0, 1
 export GANSU_DMET_LEVEL_SHIFT_DENOM_ONLY=1   # CORRECTNESS-CRITICAL epsilon un-shift
 export GANSU_CCSD_CONV=1e-7
 export GANSU_DMET_STEOM_BATH_DIAG=1          # print the gauge (expect SUFFICIENT)
+export GANSU_DMET_STEOM_RI_BLOCK=1           # REQUIRED at this size: without it the
+                                             # chain materialises the dense n_emb^4
+                                             # cluster MO-ERI (n_emb=427 -> 247.69 GB
+                                             # cudaMalloc -> instant OOM, verified
+                                             # 2026-07-30). RI-block pulls MO-ERI
+                                             # blocks from the cluster B instead.
+# The bt-polish stage is a CANONICAL cluster CCSD, so it needs the same
+# memory-safety env kit the completed canonical production runs used (without
+# BNATIVE its setup asks for a ~171 GB active-space ERI tensor -> OOM, verified
+# 2026-07-30 on this fragment):
+export GANSU_DMET_CCSD_BNATIVE=1             # CCSD works from the cluster B natively
+export GANSU_STEOM_OPERATOR_DEVICE_BALANCING=1
+export GANSU_EA_RI_LADDER=1
+export GANSU_EA_W_HOST=1
+# The bt-polish CCSD's resident-buffer auto-probes check each fast-path tensor
+# against free memory INDIVIDUALLY, so at this size they enable both v_ovvv_T
+# (19 GB) and resident nvir^4 (53 GB) and the single pooled cudaMalloc then asks
+# for 171 GB > 114 GB free -> OOM (verified 2026-07-30 x2). Force both fast-path
+# residencies off (documented bit-exact overrides; per-tile rebuild from B is
+# slower but bt-polish is capped at 3 iterations here):
+export GANSU_CCSD_VT_RESIDENT=0
+export GANSU_CCSD_VVVV_RESIDENT=0
+# The full CCSD memory-lean quartet the completed production runs (c14 manual-18,
+# auto-19 n_emb~445 on this same 4-GPU box) actually used — see /tmp/run_dox_c14.sh
+# and /tmp/run_dox_auto19.sh on s177. Without OCCI/VR_TILE the pooled CCSD carve
+# still peaked device 0 at 133 GB and the first iteration's transient OOM'd:
+export GANSU_CCSD_RI_BNATIVE=1 GANSU_CCSD_RI_LADDER_TILE=1
+export GANSU_CCSD_OCCI=1 GANSU_CCSD_VR_TILE=1
+# Production support set (same scripts): shared BarH, GEMM IP sigma, GPU cluster
+# stage, BarH on GPU 3, capped Davidson subspace.
+export GANSU_DMET_STEOM_CLUSTER_GPU=1 GANSU_STEOM_BARH_GPU=3
+export GANSU_STEOM_SHARE_BARH=1 GANSU_IP_SIGMA_GEMM=1
+export GANSU_EOM_MAX_SUB_PER_ROOT=7
+export OMP_NUM_THREADS=64
 # NO GANSU_STEOM_DENSE_DIAG  -> default iterative diag (this is what avoids OOM)
 # NO GANSU_DMET_STEOM_NTO_BATH* -> bare Schmidt bath (sufficient for dox; also
 #    required so the DLPNO solver does not hit the NTO-bath+DLPNO NaN)
@@ -43,7 +77,7 @@ echo ">>> DMET-STEOM doxorubicin group-0 / cc-pVDZ / DLPNO / iterative diag -> $
 $GANSU -x $XYZ -g cc-pvdz --eri_method ri -ag $AUX \
   --post_hf_method dmet_steom \
   --dmet_fragments "$FRAG" \
-  --dmet_cluster_solver dlpno \
+  --dmet_cluster_solver dlpno --dlpno_bt_polish 3 \
   --n_excited_states 5 --steom_n_root_cis 14 \
   --frozen_core auto --initial_guess sad --num_gpus 4 \
   2>&1 | tee "$LOG"

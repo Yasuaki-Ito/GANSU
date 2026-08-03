@@ -39,6 +39,7 @@
 
 #include "dmet.hpp"
 #include "dmet_auto_fragment.hpp"   // CIS-guided auto fragment extraction (dmet_steom_auto_*)
+#include "dmet_memory_policy.hpp"   // size-driven tensor-layout switches (no env needed)
 #include "rhf.hpp"
 #include "eri.hpp"
 #include "eom_chain_context.hpp"   // steom_spatial_orbital (DMET-STEOM, Phase 1)
@@ -751,6 +752,8 @@ STEOMResult DMET::solve_fragment_steom(
         const real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
         std::cout << "  [DMET-STEOM] full-system cluster (n_emb = nao = " << nao
                   << ") → plain reduction (" << rhf_.get_dmet_excited_method() << ")." << std::endl;
+        // Pick the tensor layouts this size needs before anything reads them.
+        dmet_apply_memory_policy(nao, full_occ, rhf_.get_verbose());
         // Full RHF ε are physical (no level shift) → valid for ADC(2) directly.
         STEOMResult r;
         if (rhf_.get_dmet_excited_method() == "adc2") {
@@ -813,7 +816,13 @@ STEOMResult DMET::solve_fragment_steom(
     // the biased one (~0.075 Ha on the {0-9} cluster). Off ⇒ legacy biased direct form.
     real_t cluster_level_shift = 0.0;
     std::vector<real_t> h_eps_phys;   // PHYSICAL (un-shifted) cluster ε — for the ADC(2) path
-    const bool denom_only_ls = (std::getenv("GANSU_DMET_LEVEL_SHIFT_DENOM_ONLY") != nullptr);
+    // Denominator-only is the physically correct form (it converges to the TRUE
+    // unshifted cluster energy; the alternative is the legacy biased one, ~0.075 Ha
+    // on the {0-9} cluster and ~4 eV on doxorubicin's excitation energies), so it is
+    // the DEFAULT and a CLI parameter. Every published recipe set the old env, which
+    // is retained as an override that can only force it on.
+    const bool denom_only_ls = rhf_.get_dmet_level_shift_denom_only()
+                               || (std::getenv("GANSU_DMET_LEVEL_SHIFT_DENOM_ONLY") != nullptr);
     {
         std::vector<real_t> h_eps(n_emb);
         cudaMemcpy(h_eps.data(), d_eigvals, n_emb * sizeof(real_t), cudaMemcpyDeviceToHost);
@@ -901,7 +910,9 @@ STEOMResult DMET::solve_fragment_steom(
     //    30-atom TXO2 acceptor gives n_emb=490 ⇒ 461 GB) is never built.
     //    steom_spatial_orbital reads the same env into ctx.prefer_ri_block, so
     //    passing d_eri_mo == nullptr routes the whole chain through the cluster B.
-    //    Default off ⇒ dense build_mo_eri ⇒ byte-identical.
+    //    The policy below turns it (and the CCSD/EA layout family) on exactly when
+    //    the direct layout would not fit, so a published command line needs no env.
+    dmet_apply_memory_policy(n_emb, n_emb_occ, rhf_.get_verbose());
     STEOMResult r;
     if (rhf_.get_dmet_excited_method() == "adc2") {
         // ADC(2) on the cluster. Uses the PHYSICAL (un-shifted) ε. With an RI
@@ -1164,7 +1175,10 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
     // OFF. Both off → Phase 1 (single Schmidt bath). Lowering τ admits more NTOs
     // → cluster grows toward the full molecule, excitation error → 0.
     // ------------------------------------------------------------------------
-    real_t leak_vir = 0.0, leak_occ = 0.0;
+    // Methodological choice ⇒ a CLI parameter (--dmet_nto_bath / --dmet_nto_bath_occ),
+    // with the historical env kept as an override so existing scripts are unchanged.
+    real_t leak_vir = (real_t)rhf_.get_dmet_nto_bath();
+    real_t leak_occ = (real_t)rhf_.get_dmet_nto_bath_occ();
     if (const char* e = std::getenv("GANSU_DMET_STEOM_NTO_BATH"))     leak_vir = std::atof(e);
     if (const char* e = std::getenv("GANSU_DMET_STEOM_NTO_BATH_OCC")) leak_occ = std::atof(e);
     // §4.3 bath-sufficiency diagnostic (self-contained: no full STEOM needed).

@@ -1734,9 +1734,27 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // GANSU_STEOM_DAVIDSON=1 forces Davidson regardless.
     // ----------------------------------------------------------------------
     Timer solve_timer;
-    const int  dense_auto_max = 12000;  // total_dim threshold for auto dense (~5.8 GB at 12000)
+    // (2026-07-30) Auto dense/Davidson by MEMORY, not by a fixed dimension.
+    // The old rule (dense only below total_dim = 12000) silently handed every
+    // production-size cluster to the Davidson this very comment calls unreliable:
+    // doxorubicin (total_dim = 29640) returned 3.635 eV with 4/5 roots flagged
+    // η<0.96, while the dense geev on the same cluster gives 3.811 eV — the
+    // published value — in ~110 s. A dimension cutoff cannot know how much memory
+    // the box has, so probe it: dense geev holds ≈5·total_dim² doubles plus an
+    // opaque cusolver workspace, and the two calibration points we have are
+    // total_dim 29640 succeeding with 114 GB free and total_dim 36072 failing
+    // with ~120 GB free. Requiring 3× the nominal tensor bytes reproduces both
+    // (29640 → 105 GB needed, dense; 36072 → 156 GB needed, Davidson).
+    // Below dense_auto_min the answer is unchanged from before (always dense).
+    const int  dense_auto_min = 12000;
     const bool force_dense    = (std::getenv("GANSU_STEOM_DENSE_DIAG") != nullptr);
     const bool force_davidson = (std::getenv("GANSU_STEOM_DAVIDSON")  != nullptr);
+    size_t diag_free_b = 0, diag_total_b = 0;
+    if (gpu::gpu_available()) cudaMemGetInfo(&diag_free_b, &diag_total_b);
+    const size_t dense_need_b = 3 * 5 * (size_t)total_dim * (size_t)total_dim * sizeof(real_t);
+    const bool   dense_auto_ok = (total_dim <= dense_auto_min)
+                                 || (diag_free_b > 0 && dense_need_b < diag_free_b);
+    const int  dense_auto_max = dense_auto_ok ? total_dim : 0;  // 0 ⇒ auto picks Davidson
     // Final non-Hermitian geev: GPU cusolverXgeev by default (fast). Eigen CPU geev
     // is deterministic but O(n^3) single-threaded — far too slow at total_dim≈3500+
     // to be a default. Opt into the deterministic CPU path with GANSU_STEOM_GEEV_HOST=1
@@ -1758,8 +1776,14 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     const char* dd_env = std::getenv("GANSU_STEOM_DENSE_DIAG");
     const bool  dense_hard_force = (dd_env && dd_env[0] == '2');   // =2 → force dense
     const int   dense_force_max  = 20000;   // force_dense ceiling (dense infeasible above)
+    // The 20000 ceiling exists because a *nominal* free-memory check cannot see
+    // cusolver's opaque workspace. The probe above is calibrated on measured
+    // successes/failures rather than nominal size, so it may also clear the
+    // ceiling; without this the auto path could never choose dense above 20000
+    // and every production cluster silently fell back to the unreliable Davidson.
+    const bool  dense_probe_ok = (diag_free_b > 0 && dense_need_b < diag_free_b);
     const bool  dense_mem_ok = geev_host || dense_hard_force
-                               || total_dim <= dense_force_max;
+                               || total_dim <= dense_force_max || dense_probe_ok;
     if (force_dense && !dense_mem_ok)
         std::cout << "  [STEOM] GANSU_STEOM_DENSE_DIAG=1 set but total_dim=" << total_dim
                   << " > " << dense_force_max << " hard ceiling (dense geev needs "
@@ -1770,6 +1794,20 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                             && !force_davidson
                             && dense_mem_ok
                             && (force_dense || total_dim <= dense_auto_max);
+
+    // Say which solver ran and why. The dense/Davidson choice is the single
+    // biggest determinant of whether the printed energies are the converged
+    // answer, so it must be readable in any log a result is quoted from.
+    std::cout << "  [STEOM diag] total_dim=" << total_dim << " → "
+              << (dense_diag ? "DENSE geev" : "iterative Davidson")
+              << " (dense needs ~" << (dense_need_b >> 30) << " GB, free "
+              << (diag_free_b >> 30) << " GB)" << std::endl;
+    if (!dense_diag && !force_davidson && total_dim > dense_auto_min)
+        std::cout << "  ⚠ [STEOM diag] the non-Hermitian Davidson can miss roots and "
+                     "settle above the true lowest root on near-degenerate G — treat "
+                     "unconverged/low-η roots as provisional. Force the dense solver "
+                     "with GANSU_STEOM_DENSE_DIAG=2 (or run on a larger-memory device)."
+                  << std::endl;
 
     std::vector<real_t> eigenvalues;
     std::vector<real_t> h_eigenvectors((size_t)n_states_to_compute * total_dim);

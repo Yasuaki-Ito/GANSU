@@ -260,6 +260,9 @@ public:
     /// or "dlpno" (cluster-space DLPNO-CCSD + bt-polish; ~500-orbital production
     /// mode). Env GANSU_DMET_STEOM_DLPNO overrides when set.
     const std::string& get_dmet_cluster_solver() const { return dmet_cluster_solver_; }
+    double get_dmet_nto_bath()     const { return dmet_nto_bath_; }
+    double get_dmet_nto_bath_occ() const { return dmet_nto_bath_occ_; }
+    bool   get_dmet_level_shift_denom_only() const { return dmet_level_shift_denom_only_; }
     /// DMET cluster excited-state solver: "steom" (STEOM-CCSD) or "adc2" (ADC(2)).
     const std::string& get_dmet_excited_method() const { return dmet_excited_method_; }
     /// DMET: bisection tolerance on |Σ N_frag − N_elec|. Default 1e-5 (tight, GANSU native).
@@ -684,6 +687,9 @@ protected:
     double dmet_threshold_ = 1e-6;     ///< SVD threshold for DMET bath orbital selection
     bool dmet_mu_refine_ccsd_ = false;  ///< DMET: refine μ with CCSD-relaxed density
     std::string dmet_cluster_solver_ = "canonical";  ///< DMET-STEOM cluster ground solver: canonical | dlpno
+    double dmet_nto_bath_     = 0.0;  ///< NTO-bath augmentation τ_vir (0 = off; env GANSU_DMET_STEOM_NTO_BATH overrides)
+    double dmet_nto_bath_occ_ = 0.0;  ///< NTO-bath augmentation τ_occ (0 = off; env ..._NTO_BATH_OCC overrides)
+    bool   dmet_level_shift_denom_only_ = true;  ///< denominator-only cluster level shift (correct, unbiased); false = legacy biased form
     std::string dmet_excited_method_ = "steom";      ///< DMET cluster excited solver: steom | adc2
     double dmet_n_tol_ = 1e-5;  ///< DMET: bisection tolerance on |Σ N_frag − N_elec|
     bool   dmet_steom_auto_fragment_   = false;  ///< DMET-STEOM: CIS-guided auto fragment extraction

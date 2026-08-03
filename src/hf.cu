@@ -132,6 +132,9 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
         throw std::runtime_error("Invalid dmet_excited_method: '" + dmet_excited_method_ +
                                  "'. Must be 'steom' or 'adc2'.");
     }
+    dmet_nto_bath_     = parameters.get<double>("dmet_nto_bath");
+    dmet_nto_bath_occ_ = parameters.get<double>("dmet_nto_bath_occ");
+    dmet_level_shift_denom_only_ = (parameters.get<int>("dmet_level_shift_denom_only") != 0);
     dmet_n_tol_ = parameters.get<double>("dmet_n_tol");
     dmet_steom_auto_fragment_   = parameters.get<bool>("dmet_steom_auto_fragment");
     dmet_steom_auto_coverage_   = parameters.get<double>("dmet_steom_auto_coverage");

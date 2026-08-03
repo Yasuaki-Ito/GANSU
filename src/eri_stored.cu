@@ -8644,40 +8644,11 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
       if (use_tiled_ladder && ri_bnative && e_mg && e_mg[0]=='1' && MultiGpuManager::instance().num_devices()>1)
           vt_dist = true; }
 #endif
-    // (Cat-A v_ovvv_T fast-path knob) When v_ovvv_T (vvv·nocc) fits in free device
-    // memory, keep it RESIDENT and read it directly in the tiled ladder (transA=false,
-    // fast) instead of rebuilding each tile from B (transA=true, memory-saving but slow
-    // per-tile block_chem). Both paths are bit-exact (same values into the GEMM). Auto
-    // by a free-memory probe; env GANSU_CCSD_VT_RESIDENT=1/0 overrides. The non-tiled /
-    // MULTIGPU paths always read the resident buffer.
-    bool vt_resident = true;
-    if (use_tiled_ladder) {
-        const char* e_vr = std::getenv("GANSU_CCSD_VT_RESIDENT");
-        if (e_vr) vt_resident = (e_vr[0] == '1');
-        else {
-            size_t freeb = 0, totalb = 0; cudaMemGetInfo(&freeb, &totalb);
-            // resident needs v_ovvv_T on device 0 (+ broadcast room on d≥1); 2× margin.
-            vt_resident = ((size_t)vvv*nocc*sizeof(double)*2 < freeb);
-        }
-        size_t freeb=0,totalb=0; cudaMemGetInfo(&freeb,&totalb);
-        std::cout << "  [CCSD ladder] v_ovvv_T " << (vt_resident ? "RESIDENT (fast)" : "build-from-B (mem)")
-                  << " | free=" << (freeb>>30) << "GB v_ovvv_T=" << ((vvv*nocc*sizeof(double))>>30)
-                  << "GB nvir^4=" << ((vv*vv*sizeof(double))>>30) << "GB (fits="
-                  << ((vv*vv*sizeof(double)*2 < freeb)?"Y":"N") << ")" << std::endl;
-    }
-    const bool vt_needed = (!use_tiled_ladder) || vt_dist || vt_resident;
-    const size_t sz_v_ovvv_T = vt_needed ? vvv*nocc : (size_t)1, sz_t1 = t1Size, sz_ovvv_t1 = use_tiled_ladder ? (ccsd_occi ? vv*(size_t)iblk_n0*nocc : t2Size) : std::max(vvv*std::max((size_t)nvir,(size_t)nocc), t2Size);
-    // (resident nvir⁴) The tiled ladder rebuilds the (ac|bd) tile from B every (a,b)
-    // tile every iter — the dominant CCSD re-solve cost (the integral is t1-independent
-    // ⇒ loop-invariant). When nvir⁴ fits, build d_v_vvvv ONCE (resident) and read tile
-    // slices from it (no per-tile block_chem). Auto by free-mem probe; env override.
-    bool nv4_resident = false;
-    if (use_tiled_ladder) {
-        const char* e_nv = std::getenv("GANSU_CCSD_VVVV_RESIDENT");
-        if (e_nv) nv4_resident = (e_nv[0] == '1');
-        else { size_t fb=0,tb=0; cudaMemGetInfo(&fb,&tb); nv4_resident = ((size_t)vv*vv*sizeof(double)*2 < fb); }
-    }
-    const size_t sz_v_vvvv = (use_tiled_ladder && !nv4_resident) ? (size_t)1 : vv*vv, sz_Fac = vv, sz_Fkc = ov;
+    // Residency-independent carve sizes FIRST, so the fast-path residency probes
+    // below can weigh the whole pool (see pool-aware auto-probe note).
+    const size_t sz_t1 = t1Size;
+    const size_t sz_ovvv_t1 = use_tiled_ladder ? (ccsd_occi ? vv*(size_t)iblk_n0*nocc : t2Size) : std::max(vvv*std::max((size_t)nvir,(size_t)nocc), t2Size);
+    const size_t sz_Fac = vv, sz_Fkc = ov;
     const size_t sz_t2v = t2Size, sz_Lac = vv, sz_Z = ccsd_occi ? vv*(size_t)iblk_n0*nvir : vv*ov;
     const size_t sz_Wex = OV2;  // each of B, V_R, W_R, V_R2 (i-independent floor)
     // (DS-5 device-0 Wex shard) WexA/C1/C2 hold i-block COMPACT data (nvir·iblk_n rows
@@ -8697,11 +8668,54 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // (Inc-B) d_w_ovvv_R is read by the non-tiled T1 DGEMM; the tiled path now
     // builds Lac per-a-tile from B (ccsd_Lac_tile_kernel) ∴ shrink to 1 when tiled.
     const size_t sz_w_ovvv_R = use_tiled_ladder ? (size_t)1 : (size_t)nvir * nocc * vv; // persistent w_ovvv_R
-    const size_t total_gpu_doubles = sz_tau + sz_Wabcd + sz_Wklij + sz_raw
-        + sz_w_oovv + sz_v_oovv + sz_Fki + sz_v_ovvv_T + sz_t1 + sz_ovvv_t1
-        + sz_v_vvvv + sz_Fac + sz_Fkc + sz_t2v + sz_Lac + sz_Z
+    const size_t base_doubles = sz_tau + sz_Wabcd + sz_Wklij + sz_raw
+        + sz_w_oovv + sz_v_oovv + sz_Fki + sz_t1 + sz_ovvv_t1
+        + sz_Fac + sz_Fkc + sz_t2v + sz_Lac + sz_Z
         + sz_Wex + 3 * sz_VR + 3 * sz_WexAC  // Wex_B (OV2) + V_R/W_R/V_R2 (=1 when vr_tile) + Wex_A/C1/C2 (compact)
         + sz_v_ovvv + sz_v_ovvv_perm + sz_w_ovvv_R;
+
+    // (Cat-A v_ovvv_T fast-path knob) When v_ovvv_T (vvv·nocc) fits, keep it RESIDENT
+    // and read it directly in the tiled ladder (transA=false, fast) instead of
+    // rebuilding each tile from B (transA=true, memory-saving but slow per-tile
+    // block_chem). Same idea for the resident nvir⁴ (ac|bd) tensor. All paths are
+    // bit-exact (same values into the GEMM); env GANSU_CCSD_VT_RESIDENT=1/0 and
+    // GANSU_CCSD_VVVV_RESIDENT=1/0 override. The non-tiled / MULTIGPU-dist paths
+    // always read the resident v_ovvv_T buffer.
+    //
+    // (pool-aware auto-probe fix, 2026-07-30) The old probes compared each fast-path
+    // tensor against free memory INDIVIDUALLY (2×tensor < free), so at n_emb=427
+    // (nocc=104, nvir=285) BOTH v_ovvv_T (19 GB) and nvir⁴ (53 GB) passed while the
+    // single pooled cudaMalloc below (base carves + both residents = 171 GB) blew
+    // past the 114 GB actually free → OOM (dox group-0). Decide against the WHOLE
+    // pool instead: enable a residency only if the pool including it still leaves
+    // ≥50% of the currently-free bytes as headroom — the CCSD iterations allocate
+    // tens of GB OUTSIDE the pool (per-tile ladder gathers, B workspaces), and at
+    // dox scale a 25% margin still hit the device ceiling mid-iteration (138.5 GB
+    // + 0.7 GB transient > 141 GB, 2026-07-30). Residency is a pure speed
+    // optimisation, so err conservative: losing it costs time, never correctness.
+    bool vt_resident = true;
+    bool nv4_resident = false;
+    if (use_tiled_ladder) {
+        size_t freeb = 0, totalb = 0; cudaMemGetInfo(&freeb, &totalb);
+        const size_t headroom = freeb / 2;
+        const char* e_vr = std::getenv("GANSU_CCSD_VT_RESIDENT");
+        if (e_vr) vt_resident = (e_vr[0] == '1');
+        else vt_resident = ((base_doubles + vvv*(size_t)nocc) * sizeof(double) + headroom < freeb);
+        // vt is carved regardless of the probe when the distributed ladder needs it.
+        const size_t vt_carve = (vt_dist || vt_resident) ? vvv*(size_t)nocc : (size_t)1;
+        const char* e_nv = std::getenv("GANSU_CCSD_VVVV_RESIDENT");
+        if (e_nv) nv4_resident = (e_nv[0] == '1');
+        else nv4_resident = ((base_doubles + vt_carve + vv*vv) * sizeof(double) + headroom < freeb);
+        std::cout << "  [CCSD ladder] v_ovvv_T " << (vt_resident ? "RESIDENT (fast)" : "build-from-B (mem)")
+                  << " | nvir^4 " << (nv4_resident ? "RESIDENT" : "per-tile")
+                  << " | free=" << (freeb>>30) << "GB v_ovvv_T=" << ((vvv*nocc*sizeof(double))>>30)
+                  << "GB nvir^4=" << ((vv*vv*sizeof(double))>>30)
+                  << "GB pool(base)=" << ((base_doubles*sizeof(double))>>30) << "GB" << std::endl;
+    }
+    const bool vt_needed = (!use_tiled_ladder) || vt_dist || vt_resident;
+    const size_t sz_v_ovvv_T = vt_needed ? vvv*nocc : (size_t)1;
+    const size_t sz_v_vvvv = (use_tiled_ladder && !nv4_resident) ? (size_t)1 : vv*vv;
+    const size_t total_gpu_doubles = base_doubles + sz_v_ovvv_T + sz_v_vvvv;
 
     double *d_gpu_pool = nullptr;
     tracked_cudaMalloc((void**)&d_gpu_pool, total_gpu_doubles * sizeof(double));

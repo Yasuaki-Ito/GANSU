@@ -335,6 +335,7 @@ set(SOURCES
     src/eri_ri_distributed.cu
     src/dmet.cu
     src/dmet_auto_fragment.cu
+    src/dmet_memory_policy.cu
     src/thc_grid.cu
     src/thc_collocation.cu
     src/thc_decomposition.cu
