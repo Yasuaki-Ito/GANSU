@@ -53,6 +53,7 @@
 #include "dlpno_ccsd.hpp"          // DMET×DLPNO Phase 1b: cluster-space DLPNO-CCSD ground
 #include "dlpno_params.hpp"        //   (resolve_dlpno_params for the cluster DLPNO hooks)
 #include "steom_result.hpp"
+#include "oscillator_strength.hpp"   // publish STEOM states through the generic API
 #include "davidson_solver.hpp"
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
@@ -2348,6 +2349,75 @@ static void compute_steom_ccsd_impl(RHF& rhf,
 
     result.report = os.str();
     std::cout << result.report;
+
+    // ----------------------------------------------------------------------
+    // Publish the STEOM states through the generic excited-state accessors
+    // (result.excited_states in the Python/C API).
+    //
+    // Without this the API kept whatever the CIS-NTO stage stored on its way
+    // through the chain, so a steom_ccsd / dlpno_steom_ccsd run reported the
+    // preceding CIS-RI states — right count for `steom_n_root_cis`, wrong
+    // method — and STEOM intensities were unreachable (reported issue,
+    // 2026-08-03).
+    //
+    // Oscillator strengths are computed from the STEOM right eigenvector R1 in
+    // the same singles layout CIS uses. That is an APPROXIMATION: G^{1h1p} is
+    // non-Hermitian, so a rigorous STEOM transition moment needs the left
+    // eigenvector and the dressed dipole operator, neither of which this chain
+    // forms. The values are useful for identifying bright states and for
+    // relative intensities; they are not quantitative. The method label carries
+    // that caveat so it cannot be lost downstream.
+    {
+        std::vector<real_t> steom_omega(result.n_states);
+        for (int n = 0; n < result.n_states; ++n) steom_omega[n] = result.per_root[n].omega;
+
+        if (ctx) ctx->excitation_energies = steom_omega;
+        else     rhf.set_excitation_energies(steom_omega);
+
+        // The dipole helper assumes a square AO==MO coefficient matrix, which a
+        // rectangular DMET cluster does not have (same restriction as the CIS
+        // stage); energies are still published above.
+        const bool can_oscillator = !ctx || (ctx->nao_ao == ctx->nmo);
+        if (can_oscillator && result.n_states > 0 && total_dim > 0) {
+            // Unit-normalise each right vector so the intensities follow the
+            // same convention as the CIS path (the non-Hermitian solve does not
+            // guarantee normalised eigenvectors).
+            std::vector<real_t> h_R1((size_t)result.n_states * total_dim, 0.0);
+            for (int n = 0; n < result.n_states; ++n) {
+                const auto& r1 = result.per_root[n].R1;
+                if ((int)r1.size() != total_dim) continue;
+                double nrm2 = 0.0;
+                for (int x = 0; x < total_dim; ++x) nrm2 += (double)r1[x] * r1[x];
+                const double s = (nrm2 > 0.0) ? 1.0 / std::sqrt(nrm2) : 0.0;
+                for (int x = 0; x < total_dim; ++x)
+                    h_R1[(size_t)n * total_dim + x] = (real_t)(s * r1[x]);
+            }
+            auto& coefficient_matrix = rhf.get_coefficient_matrix();
+            coefficient_matrix.toHost();
+            const auto& prim_shells = rhf.get_primitive_shells();
+            const auto& cgto_norms  = rhf.get_cgto_normalization_factors();
+            const_cast<DeviceHostMemory<PrimitiveShell>&>(prim_shells).toHost();
+            const_cast<DeviceHostMemory<real_t>&>(cgto_norms).toHost();
+            try {
+                auto es_result = compute_excited_state_properties(
+                    "STEOM-CCSD (f: R1 right-vector approximation)",
+                    prim_shells.host_ptr(), prim_shells.size(),
+                    cgto_norms.host_ptr(),
+                    rhf.get_shell_type_infos(),
+                    coefficient_matrix.host_ptr(),
+                    steom_omega, h_R1.data(),
+                    result.n_states, rhf.get_num_basis(),
+                    nocc_active, nvir,
+                    num_frozen, num_frozen + nocc_active);
+                if (ctx) ctx->oscillator_strengths = es_result.oscillator_strengths;
+                else     rhf.set_oscillator_strengths(es_result.oscillator_strengths);
+            } catch (const std::exception& e) {
+                // Energies are already published; intensities are best-effort.
+                std::cerr << "[STEOM] oscillator strengths unavailable: "
+                          << e.what() << std::endl;
+            }
+        }
+    }
 
     if (ctx) { ctx->excited_state_report += result.report;
                ctx->steom_result = std::move(result); }
