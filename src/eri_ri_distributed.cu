@@ -192,6 +192,8 @@ ERI_RI_Distributed_RHF::ERI_RI_Distributed_RHF(RHF& rhf, const Molecular& auxili
 }
 
 ERI_RI_Distributed_RHF::~ERI_RI_Distributed_RHF() {
+    free_replicated_B();   // gradient path replicates full B lazily; without this,
+                           // create/run/destroy loops leak naux·nao² per GPU per instance
     free_host_partitions();
     free_chunked_workspace();
     free_per_device_workspace();
@@ -2939,7 +2941,9 @@ bool ERI_RI_Distributed_RHF::replicate_B_to_all_gpus() {
 }
 
 void ERI_RI_Distributed_RHF::free_replicated_B() {
-    if (!b_replicated_) return;
+    // Also sweep partially-allocated replicas (b_replicated_ still false when
+    // replicate_B_to_all_gpus() threw mid-broadcast after its mallocs).
+    if (!b_replicated_ && d_B_full_per_gpu_.empty()) return;
     int caller_dev = 0; cudaGetDevice(&caller_dev);  // restore caller (not hardcoded 0):
     for (int g = 0; g < (int)d_B_full_per_gpu_.size(); g++) {   // DMET-STEOM cluster may
         if (d_B_full_per_gpu_[g]) {                             // run on a free peer GPU,
