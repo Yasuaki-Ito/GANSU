@@ -24,6 +24,19 @@ else()
     project(GANSU LANGUAGES CXX)
 endif()
 
+# Default to Release when the user did not choose a build type. Without this,
+# an empty CMAKE_BUILD_TYPE leaves HOST code at -O0 (no -O flag at all): GPU
+# kernels are still optimized (ptxas defaults to -O3), but every host-side
+# loop (.cpp files and the host portion of .cu files — DLPNO per-pair CPU
+# loops, OpenMP CCSD host loops, CPU integral engines, Eigen) runs unoptimized.
+# Release adds -O3 -DNDEBUG for both CXX and CUDA (nvcc -O3 propagates to the
+# host compiler; device codegen is unchanged).
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type (Release/Debug/RelWithDebInfo/MinSizeRel)" FORCE)
+endif()
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+
 
 # Enable PIC globally (required for shared library libgansu.so)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)

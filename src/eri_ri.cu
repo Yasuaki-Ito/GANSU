@@ -1179,6 +1179,10 @@ real_t ERI_RI_RHF::compute_sos_mp2_energy() {
 //  Common RI-MP2 computation from a given B matrix pointer.
 //  Used by Stored RI, Semi-Direct RI, and Direct RI.
 // ============================================================
+real_t compute_ri_mp2_from_B_ia(
+    real_t* d_B_ia, int num_auxiliary_basis,
+    int nocc, int nvir, real_t* d_eps);  // defined below
+
 real_t compute_ri_mp2_from_B(
     real_t* d_B, int num_basis, int num_auxiliary_basis,
     int nocc, int nvir, real_t* d_C, real_t* d_eps)
@@ -1189,6 +1193,17 @@ real_t compute_ri_mp2_from_B(
     transform_intermediate_matrix(num_basis, nocc, nvir, num_auxiliary_basis, d_C, d_B, d_tmp);
     tracked_cudaFree(d_tmp);
 
+    return compute_ri_mp2_from_B_ia(d_B, num_auxiliary_basis, nocc, nvir, d_eps);
+}
+
+// Post-transform core: blocked (ia|jb) DGEMM + energy kernels from an already
+// MO-transformed B_ia^P [nocc*nvir × naux] col-major (d_B_ia is read-only here).
+// Split out of compute_ri_mp2_from_B so ERI_RI_Distributed_RHF can call it with
+// a B_ia gathered from per-GPU MO-transformed aux slices (no full AO-B needed).
+real_t compute_ri_mp2_from_B_ia(
+    real_t* d_B_ia, int num_auxiliary_basis,
+    int nocc, int nvir, real_t* d_eps)
+{
     // Allocate energy accumulator
     double *d_energy;
     tracked_cudaMalloc((void**)&d_energy, sizeof(double));
@@ -1235,8 +1250,8 @@ real_t compute_ri_mp2_from_B(
             nocc * nvir,
             ((nocc_block < nocc - i) ? nocc_block : nocc - i) * nvir,
             num_auxiliary_basis,
-            &alpha, d_B, nocc * nvir,
-            &d_B[i * nvir], nocc * nvir,
+            &alpha, d_B_ia, nocc * nvir,
+            &d_B_ia[i * nvir], nocc * nvir,
             &beta, d_iajb, nocc * nvir);
 
         cudaEventRecord(events_for_sync[iter_count*4 + 0], streams[0]);

@@ -109,6 +109,27 @@ extern "C" int gansu_set_post_hf(gansu_handle_t h, const char* post_hf) {
 
 // ---- Execution ----
 
+// Clear pending CUDA error flags on every device and restore device 0.
+// A throw from a multi-GPU loop can leave the current device != 0 with a
+// pending error, which surfaces in the NEXT calculation as an unrelated-looking
+// failure (e.g. thrust radix_sort: cudaErrorInvalidDevice). Non-sticky errors
+// (OOM) are recoverable this way; sticky ones (illegal access) are not — the
+// caller must recreate the process in that case.
+static void clear_cuda_errors_all_devices(const char* who) {
+    if (!gpu::gpu_available()) return;
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess) return;
+    for (int d = 0; d < ndev; d++) {
+        if (cudaSetDevice(d) != cudaSuccess) continue;
+        cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            std::cerr << who << ": CUDA error cleared (" << cudaGetErrorString(e)
+                      << ") on device " << d << std::endl;
+        }
+    }
+    cudaSetDevice(0);
+}
+
 extern "C" int gansu_run(gansu_handle_t h) {
     if (!h) return -1;
     auto* ctx = static_cast<GansuContext*>(h);
@@ -177,15 +198,10 @@ extern "C" int gansu_run(gansu_handle_t h) {
         ctx->progress_userdata = nullptr;
         ctx->excited_state_report_cache.clear();
 
-        // Clear CUDA error flag without resetting or syncing the device.
-        // cudaDeviceReset() and cudaDeviceSynchronize() can segfault after OOM.
-        if (gpu::gpu_available()) {
-            cudaError_t cuda_err = cudaGetLastError();
-            if (cuda_err != cudaSuccess) {
-                std::cerr << "gansu_run: CUDA error cleared (" << cudaGetErrorString(cuda_err)
-                          << ")" << std::endl;
-            }
-        }
+        // Clear CUDA error flags without resetting or syncing the device
+        // (cudaDeviceReset() / cudaDeviceSynchronize() can segfault after OOM),
+        // on EVERY device, and restore device 0.
+        clear_cuda_errors_all_devices("gansu_run");
 
         // Reset memory tracking counters — after hf.reset() freed everything,
         // counters should be near zero. Recalculate from the authoritative map.
@@ -360,8 +376,12 @@ extern "C" int gansu_get_energy_gradient(gansu_handle_t h, double* buf, int len)
         return n;
     } catch (const std::exception& e) {
         std::cerr << "gansu_get_energy_gradient error: " << e.what() << std::endl;
+        clear_cuda_errors_all_devices("gansu_get_energy_gradient");
         return -2;
-    } catch (...) { return -2; }
+    } catch (...) {
+        clear_cuda_errors_all_devices("gansu_get_energy_gradient");
+        return -2;
+    }
 }
 
 extern "C" int gansu_get_hessian(gansu_handle_t h, double* buf, int len) {
@@ -379,8 +399,12 @@ extern "C" int gansu_get_hessian(gansu_handle_t h, double* buf, int len) {
         return n;
     } catch (const std::exception& e) {
         std::cerr << "gansu_get_hessian error: " << e.what() << std::endl;
+        clear_cuda_errors_all_devices("gansu_get_hessian");
         return -2;
-    } catch (...) { return -2; }
+    } catch (...) {
+        clear_cuda_errors_all_devices("gansu_get_hessian");
+        return -2;
+    }
 }
 
 extern "C" int gansu_get_frequencies(gansu_handle_t h, double* buf, int len) {

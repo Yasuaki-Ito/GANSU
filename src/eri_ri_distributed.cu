@@ -2410,47 +2410,101 @@ real_t* ERI_RI_Distributed_RHF::build_B_ij_local(
 }
 
 // ============================================================================
-//  Distributed post-HF: MP2 via build_mo_eri (avoids broken intermediate_matrix_B_)
+//  Distributed post-HF: RI-MP2 family via gathered B_ia — O(ov·naux) memory,
+//  never the nao⁴ full MO ERI (which the old build_mo_eri fallback allocated,
+//  OOMing from ~35 atoms / cc-pVDZ; see BUG report 2026-08-05).
+//  SCS/SOS/LT-MP2/LT-SOS are NOT overridden here: the ERI_RI_RHF versions all
+//  start from the virtual build_B_ia(), which this override makes correct in
+//  distributed mode (the base one reads intermediate_matrix_B_ = empty here).
 // ============================================================================
 
-// Forward declaration (defined in eri_ri.cu)
-double mp2_from_full_moeri(
-    const double* d_eri_mo, const double* d_C, const double* d_eps,
-    int nao, int occ, int frozen);
+// Post-transform MP2 core (defined in eri_ri.cu)
+real_t compute_ri_mp2_from_B_ia(
+    real_t* d_B_ia, int num_auxiliary_basis,
+    int nocc, int nvir, real_t* d_eps);
+
+real_t* ERI_RI_Distributed_RHF::build_B_ia() {
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = num_basis_ - nocc;
+    const int nbas = num_basis_;
+    const size_t ov = (size_t)nocc * nvir;
+    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
+
+    std::vector<real_t*> d_B_ia_local(num_gpus_, nullptr);
+    real_t* d_B_ia_full = nullptr;
+    try {
+        // Per-GPU MO transform of the local aux slice (same pattern as the
+        // distributed SOS-ADC(2) B-block build).
+        for (int d = 0; d < num_gpus_; d++) {
+            MultiGpuManager::DeviceGuard guard(d);
+            real_t* d_C_dev = d_C;
+            if (d > 0) {
+                tracked_cudaMalloc(&d_C_dev, (size_t)nbas * nbas * sizeof(real_t));
+                cudaMemcpyPeer(d_C_dev, d, d_C, 0, (size_t)nbas * nbas * sizeof(real_t));
+            }
+            d_B_ia_local[d] = build_B_ia_local(d_B_local_[d], naux_local_[d],
+                                               d_C_dev, nbas, nocc, nvir);
+            if (d > 0) tracked_cudaFree(d_C_dev);
+        }
+
+        // Contiguous gather on device 0: aux partition is contiguous ascending,
+        // so the col-major [ov × naux_local] slabs concatenate at P_start·ov.
+        std::vector<size_t> P_start(num_gpus_ + 1, 0);
+        for (int d = 0; d < num_gpus_; d++)
+            P_start[d + 1] = P_start[d] + naux_local_[d];
+
+        {
+            MultiGpuManager::DeviceGuard guard(0);
+            tracked_cudaMalloc(&d_B_ia_full,
+                               ov * (size_t)num_auxiliary_basis_ * sizeof(real_t));
+            for (int d_src = 0; d_src < num_gpus_; d_src++) {
+                const size_t bytes = (size_t)naux_local_[d_src] * ov * sizeof(real_t);
+                if (bytes == 0) continue;
+                if (d_src == 0)
+                    cudaMemcpy(d_B_ia_full + P_start[d_src] * ov, d_B_ia_local[d_src],
+                               bytes, cudaMemcpyDeviceToDevice);
+                else
+                    cudaMemcpyPeer(d_B_ia_full + P_start[d_src] * ov, 0,
+                                   d_B_ia_local[d_src], d_src, bytes);
+            }
+            cudaDeviceSynchronize();
+        }
+    } catch (...) {
+        for (int d = 0; d < num_gpus_; d++) {
+            if (d_B_ia_local[d]) {
+                MultiGpuManager::DeviceGuard guard(d);
+                tracked_cudaFree(d_B_ia_local[d]);
+            }
+        }
+        if (d_B_ia_full) {
+            MultiGpuManager::DeviceGuard guard(0);
+            tracked_cudaFree(d_B_ia_full);
+        }
+        throw;
+    }
+
+    for (int d = 0; d < num_gpus_; d++) {
+        MultiGpuManager::DeviceGuard guard(d);
+        tracked_cudaFree(d_B_ia_local[d]);
+    }
+    return d_B_ia_full;  // device 0, [ov × naux] col-major
+}
 
 real_t ERI_RI_Distributed_RHF::compute_mp2_energy() {
-    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), num_basis_);
-    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
-    real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
-    int nocc = rhf_.get_num_electrons() / 2;
-    int frozen = rhf_.get_num_frozen_core();
-    real_t E = mp2_from_full_moeri(d_mo_eri, d_C, d_eps, num_basis_, nocc, frozen);
-    tracked_cudaFree(d_mo_eri);
+    const int nocc = rhf_.get_num_electrons() / 2;
+    const int nvir = num_basis_ - nocc;
+    MultiGpuManager::DeviceGuard guard(0);
+    real_t* d_B_ia = build_B_ia();
+    real_t E;
+    try {
+        E = compute_ri_mp2_from_B_ia(d_B_ia, num_auxiliary_basis_, nocc, nvir,
+                                     rhf_.get_orbital_energies().device_ptr());
+    } catch (...) {
+        tracked_cudaFree(d_B_ia);
+        throw;
+    }
+    tracked_cudaFree(d_B_ia);
     std::cout << "MP2 energy: " << E << " Hartree" << std::endl;
-    return E;
-}
-
-real_t ERI_RI_Distributed_RHF::compute_scs_mp2_energy() {
-    // TODO: distributed build_B_ia for proper SCS-MP2
-    // For now, use full MO ERI fallback (same as stored ERI path)
-    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), num_basis_);
-    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
-    real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
-    int nocc = rhf_.get_num_electrons() / 2;
-    real_t E = mp2_from_full_moeri(d_mo_eri, d_C, d_eps, num_basis_, nocc, 0);
-    tracked_cudaFree(d_mo_eri);
-    std::cout << "SCS-MP2 (fallback to MP2 via full MO ERI): " << E << " Hartree" << std::endl;
-    return E;
-}
-
-real_t ERI_RI_Distributed_RHF::compute_sos_mp2_energy() {
-    real_t* d_mo_eri = build_mo_eri(rhf_.get_coefficient_matrix().device_ptr(), num_basis_);
-    real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
-    real_t* d_eps = rhf_.get_orbital_energies().device_ptr();
-    int nocc = rhf_.get_num_electrons() / 2;
-    real_t E = mp2_from_full_moeri(d_mo_eri, d_C, d_eps, num_basis_, nocc, 0);
-    tracked_cudaFree(d_mo_eri);
-    std::cout << "SOS-MP2 (fallback to MP2 via full MO ERI): " << E << " Hartree" << std::endl;
     return E;
 }
 
@@ -2642,21 +2696,34 @@ real_t* ERI_RI_Distributed_RHF::build_mo_eri(const real_t* d_C, int nmo) const {
         std::vector<real_t*> d_eri_per_gpu(num_gpus_, nullptr);
 
         const size_t C_bytes = (size_t)nao * nmo * sizeof(real_t);
-        for (int g = 0; g < num_gpus_; g++) {
-            cudaSetDevice(g);
-            if (g == 0) {
-                d_C_per_gpu[g] = const_cast<real_t*>(d_C);
-            } else {
-                tracked_cudaMalloc(&d_C_per_gpu[g], C_bytes);
-                cudaMemcpyPeer(d_C_per_gpu[g], g, d_C, 0, C_bytes);
+        try {
+            for (int g = 0; g < num_gpus_; g++) {
+                cudaSetDevice(g);
+                if (g == 0) {
+                    d_C_per_gpu[g] = const_cast<real_t*>(d_C);
+                } else {
+                    tracked_cudaMalloc(&d_C_per_gpu[g], C_bytes);
+                    cudaMemcpyPeer(d_C_per_gpu[g], g, d_C, 0, C_bytes);
+                }
             }
-        }
 
-        for (int g = 0; g < num_gpus_; g++) {
-            cudaSetDevice(g);
-            d_eri_per_gpu[g] = build_eri_from_B_pipeline(
-                d_C_per_gpu[g], nmo, nao, naux_local_[g],
-                d_B_local_[g], mgr.cublas(g));
+            for (int g = 0; g < num_gpus_; g++) {
+                cudaSetDevice(g);
+                d_eri_per_gpu[g] = build_eri_from_B_pipeline(
+                    d_C_per_gpu[g], nmo, nao, naux_local_[g],
+                    d_B_local_[g], mgr.cublas(g));
+            }
+        } catch (...) {
+            // OOM on GPU g leaks nothing: free the nmo⁴ buffers and C replicas
+            // already built on GPUs < g (a repeated-failure workflow otherwise
+            // accumulates hundreds of GB of tracked allocations; BUG 2026-08-05).
+            for (int g = 0; g < num_gpus_; g++) {
+                cudaSetDevice(g);
+                if (g != 0 && d_C_per_gpu[g]) tracked_cudaFree(d_C_per_gpu[g]);
+                if (d_eri_per_gpu[g]) tracked_cudaFree(d_eri_per_gpu[g]);
+            }
+            cudaSetDevice(0);
+            throw;
         }
 
         for (int g = 0; g < num_gpus_; g++) {

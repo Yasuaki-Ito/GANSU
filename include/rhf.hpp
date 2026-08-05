@@ -986,8 +986,15 @@ public:
     real_t compute_lt_sos_mp2_energy() override;
     real_t compute_mp3_energy() override;
 
+protected:
+    /// Helper: build B_ia^P on device [ov x naux] col-major (caller frees with
+    /// tracked_cudaFree). Virtual: the base implementation reads
+    /// intermediate_matrix_B_, which is EMPTY in ERI_RI_Distributed_RHF; the
+    /// distributed override MO-transforms each per-GPU aux slice and gathers on
+    /// device 0. All B_ia consumers (MP2/SCS/SOS/LT-MP2/LT-SOS) inherit
+    /// correctness through this virtual.
+    virtual real_t* build_B_ia();
 private:
-    real_t* build_B_ia();  // Helper: build B_ia^P on device [ov x naux]
     real_t* build_B_ab();  // Helper: build B_ab^P on device [vv x naux]
     real_t* build_B_ij();  // Helper: build B_ij^P on device [oo x naux]
     real_t compute_mp4_energy() override;
@@ -1141,10 +1148,11 @@ public:
 
     void compute_fock_matrix() override;
 
-    /// Post-HF via build_mo_eri (distributed B_local → gather → MO ERI)
+    /// RI-MP2 from gathered B_ia (per-GPU MO transform → device-0 gather →
+    /// blocked (ia|jb) pipeline). No nao⁴ MO ERI. SCS/SOS/LT-MP2/LT-SOS are
+    /// NOT overridden: the ERI_RI_RHF implementations work here through the
+    /// virtual build_B_ia() override (see protected section below).
     real_t compute_mp2_energy() override;
-    real_t compute_scs_mp2_energy() override;
-    real_t compute_sos_mp2_energy() override;
 
     /// Storage mode for B matrix
     enum class StorageMode {
@@ -1186,6 +1194,14 @@ public:
     /// Build B_ij^P [oo × naux_local] from AO-basis B_local. Caller must free result.
     static real_t* build_B_ij_local(const real_t* d_B_ao, int naux_local,
                                     real_t* d_C, int nbas, int nocc, int nvir);
+
+protected:
+    /// Override of ERI_RI_RHF::build_B_ia(): per-GPU build_B_ia_local on each
+    /// aux slice, then contiguous peer-gather to device 0 (aux partition is
+    /// contiguous ascending, so col-major [ov × naux_local] slabs concatenate).
+    /// Returns tracked buffer [ov × naux] on device 0; caller frees.
+    real_t* build_B_ia() override;
+public:
 
     /// Build MO ERI from distributed B_local: gather full B on GPU 0, then delegate
     real_t* build_mo_eri(const real_t* d_C, int nmo) const override;
