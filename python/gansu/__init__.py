@@ -666,6 +666,14 @@ class Molecule:
             xyz_path: Path to xyz file.
             basis: Basis set name ("cc-pvdz") or full path to .gbs file.
             **kwargs: Additional parameters (method, post_hf_method, eri_method, etc.)
+
+        Note:
+            num_gpus is fixed at first use for the process lifetime: the GPU
+            set (handles, NCCL communicators) is initialized by the first
+            Molecule that uses it, and later Molecules in the same process
+            cannot change it (a mismatching request prints a warning to stderr
+            and continues with the first value). Start a fresh process — e.g.
+            multiprocessing worker — to run with a different num_gpus.
         """
         self._lib = _get_lib()
         self._h = self._lib.gansu_create()

@@ -118,10 +118,9 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
 #ifdef GANSU_MULTI_GPU
         {
             auto& mgr = MultiGpuManager::instance();
-            if (!mgr.num_devices()) {
-                int num_gpus = parameters.get<int>("num_gpus");
-                mgr.initialize(num_gpus);
-            }
+            // Always call initialize: no-op after first init, but it warns when a
+            // different explicit num_gpus is requested mid-process (fixed at first use).
+            mgr.initialize(parameters.get<int>("num_gpus"));
             std::cout << "[RI] " << mgr.num_devices() << " device(s)" << std::endl;
             // B-model routing (MPI_DESIGN.md "X model"):
             //  - Single GPU, single process: full-local ERI_RI_RHF (the distributed
@@ -178,10 +177,7 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
 #ifdef GANSU_MULTI_GPU
         {
             auto& mgr = MultiGpuManager::instance();
-            if (!mgr.num_devices()) {
-                int num_gpus = parameters.get<int>("num_gpus");
-                mgr.initialize(num_gpus);
-            }
+            mgr.initialize(parameters.get<int>("num_gpus"));  // no-op + mismatch warning after first init
             std::cout << "[Direct-RI] On-the-fly mode (" << mgr.num_devices() << " device(s))" << std::endl;
             auto eri = std::make_unique<ERI_RI_Distributed_RHF>(*this, auxiliary_molecular);
             eri->set_storage_mode(ERI_RI_Distributed_RHF::StorageMode::OnTheFly);
@@ -204,10 +200,7 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
 #ifdef GANSU_MULTI_GPU
         {
             auto& mgr = MultiGpuManager::instance();
-            if (!mgr.num_devices()) {
-                int num_gpus = parameters.get<int>("num_gpus");
-                mgr.initialize(num_gpus);
-            }
+            mgr.initialize(parameters.get<int>("num_gpus"));  // no-op + mismatch warning after first init
             std::cout << "[Semi-Direct-RI] On-the-fly mode (" << mgr.num_devices() << " device(s))" << std::endl;
             auto eri = std::make_unique<ERI_RI_Distributed_RHF>(*this, auxiliary_molecular);
             eri->set_storage_mode(ERI_RI_Distributed_RHF::StorageMode::OnTheFly);

@@ -18,7 +18,25 @@
 namespace gansu {
 
 void MultiGpuManager::initialize(int requested_devices) {
-    if (initialized_) return;
+    if (initialized_) {
+        // The device set (handles, streams, NCCL communicators) is fixed at
+        // first initialization for the process lifetime. A later call with a
+        // different explicit count is silently ineffective — warn so batch
+        // drivers don't believe they switched GPU counts mid-process.
+        // (Compared against the FIRST request, not num_devices_, so a request
+        // that was merely clamped to the available device count on this box
+        // does not re-warn on every subsequent calculation.)
+        if (requested_devices != -1 && requested_devices != first_requested_devices_
+            && requested_devices != num_devices_) {
+            std::cerr << "[MultiGPU] Warning: num_gpus=" << requested_devices
+                      << " requested, but this process is already initialized with "
+                      << num_devices_ << " device(s); the first-used value is fixed "
+                      << "for the process lifetime. Continuing with " << num_devices_
+                      << ". Start a fresh process to change num_gpus." << std::endl;
+        }
+        return;
+    }
+    first_requested_devices_ = requested_devices;
 
 #ifdef GANSU_CPU_ONLY
     num_devices_ = 0;

@@ -538,20 +538,15 @@ int search_maximum_k(int mocc, int mvir) {
 }
 
 void search_k_and_cudamalloc_4cERI(int mocc, int mvir, int &k, double **d_iajb, cudaStream_t &stream) {
-    k = search_maximum_k(mocc, mvir) * 0.9;
-    // k = (int)(k*mvir / 32) * 32;
-    // k = 10;
-
-    //while(cudaMallocAsync((void**)d_iajb, sizeof(double) * k * mvir * mocc * mvir, stream) != cudaSuccess){
-    //    k *= 0.9;
-    //}
+    // Floor at 1: nocc=1 systems (H2, He, ...) give search_maximum_k()=1, and
+    // the 0.9 safety margin would truncate to k=0 — a zero-byte d_iajb, a
+    // zero-increment occ loop and a division by zero downstream (SIGSEGV).
+    k = std::max(1, (int)(search_maximum_k(mocc, mvir) * 0.9));
 
     cudaError_t err = tracked_cudaMalloc((void**)d_iajb, sizeof(double) * k * (size_t)mvir * mocc * mvir);
     if (err != cudaSuccess) {
         THROW_EXCEPTION(std::string("Failed to allocate device memory for d_iajb matrix: ") + std::string(cudaGetErrorString(err)));
     }
-
-    printf("k = %d\n",k);
 }
 
 
@@ -675,7 +670,11 @@ real_t ERI_RI_RHF::compute_mp2_energy() {
         for(int s = 1; s < 4; s++) cudaStreamWaitEvent(streams[s], events_for_sync[iter_count*4 + 0], 0);
 
         for (int j = 0; j < num_blocks_list.size(); j++){
-            num_blocks_list[j].kernel<<<num_blocks_list[j].num_blocks, num_threads, 0, streams[j]>>>(nocc, nocc_block, nvir, i, num_auxiliary_basis, d_iajb, d_eps, d_energy);
+            // Skip empty launches: at nocc=1 (H2, He) kernels 1/2 get 0 blocks
+            // in the first iteration; a gridDim=0 launch leaves a pending CUDA
+            // error that kills the NEXT calculation's first thrust call.
+            if (num_blocks_list[j].num_blocks > 0)
+                num_blocks_list[j].kernel<<<num_blocks_list[j].num_blocks, num_threads, 0, streams[j]>>>(nocc, nocc_block, nvir, i, num_auxiliary_basis, d_iajb, d_eps, d_energy);
             cudaEventRecord(events_for_sync[iter_count*4 + j], streams[j]);
             cudaStreamWaitEvent(streams[0], events_for_sync[iter_count*4 + j], 0);
         }
@@ -1258,8 +1257,11 @@ real_t compute_ri_mp2_from_B_ia(
         for(int s = 1; s < 4; s++) cudaStreamWaitEvent(streams[s], events_for_sync[iter_count*4 + 0], 0);
 
         for (size_t j = 0; j < num_blocks_list.size(); j++) {
-            num_blocks_list[j].kernel<<<num_blocks_list[j].num_blocks, num_threads, 0, streams[j]>>>(
-                nocc, nocc_block, nvir, i, num_auxiliary_basis, d_iajb, d_eps, d_energy);
+            // Skip empty launches (see compute_mp2_energy: gridDim=0 at nocc=1
+            // poisons the process with a pending CUDA error).
+            if (num_blocks_list[j].num_blocks > 0)
+                num_blocks_list[j].kernel<<<num_blocks_list[j].num_blocks, num_threads, 0, streams[j]>>>(
+                    nocc, nocc_block, nvir, i, num_auxiliary_basis, d_iajb, d_eps, d_energy);
             cudaEventRecord(events_for_sync[iter_count*4 + j], streams[j]);
             cudaStreamWaitEvent(streams[0], events_for_sync[iter_count*4 + j], 0);
         }

@@ -150,6 +150,7 @@ private:
 
     bool initialized_ = false;
     int num_devices_ = 0;
+    int first_requested_devices_ = -1;  ///< num_gpus of the FIRST initialize() (for the mismatch warning)
     int world_rank_ = 0;   ///< MPI world rank (0 if not under MPI).
     int world_size_ = 1;   ///< MPI world size (1 if not under MPI).
 
