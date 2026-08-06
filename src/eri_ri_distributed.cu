@@ -2945,10 +2945,24 @@ bool ERI_RI_Distributed_RHF::replicate_B_to_all_gpus() {
 
     d_B_full_per_gpu_.assign(num_gpus_, nullptr);
 
-    // Allocate full-B buffer on every GPU.
-    for (int g = 0; g < num_gpus_; g++) {
-        cudaSetDevice(g);
-        tracked_cudaMalloc(&d_B_full_per_gpu_[g], full_bytes);
+    // Allocate full-B buffer on every GPU. An allocation failure here must NOT
+    // kill the run: the 60% free-memory guard above is a heuristic sampled
+    // before any replica exists, so on tight GPUs the g-th replica can still
+    // fail (observed in the field: guard passes, 4th replica OOMs → whole job
+    // dies although every caller has a working non-replicated fallback).
+    // Sweep the partial replicas and refuse instead.
+    try {
+        for (int g = 0; g < num_gpus_; g++) {
+            cudaSetDevice(g);
+            tracked_cudaMalloc(&d_B_full_per_gpu_[g], full_bytes);
+        }
+    } catch (const std::exception& e) {
+        std::cout << "[Multi-GPU DMET] B replication aborted (allocation failed: "
+                  << e.what() << "). Falling back to the non-replicated path."
+                  << std::endl;
+        free_replicated_B();   // sweeps the partially-allocated replicas
+        cudaSetDevice(caller_dev);
+        return false;
     }
 
     // Each source GPU's slice is broadcast to every destination GPU.
