@@ -7,6 +7,7 @@
  * This software is licensed under the BSD 3-Clause License.
  * SPDX-License-Identifier: BSD-3-Clause
  */
+#include "progress.hpp"
 #include "dlpno_pair_data.hpp"
 
 #include <Eigen/Dense>
@@ -35,7 +36,9 @@
 
 namespace gansu {
 
-namespace {
+// External linkage (was anonymous-namespace): the CCSD auto-sparse heuristic
+// in dlpno_ccsd.cu must PREDICT the n_gpus=1 workload fallback below, so it
+// reads the same threshold through this function.
 
 // Multi-GPU work threshold (per-GPU) for LMP2 / CCSD T2 dispatch. Below
 // this, callers fall back to n_gpus=1. The default 1e11 was picked from
@@ -62,7 +65,14 @@ long long get_dlpno_min_work_per_gpu()
     return val;
 }
 
-}  // namespace
+// Memory-driven multi-GPU override for the T2-iteration workload fallback.
+// Set by the CCSD auto-sparse heuristic (dlpno_ccsd.cu) when the dense picache
+// fits per-device only with the pairs slabbed across ALL GPUs: collapsing to
+// n_gpus=1 for work-light systems would then OOM (PTCDA C24H8O6, 2026-08-06),
+// so the fallback is suppressed and the slight multi-GPU dispatch overhead is
+// accepted in exchange for the exact (dense, screen-free) path.
+namespace { bool g_dlpno_force_multigpu_iter = false; }
+void set_dlpno_force_multigpu_iter(bool v) { g_dlpno_force_multigpu_iter = v; }
 
 namespace {
 using RowMatXd = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -971,7 +981,15 @@ LMP2Status iterate_dlpno_ccsd_t2(
         const long long kMinWorkPerGpu = get_dlpno_min_work_per_gpu();
         const long long per_gpu = work_estimate / n_gpus;
         const bool fall_back =
-            !user_explicit_n_gpus && (per_gpu < kMinWorkPerGpu);
+            !user_explicit_n_gpus && !g_dlpno_force_multigpu_iter
+            && (per_gpu < kMinWorkPerGpu);
+        if (!fall_back && g_dlpno_force_multigpu_iter && verbose >= 1
+            && !user_explicit_n_gpus && per_gpu < kMinWorkPerGpu) {
+            std::cout << "[DLPNO-ITER-PROF] " << round_tag
+                      << " workload fallback suppressed: dense picache needs the "
+                      << n_gpus << "-GPU pair slab (memory-driven override)"
+                      << std::endl;
+        }
         if (fall_back) {
             if (verbose >= 1) {
                 std::cout << "[DLPNO-ITER-PROF] " << round_tag
@@ -2408,6 +2426,11 @@ LMP2Status iterate_dlpno_ccsd_t2(
                       << "  max|R|=" << std::scientific
                       << std::setprecision(3) << r_max << std::endl;
         }
+        // Report to external drivers (UI / progress callback). Without this a
+        // DLPNO run is silent between the start of the post-HF section and its
+        // end, which from the caller's side is indistinguishable from a hang.
+        { double vals[] = {r_max, conv_tol};
+          report_progress("dlpno_ccsd", iter + 1, 2, vals); }
         dt_iter_misc += std::chrono::duration<double>(
             prof_clock::now() - t_misc_0).count();
         if (r_max < conv_tol) {

@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #include "dlpno_ccsd.hpp"
+#include "progress.hpp"
 
 #include <Eigen/Dense>
 #include <algorithm>
@@ -57,6 +58,14 @@
 #include <cstdlib> // std::getenv (bt-PNO P5a.2 validation gate)
 
 namespace gansu {
+
+// Defined in dlpno_pair_data.cu (external linkage): per-GPU work threshold of
+// the LMP2/CCSD multi-GPU auto-fallback. The CCSD auto-sparse heuristic must
+// predict that fallback, so it reads the same value.
+long long get_dlpno_min_work_per_gpu();
+// Defined in dlpno_pair_data.cu: suppress the T2-iteration workload fallback
+// when the dense picache fits per-device only with the full multi-GPU slab.
+void set_dlpno_force_multigpu_iter(bool v);
 
 // Canonical spatial-orbital CCSD (defined in eri_stored.cu) — used by the
 // bt-PNO-STEOM P5a.2 back-transform validation gate as the reference T1/T2.
@@ -768,6 +777,11 @@ real_t DLPNOCCSD::compute_energy()
                       << "  max|R|=" << std::scientific
                       << std::setprecision(3) << r_max << std::endl;
         }
+        // Report to external drivers (UI / progress callback). DLPNO had no
+        // progress reporting at all, so a long run was indistinguishable from
+        // a hang from the caller's side.
+        { double vals[] = {r_max, conv_tol};
+          report_progress("dlpno_t1", t1_iter, 2, vals); }
         if (r_max < conv_tol) { t1_converged = true; break; }
     }
 
@@ -878,6 +892,13 @@ real_t DLPNOCCSD::compute_energy()
     // returns, so the decision never leaks into a later call on another
     // molecule (geometry optimisation / Python API).
     ScopedEnvOverride env_autosparse;
+    // Reset the memory-driven multi-GPU override when compute_energy returns
+    // (same lifetime discipline as env_autosparse: the decision must not leak
+    // into a later molecule in this process).
+    struct ForceMultiGpuIterGuard {
+        bool armed = false;
+        ~ForceMultiGpuIterGuard() { if (armed) set_dlpno_force_multigpu_iter(false); }
+    } fmg_guard;
     {
         const char* e_bs   = std::getenv("GANSU_DLPNO_CCSD_BARS_SPARSE");
         const char* e_auto = std::getenv("GANSU_DLPNO_CCSD_AUTO_SPARSE");
@@ -902,16 +923,58 @@ real_t DLPNOCCSD::compute_energy()
             // are all pi_T-shaped ⇒ 4× pi_T. Total dense doubles:
             const double dense_doubles = barS_pad + flat + 5.0 * pi_T;
             const double dense_bytes   = dense_doubles * sizeof(real_t);
-            const int    ng        = std::max(1, t2_num_gpus);
-            const double imbalance = 1.6;   // heavy (high-n) pairs cluster on one device
-            const double per_dev   = dense_bytes / ng * imbalance;
+            // Effective device count: iterate_dlpno_ccsd_t2's workload
+            // auto-fallback (dlpno_pair_data.cu) collapses to a single GPU
+            // when the per-GPU kernel work (Σ n_pno² × nocc²) is below the
+            // threshold. The dense-fit estimate MUST anticipate that: a
+            // memory-heavy but work-light system (PTCDA C24H8O6: dense
+            // ≈ 229 GB total but work 4.0e9 ≪ 1e11) otherwise passes the
+            // ng-way check and then OOMs on the one device that actually runs
+            // (PiCacheGpu cudaMalloc d_barS_flat; issue 2026-08-06).
+            const int ng_param = std::max(1, t2_num_gpus);
+            bool would_collapse = false;
+            if (ng_param > 1 && !user_explicit_n_gpus) {
+                const double work_estimate = sum_n2 * nocc2;   // fallback's formula
+                would_collapse = work_estimate / ng_param
+                                 < static_cast<double>(get_dlpno_min_work_per_gpu());
+            }
+            // heavy (high-n) pairs cluster on one device → imbalance allowance
+            const double per_dev_multi  = dense_bytes / ng_param * 1.6;
+            const double per_dev_single = dense_bytes;
 
             size_t free_b = 0, total_b = 0;
             const bool have_mem = (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess);
             const double GB = 1024.0 * 1024.0 * 1024.0;
             const double margin = 4.0 * GB;
-            const bool wont_fit =
+
+            int    ng       = would_collapse ? 1 : ng_param;
+            double per_dev  = (ng > 1) ? per_dev_multi : per_dev_single;
+            bool   wont_fit =
                 have_mem && (per_dev > static_cast<double>(free_b) - margin);
+
+            // Middle ground: the workload fallback would collapse to 1 GPU and
+            // dense does NOT fit there, but it DOES fit slabbed across all
+            // GPUs. Prefer suppressing the fallback (exact dense, slight
+            // multi-GPU dispatch overhead) over the sparse distance screen
+            // (~chemical-accuracy approximation).
+            if (wont_fit && would_collapse && ng_param > 1 && have_mem
+                && per_dev_multi <= static_cast<double>(free_b) - margin) {
+                set_dlpno_force_multigpu_iter(true);
+                fmg_guard.armed = true;
+                ng = ng_param;
+                per_dev = per_dev_multi;
+                wont_fit = false;
+                if (params_.verbose >= 1) {
+                    std::cout << "[DLPNO-CCSD] auto-sparse: dense est "
+                              << std::fixed << std::setprecision(1)
+                              << per_dev_single / GB << " GB on 1 dev > free "
+                              << static_cast<double>(free_b) / GB
+                              << " GB, but fits slabbed on " << ng_param
+                              << " GPUs (" << per_dev_multi / GB
+                              << " GB/dev) → forcing multi-GPU, keeping dense "
+                                 "(exact)." << std::endl;
+                }
+            }
 
             if (wont_fit) {
                 env_autosparse.set("GANSU_DLPNO_CCSD_BARS_SPARSE",     "1");

@@ -11247,6 +11247,14 @@ real_t ccsd_from_aoeri_via_full_moeri(const real_t* __restrict__ d_eri_ao, const
         real_t E_CCSD_diff = fabs(E_CCSD_new - E_CCSD_old);
         //std::cout << "CCSD Energy difference: " << E_CCSD_diff << " Hartree" <<  std::endl;
 
+        // Report the iteration so external drivers can show progress. This is
+        // the loop the RI / Direct / Hash paths go through (they all funnel
+        // into compute_ccsd_energy_impl); previously only the stored-ERI
+        // B-native loop reported, so an RI-CCSD run looked frozen from the
+        // start of the post-HF section until it finished.
+        { double vals[] = {E_CCSD_new, E_CCSD_diff, rms};
+          report_progress("ccsd", loops, 3, vals); }
+
         if(rms < convergence_threshold || E_CCSD_diff < convergence_threshold){
             std::cout << "CCSD converged in " << (loops+1) << " iterations." << std::endl;
             break;
