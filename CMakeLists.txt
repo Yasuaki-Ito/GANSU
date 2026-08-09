@@ -161,17 +161,19 @@ option(GANSU_BUNDLE_OPENBLAS "Statically embed OpenBLAS+LAPACK into libgansu.so 
 
 set(GANSU_BLAS_LAPACK_LIBS "")
 if(GANSU_BUNDLE_OPENBLAS)
-    # Locate a static, PIC OpenBLAS archive. Prefer the OpenMP-threaded variant
-    # (libopenblaso.a, built with USE_OPENMP=1): GANSU calls BLAS/LAPACK from
+    # Locate a static, PIC OpenBLAS archive. Only the OpenMP-threaded variant
+    # (built with USE_OPENMP=1) is safe to embed: GANSU calls BLAS/LAPACK from
     # INSIDE its own OpenMP parallel regions (the DLPNO per-pair loops), and the
-    # pthread variant (libopenblasp.a) detects that context and prints
-    # "Detect OpenMP Loop ... may hang" — spawning its own pthread pool nested in
-    # an OpenMP thread risks a deadlock. The OpenMP variant shares GANSU's single
-    # libgomp runtime (already linked), so nested calls run serial (nesting off
-    # by default) with no oversubscription, while standalone GEMMs (e.g. the (T)
-    # contraction) still thread. There is no "second OpenMP runtime" cost since
-    # GANSU already depends on libgomp. Fall back to pthread/serial only if the
-    # OpenMP archive is unavailable.
+    # pthread variant's own pool + per-caller-thread buffer table is not safe
+    # against 64 concurrent OMP callers — in the field this crashed ~2-4% of
+    # DLPNO runs inside dsymv_L (the dsyevd_ tridiagonalization) on a 128-core
+    # host. The serial variant is equally unsafe unless built with USE_LOCKING.
+    # The OpenMP variant shares GANSU's single libgomp runtime (already linked),
+    # so nested calls run serial (nesting off by default) with no
+    # oversubscription, while standalone GEMMs (e.g. the (T) contraction) still
+    # thread. Because install names do not encode the variant (a USE_OPENMP=1
+    # source build installs as plain libopenblas.a), the variant is verified by
+    # symbol inspection below, not by file name.
     set(_gansu_saved_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
     set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
     find_library(GANSU_OPENBLAS_STATIC
@@ -181,7 +183,57 @@ if(GANSU_BUNDLE_OPENBLAS)
     if(NOT GANSU_OPENBLAS_STATIC)
         message(FATAL_ERROR
             "GANSU_BUNDLE_OPENBLAS=ON but no static OpenBLAS archive (libopenblas*.a) "
-            "was found. Install openblas-static (dnf/apt) or unset the option.")
+            "was found. Build OpenBLAS with USE_OPENMP=1 (or install the openmp "
+            "variant, e.g. libopenblas-openmp-dev) and point GANSU_OPENBLAS_STATIC "
+            "at it, or unset the option.")
+    endif()
+    option(GANSU_BUNDLE_OPENBLAS_ALLOW_UNSAFE
+        "Embed a pthread/serial OpenBLAS archive despite the known concurrent-caller crash" OFF)
+    # Variant check: pthread builds define blas_thread_server (their private
+    # pool); OpenMP builds instead reference the GOMP/omp runtime. A serial
+    # build shows neither.
+    execute_process(
+        COMMAND ${CMAKE_NM} -g "${GANSU_OPENBLAS_STATIC}"
+        OUTPUT_VARIABLE _gansu_openblas_syms
+        ERROR_QUIET
+        RESULT_VARIABLE _gansu_nm_rc)
+    if(NOT _gansu_nm_rc EQUAL 0)
+        message(WARNING
+            "Could not inspect ${GANSU_OPENBLAS_STATIC} with ${CMAKE_NM}; "
+            "unable to verify it is the OpenMP variant (USE_OPENMP=1). "
+            "Embedding an unverified archive.")
+    else()
+        string(FIND "${_gansu_openblas_syms}" "blas_thread_server" _gansu_has_pthread_pool)
+        string(FIND "${_gansu_openblas_syms}" "GOMP_" _gansu_has_gomp)
+        string(FIND "${_gansu_openblas_syms}" "omp_get_num_threads" _gansu_has_omp)
+        if(NOT _gansu_has_pthread_pool EQUAL -1)
+            set(_gansu_openblas_variant "pthread")
+        elseif(NOT _gansu_has_gomp EQUAL -1 OR NOT _gansu_has_omp EQUAL -1)
+            set(_gansu_openblas_variant "openmp")
+        else()
+            set(_gansu_openblas_variant "serial")
+        endif()
+        if(NOT _gansu_openblas_variant STREQUAL "openmp")
+            if(GANSU_BUNDLE_OPENBLAS_ALLOW_UNSAFE)
+                message(WARNING
+                    "Embedding the ${_gansu_openblas_variant} OpenBLAS variant "
+                    "(${GANSU_OPENBLAS_STATIC}) because "
+                    "GANSU_BUNDLE_OPENBLAS_ALLOW_UNSAFE=ON. Expect rare "
+                    "nondeterministic SIGSEGV in the DLPNO host eigensolves.")
+            else()
+                message(FATAL_ERROR
+                    "GANSU_OPENBLAS_STATIC resolved to the ${_gansu_openblas_variant} "
+                    "variant (${GANSU_OPENBLAS_STATIC}). Embedding it is unsafe: "
+                    "GANSU issues concurrent BLAS/LAPACK calls from up to 64 OpenMP "
+                    "threads and this variant crashes nondeterministically (observed "
+                    "as ~2-4% SIGSEGV in dsymv_L during DLPNO setup). Build OpenBLAS "
+                    "with USE_OPENMP=1 (recommended: also DYNAMIC_ARCH=1 NUM_THREADS=256) "
+                    "and pass -DGANSU_OPENBLAS_STATIC=/path/to/libopenblas.a, or set "
+                    "GANSU_BUNDLE_OPENBLAS_ALLOW_UNSAFE=ON to override.")
+            endif()
+        else()
+            message(STATUS "OpenBLAS archive variant verified: openmp")
+        endif()
     endif()
     find_library(GANSU_GFORTRAN_SO NAMES gfortran DOC "libgfortran runtime")
     find_library(GANSU_QUADMATH_SO NAMES quadmath DOC "libquadmath runtime")

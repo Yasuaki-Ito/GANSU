@@ -11,6 +11,7 @@
 #include "gpu_manager.hpp"
 #include <iostream>
 #include <algorithm>
+#include <stdexcept>
 #ifdef GANSU_MPI
 #include <mpi.h>
 #endif
@@ -138,10 +139,58 @@ void MultiGpuManager::initialize(int requested_devices) {
         std::vector<int> dev_list(num_devices_);
         for (int d = 0; d < num_devices_; d++) dev_list[d] = d;
 
+        // Probe every device BEFORE ncclCommInitAll: on an Exclusive_Process
+        // box, a device held by another job makes ncclCommInitAll fail in a
+        // way that poisons the whole process — later CUDA calls die with
+        // unrelated-looking errors (thrust radix_sort: cudaErrorInvalidDevice
+        // at the first SCF sort) even on free devices. Observed in the field
+        // as a "random ~50% crash / hang at post-HF entry" whenever two jobs
+        // collided on this box. Detect busy devices up front, degrade to the
+        // usable contiguous prefix (device ids are assumed dense 0..n-1
+        // throughout), and never hand a busy device to NCCL.
+        int usable = 0;
+        for (int d = 0; d < num_devices_; d++) {
+            size_t probe_free = 0, probe_total = 0;
+            if (cudaSetDevice(d) == cudaSuccess
+                && cudaMemGetInfo(&probe_free, &probe_total) == cudaSuccess) {
+                ++usable;
+            } else {
+                cudaGetLastError();
+                break;   // keep the contiguous prefix 0..usable-1
+            }
+        }
+        if (usable == 0) {
+            initialized_ = true;   // mark done so retries don't loop
+            num_devices_ = 0;
+            throw std::runtime_error(
+                "[MultiGPU] No usable GPU: device 0 is unavailable — likely "
+                "held by another process (Exclusive_Process compute mode). "
+                "Retry when the GPUs are free.");
+        }
+        if (usable < num_devices_) {
+            std::cerr << "[MultiGPU] Only " << usable << " of " << num_devices_
+                      << " GPU(s) are available (device " << usable
+                      << " appears held by another process; Exclusive_Process "
+                         "compute mode). Continuing with " << usable
+                      << " GPU(s)." << std::endl;
+            num_devices_ = usable;
+            nccl_comms_.resize(num_devices_);
+            dev_list.resize(num_devices_);
+        }
+
         ncclResult_t nccl_result = ncclCommInitAll(nccl_comms_.data(), num_devices_, dev_list.data());
         if (nccl_result != ncclSuccess) {
-            std::cerr << "[MultiGPU] NCCL init failed: " << ncclGetErrorString(nccl_result) << std::endl;
-            num_devices_ = 1;
+            // Should be rare now (all devices probed OK just above) — e.g. a
+            // job grabbed a device between the probe and the init. The failed
+            // init poisons the process state, so do not limp on: fail clearly.
+            initialized_ = true;
+            num_devices_ = 0;
+            nccl_comms_.clear();
+            throw std::runtime_error(
+                std::string("[MultiGPU] NCCL init failed: ")
+                + ncclGetErrorString(nccl_result)
+                + " — a GPU was likely taken by another process during startup "
+                  "(Exclusive_Process compute mode). Retry when the GPUs are free.");
         }
     }
 #elif defined(GANSU_MPI)

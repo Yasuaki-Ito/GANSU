@@ -1,0 +1,31 @@
+# ---------------------------------------------------------------------------
+# M8 external validation -- ORCA STEOM-CCSD reference for the GANSU comparison.
+#
+# Run one job per molecule. Match GANSU: cc-pVDZ, RI (RIJCOSX + cc-pVDZ/C for
+# the CC part), frozen core (ORCA default), 5 roots, closed-shell singlets.
+# Keep the geometry file IDENTICAL to GANSU's xyz (../xyz/<Molecule>.xyz).
+#
+# ORCA has STEOM-CCSD; it has NO ADC(2). For the ADC(2) column use PySCF+adcc
+# (adcc.adc2), Turbomole (ricc2 adc(2)), or Q-Chem -- same cc-pVDZ, frozen core.
+#
+# Report the vertical excitation energies in eV (ORCA prints them in the
+# "STEOM-CCSD RESULTS" / "TRANSITION ELECTRIC DIPOLE MOMENTS" block).
+# ---------------------------------------------------------------------------
+
+# ==== Formaldehyde ====
+! STEOM-CCSD cc-pVDZ RIJCOSX cc-pVDZ/C cc-pVDZ/J TightSCF
+%mdci
+  nroots 5
+  dorootwise true
+end
+* xyzfile 0 1 Formaldehyde.xyz
+
+# ==== Ethylene (C2H4) : copy the block above, change the geometry line to ====
+# * xyzfile 0 1 C2H4.xyz
+
+# ==== Water (H2O) : ====
+# * xyzfile 0 1 H2O.xyz
+#
+# Note: H2O's low singlets are Rydberg; cc-pVDZ has no diffuse functions, so
+# the ABSOLUTE energies are not physical -- but GANSU and ORCA use the same
+# basis, so the code-vs-code AGREEMENT is still the quantity being validated.

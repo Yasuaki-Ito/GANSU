@@ -1750,6 +1750,12 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
     const char* _eap = std::getenv("GANSU_PROGRESS");   // progress default-on; GANSU_PROGRESS=0 to quiet
     const bool ea_subprof = (std::getenv("GANSU_EA_BUILD_SUBPROF") != nullptr)
                           || !_eap || _eap[0] != '0';
+    // (2026-08-07) INTRA-phase splits (term3+4 / Wvovv). These need a
+    // cudaDeviceSynchronize() per tile, which serializes the device work
+    // against the host scatter/gather that normally overlaps it — measuring
+    // them cost +114 s on the decacene term3+4 phase alone. So they are
+    // OPT-IN (GANSU_EA_BUILD_SPLIT=1) and completely absent otherwise.
+    const bool ea_split = (std::getenv("GANSU_EA_BUILD_SPLIT") != nullptr);
     auto _spclk = std::chrono::high_resolution_clock::now();
     auto subprof = [&](const char* nm) {
         if (!ea_subprof) return;
@@ -2585,9 +2591,18 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         // Rebuild the full block as a SHORT-LIVED transient (bytes identical,
         // per-k B fills straight into the buffer), freed right after the a0
         // loop — it never coexists with the ct-cluster scratch phases.
+        // (2026-08-07) Wvovv phase split. At decacene this phase is 420 s and it
+        // has four candidate costs that want different fixes: the per-k RI
+        // rebuild of the transient ovov, the ct GEMM, the ovvv l-window H2D
+        // (RE-STREAMED once per a-slab: 15 slabs × 164 GiB at decacene), and the
+        // result D2H. Measure before touching any of them.
+        double _wv_ovov = 0.0, _wv_gemm = 0.0, _wv_h2d = 0.0, _wv_asm = 0.0, _wv_d2h = 0.0;
+        auto _wv_now = []{ return std::chrono::high_resolution_clock::now(); };
         real_t* d_ovov_tr = nullptr;
         const real_t* d_ovov_src = d_eri_ovov_;
         if (!d_ovov_src) {
+            if (ea_split) cudaDeviceSynchronize();
+            const auto _o0 = _wv_now();
             const int Mfull = nmo_full_, Ofz = frozen_off_;
             tracked_cudaMalloc(&d_ovov_tr, (size_t)NO*NV*NO*NV*sizeof(real_t));
             for (int k = 0; k < NO; ++k)
@@ -2595,34 +2610,91 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                     Ofz + k, 1, NO + Ofz, NV, Ofz, NO, NO + Ofz, NV,
                     d_ovov_tr + (size_t)k * NV * NO * NV);
             d_ovov_src = d_ovov_tr;
+            if (ea_split) cudaDeviceSynchronize();
+            _wv_ovov += std::chrono::duration<double>(_wv_now() - _o0).count();
         }
-        for (int a0 = 0; a0 < Mv; a0 += TA) {
-            const int na = std::min(TA, Mv - a0);
+        // (2026-08-07) When the raw ovvv block was elided (lean mode) the l-window
+        // upload used to sit INSIDE the a-slab loop, so the whole host ovvv was
+        // re-streamed once per a-slab — 15 slabs × 164 GiB = 2.6 TB of H2D, and
+        // the split profiler put 258 s of this 335 s phase in that one memcpy.
+        // Hoist the l-window loop OUTSIDE: each window is uploaded exactly once
+        // and every a-slab consumes it while it is resident. The ct GEMM is
+        // re-done per window (0.17 s for a full a-sweep — free at this scale) and
+        // the build-to-host D2H becomes a 2D copy of the window's column range.
+        // Every output element is still written by exactly one (a-slab, l-window)
+        // assemble from an identically-computed dC ⇒ bit-identical.
+        auto wv_gemm_for = [&](int a0, int na) {
+            if (ea_split) cudaDeviceSynchronize();
+            const auto _q0 = _wv_now();
             cublasDgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N, Nv, na, Kv, &one,
                         d_ovov_src, Nv, dA + (size_t)a0*Kv, Kv, &zero, dC, Nv);
-            const int thr = 256;
-            real_t* const wv_dst = wv_build_to_host ? d_wv_slab
-                                                    : d_Wvovv_ + (size_t)a0*slab_out;
-            if (d_eri_ovvv_) {
+            if (ea_split) cudaDeviceSynchronize();
+            _wv_gemm += std::chrono::duration<double>(_wv_now() - _q0).count();
+        };
+        const int thr = 256;
+        if (d_eri_ovvv_) {
+            for (int a0 = 0; a0 < Mv; a0 += TA) {
+                const int na = std::min(TA, Mv - a0);
+                wv_gemm_for(a0, na);
+                real_t* const wv_dst = wv_build_to_host ? d_wv_slab
+                                                        : d_Wvovv_ + (size_t)a0*slab_out;
                 const size_t nel = (size_t)na * slab_out;
                 const int blk = (int)std::min<size_t>((nel + thr - 1) / thr, 65535);
+                const auto _a0t = _wv_now();
                 ea_wvovv_assemble_kernel<<<blk, thr>>>(d_eri_ovvv_, dC, wv_dst,
                                                        NO, NV, a0, na);
-            } else {
-                for (int l0 = 0; l0 < NO; l0 += wv_ls) {
-                    const int nl = std::min(wv_ls, NO - l0);
-                    cudaMemcpy(d_ovvv_ls, h_ovvv.data() + (size_t)l0*NV*NV*NV,
-                               (size_t)nl*NV*NV*NV*sizeof(real_t), cudaMemcpyHostToDevice);
-                    const size_t nel = (size_t)na * nl * NV * NV;
-                    const int blk = (int)std::min<size_t>((nel + thr - 1) / thr, 65535);
-                    ea_wvovv_assemble_lwin_kernel<<<blk, thr>>>(d_ovvv_ls, dC, wv_dst,
-                                                                NO, NV, a0, na, l0, nl);
+                if (ea_split) cudaDeviceSynchronize();
+                _wv_asm += std::chrono::duration<double>(_wv_now() - _a0t).count();
+                if (wv_build_to_host) {
+                    const auto _r0 = _wv_now();
+                    cudaMemcpy(h_wvovv_stage_.data() + (size_t)a0*slab_out, d_wv_slab,
+                               (size_t)na*slab_out*sizeof(real_t), cudaMemcpyDeviceToHost);
+                    _wv_d2h += std::chrono::duration<double>(_wv_now() - _r0).count();
                 }
             }
-            if (wv_build_to_host)
-                cudaMemcpy(h_wvovv_stage_.data() + (size_t)a0*slab_out, d_wv_slab,
-                           (size_t)na*slab_out*sizeof(real_t), cudaMemcpyDeviceToHost);
+        } else {
+            for (int l0 = 0; l0 < NO; l0 += wv_ls) {
+                const int nl = std::min(wv_ls, NO - l0);
+                const auto _h0 = _wv_now();
+                cudaMemcpy(d_ovvv_ls, h_ovvv.data() + (size_t)l0*NV*NV*NV,
+                           (size_t)nl*NV*NV*NV*sizeof(real_t), cudaMemcpyHostToDevice);
+                _wv_h2d += std::chrono::duration<double>(_wv_now() - _h0).count();
+                for (int a0 = 0; a0 < Mv; a0 += TA) {
+                    const int na = std::min(TA, Mv - a0);
+                    wv_gemm_for(a0, na);
+                    real_t* const wv_dst = wv_build_to_host ? d_wv_slab
+                                                            : d_Wvovv_ + (size_t)a0*slab_out;
+                    const size_t nel = (size_t)na * nl * NV * NV;
+                    const int blk = (int)std::min<size_t>((nel + thr - 1) / thr, 65535);
+                    const auto _a1t = _wv_now();
+                    ea_wvovv_assemble_lwin_kernel<<<blk, thr>>>(d_ovvv_ls, dC, wv_dst,
+                                                                NO, NV, a0, na, l0, nl);
+                    if (ea_split) cudaDeviceSynchronize();
+                    _wv_asm += std::chrono::duration<double>(_wv_now() - _a1t).count();
+                    if (wv_build_to_host) {
+                        // window column range only: rows = a (pitch slab_out),
+                        // width = nl·NV² doubles starting at l0·NV².
+                        const auto _r0 = _wv_now();
+                        cudaMemcpy2D(h_wvovv_stage_.data() + (size_t)a0*slab_out
+                                         + (size_t)l0*NV*NV,
+                                     slab_out * sizeof(real_t),
+                                     d_wv_slab + (size_t)l0*NV*NV,
+                                     slab_out * sizeof(real_t),
+                                     (size_t)nl*NV*NV*sizeof(real_t), na,
+                                     cudaMemcpyDeviceToHost);
+                        _wv_d2h += std::chrono::duration<double>(_wv_now() - _r0).count();
+                    }
+                }
+            }
         }
+        if (ea_split)
+            std::cout << "      [EA build-SUBPROF] Wvovv split: ovov RI rebuild = "
+                      << std::fixed << std::setprecision(2) << _wv_ovov
+                      << " s | ct GEMM = " << _wv_gemm
+                      << " s | ovvv H2D = " << _wv_h2d
+                      << " s | assemble = " << _wv_asm
+                      << " s | result D2H = " << _wv_d2h << " s"
+                      << std::defaultfloat << std::endl;
         cudaDeviceSynchronize();
         tracked_cudaFree(dA);
         if (d_ovov_tr) tracked_cudaFree(d_ovov_tr);   // (lean) short-lived ovov
@@ -3691,31 +3763,80 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
             else ovvv_host_A = ((2.0 * (double)NV2 * KV + (double)Bsz + (double)bigsz)
                                 * sizeof(real_t) > 0.80 * (double)fA);
         }
-        std::vector<real_t> hA_t[3];
+        // (2026-08-07) Uninitialized storage: every element of all three arrays is
+        // written by the gather below, so std::vector's value-initialization was a
+        // pure-waste single-threaded zero-fill of 3 × 164 GiB before the real work
+        // (and it first-touched every page on one core). `new real_t[n]` leaves
+        // trivially-typed storage uninitialized; the gather then first-touches each
+        // page on the thread that owns it.
+        std::unique_ptr<real_t[]> hA_own[3];
+        real_t* hA_t[3] = {nullptr, nullptr, nullptr};
+        double _ag_alloc = 0.0, _ag_gather = 0.0;
         if (ovvv_host_A) {
             const size_t asz = (size_t)NV2 * KV;
-            hA_t[1].resize(asz);
-            hA_t[2].resize(asz);
-            #pragma omp parallel for collapse(2)
-            for (int x = 0; x < NV; ++x)
-                for (int y = 0; y < NO; ++y) {
-                    const size_t db = (size_t)x * NV * KV + (size_t)y * NV;
-                    for (int c = 0; c < NV; ++c) {
-                        // hA1[x,c,y,d] = ovvv[y,d,x,c]   (mode 1; d-strided source)
-                        const size_t d1 = db + (size_t)c * KV;
-                        const size_t s1 = (((size_t)y * NV) * NV + x) * NV + c;
-                        for (int d = 0; d < NV; ++d)
-                            hA_t[1][d1 + d] = h_ovvv[s1 + (size_t)d * NV * NV];
-                        // hA2[x,c,y,d] = ovvv[y,c,x,d]   (mode 2; contiguous source row)
-                        std::memcpy(&hA_t[2][d1],
-                                    &h_ovvv[(((size_t)y * NV + c) * NV + x) * NV],
-                                    (size_t)NV * sizeof(real_t));
+            const auto _al0 = std::chrono::high_resolution_clock::now();
+            for (int m = 0; m < 3; ++m) {
+                hA_own[m].reset(new real_t[asz]);
+                hA_t[m] = hA_own[m].get();
+            }
+            _ag_alloc = std::chrono::duration<double>(
+                            std::chrono::high_resolution_clock::now() - _al0).count();
+            const auto _ga0 = std::chrono::high_resolution_clock::now();
+            // (2026-08-07) Tiled + fused A-gather. The previous version read the
+            // mode-1 source with a d-stride of NV² doubles (3 MB at decacene), so
+            // all 2.2e10 elements missed cache, and it then made a SECOND full
+            // pass over three 164 GiB arrays to form mode 0 — together ~274 s of
+            // the term3+4 phase. For fixed (x,y) the mode-1 gather is just a
+            // [c × d] transpose, so do it in tiles through a small buffer (reads
+            // contiguous in c, writes contiguous in d) and emit modes 2 and 0 in
+            // the same sweep (mode 2's source row is already contiguous in d).
+            // Same values, same 2·A1 − A2 expression ⇒ bit-identical.
+            constexpr int TT = 64;
+            #pragma omp parallel num_threads(64)
+            {
+                std::vector<real_t> tb((size_t)TT * TT);
+                #pragma omp for collapse(2) schedule(static)
+                for (int x = 0; x < NV; ++x)
+                    for (int y = 0; y < NO; ++y) {
+                        const size_t db = (size_t)x * NV * KV + (size_t)y * NV;
+                        const size_t sy = (size_t)y * NV * NV * NV + (size_t)x * NV;
+                        for (int c0 = 0; c0 < NV; c0 += TT) {
+                            const int nc = std::min(TT, NV - c0);
+                            for (int d0 = 0; d0 < NV; d0 += TT) {
+                                const int nd = std::min(TT, NV - d0);
+                                // gather the transpose tile: src is contiguous in c
+                                for (int d = 0; d < nd; ++d) {
+                                    const real_t* s1 = &h_ovvv[sy
+                                        + (size_t)(d0 + d) * NV * NV + c0];
+                                    for (int c = 0; c < nc; ++c)
+                                        tb[(size_t)c * TT + d] = s1[c];
+                                }
+                                for (int c = 0; c < nc; ++c) {
+                                    const size_t dd = db + (size_t)(c0 + c) * KV + d0;
+                                    const real_t* s2 = &h_ovvv[sy
+                                        + (size_t)(c0 + c) * NV * NV + d0];
+                                    const real_t* t1 = &tb[(size_t)c * TT];
+                                    real_t* a1 = &hA_t[1][dd];
+                                    real_t* a2 = &hA_t[2][dd];
+                                    real_t* a0 = &hA_t[0][dd];
+                                    for (int d = 0; d < nd; ++d) {
+                                        const real_t v1 = t1[d], v2 = s2[d];
+                                        a1[d] = v1;
+                                        a2[d] = v2;
+                                        a0[d] = 2.0 * v1 - v2;
+                                    }
+                                }
+                            }
+                        }
                     }
-                }
-            hA_t[0].resize(asz);
-            #pragma omp parallel for
-            for (long long i = 0; i < (long long)asz; ++i)
-                hA_t[0][i] = 2.0 * hA_t[1][i] - hA_t[2][i];   // mode 0 = 2·T1 − T2 (same expr as kernel)
+            }
+            _ag_gather = std::chrono::duration<double>(
+                             std::chrono::high_resolution_clock::now() - _ga0).count();
+            if (ea_split)
+                std::cout << "      [EA build-SUBPROF] A-gather split: alloc = "
+                          << std::fixed << std::setprecision(2) << _ag_alloc
+                          << " s | tiled gather (3 modes) = " << _ag_gather << " s"
+                          << std::defaultfloat << std::endl;
             if (d_eri_ovvv_) {   // (C2 already released it right after extract)
                 tracked_cudaFree(d_eri_ovvv_);
                 d_eri_ovvv_ = nullptr;
@@ -3824,6 +3945,12 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
         const real_t one = 1.0, zero = 0.0;
         const int thr = 256;
         const int blkB = (int)std::min<size_t>((Bsz + thr - 1) / thr, 65535);
+        // (2026-08-07) Split the phase wall into repack+GEMM / tile D2H / host
+        // scatter. The phase is the EA build's largest single item (545 s at
+        // decacene) and the three parts want completely different fixes, so
+        // guessing which dominates is not good enough.
+        double _t3_gemm = 0.0, _t3_d2h = 0.0, _t3_scat = 0.0;
+        auto _t3_now = []{ return std::chrono::high_resolution_clock::now(); };
         // All work on the legacy default stream → repack → GEMM → scatter are
         // implicitly ordered; consecutive scatters serialize their dBig RMW.
         auto gemm_scatter_dev = [&](int Amode, int Bmode, real_t coeff, int free_bc) {
@@ -3834,8 +3961,10 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                 const int nt_cur = (int)std::min<size_t>(nt, (size_t)NV2 - n0);
                 const size_t tsz = (size_t)nt_cur * KV;
                 const int blkT = (int)std::min<size_t>((tsz + thr - 1) / thr, 65535);
+                if (ea_split) cudaDeviceSynchronize();
+                const auto _g0 = _t3_now();
                 if (ovvv_host_A)
-                    cudaMemcpy(dA, hA_t[Amode].data() + (size_t)n0 * KV,
+                    cudaMemcpy(dA, hA_t[Amode] + (size_t)n0 * KV,
                                tsz * sizeof(real_t), cudaMemcpyHostToDevice);
                 else
                     ea_wvvvo_repack_A_kernel<<<blkT, thr>>>(d_eri_ovvv_, dA, NO, NV, Amode,
@@ -3853,23 +3982,66 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                                     dB, KV, dA + k0, KV, beta_k, dM, KV);
                     }
                 }
+                if (ea_split) { cudaDeviceSynchronize();
+                    _t3_gemm += std::chrono::duration<double>(_t3_now() - _g0).count(); }
                 if (!big_host) {
+                    if (ea_split) cudaDeviceSynchronize();
+                    const auto _g0 = _t3_now();
                     ea_wvvvo_scatter_kernel<<<blkT, thr>>>(dM, dBig, coeff, free_bc, NO, NV,
                                                            (int)n0, nt_cur);
+                    if (ea_split) { cudaDeviceSynchronize();
+                        _t3_scat += std::chrono::duration<double>(_t3_now() - _g0).count(); }
                 } else {
+                    const auto _d0 = _t3_now();
                     cudaMemcpy(h_tileM.data(), dM, tsz * sizeof(real_t),
                                cudaMemcpyDeviceToHost);
+                    const auto _d1 = _t3_now();
+                    _t3_d2h += std::chrono::duration<double>(_d1 - _d0).count();
                     const size_t KVs = (size_t)NO * NV;
-                    #pragma omp parallel for
-                    for (long long idx = 0; idx < (long long)tsz; ++idx) {
-                        const size_t row = n0 + (size_t)idx / KVs, col = (size_t)idx % KVs;
-                        const int x = (int)(row / NV), c = (int)(row % NV);
-                        const int j = (int)(col / NV), e = (int)(col % NV);
-                        const int a = free_bc ? e : x;
-                        const int b = free_bc ? x : e;
-                        wvvvo_big[(((size_t)a * NV + b) * NV + c) * NO + j]
-                            += coeff * h_tileM[idx];
+                    const long long nrow = (long long)(tsz / KVs);
+                    // (2026-08-07) Cache-blocked scatter. The old linear `idx`
+                    // loop let `e = col % NV` vary fastest, and e strides the
+                    // OUTPUT by NV·NV·NO doubles (287 MB at decacene) — every
+                    // one of the 2.2e10 read-modify-writes touched a fresh
+                    // cache line. Here each (row, e) writes the NO-long j-run
+                    // contiguously (768 B), and the tile is read through a small
+                    // per-thread [EB × NO] transpose buffer so the source side
+                    // stays local too. Every output element still receives
+                    // exactly one contribution per call — a pure reordering of
+                    // disjoint writes, so the result is bit-identical.
+                    constexpr int EB = 32;
+                    const auto _s0 = _t3_now();
+                    #pragma omp parallel num_threads(64)
+                    {
+                        std::vector<real_t> tbuf((size_t)EB * NO);
+                        #pragma omp for collapse(2) schedule(static)
+                        for (long long r = 0; r < nrow; ++r) {
+                            for (int e0 = 0; e0 < NV; e0 += EB) {
+                                const size_t row = n0 + (size_t)r;
+                                const int x = (int)(row / NV), c = (int)(row % NV);
+                                const int ne = std::min(EB, NV - e0);
+                                const real_t* src = h_tileM.data() + (size_t)r * KVs;
+                                // gather [j][e-tile] → [e][j] (reads are the
+                                // contiguous e-run of each j row)
+                                for (int j = 0; j < NO; ++j) {
+                                    const real_t* sj = src + (size_t)j * NV + e0;
+                                    for (int e = 0; e < ne; ++e)
+                                        tbuf[(size_t)e * NO + j] = sj[e];
+                                }
+                                for (int e = 0; e < ne; ++e) {
+                                    const int ee = e0 + e;
+                                    const int a = free_bc ? ee : x;
+                                    const int b = free_bc ? x : ee;
+                                    real_t* dst = wvvvo_big.data()
+                                                + (((size_t)a * NV + b) * NV + c) * NO;
+                                    const real_t* tb = tbuf.data() + (size_t)e * NO;
+                                    for (int j = 0; j < NO; ++j)
+                                        dst[j] += coeff * tb[j];
+                                }
+                            }
+                        }
                     }
+                    _t3_scat += std::chrono::duration<double>(_t3_now() - _s0).count();
                 }
             }
         };
@@ -3921,6 +4093,12 @@ void EAEOMCCSDOperator::build_dressed_intermediates() {
                       << std::scientific << dmax << " (expect ≤1e-11)"
                       << std::defaultfloat << std::endl;
         }
+        if (ea_split)
+            std::cout << "      [EA build-SUBPROF] term3+4 split: repack+GEMM = "
+                      << std::fixed << std::setprecision(2) << _t3_gemm
+                      << " s | tile D2H = " << _t3_d2h
+                      << " s | host scatter = " << _t3_scat << " s"
+                      << std::defaultfloat << std::endl;
     }
 #endif
 

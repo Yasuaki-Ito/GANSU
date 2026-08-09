@@ -31,13 +31,32 @@ RUN dnf config-manager --add-repo \
 
 # OpenBLAS (static PIC archive) + the Fortran runtime it depends on, for the
 # GANSU_BUNDLE_OPENBLAS wheel build (see CMakeLists.txt / script/build_wheel.sh).
-# The static libopenblasp.a is embedded into libgansu.so so pip-only users get
-# the fast BLAS/LAPACK path with no system OpenBLAS and no LD_PRELOAD. gcc-gfortran
-# supplies libgfortran.so.5 / libquadmath.so.0, which are shipped in the wheel.
-# openblas-static lives in EPEL for RHEL 8.
-RUN dnf install -y epel-release \
- && dnf install -y openblas-static gcc-gfortran \
- && dnf clean all && rm -rf /var/cache/dnf
+# Built from source rather than EPEL's openblas-static because the embedded
+# archive MUST be the OpenMP variant (USE_OPENMP=1): GANSU issues BLAS/LAPACK
+# calls from up to 64 concurrent OpenMP threads (DLPNO per-pair loops), and the
+# pthread/serial variants crash nondeterministically there (~2-4% SIGSEGV in
+# dsymv_L, observed in the field with a pthread archive) — CMake now verifies
+# the variant by symbol inspection and refuses the unsafe ones. EPEL8's 0.3.15
+# is also too old to know post-2021 CPUs (Sapphire Rapids etc.), falling back
+# to the slow PRESCOTT kernels; 0.3.34 with DYNAMIC_ARCH picks proper kernels
+# (~2x faster DLPNO setup measured on an H200/SPR host). NUM_THREADS=256 sizes
+# the per-caller buffer table (2*NUM_THREADS=512) well above GANSU's caller
+# count. gcc-gfortran supplies libgfortran.so.5 / libquadmath.so.0, which are
+# shipped in the wheel.
+ARG OPENBLAS_VERSION=0.3.34
+RUN dnf install -y gcc-gfortran perl \
+ && dnf clean all && rm -rf /var/cache/dnf \
+ && curl -fsSL -o /tmp/openblas.tar.gz \
+        https://github.com/OpenMathLib/OpenBLAS/releases/download/v${OPENBLAS_VERSION}/OpenBLAS-${OPENBLAS_VERSION}.tar.gz \
+ && tar -xzf /tmp/openblas.tar.gz -C /tmp \
+ && make -C /tmp/OpenBLAS-${OPENBLAS_VERSION} -j"$(nproc)" \
+        USE_OPENMP=1 DYNAMIC_ARCH=1 BINARY=64 NUM_THREADS=256 \
+ && make -C /tmp/OpenBLAS-${OPENBLAS_VERSION} install PREFIX=/opt/openblas-omp \
+ && rm -rf /tmp/OpenBLAS-${OPENBLAS_VERSION} /tmp/openblas.tar.gz
+
+# script/build_wheel.sh forwards this to CMake (-DGANSU_OPENBLAS_STATIC=...);
+# the archive is symbol-checked there ("variant verified: openmp").
+ENV GANSU_OPENBLAS_STATIC=/opt/openblas-omp/lib/libopenblas.a
 
 ENV CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:/opt/python/cp311-cp311/bin:${PATH} \

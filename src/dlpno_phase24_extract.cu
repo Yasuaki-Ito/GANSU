@@ -11,6 +11,9 @@
 
 #include <cuda_runtime.h>
 
+#include <stdexcept>
+#include <string>
+
 namespace gansu {
 
 namespace {
@@ -19,6 +22,20 @@ constexpr int kBlock = 256;
 
 inline int grid_for(std::size_t total) {
     return static_cast<int>((total + kBlock - 1) / kBlock);
+}
+
+// Launch-error check. All extract kernels here were launched unchecked; a
+// failed launch (bad config / sticky prior error) left the packed buffer
+// stale and surfaced only later as a SIGSEGV or silent garbage (bug report
+// (3)). cudaGetLastError is sticky, so one check after a launch batch
+// pinpoints this file even if an individual kernel is not identified.
+inline void check_launch_(const char* what) {
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        throw std::runtime_error(std::string(what)
+                                 + " kernel launch failed: "
+                                 + cudaGetErrorString(e));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +664,7 @@ void launch_phase24_extract(
                 n_emb, n_lmo, n_pno, si, sj);
         }
     }
+    check_launch_("launch_phase24_extract");
 }
 
 void launch_phase24_transpose_mid(
@@ -660,6 +678,7 @@ void launch_phase24_transpose_mid(
     if (total == 0) return;
     transpose_mid_kernel<<<grid_for(total), kBlock, 0, stream>>>(
         d_in, d_out, A0, A1, A2, A3);
+    check_launch_("launch_phase24_transpose_mid");
 }
 
 void launch_phase24_fuse_T_from_A(
@@ -673,6 +692,7 @@ void launch_phase24_fuse_T_from_A(
     if (total == 0) return;
     fuse_T_from_A_kernel<<<grid_for(total), kBlock, 0, stream>>>(
         d_A, d_out, n_lmo, n_pno);
+    check_launch_("launch_phase24_fuse_T_from_A");
 }
 
 } // namespace gansu

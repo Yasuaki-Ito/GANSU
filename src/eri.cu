@@ -24,6 +24,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #ifndef GANSU_CPU_ONLY
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
@@ -609,6 +611,14 @@ inline void launch_eri_ri_transpose_b_tmp(
               naux);
     eri_ri_transpose_b_tmp_per_aux_kernel<<<grid, block, 0, stream>>>(
         d_in, d_out, naux, nmo, nao);
+    // gridDim.z is capped at 65535 — a launch with naux beyond that fails
+    // silently without this check and the stale d_out flows into the GEMM.
+    const cudaError_t lerr = cudaGetLastError();
+    if (lerr != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("eri_ri_transpose_b_tmp launch failed (naux=")
+            + std::to_string(naux) + "): " + cudaGetErrorString(lerr));
+    }
 }
 
 // Phase 0 — gather one (P,Q) sub-block of B_mo (naux, nmo, nmo) row-major into a
@@ -640,6 +650,12 @@ inline void launch_eri_ri_gather_bmo_block(
               naux);
     eri_ri_gather_bmo_block_kernel<<<grid, block, 0, stream>>>(
         d_B_mo, d_half, naux, nmo, p0, pn, q0, qn);
+    const cudaError_t lerr = cudaGetLastError();
+    if (lerr != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("eri_ri_gather_bmo_block launch failed (naux=")
+            + std::to_string(naux) + "): " + cudaGetErrorString(lerr));
+    }
 }
 } // anonymous namespace
 #endif // !GANSU_CPU_ONLY
@@ -723,12 +739,16 @@ void ERI_RI::build_mo_eri_into(const real_t* d_C, int nmo,
     if (need_B_tmp_bytes > ws_B_tmp_bytes) {
         if (ws_B_tmp)  { tracked_cudaFree(ws_B_tmp);  ws_B_tmp  = nullptr; }
         if (ws_B_tmp2) { tracked_cudaFree(ws_B_tmp2); ws_B_tmp2 = nullptr; }
+        // Zero the byte count before the (throwing) mallocs — a stale value
+        // would let a later smaller request skip reallocation and use null.
+        ws_B_tmp_bytes = 0;
         tracked_cudaMalloc(&ws_B_tmp,  need_B_tmp_bytes);
         tracked_cudaMalloc(&ws_B_tmp2, need_B_tmp_bytes);
         ws_B_tmp_bytes = need_B_tmp_bytes;
     }
     if (need_B_mo_bytes > ws_B_mo_bytes) {
         if (ws_B_mo) { tracked_cudaFree(ws_B_mo); ws_B_mo = nullptr; }
+        ws_B_mo_bytes = 0;
         tracked_cudaMalloc(&ws_B_mo, need_B_mo_bytes);
         ws_B_mo_bytes = need_B_mo_bytes;
     }
@@ -929,12 +949,17 @@ const real_t* ERI_RI::build_B_mo_impl(const real_t* d_B_ao_src,
     if (need_B_tmp_bytes > ws_B_tmp_bytes) {
         if (ws_B_tmp)  { tracked_cudaFree(ws_B_tmp);  ws_B_tmp  = nullptr; }
         if (ws_B_tmp2) { tracked_cudaFree(ws_B_tmp2); ws_B_tmp2 = nullptr; }
+        // The byte count must be zeroed before the (throwing) mallocs: a stale
+        // nonzero value would let a later smaller request skip reallocation
+        // and hand a null pointer to the GEMMs below.
+        ws_B_tmp_bytes = 0;
         tracked_cudaMalloc(&ws_B_tmp,  need_B_tmp_bytes);
         tracked_cudaMalloc(&ws_B_tmp2, need_B_tmp_bytes);
         ws_B_tmp_bytes = need_B_tmp_bytes;
     }
     if (need_B_mo_bytes > ws_B_mo_bytes) {
         if (ws_B_mo) { tracked_cudaFree(ws_B_mo); ws_B_mo = nullptr; }
+        ws_B_mo_bytes = 0;
         tracked_cudaMalloc(&ws_B_mo, need_B_mo_bytes);
         ws_B_mo_bytes = need_B_mo_bytes;
     }
@@ -1053,12 +1078,16 @@ const real_t* ERI_RI::build_B_mo_asym_impl(const real_t* d_B_ao_src,
     if (need_B_tmp_bytes > ws_B_tmp_bytes) {
         if (ws_B_tmp)  { tracked_cudaFree(ws_B_tmp);  ws_B_tmp  = nullptr; }
         if (ws_B_tmp2) { tracked_cudaFree(ws_B_tmp2); ws_B_tmp2 = nullptr; }
+        // Zero the byte count before the (throwing) mallocs — a stale value
+        // would let a later smaller request skip reallocation and use null.
+        ws_B_tmp_bytes = 0;
         tracked_cudaMalloc(&ws_B_tmp,  need_B_tmp_bytes);
         tracked_cudaMalloc(&ws_B_tmp2, need_B_tmp_bytes);
         ws_B_tmp_bytes = need_B_tmp_bytes;
     }
     if (need_B_mo_bytes > ws_B_mo_bytes) {
         if (ws_B_mo) { tracked_cudaFree(ws_B_mo); ws_B_mo = nullptr; }
+        ws_B_mo_bytes = 0;
         tracked_cudaMalloc(&ws_B_mo, need_B_mo_bytes);
         ws_B_mo_bytes = need_B_mo_bytes;
     }
@@ -1131,6 +1160,14 @@ void ERI_RI::mo_eri_block_into(const real_t* d_B_mo, int nmo,
                                int r0, int rn, int s0, int sn,
                                real_t* d_out) const {
 #ifndef GANSU_CPU_ONLY
+    // A null B_mo means build_B_mo failed upstream (B replication rejected or
+    // OOM). Fail here with a message instead of letting the gather kernel
+    // dereference it (previously a nondeterministic SIGSEGV).
+    if (!d_B_mo) {
+        throw std::runtime_error(
+            "ERI_RI::mo_eri_block_into: d_B_mo is null (build_B_mo failed — "
+            "B replication rejected or out of memory)");
+    }
     const int naux = num_auxiliary_basis_;
     const size_t nPQ = (size_t)pn * qn;
     const size_t nRS = (size_t)rn * sn;
@@ -1168,11 +1205,13 @@ void ERI_RI::mo_eri_block_into(const real_t* d_B_mo, int nmo,
     // request pins its buffer through phases that only need a fraction of it
     // (part of the IP-EOM build OOM budget). Same gathers/GEMM → byte-identical.
     if (need_bra > ws_bra_bytes || need_bra * 4 < ws_bra_bytes) {
-        if (ws_bra) tracked_cudaFree(ws_bra);
+        if (ws_bra) { tracked_cudaFree(ws_bra); ws_bra = nullptr; }
+        ws_bra_bytes = 0;
         tracked_cudaMalloc(&ws_bra, need_bra); ws_bra_bytes = need_bra;
     }
     if (need_ket > ws_ket_bytes || need_ket * 4 < ws_ket_bytes) {
-        if (ws_ket) tracked_cudaFree(ws_ket);
+        if (ws_ket) { tracked_cudaFree(ws_ket); ws_ket = nullptr; }
+        ws_ket_bytes = 0;
         tracked_cudaMalloc(&ws_ket, need_ket); ws_ket_bytes = need_ket;
     }
 

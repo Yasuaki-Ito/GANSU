@@ -421,6 +421,10 @@ LMP2Status iterate_lmp2(
         // race-free. Serialising it was previously hiding ~9 s/device of
         // barS H2D + buffer alloc cost; at LMP2 scale (max_n=3) it is
         // already cheap, but kept symmetric with the CCSD T2 path.
+        // Exception containment: the PiCacheGpu ctor can throw (pinned/host
+        // allocation failure past its internal OOM fallbacks), and an
+        // exception escaping an OpenMP structured block is UB (terminate).
+        std::string picache_ctor_err;
         #pragma omp parallel num_threads(n_gpus)
         {
 #ifdef _OPENMP
@@ -428,11 +432,33 @@ LMP2Status iterate_lmp2(
 #else
             const int d = 0;
 #endif
-            MultiGpuManager::DeviceGuard guard(d);
-            pgpus[d] = std::make_unique<PiCacheGpu>(
-                barS_cache, n_pno_per_pair, max_n,
-                nullptr, nullptr, 0,
-                slab_starts[d], slab_starts[d + 1], d);
+            try {
+                MultiGpuManager::DeviceGuard guard(d);
+                pgpus[d] = std::make_unique<PiCacheGpu>(
+                    barS_cache, n_pno_per_pair, max_n,
+                    nullptr, nullptr, 0,
+                    slab_starts[d], slab_starts[d + 1], d);
+            } catch (const std::exception& ex) {
+                #pragma omp critical(dlpno_picache_ctor_err)
+                { if (picache_ctor_err.empty()) picache_ctor_err = ex.what(); }
+            }
+        }
+        if (!picache_ctor_err.empty()) {
+            throw std::runtime_error(
+                std::string("PiCacheGpu construction failed: ")
+                + picache_ctor_err);
+        }
+        // A slot can also be left null if the runtime supplied fewer threads
+        // than num_threads requested. Fail loudly — silently skipping a slab
+        // would produce wrong pi_cache contents, and dereferencing null in
+        // the iteration loop below was a SIGSEGV.
+        for (int d = 0; d < n_gpus; ++d) {
+            if (!pgpus[d]) {
+                throw std::runtime_error(
+                    "PiCacheGpu slot " + std::to_string(d)
+                    + " was not constructed (OpenMP supplied fewer than "
+                    + std::to_string(n_gpus) + " threads)");
+            }
         }
 #else
         pgpus[0] = std::make_unique<PiCacheGpu>(
@@ -469,6 +495,9 @@ LMP2Status iterate_lmp2(
             const auto t_pi0 = prof_clock::now();
             if (n_gpus > 1) {
 #ifndef GANSU_CPU_ONLY
+                // Same containment as the ctor region: rebuild allocates
+                // lazily (device + pinned) and can throw.
+                std::string picache_rebuild_err;
                 #pragma omp parallel num_threads(n_gpus)
                 {
 #ifdef _OPENMP
@@ -476,12 +505,25 @@ LMP2Status iterate_lmp2(
 #else
                     const int d = 0;
 #endif
-                    MultiGpuManager::DeviceGuard guard(d);
-                    if (picache_gather)
-                        pgpus[d]->rebuild_needed(Y_old, pi_cache,
-                                                 needed_ikl_per_pair);
-                    else
-                        pgpus[d]->rebuild(Y_old, pi_cache);
+                    try {
+                        MultiGpuManager::DeviceGuard guard(d);
+                        if (picache_gather)
+                            pgpus[d]->rebuild_needed(Y_old, pi_cache,
+                                                     needed_ikl_per_pair);
+                        else
+                            pgpus[d]->rebuild(Y_old, pi_cache);
+                    } catch (const std::exception& ex) {
+                        #pragma omp critical(dlpno_picache_rebuild_err)
+                        {
+                            if (picache_rebuild_err.empty())
+                                picache_rebuild_err = ex.what();
+                        }
+                    }
+                }
+                if (!picache_rebuild_err.empty()) {
+                    throw std::runtime_error(
+                        std::string("PiCacheGpu rebuild failed: ")
+                        + picache_rebuild_err);
                 }
 #endif
             } else {
@@ -1090,6 +1132,10 @@ LMP2Status iterate_dlpno_ccsd_t2(
         // per-instance members; barS_cache, n_pno_per_pair, pair_lookup,
         // and setup_i_per_pair are read-only inputs. Expected: 75 → ~10 s
         // (concurrent barS H2D + buffer alloc across 8 H200).
+        // Exception containment — see the LMP2 PiCacheGpu region: a ctor
+        // throw escaping the OpenMP block is UB (terminate). This stacked
+        // ctor is where the PTCDA-class OOM hit in the field.
+        std::string picache_ctor_err;
         #pragma omp parallel num_threads(n_gpus)
         {
 #ifdef _OPENMP
@@ -1097,11 +1143,21 @@ LMP2Status iterate_dlpno_ccsd_t2(
 #else
             const int d = 0;
 #endif
-            MultiGpuManager::DeviceGuard guard(d);
-            pgpus[d] = std::make_unique<PiCacheGpu>(
-                barS_cache, n_pno_per_pair, max_n_pno,
-                &pair_lookup, &setup_i_per_pair, nocc,
-                slab_starts[d], slab_starts[d + 1], d, &setup_j_per_pair);
+            try {
+                MultiGpuManager::DeviceGuard guard(d);
+                pgpus[d] = std::make_unique<PiCacheGpu>(
+                    barS_cache, n_pno_per_pair, max_n_pno,
+                    &pair_lookup, &setup_i_per_pair, nocc,
+                    slab_starts[d], slab_starts[d + 1], d, &setup_j_per_pair);
+            } catch (const std::exception& ex) {
+                #pragma omp critical(dlpno_picache_t2_ctor_err)
+                { if (picache_ctor_err.empty()) picache_ctor_err = ex.what(); }
+            }
+        }
+        if (!picache_ctor_err.empty()) {
+            throw std::runtime_error(
+                std::string("PiCacheGpu (stacked) construction failed: ")
+                + picache_ctor_err);
         }
 #else
         pgpus[0] = std::make_unique<PiCacheGpu>(
@@ -1138,6 +1194,7 @@ LMP2Status iterate_dlpno_ccsd_t2(
         // serialised 8× (cudaMalloc + V_meta/W_bare H2D + pack), which was the
         // dominant setup_rgpu cost (Pentacene 8×A100: ~12.4 s → expected
         // ~2-3 s, limited by the heaviest device + H2D bandwidth).
+        std::string rgpu_ctor_err;
         #pragma omp parallel num_threads(n_gpus)
         {
 #ifdef _OPENMP
@@ -1145,11 +1202,21 @@ LMP2Status iterate_dlpno_ccsd_t2(
 #else
             const int d = 0;
 #endif
-            MultiGpuManager::DeviceGuard guard(d);
-            if (pgpus[d] && pgpus[d]->stacked()) {
-                rgpus[d] = std::make_unique<ResidGpu>(
-                    *pgpus[d], setups, pairs, *phase24, F_LMO, nocc, max_n_pno);
+            try {
+                MultiGpuManager::DeviceGuard guard(d);
+                if (pgpus[d] && pgpus[d]->stacked()) {
+                    rgpus[d] = std::make_unique<ResidGpu>(
+                        *pgpus[d], setups, pairs, *phase24, F_LMO, nocc,
+                        max_n_pno);
+                }
+            } catch (const std::exception& ex) {
+                #pragma omp critical(dlpno_rgpu_ctor_err)
+                { if (rgpu_ctor_err.empty()) rgpu_ctor_err = ex.what(); }
             }
+        }
+        if (!rgpu_ctor_err.empty()) {
+            throw std::runtime_error(
+                std::string("ResidGpu construction failed: ") + rgpu_ctor_err);
         }
 #else
         if (pgpus[0] && pgpus[0]->stacked()) {

@@ -48,6 +48,24 @@ inline void check_cublas_(cublasStatus_t s, const char* what) {
     }
 }
 
+// The cudaMalloc macro (device_host_memory.hpp) maps to the THROWING
+// tracked_cudaMalloc, which silently turned the `cudaMalloc(...) !=
+// cudaSuccess` OOM fallbacks in upload_T_pair_and_reshape /
+// upload_T_meta_dpair ("OOM → caller keeps the CPU DFpair loop") into dead
+// code: the throw escaped instead of returning false. This wrapper restores
+// the intended non-throwing probe semantics while keeping the allocation
+// tracked.
+template <typename T>
+inline cudaError_t try_tracked_malloc_(T** p, size_t bytes) {
+    try {
+        cudaMalloc(p, bytes);   // macro → tracked_cudaMalloc (throws on OOM)
+        return cudaSuccess;
+    } catch (const std::exception&) {
+        *p = nullptr;
+        return cudaErrorMemoryAllocation;
+    }
+}
+
 // Step S1 + Step Z — GPU scatter kernel for compact barS_pad.
 //
 // Source layout (`d_barS_flat`, contiguous per active (i_ij, i_kl) pair):
@@ -3114,20 +3132,20 @@ bool PiCacheGpu::build_T_meta_dpair_dev(
     if (slab_total == 0) return false;
 
     if (s.d_T_meta_dpair == nullptr) {
-        if (cudaMalloc(&s.d_T_meta_dpair, slab_total * sizeof(real_t))
+        if (try_tracked_malloc_(&s.d_T_meta_dpair, slab_total * sizeof(real_t))
             != cudaSuccess) { s.d_T_meta_dpair = nullptr; return false; }
     }
     if (s.d_DF_scratch == nullptr) {
         const size_t df_bytes =
             static_cast<size_t>(max_n_) * max_n_ * sizeof(real_t);
         if (df_bytes > 0
-            && cudaMalloc(&s.d_DF_scratch, df_bytes) != cudaSuccess) {
+            && try_tracked_malloc_(&s.d_DF_scratch, df_bytes) != cudaSuccess) {
             s.d_DF_scratch = nullptr; return false;
         }
     }
     // Temp device buffer for the raw T_pair slab (contiguous per pair).
     real_t* d_tpair = nullptr;
-    if (cudaMalloc(&d_tpair, slab_total * sizeof(real_t)) != cudaSuccess)
+    if (try_tracked_malloc_(&d_tpair, slab_total * sizeof(real_t)) != cudaSuccess)
         return false;
     // Zero the temp src so any pair skipped below (empty/absent T_pair) reshapes
     // to 0, matching the host build's setZero. (dst is fully written by the
@@ -3202,14 +3220,14 @@ bool PiCacheGpu::upload_T_meta_dpair(const std::vector<RowMatXd>& T_meta_dpair)
         const size_t sp_slab  = sp_off[ie] - sp_off[ib];
         if (sp_slab == 0) return false;
         if (s.d_T_meta_dpair == nullptr) {
-            if (cudaMalloc(&s.d_T_meta_dpair, sp_slab * sizeof(real_t))
+            if (try_tracked_malloc_(&s.d_T_meta_dpair, sp_slab * sizeof(real_t))
                 != cudaSuccess) { s.d_T_meta_dpair = nullptr; return false; }
         }
         if (s.d_DF_scratch == nullptr) {
             const size_t df_bytes =
                 static_cast<size_t>(max_n_) * max_n_ * sizeof(real_t);
             if (df_bytes > 0
-                && cudaMalloc(&s.d_DF_scratch, df_bytes) != cudaSuccess) {
+                && try_tracked_malloc_(&s.d_DF_scratch, df_bytes) != cudaSuccess) {
                 s.d_DF_scratch = nullptr; return false;
             }
         }
@@ -3238,7 +3256,7 @@ bool PiCacheGpu::upload_T_meta_dpair(const std::vector<RowMatXd>& T_meta_dpair)
     }
 
     if (s.d_T_meta_dpair == nullptr) {
-        if (cudaMalloc(&s.d_T_meta_dpair, slab_total * sizeof(real_t))
+        if (try_tracked_malloc_(&s.d_T_meta_dpair, slab_total * sizeof(real_t))
             != cudaSuccess) {
             s.d_T_meta_dpair = nullptr;
             return false;   // OOM → caller keeps the CPU DFpair loop
@@ -3248,7 +3266,7 @@ bool PiCacheGpu::upload_T_meta_dpair(const std::vector<RowMatXd>& T_meta_dpair)
         const size_t df_bytes =
             static_cast<size_t>(max_n_) * max_n_ * sizeof(real_t);
         if (df_bytes > 0
-            && cudaMalloc(&s.d_DF_scratch, df_bytes) != cudaSuccess) {
+            && try_tracked_malloc_(&s.d_DF_scratch, df_bytes) != cudaSuccess) {
             s.d_DF_scratch = nullptr;
             return false;
         }

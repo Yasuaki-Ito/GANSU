@@ -13,7 +13,9 @@
 #include <Eigen/Dense>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <stdexcept>
 #include <fstream>   // GANSU_DLPNO_BT_DUMP singles diagnostic
 #include <iomanip>
 #include <iostream>
@@ -84,6 +86,17 @@ real_t ccsd_spatial_orbital(const real_t* d_eri_ao,
 namespace {
 using RowMatXd = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 constexpr real_t kFLMOThresh = 1e-14;
+
+// Convert a raw CUDA status into the exception channel already used by
+// tracked_cudaMalloc. Unchecked memcpy / launch failures previously surfaced
+// only later as SIGSEGV (bug report (3): "the same allocation sometimes
+// reports OOM and sometimes segfaults").
+inline void check_cuda_ccsd_(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) {
+        throw std::runtime_error(std::string("DLPNO pair-ERI CUDA error in ")
+                                 + what + ": " + cudaGetErrorString(e));
+    }
+}
 
 /// Scoped environment-variable override. set() records the prior value and
 /// installs a new one; the destructor restores the original (or unsets it if
@@ -286,6 +299,14 @@ inline Phase24Integrals precompute_phase24_integrals(
     // multi-CPU hosts. The num_threads clause alone is sufficient; do NOT
     // mutate the process-wide OMP state here.
 
+    // Exception containment: tracked_cudaMalloc (and the CUDA checks below)
+    // throw, and an exception escaping an OpenMP structured block is UB
+    // (libgomp: std::terminate). Record the first error, drain the remaining
+    // iterations, and rethrow after the region — a clean error instead of the
+    // SIGSEGV/SIGABRT of bug report (3).
+    std::atomic<bool> pair_eri_failed{false};
+    std::string       pair_eri_err;
+
     #pragma omp parallel num_threads(num_gpus)
     {
 #ifdef _OPENMP
@@ -318,6 +339,8 @@ inline Phase24Integrals precompute_phase24_integrals(
 
     #pragma omp for schedule(static, 1)
     for (long long idx = 0; idx < static_cast<long long>(n_pairs); ++idx) {
+        if (pair_eri_failed) continue;   // drain after the first error
+        try {
         const PairSetup& s = res.setups[idx];
         const PairData&  p = res.pairs[idx];
         if (p.n_pno == 0) continue;
@@ -340,12 +363,15 @@ inline Phase24Integrals precompute_phase24_integrals(
         // Step S7a — grow d_C_ext workspace if this pair is bigger.
         const size_t n_C_ext = static_cast<size_t>(nao) * n_emb;
         if (n_C_ext > ws_C_ext_capacity) {
-            if (d_C_ext_ws) tracked_cudaFree(d_C_ext_ws);
+            if (d_C_ext_ws) { tracked_cudaFree(d_C_ext_ws); d_C_ext_ws = nullptr; }
+            ws_C_ext_capacity = 0;   // pre-zero: a stale value after a throw
+                                     // would skip realloc and use null later
             tracked_cudaMalloc(&d_C_ext_ws, n_C_ext * sizeof(real_t));
             ws_C_ext_capacity = n_C_ext;
         }
-        cudaMemcpy(d_C_ext_ws, C_ext.data(),
-            n_C_ext * sizeof(real_t), cudaMemcpyHostToDevice);
+        check_cuda_ccsd_(cudaMemcpy(d_C_ext_ws, C_ext.data(),
+            n_C_ext * sizeof(real_t), cudaMemcpyHostToDevice),
+            "H2D C_ext");
 
         // Packed output layout + buffer growth (common to both build paths).
         // The S7b/S7c packed layout is identical, so the downstream copy_block
@@ -355,10 +381,22 @@ inline Phase24Integrals precompute_phase24_integrals(
             compute_phase24_extract_layout(n_lmo, n_pno, is_diag, singles_want);
 
         if (layout.total > ws_packed_capacity) {
-            if (d_packed_ws) tracked_cudaFree(d_packed_ws);
+            if (d_packed_ws) { tracked_cudaFree(d_packed_ws); d_packed_ws = nullptr; }
+            if (h_packed_ws) { cudaFreeHost(h_packed_ws); h_packed_ws = nullptr; }
+            ws_packed_capacity = 0;
             tracked_cudaMalloc(&d_packed_ws, layout.total * sizeof(real_t));
-            if (h_packed_ws) cudaFreeHost(h_packed_ws);
-            cudaMallocHost(&h_packed_ws, layout.total * sizeof(real_t));
+            // Pinned allocation exhausts independently of device memory; an
+            // unchecked failure here left h_packed_ws null/dangling and the
+            // copy_block memcpy below segfaulted (bug report (3), PTCDA).
+            const cudaError_t herr =
+                cudaMallocHost(&h_packed_ws, layout.total * sizeof(real_t));
+            if (herr != cudaSuccess) {
+                h_packed_ws = nullptr;
+                throw std::runtime_error(
+                    std::string("cudaMallocHost h_packed_ws failed (")
+                    + std::to_string(layout.total * sizeof(real_t))
+                    + " bytes): " + cudaGetErrorString(herr));
+            }
             ws_packed_capacity = layout.total;
         }
 
@@ -367,13 +405,19 @@ inline Phase24Integrals precompute_phase24_integrals(
             // directly with mo_eri_block_into into the packed buffer. No
             // n_emb⁴ tensor, no S7b gather. (See the S7c note above.)
             const real_t* d_B_mo = eri_ri->build_B_mo(d_C_ext_ws, n_emb);
+            if (!d_B_mo) {
+                throw std::runtime_error(
+                    "build_B_mo returned null (B replication rejected or "
+                    "out of memory)");
+            }
 
             // Relayout-source scratch: the largest non-direct block is either
             // A = (occ,pno|occ,pno) (n_lmo²·n_pno²) or W_pair (n_pno⁴).
             const size_t n_block_max =
                 std::max(layout.sz_T_pair, layout.sz_W_pair);
             if (n_block_max > ws_block_capacity) {
-                if (d_block_ws) tracked_cudaFree(d_block_ws);
+                if (d_block_ws) { tracked_cudaFree(d_block_ws); d_block_ws = nullptr; }
+                ws_block_capacity = 0;
                 tracked_cudaMalloc(&d_block_ws, n_block_max * sizeof(real_t));
                 ws_block_capacity = n_block_max;
             }
@@ -459,7 +503,8 @@ inline Phase24Integrals precompute_phase24_integrals(
             const size_t n_emb4 =
                 static_cast<size_t>(n_emb) * n_emb * n_emb * n_emb;
             if (n_emb4 > ws_eri_capacity) {
-                if (d_eri_ws) tracked_cudaFree(d_eri_ws);
+                if (d_eri_ws) { tracked_cudaFree(d_eri_ws); d_eri_ws = nullptr; }
+                ws_eri_capacity = 0;
                 tracked_cudaMalloc(&d_eri_ws, n_emb4 * sizeof(real_t));
                 ws_eri_capacity = n_emb4;
             }
@@ -473,8 +518,9 @@ inline Phase24Integrals precompute_phase24_integrals(
         // Synchronous D2H — implicit wait for the kernels above (default
         // stream). After this, h_packed_ws holds all 14 blocks back-to-back
         // at the offsets recorded in `layout`.
-        cudaMemcpy(h_packed_ws, d_packed_ws,
-            layout.total * sizeof(real_t), cudaMemcpyDeviceToHost);
+        check_cuda_ccsd_(cudaMemcpy(h_packed_ws, d_packed_ws,
+            layout.total * sizeof(real_t), cudaMemcpyDeviceToHost),
+            "D2H packed blocks");
 
         // Unpack pinned packed buffer → per-block std::vector<real_t>
         // destinations. memcpy is sequential and cache-friendly compared
@@ -517,6 +563,15 @@ inline Phase24Integrals precompute_phase24_integrals(
         copy_block(out.W_oovo_pq[idx], layout.off_W_oovo_pq, layout.sz_ooov);
 
         (void)s;  // s used above; suppress -Wunused if conditional.
+        } catch (const std::exception& ex) {
+            #pragma omp critical(dlpno_pair_eri_err)
+            {
+                if (!pair_eri_failed) {
+                    pair_eri_failed = true;
+                    pair_eri_err    = ex.what();
+                }
+            }
+        }
     }
 
     // Step S7a + S7b — release per-thread workspaces (one alloc per buffer
@@ -527,6 +582,12 @@ inline Phase24Integrals precompute_phase24_integrals(
     if (h_packed_ws) cudaFreeHost(h_packed_ws);
     if (d_block_ws)  tracked_cudaFree(d_block_ws);
     }  // end omp parallel
+    if (pair_eri_failed) {
+        if (num_gpus > 1) cudaSetDevice(0);
+        throw std::runtime_error(
+            std::string("DLPNO pair-ERI build (phase24) failed: ")
+            + pair_eri_err);
+    }
     return out;
 }
 

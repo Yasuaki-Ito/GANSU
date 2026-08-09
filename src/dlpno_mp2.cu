@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #include "dlpno_mp2.hpp"
+#include <atomic>
 #include <memory>
 
 #include <Eigen/Dense>
@@ -41,6 +42,21 @@
 #include "rhf.hpp"
 
 namespace gansu {
+
+namespace {
+
+// Convert a raw CUDA status into the exception channel already used by
+// tracked_cudaMalloc. Unchecked memcpy / launch failures previously surfaced
+// only later as SIGSEGV (bug report (3): "the same allocation sometimes
+// reports OOM and sometimes segfaults").
+inline void check_cuda_mp2_(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) {
+        throw std::runtime_error(std::string("DLPNO pair_setup CUDA error in ")
+                                 + what + ": " + cudaGetErrorString(e));
+    }
+}
+
+} // namespace
 
 namespace {
 using RowMatXd = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -492,6 +508,14 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     // (V block only, via build_B_mo + mo_eri_block_into) + diagnostic pre-PNO MP2
     // energy. Reads the Phase-1 results from setups[idx].
     // ============================================================
+    // Exception containment: tracked_cudaMalloc (and the checks added below)
+    // throw, and an exception escaping an OpenMP structured block is UB
+    // (libgomp: std::terminate). Record the first error, drain the remaining
+    // iterations, and rethrow after the region so the caller gets a clean
+    // "gansu_run error" instead of a SIGSEGV/SIGABRT.
+    std::atomic<bool> phase2_failed{false};
+    std::string       phase2_err;
+
     #pragma omp parallel num_threads(num_gpus) reduction(+:E_pao_total_par)
     {
 #ifdef _OPENMP
@@ -516,6 +540,8 @@ DLPNOLMP2Result solve_dlpno_lmp2(
 
         #pragma omp for schedule(dynamic, 1)
         for (long long idx = 0; idx < n_pairs_total; ++idx) {
+            if (phase2_failed) continue;   // drain after the first error
+            try {
             PairSetup& s = setups[static_cast<size_t>(idx)];
             const int n_pao = s.n_pao;
             if (n_pao == 0) continue;
@@ -526,7 +552,9 @@ DLPNOLMP2Result solve_dlpno_lmp2(
 
             const size_t n_V = static_cast<size_t>(n_pao) * n_pao;
             if (n_V > ws_V_capacity) {
-                if (d_V_ws) tracked_cudaFree(d_V_ws);
+                if (d_V_ws) { tracked_cudaFree(d_V_ws); d_V_ws = nullptr; }
+                ws_V_capacity = 0;   // pre-zero: stale value after a throw
+                                     // would skip realloc and use null later
                 tracked_cudaMalloc(&d_V_ws, n_V * sizeof(real_t));
                 ws_V_capacity = n_V;
             }
@@ -542,7 +570,8 @@ DLPNOLMP2Result solve_dlpno_lmp2(
                 // C_lmo = [C_LMO_i (,C_LMO_j)] (nao × n_lmo, row-major).
                 const size_t n_Cl = static_cast<size_t>(nao_) * n_lmo;
                 if (n_Cl > ws_C_lmo_capacity) {
-                    if (d_C_lmo_ws) tracked_cudaFree(d_C_lmo_ws);
+                    if (d_C_lmo_ws) { tracked_cudaFree(d_C_lmo_ws); d_C_lmo_ws = nullptr; }
+                    ws_C_lmo_capacity = 0;
                     tracked_cudaMalloc(&d_C_lmo_ws, n_Cl * sizeof(real_t));
                     ws_C_lmo_capacity = n_Cl;
                 }
@@ -551,18 +580,21 @@ DLPNOLMP2Result solve_dlpno_lmp2(
                     C_lmo[mu * n_lmo + 0] = h_C_LMO[mu * nocc_ + i];
                     if (!diag) C_lmo[mu * n_lmo + 1] = h_C_LMO[mu * nocc_ + j];
                 }
-                cudaMemcpy(d_C_lmo_ws, C_lmo.data(),
-                    n_Cl * sizeof(real_t), cudaMemcpyHostToDevice);
+                check_cuda_mp2_(cudaMemcpy(d_C_lmo_ws, C_lmo.data(),
+                    n_Cl * sizeof(real_t), cudaMemcpyHostToDevice),
+                    "H2D C_lmo");
 
                 // C_pao = semi-canonical PAOs (nao × n_pao, already row-major).
                 const size_t n_Cp = static_cast<size_t>(nao_) * n_pao;
                 if (n_Cp > ws_C_pao_capacity) {
-                    if (d_C_pao_ws) tracked_cudaFree(d_C_pao_ws);
+                    if (d_C_pao_ws) { tracked_cudaFree(d_C_pao_ws); d_C_pao_ws = nullptr; }
+                    ws_C_pao_capacity = 0;
                     tracked_cudaMalloc(&d_C_pao_ws, n_Cp * sizeof(real_t));
                     ws_C_pao_capacity = n_Cp;
                 }
-                cudaMemcpy(d_C_pao_ws, s.C_can_pair.data(),
-                    n_Cp * sizeof(real_t), cudaMemcpyHostToDevice);
+                check_cuda_mp2_(cudaMemcpy(d_C_pao_ws, s.C_can_pair.data(),
+                    n_Cp * sizeof(real_t), cudaMemcpyHostToDevice),
+                    "H2D C_pao");
 
                 v_built = eri_ri->build_v_block_ia_jb(
                     d_C_lmo_ws, n_lmo, d_C_pao_ws, n_pao,
@@ -581,15 +613,22 @@ DLPNOLMP2Result solve_dlpno_lmp2(
                 }
                 const size_t n_C = static_cast<size_t>(nao_) * n_emb;
                 if (n_C > ws_C_pair_capacity) {
-                    if (d_C_pair_ws) tracked_cudaFree(d_C_pair_ws);
+                    if (d_C_pair_ws) { tracked_cudaFree(d_C_pair_ws); d_C_pair_ws = nullptr; }
+                    ws_C_pair_capacity = 0;
                     tracked_cudaMalloc(&d_C_pair_ws, n_C * sizeof(real_t));
                     ws_C_pair_capacity = n_C;
                 }
-                cudaMemcpy(d_C_pair_ws, C_pair.data(),
-                    n_C * sizeof(real_t), cudaMemcpyHostToDevice);
+                check_cuda_mp2_(cudaMemcpy(d_C_pair_ws, C_pair.data(),
+                    n_C * sizeof(real_t), cudaMemcpyHostToDevice),
+                    "H2D C_pair");
 
                 if (eri_ri) {
                     const real_t* d_B_mo = eri_ri->build_B_mo(d_C_pair_ws, n_emb);
+                    if (!d_B_mo) {
+                        throw std::runtime_error(
+                            "build_B_mo returned null (B replication rejected "
+                            "or out of memory)");
+                    }
                     eri_ri->mo_eri_block_into(
                         d_B_mo, n_emb,
                         /*p=i*/ 0,     1,
@@ -602,7 +641,8 @@ DLPNOLMP2Result solve_dlpno_lmp2(
                     const size_t n_emb4 = static_cast<size_t>(n_emb)
                                         * n_emb * n_emb * n_emb;
                     if (n_emb4 > ws_eri_capacity) {
-                        if (d_eri_ws) tracked_cudaFree(d_eri_ws);
+                        if (d_eri_ws) { tracked_cudaFree(d_eri_ws); d_eri_ws = nullptr; }
+                        ws_eri_capacity = 0;
                         tracked_cudaMalloc(&d_eri_ws, n_emb4 * sizeof(real_t));
                         ws_eri_capacity = n_emb4;
                     }
@@ -613,12 +653,15 @@ DLPNOLMP2Result solve_dlpno_lmp2(
                         static_cast<unsigned>((n_pao + 15) / 16));
                     extract_V_block_kernel<<<grid, block>>>(
                         d_eri_ws, d_V_ws, n_emb, n_lmo, n_pao, j_col);
+                    check_cuda_mp2_(cudaGetLastError(),
+                                    "extract_V_block_kernel launch");
                 }
             }
 
             std::vector<real_t> V(n_V, 0.0);
-            cudaMemcpy(V.data(), d_V_ws,
-                       n_V * sizeof(real_t), cudaMemcpyDeviceToHost);
+            check_cuda_mp2_(cudaMemcpy(V.data(), d_V_ws,
+                       n_V * sizeof(real_t), cudaMemcpyDeviceToHost),
+                       "D2H V block");
 
             // Diagnostic pre-PNO MP2 in semi-canonical PAO basis.
             const std::vector<real_t>& eps_a = s.eps_a;
@@ -635,6 +678,15 @@ DLPNOLMP2Result solve_dlpno_lmp2(
             E_pao_total_par += s.pair_factor * E_pair_pao;
 
             s.V = std::move(V);
+            } catch (const std::exception& ex) {
+                #pragma omp critical(dlpno_phase2_err)
+                {
+                    if (!phase2_failed) {
+                        phase2_failed = true;
+                        phase2_err    = ex.what();
+                    }
+                }
+            }
         }
 
         if (d_C_pair_ws) tracked_cudaFree(d_C_pair_ws);
@@ -642,6 +694,11 @@ DLPNOLMP2Result solve_dlpno_lmp2(
         if (d_V_ws)      tracked_cudaFree(d_V_ws);
         if (d_C_lmo_ws)  tracked_cudaFree(d_C_lmo_ws);
         if (d_C_pao_ws)  tracked_cudaFree(d_C_pao_ws);
+    }
+    if (phase2_failed) {
+        if (num_gpus > 1) cudaSetDevice(0);
+        throw std::runtime_error(
+            std::string("DLPNO pair_setup phase 2 failed: ") + phase2_err);
     }
     E_pao_total = E_pao_total_par;
 

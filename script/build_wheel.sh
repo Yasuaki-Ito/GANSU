@@ -43,11 +43,18 @@ JOBS="${JOBS:-$(nproc)}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 BUILD_DIR="${BUILD_DIR:-/tmp/gansu-cmake-build}"
 STAGE_DIR="${STAGE_DIR:-/tmp/gansu-wheel-stage}"
+# Optional: explicit OpenBLAS archive to embed. Must be the OpenMP variant
+# (USE_OPENMP=1) — CMake verifies the archive's symbols and aborts on the
+# pthread/serial variants, which crash under GANSU's concurrent OMP callers.
+GANSU_OPENBLAS_STATIC="${GANSU_OPENBLAS_STATIC:-}"
 
 echo "==> CUDA archs: $CUDA_ARCHS"
 echo "==> manylinux platform: $PLAT"
 echo "==> CMake build dir: $BUILD_DIR"
 echo "==> Wheel stage dir:  $STAGE_DIR"
+if [[ -n "$GANSU_OPENBLAS_STATIC" ]]; then
+    echo "==> OpenBLAS archive: $GANSU_OPENBLAS_STATIC"
+fi
 
 # --- 1. Build libgansu.so --------------------------------------------------
 if [[ "$SKIP_BUILD" != "1" ]]; then
@@ -57,7 +64,8 @@ if [[ "$SKIP_BUILD" != "1" ]]; then
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
         -DENABLE_MULTI_GPU=ON \
-        -DGANSU_BUNDLE_OPENBLAS=ON
+        -DGANSU_BUNDLE_OPENBLAS=ON \
+        ${GANSU_OPENBLAS_STATIC:+-DGANSU_OPENBLAS_STATIC="$GANSU_OPENBLAS_STATIC"}
     cmake --build "$BUILD_DIR" --target gansu_shared -j "$JOBS"
 fi
 
