@@ -17,6 +17,7 @@
 #include <nccl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <cfloat>
 
 
 #define NCCL_CHECK(cmd) do {                         \
@@ -1672,7 +1673,7 @@ void davidson(
     int    space = 0, conv = 0, reset_state = 0, conv_last = 0;
     double dx_norm = 0.0, de = 0.0, e_last = 0.0;
 
-    bool overlap_state = true; // Use overlap pipeline or not (overlap_state = true enables overlap)
+    bool overlap_state = false; // Use overlap pipeline or not (overlap_state = true enables overlap)
     
 
     // ========== DOT PRODUCT SETUP ==========
@@ -2292,6 +2293,10 @@ extern "C" void fci(
         CUDA_CHECK(cudaGetLastError());
     }
 
+   
+
+   
+
     // =========================================================
     // Generate link indices and 2e integrals
     // =========================================================
@@ -2337,9 +2342,10 @@ extern "C" void fci(
         CUDA_CHECK(cudaMemset(d_ci0, 0, base_size));
         const double firstv =  1.0 + 1e-5;
         const double lastv  =  0.0 - 1e-5;
-
+        //const double midv    =  1;
         if (rank == 0) {
             CUDA_CHECK(cudaMemcpy(&d_ci0[0],      &firstv, sizeof(double), cudaMemcpyHostToDevice));
+            //CUDA_CHECK(cudaMemcpy(&d_ci0[6*na+1],      &midv, sizeof(double), cudaMemcpyHostToDevice));
         }
         if (rank == nprocs - 1) {
             CUDA_CHECK(cudaMemcpy(&d_ci0[mynp-1], &lastv,  sizeof(double), cudaMemcpyHostToDevice));
