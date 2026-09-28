@@ -22,3 +22,21 @@ void fci_result(double *h_Gmo1e, double *h_Gmo, double *e,
       max_space, max_cycle, in_cpu, tile, debug_mode,  tol, E_rhf);
 }
 
+extern void fci_unequal_elec(double *h_Gmo1e, double *h_Gmo, double *e,
+               int32_t *occslsta, int32_t *occslstb, int32_t na, int32_t nb, int32_t norb,
+               int32_t neleca, int32_t nelecb, int max_space, int max_cycle, 
+               int in_cpu, int tile, int debug_mode, 
+               double tol, double E_rhf);
+
+
+void fci_result_unequal_elec(double *h_Gmo1e, double *h_Gmo, double *e,
+                int32_t *occslsta, int32_t *occslstb, int32_t na, int32_t nb, int32_t norb,
+                int32_t neleca, int nelecb, int max_space, int max_cycle,
+                int in_cpu, int tile, int debug_mode, 
+                double tol, double E_rhf)
+{
+   printf("Running FCI with unequal electrons: na=%d, nb=%d, norb=%d, neleca=%d, nelecb=%d\n", na, nb, norb, neleca, nelecb);
+   fci_unequal_elec(h_Gmo1e, h_Gmo, e, occslsta, occslstb, na, nb,  norb, neleca, nelecb,
+      max_space, max_cycle, in_cpu, tile, debug_mode,  tol, E_rhf);
+}
+

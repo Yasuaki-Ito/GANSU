@@ -127,80 +127,159 @@ def save_result(args, e_value, na, norb, nelec_t, nprocs, ecore, E_HF, fci_time)
 # =============================================================================
 # Run FCI via libfci
 # =============================================================================
-def run_fci(h1e, eri_new, norb, nelec, ecore, E_HF, args):
+def run_fci(h1e, eri_new, norb, nelec, ecore, E_HF,  args):
     neleca, nelecb = nelec
-    assert neleca == nelecb, f"neleca={neleca} != nelecb={nelecb}: not implemented"
-    nelec_t = neleca + nelecb
-    start_oth = time.time()
-    occslst      = cistring._gen_occslst(range(norb), neleca)
-    na           = cistring.num_strings(norb, neleca)
-    tol          = 1e-12
+    #assert neleca == nelecb, f"neleca={neleca} != nelecb={nelecb}: not implemented"
+    if neleca == nelecb:
+        nelec_t = neleca + nelecb
+        start_oth = time.time()
+        occslst      = cistring._gen_occslst(range(norb), neleca)
+        na           = cistring.num_strings(norb, neleca)
+        nb           = cistring.num_strings(norb, nelecb)
+        tol          = 1e-14
 
-    # Initialize energy array
-    e_value     = np.zeros((1,))
+        # Initialize energy array
+        e_value     = np.zeros((1,))
 
-    if rank == 0 and args.debugmode > 0:
-        print("=" * 60)
-        print(f"Molecule: {args.mol}")
-        print(f"Basis: {args.basis}")
-        print(f"MPI Ranks: {nprocs}")
-        print("=" * 60)
-        #print("\n Starting FCI solver... \n")
-        #print("----------------------------------------------")
+        if rank == 0 and args.debugmode > 0:
+            print("=" * 60)
+            print(f"Molecule: {args.mol}")
+            print(f"Basis: {args.basis}")
+            print(f"MPI Ranks: {nprocs}")
+            print("=" * 60)
+            #print("\n Starting FCI solver... \n")
+            #print("----------------------------------------------")
 
-        print(
-            f"nelec: {nelec}, norb: {norb}, na: {na}, ndet: {na*na}\n"
-            f"max_space: {args.max_space}, max_cycle: {args.max_cycle}, "
-            f"in_cpu: {args.incpu}, chunksize:{args.chunksize}, ecore: {ecore}"
+            print(
+                f"nelec: {nelec}, norb: {norb}, na: {na}, ndet: {na*na}\n"
+                f"max_space: {args.max_space}, max_cycle: {args.max_cycle}, "
+                f"in_cpu: {args.incpu}, chunksize:{args.chunksize}, ecore: {ecore}"
+            )
+            #print("----------------------------------------------")
+        start_fci = time.time()
+        # Define ctypes function signature
+        libfci.fci_result.argtypes = [
+            ctypes.c_void_p,  # h1e
+            ctypes.c_void_p,  # eri
+            ctypes.c_void_p,  # e_value
+            ctypes.c_void_p,  # occslst
+            ctypes.c_int64,   # na
+            ctypes.c_int64,   # norb
+            ctypes.c_int64,   # neleca
+            ctypes.c_int,     # max_space
+            ctypes.c_int,     # max_cycle
+            ctypes.c_int,     # in_cpu
+            ctypes.c_int,     # chunk_size
+            ctypes.c_int,     # debug_mode
+            ctypes.c_double,  # tol
+            ctypes.c_double,  # ecore
+        ]
+
+        # Call FCI solver
+        libfci.fci_result(
+            h1e.ctypes.data_as(ctypes.c_void_p),
+            eri_new.ctypes.data_as(ctypes.c_void_p),
+            e_value.ctypes.data_as(ctypes.c_void_p),
+            occslst.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_int64(na),
+            ctypes.c_int64(norb),
+            ctypes.c_int64(neleca),
+            ctypes.c_int(args.max_space),
+            ctypes.c_int(args.max_cycle),
+            ctypes.c_int(args.incpu),
+            ctypes.c_int(args.chunksize),
+            ctypes.c_int(args.debugmode),
+            ctypes.c_double(tol),
+            ctypes.c_double(ecore),
         )
-        #print("----------------------------------------------")
-    start_fci = time.time()
-    # Define ctypes function signature
-    libfci.fci_result.argtypes = [
-        ctypes.c_void_p,  # h1e
-        ctypes.c_void_p,  # eri
-        ctypes.c_void_p,  # e_value
-        ctypes.c_void_p,  # occslst
-        ctypes.c_int64,   # na
-        ctypes.c_int64,   # norb
-        ctypes.c_int64,   # neleca
-        ctypes.c_int,     # max_space
-        ctypes.c_int,     # max_cycle
-        ctypes.c_int,     # in_cpu
-        ctypes.c_int,     # chunk_size
-        ctypes.c_int,     # debug_mode
-        ctypes.c_double,  # tol
-        ctypes.c_double,  # ecore
-    ]
+        fci_time = time.time() - start_fci
+        
+        # Save and print results
+        if rank == 0 and args.filename != None:
+            save_result(args, geometry, e_value, na, nb, norb, nelec_t, nprocs, ecore, E_HF, fci_time)
+    else:
+        nelec_t = neleca + nelecb
+        start_oth = time.time()
+        occslsta      = cistring._gen_occslst(range(norb), neleca)
+        occslstb      = cistring._gen_occslst(range(norb), nelecb)
+        na           = cistring.num_strings(norb, neleca)
+        nb           = cistring.num_strings(norb, nelecb)
+        tol          = 1e-12
 
-    # Call FCI solver
-    libfci.fci_result(
-        h1e.ctypes.data_as(ctypes.c_void_p),
-        eri_new.ctypes.data_as(ctypes.c_void_p),
-        e_value.ctypes.data_as(ctypes.c_void_p),
-        occslst.ctypes.data_as(ctypes.c_void_p),
-        ctypes.c_int64(na),
-        ctypes.c_int64(norb),
-        ctypes.c_int64(neleca),
-        ctypes.c_int(args.max_space),
-        ctypes.c_int(args.max_cycle),
-        ctypes.c_int(args.incpu),
-        ctypes.c_int(args.chunksize),
-        ctypes.c_int(args.debugmode),
-        ctypes.c_double(tol),
-        ctypes.c_double(ecore),
-    )
-    fci_time = time.time() - start_fci
-    
-    # Save and print results
-    if rank == 0 and args.filename != None:
-        save_result(args, e_value, na, norb, nelec_t, nprocs, ecore, E_HF, fci_time)
+        # Initialize energy array
+        e_value     = np.zeros((1,))
+
+        if rank == 0 and args.debugmode > 0:
+            print("=" * 60)
+            print(f"Molecule: {args.mol}")
+            print(f"Basis: {args.basis}")
+            print(f"Geometry: {geometry}")
+            print(f"MPI Ranks: {nprocs}")
+            print("=" * 60)
+            #print("\n Starting FCI solver... \n")
+            #print("----------------------------------------------")
+
+            print(
+                f"nelec: {nelec}, norb: {norb}, na: {na}, ndet: {na*na}\n"
+                f"max_space: {args.max_space}, max_cycle: {args.max_cycle}, "
+                f"in_cpu: {args.incpu}, chunksize:{args.chunksize}, ecore: {ecore}"
+            )
+            #print("----------------------------------------------")
+        start_fci = time.time()
+        # Define ctypes function signature
+        libfci.fci_result.argtypes = [
+            ctypes.c_void_p,  # h1e
+            ctypes.c_void_p,  # eri
+            ctypes.c_void_p,  # e_value
+            ctypes.c_void_p,  # occslsta
+            ctypes.c_void_p,  # occslstb
+            ctypes.c_int64,   # na
+            ctypes.c_int64,   # nb
+            ctypes.c_int64,   # norb
+            ctypes.c_int64,   # neleca
+            ctypes.c_int64,   # nelecb
+            ctypes.c_int,     # max_space
+            ctypes.c_int,     # max_cycle
+            ctypes.c_int,     # in_cpu
+            ctypes.c_int,     # chunk_size
+            ctypes.c_int,     # debug_mode
+            ctypes.c_double,  # tol
+            ctypes.c_double,  # ecore
+        ]
+
+        # Call FCI solver
+        libfci.fci_result_unequal_elec(
+            h1e.ctypes.data_as(ctypes.c_void_p),
+            eri_new.ctypes.data_as(ctypes.c_void_p),
+            e_value.ctypes.data_as(ctypes.c_void_p),
+            occslsta.ctypes.data_as(ctypes.c_void_p),
+            occslstb.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_int64(na),
+            ctypes.c_int64(nb),
+            ctypes.c_int64(norb),
+            ctypes.c_int64(neleca),
+            ctypes.c_int64(nelecb),
+            ctypes.c_int(args.max_space),
+            ctypes.c_int(args.max_cycle),
+            ctypes.c_int(args.incpu),
+            ctypes.c_int(args.chunksize),
+            ctypes.c_int(args.debugmode),
+            ctypes.c_double(tol),
+            ctypes.c_double(ecore),
+        )
+        fci_time = time.time() - start_fci
+        
+        # Save and print results
+        if rank == 0 and args.filename != None:
+            save_result(args, geometry, e_value, na, nb, norb, nelec_t, nprocs, ecore, E_HF, fci_time)
+        
     if rank == 0 and args.debugmode > 1:
         #print(f"\n FCI energy: {e_value[0]:.12f} Ha")
         #print(f" FCI correlation energy: {e_value[0] - E_HF:.12f} Ha")
         print(f" fci_result time: {fci_time:.3f} s, others: {start_fci - start_oth:.3f} s\n")
     
     return e_value, na, nelec_t
+
 
 
 
@@ -221,5 +300,4 @@ if __name__ == '__main__':
         print(f"pre_time: {end_integral - start_hf:.3f} s \n")
     # Run FCI
     e_value, na, nelec_t   = run_fci(h1e, eri_new, norb, nelec, ecore, E_HF, args)
-
     

@@ -490,6 +490,19 @@
     "target": "N-N",
     "file": "N2.mol"
   },
+  
+  "NO": {
+    "distance_start": 0.6,
+    "distance_end": 2.6,
+    "distance_step": 0.1,
+    "spin": 1,
+    "active_space": "freeze",
+    "bond_type": "doublet",
+    "angle": [180, 180],
+    "target": "N-O",
+    "file": "NO.mol"
+  },
+
 
   "CaH2": {
     "distance_start": 0.6,
@@ -663,7 +676,7 @@
     "distance_start": 0.5,
     "distance_end": 2.8,
     "distance_step": 0.1,
-    "spin": 0,
+    "spin": 2,
     "active_space": "freeze",
     "bond_type": "single",
     "angle": [180, 180],

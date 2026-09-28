@@ -17,7 +17,6 @@
 #include <nccl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include <cfloat>
 
 
 #define NCCL_CHECK(cmd) do {                         \
@@ -75,9 +74,99 @@ do {                                                              \
     }                                                             \
 } while (0)
 
+__global__ void FCImake_hdiag_uhf_part_kernel_large_diff_elec(
+    double *hdiag,
+    size_t size,
+    const double *h1e,
+    const double *jdiag,
+    const double *kdiag,
+    int32_t norb,
+    int32_t nstra,
+    int32_t nstrb,
+    int32_t starta,
+    int32_t nocca,
+    int32_t noccb,
+    const int32_t *occslista,
+    const int32_t *occslistb,
+    int rank)
+{
+    size_t tid    = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)blockDim.x * gridDim.x;
 
+    for (size_t i = tid; i < size; i += stride) {
 
-__global__ void FCImake_hdiag_uhf_part_kernel_large(
+        const int32_t ia = (int32_t)(i / (size_t)nstrb);
+        const int32_t ib = (int32_t)(i % (size_t)nstrb);
+
+        // ia is the local alpha-string index.
+        // Convert it to the global alpha-string index with starta.
+        const int32_t iga = ia + starta;
+
+        // if (iga >= nstra) continue;
+        // if (ib  >= nstrb) continue;
+
+        const int32_t *paocc =
+            occslista + (size_t)iga * nocca;
+
+        const int32_t *pbocc =
+            occslistb + (size_t)ib * noccb;
+
+        double e1 = 0.0;
+        double e2 = 0.0;
+
+        // ------------------------------------------------------------
+        // Alpha-electron contributions
+        // ------------------------------------------------------------
+        for (int32_t j0 = 0; j0 < nocca; ++j0) {
+
+            const int32_t j = paocc[j0];
+            const size_t jbase = (size_t)j * norb;
+
+            // One-electron alpha contribution
+            e1 += h1e[jbase + j];
+
+            // alpha-alpha contribution
+            for (int32_t k0 = 0; k0 < nocca; ++k0) {
+                const int32_t k = paocc[k0];
+                const size_t jk = jbase + k;
+
+                e2 += jdiag[jk] - kdiag[jk];
+            }
+
+            // alpha-beta Coulomb contribution
+            for (int32_t k0 = 0; k0 < noccb; ++k0) {
+                const int32_t k = pbocc[k0];
+                const size_t jk = jbase + k;
+
+                e2 += 2.0 * jdiag[jk];
+            }
+        }
+
+        // ------------------------------------------------------------
+        // Beta-electron contributions
+        // ------------------------------------------------------------
+        for (int32_t j0 = 0; j0 < noccb; ++j0) {
+
+            const int32_t j = pbocc[j0];
+            const size_t jbase = (size_t)j * norb;
+
+            // One-electron beta contribution
+            e1 += h1e[jbase + j];
+
+            // beta-beta contribution
+            for (int32_t k0 = 0; k0 < noccb; ++k0) {
+                const int32_t k = pbocc[k0];
+                const size_t jk = jbase + k;
+
+                e2 += jdiag[jk] - kdiag[jk];
+            }
+        }
+
+        hdiag[(size_t)ia * nstrb + ib] = e1 + 0.5 * e2;
+    }
+}
+
+__global__ void FCImake_hdiag_uhf_part_kernel_large_ue(
     double *hdiag,
     size_t size,
     const double *h1e,
@@ -133,7 +222,7 @@ __global__ void FCImake_hdiag_uhf_part_kernel_large(
 
 
 
-void computeEigenvaluesAndVectorsn(cusolverDnHandle_t cusolverH, int32_t N, double* d_A, double* values, double* vectors, int* devInfo, double* d_W) {
+void computeEigenvaluesAndVectorsn_ue(cusolverDnHandle_t cusolverH, int32_t N, double* d_A, double* values, double* vectors, int* devInfo, double* d_W) {
     double *d_work = NULL;
     int lwork = 0;
 
@@ -151,7 +240,7 @@ void computeEigenvaluesAndVectorsn(cusolverDnHandle_t cusolverH, int32_t N, doub
 }
 
 
-__global__ void f1e_kernel(double* f1e, double* eri, double* h1e, int32_t norb, int32_t d2, int32_t d3, double norm_factor){
+__global__ void f1e_kernel_ue(double* f1e, double* eri, double* h1e, int32_t norb, int32_t d2, int32_t d3, double norm_factor){
       int32_t jk=blockIdx.x * blockDim.x + threadIdx.x;
       int32_t j=jk/norb;
       int32_t k=jk%norb;
@@ -161,7 +250,7 @@ __global__ void f1e_kernel(double* f1e, double* eri, double* h1e, int32_t norb, 
       }
       f1e[j * norb + k] = (h1e[j * norb + k] - 0.5 * sum)*norm_factor;
 }
-__global__ void adderi_kernel(double* f1e, double* eri, int32_t norb, int32_t d2, int32_t d3){
+__global__ void adderi_kernel_ue(double* f1e, double* eri, int32_t norb, int32_t d2, int32_t d3){
        int32_t ijk=blockIdx.x * blockDim.x + threadIdx.x;
        int32_t i = ijk/d2;
        int32_t j = (ijk-i*d2)/norb;
@@ -171,7 +260,7 @@ __global__ void adderi_kernel(double* f1e, double* eri, int32_t norb, int32_t d2
        atomicAdd(&eri[i * d3 + j * d2 + k * norb + k], f1e[i * norb + j]);
 }
 
-__global__ void nr1to4_kernel(double* eri1, double* eri4, int32_t norb, int32_t d1, int32_t d2, int32_t d3, size_t npair, double fac)
+__global__ void nr1to4_kernel_ue(double* eri1, double* eri4, int32_t norb, int32_t d1, int32_t d2, int32_t d3, size_t npair, double fac)
 {
         int32_t idx=blockIdx.x * blockDim.x + threadIdx.x;
         //for (int idx=0; idx<npair*npair; idx++){
@@ -186,24 +275,24 @@ __global__ void nr1to4_kernel(double* eri1, double* eri4, int32_t norb, int32_t 
         //}
 }
 
-void absorb_h1e(double* d_h1e,  double* d_erio, double* d_eri, int32_t norb, int32_t nelec, int32_t nnorb, double fac) {
+void absorb_h1e_ue(double* d_h1e,  double* d_erio, double* d_eri, int32_t norb, int32_t nelec, int32_t nnorb, double fac) {
     //double* f1e = (double*)malloc(norb * norb * sizeof(double));
     int32_t d2 = norb * norb;
     int32_t d3 = norb * norb * norb;
     double norm_factor = 1.0 / (nelec + 1e-100);
     double *d_f1e;
     cudaMalloc((void **)&d_f1e, d2* sizeof(double));
-    f1e_kernel<<<d2, 1>>>(d_f1e, d_erio, d_h1e, norb, d2, d3, norm_factor);
-    adderi_kernel<<<d3, 1>>>(d_f1e, d_erio, norb, d2, d3);
+    f1e_kernel_ue<<<d2, 1>>>(d_f1e, d_erio, d_h1e, norb, d2, d3, norm_factor);
+    adderi_kernel_ue<<<d3, 1>>>(d_f1e, d_erio, norb, d2, d3);
     
-    nr1to4_kernel<<<nnorb*nnorb, 1>>>(d_erio, d_eri, norb, norb, d2, d3, nnorb, fac);
+    nr1to4_kernel_ue<<<nnorb*nnorb, 1>>>(d_erio, d_eri, norb, norb, d2, d3, nnorb, fac);
 
     //free(f1e);
     cudaFree(d_f1e);
 }
 
 
-__device__ inline void sort_small_int64(int32_t* arr, int32_t n) {
+__device__ inline void sort_small_int64_ue(int32_t* arr, int32_t n) {
     // insertion sort
     for (int32_t i = 1; i < n; i++) {
         int32_t key = arr[i];
@@ -217,7 +306,7 @@ __device__ inline void sort_small_int64(int32_t* arr, int32_t n) {
 }
 
 // Global function (kernel) for the GPU
-__global__ void propgate1e_kernel(
+__global__ void propgate1e_kernel_ue(
     int32_t  nelec,        int32_t  norb,         int32_t  na,
     int      amin,         int      nstring,       int32_t *d_link_index,
     int32_t *occslst,      int32_t *d_link_nnorb,  int32_t  nvir,
@@ -285,7 +374,7 @@ __global__ void propgate1e_kernel(
             int32_t *s1 = str1buf + i * nelec;
             for (int32_t k = 0; k < nelec; ++k) s1[k] = str0[k];
             s1[n] = vir[i];
-            sort_small_int64(s1, nelec);
+            sort_small_int64_ue(s1, nelec);
         }
 
         for (i = 0; i < nvir; ++i) {
@@ -332,7 +421,7 @@ __global__ void propgate1e_kernel(
 }
 
 
-void gen_linkstr_index(int32_t nelec, int32_t norb, int32_t nstring, int amin, int na, int32_t* d_occslst,  int32_t* d_link_index, int32_t* d_link_nnorb) {
+void gen_linkstr_index_ue(int32_t nelec, int32_t norb, int32_t nstring, int amin, int na, int32_t* d_occslst,  int32_t* d_link_index, int32_t* d_link_nnorb) {
 
     int32_t nvir = norb - nelec;
     int32_t nlink = nelec + nelec * nvir;
@@ -352,7 +441,7 @@ void gen_linkstr_index(int32_t nelec, int32_t norb, int32_t nstring, int amin, i
     
     CUDA_CHECK(cudaMemset(d_scratch, 0, total_scratch_bytes));
     
-    propgate1e_kernel<<<blocks, threads>>>(nelec, norb, nstring, amin, na,
+    propgate1e_kernel_ue<<<blocks, threads>>>(nelec, norb, nstring, amin, na,
         d_link_index,  d_occslst,  d_link_nnorb, nvir, nlink, d_scratch);
 
     CUDA_CHECK(cudaGetLastError()); 
@@ -362,13 +451,13 @@ void gen_linkstr_index(int32_t nelec, int32_t norb, int32_t nstring, int amin, i
 
 
 
-__global__ void Dcopy_kernel(double *in, double *out, int heff_size, int space){
+__global__ void Dcopy_kernel_ue(double *in, double *out, int heff_size, int space){
      int32_t id=blockIdx.x * blockDim.x + threadIdx.x;
      int32_t j=id/space;
      out[id] = in[j*heff_size+id%space];     
 }
 
-__global__ void dot_partial_kernel(
+__global__ void dot_partial_kernel_ue(
     const double* __restrict__ a,
     const double* __restrict__ b,
     double* __restrict__ partial,
@@ -401,8 +490,8 @@ __global__ void dot_partial_kernel(
         partial[blockIdx.x] = sdata[0];
 }
 
-void dot_func(double* d_partial, double* h_partial, double* d_ci0, double* d_ci1, double* d_inner_local, size_t mynp, int blocks, int rank, cudaStream_t computeStream){
-    dot_partial_kernel<<<blocks, 256, 0, computeStream>>>(
+void dot_func_ue(double* d_partial, double* h_partial, double* d_ci0, double* d_ci1, double* d_inner_local, size_t mynp, int blocks, int rank, cudaStream_t computeStream){
+    dot_partial_kernel_ue<<<blocks, 256, 0, computeStream>>>(
         d_ci0, d_ci1, d_partial, mynp
     );
     CUDA_CHECK(cudaGetLastError());
@@ -419,8 +508,8 @@ void dot_func(double* d_partial, double* h_partial, double* d_ci0, double* d_ci1
     CUDA_CHECK(cudaMemcpyAsync(d_inner_local, &result, sizeof(double), cudaMemcpyHostToDevice, computeStream));
 }
 
-void dot_func_h(double* d_partial, double* h_partial, const double* __restrict__ d_ci0, const double* __restrict__ d_ci1, double* h_local, size_t mynp, int blocks, int rank, cudaStream_t computeStream){
-    dot_partial_kernel<<<blocks, 256, 0, computeStream>>>(
+void dot_func_h_ue(double* d_partial, double* h_partial, const double* __restrict__ d_ci0, const double* __restrict__ d_ci1, double* h_local, size_t mynp, int blocks, int rank, cudaStream_t computeStream){
+    dot_partial_kernel_ue<<<blocks, 256, 0, computeStream>>>(
         d_ci0, d_ci1, d_partial, mynp
     );
     CUDA_CHECK(cudaGetLastError());
@@ -436,29 +525,30 @@ void dot_func_h(double* d_partial, double* h_partial, const double* __restrict__
 }
 
 
-__global__ void write_heff(double* d_heff_tmp, double* val,
+__global__ void write_heff_ue(double* d_heff_tmp, double* val,
                            int r, int c, int ld)
 {
-    if (threadIdx.x == 0)
+    if (threadIdx.x == 0){
         d_heff_tmp[r * ld + c] = *val;
         d_heff_tmp[c * ld + r] = *val;
+    }
 }
 
 
 
-void fill_heff_hermitian_gpu_fast(cublasHandle_t handle, ncclComm_t ncclComm, cudaStream_t computeStream, double* d_heff_tmp, double* d_heff, double* d_ci0, double* d_ci1, double* d_ci1_list, double* h_ci1_list, double* d_tmp, double* d_inner_global, double* d_inner_local, double* d_partial, double* h_partial, int32_t row1, int32_t nrow, int32_t heff_size, int nprocs, int in_cpu, size_t mynp, int blocks, int rank){
+void fill_heff_hermitian_gpu_fast_ue(cublasHandle_t handle, ncclComm_t ncclComm, cudaStream_t computeStream, double* d_heff_tmp, double* d_heff, double* d_ci0, double* d_ci1, double* d_ci1_list, double* h_ci1_list, double* d_tmp, double* d_inner_global, double* d_inner_local, double* d_partial, double* h_partial, int32_t row1, int32_t nrow, int32_t heff_size, int nprocs, int in_cpu, size_t mynp, int blocks, int rank){
     
     int32_t row0 = row1 - nrow;
     
     // Compute diagonal element heff[row0, row0]
-    dot_func(d_partial, h_partial, d_ci0, d_ci1, d_inner_local, mynp, blocks, rank, computeStream);
+    dot_func_ue(d_partial, h_partial, d_ci0, d_ci1, d_inner_local, mynp, blocks, rank, computeStream);
     CUDA_CHECK(cudaStreamSynchronize(computeStream));
     if (nprocs > 1) {
         NCCL_CHECK(ncclAllReduce(d_inner_local, d_inner_global, 1, ncclDouble, ncclSum, ncclComm, computeStream));
         CUDA_CHECK(cudaStreamSynchronize(computeStream));
-        write_heff<<<1, 1, 0, computeStream>>>(d_heff_tmp, d_inner_global, row0, row0, heff_size);
+        write_heff_ue<<<1, 1, 0, computeStream>>>(d_heff_tmp, d_inner_global, row0, row0, heff_size);
     } else {
-        write_heff<<<1, 1, 0, computeStream>>>(d_heff_tmp, d_inner_local, row0, row0, heff_size);
+        write_heff_ue<<<1, 1, 0, computeStream>>>(d_heff_tmp, d_inner_local, row0, row0, heff_size);
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -466,29 +556,29 @@ void fill_heff_hermitian_gpu_fast(cublasHandle_t handle, ncclComm_t ncclComm, cu
     for (int32_t i = 0; i < row0; i++) {
         if (in_cpu == 1) {
             CUDA_CHECK(cudaMemcpyAsync(d_tmp, h_ci1_list + i * mynp, sizeof(double) * mynp, cudaMemcpyHostToDevice, computeStream));
-            dot_func(d_partial, h_partial, d_ci0, d_tmp, d_inner_local, mynp, blocks, rank, computeStream);
+            dot_func_ue(d_partial, h_partial, d_ci0, d_tmp, d_inner_local, mynp, blocks, rank, computeStream);
         } else {
-            dot_func(d_partial, h_partial, d_ci0, d_ci1_list + i * mynp, d_inner_local, mynp, blocks, rank, computeStream);
+            dot_func_ue(d_partial, h_partial, d_ci0, d_ci1_list + i * mynp, d_inner_local, mynp, blocks, rank, computeStream);
         }   
         
         if (nprocs > 1) {
             NCCL_CHECK(ncclAllReduce(d_inner_local, d_inner_global, 1, ncclDouble, ncclSum, ncclComm, computeStream));
             CUDA_CHECK(cudaStreamSynchronize(computeStream));
-            write_heff<<<1, 1, 0, computeStream>>>(d_heff_tmp, d_inner_global, row0, i, heff_size);
+            write_heff_ue<<<1, 1, 0, computeStream>>>(d_heff_tmp, d_inner_global, row0, i, heff_size);
         } else {
-            write_heff<<<1, 1, 0, computeStream>>>(d_heff_tmp, d_inner_local, row0, i, heff_size);
+            write_heff_ue<<<1, 1, 0, computeStream>>>(d_heff_tmp, d_inner_local, row0, i, heff_size);
         }
         CUDA_CHECK(cudaGetLastError());
     }
 
     // Copy to final heff matrix
-    Dcopy_kernel<<<row1 * row1, 1, 0, computeStream>>>(d_heff_tmp, d_heff, heff_size, row1);
+    Dcopy_kernel_ue<<<row1 * row1, 1, 0, computeStream>>>(d_heff_tmp, d_heff, heff_size, row1);
     CUDA_CHECK(cudaGetLastError());
 }
 
 
 
-__global__ void Dscal_kernel(double *in, double *out, double k, size_t np)
+__global__ void Dscal_kernel_ue(double *in, double *out, double k, size_t np)
 {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)blockDim.x * gridDim.x;
@@ -497,7 +587,7 @@ __global__ void Dscal_kernel(double *in, double *out, double k, size_t np)
         out[id] = k * in[id];
     }
 }
-__global__ void Dscalplus_kernel(double *in, double *out, double k, size_t np)
+__global__ void Dscalplus_kernel_ue(double *in, double *out, double k, size_t np)
 {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)blockDim.x * gridDim.x;
@@ -508,7 +598,7 @@ __global__ void Dscalplus_kernel(double *in, double *out, double k, size_t np)
 }
 
 
-__global__ void Dscal_accum_kernel(const double* __restrict__ d_ci0_list, const double* __restrict__ d_ci1_list, double* __restrict__ d_ci0, double* __restrict__ d_ci1, const  double* __restrict__ v, int space, size_t np)
+__global__ void Dscal_accum_kernel_ue(const double* __restrict__ d_ci0_list, const double* __restrict__ d_ci1_list, double* __restrict__ d_ci0, double* __restrict__ d_ci1, const  double* __restrict__ v, int space, size_t np)
 {
     size_t id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= np) return;
@@ -524,7 +614,7 @@ __global__ void Dscal_accum_kernel(const double* __restrict__ d_ci0_list, const 
     d_ci1[id] = y;
 }
 
-void gen_x0_gpu(double *v, double *d_ci0_list,  double *d_ci1_list, double *d_ci0, double *d_ci1, int space, size_t np, cudaStream_t computeStream)
+void gen_x0_gpu_ue(double *v, double *d_ci0_list,  double *d_ci1_list, double *d_ci0, double *d_ci1, int space, size_t np, cudaStream_t computeStream)
 {
     const int threads = 256;
     const int blocks  = (int)((np + threads - 1) / threads);
@@ -535,7 +625,7 @@ void gen_x0_gpu(double *v, double *d_ci0_list,  double *d_ci1_list, double *d_ci
     CUDA_CHECK(cudaMemcpyAsync(d_v, v, space * sizeof(double),
                                cudaMemcpyHostToDevice, computeStream));
 
-    Dscal_accum_kernel<<<blocks, threads, 0, computeStream>>>(
+    Dscal_accum_kernel_ue<<<blocks, threads, 0, computeStream>>>(
         d_ci0_list, d_ci1_list, d_ci0, d_ci1, d_v, space, np);
     CUDA_CHECK(cudaGetLastError());
 
@@ -544,7 +634,7 @@ void gen_x0_gpu(double *v, double *d_ci0_list,  double *d_ci1_list, double *d_ci
 }
 
 
-void gen_x0_gpu_incpu(double *h_v, double *h_c_list, double *d_x0, double* d_tmp, int space, size_t np, cudaStream_t computeStream){
+void gen_x0_gpu_incpu_ue(double *h_v, double *h_c_list, double *d_x0, double* d_tmp, int space, size_t np, cudaStream_t computeStream){
     size_t nthread = 256;
     size_t max_blocks = 65535; 
     const size_t nblock = (np + nthread - 1) / nthread < max_blocks
@@ -552,18 +642,18 @@ void gen_x0_gpu_incpu(double *h_v, double *h_c_list, double *d_x0, double* d_tmp
 
     // Initialize with the last term
     CUDA_CHECK(cudaMemcpyAsync(d_tmp, h_c_list + (space - 1) * np, sizeof(double) * np, cudaMemcpyHostToDevice, computeStream));
-    Dscal_kernel<<<nblock, nthread, 0, computeStream>>>(d_tmp, d_x0, h_v[space - 1], np);
+    Dscal_kernel_ue<<<nblock, nthread, 0, computeStream>>>(d_tmp, d_x0, h_v[space - 1], np);
     
     // Accumulate remaining terms
     for (int i = space - 2; i >= 0; i--) {
         CUDA_CHECK(cudaMemcpyAsync(d_tmp, h_c_list + i * np, sizeof(double) * np, cudaMemcpyHostToDevice, computeStream));
-        Dscalplus_kernel<<<nblock, nthread, 0, computeStream>>>(d_tmp, d_x0, h_v[i], np);
+        Dscalplus_kernel_ue<<<nblock, nthread, 0, computeStream>>>(d_tmp, d_x0, h_v[i], np);
     }
 }
 
 
 
-__global__ void precond_kernel(const double* __restrict__ diag, double* __restrict__ dx, double e, double level_shift, size_t np){
+__global__ void precond_kernel_ue(const double* __restrict__ diag, double* __restrict__ dx, double e, double level_shift, size_t np){
     size_t tid    = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)blockDim.x * gridDim.x;
     
@@ -578,17 +668,17 @@ __global__ void precond_kernel(const double* __restrict__ diag, double* __restri
 }
 
 
-__global__ void Dscalminus_kernel(double *in, double *out, double k,  size_t np){
+__global__ void Dscalminus_kernel_ue(double *in, double *out, double k,  size_t np){
      size_t id=blockIdx.x * blockDim.x + threadIdx.x;
      if (id>=np) return;
      out[id]-=k*in[id];
 }
-__global__ void Ddiv_kernel(double *in, double *out, double k,  size_t np){
+__global__ void Ddiv_kernel_ue(double *in, double *out, double k,  size_t np){
      size_t id=blockIdx.x * blockDim.x + threadIdx.x;
      if (id>=np) return;
      out[id]=in[id]/k;
 }
-__global__ void Dscalminus_largekernel(const double* __restrict__ in, double* __restrict__ out, double k, size_t np){
+__global__ void Dscalminus_largekernel_ue(const double* __restrict__ in, double* __restrict__ out, double k, size_t np){
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)blockDim.x * gridDim.x;
 
@@ -597,7 +687,7 @@ __global__ void Dscalminus_largekernel(const double* __restrict__ in, double* __
     }
 }
 
-__global__ void Ddiv_largekernel(const double* __restrict__ in, double* __restrict__ out, double k, size_t np){
+__global__ void Ddiv_largekernel_ue(const double* __restrict__ in, double* __restrict__ out, double k, size_t np){
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)blockDim.x * gridDim.x;
 
@@ -607,7 +697,7 @@ __global__ void Ddiv_largekernel(const double* __restrict__ in, double* __restri
 }
 
 
-void normalize_xt_gpu_large(
+void normalize_xt_gpu_large_ue(
     cublasHandle_t handle,   double *d_ci0,      double *d_ci0_list,
     double        *d_tmp,    double  lindep,      double  norm_min,
     int            space,    size_t  np,          int     nprocs,
@@ -628,10 +718,10 @@ void normalize_xt_gpu_large(
             CUDA_CHECK(cudaMemcpyAsync(d_tmp, &d_ci0_list[i * mynp],
                                        mynp * sizeof(double),
                                        cudaMemcpyHostToDevice, computeStream));
-            dot_func_h(d_partial, h_partial, d_tmp, d_ci0,
+            dot_func_h_ue(d_partial, h_partial, d_tmp, d_ci0,
                        h_single, mynp, blocks_dot, rank, computeStream);
         } else {
-            dot_func_h(d_partial, h_partial, d_ci0_list + i * mynp, d_ci0,
+            dot_func_h_ue(d_partial, h_partial, d_ci0_list + i * mynp, d_ci0,
                        h_single, mynp, blocks_dot, rank, computeStream);
         }
         CUDA_CHECK(cudaStreamSynchronize(computeStream));
@@ -653,10 +743,10 @@ void normalize_xt_gpu_large(
             CUDA_CHECK(cudaMemcpyAsync(d_tmp, &d_ci0_list[i * mynp],
                                        mynp * sizeof(double),
                                        cudaMemcpyHostToDevice, computeStream));
-            Dscalminus_largekernel<<<nblock, nthread, 0, computeStream>>>(
+            Dscalminus_largekernel_ue<<<nblock, nthread, 0, computeStream>>>(
                 d_tmp, d_ci0, tmp, mynp);
         } else {
-            Dscalminus_largekernel<<<nblock, nthread, 0, computeStream>>>(
+            Dscalminus_largekernel_ue<<<nblock, nthread, 0, computeStream>>>(
                 d_ci0_list + i * mynp, d_ci0, tmp, mynp);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -664,7 +754,7 @@ void normalize_xt_gpu_large(
     }
 
     // Normalize ci0
-    dot_func_h(d_partial, h_partial, d_ci0, d_ci0,
+    dot_func_h_ue(d_partial, h_partial, d_ci0, d_ci0,
                h_single, mynp, blocks_dot, rank, computeStream);
     CUDA_CHECK(cudaStreamSynchronize(computeStream));
 
@@ -681,14 +771,14 @@ void normalize_xt_gpu_large(
     const double norm_sq = h_single[0];
     if (norm_sq > lindep && sqrt(norm_sq) > 1e-14) {
         const double norm = sqrt(norm_sq);
-        Ddiv_largekernel<<<nblock, nthread, 0, computeStream>>>(
+        Ddiv_largekernel_ue<<<nblock, nthread, 0, computeStream>>>(
             d_ci0, d_ci0, norm, mynp);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaStreamSynchronize(computeStream));
     }
 }
 
-void normalize_xt_gpu(
+void normalize_xt_gpu_ue(
     cublasHandle_t handle,  double *d_ci0,     double *d_ci0_list,
     double        *d_tmp,   double  lindep,     double  norm_min,
     int            space,   size_t  np,         int     nprocs,
@@ -729,10 +819,10 @@ void normalize_xt_gpu(
 
         // Subtract projection: ci0 -= tmp * ci0_list[i]
         if (in_cpu == 1) {
-            Dscalminus_kernel<<<nblock, nthread, 0, computeStream>>>(
+            Dscalminus_kernel_ue<<<nblock, nthread, 0, computeStream>>>(
                 d_tmp, d_ci0, tmp, mynp);
         } else {
-            Dscalminus_kernel<<<nblock, nthread, 0, computeStream>>>(
+            Dscalminus_kernel_ue<<<nblock, nthread, 0, computeStream>>>(
                 d_ci0_list + i * mynp, d_ci0, tmp, mynp);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -756,15 +846,15 @@ void normalize_xt_gpu(
 
     if (norm_sq > lindep) {
         const double norm = sqrt(norm_sq);
-        Ddiv_kernel<<<nblock, nthread, 0, computeStream>>>(d_ci0, d_ci0, norm, mynp);
+        Ddiv_kernel_ue<<<nblock, nthread, 0, computeStream>>>(d_ci0, d_ci0, norm, mynp);
         CUDA_CHECK(cudaGetLastError());
     }
 }
 
 
-__global__ void _build_t1(double *ci0, double *t1,
+__global__ void _build_t1_ue(double *ci0, double *t1,
     int32_t strb0, int32_t na, int32_t nb, int32_t nnorb,
-    int32_t *d_linknn,  int32_t chunk, int32_t nab)
+    int32_t *d_linka_nnorb, int32_t *d_linkb_nnorb, int32_t chunk, int32_t nab)
 {
     int32_t thread_id=blockIdx.x * blockDim.x + threadIdx.x;
     if (thread_id>=na*chunk){
@@ -779,19 +869,19 @@ __global__ void _build_t1(double *ci0, double *t1,
   
     if (stra < na && strb < nb) {
             for (j = 0; j < nnorb; j++) {
-                str1a = d_linknn[2*(j*na+stra)];
-                signa = d_linknn[2*(j*na+stra)+1];
+                str1a = d_linka_nnorb[2*(j*na+stra)];
+                signa = d_linka_nnorb[2*(j*na+stra)+1];
 
-                str1b = d_linknn[2*(j*na+strb)];
-                signb = d_linknn[2*(j*na+strb)+1];
+                str1b = d_linkb_nnorb[2*(j*nb+strb)];
+                signb = d_linkb_nnorb[2*(j*nb+strb)+1];
                 t1[j*nab + ab_id] = signa * ci0[str1a*nb+strb] + signb * ci0[stra*nb+str1b];
             }
     }
 }
 
-__global__ void _gather(double *out, double *t1,
+__global__ void _gather_ue(double *out, double *t1,
     int32_t strb0, int32_t na, int32_t nb, int32_t nnorb,
-    int32_t chunk, int32_t nab, int32_t *d_clink_index, int32_t nlink)
+    int32_t chunk, int32_t nab, int32_t *d_clinka_index, int32_t *d_clinkb_index, int32_t nlinka, int32_t nlinkb)
 {
     int32_t thread_id=blockIdx.x * blockDim.x + threadIdx.x;
     if (thread_id>=na*chunk) return;
@@ -800,38 +890,43 @@ __global__ void _gather(double *out, double *t1,
     int32_t strb = strb0 + tx;
     int32_t ab_id = stra * chunk + tx;
     int32_t str1, j, ia;
-    double val = 0.;
-    int32_t *tabb = d_clink_index + strb * nlink*3;
-    int32_t *taba = d_clink_index + stra * nlink*3;
+    //double val = 0.;
+    int32_t *tabb = d_clinkb_index + strb * nlinkb*3;
+    int32_t *taba = d_clinka_index + stra * nlinka*3;
     int8_t signa, signb;
     
 
     if (stra < na && strb < nb) {
-        for (j = 0; j < nlink; j++) {
+        for (j = 0; j < nlinka; j++) {
             ia = taba[j*3];
             str1 = taba[j*3+1];
             signa = taba[j*3+2];
-            val += signa * t1[ia*nab + (str1*chunk+tx)];
+            //val += signa * t1[ia*nab + (str1*chunk+tx)];
+            atomicAdd(&out[str1*nb+strb], signa * t1[ia*nab + ab_id]);
+
+        }
+        //atomicAdd(&out[stra*nb+strb], val);
+        for (j = 0; j < nlinkb; j++) {
 
             ia = tabb[j*3];
             str1 = tabb[j*3+1];
             signb = tabb[j*3+2];
             atomicAdd(&out[stra*nb+str1], signb * t1[ia*nab + ab_id]);
         }
-        atomicAdd(&out[stra*nb+strb], val);
     }
 
 }
 
 
-void contract_2e_spin1_gpu(
+void contract_2e_spin1_gpu_ue(
     cublasHandle_t handle,
     double        *d_eri,
     double        *d_ci0,    double  *d_ci1,
     double        *d_t1,     double  *d_vt1,
     int32_t        norb,     int32_t  na,
-    int32_t        nb,       int32_t  nlink,
-    int32_t       *d_clink,  int32_t *d_linknn,
+    int32_t        nb,       int32_t  nlinka, int32_t nlinkb,
+    int32_t       *d_clinka,  int32_t *d_linka_nnorb,
+    int32_t       *d_clinkb,  int32_t *d_linkb_nnorb,
     int32_t        na_self,
     int32_t        chunk,    int      debug_mode,
     cudaStream_t   computeStream)
@@ -857,15 +952,15 @@ void contract_2e_spin1_gpu(
     }
 
     for (int32_t strb0 = 0; strb0 < nb; strb0 += chunk) {
-        _build_t1<<<nblocks, threadsPerBlock, 0, computeStream>>>(
-            d_ci0, d_t1, strb0, na, nb, nnorb, d_linknn, chunk, nab);
+        _build_t1_ue<<<nblocks, threadsPerBlock, 0, computeStream>>>(
+            d_ci0, d_t1, strb0, na, nb, nnorb, d_linka_nnorb, d_linkb_nnorb, chunk, nab);
         CUDA_CHECK(cudaGetLastError());
 
         CUBLAS_CHECK(cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
             nab, nnorb, nnorb, &D1, d_t1, nab, d_eri, nnorb, &D0, d_vt1, nab));
 
-        _gather<<<nblocks, threadsPerBlock, 0, computeStream>>>(
-            d_ci1, d_vt1, strb0, na, nb, nnorb, chunk, nab, d_clink, nlink);
+        _gather_ue<<<nblocks, threadsPerBlock, 0, computeStream>>>(
+            d_ci1, d_vt1, strb0, na, nb, nnorb, chunk, nab, d_clinka, d_clinkb, nlinka, nlinkb);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -883,11 +978,12 @@ void contract_2e_spin1_gpu(
 
 
 
-__global__ void _build_t1_buf(
+__global__ void _build_t1_buf_ue(
     const double* __restrict__ ci0,
     const double* __restrict__ ci0_buf,
     double* __restrict__ t1,
-    const int32_t* __restrict__ d_link_nnorb,
+    const int32_t* __restrict__ d_linka_nnorb,
+    const int32_t* __restrict__ d_linkb_nnorb,
     const int32_t* __restrict__ natomax,
     int32_t strb0,
     int32_t na,
@@ -934,12 +1030,12 @@ __global__ void _build_t1_buf(
         //#pragma unroll 4
         for (int32_t j = 0; j < nnorb; j++) {
             const size_t link_idx_a = 2 * (j * na_sz + stra);
-            const size_t link_idx_b = 2 * (j * na_sz + strb);
+            const size_t link_idx_b = 2 * (j * nb_sz + strb);
             
-            const size_t str1a = (size_t)d_link_nnorb[link_idx_a];
-            const int8_t signa = (int8_t)d_link_nnorb[link_idx_a + 1];
-            const size_t str1b = (size_t)d_link_nnorb[link_idx_b];
-            const int8_t signb = (int8_t)d_link_nnorb[link_idx_b + 1];
+            const size_t str1a = (size_t)d_linka_nnorb[link_idx_a];
+            const int8_t signa = (int8_t)d_linka_nnorb[link_idx_a + 1];
+            const size_t str1b = (size_t)d_linkb_nnorb[link_idx_b];
+            const int8_t signb = (int8_t)d_linkb_nnorb[link_idx_b + 1];
             
             const double term1 = (double)signa * ci0_buf[str1a * ntile_sz + tx];
             const double term2 = (double)signb * ci0[stra_base_nb + str1b];
@@ -951,12 +1047,12 @@ __global__ void _build_t1_buf(
         //#pragma unroll 4
         for (int32_t j = 0; j < nnorb; j++) {
             const size_t link_idx_a = 2 * (j * na_sz + stra);
-            const size_t link_idx_b = 2 * (j * na_sz + strb);
+            const size_t link_idx_b = 2 * (j * nb_sz + strb);
             
-            size_t str1a = (size_t)d_link_nnorb[link_idx_a];
-            const int8_t signa = (int8_t)d_link_nnorb[link_idx_a + 1];
-            const size_t str1b = (size_t)d_link_nnorb[link_idx_b];
-            const int8_t signb = (int8_t)d_link_nnorb[link_idx_b + 1];
+            size_t str1a = (size_t)d_linka_nnorb[link_idx_a];
+            const int8_t signa = (int8_t)d_linka_nnorb[link_idx_a + 1];
+            const size_t str1b = (size_t)d_linkb_nnorb[link_idx_b];
+            const int8_t signb = (int8_t)d_linkb_nnorb[link_idx_b + 1];
             
             // Apply mapping for str1a
             str1a = (size_t)natomax[str1a];
@@ -969,12 +1065,13 @@ __global__ void _build_t1_buf(
     }
 }
 
-__global__ void _gather_buf(
+__global__ void _gather_buf_ue(
     double* __restrict__ out,
     double* __restrict__ ci1_buf,
     double* __restrict__ d_cbuf_large,
     const double* __restrict__ t1,
-    const int32_t* __restrict__ d_clink_index,
+    const int32_t* __restrict__ d_clinka_index,
+    const int32_t* __restrict__ d_clinkb_index,
     const int32_t* __restrict__ natomax,
     int32_t strb0,
     int32_t na,
@@ -983,7 +1080,8 @@ __global__ void _gather_buf(
     int32_t ntile,
     int32_t ntile2,
     int32_t nab,
-    int32_t nlink,
+    int32_t nlinka,
+    int32_t nlinkb,
     int32_t amin,
     int32_t amax,
     int32_t na_self,
@@ -1011,40 +1109,48 @@ __global__ void _gather_buf(
     const size_t ntile_sz = (size_t)ntile;
     const size_t nab_sz = (size_t)nab;
     const size_t nb_sz = (size_t)nb;
-    const size_t nlink_sz = (size_t)nlink;
+    const size_t nlinka_sz = (size_t)nlinka;
+    const size_t nlinkb_sz = (size_t)nlinkb;
     
     // Pre-calculate base indices for link tables
-    const int32_t* __restrict__ taba = d_clink_index + stra * nlink_sz * 3;
-    const int32_t* __restrict__ tabb = d_clink_index + strb * nlink_sz * 3;
+    const int32_t* __restrict__ taba = d_clinka_index + stra * nlinka_sz * 3;
+    const int32_t* __restrict__ tabb = d_clinkb_index + strb * nlinkb_sz * 3;
     
     // Pre-calculate common array indices
     const size_t out_base_idx = stra0 * nb_sz;
     const size_t t1_base_idx = stra0 * ntile_sz + tx;
     
     // ReduceScatter mode
-    for (size_t j = 0; j < nlink_sz; j++) {
+    for (size_t j = 0; j < nlinka_sz; j++) {
         const size_t j3 = j * 3;
 
         const size_t  ia    = (size_t)taba[j3];
         size_t        str1a = (size_t)taba[j3 + 1];
         const int8_t  signa = taba[j3 + 2];
 
+        if (mode != 0) str1a = (size_t)natomax[str1a];
+
+        const double t1_val_a = t1[ia * nab_sz + t1_base_idx];
+
+        atomicAdd(&d_cbuf_large[str1a * ntile_sz + tx], signa * t1_val_a);
+
+    }
+    for (size_t j = 0; j < nlinkb_sz; j++) { 
+        const size_t j3 = j * 3;
+
         const size_t  ib    = (size_t)tabb[j3];
         const size_t  str1b = (size_t)tabb[j3 + 1];
         const int8_t  signb = tabb[j3 + 2];
 
-        if (mode != 0) str1a = (size_t)natomax[str1a];
-
-        const double t1_val_a = t1[ia * nab_sz + t1_base_idx];
         const double t1_val_b = t1[ib * nab_sz + t1_base_idx];
 
-        atomicAdd(&d_cbuf_large[str1a * ntile_sz + tx], signa * t1_val_a);
-        atomicAdd(&out[out_base_idx + str1b],            signb * t1_val_b);
+        atomicAdd(&out[out_base_idx + str1b],   signb * t1_val_b);
     }
+
 }
 
 
-__global__ void _copy_buf(
+__global__ void _copy_buf_ue(
     double  *in,          double  *out,
     int32_t  strb0,       int32_t  ntile,
     int32_t  amin,        int32_t  amax,
@@ -1073,7 +1179,7 @@ __global__ void _copy_buf(
 
 
 __global__
-void _add_to_c_option(
+void _add_to_c_option_ue(
     const double* __restrict__ ci1_buf,
     const double* __restrict__ cbuf_local,
     double* __restrict__ out,
@@ -1122,12 +1228,13 @@ struct SolverConfig {
     // Problem dimensions
     int32_t na;          // total alpha strings
     int32_t na_self;     // alpha strings owned by this rank
+    int32_t nb;          // total beta strings
     int32_t norb;        // number of orbitals
-    int32_t nelec;       // number of electrons (alpha)
-    int32_t nlinka;      // number of link entries per string
+    int32_t nlinka;      // number of link entries per alpha string
+    int32_t nlinkb;      // number of link entries per beta string
     int32_t nnorb;       // norb*(norb+1)/2
     int32_t ntile;       // tile (chunk) size
-    size_t  np;          // na * na (total CI space)
+    size_t  np;          // na * nb (total CI space)
     // Davidson parameters
     int     nroots;
     int     max_space;
@@ -1156,15 +1263,16 @@ struct PipelineConfig {
     size_t  recvlarge;    // sendcount * nprocs
     size_t  base_size;    // na_self * na * sizeof(double)
     size_t  nblocks_buf;  // grid size for _copy_buf
-    size_t  nblocks;      // grid size for _build_t1_buf / _gather_buf
+    size_t  nblocks;      // grid size for _build_t1_buf / _gather_buf_ue
     int     threads;      // threads per block (256)
 };
 
-void contract_2e_spin1_gpu_buf(
+void contract_2e_spin1_gpu_buf_ue(
     cublasHandle_t  handle,
     double         *d_eri,
     double        *d_t1,          double        *d_vt1,
-    int32_t        *d_clink,       int32_t     *d_link_nnorb,
+    int32_t        *d_clinka,       int32_t     *d_linka_nnorb,
+    int32_t        *d_clinkb,       int32_t     *d_linkb_nnorb,
     double        *d_ci1_buf,      double       *d_cbuf_local,
     double        *d_cbuf_large,
     double         *d_ci0,          double         *d_ci1,
@@ -1181,7 +1289,7 @@ void contract_2e_spin1_gpu_buf(
     CUBLAS_CHECK(cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST));
     CUBLAS_CHECK(cublasSetStream(handle, computeStream));
  
-    const int32_t total_tiles     = (cfg.na + cfg.ntile - 1) / cfg.ntile;
+    const int32_t total_tiles     = (cfg.nb + cfg.ntile - 1) / cfg.ntile;
     const int     print_period     = 100;
 
     const int32_t amin   = cfg.starts_na[cfg.rank];
@@ -1209,8 +1317,8 @@ void contract_2e_spin1_gpu_buf(
 
     // Main computation loop
     int32_t tile_id = 0;
-    for (int32_t strb0 = 0; strb0 < cfg.na; strb0 += cfg.ntile) {
-        const int32_t ntile2 = (cfg.na - strb0 < cfg.ntile) ? (cfg.na - strb0) : cfg.ntile;
+    for (int32_t strb0 = 0; strb0 < cfg.nb; strb0 += cfg.ntile) {
+        const int32_t ntile2 = (cfg.nb - strb0 < cfg.ntile) ? (cfg.nb - strb0) : cfg.ntile;
 
         if (cfg.debug_mode > 1) {
             CUDA_CHECK(cudaStreamSynchronize(computeStream));
@@ -1221,9 +1329,9 @@ void contract_2e_spin1_gpu_buf(
         // ----------------------------------------------------------------
         // Compute: copy buffer
         // ----------------------------------------------------------------
-        _copy_buf<<<pc.nblocks_buf, pc.threads, 0, computeStream>>>(
+        _copy_buf_ue<<<pc.nblocks_buf, pc.threads, 0, computeStream>>>(
             d_ci0, d_cbuf_local, strb0, cfg.ntile,
-            amin, amax, cfg.na_self, pc.na_max, cfg.na, cfg.na, cfg.rank);
+            amin, amax, cfg.na_self, pc.na_max, cfg.na, cfg.nb, cfg.rank);
         CUDA_CHECK(cudaGetLastError());
 
         // ----------------------------------------------------------------
@@ -1249,9 +1357,9 @@ void contract_2e_spin1_gpu_buf(
         // Compute: build t1 + dgemm + clear buffer + gather
         // ----------------------------------------------------------------
 
-        _build_t1_buf<<<pc.nblocks, pc.threads, 0, computeStream>>>(
-                d_ci0, d_cbuf_large, d_t1, d_link_nnorb, natomax,
-                strb0, cfg.na, cfg.na, cfg.nnorb, cfg.ntile, ntile2,
+        _build_t1_buf_ue<<<pc.nblocks, pc.threads, 0, computeStream>>>(
+                d_ci0, d_cbuf_large, d_t1, d_linka_nnorb, d_linkb_nnorb, natomax,
+                strb0, cfg.na, cfg.nb, cfg.nnorb, cfg.ntile, ntile2,
                 amin, amax, cfg.na_self, pc.nab, pc.mode, cfg.rank);
         CUDA_CHECK(cudaGetLastError());
 
@@ -1263,11 +1371,11 @@ void contract_2e_spin1_gpu_buf(
         CUDA_CHECK(cudaMemsetAsync(d_cbuf_large, 0,
                     pc.recvlarge * sizeof(double), computeStream));
         
-        _gather_buf<<<pc.nblocks, pc.threads, 0, computeStream>>>(
+        _gather_buf_ue<<<pc.nblocks, pc.threads, 0, computeStream>>>(
                 d_ci1, d_ci1_buf, d_cbuf_large, d_vt1,
-                d_clink, natomax,
-                strb0, cfg.na, cfg.na, cfg.nnorb, cfg.ntile, ntile2,
-                pc.nab, cfg.nlinka, amin, amax, cfg.na_self, pc.mode, cfg.rank);
+                d_clinka, d_clinkb, natomax,
+                strb0, cfg.na, cfg.nb, cfg.nnorb, cfg.ntile, ntile2,
+                pc.nab, cfg.nlinka, cfg.nlinkb, amin, amax, cfg.na_self, pc.mode, cfg.rank);
         CUDA_CHECK(cudaGetLastError());
 
         // ----------------------------------------------------------------
@@ -1294,9 +1402,9 @@ void contract_2e_spin1_gpu_buf(
         // Compute: add results to output
         // ----------------------------------------------------------------
 
-        _add_to_c_option<<<pc.nblocks, pc.threads, 0, computeStream>>>(
+        _add_to_c_option_ue<<<pc.nblocks, pc.threads, 0, computeStream>>>(
                d_ci1_buf, d_cbuf_local, d_ci1,
-               strb0, cfg.ntile, ntile2, cfg.na,
+               strb0, cfg.ntile, ntile2, cfg.nb,
                amin, amax, cfg.na_self, pc.na_max, cfg.nprocs, cfg.rank);
 
         CUDA_CHECK(cudaGetLastError());
@@ -1369,11 +1477,12 @@ void contract_2e_spin1_gpu_buf(
 //      ||
 //   build/dgemm/gather(tile N-1)
 // ------------------------------------------------------------------
-void contract_2e_spin1_gpu_buf_overlap(
+void contract_2e_spin1_gpu_buf_overlap_ue(
     cublasHandle_t  handle,
     double         *d_eri,
     double        **d_t1,          double        **d_vt1,
-    int32_t        *d_clink,        int32_t        *d_link_nnorb,
+    int32_t        *d_clinka,        int32_t        *d_linka_nnorb,
+    int32_t        *d_clinkb,        int32_t        *d_linkb_nnorb,
     double        **d_ci1_buf,      double        **d_cbuf_local,
     double        **d_cbuf_large,
     double         *d_ci0,          double         *d_ci1,
@@ -1423,9 +1532,9 @@ void contract_2e_spin1_gpu_buf_overlap(
         // commStream: copy_buf + AllGather for tile N
         CUDA_CHECK(cudaStreamWaitEvent(commStream, ev_rs_done[b], 0));
 
-        _copy_buf<<<pc.nblocks_buf, pc.threads, 0, commStream>>>(
+        _copy_buf_ue<<<pc.nblocks_buf, pc.threads, 0, commStream>>>(
             d_ci0, d_cbuf_local[b], strb0, cfg.ntile,
-            amin, amax, cfg.na_self, pc.na_max, cfg.na, cfg.na, cfg.rank);
+            amin, amax, cfg.na_self, pc.na_max, cfg.na, cfg.nb, cfg.rank);
         CUDA_CHECK(cudaGetLastError());
 
         NCCL_CHECK(ncclAllGather(
@@ -1436,14 +1545,14 @@ void contract_2e_spin1_gpu_buf_overlap(
         // computeStream: build_t1 + dgemm + gather + ReduceScatter for tile N-1
         if (tile > 0) {
             const int32_t prev_strb0  = (tile - 1) * cfg.ntile;
-            const int32_t prev_ntile2 = (cfg.na - prev_strb0 < cfg.ntile)
-                                        ? (cfg.na - prev_strb0) : cfg.ntile;
+            const int32_t prev_ntile2 = (cfg.nb - prev_strb0 < cfg.ntile)
+                                        ? (cfg.nb - prev_strb0) : cfg.ntile;
 
             CUDA_CHECK(cudaStreamWaitEvent(computeStream, ev_ag_done[p], 0));
 
-            _build_t1_buf<<<pc.nblocks, pc.threads, 0, computeStream>>>(
-                d_ci0, d_cbuf_large[p], d_t1[p], d_link_nnorb, natomax,
-                prev_strb0, cfg.na, cfg.na, cfg.nnorb, cfg.ntile, prev_ntile2,
+            _build_t1_buf_ue<<<pc.nblocks, pc.threads, 0, computeStream>>>(
+                d_ci0, d_cbuf_large[p], d_t1[p], d_linka_nnorb, d_linkb_nnorb, natomax,
+                prev_strb0, cfg.na, cfg.nb, cfg.nnorb, cfg.ntile, prev_ntile2,
                 amin, amax, cfg.na_self, pc.nab, pc.mode, cfg.rank);
             CUDA_CHECK(cudaGetLastError());
 
@@ -1455,20 +1564,20 @@ void contract_2e_spin1_gpu_buf_overlap(
             CUDA_CHECK(cudaMemsetAsync(d_cbuf_large[p], 0,
                                        pc.recvlarge * sizeof(double), computeStream));
 
-            _gather_buf<<<pc.nblocks, pc.threads, 0, computeStream>>>(
+            _gather_buf_ue<<<pc.nblocks, pc.threads, 0, computeStream>>>(
                 d_ci1, d_ci1_buf[p], d_cbuf_large[p], d_vt1[p],
-                d_clink, natomax,
-                prev_strb0, cfg.na, cfg.na, cfg.nnorb, cfg.ntile, prev_ntile2,
-                pc.nab, cfg.nlinka, amin, amax, cfg.na_self, pc.mode, cfg.rank);
+                d_clinka, d_clinkb, natomax,
+                prev_strb0, cfg.na, cfg.nb, cfg.nnorb, cfg.ntile, prev_ntile2,
+                pc.nab, cfg.nlinka, cfg.nlinkb, amin, amax, cfg.na_self, pc.mode, cfg.rank);
             CUDA_CHECK(cudaGetLastError());
 
             NCCL_CHECK(ncclReduceScatter(
                 d_cbuf_large[p], d_cbuf_local[p],
                 pc.sendcount, ncclDouble, ncclSum, ncclComm, computeStream));
 
-            _add_to_c_option<<<pc.nblocks, pc.threads, 0, computeStream>>>(
+            _add_to_c_option_ue<<<pc.nblocks, pc.threads, 0, computeStream>>>(
                 d_ci1_buf[p], d_cbuf_local[p], d_ci1,
-                prev_strb0, cfg.ntile, prev_ntile2, cfg.na,
+                prev_strb0, cfg.ntile, prev_ntile2, cfg.nb,
                 amin, amax, cfg.na_self, pc.na_max, cfg.nprocs, cfg.rank);
             CUDA_CHECK(cudaEventRecord(ev_rs_done[p], computeStream));
             CUDA_CHECK(cudaGetLastError());
@@ -1481,16 +1590,16 @@ void contract_2e_spin1_gpu_buf_overlap(
     {
         const int     p           = (pc.ntiles - 1) & 1;
         const int32_t prev_strb0  = (pc.ntiles - 1) * cfg.ntile;
-        const int32_t prev_ntile2 = (cfg.na - prev_strb0 < cfg.ntile)
-                                    ? (cfg.na - prev_strb0) : cfg.ntile;
+        const int32_t prev_ntile2 = (cfg.nb - prev_strb0 < cfg.ntile)
+                                    ? (cfg.nb - prev_strb0) : cfg.ntile;
         const int32_t amin        = cfg.starts_na[cfg.rank];
         const int32_t amax        = cfg.ends_na[cfg.rank];
 
         CUDA_CHECK(cudaStreamWaitEvent(computeStream, ev_ag_done[p], 0));
 
-        _build_t1_buf<<<pc.nblocks, pc.threads, 0, computeStream>>>(
-            d_ci0, d_cbuf_large[p], d_t1[p], d_link_nnorb, natomax,
-            prev_strb0, cfg.na, cfg.na, cfg.nnorb, cfg.ntile, prev_ntile2,
+        _build_t1_buf_ue<<<pc.nblocks, pc.threads, 0, computeStream>>>(
+            d_ci0, d_cbuf_large[p], d_t1[p], d_linka_nnorb, d_linkb_nnorb, natomax,
+            prev_strb0, cfg.na, cfg.nb, cfg.nnorb, cfg.ntile, prev_ntile2,
             amin, amax, cfg.na_self, pc.nab, pc.mode, cfg.rank);
         CUDA_CHECK(cudaGetLastError());
 
@@ -1502,11 +1611,11 @@ void contract_2e_spin1_gpu_buf_overlap(
         CUDA_CHECK(cudaMemsetAsync(d_cbuf_large[p], 0,
                                    pc.recvlarge * sizeof(double), computeStream));
 
-        _gather_buf<<<pc.nblocks, pc.threads, 0, computeStream>>>(
+        _gather_buf_ue<<<pc.nblocks, pc.threads, 0, computeStream>>>(
             d_ci1, d_ci1_buf[p], d_cbuf_large[p], d_vt1[p],
-            d_clink, natomax,
-            prev_strb0, cfg.na, cfg.na, cfg.nnorb, cfg.ntile, prev_ntile2,
-            pc.nab, cfg.nlinka, amin, amax, cfg.na_self, pc.mode, cfg.rank);
+            d_clinka, d_clinkb, natomax,
+            prev_strb0, cfg.na, cfg.nb, cfg.nnorb, cfg.ntile, prev_ntile2,
+            pc.nab, cfg.nlinka, cfg.nlinkb, amin, amax, cfg.na_self, pc.mode, cfg.rank);
         CUDA_CHECK(cudaGetLastError());
 
         NCCL_CHECK(ncclReduceScatter(
@@ -1514,9 +1623,9 @@ void contract_2e_spin1_gpu_buf_overlap(
             pc.sendcount, ncclDouble, ncclSum, ncclComm, computeStream));
 
     
-        _add_to_c_option<<<pc.nblocks, pc.threads, 0, computeStream>>>(
+        _add_to_c_option_ue<<<pc.nblocks, pc.threads, 0, computeStream>>>(
             d_ci1_buf[p], d_cbuf_local[p], d_ci1,
-            prev_strb0, cfg.ntile, prev_ntile2, cfg.na,
+            prev_strb0, cfg.ntile, prev_ntile2, cfg.nb,
             amin, amax, cfg.na_self, pc.na_max, cfg.nprocs, cfg.rank);
         CUDA_CHECK(cudaEventRecord(ev_rs_done[p], computeStream));
         CUDA_CHECK(cudaGetLastError());
@@ -1533,7 +1642,7 @@ cleanup:
 }
 
 
-__global__ void normalize_kernel(double* __restrict__ ci0, size_t np,
+__global__ void normalize_kernel_ue(double* __restrict__ ci0, size_t np,
                                  const double* __restrict__ d_inner,
                                  double lindep)
 {
@@ -1556,7 +1665,7 @@ __global__ void normalize_kernel(double* __restrict__ ci0, size_t np,
 
 
 __global__
-void _convertids(int32_t *natomax, int32_t *starts_aid, int32_t*ends_aid, int32_t na, int32_t na_max_total, int32_t na_max_node, int rank)
+void _convertids_ue(int32_t *natomax, int32_t *starts_aid, int32_t*ends_aid, int32_t na, int32_t na_max_total, int32_t na_max_node, int rank)
 {
     int32_t thread_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (thread_id >= na_max_total) return;
@@ -1581,7 +1690,7 @@ void _convertids(int32_t *natomax, int32_t *starts_aid, int32_t*ends_aid, int32_
     } 
 }
 
-__global__ void dr_kernel_safe(
+__global__ void dr_kernel_safe_ue(
     const double* __restrict__ ci0,
     const double* __restrict__ ci1,
     double* __restrict__ r,
@@ -1597,7 +1706,7 @@ __global__ void dr_kernel_safe(
 }
 
 
-__global__ void jkcopy_kernel(
+__global__ void jkcopy_kernel_ue(
     double *d_Gmo, double *d_jdiag, 
     double *d_kdiag, int32_t norb, 
     int32_t norb_sq, int32_t norb_t)
@@ -1616,7 +1725,7 @@ __global__ void jkcopy_kernel(
 // ================================================================
 // Davidson eigenvalue solver
 // ================================================================
-void davidson(
+void davidson_ue(
     // CI vector storage
     double  *d_ci0_list, double *d_ci1_list,
     double  *h_ci0_list, double *h_ci1_list,
@@ -1624,7 +1733,8 @@ void davidson(
     // Integrals and link indices
     double  *eri,
     double  *d_hdiag,    double *hdiag,
-    int32_t *d_link_index, int32_t *d_link_nnorb,
+    int32_t *d_linka_index, int32_t *d_linka_nnorb,
+    int32_t *d_linkb_index, int32_t *d_linkb_nnorb,
     // Output
     double  *e,          double *e_check,
     // Work arrays
@@ -1644,7 +1754,7 @@ void davidson(
     if (cfg.debug_mode > 1) clock_gettime(CLOCK_MONOTONIC, &ts_begin);
 
     // ========== CONSTANTS ==========
-    const size_t  mynp        = (size_t)cfg.na_self * (size_t)cfg.na;
+    const size_t  mynp        = (size_t)cfg.na_self * (size_t)cfg.nb;
     const double  lindep      = 1e-10;
     const double  level_shift = 1e-3;
     const double  toloose     = sqrt(cfg.tol) / 100.0;
@@ -1661,10 +1771,10 @@ void davidson(
     pc.na_max      = cfg.counts_na[0];
     pc.nab         = cfg.na_self * cfg.ntile;
     pc.mode        = cfg.na % cfg.nprocs;
-    pc.ntiles      = (cfg.na + cfg.ntile - 1) / cfg.ntile;
+    pc.ntiles      = (cfg.nb + cfg.ntile - 1) / cfg.ntile;
     pc.sendcount   = (size_t)pc.na_max * cfg.ntile;
     pc.recvlarge   = pc.sendcount * cfg.nprocs;
-    pc.base_size   = (size_t)cfg.na_self * cfg.na * sizeof(double);
+    pc.base_size   = (size_t)cfg.na_self * cfg.nb * sizeof(double);
     pc.nblocks_buf = ((size_t)pc.na_max * cfg.ntile + nthread - 1) / nthread;
     pc.nblocks     = ((size_t)cfg.na_self * cfg.ntile + nthread - 1) / nthread;
     pc.threads     = nthread;
@@ -1673,7 +1783,7 @@ void davidson(
     int    space = 0, conv = 0, reset_state = 0, conv_last = 0;
     double dx_norm = 0.0, de = 0.0, e_last = 0.0;
 
-    bool overlap_state = false; // Use overlap pipeline or not (overlap_state = true enables overlap)
+    bool overlap_state = true; // Use overlap pipeline or not (overlap_state = true enables overlap)
     
 
     // ========== DOT PRODUCT SETUP ==========
@@ -1763,7 +1873,7 @@ void davidson(
 
         const int nblock_conv = (na_max_total + min(nthread, na_max) - 1)
                                 / min(nthread, na_max);
-        _convertids<<<nblock_conv, min(nthread, na_max), 0, computeStream>>>(
+        _convertids_ue<<<nblock_conv, min(nthread, na_max), 0, computeStream>>>(
             natomax, d_starta, d_enda,
             cfg.na, na_max_total, na_max, cfg.rank);
         CUDA_CHECK(cudaGetLastError());
@@ -1781,7 +1891,7 @@ void davidson(
     CUSOLVER_CHECK(cusolverDnSetStream(cusolverH, computeStream));
 
     // ========== INITIAL NORMALIZATION ==========
-    dot_func(d_partial, h_partial, d_ci0, d_ci0, d_inner_local,
+    dot_func_ue(d_partial, h_partial, d_ci0, d_ci0, d_inner_local,
              mynp, blocks_dot, cfg.rank, computeStream);
     if (cfg.nprocs > 1) {
         NCCL_CHECK(ncclAllReduce(d_inner_local, d_inner_global, 1,
@@ -1790,7 +1900,7 @@ void davidson(
         CUDA_CHECK(cudaMemcpyAsync(d_inner_global, d_inner_local, sizeof(double),
                                    cudaMemcpyDeviceToDevice, computeStream));
     }
-    normalize_kernel<<<nblock_small, nthread, 0, computeStream>>>(
+    normalize_kernel_ue<<<nblock_small, nthread, 0, computeStream>>>(
         d_ci0, mynp, d_inner_global, lindep);
     CUDA_CHECK(cudaGetLastError());
     
@@ -1811,25 +1921,27 @@ void davidson(
         if (reset_state == 1) {
             if (cfg.rank == 0 && cfg.debug_mode > 0) printf("reset state\n");
         } else if (cfg.nprocs > 1 && overlap_state) {
-            contract_2e_spin1_gpu_buf_overlap(
+            contract_2e_spin1_gpu_buf_overlap_ue(
                 handle, eri, dl_t1, dl_vt1,                 
-                d_link_index, d_link_nnorb,
+                d_linka_index, d_linka_nnorb,
+                d_linkb_index, d_linkb_nnorb,
                 d_ci1_buf, d_cbuf_local, d_cbuf_large,
                 d_ci0, d_ci1, natomax, 
                 cfg, pc, computeStream, commStream, ncclComm);
         } else if (cfg.nprocs > 1) {
-            contract_2e_spin1_gpu_buf(
+            contract_2e_spin1_gpu_buf_ue(
                 handle, eri, dl_t1[0], dl_vt1[0],
-                d_link_index, d_link_nnorb, 
+                d_linka_index, d_linka_nnorb, 
+                d_linkb_index, d_linkb_nnorb,
                 d_ci1_buf[0], d_cbuf_local[0], d_cbuf_large[0], 
                 d_ci0, d_ci1, natomax,
                 cfg, pc, computeStream, ncclComm);
         }
         else {
-            contract_2e_spin1_gpu(
+            contract_2e_spin1_gpu_ue(
                 handle, eri, d_ci0, d_ci1, dl_t1[0], dl_vt1[0],
-                cfg.norb, cfg.na, cfg.na, cfg.nlinka, 
-                d_link_index, d_link_nnorb, cfg.na_self, 
+                cfg.norb, cfg.na, cfg.nb, cfg.nlinka, cfg.nlinkb,
+                d_linka_index, d_linka_nnorb, d_linkb_index, d_linkb_nnorb, cfg.na_self, 
                 cfg.ntile, cfg.debug_mode, computeStream);
         }
 
@@ -1861,7 +1973,7 @@ void davidson(
 
         // --- Effective Hamiltonian ---
         
-        fill_heff_hermitian_gpu_fast(
+        fill_heff_hermitian_gpu_fast_ue(
             handle, ncclComm, computeStream,
             d_heff_tmp, d_heff, d_ci0, d_ci1,
             d_ci1_list, h_ci1_list, d_tmp,
@@ -1879,7 +1991,7 @@ void davidson(
         e_last    = e[0];
         conv_last = conv;
         if (cfg.debug_mode > 1) clock_gettime(CLOCK_MONOTONIC, &t1);
-        computeEigenvaluesAndVectorsn(cusolverH, space, d_heff, e, v, devInfo, d_W);
+        computeEigenvaluesAndVectorsn_ue(cusolverH, space, d_heff, e, v, devInfo, d_W);
         if (cfg.debug_mode > 1) {
             CUDA_CHECK(cudaStreamSynchronize(computeStream));
             clock_gettime(CLOCK_MONOTONIC, &t2);
@@ -1893,10 +2005,10 @@ void davidson(
         // --- Generate new trial vector ---
         if (cfg.debug_mode > 1) clock_gettime(CLOCK_MONOTONIC, &t1);
         if (cfg.in_cpu == 1) {
-            gen_x0_gpu_incpu(v, h_ci0_list, d_ci0, d_tmp, space, mynp, computeStream);
-            gen_x0_gpu_incpu(v, h_ci1_list, d_ci1, d_tmp, space, mynp, computeStream);
+            gen_x0_gpu_incpu_ue(v, h_ci0_list, d_ci0, d_tmp, space, mynp, computeStream);
+            gen_x0_gpu_incpu_ue(v, h_ci1_list, d_ci1, d_tmp, space, mynp, computeStream);
         } else {
-            gen_x0_gpu(v, d_ci0_list, d_ci1_list, d_ci0, d_ci1,
+            gen_x0_gpu_ue(v, d_ci0_list, d_ci1_list, d_ci0, d_ci1,
                        space, mynp, computeStream);
         }
         
@@ -1937,10 +2049,10 @@ void davidson(
                 }
                 space = 0; reset_state = 1; continue;
             }
-            dr_kernel_safe<<<nblock_small, nthread, 0, computeStream>>>(
+            dr_kernel_safe_ue<<<nblock_small, nthread, 0, computeStream>>>(
                 d_ci0, d_ci1, d_tmp, e[0], mynp);
             CUDA_CHECK(cudaGetLastError());
-            dot_func(d_partial, h_partial, d_tmp, d_tmp, d_inner_local,
+            dot_func_ue(d_partial, h_partial, d_tmp, d_tmp, d_inner_local,
                      mynp, blocks_dot, cfg.rank, computeStream);
             allreduce_to_host();
             dx_norm = sqrt(fabs(h_single[0]));
@@ -1953,10 +2065,10 @@ void davidson(
 
         // --- Residual ---
         
-        dr_kernel_safe<<<nblock_small, nthread, 0, computeStream>>>(
+        dr_kernel_safe_ue<<<nblock_small, nthread, 0, computeStream>>>(
             d_ci0, d_ci1, d_ci0, e[0], mynp);
         CUDA_CHECK(cudaGetLastError());
-        dot_func(d_partial, h_partial, d_ci0, d_ci0, d_inner_local,
+        dot_func_ue(d_partial, h_partial, d_ci0, d_ci0, d_inner_local,
                  mynp, blocks_dot, cfg.rank, computeStream);
         allreduce_to_host();
         dx_norm = sqrt(fabs(h_single[0]));
@@ -1968,19 +2080,19 @@ void davidson(
             if (cfg.in_cpu == 1) {
                 CUDA_CHECK(cudaMemcpyAsync(d_tmp, hdiag, mynp * sizeof(double),
                                            cudaMemcpyHostToDevice, computeStream));
-                precond_kernel<<<nblock_small, nthread, 0, computeStream>>>(
+                precond_kernel_ue<<<nblock_small, nthread, 0, computeStream>>>(
                     d_tmp, d_ci0, e[0], level_shift, mynp);
             } else {
-                precond_kernel<<<nblock_small, nthread, 0, computeStream>>>(
+                precond_kernel_ue<<<nblock_small, nthread, 0, computeStream>>>(
                     d_hdiag, d_ci0, e[0], level_shift, mynp);
             }
             CUDA_CHECK(cudaGetLastError());
-            dot_func(d_partial, h_partial, d_ci0, d_ci0, d_inner_local,
+            dot_func_ue(d_partial, h_partial, d_ci0, d_ci0, d_inner_local,
                      mynp, blocks_dot, cfg.rank, computeStream);
             allreduce_to_host();
             if (h_single[0] > 0.0) {
                 const double tmpk = pow(h_single[0], -0.5);
-                Dscal_kernel<<<nblock_small, nthread, 0, computeStream>>>(
+                Dscal_kernel_ue<<<nblock_small, nthread, 0, computeStream>>>(
                     d_ci0, d_ci0, tmpk, mynp);
                 CUDA_CHECK(cudaGetLastError());
             }
@@ -1992,13 +2104,13 @@ void davidson(
 
         // --- Orthogonalization ---
         if (cfg.in_cpu == 1) {
-            normalize_xt_gpu_large(
+            normalize_xt_gpu_large_ue(
                 handle, d_ci0, h_ci0_list, d_tmp, lindep, 1.0,
                 space, cfg.np, cfg.nprocs, ncclComm, cfg.rank, mynp,
                 d_inner_local, d_inner_global, h_single, cfg.in_cpu,
                 blocks_dot, d_partial, h_partial, computeStream);
         } else {
-            normalize_xt_gpu(
+            normalize_xt_gpu_ue(
                 handle, d_ci0, d_ci0_list, d_tmp, lindep, 1.0,
                 space, cfg.np, cfg.nprocs, ncclComm, cfg.rank, mynp,
                 d_inner_local, d_inner_global, cfg.in_cpu, computeStream);
@@ -2094,10 +2206,10 @@ cleanup:
 
 
 
-extern "C" void fci(
+extern "C" void fci_unequal_elec(
     double  *h_Gmo1e,    double  *h_Gmo,       double  *e_value,
-    int32_t *occslst,    int32_t  na,          int32_t  norb,
-    int32_t  neleca,     int      max_space,   int      max_cycle, 
+    int32_t *occslsta,   int32_t *occslstb,   int32_t  na,         int32_t  nb,  int32_t  norb,
+    int32_t  neleca,     int32_t  nelecb,     int      max_space,   int      max_cycle, 
     int      in_cpu,     int      tile,        int      debug_mode,  
     double   tol,        double   E_rhf)
 {
@@ -2150,7 +2262,7 @@ extern "C" void fci(
 
     const int32_t na_ave = na / nprocs;
     const int32_t na_res = na % nprocs;
-    const int32_t nelec  = neleca * 2;      
+    const int32_t nelec  = neleca + nelecb;      
 
     int32_t *counts_na = (int32_t*)malloc(nprocs * sizeof(int32_t));
     int32_t *starts_na = (int32_t*)malloc(nprocs * sizeof(int32_t));
@@ -2169,8 +2281,8 @@ extern "C" void fci(
 
     const int32_t amin   = starts_na[rank];
     const int32_t my_na  = counts_na[rank];
-    const size_t  np     = (size_t)na    * (size_t)na;
-    const size_t  mynp   = (size_t)my_na * (size_t)na;
+    const size_t  np     = (size_t)na    * (size_t)nb;
+    const size_t  mynp   = (size_t)my_na * (size_t)nb;
 
     const size_t norb_sq = (size_t)norb * norb;
     const size_t norb_t  = norb_sq * norb;
@@ -2179,11 +2291,15 @@ extern "C" void fci(
     const int     heff_size  = max_space + nroots;
     const int32_t nnorb      = norb * (norb + 1) / 2;
     const int32_t nlinka     = neleca + neleca * (norb - neleca);
-    const int32_t chunk      = (na > tile) ? tile : na;
+    const int32_t nlinkb     = nelecb + nelecb * (norb - nelecb);
+    const int32_t chunk      = (nb > tile) ? tile : nb;
 
-    const size_t link_size   = (size_t)nlinka * (size_t)na * 3     * sizeof(int32_t);
-    const size_t linknn_size = (size_t)na     * (size_t)nnorb * 2  * sizeof(int32_t);
-    const size_t occs_size   = (size_t)na     * neleca              * sizeof(int32_t);
+    const size_t linka_size   = (size_t)nlinka * (size_t)na * 3     * sizeof(int32_t);
+    const size_t linknna_size = (size_t)na     * (size_t)nnorb * 2  * sizeof(int32_t);
+    const size_t linkb_size   = (size_t)nlinkb * (size_t)nb * 3     * sizeof(int32_t);
+    const size_t linknnb_size = (size_t)nb     * (size_t)nnorb * 2  * sizeof(int32_t);
+    const size_t occsa_size   = (size_t)na     * neleca              * sizeof(int32_t);
+    const size_t occsb_size   = (size_t)nb     * nelecb              * sizeof(int32_t);
     const size_t base_size   = mynp                                 * sizeof(double);
     const size_t list_size   = (size_t)max_space * mynp             * sizeof(double);
 
@@ -2202,7 +2318,8 @@ extern "C" void fci(
     double  *d_ci1       = NULL, *e           = NULL;
     double  *d_tmp       = NULL, *d_ci0_list  = NULL, *d_ci1_list = NULL;
     double  *h_ci0_list  = NULL, *h_ci1_list  = NULL, *hdiag      = NULL;
-    int32_t *d_clink     = NULL, *d_link_nnorb = NULL, *d_occslst = NULL;
+    int32_t *d_clinka    = NULL, *d_linka_nnorb = NULL, *d_occslsta = NULL;
+    int32_t *d_clinkb    = NULL, *d_linkb_nnorb = NULL, *d_occslstb = NULL;
     cudaEvent_t occs_ready;
 
     e = (double*)calloc(heff_size, sizeof(double));
@@ -2211,9 +2328,12 @@ extern "C" void fci(
         goto cleanup;
     }
 
-    CUDA_CHECK(cudaMalloc((void**)&d_occslst,   occs_size));
-    CUDA_CHECK(cudaMalloc((void**)&d_clink,     link_size));
-    CUDA_CHECK(cudaMalloc((void**)&d_link_nnorb, linknn_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_occslsta,   occsa_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_occslstb,   occsb_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_clinka,     linka_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_clinkb,     linkb_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_linka_nnorb, linknna_size));
+    CUDA_CHECK(cudaMalloc((void**)&d_linkb_nnorb, linknnb_size));
     CUDA_CHECK(cudaMalloc((void**)&d_Gmo,       norb4   * sizeof(double)));
     CUDA_CHECK(cudaMalloc((void**)&d_jdiag,     norb_sq * sizeof(double)));
     CUDA_CHECK(cudaMalloc((void**)&d_kdiag,     norb_sq * sizeof(double)));
@@ -2257,7 +2377,8 @@ extern "C" void fci(
     }
 
     CUDA_CHECK(cudaEventCreate(&occs_ready));
-    CUDA_CHECK(cudaMemcpyAsync(d_occslst, occslst, occs_size, cudaMemcpyHostToDevice, transferStream));
+    CUDA_CHECK(cudaMemcpyAsync(d_occslsta, occslsta, occsa_size, cudaMemcpyHostToDevice, transferStream));
+    CUDA_CHECK(cudaMemcpyAsync(d_occslstb, occslstb, occsb_size, cudaMemcpyHostToDevice, transferStream));
 
     // Timing: MPI init + GPU alloc + data transfer
     if (debug_mode > 1) {
@@ -2274,7 +2395,7 @@ extern "C" void fci(
 
     CUDA_CHECK(cudaEventRecord(occs_ready, transferStream));
     CUDA_CHECK(cudaStreamWaitEvent(computeStream, occs_ready, 0));
-    jkcopy_kernel<<<norb_sq, 1, 0, computeStream>>>(d_Gmo, d_jdiag, d_kdiag, norb, norb_sq, norb_t);
+    jkcopy_kernel_ue<<<norb_sq, 1, 0, computeStream>>>(d_Gmo, d_jdiag, d_kdiag, norb, norb_sq, norb_t);
     CUDA_CHECK(cudaGetLastError());
 
     // =========================================================
@@ -2283,45 +2404,49 @@ extern "C" void fci(
     //if (debug_mode > 1 && rank == 0) printf("==> Starting: Compute Hamiltonian diagonal\n");
 
     if (in_cpu == 1) {
-        FCImake_hdiag_uhf_part_kernel_large<<<large_blocks, nthread, 0, computeStream>>>(
-            d_tmp, mynp, d_Gmo1e, d_jdiag, d_kdiag, norb, my_na, na, amin, neleca, d_occslst, rank);
+        // FCImake_hdiag_uhf_part_kernel_large_ue<<<large_blocks, nthread, 0, computeStream>>>(
+        //     d_tmp, mynp, d_Gmo1e, d_jdiag, d_kdiag, norb, my_na, na, amin, neleca, d_occslsta, rank);
+        FCImake_hdiag_uhf_part_kernel_large_diff_elec<<<large_blocks, nthread, 0, computeStream>>>(
+            d_tmp, mynp, d_Gmo1e, d_jdiag, d_kdiag, norb, my_na,  nb, amin, neleca, nelecb, d_occslsta, d_occslstb, rank);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaMemcpyAsync(hdiag, d_tmp, base_size, cudaMemcpyDeviceToHost, computeStream));
     } else {
-        FCImake_hdiag_uhf_part_kernel_large<<<large_blocks, nthread, 0, computeStream>>>(
-            d_hdiag, mynp, d_Gmo1e, d_jdiag, d_kdiag, norb, my_na, na, amin, neleca, d_occslst, rank);
+        FCImake_hdiag_uhf_part_kernel_large_diff_elec<<<large_blocks, nthread, 0, computeStream>>>(
+            d_hdiag, mynp, d_Gmo1e, d_jdiag, d_kdiag, norb, my_na,  nb, amin, neleca, nelecb, d_occslsta, d_occslstb, rank);
         CUDA_CHECK(cudaGetLastError());
     }
-
-   
-
-   
 
     // =========================================================
     // Generate link indices and 2e integrals
     // =========================================================
     //if (debug_mode > 1 && rank == 0) printf("==> Starting: Generate link indices and process 2e integrals\n");
 
-    absorb_h1e(d_Gmo1e, d_Gmo, d_eri, norb, nelec, nnorb, 0.5);
+    absorb_h1e_ue(d_Gmo1e, d_Gmo, d_eri, norb, nelec, nnorb, 0.5);
 
-    if (nprocs > 1) {
-        CUDA_CHECK(cudaMemset(d_clink,      0, link_size));
-        CUDA_CHECK(cudaMemset(d_link_nnorb, 0, linknn_size));
-        gen_linkstr_index(neleca, norb, my_na, amin, na, d_occslst, d_clink, d_link_nnorb);
-        NCCL_CHECK(ncclGroupStart());
-        NCCL_CHECK(ncclBcast(d_eri,        nnorb * nnorb,                   ncclDouble, 0,      ncclComm, computeStream));
-        NCCL_CHECK(ncclAllReduce(d_clink,      d_clink,      (size_t)nlinka * (size_t)na * 3,    ncclInt32, ncclSum, ncclComm, computeStream));
-        NCCL_CHECK(ncclAllReduce(d_link_nnorb, d_link_nnorb, (size_t)na     * (size_t)nnorb * 2, ncclInt32, ncclSum, ncclComm, computeStream));
-        CUDA_CHECK(cudaStreamSynchronize(computeStream));
-        NCCL_CHECK(ncclGroupEnd());
-    } else {
-        gen_linkstr_index(neleca, norb, na, 0, na, d_occslst, d_clink, d_link_nnorb);
-    }
+    // if (nprocs > 1) {
+    //     CUDA_CHECK(cudaMemset(d_clinka,      0, linka_size));
+    //     CUDA_CHECK(cudaMemset(d_clinkb,      0, linkb_size));
+    //     CUDA_CHECK(cudaMemset(d_linka_nnorb, 0, linknna_size));
+    //     CUDA_CHECK(cudaMemset(d_linkb_nnorb, 0, linknnb_size));
+    //     gen_linkstr_index_ue(neleca, norb, my_na, amin, na, d_occslsta, d_clinka, d_linka_nnorb);
+    //     NCCL_CHECK(ncclGroupStart());
+    //     NCCL_CHECK(ncclBcast(d_eri,        nnorb * nnorb,                   ncclDouble, 0,      ncclComm, computeStream));
+    //     NCCL_CHECK(ncclAllReduce(d_clinka,      d_clinka,      (size_t)nlinka * (size_t)na * 3,    ncclInt32, ncclSum, ncclComm, computeStream));
+    //     NCCL_CHECK(ncclAllReduce(d_linka_nnorb, d_linka_nnorb, (size_t)na     * (size_t)nnorb * 2, ncclInt32, ncclSum, ncclComm, computeStream));
+    //     CUDA_CHECK(cudaStreamSynchronize(computeStream));
+    //     NCCL_CHECK(ncclGroupEnd());
+    // } else {
+    //     gen_linkstr_index_ue(neleca, norb, na, 0, na, d_occslsta, d_clinka, d_linka_nnorb);
 
+        
+    // }
+    gen_linkstr_index_ue(neleca, norb, na, 0, na, d_occslsta, d_clinka, d_linka_nnorb);
+    gen_linkstr_index_ue(nelecb, norb, nb, 0, nb, d_occslstb, d_clinkb, d_linkb_nnorb);
     // Free temporary GPU memory early
     CUDA_CHECK(cudaFree(d_jdiag));   d_jdiag   = NULL;
     CUDA_CHECK(cudaFree(d_kdiag));   d_kdiag   = NULL;
-    CUDA_CHECK(cudaFree(d_occslst)); d_occslst = NULL;
+    CUDA_CHECK(cudaFree(d_occslsta)); d_occslsta = NULL;
+    CUDA_CHECK(cudaFree(d_occslstb)); d_occslstb = NULL;
     CUDA_CHECK(cudaFree(d_Gmo1e));   d_Gmo1e   = NULL;
     CUDA_CHECK(cudaFree(d_Gmo));     d_Gmo     = NULL;
 
@@ -2342,10 +2467,9 @@ extern "C" void fci(
         CUDA_CHECK(cudaMemset(d_ci0, 0, base_size));
         const double firstv =  1.0 + 1e-5;
         const double lastv  =  0.0 - 1e-5;
-        //const double midv    =  1;
+
         if (rank == 0) {
             CUDA_CHECK(cudaMemcpy(&d_ci0[0],      &firstv, sizeof(double), cudaMemcpyHostToDevice));
-            //CUDA_CHECK(cudaMemcpy(&d_ci0[6*na+1],      &midv, sizeof(double), cudaMemcpyHostToDevice));
         }
         if (rank == nprocs - 1) {
             CUDA_CHECK(cudaMemcpy(&d_ci0[mynp-1], &lastv,  sizeof(double), cudaMemcpyHostToDevice));
@@ -2359,9 +2483,10 @@ extern "C" void fci(
         SolverConfig cfg;
         cfg.na         = na;
         cfg.na_self    = my_na;
+        cfg.nb         = nb;
         cfg.norb       = norb;
-        cfg.nelec      = neleca;
         cfg.nlinka     = nlinka;
+        cfg.nlinkb     = nlinkb;
         cfg.nnorb      = nnorb;
         cfg.ntile      = chunk;
         cfg.np         = np;
@@ -2381,10 +2506,10 @@ extern "C" void fci(
 
         // commStream は davidson 内で自動的に作成・破棄される
 
-        davidson(
+        davidson_ue(
             d_ci0_list, d_ci1_list, h_ci0_list, h_ci1_list,
             d_ci0, d_ci1, d_eri, d_hdiag, hdiag,
-            d_clink, d_link_nnorb, e, e_value, d_tmp, d_heff, d_heff_tmp,
+            d_clinka, d_linka_nnorb, d_clinkb, d_linkb_nnorb, e, e_value, d_tmp, d_heff, d_heff_tmp,
             cfg, ncclComm, computeStream);
 
         e_value[0] = e[0] + E_rhf;
@@ -2443,14 +2568,17 @@ cleanup:
     safe_free_dev((void*&)d_ci0);
     safe_free_dev((void*&)d_ci1);
     safe_free_dev((void*&)d_tmp);
-    safe_free_dev((void*&)d_link_nnorb);
-    safe_free_dev((void*&)d_clink);
+    safe_free_dev((void*&)d_linka_nnorb);
+    safe_free_dev((void*&)d_linkb_nnorb);
+    safe_free_dev((void*&)d_clinka);
+    safe_free_dev((void*&)d_clinkb);
     safe_free_dev((void*&)d_eri);
     safe_free_dev((void*&)d_jdiag);
     safe_free_dev((void*&)d_kdiag);
     safe_free_dev((void*&)d_Gmo1e);
     safe_free_dev((void*&)d_Gmo);
-    safe_free_dev((void*&)d_occslst);
+    safe_free_dev((void*&)d_occslsta);
+    safe_free_dev((void*&)d_occslstb);
 
     if (in_cpu == 0) {
         safe_free_dev((void*&)d_ci0_list);
