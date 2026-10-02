@@ -31,7 +31,7 @@ extern void fci_unequal_elec(double *h_Gmo1e, double *h_Gmo, double *e,
 
 void fci_result_unequal_elec(double *h_Gmo1e, double *h_Gmo, double *e,
                 int32_t *occslsta, int32_t *occslstb, int32_t na, int32_t nb, int32_t norb,
-                int32_t neleca, int nelecb, int max_space, int max_cycle,
+                int32_t neleca, int32_t nelecb, int max_space, int max_cycle,
                 int in_cpu, int tile, int debug_mode, 
                 double tol, double E_rhf)
 {
