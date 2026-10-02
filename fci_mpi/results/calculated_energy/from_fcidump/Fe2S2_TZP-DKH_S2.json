@@ -1,0 +1,21 @@
+{
+    "nelec": 30,
+    "neleca": 17,
+    "nelecb": 13,
+    "norb": 20,
+    "na": 1140,
+    "nb": 77520,
+    "nstr": 88372800,
+    "nprocs": 1,
+    "use_cpu_memory": false,
+    "chunksize": 512,
+    "max_space": 12,
+    "device": "NVIDIA H200",
+    "ecore": 0.0,
+    "e_HF": NaN,
+    "e_FCI": -116.60134020552006,
+    "fci_time": 92.8189046382904,
+    "ss": 6.000000134780419,
+    "mult": 5.000000053912167,
+    "S": 2.0000000269560836
+}

@@ -52,17 +52,9 @@ ${NVCC} -O2 -Xcompiler -fPIC \
         ${INCLUDE} \
         -c fci.cu -o fci.o
 
-echo "=== Compiling fci_unequal_e.cu ==="
-${NVCC} -O2 -Xcompiler -fPIC \
-	${GENCODE} \
-        -rdc=true \
-        ${INCLUDE} \
-        -c fci_unequal_e.cu -o fci_unequal_e.o
-
-
 echo "=== Linking libfci.so ==="
 ${NVCC} -shared ${GENCODE} \
-    fci_contract.o fci.o fci_unequal_e.o \
+    fci_contract.o fci.o \
     -L${CUDA_HOME}/lib64 \
     -L${NCCL_ROOT}/lib -lnccl \
     -L${MPI_LIB} -lmpi \
