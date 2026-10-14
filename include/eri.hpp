@@ -395,7 +395,18 @@ public:
     void precomputation() override;
 
     std::string get_algorithm_name() override { return "Stored"; } ///< Get the algorithm name
-    const real_t* get_eri_matrix_device() const { return eri_matrix_.device_ptr(); }
+
+    /// AO ERI device pointer, or nullptr once the buffer was destructively
+    /// consumed by a post-HF MP3 path. Callers must treat nullptr as
+    /// "no AO ERIs available" instead of reading stale scratch contents.
+    const real_t* get_eri_matrix_device() const { return is_ao_eri_valid() ? eri_matrix_.device_ptr() : nullptr; }
+
+    /// Whether the AO ERI buffer still holds valid AO ERIs.
+    /// Some post-HF paths (UMP3 cascading integral transformation)
+    /// destructively reuse the AO ERI buffer as scratch; afterwards this
+    /// flag is false.
+    bool is_ao_eri_valid() const { return ao_eri_valid_; }
+    void invalidate_ao_eri() { ao_eri_valid_ = false; }
 
     /// Build MO ERI with rectangular C [nao × nmo] support
     real_t* build_mo_eri(const real_t* d_C, int nmo) const override;
@@ -437,6 +448,7 @@ protected:
     const HF& hf_; ///< HF. This excludes MOs.
     const int num_basis_;
     DeviceHostMatrix<real_t> eri_matrix_;
+    bool ao_eri_valid_ = true; ///< false once the AO ERI buffer was destructively reused as scratch
 
     DeviceHostMemory<real_t> schwarz_upper_bound_factors;
 };

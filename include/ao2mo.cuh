@@ -238,6 +238,33 @@ static __global__ void tensorize_x_aaaa_ovov(
 }
 
 
+// Plain (non-amplitude) ovov block: identical layout to tensorize_x_aaaa_ovov
+// but without the epsilon division. Used to harvest the UMP2 energy from the
+// spin_reuse full MO ERI tensor (the compact ovov layout matches the layout
+// expected by compute_ump2_energy_contrib_ss when called with the active-space
+// counts and the frozen-core-shifted epsilon pointer).
+static __global__ void tensorize_g_aaaa_ovov(
+    double* g_g_aaaa_ovov, const double* g_g_aaaa_full,
+    const int num_occ_al, const int num_vir_al)
+{
+    const size_t iajb = ((size_t)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const size_t num_ovov = (size_t)num_occ_al * num_vir_al * num_occ_al * num_vir_al;
+    if (iajb >= num_ovov) {
+        return;
+    }
+    const int num_orbitals = num_occ_al + num_vir_al;
+
+    const int ia = iajb / (num_occ_al * num_vir_al);
+    const int jb = iajb % (num_occ_al * num_vir_al);
+    const int i = ia / num_vir_al;
+    const int a = ia % num_vir_al + num_occ_al;
+    const int j = jb / num_vir_al;
+    const int b = jb % num_vir_al + num_occ_al;
+
+    g_g_aaaa_ovov[ovov2s(i, a, j, b, num_occ_al, num_vir_al)] = g_g_aaaa_full[q2s(i, a, j, b, num_orbitals)];
+}
+
+
 static __global__ void tensorize_y_aaaa_ovov(
     double* g_y_aaaa_ovov, const double* g_g_aaaa_full,
     const double* g_eps_al, const int num_occ_al, const int num_vir_al)
@@ -497,6 +524,31 @@ static __global__ void tensorize_x_aabb_ovov(
     const double eps_ijab = g_eps_al[i] + g_eps_be[j] - g_eps_al[a] - g_eps_be[b];
 
     g_x_aabb_ovov[ovov2s_aabb(i, a, j, b, num_occ_al, num_vir_al, num_occ_be, num_vir_be)] = g_iajb / eps_ijab;
+}
+
+
+// Plain (non-amplitude) aabb ovov block: identical layout to
+// tensorize_x_aabb_ovov but without the epsilon division. Used to harvest the
+// UMP2 opposite-spin energy from the spin_reuse full MO ERI tensor.
+static __global__ void tensorize_g_aabb_ovov(
+    double* g_g_aabb_ovov, const double* g_g_aabb_full,
+    const int num_occ_al, const int num_vir_al,
+    const int num_occ_be, const int num_vir_be, const int num_basis)
+{
+    const size_t iajb = ((size_t)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const size_t num_ovov = (size_t)num_occ_al * num_vir_al * num_occ_be * num_vir_be;
+    if (iajb >= num_ovov) {
+        return;
+    }
+
+    const int ia = iajb / (num_occ_be * num_vir_be);
+    const int jb = iajb % (num_occ_be * num_vir_be);
+    const int i = ia / num_vir_al;
+    const int a = ia % num_vir_al + num_occ_al;
+    const int j = jb / num_vir_be;
+    const int b = jb % num_vir_be + num_occ_be;
+
+    g_g_aabb_ovov[ovov2s_aabb(i, a, j, b, num_occ_al, num_vir_al, num_occ_be, num_vir_be)] = g_g_aabb_full[q2s(i, a, j, b, num_basis)];
 }
 
 
@@ -1268,6 +1320,172 @@ inline void transform_eri_ao2mo_dgemm_ovov_os(
 
     cudaDeviceSynchronize();
     cublasDestroy(cublasH);
+}
+
+// Non-destructive variant of transform_eri_ao2mo_dgemm_ovov.
+// Reads the AO ERIs from d_eri_src without overwriting them (needed when the
+// same AO ERIs are transformed once per spin pattern, e.g., in unrestricted
+// MP2, or must survive for a subsequent post-HF step). Only the first GEMM
+// touches the full M^4 AO tensor; all subsequent ping-pong stages stay within
+// num_occ * N^3 regions, so d_scratch (num_occ * N^3) replaces the M^4 working
+// copy of the destructive variant and the peak memory becomes one M^4 tensor
+// (the AO ERIs themselves) plus two num_occ * N^3 buffers.
+// Returns the pointer holding the compact (ia|jb) block (= d_scratch).
+inline double* transform_eri_ao2mo_dgemm_ovov_keep_ao(
+    const double* d_eri_src, double* d_scratch, double* d_eri_mo,
+    const double* d_coefficient_matrix,
+    const int num_occ, const int num_vir)
+{
+    const size_t num_basis = num_occ + num_vir;
+    const size_t num_basis_2 = num_basis * num_basis;
+    const size_t num_basis_3 = num_basis_2 * num_basis;
+
+    const double alpha = 1.0;
+    const double beta = 0.0;
+    cublasHandle_t cublasH = NULL;
+    cublasCreate(&cublasH);
+
+    dgemm_device_row_major(
+        cublasH,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_occ, num_basis_3, num_basis,
+        &alpha,
+        d_coefficient_matrix, num_basis,
+        d_eri_src, num_basis_3,
+        &beta,
+        d_eri_mo, num_basis_3
+    );
+    dgeam_transpose_row_major(
+        cublasH,
+        num_occ * num_basis,
+        num_basis * num_basis,
+        d_eri_mo,
+        d_scratch);
+    dgemm_device_row_major(
+        cublasH,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_occ, num_basis_2 * num_occ, num_basis,
+        &alpha,
+        d_coefficient_matrix, num_basis,
+        d_scratch, num_basis_2 * num_occ,
+        &beta,
+        d_eri_mo, num_basis_2 * num_occ
+    );
+
+    dgemm_strided_batched_device_row_major(
+        cublasH,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_vir, num_occ * num_basis, num_basis,
+        &alpha,
+        d_coefficient_matrix + num_occ, num_basis, 0,
+        d_eri_mo, num_occ * num_basis, num_basis_2 * num_occ,
+        &beta,
+        d_scratch, num_occ * num_basis, num_vir * num_occ * num_basis,
+        num_occ
+    );
+    dgeam_transpose_row_major(
+        cublasH,
+        num_occ * num_vir,
+        num_occ * num_basis,
+        d_scratch,
+        d_eri_mo);
+    dgemm_strided_batched_device_row_major(
+        cublasH,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_vir, num_occ * num_vir, num_basis,
+        &alpha,
+        d_coefficient_matrix + num_occ, num_basis, 0,
+        d_eri_mo, num_occ * num_vir, num_basis * num_occ * num_vir,
+        &beta,
+        d_scratch, num_occ * num_vir, num_vir * num_occ * num_vir,
+        num_occ
+    );
+
+    cudaDeviceSynchronize();
+    cublasDestroy(cublasH);
+    return d_scratch;
+}
+
+// Non-destructive variant of transform_eri_ao2mo_dgemm_ovov_os (opposite spin).
+// Same buffer contract as transform_eri_ao2mo_dgemm_ovov_keep_ao: the AO ERIs
+// are only read, and both d_scratch and d_eri_mo are max(num_occ_al,
+// num_occ_be) * N^3 buffers. Returns the pointer holding the compact
+// (i_alpha a_alpha | j_beta b_beta) block (= d_scratch).
+inline double* transform_eri_ao2mo_dgemm_ovov_os_keep_ao(
+    const double* d_eri_src, double* d_scratch, double* d_eri_mo,
+    const double* d_coefficient_matrix_al,
+    const double* d_coefficient_matrix_be,
+    const int num_occ_al, const int num_vir_al,
+    const int num_occ_be, const int num_vir_be)
+{
+    const size_t num_basis = num_occ_al + num_vir_al;
+    const size_t num_basis_2 = num_basis * num_basis;
+    const size_t num_basis_3 = num_basis_2 * num_basis;
+
+    const double alpha = 1.0;
+    const double beta = 0.0;
+    cublasHandle_t cublasH = NULL;
+    cublasCreate(&cublasH);
+
+    dgemm_device_row_major(
+        cublasH,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_occ_al, num_basis_3, num_basis,
+        &alpha,
+        d_coefficient_matrix_al, num_basis,
+        d_eri_src, num_basis_3,
+        &beta,
+        d_eri_mo, num_basis_3
+    );
+    dgeam_transpose_row_major(
+        cublasH,
+        num_occ_al * num_basis,
+        num_basis * num_basis,
+        d_eri_mo,
+        d_scratch);
+    dgemm_device_row_major(
+        cublasH,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_occ_be, num_basis_2 * num_occ_al, num_basis,
+        &alpha,
+        d_coefficient_matrix_be, num_basis,
+        d_scratch, num_basis_2 * num_occ_al,
+        &beta,
+        d_eri_mo, num_basis_2 * num_occ_al
+    );
+
+    dgemm_strided_batched_device_row_major(
+        cublasH,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_vir_be, num_occ_al * num_basis, num_basis,
+        &alpha,
+        d_coefficient_matrix_be + num_occ_be, num_basis, 0,
+        d_eri_mo, num_occ_al * num_basis, num_basis_2 * num_occ_al,
+        &beta,
+        d_scratch, num_occ_al * num_basis, num_vir_be * num_occ_al * num_basis,
+        num_occ_be
+    );
+    dgeam_transpose_row_major(
+        cublasH,
+        num_occ_be * num_vir_be,
+        num_occ_al * num_basis,
+        d_scratch,
+        d_eri_mo);
+    dgemm_strided_batched_device_row_major(
+        cublasH,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        num_vir_al, num_occ_be * num_vir_be, num_basis,
+        &alpha,
+        d_coefficient_matrix_al + num_occ_al, num_basis, 0,
+        d_eri_mo, num_occ_be * num_vir_be, num_basis * num_occ_be * num_vir_be,
+        &beta,
+        d_scratch, num_occ_be * num_vir_be, num_vir_al * num_occ_be * num_vir_be,
+        num_occ_al
+    );
+
+    cudaDeviceSynchronize();
+    cublasDestroy(cublasH);
+    return d_scratch;
 }
 /**/
 

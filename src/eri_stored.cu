@@ -4301,7 +4301,31 @@ real_t ERI_Stored_RHF::compute_mp3_energy() {
         tracked_cudaFree(d_mo_eri);
         return result;
     }
-    return compute_mp3_energy_impl(rhf_, eri_matrix_.device_ptr());
+    // Build the full MO ERI here, then release the AO ERI buffer before the
+    // MP3 block extraction / contraction phase. transform_eri_ao2mo_dgemm_full
+    // ping-pongs between the AO and MO buffers (it uses d_eri_ao as scratch),
+    // so both M^4 tensors must coexist during the transform and the AO ERI
+    // contents are destroyed by it; afterwards the buffer is dead weight that
+    // used to push the peak to 2*M^4 + v^4. The peak is now
+    // max(2*M^4 [transform], M^4 + v^4 [extraction+contraction]).
+    // Numerics are unchanged: the same transform produces the same MO ERI
+    // that mp3_from_aoeri_via_full_moeri_dgemm would have built internally.
+    const int num_basis = rhf_.get_num_basis();
+    const size_t num_basis_2 = (size_t)num_basis * num_basis;
+    double* d_mo_eri = nullptr;
+    tracked_cudaMalloc((void**)&d_mo_eri, sizeof(double) * num_basis_2 * num_basis_2);
+    if (!d_mo_eri) {
+        THROW_EXCEPTION("cudaMalloc failed for d_mo_eri.");
+    }
+    transform_eri_ao2mo_dgemm_full(eri_matrix_.device_ptr(), d_mo_eri,
+                                   rhf_.get_coefficient_matrix().device_ptr(), num_basis);
+    // The AO ERI is consumed (contents destroyed by the transform above);
+    // free the buffer and mark it invalid.
+    eri_matrix_.release();
+    invalidate_ao_eri();
+    real_t result = compute_mp3_energy_impl(rhf_, nullptr, d_mo_eri);
+    tracked_cudaFree(d_mo_eri);
+    return result;
 }
 
 real_t ERI_RI_RHF::compute_mp3_energy() {
