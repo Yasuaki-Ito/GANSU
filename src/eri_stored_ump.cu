@@ -15,11 +15,17 @@
 #include <iomanip>
 #include <iostream>
 #include <assert.h>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <chrono>
 
 #include "uhf.hpp"
 #include "eri_stored.hpp"
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
+
+#include <Eigen/Dense>
 
 #include "ao2mo.cuh"
 
@@ -110,18 +116,85 @@ static inline void cpu_dgemm_row_major(
     bool trA, bool trB,
     bool accumulate = false)
 {
-    // gpu::matrixMatrixProductRect is column-major internally.
-    // Row-major C(m,n) = opA(A)*opB(B) is equivalent to
-    //   col-major C^T(n,m) = opB(B)^T * opA(A)^T
-    // Since our arrays are already row-major (== transposed col-major),
-    // the trick is: call with (N=n, M=m, K=k, transposes swapped).
-    // But gpu::matrixMatrixProductRect is already CPU-safe so we just
-    // pass: C(n,m)_cm = B_cm * A_cm with appropriate transposes.
-    //
-    // Actually the simplest correct approach: treat row-major data as
-    // column-major transposed, then:
-    //   C_cm = op(B_cm)*op(A_cm), where _cm means the same pointer.
-    gansu::gpu::matrixMatrixProductRect(B, A, C, n, m, k, trB, trA, accumulate, alpha_val);
+    // gpu::matrixMatrixProductRect already has row-major semantics:
+    //   C(m,n) = opA(A)*opB(B), with A stored row-major (m x k) [!trA]
+    //   or (k x m) [trA], B stored row-major (k x n) [!trB] or (n x k) [trB].
+    // (The previous implementation passed (B, A, n, m, k, trB, trA), which
+    // computes B*A for square shapes and misreads layouts for non-square
+    // shapes; that silently corrupted the CPU MP3 contractions.)
+    gansu::gpu::matrixMatrixProductRect(A, B, C, m, n, k, trA, trB, accumulate, alpha_val);
+}
+
+// CPU mirror of dgemm_device_row_major (ao2mo.cuh): row-major
+// C(m x n) = opA(A) * opB(B) with explicit leading dimensions (row strides),
+// so the CPU path can issue exactly the same GEMM sequence (including
+// column-sliced operands such as C + num_occ with lda = N) as the cuBLAS
+// path. Uses Eigen's OpenMP-threaded GEMM.
+static inline void cpu_dgemm_ld_row_major(
+    cublasOperation_t opA, cublasOperation_t opB,
+    int m, int n, int k,
+    const double* A, int lda,
+    const double* B, int ldb,
+    double* C, int ldc)
+{
+    const bool trA = (opA == CUBLAS_OP_T);
+    const bool trB = (opB == CUBLAS_OP_T);
+    // Physical (stored) shapes: A is (trA ? k x m : m x k), B is (trB ? n x k : k x n).
+    const int rowsA = trA ? k : m;
+    const int colsA = trA ? m : k;
+    const int rowsB = trB ? n : k;
+    const int colsB = trB ? k : n;
+
+    Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0, Eigen::OuterStride<>> Am(
+        A, rowsA, colsA, Eigen::OuterStride<>(lda));
+    Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0, Eigen::OuterStride<>> Bm(
+        B, rowsB, colsB, Eigen::OuterStride<>(ldb));
+    Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0, Eigen::OuterStride<>> Cm(
+        C, m, n, Eigen::OuterStride<>(ldc));
+
+    if (trA && trB)      { Cm.noalias() = Am.transpose() * Bm.transpose(); }
+    else if (trA)        { Cm.noalias() = Am.transpose() * Bm; }
+    else if (trB)        { Cm.noalias() = Am * Bm.transpose(); }
+    else                 { Cm.noalias() = Am * Bm; }
+}
+
+// CPU mirror of dgemm_strided_batched_device_row_major (ao2mo.cuh): the same
+// row-major batched GEMM with per-batch strides (stride 0 broadcasts the
+// operand). Batches run sequentially; each GEMM is OpenMP-threaded by Eigen.
+static inline void cpu_dgemm_strided_batched_ld_row_major(
+    cublasOperation_t opA, cublasOperation_t opB,
+    int m, int n, int k,
+    const double* A, int lda, long long int strideA,
+    const double* B, int ldb, long long int strideB,
+    double* C, int ldc, long long int strideC,
+    int batchCount)
+{
+    for (int b = 0; b < batchCount; b++) {
+        cpu_dgemm_ld_row_major(opA, opB, m, n, k,
+            A + (size_t)b * (size_t)strideA, lda,
+            B + (size_t)b * (size_t)strideB, ldb,
+            C + (size_t)b * (size_t)strideC, ldc);
+    }
+}
+
+// CPU mirror of dgeam_transpose_row_major (ao2mo.cuh):
+// AT_rm (cols x rows) = A_rm^T (rows x cols), tiled for cache efficiency.
+static inline void cpu_dgeam_transpose_row_major(
+    int rows_rm, int cols_rm, const double* A_rm, double* AT_rm)
+{
+    constexpr int TILE = 64;
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int ii = 0; ii < rows_rm; ii += TILE) {
+        for (int jj = 0; jj < cols_rm; jj += TILE) {
+            const int imax = std::min(ii + TILE, rows_rm);
+            const int jmax = std::min(jj + TILE, cols_rm);
+            for (int i = ii; i < imax; i++) {
+                for (int j = jj; j < jmax; j++) {
+                    AT_rm[(size_t)j * rows_rm + i] = A_rm[(size_t)i * cols_rm + j];
+                }
+            }
+        }
+    }
 }
 
 // ============================================================
@@ -170,6 +243,19 @@ static void tensorize_x_aaaa_ovov_cpu(double* out, const double* full, const dou
         int i = ia/nvir, a = ia%nvir+nocc, j = jb/nvir, b = jb%nvir+nocc;
         double d_eps = eps[i]+eps[j]-eps[a]-eps[b];
         out[ovov2s(i,a,j,b,nocc,nvir)] = full[q2s(i,a,j,b,N)] / d_eps;
+    }
+}
+// Plain (non-amplitude) ovov block, CPU mirror of tensorize_g_aaaa_ovov:
+// identical layout to tensorize_x_aaaa_ovov_cpu without the epsilon division.
+// Used to obtain the UMP2 same-spin energy from the cascade full tensor
+static void tensorize_g_aaaa_ovov_cpu(double* out, const double* full, int nocc, int nvir) {
+    const int N = nocc + nvir;
+    const size_t n = (size_t)nocc*nvir*nocc*nvir;
+    #pragma omp parallel for schedule(static)
+    for (size_t idx = 0; idx < n; idx++) {
+        int ia = idx / (nocc*nvir), jb = idx % (nocc*nvir);
+        int i = ia/nvir, a = ia%nvir+nocc, j = jb/nvir, b = jb%nvir+nocc;
+        out[ovov2s(i,a,j,b,nocc,nvir)] = full[q2s(i,a,j,b,N)];
     }
 }
 static void tensorize_y_aaaa_ovov_cpu(double* out, const double* full, const double* eps, int nocc, int nvir) {
@@ -295,6 +381,51 @@ static void tensorize_x_aabb_ovov_cpu(double* out, const double* full, const dou
         int i = ia/nvir_al, a = ia%nvir_al+nocc_al, j = jb/nvir_be, b = jb%nvir_be+nocc_be;
         double d_eps = eps_al[i]+eps_be[j]-eps_al[a]-eps_be[b];
         out[ovov2s_aabb(i,a,j,b,nocc_al,nvir_al,nocc_be,nvir_be)] = full[q2s(i,a,j,b,N)] / d_eps;
+    }
+}
+// Plain (non-amplitude) aabb ovov block, CPU mirror of tensorize_g_aabb_ovov:
+// identical layout to tensorize_x_aabb_ovov_cpu without the epsilon division.
+// Used to obtain the UMP2 opposite-spin energy from the cascade full tensor
+static void tensorize_g_aabb_ovov_cpu(double* out, const double* full, int nocc_al, int nvir_al, int nocc_be, int nvir_be, int N) {
+    const size_t n = (size_t)nocc_al*nvir_al*nocc_be*nvir_be;
+    #pragma omp parallel for schedule(static)
+    for (size_t idx = 0; idx < n; idx++) {
+        int ia = idx / (nocc_be*nvir_be), jb = idx % (nocc_be*nvir_be);
+        int i = ia/nvir_al, a = ia%nvir_al+nocc_al, j = jb/nvir_be, b = jb%nvir_be+nocc_be;
+        out[ovov2s_aabb(i,a,j,b,nocc_al,nvir_al,nocc_be,nvir_be)] = full[q2s(i,a,j,b,N)];
+    }
+}
+
+// --- swapped-source variants: pack (bb|aa) compact blocks from the (aa|bb) full tensor ---
+// ERI pair symmetry gives full_bbaa[k,c,b,j] = full_aabb[b,j,k,c], so the same
+// compact blocks can be tensorized from the aabb tensor with the source index
+// pairs swapped. Compact layouts and denominators are identical to the originals.
+static void tensorize_g_bbaa_ovvo_swapped_cpu(double* out, const double* full, int nocc_be, int nocc_al, int nvir_be, int nvir_al, int N) {
+    const size_t n = (size_t)nocc_be*nvir_be*nvir_al*nocc_al;
+    #pragma omp parallel for schedule(static)
+    for (size_t idx = 0; idx < n; idx++) {
+        int kc = idx / (nvir_al*nocc_al), bj = idx % (nvir_al*nocc_al);
+        int k = kc/nvir_be, c = kc%nvir_be+nocc_be, b = bj/nocc_al+nocc_al, j = bj%nocc_al;
+        out[ovvo2s_bbaa(k,c,b,j,nocc_be,nocc_al,nvir_be,nvir_al)] = full[q2s(b,j,k,c,N)];
+    }
+}
+static void tensorize_g_bbaa_oovv_swapped_cpu(double* out, const double* full, int nocc_be, int nocc_al, int nvir_be, int nvir_al, int N) {
+    const size_t n = (size_t)nocc_be*nocc_be*nvir_al*nvir_al;
+    #pragma omp parallel for schedule(static)
+    for (size_t idx = 0; idx < n; idx++) {
+        int kj = idx / (nvir_al*nvir_al), bc = idx % (nvir_al*nvir_al);
+        int k = kj/nocc_be, j = kj%nocc_be, b = bc/nvir_al+nocc_al, c = bc%nvir_al+nocc_al;
+        out[ovvo2s_baab(k,c,b,j,nocc_be,nocc_al,nvir_al,nvir_be)] = full[q2s(b,c,k,j,N)];
+    }
+}
+static void tensorize_x_aabb_ovov_swapped_cpu(double* out, const double* full, const double* eps_al, const double* eps_be, int nocc_al, int nvir_al, int nocc_be, int nvir_be, int N) {
+    const size_t n = (size_t)nocc_al*nvir_al*nocc_be*nvir_be;
+    #pragma omp parallel for schedule(static)
+    for (size_t idx = 0; idx < n; idx++) {
+        int ia = idx / (nocc_be*nvir_be), jb = idx % (nocc_be*nvir_be);
+        int i = ia/nvir_al, a = ia%nvir_al+nocc_al, j = jb/nvir_be, b = jb%nvir_be+nocc_be;
+        double d_eps = eps_al[i]+eps_be[j]-eps_al[a]-eps_be[b];
+        out[ovov2s_aabb(i,a,j,b,nocc_al,nvir_al,nocc_be,nvir_be)] = full[q2s(j,b,i,a,N)] / d_eps;
     }
 }
 
@@ -542,6 +673,189 @@ static double compute_3h3p_abbbaa_cpu(const double* g_aabb, const double* g_bbaa
     return sum;
 }
 
+// ============================================================
+//  CPU mirrors of the ao2mo.cuh axis-sequential GEMM transforms.
+//  These issue the identical GEMM/transpose sequence as the GPU versions
+//  (same operand shapes, strides, and ping-pong buffer schedule), so the
+//  CPU and GPU backends execute the same algorithm and only the hardware
+//  differs. GEMMs run through Eigen (OpenMP-threaded).
+// ============================================================
+
+// Mirror of transform_eri_ao2mo_dgemm_full (ao2mo.cuh): destructive in-place
+// 4-axis AO->MO transformation of the full M^4 tensor (same-spin coefficient
+// matrix on all four axes). Ping-pongs between d_eri_ao and d_eri_mo.
+static void transform_eri_ao2mo_dgemm_full_cpu(
+    double* d_eri_ao, double* d_eri_mo,
+    const double* d_coefficient_matrix, const int num_basis)
+{
+    const size_t num_basis_2 = (size_t)num_basis * num_basis;
+    const size_t num_basis_3 = num_basis_2 * num_basis;
+
+    cpu_dgemm_ld_row_major(CUBLAS_OP_T, CUBLAS_OP_N,
+        num_basis, (int)num_basis_3, num_basis,
+        d_coefficient_matrix, num_basis,
+        d_eri_ao, (int)num_basis_3,
+        d_eri_mo, (int)num_basis_3);
+    cpu_dgemm_strided_batched_ld_row_major(CUBLAS_OP_T, CUBLAS_OP_N,
+        num_basis, (int)num_basis_2, num_basis,
+        d_coefficient_matrix, num_basis, 0,
+        d_eri_mo, (int)num_basis_2, (long long int)num_basis_3,
+        d_eri_ao, (int)num_basis_2, (long long int)num_basis_3,
+        num_basis);
+
+    cpu_dgeam_transpose_row_major((int)num_basis_2, (int)num_basis_2, d_eri_ao, d_eri_mo);
+
+    cpu_dgemm_ld_row_major(CUBLAS_OP_T, CUBLAS_OP_N,
+        num_basis, (int)num_basis_3, num_basis,
+        d_coefficient_matrix, num_basis,
+        d_eri_mo, (int)num_basis_3,
+        d_eri_ao, (int)num_basis_3);
+    cpu_dgemm_strided_batched_ld_row_major(CUBLAS_OP_T, CUBLAS_OP_N,
+        num_basis, (int)num_basis_2, num_basis,
+        d_coefficient_matrix, num_basis, 0,
+        d_eri_ao, (int)num_basis_2, (long long int)num_basis_3,
+        d_eri_mo, (int)num_basis_2, (long long int)num_basis_3,
+        num_basis);
+}
+
+// Mirror of transform_eri_ao2mo_dgemm_ovov_keep_ao (ao2mo.cuh): non-destructive
+// compact (ia|jb) transformation. Only the first GEMM reads the full M^4 AO
+// tensor; the remaining stages ping-pong inside num_occ * N^3 buffers
+// (d_scratch, d_eri_mo). Returns d_scratch, which holds the compact ovov
+// block in ovov2seq layout.
+static double* transform_eri_ao2mo_dgemm_ovov_keep_ao_cpu(
+    const double* d_eri_src, double* d_scratch, double* d_eri_mo,
+    const double* d_coefficient_matrix,
+    const int num_occ, const int num_vir)
+{
+    const size_t num_basis = (size_t)num_occ + num_vir;
+    const size_t num_basis_2 = num_basis * num_basis;
+    const size_t num_basis_3 = num_basis_2 * num_basis;
+
+    cpu_dgemm_ld_row_major(CUBLAS_OP_T, CUBLAS_OP_N,
+        num_occ, (int)num_basis_3, num_basis,
+        d_coefficient_matrix, num_basis,
+        d_eri_src, (int)num_basis_3,
+        d_eri_mo, (int)num_basis_3);
+    cpu_dgeam_transpose_row_major(num_occ * num_basis, (int)(num_basis * num_basis), d_eri_mo, d_scratch);
+    cpu_dgemm_ld_row_major(CUBLAS_OP_T, CUBLAS_OP_N,
+        num_occ, (int)(num_basis_2 * num_occ), num_basis,
+        d_coefficient_matrix, num_basis,
+        d_scratch, (int)(num_basis_2 * num_occ),
+        d_eri_mo, (int)(num_basis_2 * num_occ));
+
+    cpu_dgemm_strided_batched_ld_row_major(CUBLAS_OP_T, CUBLAS_OP_N,
+        num_vir, num_occ * num_basis, num_basis,
+        d_coefficient_matrix + num_occ, num_basis, 0,
+        d_eri_mo, num_occ * num_basis, (long long int)(num_basis_2 * num_occ),
+        d_scratch, num_occ * num_basis, (long long int)(num_vir * num_occ * num_basis),
+        num_occ);
+    cpu_dgeam_transpose_row_major(num_occ * num_vir, num_occ * num_basis, d_scratch, d_eri_mo);
+    cpu_dgemm_strided_batched_ld_row_major(CUBLAS_OP_T, CUBLAS_OP_N,
+        num_vir, num_occ * num_vir, num_basis,
+        d_coefficient_matrix + num_occ, num_basis, 0,
+        d_eri_mo, num_occ * num_vir, (long long int)(num_basis * num_occ * num_vir),
+        d_scratch, num_occ * num_vir, (long long int)(num_vir * num_occ * num_vir),
+        num_occ);
+
+    return d_scratch;
+}
+
+// Mirror of transform_eri_ao2mo_dgemm_ovov_os_keep_ao (ao2mo.cuh):
+// non-destructive compact (i_alpha a_alpha | j_beta b_beta) transformation.
+// Returns d_scratch (compact ovov block in ovov2seq_aabb layout).
+static double* transform_eri_ao2mo_dgemm_ovov_os_keep_ao_cpu(
+    const double* d_eri_src, double* d_scratch, double* d_eri_mo,
+    const double* d_coefficient_matrix_al,
+    const double* d_coefficient_matrix_be,
+    const int num_occ_al, const int num_vir_al,
+    const int num_occ_be, const int num_vir_be)
+{
+    const size_t num_basis = (size_t)num_occ_al + num_vir_al;
+    const size_t num_basis_2 = num_basis * num_basis;
+    const size_t num_basis_3 = num_basis_2 * num_basis;
+
+    cpu_dgemm_ld_row_major(CUBLAS_OP_T, CUBLAS_OP_N,
+        num_occ_al, (int)num_basis_3, num_basis,
+        d_coefficient_matrix_al, num_basis,
+        d_eri_src, (int)num_basis_3,
+        d_eri_mo, (int)num_basis_3);
+    cpu_dgeam_transpose_row_major(num_occ_al * num_basis, (int)(num_basis * num_basis), d_eri_mo, d_scratch);
+    cpu_dgemm_ld_row_major(CUBLAS_OP_T, CUBLAS_OP_N,
+        num_occ_be, (int)(num_basis_2 * num_occ_al), num_basis,
+        d_coefficient_matrix_be, num_basis,
+        d_scratch, (int)(num_basis_2 * num_occ_al),
+        d_eri_mo, (int)(num_basis_2 * num_occ_al));
+
+    cpu_dgemm_strided_batched_ld_row_major(CUBLAS_OP_T, CUBLAS_OP_N,
+        num_vir_be, num_occ_al * num_basis, num_basis,
+        d_coefficient_matrix_be + num_occ_be, num_basis, 0,
+        d_eri_mo, num_occ_al * num_basis, (long long int)(num_basis_2 * num_occ_al),
+        d_scratch, num_occ_al * num_basis, (long long int)(num_vir_be * num_occ_al * num_basis),
+        num_occ_be);
+    cpu_dgeam_transpose_row_major(num_occ_be * num_vir_be, num_occ_al * num_basis, d_scratch, d_eri_mo);
+    cpu_dgemm_strided_batched_ld_row_major(CUBLAS_OP_T, CUBLAS_OP_N,
+        num_vir_al, num_occ_be * num_vir_be, num_basis,
+        d_coefficient_matrix_al + num_occ_al, num_basis, 0,
+        d_eri_mo, num_occ_be * num_vir_be, (long long int)(num_basis * num_occ_be * num_vir_be),
+        d_scratch, num_occ_be * num_vir_be, (long long int)(num_vir_al * num_occ_be * num_vir_be),
+        num_occ_al);
+
+    return d_scratch;
+}
+
+// CPU mirrors of the compute_ump2_energy_contrib_ss / _os CUDA kernels.
+// Same summation, OpenMP reduction instead of warp shuffle + atomicAdd.
+static void compute_ump2_energy_contrib_ss_cpu(
+    double* g_energy_second,
+    const double* g_eri_mo, const double* g_eps,
+    const int num_occupied, const int num_virtual, const int num_frozen = 0)
+{
+    const int active_occ = num_occupied - num_frozen;
+    const size_t total = (size_t)active_occ * num_virtual * (size_t)active_occ * num_virtual;
+    double sum = 0.0;
+    #pragma omp parallel for reduction(+:sum) schedule(static)
+    for (size_t seq = 0; seq < total; seq++) {
+        const size_t ia = seq / ((size_t)active_occ * num_virtual);
+        const size_t jb = seq % ((size_t)active_occ * num_virtual);
+        const int i = (int)(ia / num_virtual) + num_frozen;
+        const int a = (int)(ia % num_virtual);
+        const int j = (int)(jb / num_virtual) + num_frozen;
+        const int b = (int)(jb % num_virtual);
+
+        const double iajb = g_eri_mo[ovov2seq(i, a, j, b, num_occupied, num_virtual)];
+        const double jaib = g_eri_mo[ovov2seq(j, a, i, b, num_occupied, num_virtual)];
+        sum += iajb * (iajb - jaib) / (g_eps[i] + g_eps[j] - g_eps[num_occupied + a] - g_eps[num_occupied + b]);
+    }
+    *g_energy_second += sum * 0.5;
+}
+
+static void compute_ump2_energy_contrib_os_cpu(
+    double* g_energy_second, const double* g_eri_mo,
+    const double* g_eps_al, const double* g_eps_be,
+    const int num_occupied_al, const int num_virtual_al,
+    const int num_occupied_be, const int num_virtual_be,
+    const int num_frozen = 0)
+{
+    const int active_occ_al = num_occupied_al - num_frozen;
+    const int active_occ_be = num_occupied_be - num_frozen;
+    const size_t total = (size_t)active_occ_al * num_virtual_al * (size_t)active_occ_be * num_virtual_be;
+    double sum = 0.0;
+    #pragma omp parallel for reduction(+:sum) schedule(static)
+    for (size_t seq = 0; seq < total; seq++) {
+        const size_t ia = seq / ((size_t)active_occ_be * num_virtual_be);
+        const size_t jb = seq % ((size_t)active_occ_be * num_virtual_be);
+        const int i = (int)(ia / num_virtual_al) + num_frozen;
+        const int a = (int)(ia % num_virtual_al);
+        const int j = (int)(jb / num_virtual_be) + num_frozen;
+        const int b = (int)(jb % num_virtual_be);
+
+        const double iajb = g_eri_mo[ovov2seq_aabb(i, a, j, b, num_occupied_al, num_virtual_al, num_occupied_be, num_virtual_be)];
+        sum += (iajb * iajb) / (g_eps_al[i] + g_eps_be[j] - g_eps_al[num_occupied_al + a] - g_eps_be[num_occupied_be + b]);
+    }
+    *g_energy_second += sum;
+}
+
 } // namespace cpu_kernels
 
 namespace gansu {
@@ -767,13 +1081,18 @@ double ump2_from_aoeri_via_required_moeri(
     double* out_E_os = nullptr,
     double* out_E_ss = nullptr)
 {
-    double* d_eri_tmp1 = nullptr;
+    double* d_eri_scratch = nullptr;
     double* d_eri_tmp2 = nullptr;
     const size_t num_basis_2 = num_basis * num_basis;
     const int max_num_occ = std::max(num_occ_al, num_occ_be);
-    tracked_cudaMalloc(&d_eri_tmp1, sizeof(double) * num_basis_2 * num_basis_2);
+    // The AO ERIs (d_eri_ao) are only read, never overwritten: only the first
+    // GEMM of each spin-pattern transformation touches the full M^4 tensor and
+    // the remaining stages ping-pong inside num_occ * N^3 regions. No M^4
+    // working copy is therefore needed; the peak memory is one M^4 tensor
+    // (the AO ERIs themselves) plus two max_num_occ * N^3 buffers.
+    tracked_cudaMalloc(&d_eri_scratch, sizeof(double) * max_num_occ * num_basis_2 * num_basis);
     tracked_cudaMalloc(&d_eri_tmp2, sizeof(double) * max_num_occ * num_basis_2 * num_basis);
-    if (!d_eri_tmp1) { THROW_EXCEPTION("cudaMalloc failed for d_eri_tmp_1."); }
+    if (!d_eri_scratch) { THROW_EXCEPTION("cudaMalloc failed for d_eri_scratch."); }
     if (!d_eri_tmp2) { THROW_EXCEPTION("cudaMalloc failed for d_eri_tmp_2."); }
 
     const int num_vir_al = num_basis - num_occ_al;
@@ -794,7 +1113,19 @@ double ump2_from_aoeri_via_required_moeri(
     const int num_threads_per_block = num_threads_per_warp * num_warps_per_block;
 
     if (!gpu::gpu_available()) {
-        // ---------- CPU fallback: direct AO→MO inline ----------
+        // ---------- CPU path: same algorithm as the GPU path ----------
+        // Runs the identical keep_ao GEMM-chain transformations and energy
+        // contractions as the GPU branch below (same buffer schedule:
+        // the AO ERIs are only read, two num_occ * N^3 ping-pong buffers),
+        // so GPU-vs-CPU comparisons reflect hardware, not algorithm,
+        // differences.
+        //
+        // Historical note: the CPU path previously used a brute-force
+        // O(o^2 v^2 N^4) inline evaluation that recomputed every (ia|jb)
+        // directly from the AO ERIs. It is preserved below (commented out)
+        // for reference.
+#if 0
+        // ---------- OLD CPU implementation: brute-force inline ----------
         const int N = num_basis;
         const double* Ca = d_coefficient_matrix_al;  // C_alpha(AO, MO) row-major
         const double* Cb = d_coefficient_matrix_be;  // C_beta(AO, MO) row-major
@@ -866,6 +1197,67 @@ double ump2_from_aoeri_via_required_moeri(
             *d_second_energy += sum_ab;
             *d_energy_os += sum_ab;
         }
+#endif // OLD brute-force CPU implementation
+
+        auto cpu_elapsed_ms = [](const std::chrono::steady_clock::time_point& t0) {
+            return std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        };
+
+        // Compute alpha-alpha energy contribution
+        {
+            std::string str = "Computing 1st term... ";
+            PROFILE_ELAPSED_TIME(str);
+            const auto t0 = std::chrono::steady_clock::now();
+
+            cudaMemset(d_eri_tmp2, 0, sizeof(double) * max_num_occ * num_basis_2 * num_basis);
+
+            double* d_eri_mo_ovov_aa = cpu_kernels::transform_eri_ao2mo_dgemm_ovov_keep_ao_cpu(
+                d_eri_ao, d_eri_scratch, d_eri_tmp2,
+                d_coefficient_matrix_al, num_occ_al, num_vir_al);
+
+            cpu_kernels::compute_ump2_energy_contrib_ss_cpu(d_second_energy, d_eri_mo_ovov_aa, d_orbital_energies_al, num_occ_al, num_vir_al, num_frozen);
+            cpu_kernels::compute_ump2_energy_contrib_ss_cpu(d_energy_ss, d_eri_mo_ovov_aa, d_orbital_energies_al, num_occ_al, num_vir_al, num_frozen);
+
+            printf("alpha-alpha: %.2f [ms]\n", cpu_elapsed_ms(t0));
+        }
+
+        // Compute beta-beta energy contribution
+        {
+            std::string str = "Computing 2nd term... ";
+            PROFILE_ELAPSED_TIME(str);
+            const auto t0 = std::chrono::steady_clock::now();
+
+            cudaMemset(d_eri_tmp2, 0, sizeof(double) * max_num_occ * num_basis_2 * num_basis);
+
+            double* d_eri_mo_ovov_bb = cpu_kernels::transform_eri_ao2mo_dgemm_ovov_keep_ao_cpu(
+                d_eri_ao, d_eri_scratch, d_eri_tmp2,
+                d_coefficient_matrix_be, num_occ_be, num_vir_be);
+
+            cpu_kernels::compute_ump2_energy_contrib_ss_cpu(d_second_energy, d_eri_mo_ovov_bb, d_orbital_energies_be, num_occ_be, num_vir_be, num_frozen);
+            cpu_kernels::compute_ump2_energy_contrib_ss_cpu(d_energy_ss, d_eri_mo_ovov_bb, d_orbital_energies_be, num_occ_be, num_vir_be, num_frozen);
+
+            printf("beta-beta: %.2f [ms]\n", cpu_elapsed_ms(t0));
+        }
+
+        // Compute alpha-beta energy contribution
+        {
+            std::string str = "Computing 3rd term... ";
+            PROFILE_ELAPSED_TIME(str);
+            const auto t0 = std::chrono::steady_clock::now();
+
+            cudaMemset(d_eri_tmp2, 0, sizeof(double) * max_num_occ * num_basis_2 * num_basis);
+
+            double* d_eri_mo_ovov_ab = cpu_kernels::transform_eri_ao2mo_dgemm_ovov_os_keep_ao_cpu(
+                d_eri_ao, d_eri_scratch, d_eri_tmp2,
+                d_coefficient_matrix_al, d_coefficient_matrix_be,
+                num_occ_al, num_vir_al, num_occ_be, num_vir_be);
+
+            cpu_kernels::compute_ump2_energy_contrib_os_cpu(d_second_energy, d_eri_mo_ovov_ab, d_orbital_energies_al, d_orbital_energies_be, num_occ_al, num_vir_al, num_occ_be, num_vir_be, num_frozen);
+            cpu_kernels::compute_ump2_energy_contrib_os_cpu(d_energy_os, d_eri_mo_ovov_ab, d_orbital_energies_al, d_orbital_energies_be, num_occ_al, num_vir_al, num_occ_be, num_vir_be, num_frozen);
+
+            printf("alpha-beta: %.2f [ms]\n", cpu_elapsed_ms(t0));
+        }
     } else {
         // ---------- GPU path ----------
         float time_aa, time_bb, time_ab;
@@ -879,12 +1271,10 @@ double ump2_from_aoeri_via_required_moeri(
             std::string str = "Computing 1st term... ";
             PROFILE_ELAPSED_TIME(str);
 
-            cudaMemcpy(d_eri_tmp1, d_eri_ao, sizeof(double) * num_basis_2 * num_basis_2, cudaMemcpyDeviceToDevice);
             cudaMemset(d_eri_tmp2, 0, sizeof(double) * max_num_occ * num_basis_2 * num_basis);
 
-            transform_eri_ao2mo_dgemm_ovov(d_eri_tmp1, d_eri_tmp2, d_coefficient_matrix_al, num_occ_al, num_vir_al);
+            double* d_eri_mo_ovov_aa = transform_eri_ao2mo_dgemm_ovov_keep_ao(d_eri_ao, d_eri_scratch, d_eri_tmp2, d_coefficient_matrix_al, num_occ_al, num_vir_al);
             cudaDeviceSynchronize();
-            double* d_eri_mo_ovov_aa = d_eri_tmp1;
 
             const int active_occ_al = num_occ_al - num_frozen;
             const size_t total = (size_t)active_occ_al * num_vir_al * active_occ_al * num_vir_al;
@@ -907,12 +1297,10 @@ double ump2_from_aoeri_via_required_moeri(
             std::string str = "Computing 2nd term... ";
             PROFILE_ELAPSED_TIME(str);
 
-            cudaMemcpy(d_eri_tmp1, d_eri_ao, sizeof(double) * num_basis_2 * num_basis_2, cudaMemcpyDeviceToDevice);
             cudaMemset(d_eri_tmp2, 0, sizeof(double) * max_num_occ * num_basis_2 * num_basis);
 
-            transform_eri_ao2mo_dgemm_ovov(d_eri_tmp1, d_eri_tmp2, d_coefficient_matrix_be, num_occ_be, num_vir_be);
+            double* d_eri_mo_ovov_bb = transform_eri_ao2mo_dgemm_ovov_keep_ao(d_eri_ao, d_eri_scratch, d_eri_tmp2, d_coefficient_matrix_be, num_occ_be, num_vir_be);
             cudaDeviceSynchronize();
-            double* d_eri_mo_ovov_bb = d_eri_tmp1;
 
             const int active_occ_be = num_occ_be - num_frozen;
             const size_t total = (size_t)active_occ_be * num_vir_be * active_occ_be * num_vir_be;
@@ -935,12 +1323,10 @@ double ump2_from_aoeri_via_required_moeri(
             std::string str = "Computing 3rd term... ";
             PROFILE_ELAPSED_TIME(str);
 
-            cudaMemcpy(d_eri_tmp1, d_eri_ao, sizeof(double) * num_basis_2 * num_basis_2, cudaMemcpyDeviceToDevice);
             cudaMemset(d_eri_tmp2, 0, sizeof(double) * max_num_occ * num_basis_2 * num_basis);
 
-            transform_eri_ao2mo_dgemm_ovov_os(d_eri_tmp1, d_eri_tmp2, d_coefficient_matrix_al, d_coefficient_matrix_be, num_occ_al, num_vir_al, num_occ_be, num_vir_be);
+            double* d_eri_mo_ovov_ab = transform_eri_ao2mo_dgemm_ovov_os_keep_ao(d_eri_ao, d_eri_scratch, d_eri_tmp2, d_coefficient_matrix_al, d_coefficient_matrix_be, num_occ_al, num_vir_al, num_occ_be, num_vir_be);
             cudaDeviceSynchronize();
-            double* d_eri_mo_ovov_ab = d_eri_tmp1;
 
             const int active_occ_al2 = num_occ_al - num_frozen;
             const int active_occ_be2 = num_occ_be - num_frozen;
@@ -971,7 +1357,7 @@ double ump2_from_aoeri_via_required_moeri(
     if (out_E_os) *out_E_os = h_E_os;
     if (out_E_ss) *out_E_ss = h_E_ss;
 
-    tracked_cudaFree(d_eri_tmp1);
+    tracked_cudaFree(d_eri_scratch);
     tracked_cudaFree(d_eri_tmp2);
     tracked_cudaFree(d_second_energy);
     tracked_cudaFree(d_energy_ss);
@@ -986,6 +1372,10 @@ double ump2_from_aoeri_via_required_moeri(
 real_t ERI_Stored_UHF::compute_mp2_energy()
 {
     PROFILE_FUNCTION();
+
+    if (!is_ao_eri_valid()) {
+        THROW_EXCEPTION("AO ERIs are no longer available: the UMP3 cascading integral transformation destructively reused the AO ERI buffer as scratch.");
+    }
 
     const int num_basis = uhf_.get_num_basis();
     const int num_occ_al = uhf_.get_num_alpha_spins();
@@ -1049,10 +1439,16 @@ static real_t compute_scaled_ump2_impl(UHF& uhf, real_t* d_eri, int mode) {
 }
 
 real_t ERI_Stored_UHF::compute_scs_mp2_energy() {
+    if (!is_ao_eri_valid()) {
+        THROW_EXCEPTION("AO ERIs are no longer available: the UMP3 cascading integral transformation destructively reused the AO ERI buffer as scratch.");
+    }
     return compute_scaled_ump2_impl(uhf_, eri_matrix_.device_ptr(), 0);
 }
 
 real_t ERI_Stored_UHF::compute_sos_mp2_energy() {
+    if (!is_ao_eri_valid()) {
+        THROW_EXCEPTION("AO ERIs are no longer available: the UMP3 cascading integral transformation destructively reused the AO ERI buffer as scratch.");
+    }
     return compute_scaled_ump2_impl(uhf_, eri_matrix_.device_ptr(), 1);
 }
 
@@ -2576,7 +2972,15 @@ double compute_aabb_contributions(
 
 
 
-
+// Naive 5 x M^4 reference baseline: all four spin blocks of the full MO
+// ERI tensor (aaaa/aabb/bbaa/bbbb) are transformed and held simultaneously
+// alongside the AO ERIs -- no intermediate lifetime management and no
+// spin-transform reuse. This is the ablation baseline of the paper (the
+// "naive algorithm" up to the matrix-multiplication formulation), retained
+// as source only: compute_mp3_energy above always runs the cascading
+// integral transformation and never calls this function. To reproduce the
+// ablation, call it directly and invalidate_ao_eri() afterwards (the
+// transform is destructive to the AO ERIs). Frozen core is unsupported.
 double ump3_from_aoeri_via_full_moeri_dgemm(
     double* d_eri_ao,
     const double* d_coefficient_matrix_al,
@@ -2924,6 +3328,80 @@ static void contract_mixed_4h2p_2h4p_from_tensors(
 __global__ void trim_eri_frozen_core_kernel(const real_t* __restrict__ eri_full,
                                             real_t* __restrict__ eri_trimmed,
                                             int N_full, int na_active, int offset);
+
+// ============================================================
+//  Swapped-source tensorize kernels: pack the (bb|aa) compact
+//  blocks from the (aa|bb) full MO ERI tensor via ERI pair
+//  symmetry, full_bbaa[k,c,b,j] = full_aabb[b,j,k,c].
+//  Compact layouts and denominators are identical to the
+//  originals in ao2mo.cuh; only the source index read differs.
+// ============================================================
+static __global__ void tensorize_g_bbaa_ovvo_swapped(
+    double* g_g_bbaa_ovvo, const double* g_g_aabb_full,
+    const int num_occ_be, const int num_occ_al,
+    const int num_vir_be, const int num_vir_al, const int num_basis)
+{
+    const size_t kcbj = ((size_t)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const size_t num_ovvo = (size_t)num_occ_be * num_vir_be * num_vir_al * num_occ_al;
+    if (kcbj >= num_ovvo) {
+        return;
+    }
+
+    const int kc = kcbj / (num_vir_al * num_occ_al);
+    const int bj = kcbj % (num_vir_al * num_occ_al);
+    const int k = kc / num_vir_be;
+    const int c = kc % num_vir_be + num_occ_be;
+    const int b = bj / num_occ_al + num_occ_al;
+    const int j = bj % num_occ_al;
+
+    g_g_bbaa_ovvo[ovvo2s_bbaa(k, c, b, j, num_occ_be, num_occ_al, num_vir_be, num_vir_al)] = g_g_aabb_full[q2s(b, j, k, c, num_basis)];
+}
+
+static __global__ void tensorize_g_bbaa_oovv_swapped(
+    double* g_g_bbaa_oovv, const double* g_g_aabb_full,
+    const int num_occ_be, const int num_occ_al,
+    const int num_vir_be, const int num_vir_al, const int num_basis)
+{
+    const size_t kjbc = ((size_t)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const size_t num_oovv = (size_t)num_occ_be * num_occ_be * num_vir_al * num_vir_al;
+    if (kjbc >= num_oovv) {
+        return;
+    }
+
+    const int kj = kjbc / (num_vir_al * num_vir_al);
+    const int bc = kjbc % (num_vir_al * num_vir_al);
+    const int k = kj / num_occ_be;
+    const int j = kj % num_occ_be;
+    const int b = bc / num_vir_al + num_occ_al;
+    const int c = bc % num_vir_al + num_occ_al;
+
+    g_g_bbaa_oovv[ovvo2s_baab(k, c, b, j, num_occ_be, num_occ_al, num_vir_al, num_vir_be)] = g_g_aabb_full[q2s(b, c, k, j, num_basis)];
+}
+
+static __global__ void tensorize_x_aabb_ovov_swapped(
+    double* g_x_aabb_ovov, const double* g_g_aabb_full,
+    const double* g_eps_al, const double* g_eps_be,
+    const int num_occ_al, const int num_vir_al,
+    const int num_occ_be, const int num_vir_be, const int num_basis)
+{
+    const size_t iajb = ((size_t)blockDim.x * blockDim.y) * (gridDim.x * blockIdx.y + blockIdx.x) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const size_t num_ovov = (size_t)num_occ_al * num_vir_al * num_occ_be * num_vir_be;
+    if (iajb >= num_ovov) {
+        return;
+    }
+
+    const int ia = iajb / (num_occ_be * num_vir_be);
+    const int jb = iajb % (num_occ_be * num_vir_be);
+    const int i = ia / num_vir_al;
+    const int a = ia % num_vir_al + num_occ_al;
+    const int j = jb / num_vir_be;
+    const int b = jb % num_vir_be + num_occ_be;
+
+    const double g_iajb = g_g_aabb_full[q2s(j, b, i, a, num_basis)];
+    const double eps_ijab = g_eps_al[i] + g_eps_be[j] - g_eps_al[a] - g_eps_be[b];
+
+    g_x_aabb_ovov[ovov2s_aabb(i, a, j, b, num_occ_al, num_vir_al, num_occ_be, num_vir_be)] = g_iajb / eps_ijab;
+}
 
 double ump3_from_aoeri_via_full_moeri_dgemm_eff(
     double* d_eri_ao,
@@ -3403,19 +3881,844 @@ double ump3_from_aoeri_via_full_moeri_dgemm_eff(
     return h_energy_4h2p_2h4p + h_energy_3h3p;
 }
 
+// ============================================================
+//  UMP3 via spin-transform reuse (peak 2 x M^4 buffers, GPU only)
+// ============================================================
+// The reference path transforms the AO ERIs four times (aaaa, aabb, bbaa,
+// bbbb), peaking at 3 M^4 buffers (AO + d_g_full + d_eri_tmp). This path
+// builds the alpha-spin MO ERIs once and obtains the beta-spin blocks by
+// rotating axes with the spin transformation matrix
+//
+//     U = C_alpha^T S C_beta
+//
+// (C_beta = C_alpha U holds exactly because both C_alpha and C_beta are
+// complete S-orthonormal bases of the same num_basis-dimensional space):
+//
+//     G_aabb[p,q,r,s] = sum_{x,y} G_aaaa[p,q,x,y] U(x,r) U(y,s)  (axes 2,3)
+//     G_bbbb[k,c,b,j] = sum_{x,y} G_aabb[x,y,b,j] U(x,k) U(y,c)  (axes 0,1)
+//
+// The (bb|aa) compact blocks are packed from the aabb tensor via ERI pair
+// symmetry (full_bbaa[k,c,b,j] = full_aabb[b,j,k,c]).
+//
+// Buffer ping-pong (B0 = d_eri_ao, reused as scratch and destroyed;
+// B1 = d_g_full):
+//   stage A: AO --(full transform, C_alpha)--> aaaa in B1
+//   stage B: B1 --rot axis 3--> B0 --transpose--> B1 --rot axis 0--> B0
+//            --transpose--> B1 (= aabb)
+//   stage C: B1 --rot axis 1 (batched)--> B0 --rot axis 0--> B1 (= bbbb)
+//
+// The contraction sequence is identical to the reference implementation.
+// U is verified on the host before the AO ERIs are touched; if the check
+// fails, the reference path runs instead and *out_ao_consumed stays false.
 
+// Tolerance for the spin rotation matrix consistency check.
+constexpr double kSpinRotationTolerance = 1e-8;
 
+// Builds U = C_alpha^T S C_beta and returns the maximum deviation of the
+// consistency checks max|C_alpha U - C_beta| and max|U^T U - I|.
+// (C_alpha and C_beta are complete S-orthonormal bases, so both should hold
+// to SCF orthonormality precision, ~1e-14.) The built matrix is handed out
+// through *out_d_U (tracked allocation; the caller owns and frees it).
+// Used both inside ump3_from_aoeri_via_cascade and by callers that need
+// the check result before deciding whether to enter the fused UMP2/UMP3
+// workflow, so both see the identical (deterministic) decision.
+static double build_spin_rotation_matrix(
+    double** out_d_U,
+    const double* d_coefficient_matrix_al,
+    const double* d_coefficient_matrix_be,
+    const double* d_overlap_matrix,
+    const int num_basis)
+{
+    const size_t num_basis_2 = (size_t)num_basis * num_basis;
 
+    double* d_U = nullptr;
+    double* d_U_tmp = nullptr;
+    tracked_cudaMalloc(&d_U, sizeof(double) * num_basis_2);
+    tracked_cudaMalloc(&d_U_tmp, sizeof(double) * num_basis_2);
+    if (!d_U) { THROW_EXCEPTION("cudaMalloc failed for d_U."); }
+    if (!d_U_tmp) { THROW_EXCEPTION("cudaMalloc failed for d_U_tmp."); }
 
+    {
+        if (gpu::gpu_available()) {
+            cublasHandle_t cublasH = NULL;
+            cublasCreate(&cublasH);
+            const double alpha = 1.0;
+            const double beta = 0.0;
+            // U_tmp = C_alpha^T S
+            dgemm_device_row_major(cublasH, CUBLAS_OP_T, CUBLAS_OP_N,
+                num_basis, num_basis, num_basis, &alpha,
+                d_coefficient_matrix_al, num_basis,
+                d_overlap_matrix, num_basis, &beta,
+                d_U_tmp, num_basis);
+            // U = U_tmp C_beta
+            dgemm_device_row_major(cublasH, CUBLAS_OP_N, CUBLAS_OP_N,
+                num_basis, num_basis, num_basis, &alpha,
+                d_U_tmp, num_basis,
+                d_coefficient_matrix_be, num_basis, &beta,
+                d_U, num_basis);
+            cublasDestroy(cublasH);
+        } else {
+            // U_tmp = C_alpha^T S
+            cpu_dgemm_ld_row_major(CUBLAS_OP_T, CUBLAS_OP_N,
+                num_basis, num_basis, num_basis,
+                d_coefficient_matrix_al, num_basis,
+                d_overlap_matrix, num_basis,
+                d_U_tmp, num_basis);
+            // U = U_tmp C_beta
+            cpu_dgemm_ld_row_major(CUBLAS_OP_N, CUBLAS_OP_N,
+                num_basis, num_basis, num_basis,
+                d_U_tmp, num_basis,
+                d_coefficient_matrix_be, num_basis,
+                d_U, num_basis);
+        }
+        cudaDeviceSynchronize();
+    }
 
+    // Host-side verification: max |C_alpha U - C_beta| and max |U^T U - I|.
+    double max_dev = 0.0;
+    {
+        std::vector<double> h_Ca(num_basis_2), h_Cb(num_basis_2), h_U(num_basis_2);
+        cudaMemcpy(h_Ca.data(), d_coefficient_matrix_al, sizeof(double) * num_basis_2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_Cb.data(), d_coefficient_matrix_be, sizeof(double) * num_basis_2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_U.data(), d_U, sizeof(double) * num_basis_2, cudaMemcpyDeviceToHost);
 
+        for (int mu = 0; mu < num_basis; mu++) {
+            for (int q = 0; q < num_basis; q++) {
+                double sum = 0.0;
+                for (int p = 0; p < num_basis; p++) {
+                    sum += h_Ca[(size_t)mu * num_basis + p] * h_U[(size_t)p * num_basis + q];
+                }
+                max_dev = std::max(max_dev, std::fabs(sum - h_Cb[(size_t)mu * num_basis + q]));
+            }
+        }
+        for (int p = 0; p < num_basis; p++) {
+            for (int q = 0; q < num_basis; q++) {
+                double sum = 0.0;
+                for (int x = 0; x < num_basis; x++) {
+                    sum += h_U[(size_t)x * num_basis + p] * h_U[(size_t)x * num_basis + q];
+                }
+                max_dev = std::max(max_dev, std::fabs(sum - (p == q ? 1.0 : 0.0)));
+            }
+        }
+    }
 
+    tracked_cudaFree(d_U_tmp);
+    *out_d_U = d_U;
+    return max_dev;
+}
+
+double ump3_from_aoeri_via_cascade(
+    double* d_eri_ao,
+    const double* d_coefficient_matrix_al,
+    const double* d_coefficient_matrix_be,
+    const double* d_overlap_matrix,
+    const double* d_orbital_energies_al,
+    const double* d_orbital_energies_be,
+    const int num_basis,
+    const int num_occ_al,
+    const int num_occ_be,
+    const int num_frozen = 0,
+    bool* out_ao_consumed = nullptr,
+    double* out_ump2_energy = nullptr,
+    bool* out_ump2_from_superset = nullptr)
+{
+    if (out_ao_consumed) { *out_ao_consumed = false; }
+    if (out_ump2_from_superset) { *out_ump2_from_superset = false; }
+    // ump3_superset: when out_ump2_energy is non-null, the UMP2 correlation
+    // energy is obtained from the cascade intermediates (the cascade UMP3
+    // intermediates are a strict superset of the canonical UMP2 inputs),
+    // making the standalone UMP2 phase -- a full extra pass over the AO ERIs
+    // -- unnecessary.
+    const bool superset_ump2 = (out_ump2_energy != nullptr);
+
+    // NOTE: the CPU backend no longer falls back to the reference (eff)
+    // implementation. Both backends now execute the identical cascade
+    // algorithm — the same GEMM/transform sequence, tensorization kernels,
+    // and contraction order — so GPU-vs-CPU comparisons reflect hardware
+    // differences, not algorithm differences. The dispatchers below choose
+    // cuBLAS (GPU) or Eigen (CPU, OpenMP-threaded) for each GEMM.
+
+    const int active_occ_al = num_occ_al - num_frozen;
+    const int active_occ_be = num_occ_be - num_frozen;
+    const int num_vir_al = num_basis - num_occ_al;
+    const int num_vir_be = num_basis - num_occ_be;
+    const int na_active = num_basis - num_frozen;  // = active_occ + num_vir (same for al/be)
+
+    // Shifted epsilon pointers for frozen core
+    const double* d_eps_al = d_orbital_energies_al + num_frozen;
+    const double* d_eps_be = d_orbital_energies_be + num_frozen;
+
+    double* d_g_full = nullptr;       // B1 (the only newly allocated M^4 buffer)
+    const size_t num_basis_2 = num_basis * num_basis;
+    const size_t num_basis_3 = num_basis_2 * num_basis;
+    const size_t num_basis_4 = num_basis_2 * num_basis_2;
+    tracked_cudaMalloc(&d_g_full, sizeof(double) * num_basis_4);
+    if (!d_g_full) { THROW_EXCEPTION("cudaMalloc failed for d_g_full."); }
+
+    double* d_energy_4h2p_2h4p = nullptr;
+    double* d_energy_3h3p = nullptr;
+    tracked_cudaMalloc(&d_energy_4h2p_2h4p, sizeof(double));
+    tracked_cudaMalloc(&d_energy_3h3p, sizeof(double));
+    cudaMemset(d_energy_4h2p_2h4p, 0, sizeof(double));
+    cudaMemset(d_energy_3h3p, 0, sizeof(double));
+
+    // UMP2 energy accumulator for the fused workflow (ss_aa + os_ab + ss_bb,
+    // accumulated by the existing compute_ump2_energy_contrib_* kernels).
+    double* d_ump2_energy = nullptr;
+    if (superset_ump2) {
+        tracked_cudaMalloc(&d_ump2_energy, sizeof(double));
+        if (!d_ump2_energy) { THROW_EXCEPTION("cudaMalloc failed for d_ump2_energy."); }
+        cudaMemset(d_ump2_energy, 0, sizeof(double));
+    }
+
+    constexpr int num_threads_per_warp = 32;
+    constexpr int num_warps_per_block = 32;
+    constexpr int num_threads_per_block = num_threads_per_warp * num_warps_per_block;
+    const dim3 threads(num_threads_per_warp, num_warps_per_block);
+
+    const size_t num_aaaa_oooo = (size_t)active_occ_al * active_occ_al * active_occ_al * active_occ_al;
+    const size_t num_aaaa_vvvv = (size_t)num_vir_al * num_vir_al * num_vir_al * num_vir_al;
+    const size_t num_aaaa_ovov = (size_t)active_occ_al * num_vir_al * active_occ_al * num_vir_al;
+    const size_t num_aabb_oooo = (size_t)active_occ_al * active_occ_be * active_occ_al * active_occ_be;
+    const size_t num_aabb_vvvv = (size_t)num_vir_al * num_vir_be * num_vir_al * num_vir_be;
+    const size_t num_aabb_ovov = (size_t)active_occ_al * num_vir_al * active_occ_be * num_vir_be;
+    const size_t num_aabb_oovv = (size_t)active_occ_al * active_occ_al * num_vir_be * num_vir_be;
+    const size_t num_bbaa_oovv = (size_t)active_occ_be * active_occ_be * num_vir_al * num_vir_al;
+    const size_t num_bbbb_oooo = (size_t)active_occ_be * active_occ_be * active_occ_be * active_occ_be;
+    const size_t num_bbbb_vvvv = (size_t)num_vir_be * num_vir_be * num_vir_be * num_vir_be;
+    const size_t num_bbbb_ovov = (size_t)active_occ_be * num_vir_be * active_occ_be * num_vir_be;
+    const size_t num_same_ovov_max = std::max(num_aaaa_ovov, num_bbbb_ovov);
+
+    const size_t num_blocks_aaaa_oooo = (num_aaaa_oooo + num_threads_per_block - 1) / num_threads_per_block;
+    const size_t num_blocks_aaaa_vvvv = (num_aaaa_vvvv + num_threads_per_block - 1) / num_threads_per_block;
+    const size_t num_blocks_aaaa_ovov = (num_aaaa_ovov + num_threads_per_block - 1) / num_threads_per_block;
+    const size_t num_blocks_aabb_oooo = (num_aabb_oooo + num_threads_per_block - 1) / num_threads_per_block;
+    const size_t num_blocks_aabb_vvvv = (num_aabb_vvvv + num_threads_per_block - 1) / num_threads_per_block;
+    const size_t num_blocks_aabb_ovov = (num_aabb_ovov + num_threads_per_block - 1) / num_threads_per_block;
+    const size_t num_blocks_aabb_oovv = (num_aabb_oovv + num_threads_per_block - 1) / num_threads_per_block;
+    const size_t num_blocks_bbaa_oovv = (num_bbaa_oovv + num_threads_per_block - 1) / num_threads_per_block;
+    const size_t num_blocks_bbbb_oooo = (num_bbbb_oooo + num_threads_per_block - 1) / num_threads_per_block;
+    const size_t num_blocks_bbbb_vvvv = (num_bbbb_vvvv + num_threads_per_block - 1) / num_threads_per_block;
+    const size_t num_blocks_bbbb_ovov = (num_bbbb_ovov + num_threads_per_block - 1) / num_threads_per_block;
+
+    {
+        if (gpu::gpu_available()) {
+            cudaDeviceProp prop;
+            int device = 0;
+            cudaGetDeviceProperties(&prop, device);
+
+            const auto check_num_blocks = [&prop](const size_t num_blocks) {
+                if (num_blocks > static_cast<size_t>(prop.maxGridSize[0])) {
+                    THROW_EXCEPTION("Error: Too many blocks for the grid size.");
+                }
+            };
+
+            check_num_blocks(num_blocks_aaaa_oooo);
+            check_num_blocks(num_blocks_aaaa_vvvv);
+            check_num_blocks(num_blocks_aaaa_ovov);
+            check_num_blocks(num_blocks_aabb_oooo);
+            check_num_blocks(num_blocks_aabb_vvvv);
+            check_num_blocks(num_blocks_aabb_ovov);
+            check_num_blocks(num_blocks_aabb_oovv);
+            check_num_blocks(num_blocks_bbaa_oovv);
+            check_num_blocks(num_blocks_bbbb_oooo);
+            check_num_blocks(num_blocks_bbbb_vvvv);
+            check_num_blocks(num_blocks_bbbb_ovov);
+        }
+    }
+
+    cublasHandle_t cublasH = NULL;
+    if (gpu::gpu_available()) {
+        cublasCreate(&cublasH);
+    }
+
+    // Backend-agnostic GEMM/transpose dispatchers: on GPU they call the
+    // cuBLAS wrappers of ao2mo.cuh; on CPU they run the identical operation
+    // through Eigen (OpenMP-threaded), preserving operand shapes, strides,
+    // and the ping-pong buffer schedule of the GPU path.
+    auto dgemm_rm = [cublasH](cublasOperation_t opA, cublasOperation_t opB,
+                              int m, int n, int k,
+                              const double* A, int lda,
+                              const double* B, int ldb,
+                              double* C, int ldc) {
+        const double alpha = 1.0;
+        const double beta = 0.0;
+        if (gpu::gpu_available()) {
+            dgemm_device_row_major(cublasH, opA, opB, m, n, k, &alpha, A, lda, B, ldb, &beta, C, ldc);
+        } else {
+            cpu_dgemm_ld_row_major(opA, opB, m, n, k, A, lda, B, ldb, C, ldc);
+        }
+    };
+    auto dgeam_transpose_rm = [cublasH](int rows_rm, int cols_rm, const double* A, double* AT) {
+        if (gpu::gpu_available()) {
+            dgeam_transpose_row_major(cublasH, rows_rm, cols_rm, A, AT);
+        } else {
+            cpu_dgeam_transpose_row_major(rows_rm, cols_rm, A, AT);
+        }
+    };
+    auto dgemm_batched_rm = [cublasH](cublasOperation_t opA, cublasOperation_t opB,
+                                      int m, int n, int k,
+                                      const double* A, int lda, long long int strideA,
+                                      const double* B, int ldb, long long int strideB,
+                                      double* C, int ldc, long long int strideC,
+                                      int batchCount) {
+        const double alpha = 1.0;
+        const double beta = 0.0;
+        if (gpu::gpu_available()) {
+            dgemm_strided_batched_device_row_major(cublasH, opA, opB, m, n, k, &alpha,
+                A, lda, strideA, B, ldb, strideB, &beta, C, ldc, strideC, batchCount);
+        } else {
+            cpu_dgemm_strided_batched_ld_row_major(opA, opB, m, n, k,
+                A, lda, strideA, B, ldb, strideB, C, ldc, strideC, batchCount);
+        }
+    };
+
+    double* d_tmp_same_1 = nullptr;
+    double* d_tmp_same_2 = nullptr;
+    double* d_tmp_same_3 = nullptr;
+    double* d_tmp_mixed_1 = nullptr;
+    double* d_tmp_mixed_2 = nullptr;
+    double* d_tmp_mixed_3 = nullptr;
+    tracked_cudaMalloc(&d_tmp_same_1, sizeof(double) * num_same_ovov_max);
+    tracked_cudaMalloc(&d_tmp_same_2, sizeof(double) * num_same_ovov_max);
+    tracked_cudaMalloc(&d_tmp_same_3, sizeof(double) * num_same_ovov_max);
+    tracked_cudaMalloc(&d_tmp_mixed_1, sizeof(double) * num_aabb_ovov);
+    tracked_cudaMalloc(&d_tmp_mixed_2, sizeof(double) * num_aabb_ovov);
+    tracked_cudaMalloc(&d_tmp_mixed_3, sizeof(double) * num_aabb_ovov);
+    if (!d_tmp_same_1) { THROW_EXCEPTION("cudaMalloc failed for d_tmp_same_1."); }
+    if (!d_tmp_same_2) { THROW_EXCEPTION("cudaMalloc failed for d_tmp_same_2."); }
+    if (!d_tmp_same_3) { THROW_EXCEPTION("cudaMalloc failed for d_tmp_same_3."); }
+    if (!d_tmp_mixed_1) { THROW_EXCEPTION("cudaMalloc failed for d_tmp_mixed_1."); }
+    if (!d_tmp_mixed_2) { THROW_EXCEPTION("cudaMalloc failed for d_tmp_mixed_2."); }
+    if (!d_tmp_mixed_3) { THROW_EXCEPTION("cudaMalloc failed for d_tmp_mixed_3."); }
+
+    double* d_y_aaaa_ovov = nullptr;
+    double* d_u_aaaa_ovvo = nullptr;
+    double* d_x_aabb_ovov = nullptr;
+    double* d_g_aabb_oovv = nullptr;
+    double* d_g_aabb_ovvo = nullptr;
+    double* d_x_bbaa_ovov = nullptr;
+    double* d_g_bbaa_ovvo = nullptr;
+    double* d_g_bbaa_oovv = nullptr;
+
+    tracked_cudaMalloc(&d_y_aaaa_ovov, sizeof(double) * num_aaaa_ovov);
+    tracked_cudaMalloc(&d_u_aaaa_ovvo, sizeof(double) * num_aaaa_ovov);
+    tracked_cudaMalloc(&d_x_aabb_ovov, sizeof(double) * num_aabb_ovov);
+    tracked_cudaMalloc(&d_g_aabb_oovv, sizeof(double) * num_aabb_oovv);
+    tracked_cudaMalloc(&d_g_aabb_ovvo, sizeof(double) * num_aabb_ovov);
+    tracked_cudaMalloc(&d_x_bbaa_ovov, sizeof(double) * num_aabb_ovov);
+    if (!d_y_aaaa_ovov) { THROW_EXCEPTION("cudaMalloc failed for d_y_aaaa_ovov."); }
+    if (!d_u_aaaa_ovvo) { THROW_EXCEPTION("cudaMalloc failed for d_u_aaaa_ovvo."); }
+    if (!d_x_aabb_ovov) { THROW_EXCEPTION("cudaMalloc failed for d_x_aabb_ovov."); }
+    if (!d_g_aabb_oovv) { THROW_EXCEPTION("cudaMalloc failed for d_g_aabb_oovv."); }
+    if (!d_g_aabb_ovvo) { THROW_EXCEPTION("cudaMalloc failed for d_g_aabb_ovvo."); }
+    if (!d_x_bbaa_ovov) { THROW_EXCEPTION("cudaMalloc failed for d_x_bbaa_ovov."); }
+
+    cudaMemset(d_y_aaaa_ovov, 0, sizeof(double) * num_aaaa_ovov);
+    cudaMemset(d_u_aaaa_ovvo, 0, sizeof(double) * num_aaaa_ovov);
+    cudaMemset(d_x_aabb_ovov, 0, sizeof(double) * num_aabb_ovov);
+    cudaMemset(d_g_aabb_oovv, 0, sizeof(double) * num_aabb_oovv);
+    cudaMemset(d_g_aabb_ovvo, 0, sizeof(double) * num_aabb_ovov);
+    cudaMemset(d_x_bbaa_ovov, 0, sizeof(double) * num_aabb_ovov);
+
+    // Helper: trim full MO ERI to active space when frozen core is present
+    // After transform, d_g_full is num_basis^4. Trim into d_eri_ao (reused as temp).
+    auto trim_eri = [&](double* d_src, double* d_dst) {
+        if (num_frozen == 0) return d_src;  // no trim needed
+        const size_t na4 = (size_t)na_active * na_active * na_active * na_active;
+        if (!gpu::gpu_available()) {
+            const size_t N = num_basis;
+            #pragma omp parallel for collapse(2)
+            for (int p = 0; p < na_active; p++)
+                for (int q = 0; q < na_active; q++)
+                    for (int r = 0; r < na_active; r++)
+                        for (int s = 0; s < na_active; s++) {
+                            size_t src = ((size_t)(num_frozen+p)*N + (num_frozen+q))*N*N
+                                       + (size_t)(num_frozen+r)*N + (num_frozen+s);
+                            size_t dst_idx = ((size_t)p*na_active*na_active + (size_t)q*na_active + r)*(size_t)na_active + s;
+                            d_dst[dst_idx] = d_src[src];
+                        }
+        } else {
+            int thr = 256;
+            int blk = (int)((na4 + thr - 1) / thr);
+            trim_eri_frozen_core_kernel<<<blk, thr>>>(d_src, d_dst, num_basis, na_active, num_frozen);
+            cudaDeviceSynchronize();
+        }
+        return d_dst;
+    };
+
+    // The AO-ERI buffer (d_eri_ao) is dead storage between the transforms/
+    // rotations: it only serves as their ping-pong scratch, and after each
+    // transform its contents are garbage. The large vvvv intermediates are
+    // allocated exactly inside those dead windows, so they can be carved
+    // into the AO-ERI buffer instead of allocating fresh memory. This
+    // reduces the peak from 2*M^4 + v^4 to 2*M^4.
+    // Restriction: with a frozen core, trim_eri() writes the trimmed tensor
+    // into d_eri_ao, so the buffer is live during tensorization; in that
+    // case keep the plain mallocs (frozen-core cases are small anyway).
+    const bool carve_vvvv_into_eri = (num_frozen == 0);
+
+    // ---- Build and verify U = C_alpha^T S C_beta (before the AO ERIs are touched) ----
+    double* d_U = nullptr;
+    const double u_max_dev = build_spin_rotation_matrix(
+        &d_U,
+        d_coefficient_matrix_al,
+        d_coefficient_matrix_be,
+        d_overlap_matrix,
+        num_basis);
+
+    if (u_max_dev > kSpinRotationTolerance) {
+        std::cout << "[UMP3] cascade: spin transformation matrix check failed (max deviation "
+                  << u_max_dev << "); falling back to the default algorithm." << std::endl;
+        tracked_cudaFree(d_U);
+        if (superset_ump2) { tracked_cudaFree(d_ump2_energy); }
+        cublasDestroy(cublasH);
+        tracked_cudaFree(d_g_full);
+        tracked_cudaFree(d_energy_4h2p_2h4p);
+        tracked_cudaFree(d_energy_3h3p);
+        tracked_cudaFree(d_tmp_same_1);
+        tracked_cudaFree(d_tmp_same_2);
+        tracked_cudaFree(d_tmp_same_3);
+        tracked_cudaFree(d_tmp_mixed_1);
+        tracked_cudaFree(d_tmp_mixed_2);
+        tracked_cudaFree(d_tmp_mixed_3);
+        tracked_cudaFree(d_y_aaaa_ovov);
+        tracked_cudaFree(d_u_aaaa_ovvo);
+        tracked_cudaFree(d_x_aabb_ovov);
+        tracked_cudaFree(d_g_aabb_oovv);
+        tracked_cudaFree(d_g_aabb_ovvo);
+        tracked_cudaFree(d_x_bbaa_ovov);
+        return ump3_from_aoeri_via_full_moeri_dgemm_eff(
+            d_eri_ao,
+            d_coefficient_matrix_al,
+            d_coefficient_matrix_be,
+            d_orbital_energies_al,
+            d_orbital_energies_be,
+            num_basis,
+            num_occ_al,
+            num_occ_be,
+            num_frozen
+        );
+    }
+
+    // (αα|αα) block: B0 (= d_eri_ao) is destructively consumed by the transform.
+    {
+        if (gpu::gpu_available()) {
+            transform_eri_ao2mo_dgemm_full(d_eri_ao, d_g_full, d_coefficient_matrix_al, num_basis);
+        } else {
+            cpu_kernels::transform_eri_ao2mo_dgemm_full_cpu(d_eri_ao, d_g_full, d_coefficient_matrix_al, num_basis);
+        }
+        double* d_g_src = trim_eri(d_g_full, d_eri_ao);
+
+        double* d_g_aaaa_oooo = nullptr;
+        double* d_g_aaaa_vvvv = nullptr;
+        double* d_x_aaaa_ovov = nullptr;
+        tracked_cudaMalloc(&d_g_aaaa_oooo, sizeof(double) * num_aaaa_oooo);
+        bool aaaa_vvvv_is_carved = false;
+        if (carve_vvvv_into_eri) {
+            // vvvv <= M^4 always holds, so the block fits in the dead
+            // AO-ERI buffer. The Stage-B rotations that overwrite this
+            // buffer are issued after the contraction below (same-stream
+            // execution order), so the handoff is race-free.
+            d_g_aaaa_vvvv = d_eri_ao;
+            aaaa_vvvv_is_carved = true;
+        } else {
+            tracked_cudaMalloc(&d_g_aaaa_vvvv, sizeof(double) * num_aaaa_vvvv);
+        }
+        tracked_cudaMalloc(&d_x_aaaa_ovov, sizeof(double) * num_aaaa_ovov);
+        if (!d_g_aaaa_oooo) { THROW_EXCEPTION("cudaMalloc failed for d_g_aaaa_oooo."); }
+        if (!d_g_aaaa_vvvv) { THROW_EXCEPTION("cudaMalloc failed for d_g_aaaa_vvvv."); }
+        if (!d_x_aaaa_ovov) { THROW_EXCEPTION("cudaMalloc failed for d_x_aaaa_ovov."); }
+
+        cudaMemset(d_g_aaaa_oooo, 0, sizeof(double) * num_aaaa_oooo);
+        cudaMemset(d_g_aaaa_vvvv, 0, sizeof(double) * num_aaaa_vvvv);
+        cudaMemset(d_x_aaaa_ovov, 0, sizeof(double) * num_aaaa_ovov);
+        cudaMemset(d_y_aaaa_ovov, 0, sizeof(double) * num_aaaa_ovov);
+        cudaMemset(d_u_aaaa_ovvo, 0, sizeof(double) * num_aaaa_ovov);
+
+        if (!gpu::gpu_available()) {
+            cpu_kernels::tensorize_g_aaaa_oooo_cpu(d_g_aaaa_oooo, d_g_src, active_occ_al, num_vir_al);
+            cpu_kernels::tensorize_g_aaaa_vvvv_cpu(d_g_aaaa_vvvv, d_g_src, active_occ_al, num_vir_al);
+            cpu_kernels::tensorize_u_aaaa_ovvo_cpu(d_u_aaaa_ovvo, d_g_src, active_occ_al, num_vir_al);
+            cpu_kernels::tensorize_x_aaaa_ovov_cpu(d_x_aaaa_ovov, d_g_src, d_eps_al, active_occ_al, num_vir_al);
+            cpu_kernels::tensorize_y_aaaa_ovov_cpu(d_y_aaaa_ovov, d_g_src, d_eps_al, active_occ_al, num_vir_al);
+        } else {
+            tensorize_g_aaaa_oooo<<<num_blocks_aaaa_oooo, threads>>>(d_g_aaaa_oooo, d_g_src, active_occ_al, num_vir_al);
+            tensorize_g_aaaa_vvvv<<<num_blocks_aaaa_vvvv, threads>>>(d_g_aaaa_vvvv, d_g_src, active_occ_al, num_vir_al);
+            tensorize_u_aaaa_ovvo<<<num_blocks_aaaa_ovov, threads>>>(d_u_aaaa_ovvo, d_g_src, active_occ_al, num_vir_al);
+            tensorize_x_aaaa_ovov<<<num_blocks_aaaa_ovov, threads>>>(d_x_aaaa_ovov, d_g_src, d_eps_al, active_occ_al, num_vir_al);
+            tensorize_y_aaaa_ovov<<<num_blocks_aaaa_ovov, threads>>>(d_y_aaaa_ovov, d_g_src, d_eps_al, active_occ_al, num_vir_al);
+        }
+
+        if (superset_ump2) {
+            // Plain (ia|jb) ovov block -> UMP2 same-spin (alpha-alpha) energy.
+            // Reuses d_tmp_same_1 (overwritten by the contraction below). The
+            // compact ovov layout (ovov2s) is identical to the layout expected
+            // by the UMP2 energy kernel (ovov2seq) when called with the
+            // active-space counts, num_frozen = 0, and the shifted epsilon
+            // pointer, so the standalone-validated kernel is reused verbatim.
+            if (!gpu::gpu_available()) {
+                cpu_kernels::tensorize_g_aaaa_ovov_cpu(d_tmp_same_1, d_g_src, active_occ_al, num_vir_al);
+                cpu_kernels::compute_ump2_energy_contrib_ss_cpu(d_ump2_energy, d_tmp_same_1, d_eps_al, active_occ_al, num_vir_al, 0);
+            } else {
+                tensorize_g_aaaa_ovov<<<num_blocks_aaaa_ovov, threads>>>(d_tmp_same_1, d_g_src, active_occ_al, num_vir_al);
+                compute_ump2_energy_contrib_ss<<<num_blocks_aaaa_ovov, threads>>>(d_ump2_energy, d_tmp_same_1, d_eps_al, active_occ_al, num_vir_al, 0);
+            }
+        }
+
+        contract_same_spin_contributions_from_tensors(
+            cublasH,
+            d_energy_4h2p_2h4p, d_energy_3h3p,
+            d_x_aaaa_ovov, d_y_aaaa_ovov,
+            d_g_aaaa_oooo, d_g_aaaa_vvvv,
+            d_u_aaaa_ovvo,
+            d_tmp_same_1, d_tmp_same_2, d_tmp_same_3,
+            threads, num_blocks_aaaa_ovov,
+            active_occ_al, num_vir_al
+        );
+
+        tracked_cudaFree(d_g_aaaa_oooo);
+        if (!aaaa_vvvv_is_carved) { tracked_cudaFree(d_g_aaaa_vvvv); }  // carved: backed by the AO-ERI buffer, freed by its owner
+        tracked_cudaFree(d_x_aaaa_ovov);
+    }
+
+    // (αα|ββ) block: rotate axes 2,3 of the aaaa tensor (B1) with U.
+    {
+        // axis 3: B0[a0,a1,a2,s] = sum_y B1[a0,a1,a2,y] U(y,s)
+        dgemm_rm(CUBLAS_OP_N, CUBLAS_OP_N,
+            (int)num_basis_3, num_basis, num_basis,
+            d_g_full, num_basis,
+            d_U, num_basis,
+            d_eri_ao, num_basis
+        );
+        // (N^2 x N^2) transpose: B1[old axis2, s, a0, a1] = B0[a0, a1, old axis2, s]
+        dgeam_transpose_rm((int)num_basis_2, (int)num_basis_2, d_eri_ao, d_g_full);
+        // axis 0: B0[k, s, a0, a1] = sum_x U(x,k) B1[x, s, a0, a1]
+        dgemm_rm(CUBLAS_OP_T, CUBLAS_OP_N,
+            num_basis, (int)num_basis_3, num_basis,
+            d_U, num_basis,
+            d_g_full, (int)num_basis_3,
+            d_eri_ao, (int)num_basis_3
+        );
+        // (N^2 x N^2) transpose back: B1 = aabb [p_alpha, q_alpha, r_beta, s_beta]
+        dgeam_transpose_rm((int)num_basis_2, (int)num_basis_2, d_eri_ao, d_g_full);
+        cudaDeviceSynchronize();
+
+        double* d_g_src = trim_eri(d_g_full, d_eri_ao);
+
+        double* d_g_aabb_oooo = nullptr;
+        double* d_g_aabb_vvvv = nullptr;
+        tracked_cudaMalloc(&d_g_aabb_oooo, sizeof(double) * num_aabb_oooo);
+        bool aabb_vvvv_is_carved = false;
+        if (carve_vvvv_into_eri) {
+            // Dead window: the Stage-C rotations that overwrite the AO-ERI
+            // buffer are issued after the 4h2p contraction below consumed
+            // this block (same-stream execution order).
+            d_g_aabb_vvvv = d_eri_ao;
+            aabb_vvvv_is_carved = true;
+        } else {
+            tracked_cudaMalloc(&d_g_aabb_vvvv, sizeof(double) * num_aabb_vvvv);
+        }
+        if (!d_g_aabb_oooo) { THROW_EXCEPTION("cudaMalloc failed for d_g_aabb_oooo."); }
+        if (!d_g_aabb_vvvv) { THROW_EXCEPTION("cudaMalloc failed for d_g_aabb_vvvv."); }
+
+        cudaMemset(d_g_aabb_oooo, 0, sizeof(double) * num_aabb_oooo);
+        cudaMemset(d_g_aabb_vvvv, 0, sizeof(double) * num_aabb_vvvv);
+        cudaMemset(d_x_aabb_ovov, 0, sizeof(double) * num_aabb_ovov);
+        cudaMemset(d_g_aabb_oovv, 0, sizeof(double) * num_aabb_oovv);
+        cudaMemset(d_g_aabb_ovvo, 0, sizeof(double) * num_aabb_ovov);
+
+        if (!gpu::gpu_available()) {
+            cpu_kernels::tensorize_g_aabb_oooo_cpu(d_g_aabb_oooo, d_g_src, active_occ_al, active_occ_be, na_active);
+            cpu_kernels::tensorize_g_aabb_vvvv_cpu(d_g_aabb_vvvv, d_g_src, active_occ_al, active_occ_be, num_vir_al, num_vir_be, na_active);
+            cpu_kernels::tensorize_x_aabb_ovov_cpu(d_x_aabb_ovov, d_g_src, d_eps_al, d_eps_be, active_occ_al, num_vir_al, active_occ_be, num_vir_be, na_active);
+            cpu_kernels::tensorize_g_bbaa_oovv_cpu(d_g_aabb_oovv, d_g_src, active_occ_al, active_occ_be, num_vir_al, num_vir_be, na_active);
+            cpu_kernels::tensorize_g_bbaa_ovvo_cpu(d_g_aabb_ovvo, d_g_src, active_occ_al, active_occ_be, num_vir_al, num_vir_be, na_active);
+        } else {
+            tensorize_g_aabb_oooo<<<num_blocks_aabb_oooo, threads>>>(d_g_aabb_oooo, d_g_src, active_occ_al, active_occ_be, na_active);
+            tensorize_g_aabb_vvvv<<<num_blocks_aabb_vvvv, threads>>>(d_g_aabb_vvvv, d_g_src, active_occ_al, active_occ_be, num_vir_al, num_vir_be, na_active);
+            tensorize_x_aabb_ovov<<<num_blocks_aabb_ovov, threads>>>(d_x_aabb_ovov, d_g_src, d_eps_al, d_eps_be, active_occ_al, num_vir_al, active_occ_be, num_vir_be, na_active);
+            tensorize_g_bbaa_oovv<<<num_blocks_aabb_oovv, threads>>>(d_g_aabb_oovv, d_g_src, active_occ_al, active_occ_be, num_vir_al, num_vir_be, na_active);
+            tensorize_g_bbaa_ovvo<<<num_blocks_aabb_ovov, threads>>>(d_g_aabb_ovvo, d_g_src, active_occ_al, active_occ_be, num_vir_al, num_vir_be, na_active);
+        }
+
+        // Pack the (ββ|αα) compact blocks from the aabb tensor via pair
+        // exchange (full_bbaa[k,c,b,j] = full_aabb[b,j,k,c]).
+        tracked_cudaMalloc(&d_g_bbaa_ovvo, sizeof(double) * num_aabb_ovov);
+        tracked_cudaMalloc(&d_g_bbaa_oovv, sizeof(double) * num_bbaa_oovv);
+        if (!d_g_bbaa_ovvo) { THROW_EXCEPTION("cudaMalloc failed for d_g_bbaa_ovvo."); }
+        if (!d_g_bbaa_oovv) { THROW_EXCEPTION("cudaMalloc failed for d_g_bbaa_oovv."); }
+
+        cudaMemset(d_x_bbaa_ovov, 0, sizeof(double) * num_aabb_ovov);
+        cudaMemset(d_g_bbaa_ovvo, 0, sizeof(double) * num_aabb_ovov);
+        cudaMemset(d_g_bbaa_oovv, 0, sizeof(double) * num_bbaa_oovv);
+
+        if (!gpu::gpu_available()) {
+            cpu_kernels::tensorize_x_aabb_ovov_swapped_cpu(d_x_bbaa_ovov, d_g_src, d_eps_be, d_eps_al, active_occ_be, num_vir_be, active_occ_al, num_vir_al, na_active);
+            cpu_kernels::tensorize_g_bbaa_ovvo_swapped_cpu(d_g_bbaa_ovvo, d_g_src, active_occ_be, active_occ_al, num_vir_be, num_vir_al, na_active);
+            cpu_kernels::tensorize_g_bbaa_oovv_swapped_cpu(d_g_bbaa_oovv, d_g_src, active_occ_be, active_occ_al, num_vir_be, num_vir_al, na_active);
+        } else {
+            tensorize_x_aabb_ovov_swapped<<<num_blocks_aabb_ovov, threads>>>(d_x_bbaa_ovov, d_g_src, d_eps_be, d_eps_al, active_occ_be, num_vir_be, active_occ_al, num_vir_al, na_active);
+            tensorize_g_bbaa_ovvo_swapped<<<num_blocks_aabb_ovov, threads>>>(d_g_bbaa_ovvo, d_g_src, active_occ_be, active_occ_al, num_vir_be, num_vir_al, na_active);
+            tensorize_g_bbaa_oovv_swapped<<<num_blocks_bbaa_oovv, threads>>>(d_g_bbaa_oovv, d_g_src, active_occ_be, active_occ_al, num_vir_be, num_vir_al, na_active);
+        }
+
+        if (superset_ump2) {
+            // Plain (i_al a_al | j_be b_be) ovov block -> UMP2 opposite-spin
+            // energy. Reuses d_tmp_mixed_1 (overwritten by the contraction
+            // below). Layout note: ovov2s_aabb is identical to the layout
+            // expected by compute_ump2_energy_contrib_os (ovov2seq_aabb)
+            // with the active-space counts, num_frozen = 0, and the shifted
+            // epsilon pointers.
+            if (!gpu::gpu_available()) {
+                cpu_kernels::tensorize_g_aabb_ovov_cpu(d_tmp_mixed_1, d_g_src, active_occ_al, num_vir_al, active_occ_be, num_vir_be, na_active);
+                cpu_kernels::compute_ump2_energy_contrib_os_cpu(d_ump2_energy, d_tmp_mixed_1, d_eps_al, d_eps_be, active_occ_al, num_vir_al, active_occ_be, num_vir_be, 0);
+            } else {
+                tensorize_g_aabb_ovov<<<num_blocks_aabb_ovov, threads>>>(d_tmp_mixed_1, d_g_src, active_occ_al, num_vir_al, active_occ_be, num_vir_be, na_active);
+                compute_ump2_energy_contrib_os<<<num_blocks_aabb_ovov, threads>>>(d_ump2_energy, d_tmp_mixed_1, d_eps_al, d_eps_be, active_occ_al, num_vir_al, active_occ_be, num_vir_be, 0);
+            }
+        }
+
+        contract_mixed_4h2p_2h4p_from_tensors(
+            cublasH,
+            d_energy_4h2p_2h4p,
+            d_x_aabb_ovov,
+            d_g_aabb_oooo,
+            d_g_aabb_vvvv,
+            d_tmp_mixed_1,
+            d_tmp_mixed_2,
+            d_tmp_mixed_3,
+            threads,
+            num_blocks_aabb_ovov,
+            active_occ_al, active_occ_be, num_vir_al, num_vir_be
+        );
+
+        tracked_cudaFree(d_g_aabb_oooo);
+        if (!aabb_vvvv_is_carved) { tracked_cudaFree(d_g_aabb_vvvv); }  // carved: backed by the AO-ERI buffer, freed by its owner
+
+        contract_mixed_yxg_3h3p_from_tensors(
+            cublasH,
+            d_energy_3h3p,
+            d_y_aaaa_ovov,
+            d_x_aabb_ovov,
+            d_g_bbaa_ovvo,
+            d_tmp_same_1,
+            threads,
+            num_blocks_aaaa_ovov,
+            active_occ_al, num_vir_al,
+            active_occ_be, num_vir_be
+        );
+
+        contract_mixed_xg_oovv_3h3p_from_tensors(
+            cublasH,
+            d_energy_3h3p,
+            d_x_aabb_ovov,
+            d_g_bbaa_oovv,
+            d_tmp_mixed_1,
+            d_tmp_mixed_2,
+            threads,
+            num_blocks_aabb_ovov,
+            active_occ_al, active_occ_be, num_vir_al, num_vir_be
+        );
+
+        contract_mixed_xg_oovv_3h3p_from_tensors(
+            cublasH,
+            d_energy_3h3p,
+            d_x_bbaa_ovov,
+            d_g_aabb_oovv,
+            d_tmp_mixed_1,
+            d_tmp_mixed_2,
+            threads,
+            num_blocks_aabb_ovov,
+            active_occ_be, active_occ_al, num_vir_be, num_vir_al
+        );
+
+        contract_mixed_xu_3h3p_from_tensors(
+            cublasH,
+            d_energy_3h3p,
+            d_x_bbaa_ovov,
+            d_u_aaaa_ovvo,
+            d_tmp_mixed_1,
+            threads,
+            num_blocks_aabb_ovov,
+            active_occ_be, active_occ_al, num_vir_be, num_vir_al
+        );
+
+        tracked_cudaFree(d_g_bbaa_ovvo);
+        tracked_cudaFree(d_g_bbaa_oovv);
+        tracked_cudaFree(d_y_aaaa_ovov);
+        tracked_cudaFree(d_u_aaaa_ovvo);
+        tracked_cudaFree(d_g_aabb_oovv);
+        d_y_aaaa_ovov = nullptr;
+        d_u_aaaa_ovvo = nullptr;
+        d_g_aabb_oovv = nullptr;
+    }
+
+    // (ββ|ββ) block: rotate axes 0,1 of the aabb tensor (B1) with U.
+    {
+        // axis 1 (batched over axis 0): B0[a0, c, b, j] = sum_y U(y,c) B1[a0, y, b, j]
+        dgemm_batched_rm(CUBLAS_OP_T, CUBLAS_OP_N,
+            num_basis, (int)num_basis_2, num_basis,
+            d_U, num_basis, 0,
+            d_g_full, (int)num_basis_2, (long long int)num_basis_3,
+            d_eri_ao, (int)num_basis_2, (long long int)num_basis_3,
+            num_basis
+        );
+        // axis 0: B1[k, c, b, j] = sum_x U(x,k) B0[x, c, b, j]  (B1 = bbbb)
+        dgemm_rm(CUBLAS_OP_T, CUBLAS_OP_N,
+            num_basis, (int)num_basis_3, num_basis,
+            d_U, num_basis,
+            d_eri_ao, (int)num_basis_3,
+            d_g_full, (int)num_basis_3
+        );
+        cudaDeviceSynchronize();
+
+        double* d_g_src = trim_eri(d_g_full, d_eri_ao);
+
+        double* d_g_bbbb_oooo = nullptr;
+        double* d_g_bbbb_vvvv = nullptr;
+        double* d_u_bbbb_ovvo = nullptr;
+        double* d_x_bbbb_ovov = nullptr;
+        double* d_y_bbbb_ovov = nullptr;
+        tracked_cudaMalloc(&d_g_bbbb_oooo, sizeof(double) * num_bbbb_oooo);
+        bool bbbb_vvvv_is_carved = false;
+        if (carve_vvvv_into_eri) {
+            // Final stage: the AO-ERI buffer is dead for the rest of the
+            // function, so the carved block can stay until the end.
+            d_g_bbbb_vvvv = d_eri_ao;
+            bbbb_vvvv_is_carved = true;
+        } else {
+            tracked_cudaMalloc(&d_g_bbbb_vvvv, sizeof(double) * num_bbbb_vvvv);
+        }
+        tracked_cudaMalloc(&d_u_bbbb_ovvo, sizeof(double) * num_bbbb_ovov);
+        tracked_cudaMalloc(&d_x_bbbb_ovov, sizeof(double) * num_bbbb_ovov);
+        tracked_cudaMalloc(&d_y_bbbb_ovov, sizeof(double) * num_bbbb_ovov);
+        if (!d_g_bbbb_oooo) { THROW_EXCEPTION("cudaMalloc failed for d_g_bbbb_oooo."); }
+        if (!d_g_bbbb_vvvv) { THROW_EXCEPTION("cudaMalloc failed for d_g_bbbb_vvvv."); }
+        if (!d_u_bbbb_ovvo) { THROW_EXCEPTION("cudaMalloc failed for d_u_bbbb_ovvo."); }
+        if (!d_x_bbbb_ovov) { THROW_EXCEPTION("cudaMalloc failed for d_x_bbbb_ovov."); }
+        if (!d_y_bbbb_ovov) { THROW_EXCEPTION("cudaMalloc failed for d_y_bbbb_ovov."); }
+
+        cudaMemset(d_g_bbbb_oooo, 0, sizeof(double) * num_bbbb_oooo);
+        cudaMemset(d_g_bbbb_vvvv, 0, sizeof(double) * num_bbbb_vvvv);
+        cudaMemset(d_u_bbbb_ovvo, 0, sizeof(double) * num_bbbb_ovov);
+        cudaMemset(d_x_bbbb_ovov, 0, sizeof(double) * num_bbbb_ovov);
+        cudaMemset(d_y_bbbb_ovov, 0, sizeof(double) * num_bbbb_ovov);
+
+        if (!gpu::gpu_available()) {
+            cpu_kernels::tensorize_g_aaaa_oooo_cpu(d_g_bbbb_oooo, d_g_src, active_occ_be, num_vir_be);
+            cpu_kernels::tensorize_g_aaaa_vvvv_cpu(d_g_bbbb_vvvv, d_g_src, active_occ_be, num_vir_be);
+            cpu_kernels::tensorize_u_aaaa_ovvo_cpu(d_u_bbbb_ovvo, d_g_src, active_occ_be, num_vir_be);
+            cpu_kernels::tensorize_x_aaaa_ovov_cpu(d_x_bbbb_ovov, d_g_src, d_eps_be, active_occ_be, num_vir_be);
+            cpu_kernels::tensorize_y_aaaa_ovov_cpu(d_y_bbbb_ovov, d_g_src, d_eps_be, active_occ_be, num_vir_be);
+        } else {
+            tensorize_g_aaaa_oooo<<<num_blocks_bbbb_oooo, threads>>>(d_g_bbbb_oooo, d_g_src, active_occ_be, num_vir_be);
+            tensorize_g_aaaa_vvvv<<<num_blocks_bbbb_vvvv, threads>>>(d_g_bbbb_vvvv, d_g_src, active_occ_be, num_vir_be);
+            tensorize_u_aaaa_ovvo<<<num_blocks_bbbb_ovov, threads>>>(d_u_bbbb_ovvo, d_g_src, active_occ_be, num_vir_be);
+            tensorize_x_aaaa_ovov<<<num_blocks_bbbb_ovov, threads>>>(d_x_bbbb_ovov, d_g_src, d_eps_be, active_occ_be, num_vir_be);
+            tensorize_y_aaaa_ovov<<<num_blocks_bbbb_ovov, threads>>>(d_y_bbbb_ovov, d_g_src, d_eps_be, active_occ_be, num_vir_be);
+        }
+
+        if (superset_ump2) {
+            // Plain (ia|jb) ovov block -> UMP2 same-spin (beta-beta) energy.
+            // Reuses d_tmp_same_1 (overwritten by the contraction below);
+            // same layout argument as the Stage-A superset accumulation above.
+            if (!gpu::gpu_available()) {
+                cpu_kernels::tensorize_g_aaaa_ovov_cpu(d_tmp_same_1, d_g_src, active_occ_be, num_vir_be);
+                cpu_kernels::compute_ump2_energy_contrib_ss_cpu(d_ump2_energy, d_tmp_same_1, d_eps_be, active_occ_be, num_vir_be, 0);
+            } else {
+                tensorize_g_aaaa_ovov<<<num_blocks_bbbb_ovov, threads>>>(d_tmp_same_1, d_g_src, active_occ_be, num_vir_be);
+                compute_ump2_energy_contrib_ss<<<num_blocks_bbbb_ovov, threads>>>(d_ump2_energy, d_tmp_same_1, d_eps_be, active_occ_be, num_vir_be, 0);
+            }
+        }
+
+        contract_mixed_xu_3h3p_from_tensors(
+            cublasH,
+            d_energy_3h3p,
+            d_x_aabb_ovov,
+            d_u_bbbb_ovvo,
+            d_tmp_mixed_1,
+            threads,
+            num_blocks_aabb_ovov,
+            active_occ_al, active_occ_be, num_vir_al, num_vir_be
+        );
+
+        contract_mixed_yxg_3h3p_from_tensors(
+            cublasH,
+            d_energy_3h3p,
+            d_y_bbbb_ovov,
+            d_x_bbaa_ovov,
+            d_g_aabb_ovvo,
+            d_tmp_same_1,
+            threads,
+            num_blocks_bbbb_ovov,
+            active_occ_be, num_vir_be,
+            active_occ_al, num_vir_al
+        );
+
+        contract_same_spin_contributions_from_tensors(
+            cublasH,
+            d_energy_4h2p_2h4p, d_energy_3h3p,
+            d_x_bbbb_ovov, d_y_bbbb_ovov,
+            d_g_bbbb_oooo, d_g_bbbb_vvvv,
+            d_u_bbbb_ovvo,
+            d_tmp_same_1, d_tmp_same_2, d_tmp_same_3,
+            threads, num_blocks_bbbb_ovov,
+            active_occ_be, num_vir_be
+        );
+
+        tracked_cudaFree(d_g_bbbb_oooo);
+        if (!bbbb_vvvv_is_carved) { tracked_cudaFree(d_g_bbbb_vvvv); }  // carved: backed by the AO-ERI buffer, freed by its owner
+        tracked_cudaFree(d_u_bbbb_ovvo);
+        tracked_cudaFree(d_x_bbbb_ovov);
+        tracked_cudaFree(d_y_bbbb_ovov);
+    }
+
+    double h_energy_3h3p = 0.0;
+    double h_energy_4h2p_2h4p = 0.0;
+    cudaMemcpy(&h_energy_3h3p, d_energy_3h3p, sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_energy_4h2p_2h4p, d_energy_4h2p_2h4p, sizeof(double), cudaMemcpyDeviceToHost);
+
+    if (superset_ump2) {
+        double h_ump2_energy = 0.0;
+        cudaMemcpy(&h_ump2_energy, d_ump2_energy, sizeof(double), cudaMemcpyDeviceToHost);
+        tracked_cudaFree(d_ump2_energy);
+        if (out_ump2_energy) { *out_ump2_energy = h_ump2_energy; }
+        if (out_ump2_from_superset) { *out_ump2_from_superset = true; }
+    }
+
+    if (gpu::gpu_available()) {
+        cublasDestroy(cublasH);
+    }
+
+    tracked_cudaFree(d_g_full);
+    tracked_cudaFree(d_energy_4h2p_2h4p);
+    tracked_cudaFree(d_energy_3h3p);
+    tracked_cudaFree(d_tmp_same_1);
+    tracked_cudaFree(d_tmp_same_2);
+    tracked_cudaFree(d_tmp_same_3);
+    tracked_cudaFree(d_tmp_mixed_1);
+    tracked_cudaFree(d_tmp_mixed_2);
+    tracked_cudaFree(d_tmp_mixed_3);
+    tracked_cudaFree(d_x_aabb_ovov);
+    tracked_cudaFree(d_g_aabb_ovvo);
+    tracked_cudaFree(d_x_bbaa_ovov);
+    tracked_cudaFree(d_U);
+
+    if (out_ao_consumed) { *out_ao_consumed = true; }
+
+    return h_energy_4h2p_2h4p + h_energy_3h3p;
+}
 
 
 
 real_t ERI_Stored_UHF::compute_mp3_energy()
 {
     PROFILE_FUNCTION();
+
+    if (!is_ao_eri_valid()) {
+        THROW_EXCEPTION("AO ERIs are no longer available: the UMP3 cascading integral transformation destructively reused the AO ERI buffer as scratch.");
+    }
 
     const int num_basis = uhf_.get_num_basis();
     const int num_occ_al = uhf_.get_num_alpha_spins();
@@ -3427,29 +4730,72 @@ real_t ERI_Stored_UHF::compute_mp3_energy()
     DeviceHostMemory<real_t>& orbital_energies_al = uhf_.get_orbital_energies_a();
     DeviceHostMemory<real_t>& orbital_energies_be = uhf_.get_orbital_energies_b();
 
-    const real_t E_UMP2 = ump2_from_aoeri_via_required_moeri(
-        eri_matrix_.device_ptr(),
-        coefficient_matrix_al.device_ptr(),
-        coefficient_matrix_be.device_ptr(),
-        orbital_energies_al.device_ptr(),
-        orbital_energies_be.device_ptr(),
-        num_basis,
-        num_occ_al,
-        num_occ_be,
-        num_frozen
-    );
+    real_t E_UMP2 = 0.0;
+    real_t E_UMP3 = 0.0;
 
-    const real_t E_UMP3 = ump3_from_aoeri_via_full_moeri_dgemm_eff(
+    // Cascading integral transformation: 2 x M^4 peak buffers; destructively
+    // reuses the AO ERI buffer as scratch (invalidated below).
+    //
+    // Superset evaluation (UMP3 subsuming UMP2): the cascade UMP3
+    // intermediates (the plain ovov blocks tensorized during the stages) are
+    // a strict superset of the canonical UMP2 inputs, so when the spin
+    // rotation matrix passes the consistency check the UMP2 energy is
+    // obtained inside the cascade and the standalone UMP2 phase -- a full
+    // extra pass of AO->MO transforms over the AO ERIs -- is skipped
+    // entirely.
+    double* d_U_probe = nullptr;
+    const bool fuse_ump2 =
+        build_spin_rotation_matrix(
+            &d_U_probe,
+            coefficient_matrix_al.device_ptr(),
+            coefficient_matrix_be.device_ptr(),
+            uhf_.get_overlap_matrix().device_ptr(),
+            num_basis) <= kSpinRotationTolerance;
+    tracked_cudaFree(d_U_probe);
+
+    real_t superset_ump2 = 0.0;
+    bool ump2_from_superset = false;
+    bool ao_consumed = false;
+    E_UMP3 = ump3_from_aoeri_via_cascade(
         eri_matrix_.device_ptr(),
         coefficient_matrix_al.device_ptr(),
         coefficient_matrix_be.device_ptr(),
+        uhf_.get_overlap_matrix().device_ptr(),
         orbital_energies_al.device_ptr(),
         orbital_energies_be.device_ptr(),
         num_basis,
         num_occ_al,
         num_occ_be,
-        num_frozen
+        num_frozen,
+        &ao_consumed,
+        fuse_ump2 ? &superset_ump2 : nullptr,
+        fuse_ump2 ? &ump2_from_superset : nullptr
     );
+    if (ao_consumed) {
+        invalidate_ao_eri();
+    }
+    if (ump2_from_superset) {
+        E_UMP2 = superset_ump2;
+        std::cout << "UMP2 correlation energy (superset evaluation within the UMP3 cascade): "
+                  << std::setprecision(12) << E_UMP2 << std::endl;
+    } else {
+        // The superset evaluation did not run: either the pre-check above
+        // failed (the cascade then fell back to the reference algorithm
+        // internally, which leaves the AO ERIs intact) or the internal
+        // check disagreed with the pre-check (defensive; both run the
+        // identical deterministic computation).
+        E_UMP2 = ump2_from_aoeri_via_required_moeri(
+            eri_matrix_.device_ptr(),
+            coefficient_matrix_al.device_ptr(),
+            coefficient_matrix_be.device_ptr(),
+            orbital_energies_al.device_ptr(),
+            orbital_energies_be.device_ptr(),
+            num_basis,
+            num_occ_al,
+            num_occ_be,
+            num_frozen
+        );
+    }
 
     std::cout << "UMP3 energy: " << E_UMP3 << " [hartree]" << std::endl;
 

@@ -483,6 +483,21 @@ public:
      */
     void break_symmetry(){
 
+        // Do not break symmetry for closed-shell systems when the post-HF
+        // method is UMP2 or UMP3. The closed-shell limit verification
+        // (spin-resolved UMP2/UMP3 vs spin-free RMP2/RMP3) requires the UHF
+        // SCF to stay on the restricted (spin-symmetric) solution; the
+        // HOMO/LUMO rotation would otherwise kick the trajectory off that
+        // solution and mask the formulation equivalence with SCF truncation
+        // noise. All other methods keep the symmetry breaking so ordinary
+        // UHF runs can still escape the RHF solution.
+        if (hf_.get_num_alpha_spins() == hf_.get_num_beta_spins()) {
+            const PostHFMethod ph = hf_.get_post_hf_method();
+            if (ph == PostHFMethod::MP2 || ph == PostHFMethod::MP3) {
+                return;
+            }
+        }
+
         hf_.get_coefficient_matrix_a().toHost();
         hf_.get_coefficient_matrix_b().toHost();
 
@@ -862,6 +877,10 @@ public:
     real_t compute_mp3_energy() override;
 
     void compute_fock_matrix() override {
+        if (!is_ao_eri_valid()) {
+            THROW_EXCEPTION("AO ERIs are no longer available: the UMP3 cascading integral transformation destructively reused the AO ERI buffer as scratch.");
+        }
+
         const DeviceHostMatrix<real_t>& density_matrix_a = uhf_.get_density_matrix_a();
         const DeviceHostMatrix<real_t>& density_matrix_b = uhf_.get_density_matrix_b();
         const DeviceHostMatrix<real_t>& core_hamiltonian_matrix = uhf_.get_core_hamiltonian_matrix();
