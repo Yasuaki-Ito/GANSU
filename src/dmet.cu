@@ -1417,7 +1417,15 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
 
         std::vector<std::vector<real_t>> added;   // accepted env-NTO bath columns (Löwdin)
         int n_occ_added = 0;
-        const real_t ortho_thresh = 1e-6;
+        // Linear-dependence-safe augmentation: each group of candidates (virtual, then
+        // occupied) is projected onto the complement of the current cluster span with the
+        // metric-corrected projector  φ ← φ − C (CᵀC)⁻¹ Cᵀ φ  (applied twice; the bare
+        // columns are orthonormal only to ~1e-4), then orthonormalised CANONICALLY:
+        // diagonalise the candidates' overlap matrix and keep only directions with
+        // eigenvalue ≥ lindep_thresh. The former single Gram-Schmidt pass with a 1e-6
+        // residual-norm test let near-dependent candidates through as amplified
+        // round-off, producing a ~zero-norm cluster orbital and spurious roots.
+        const double lindep_thresh = 1e-6;
 
         // Project a Löwdin candidate onto the environment (zero fragment AOs);
         // returns the environment fraction ∈ [0,1] (the NTO is unit-norm).
@@ -1429,49 +1437,56 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
             }
             return env2;
         };
-        // Modified Gram-Schmidt vs the existing embedding + already-accepted
-        // bath; returns the residual (new-direction) norm.
-        auto mgs_residual = [&](std::vector<real_t>& phi) {
-            for (int p = 0; p < n_emb; ++p) {
-                real_t dot = 0.0;
-                for (int mu = 0; mu < nao; ++mu) dot += C_emb_lo[mu * n_emb + p] * phi[mu];
-                for (int mu = 0; mu < nao; ++mu) phi[mu] -= dot * C_emb_lo[mu * n_emb + p];
-            }
-            for (const auto& q : added) {
-                real_t dot = 0.0;
-                for (int mu = 0; mu < nao; ++mu) dot += q[mu] * phi[mu];
-                for (int mu = 0; mu < nao; ++mu) phi[mu] -= dot * q[mu];
-            }
-            real_t nrm = 0.0;
-            for (real_t v : phi) nrm += v * v;
-            return std::sqrt(nrm);
-        };
+        // Bare cluster columns (Löwdin) and the metric-corrected projector pieces.
+        Eigen::MatrixXd Cb(nao, n_emb);
+        for (int mu = 0; mu < nao; ++mu)
+            for (int p = 0; p < n_emb; ++p) Cb(mu, p) = (double)C_emb_lo[mu * n_emb + p];
+        const Eigen::LDLT<Eigen::MatrixXd> Gb_ldlt(Cb.transpose() * Cb);
 
-        // --- VIRTUAL NTOs (particle leak) → extra cluster virtuals ---------------
-        if (leak_vir > 0.0) {
-            for (int k = 0; k < nto.n_act_vir; ++k) {
-                std::vector<real_t> phi = build_nto(/*occ=*/false, k);
-                if (env_project(phi) < leak_vir) continue;
-                real_t nrm = mgs_residual(phi);
-                if (nrm < ortho_thresh) continue;
-                for (real_t& v : phi) v /= nrm;
-                added.push_back(std::move(phi));
+        // Collect the leaking candidates of one kind, project them onto the complement
+        // of (bare cluster ∪ already-accepted columns), canonically orthonormalise, and
+        // append the surviving directions to `added`. Returns the number kept.
+        auto augment_group = [&](bool occ, double tau, int n_act) -> int {
+            std::vector<std::vector<real_t>> cand;
+            for (int k = 0; k < n_act; ++k) {
+                std::vector<real_t> phi = build_nto(occ, k);
+                if (env_project(phi) < tau) continue;
+                cand.push_back(std::move(phi));
             }
-        }
+            const int m = (int)cand.size();
+            if (m == 0) return 0;
+            Eigen::MatrixXd Phi(nao, m);
+            for (int j = 0; j < m; ++j)
+                for (int mu = 0; mu < nao; ++mu) Phi(mu, j) = (double)cand[j][mu];
+            for (int pass = 0; pass < 2; ++pass) {
+                Phi -= Cb * Gb_ldlt.solve(Cb.transpose() * Phi);
+                for (const auto& q : added) {       // accepted columns are orthonormal
+                    Eigen::VectorXd qv(nao);
+                    for (int mu = 0; mu < nao; ++mu) qv[mu] = (double)q[mu];
+                    Phi -= qv * (qv.transpose() * Phi);
+                }
+            }
+            Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(Phi.transpose() * Phi);
+            int kept = 0;
+            for (int j = m - 1; j >= 0; --j) {      // descending eigenvalue → deterministic order
+                const double lam = es.eigenvalues()[j];
+                if (lam < lindep_thresh) continue;
+                const Eigen::VectorXd v = Phi * es.eigenvectors().col(j) / std::sqrt(lam);
+                std::vector<real_t> col(nao);
+                for (int mu = 0; mu < nao; ++mu) col[mu] = (real_t)v[mu];
+                added.push_back(std::move(col));
+                ++kept;
+            }
+            return kept;
+        };
+        // --- VIRTUAL NTOs (particle leak) → extra cluster virtuals ---------------
+        if (leak_vir > 0.0)
+            augment_group(/*occ=*/false, leak_vir, nto.n_act_vir);
         const int n_vir_added = (int)added.size();
 
         // --- OCCUPIED NTOs (hole leak) → extra cluster occupieds (n_emb_occ += k) -
-        if (leak_occ > 0.0) {
-            for (int k = 0; k < nto.n_act_occ; ++k) {
-                std::vector<real_t> phi = build_nto(/*occ=*/true, k);
-                if (env_project(phi) < leak_occ) continue;
-                real_t nrm = mgs_residual(phi);
-                if (nrm < ortho_thresh) continue;
-                for (real_t& v : phi) v /= nrm;
-                added.push_back(std::move(phi));
-                ++n_occ_added;
-            }
-        }
+        if (leak_occ > 0.0)
+            n_occ_added = augment_group(/*occ=*/true, leak_occ, nto.n_act_occ);
 
         if (!added.empty()) {
             const int n_added = (int)added.size();
