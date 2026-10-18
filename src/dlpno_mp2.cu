@@ -382,12 +382,10 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     // (same pattern as precompute_phase24_integrals).
     int num_gpus = 1;
 #ifdef GANSU_MULTI_GPU
-    if (auto* eri_dist = dynamic_cast<const ERI_RI_Distributed_RHF*>(&eri)) {
-        if (eri_dist->num_gpus() > 1) {
-            const bool ok = const_cast<ERI_RI_Distributed_RHF*>(eri_dist)
-                                ->replicate_B_to_all_gpus();
-            if (ok) num_gpus = eri_dist->num_gpus();
-        }
+    {   // Phase 4: back-end-neutral contract
+        const ERI_RI* eri_ri_ = nullptr;
+        const int nd = (eri_ri_ = dynamic_cast<const ERI_RI*>(&eri)) ? eri_ri_->mo_eri_devices() : 1;
+        if (nd > 1 && eri_ri_->prepare_mo_eri_devices()) num_gpus = nd;
     }
 #endif
 
@@ -870,10 +868,10 @@ DLPNOLMP2Result solve_dlpno_lmp2(
     int lmp2_num_gpus = 1;
     const bool user_explicit_n_gpus = (rhf.get_num_gpus() != -1);
 #ifdef GANSU_MULTI_GPU
-    if (auto* eri_dist = dynamic_cast<const ERI_RI_Distributed_RHF*>(&eri)) {
-        if (eri_dist->num_gpus() > 1) {
-            lmp2_num_gpus = eri_dist->num_gpus();
-        }
+    {   // Phase 4: back-end-neutral contract
+        const ERI_RI* eri_ri_ = nullptr;
+        const int nd = (eri_ri_ = dynamic_cast<const ERI_RI*>(&eri)) ? eri_ri_->mo_eri_devices() : 1;
+        if (nd > 1 && eri_ri_->prepare_mo_eri_devices()) lmp2_num_gpus = nd;
     }
 #endif
 

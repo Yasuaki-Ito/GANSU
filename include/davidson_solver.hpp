@@ -288,6 +288,8 @@ private:
 
     const int dim_;                     ///< Dimension of the operator
     int subspace_dim_;                  ///< Current subspace dimension
+    real_t stag_prev_max_res_ = -1.0;   ///< complex-pair stagnation acceptance: previous max|r|
+    int    stag_count_ = 0;             ///< consecutive iterations with max|r| unchanged (<0.1%)
     int num_iterations_;                ///< Iteration counter
 
     // Device memory pointers
@@ -311,6 +313,13 @@ private:
     real_t* d_subspace_eigenvectors_;   ///< Subspace eigenvectors (max_subspace × max_subspace)
     real_t* d_residuals_;               ///< Residual vectors (dim × num_eigenvalues)
     real_t* d_eigenvectors_;            ///< Final Ritz vectors (dim × num_eigenvalues)
+    // (2026-09-16) Streamable mode (GANSU_DAVIDSON_UVM=2): subspace + sigma live on
+    // HOST-preferred managed memory and every dim-sized loop that used to touch the
+    // basis per vector (Gram-Schmidt, Ritz/residuals, restart) is replaced by blocked
+    // DGEMMs that read the basis once per pass; the working block itself sits in a
+    // device scratch (dim x 2*num_eigenvalues). Device mode is byte-identical.
+    bool    host_managed_ = false;
+    real_t* d_block_scratch_ = nullptr; ///< dim × 2*num_eigenvalues (streamable mode only)
 
     // Host memory
     std::vector<real_t> h_eigenvalues_;      ///< Computed eigenvalues (real parts)
@@ -339,6 +348,16 @@ private:
      * @note Handles linear dependence by replacing with random vectors
      */
     void orthogonalize_vectors(int start_index, int num_vectors);
+    /// Restart-basis orthonormalisation with compaction (CGS2 + relative
+    /// dependence test; dependent vectors are DROPPED, not replaced by noise).
+    /// Returns the number of vectors retained in slots [0, kept).
+    int  orthonormalize_compact(int num_vectors, real_t* base = nullptr);
+    /// (2026-09-16) Apply the operator to subspace vectors [first, first+n). In the
+    /// streamable mode the block is staged through the device scratch (input copy,
+    /// device output, one write-back) so the operator never reads its input from,
+    /// or accumulates its output into, host-managed memory (MgO 3x3x3 EA: 2 h per
+    /// iteration when the RI-ladder sigma accumulated into host pages over PCIe).
+    void apply_sigma_block(int first, int n);
 
     /**
      * @brief Build subspace matrix H_ij = <v_i | Op(v_j)>

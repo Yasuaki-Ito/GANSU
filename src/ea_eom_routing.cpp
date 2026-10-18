@@ -26,6 +26,7 @@
  */
 
 #include "ea_eom_result.hpp"
+#include "ip_eom_result.hpp"   // steom_followcis_overlap_floor() — shared floor
 
 #include <algorithm>
 #include <cstddef>
@@ -47,6 +48,8 @@ EAEOMRoutingDecision select_active_ea_roots(
     out.assigned_root_for_a.assign(n_act_vir, -1);
     out.overlap_for_a.assign(n_act_vir, real_t(0.0));
     out.root_taken.assign(n_roots, false);
+    out.unassigned_by_floor.assign(n_act_vir, 0);
+    out.overlap_floor = steom_followcis_overlap_floor();
 
     if (n_act_vir <= 0 || n_roots <= 0 || nvir <= 0) return out;
 
@@ -88,6 +91,15 @@ EAEOMRoutingDecision select_active_ea_roots(
             }
         }
         if (best_k < 0) break;
+        // Overlap floor — same argument as the IP side; see
+        // steom_followcis_overlap_floor() in ip_eom_result.hpp.
+        if (best_ov < out.overlap_floor) {
+            out.best_below_floor = best_ov;
+            for (int m = 0; m < n_act_vir; ++m) {
+                if (!m_taken[m]) { out.unassigned_by_floor[m] = 1; ++out.n_below_floor; }
+            }
+            break;
+        }
         out.root_taken[best_k]              = true;
         m_taken[best_m]                     = true;
         out.assigned_root_for_a[best_m]     = best_k;

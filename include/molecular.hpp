@@ -93,6 +93,7 @@ public:
         // First compute full-electron count (needed by create_basis_set for ECP adjustment)
         num_electrons_ = 0;
         for(const auto& atom : atoms_){
+            if (atom.effective_charge == 0) continue; // ghost (X-): basis only
             num_electrons_ += atom.atomic_number;
         }
         num_electrons_ -= charge;
@@ -126,6 +127,7 @@ public:
 
         num_electrons_ = 0;
         for(const auto& atom : atoms_){
+            if (atom.effective_charge == 0) continue; // ghost (X-): basis only
             num_electrons_ += atom.atomic_number;
         }
         num_electrons_ -= charge;

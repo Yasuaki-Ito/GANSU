@@ -112,6 +112,26 @@ int main(int argc, char* argv[]){
   // which delays progress output to the UI)
   setvbuf(stdout, NULL, _IOLBF, 0);
 
+  // (debug) GANSU_DEBUG_BALLOON_GB=<n>: grab n GB of device-0 memory up front
+  // and never release it. Shrinks the effective GPU so large-cluster OOM code
+  // paths (RFC 81.4: the second ~n_emb^4 allocation) reproduce on SMALL test
+  // systems in minutes instead of hours. Untracked on purpose — it must not
+  // appear in the tracked-allocation dump it exists to provoke.
+  if (const char* bal = std::getenv("GANSU_DEBUG_BALLOON_GB")) {
+      const double gb = std::atof(bal);
+      if (gb > 0) {
+          void* p = nullptr;
+          const size_t bytes = (size_t)(gb * 1e9);
+          if (cudaMalloc(&p, bytes) == cudaSuccess) {
+              std::cerr << "[debug] balloon: " << gb << " GB held on device 0"
+                        << std::endl;
+          } else {
+              std::cerr << "[debug] balloon: FAILED to allocate " << gb
+                        << " GB" << std::endl;
+          }
+      }
+  }
+
   try {
     // Check for special flags before parameter parsing
     bool force_cpu = false;

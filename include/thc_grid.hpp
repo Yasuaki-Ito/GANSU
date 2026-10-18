@@ -155,9 +155,28 @@ struct MolecularGrid {
  * The result honours sum_P w_P * f(r_P) ~ integral f(r) d^3r with relative
  * accuracy 1e-6 ... 1e-8 (Becke + Treutler M3 + Lebedev 194 typical).
  */
+/**
+ * @param n_generate  generate points for only the FIRST n_generate atoms, while
+ *        still partitioning against all of them. 0 (default) means all atoms
+ *        and is the ordinary molecular case.
+ *
+ *        This exists for periodic grids. There the atom list is home + images,
+ *        the Becke partition has to run against the whole list (it is a
+ *        partition of unity over the real, infinite atom set), but only the
+ *        home atoms' points are kept -- so generating the image atoms' points
+ *        and discarding them afterwards is pure waste. It is not small waste:
+ *        the partition is O(N^2) per point and there are N * p points, so
+ *        building for all atoms costs O(N^3 p) against O(n_home N^2 p) for
+ *        this. With N ~ 900 image atoms and n_home = 2, that is the difference
+ *        between a diamond XC grid taking minutes and taking hours.
+ *
+ *        Points and weights for the atoms that ARE generated are bit-identical
+ *        either way: the partition denominator still sums over every atom.
+ */
 MolecularGrid build_molecular_grid(
     const std::vector<Atom>& atoms,
-    const ThcGridOptions& options = ThcGridOptions{});
+    const ThcGridOptions& options = ThcGridOptions{},
+    std::size_t n_generate = 0);
 
 // Convenience overload that pulls atoms from a Molecular instance.
 inline MolecularGrid build_molecular_grid(

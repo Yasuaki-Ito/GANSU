@@ -161,7 +161,7 @@ void Rys_compute_hessian_two_electron(
     const int num_atoms,
     const double* g_boys_grid)
 {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_threads) return;
 
     const int ndim = 3 * num_atoms;

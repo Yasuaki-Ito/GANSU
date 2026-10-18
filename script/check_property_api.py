@@ -21,7 +21,8 @@ import numpy as np
 sys.path.insert(0, "python")
 import gansu
 
-BOHR = 0.52917721067          # Angstrom per Bohr
+BOHR = 0.529177210903        # Angstrom per Bohr; must match
+                             # gansu::kBohrInAngstrom (types.hpp)
 AU_TO_DEBYE = 2.5417464157
 BASIS = "sto-3g"
 TMP = os.path.join(os.environ.get("TMPDIR", "."), "_prop_test.xyz")

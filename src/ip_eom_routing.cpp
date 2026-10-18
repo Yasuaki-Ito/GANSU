@@ -26,10 +26,22 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 
 #include "cis_nto_active_space.hpp"
 
 namespace gansu {
+
+real_t steom_followcis_overlap_floor() {
+    static const real_t v = [] {
+        if (const char* e = std::getenv("GANSU_STEOM_OVERLAP_FLOOR")) {
+            const double x = std::atof(e);
+            if (x >= 0.0) return static_cast<real_t>(x);
+        }
+        return static_cast<real_t>(1e-4);
+    }();
+    return v;
+}
 
 IPEOMRoutingDecision select_active_ip_roots(
     const CISNTOResult& cis_nto,
@@ -44,6 +56,8 @@ IPEOMRoutingDecision select_active_ip_roots(
     out.assigned_root_for_m.assign(n_act_occ, -1);
     out.overlap_for_m.assign(n_act_occ, real_t(0.0));
     out.root_taken.assign(n_roots, false);
+    out.unassigned_by_floor.assign(n_act_occ, 0);
+    out.overlap_floor = steom_followcis_overlap_floor();
 
     if (n_act_occ <= 0 || n_roots <= 0 || nocc_active <= 0) return out;
 
@@ -86,6 +100,18 @@ IPEOMRoutingDecision select_active_ip_roots(
             }
         }
         if (best_k < 0) break;
+        // Overlap floor. The greedy takes the GLOBAL best each step, so once
+        // that is below the floor no remaining (k, m̃) pair can clear it —
+        // every still-unassigned NTO stays unassigned, which is the honest
+        // answer ("no IP root corresponds to this NTO") and, unlike the old
+        // behaviour, a deterministic one. See steom_followcis_overlap_floor.
+        if (best_ov < out.overlap_floor) {
+            out.best_below_floor = best_ov;
+            for (int m = 0; m < n_act_occ; ++m) {
+                if (!m_taken[m]) { out.unassigned_by_floor[m] = 1; ++out.n_below_floor; }
+            }
+            break;
+        }
         out.root_taken[best_k]              = true;
         m_taken[best_m]                     = true;
         out.assigned_root_for_m[best_m]     = best_k;

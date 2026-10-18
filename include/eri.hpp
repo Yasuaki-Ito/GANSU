@@ -31,6 +31,7 @@ namespace gansu{
 
 // prototype of classes
 class HF;
+class ERI_RI;   // (Inc3) return type of ERI::mo_eri_block_source, defined below
 
 /**
  * @brief ERI_RHF class for the electron repulsion integrals (ERIs) of the restricted HF method
@@ -81,6 +82,20 @@ public:
     /// Default: delegates to build_mo_eri + cudaMemcpy + tracked_cudaFree.
     virtual void build_mo_eri_into(const real_t* d_C, int nmo,
                                    real_t* d_eri_out) const;
+
+    /// (Inc3) Storage-free MO-ERI block source, or nullptr if this engine has
+    /// none. Consumers use it as `src->build_B_mo(C, nmo)` followed by
+    /// `src->mo_eri_block_into(...)` and never allocate the nmo⁴ tensor.
+    ///
+    /// Default: `this`, when it IS an ERI_RI — i.e. exactly the
+    /// `dynamic_cast<const ERI_RI*>(&eri_method)` the call sites used to spell
+    /// out, so every molecular engine keeps its previous answer. The hook
+    /// exists because the periodic Gamma engine is NOT an ERI_RI (it has no AO
+    /// B and no molecular auxiliary machinery) yet can still hand out a
+    /// positive naux-row cluster B; it returns a companion object instead.
+    /// See pbc/cluster_eri.hpp (computeGammaClusterB_RI) and
+    /// rfc/INC3_PERIODIC_B_DESIGN.md.
+    virtual const ERI_RI* mo_eri_block_source() const;
 
     /// Compute G(D) = 2J[D] - K[D] (two-electron response) from an arbitrary density matrix.
     /// Default: uses get_eri_matrix_device() + computeFockMatrix_RHF with zero core Hamiltonian.
@@ -431,6 +446,7 @@ public:
             || method == PostHFMethod::EOM_CCSD // The stored ERI method supports EOM-CCSD
             || method == PostHFMethod::DMET_CCSD // DMET-CCSD
             || method == PostHFMethod::DMET_CCSD_T // DMET-CCSD(T)
+            || method == PostHFMethod::DMET_STEOM // DMET-STEOM (canonical cluster via build_mo_eri; no RI needed)
             || method == PostHFMethod::THC_MP2 // Tensor Hypercontraction MP2
             || method == PostHFMethod::THC_SOS_MP2 // THC + Laplace SOS-MP2
             || method == PostHFMethod::THC_SOS_ADC2 // THC SOS-ADC(2) excited states
@@ -477,7 +493,11 @@ public:
     void precompute_schwarz_and_shell_pairs();
 
     DeviceHostMemory<PrimitiveShell>& get_auxiliary_primitive_shells() { return auxiliary_primitive_shells_; } ///< Get the auxiliary primitive shells
-    int get_num_auxiliary_basis() const { return num_auxiliary_basis_; }
+    /// Number of ROWS in the B this engine hands out — which is what every B
+    /// consumer means by "naux". Virtual because the periodic cluster-B source
+    /// can append EXACT long-wavelength rows to the fitted factor (the Gc
+    /// dial), so its row count exceeds the auxiliary-basis size.
+    virtual int get_num_auxiliary_basis() const { return num_auxiliary_basis_; }
 
     std::string get_algorithm_name() override { return "RI"; } ///< Get the algorithm name
 
@@ -511,6 +531,18 @@ public:
     /// can be freed to reclaim ~naux·nao² per GPU; the next build_B_mo lazily
     /// rebuilds it. Default no-op (non-distributed RI keeps B resident anyway).
     virtual void release_bmo_ao_replica() const {}
+
+    /// (Phase 4, PBC_DLPNO_CLUSTER_DESIGN) How many GPUs this RI source can
+    /// serve MO blocks on, and a hook to make that true. DLPNO's per-pair
+    /// fan-out used to learn this by dynamic_cast to ERI_RI_Distributed_RHF,
+    /// which silently pinned every other ERI_RI — including the periodic
+    /// cluster-B — to one GPU (observed as "ng=1" and the barS OOM on the
+    /// MgO 2x2x2 cluster). Defaults keep every existing engine's behaviour:
+    /// one device, nothing to prepare. Distributed RI answers num_gpus() and
+    /// replicates its AO B; the periodic cluster-B answers the
+    /// MultiGpuManager count once its anchor factor is cross-device readable.
+    virtual int  mo_eri_devices() const { return 1; }
+    virtual bool prepare_mo_eri_devices() const { return true; }
 
     /// Phase P4b — workhorse for build_B_mo: takes the AO-basis source B
     /// pointer explicitly so distributed RI (where intermediate_matrix_B_ is
@@ -773,6 +805,14 @@ public:
          || method == PostHFMethod::EOM_CC2
          || method == PostHFMethod::EOM_CCSD
          || method == PostHFMethod::FCI
+         // PBC transient companion: PBC_RHF forces eri_method=direct for the
+         // base constructor (the stored companion's eager nbf^4 tensor is
+         // 287 GB at 443 AO) and replaces it with ERI_PBC_Gamma_RHF before
+         // any dispatch. A molecular direct run asking for these still throws
+         // at the ERI base virtual.
+         || method == PostHFMethod::CIS_NTO
+         || method == PostHFMethod::DMET_CCSD
+         || method == PostHFMethod::DMET_STEOM
           ){
             return true;
         }

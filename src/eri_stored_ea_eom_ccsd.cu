@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "rhf.hpp"
+#include "steom_cluster_ground_cache.hpp"
 #include "dlpno_ea_packing.hpp"                // bt-PNO-STEOM stage B: EA packed layout
 #include "dlpno_ea_eom_projected_operator.hpp" // stage B: projected DLPNO-EA operator
 #include "dlpno_ea_eom_native_operator.hpp"    // stage B (a): native per-pair DLPNO-EA σ operator
@@ -49,6 +50,39 @@
 #include "gpu_manager.hpp"
 #include "profiler.hpp"
 #include "utils.hpp"
+
+// (2026-09-12 pob-DZVP@2x2x1 24-atom) The EA operator's own T2 copy is NO²NV² (20 GiB
+// at nocc=156/nvir=332) and sat on the device next to the raw ERI blocks -> the ovvv
+// block (42.5 GiB) no longer fit (p10d). Park it on the host like the IP stage does:
+// host first-touch managed (tracked_cudaMallocManagedHost), preferred location CPU,
+// GPU direct access; evicted again after the fill. Env GANSU_EA_T2_UVM: 1 = always,
+// 0 = never, unset = auto when the copy exceeds 12 GB. Math-inert (same bytes).
+static void ea_alloc_t2(gansu::real_t** d_t2, size_t t2n) {
+    using gansu::real_t;
+    const size_t bytes = t2n * sizeof(real_t);
+    bool uvm = false;
+    if (const char* e = std::getenv("GANSU_EA_T2_UVM")) uvm = (e[0] == '1');
+    else uvm = bytes > (size_t)12e9;
+    if (!uvm) { gansu::tracked_cudaMalloc(d_t2, bytes); return; }
+    gansu::tracked_cudaMallocManagedHost(d_t2, bytes);
+    int dev = 0; cudaGetDevice(&dev);
+    cudaMemLocation loc_host{}; loc_host.type = cudaMemLocationTypeHost;   loc_host.id = 0;
+    cudaMemLocation loc_dev{};  loc_dev.type  = cudaMemLocationTypeDevice; loc_dev.id  = dev;
+    cudaMemAdvise(*d_t2, bytes, cudaMemAdviseSetPreferredLocation, loc_host);
+    cudaMemAdvise(*d_t2, bytes, cudaMemAdviseSetAccessedBy, loc_dev);
+    std::cout << "  [EA-EOM] operator T2 copy parked on HOST (managed, preferred location CPU, "
+                 "GPU direct access; " << bytes / 1e9 << " GB off device " << dev
+              << ", env GANSU_EA_T2_UVM)" << std::endl;
+}
+static void ea_park_t2_after_copy(gansu::real_t* d_t2, size_t t2n) {
+    if (!d_t2) return;
+    cudaPointerAttributes attr{};
+    if (cudaPointerGetAttributes(&attr, d_t2) != cudaSuccess) { cudaGetLastError(); return; }
+    if (attr.type != cudaMemoryTypeManaged) return;
+    cudaMemLocation loc_host{}; loc_host.type = cudaMemLocationTypeHost; loc_host.id = 0;
+    cudaMemPrefetchAsync(d_t2, t2n * sizeof(gansu::real_t), loc_host, /*flags=*/0, /*stream=*/0);
+    cudaDeviceSynchronize();
+}
 
 namespace gansu {
 
@@ -281,13 +315,27 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
         const size_t t1n = (size_t)nocc_active * nvir;
         const size_t t2n = (size_t)nocc_active * nocc_active * nvir * nvir;
         tracked_cudaMalloc(&d_t1, t1n * sizeof(real_t));
-        tracked_cudaMalloc(&d_t2, t2n * sizeof(real_t));
+        ea_alloc_t2(&d_t2, t2n);
         cudaMemcpy(d_t1, bt.T1.data(), t1n * sizeof(real_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_t2, bt.T2.data(), t2n * sizeof(real_t), cudaMemcpyHostToDevice);
+        ea_park_t2_after_copy(d_t2, t2n);
         E_CCSD = (ctx && ctx->dlpno_bt) ? ctx->dlpno_E
                                         : rhf.get_post_hf_energy();  // DLPNO-CCSD energy (set by stage 1)
         if (ctx) ctx->post_hf_energy = E_CCSD;
         std::cout << "  Using DLPNO back-transformed canonical T1/T2 (hybrid bt-PNO-STEOM P5b)." << std::endl;
+        // (2026-09-07) Prefer the cached/checkpointed cluster ground over the freshly
+        // recomputed bt-PNO amplitudes (resume-deterministic; see the IP-stage note).
+        if (ctx && ctx->cc_ground_cached && ctx->cc_t1n == t1n && ctx->cc_t2n == t2n) {
+            cudaMemcpy(d_t1, ctx->cc_t1, t1n * sizeof(real_t), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(d_t2, ctx->cc_t2, t2n * sizeof(real_t), cudaMemcpyDeviceToDevice);
+            ea_park_t2_after_copy(d_t2, t2n);
+            E_CCSD = ctx->cc_E; ctx->post_hf_energy = E_CCSD;
+            std::cout << "  bt-PNO T1/T2 overridden by the cached/checkpointed cluster ground "
+                         "(resume-deterministic): E_corr " << std::fixed << std::setprecision(10)
+                      << E_CCSD << " Ha" << std::endl;
+        } else if (ctx && !std::getenv("GANSU_STEOM_NO_CCSD_CACHE")) {
+            steom_cache_cluster_ground_host(ctx, d_t1, d_t2, t1n, t2n, E_CCSD);
+        }
     } else if (ctx && ctx->cc_ground_cached) {
         // (solve-once) reuse the cluster CCSD ground cached by an earlier stage.
         const size_t t1n = (size_t)nocc_active*nvir;
@@ -321,14 +369,12 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
         if (ctx) ctx->post_hf_energy = E_CCSD;
         else     rhf.set_post_hf_energy(E_CCSD);
         // (solve-once) cache the cluster ground for the later stages.
+        // (2026-09-19) HOST-parked, like the bt-PNO branch above: the device copy
+        // (o^2 v^2 = 8.3 GB at nocc 238) sat on the home GPU through the IP build.
         if (ctx && !std::getenv("GANSU_STEOM_NO_CCSD_CACHE")) {
             const size_t t1n = (size_t)nocc_active*nvir;
             const size_t t2n = (size_t)nocc_active*nocc_active*(size_t)nvir*nvir;
-            tracked_cudaMalloc(&ctx->cc_t1, t1n*sizeof(real_t));
-            tracked_cudaMalloc(&ctx->cc_t2, t2n*sizeof(real_t));
-            cudaMemcpy(ctx->cc_t1, d_t1, t1n*sizeof(real_t), cudaMemcpyDeviceToDevice);
-            cudaMemcpy(ctx->cc_t2, d_t2, t2n*sizeof(real_t), cudaMemcpyDeviceToDevice);
-            ctx->cc_t1n=t1n; ctx->cc_t2n=t2n; ctx->cc_E=E_CCSD; ctx->cc_ground_cached=true;
+            steom_cache_cluster_ground_host(ctx, d_t1, d_t2, t1n, t2n, E_CCSD);
         }
     }
 
@@ -547,6 +593,21 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
             config.max_subspace_size = std::min(total_dim,
                 std::max(4 * n_roots_to_compute, m * n_roots_to_compute));
     }
+    // (2026-09-05) EA-specific override. The shared cap exists for the IP
+    // Davidson's memory (dim 7.7M x 89 roots on MgO 374); the EA problem is
+    // smaller (4.6M x 57) but harder — under the shared cap of 6 it stalled at
+    // max|r| ~ 1e-2 for 242/308 iterations and was ACCEPTED by the soft
+    // eigenvalue-stability rule, and those unconverged EA vectors moved the
+    // STEOM root 0 by 10 meV between runs. GANSU_EA_EOM_MAX_SUB_PER_ROOT=<m>
+    // (m >= 4) sets the EA cap independently.
+    if (const char* e = std::getenv("GANSU_EA_EOM_MAX_SUB_PER_ROOT")) {
+        const int m = std::atoi(e);
+        if (m >= 4)
+            config.max_subspace_size = std::min(total_dim,
+                std::max(4 * n_roots_to_compute, m * n_roots_to_compute));
+    }
+    std::cout << "  [EA-EOM] Davidson max_subspace = " << config.max_subspace_size
+              << " (" << n_roots_to_compute << " roots)" << std::endl;
     config.max_iterations        = rhf.get_ea_eom_max_iter();
     config.use_preconditioner    = true;
     config.symmetric             = false;
@@ -880,8 +941,19 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
             const auto& pr = result.per_active[m];
             os << "  " << std::setw(2) << m;
             if (pr.canonical_vir_label < 0) {
-                os << "   (no Davidson root passed %singles ≥ " << std::setprecision(3) << ea_thresh
-                   << " — try lowering ea_eom_ea_thresh or raising ea_eom_safety_margin)\n";
+                if (m < (int)decision.unassigned_by_floor.size()
+                    && decision.unassigned_by_floor[m]) {
+                    os << "   (UNASSIGNED: best FollowCIS overlap "
+                       << std::scientific << std::setprecision(2)
+                       << decision.best_below_floor << " < floor "
+                       << decision.overlap_floor << std::fixed
+                       << " — no EA root corresponds to this NTO, so its Ŝ^EA "
+                          "contribution is zero. Raise ea_eom_safety_margin to "
+                          "compute more roots)\n";
+                } else {
+                    os << "   (no Davidson root passed %singles ≥ " << std::setprecision(3) << ea_thresh
+                       << " — try lowering ea_eom_ea_thresh or raising ea_eom_safety_margin)\n";
+                }
             } else {
                 os << "   " << std::setw(12) << std::setprecision(8) << std::fixed << pr.omega
                    << "   " << std::setw(10) << std::setprecision(4) << (pr.omega * 27.2114)
@@ -889,6 +961,15 @@ static void compute_ea_eom_ccsd_impl(RHF& rhf,
                    << "   " << std::setw(7) << std::setprecision(4) << pr.followcis_overlap
                    << "    " << decision.assigned_root_for_a[m] << "\n";
             }
+        }
+        if (decision.n_below_floor > 0) {
+            os << "  ⚠ [EA routing] " << decision.n_below_floor << " of "
+               << cis_nto.n_act_vir << " active virtual NTO(s) left UNASSIGNED: no "
+                  "Davidson root reached the FollowCIS overlap floor ("
+               << std::scientific << std::setprecision(1) << decision.overlap_floor
+               << std::fixed << "). Their Ŝ^EA contribution is zero. See RFC 86.3b "
+                  "for why assigning one anyway was worth 20.7 meV of run-to-run "
+                  "scatter.\n";
         }
         if (!result.auxiliary.empty()) {
             os << "  Auxiliary EA roots (Davidson found, not routed to an active virtual NTO):\n"

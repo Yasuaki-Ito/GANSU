@@ -2269,6 +2269,14 @@ real_t* ERI_RI_Distributed_RHF::build_B_ia_local(
     const real_t* d_B_ao, int naux_local,
     real_t* d_C, int nbas, int nocc, int nvir)
 {
+    // A null slice means B was never materialised for this storage mode.
+    // cudaMemcpy would just set an error flag nobody reads and the caller
+    // would get a zero-filled buffer -- which is how RI-MP2 silently
+    // returned 0 under semi_direct_ri/direct_ri. Fail loudly instead.
+    if (d_B_ao == nullptr) {
+        THROW_EXCEPTION("build_B_ia_local: B slice is not resident. Post-HF needs B "
+                        "materialised (see build_B_ia's ensure/release).");
+    }
     const size_t B_ao_size = (size_t)naux_local * nbas * nbas;
 
     // Copy AO-basis B (transform is destructive)
@@ -2291,6 +2299,14 @@ real_t* ERI_RI_Distributed_RHF::build_B_ab_local(
     const real_t* d_B_ao, int naux_local,
     real_t* d_C, int nbas, int nocc, int nvir)
 {
+    // A null slice means B was never materialised for this storage mode.
+    // cudaMemcpy would just set an error flag nobody reads and the caller
+    // would get a zero-filled buffer -- which is how RI-MP2 silently
+    // returned 0 under semi_direct_ri/direct_ri. Fail loudly instead.
+    if (d_B_ao == nullptr) {
+        THROW_EXCEPTION("build_B_ab_local: B slice is not resident. Post-HF needs B "
+                        "materialised (see build_B_ia's ensure/release).");
+    }
     cublasHandle_t handle = gpu::GPUHandle::cublas();
     const double alpha = 1.0, beta = 0.0;
     const size_t vv = (size_t)nvir * nvir;
@@ -2430,6 +2446,33 @@ real_t* ERI_RI_Distributed_RHF::build_B_ia() {
     const size_t ov = (size_t)nocc * nvir;
     real_t* d_C = rhf_.get_coefficient_matrix().device_ptr();
 
+    // OnTheFly (semi_direct_ri / direct_ri) never populates d_B_local_: its
+    // Fock build rebuilds B in chunks and discards it, so distributed_build_B()
+    // is never reached and the slices stay null. This function then handed a
+    // NULL source to cudaMemcpy, whose error nobody checked, and every RI-MP2
+    // came back as exactly 0 -- printed as "MP2 energy: 0 Hartree" next to a
+    // total energy, with no failure of any kind. `scattered_` is the flag that
+    // says whether B is resident, so key off that rather than the mode enum
+    // (any future mode that skips the build is then covered too).
+    //
+    // Post-HF genuinely needs B, so materialize it here and release it again:
+    // OnTheFly exists to avoid the O(naux*nao^2) residency during SCF, and this
+    // keeps that true everywhere except inside this call.
+    const bool temp_B = !scattered_;
+    if (temp_B) {
+        std::cout << "[RI-Dist] post-HF needs B; building it for this step "
+                     "(storage mode keeps none)" << std::endl;
+        distributed_build_B();
+    }
+    auto release_temp_B = [this, temp_B]() {
+        if (!temp_B) return;
+        for (int d = 0; d < num_gpus_; d++) {
+            MultiGpuManager::DeviceGuard guard(d);
+            if (d_B_local_[d]) { cudaFree(d_B_local_[d]); d_B_local_[d] = nullptr; }
+        }
+        scattered_ = false;
+    };
+
     std::vector<real_t*> d_B_ia_local(num_gpus_, nullptr);
     real_t* d_B_ia_full = nullptr;
     try {
@@ -2480,6 +2523,7 @@ real_t* ERI_RI_Distributed_RHF::build_B_ia() {
             MultiGpuManager::DeviceGuard guard(0);
             tracked_cudaFree(d_B_ia_full);
         }
+        release_temp_B();
         throw;
     }
 
@@ -2487,6 +2531,7 @@ real_t* ERI_RI_Distributed_RHF::build_B_ia() {
         MultiGpuManager::DeviceGuard guard(d);
         tracked_cudaFree(d_B_ia_local[d]);
     }
+    release_temp_B();
     return d_B_ia_full;  // device 0, [ov × naux] col-major
 }
 

@@ -46,7 +46,7 @@ std::string gb(size_t bytes) {
 
 } // namespace
 
-void dmet_apply_memory_policy(int n_emb, int n_emb_occ, int verbose) {
+void dmet_apply_memory_policy(int n_emb, int n_emb_occ, int verbose, bool allow_cluster_gpu) {
 #ifndef GANSU_CPU_ONLY
     if (!gpu::gpu_available() || n_emb <= 0) return;
 
@@ -97,8 +97,20 @@ void dmet_apply_memory_policy(int n_emb, int n_emb_occ, int verbose) {
         apply("GANSU_EA_W_HOST");
         apply("GANSU_EA_WVVVO_HOST_ASM");
         // Spread the STEOM operator build and keep the bar-H on its own device.
-        apply("GANSU_STEOM_OPERATOR_DEVICE_BALANCING");
-        apply("GANSU_DMET_STEOM_CLUSTER_GPU");
+        // (2026-09-11) Not for periodic runs either: the EA operator redirect to the
+        // freest GPU (p10b: GPU 0 free 119.8 vs GPU 2 128.5 GB after the parks became
+        // real) makes build_B_mo rotate the ClusterB anchor on that GPU with the
+        // GPU-0 cluster C -> illegal memory access. Same gate as CLUSTER_GPU below.
+        if (allow_cluster_gpu) apply("GANSU_STEOM_OPERATOR_DEVICE_BALANCING");
+        // (2026-09-08) Not for periodic runs: the PBC RI cluster ERI is built AFTER the
+        // cluster-GPU switch and reads device-0 resources (Boys grid, lattice contexts)
+        // -> illegal memory access in GammaSR3cFoldEnv (pob-DZVP@2x2x1). An explicit
+        // user export still wins (set_if_unset); we only stop auto-enabling it.
+        if (allow_cluster_gpu) apply("GANSU_DMET_STEOM_CLUSTER_GPU");
+        else if (verbose > 0 && std::getenv("GANSU_DMET_STEOM_CLUSTER_GPU") == nullptr)
+            std::cout << "  [DMET memory policy] GANSU_DMET_STEOM_CLUSTER_GPU not auto-enabled "
+                         "(periodic run: the PBC RI cluster ERI must be built on the SCF device)."
+                      << std::endl;
         apply("GANSU_STEOM_SHARE_BARH");
         apply("GANSU_IP_SIGMA_GEMM");
         if (set_if_unset("GANSU_STEOM_BARH_GPU", "3")) applied.push_back("GANSU_STEOM_BARH_GPU=3");

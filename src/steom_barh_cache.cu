@@ -42,14 +42,16 @@ void SteomBarHCache::migrate_to_device(int src_dev, int dst_dev) {
         tracked_cudaFree(p);                                  // free the src_dev copy
         p = np;
     };
-    move(d_Loo,   NO*NO);
-    move(d_Lvv,   NV*NV);
-    move(d_Fov,   NO*NV);
-    move(d_Woooo, NO*NO*NO*NO);
-    move(d_Wooov, NO*NO*NO*NV);
-    move(d_Wovov, NO*NV*NO*NV);
-    move(d_Wovvo, NO*NV*NV*NO);
-    move(d_Wovoo, NO*NV*NO*NO);
+    if (!ip_host_parked) {   // host-parked IP buffers are device-agnostic: leave them
+        move(d_Loo,   NO*NO);
+        move(d_Lvv,   NV*NV);
+        move(d_Fov,   NO*NV);
+        move(d_Woooo, NO*NO*NO*NO);
+        move(d_Wooov, NO*NO*NO*NV);
+        move(d_Wovov, NO*NV*NO*NV);
+        move(d_Wovvo, NO*NV*NV*NO);
+        move(d_Wovoo, NO*NV*NO*NO);
+    }
     move(d_Wvovv, NV*NO*NV*NV);
     move(d_Wvvvv, NV*NV*NV*NV);   // null-safe (canonical-skip)
     move(d_Wvvvo, NV*NV*NV*NO);
@@ -73,9 +75,52 @@ static void barh_move_one(real_t*& p, size_t n, int src_dev, int dst_dev) {
 }
 #endif
 
+void SteomBarHCache::park_ip_on_host() {
+#ifndef GANSU_CPU_ONLY
+    if (!gpu::gpu_available() || ip_host_parked) return;
+    int cur = 0; cudaGetDevice(&cur);
+    int n_dev = 0; cudaGetDeviceCount(&n_dev);
+    cudaSetDevice(ip_dev);
+    const size_t NO = (size_t)nocc, NV = (size_t)nvir;
+    size_t moved = 0;
+    auto park = [&](real_t*& p, size_t n) {
+        if (!p) return;
+        real_t* np = nullptr;
+        const size_t bytes = n * sizeof(real_t);
+        tracked_cudaMallocManagedHost(&np, bytes);
+        cudaMemLocation loc_host{}; loc_host.type = cudaMemLocationTypeHost; loc_host.id = 0;
+        cudaMemAdvise(np, bytes, cudaMemAdviseSetPreferredLocation, loc_host);
+        for (int d = 0; d < n_dev; ++d) {
+            cudaMemLocation loc_d{}; loc_d.type = cudaMemLocationTypeDevice; loc_d.id = d;
+            cudaMemAdvise(np, bytes, cudaMemAdviseSetAccessedBy, loc_d);
+        }
+        cudaMemcpy(np, p, bytes, cudaMemcpyDefault);
+        cudaMemPrefetchAsync(np, bytes, loc_host, /*flags=*/0, /*stream=*/0);
+        cudaDeviceSynchronize();
+        tracked_cudaFree(p);
+        p = np; moved += bytes;
+    };
+    park(d_Loo,   NO*NO);
+    park(d_Lvv,   NV*NV);
+    park(d_Fov,   NO*NV);
+    park(d_Woooo, NO*NO*NO*NO);
+    park(d_Wooov, NO*NO*NO*NV);
+    park(d_Wovov, NO*NV*NO*NV);
+    park(d_Wovvo, NO*NV*NV*NO);
+    park(d_Wovoo, NO*NV*NO*NO);
+    cudaDeviceSynchronize();
+    cudaSetDevice(cur);
+    ip_host_parked = true;
+    std::cout << "  [STEOM share-barH] IP bar-H (8) parked on HOST (managed, preferred location CPU, "
+                 "GPU direct access from every device; " << moved / 1e9 << " GB off GPU " << ip_dev
+              << ", env GANSU_STEOM_BARH_IP_HOST)" << std::endl;
+#endif
+}
+
 void SteomBarHCache::migrate_ip_to(int dst) {
 #ifndef GANSU_CPU_ONLY
     if (!gpu::gpu_available() || ip_dev == dst) return;
+    if (ip_host_parked) { ip_dev = dst; return; }   // device-agnostic; just re-point the hint
     const int src = ip_dev; int cur = 0; cudaGetDevice(&cur); cudaSetDevice(dst);
     const size_t NO = (size_t)nocc, NV = (size_t)nvir;
     barh_move_one(d_Loo,   NO*NO,          src, dst);

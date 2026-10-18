@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <random>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -41,10 +42,12 @@
 #include <vector>
 #include <limits>
 #include <cmath>
+#include <random>
 #include <cstring>
 #include <fstream>
 
 #include "rhf.hpp"
+#include "steom_cluster_ground_cache.hpp"
 #include "steom_ccsd_operator.hpp"
 #include "eom_chain_context.hpp"   // DMET-STEOM: standalone cluster electronic state
 #include "dmet.hpp"                // DMET-STEOM Phase 1: cluster embedding driver
@@ -428,6 +431,21 @@ inline void ckpt_wr_dev(std::ofstream& f, const real_t* d, size_t n){
     if (nn) { std::vector<real_t> h(nn);
         cudaMemcpy(h.data(), d, nn * sizeof(real_t), cudaMemcpyDeviceToHost);
         f.write((const char*)h.data(), nn * sizeof(real_t)); } }
+// (2026-09-12) Read into HOST-parked managed memory (the cluster-ground cache
+// contract: preferred location CPU, GPU direct access). A raw device restore of
+// cc_t2 (20 GiB at nocc=156/nvir=332) was one of the two T2 copies that pushed
+// the EA extract_eri_blocks over the card (p10d).
+inline real_t* ckpt_rd_dev_host(std::ifstream& f){
+    size_t n = 0; f.read((char*)&n, sizeof(n)); if (!n) return nullptr;
+    std::vector<real_t> h(n); f.read((char*)h.data(), n * sizeof(real_t));
+    real_t* d = nullptr; tracked_cudaMallocManagedHost(&d, n * sizeof(real_t));
+    int dev = 0; cudaGetDevice(&dev);
+    cudaMemLocation lh{}; lh.type = cudaMemLocationTypeHost;   lh.id = 0;
+    cudaMemLocation ld{}; ld.type = cudaMemLocationTypeDevice; ld.id = dev;
+    cudaMemAdvise(d, n * sizeof(real_t), cudaMemAdviseSetPreferredLocation, lh);
+    cudaMemAdvise(d, n * sizeof(real_t), cudaMemAdviseSetAccessedBy, ld);
+    std::memcpy(d, h.data(), n * sizeof(real_t));   // host write: pages stay on the host
+    return d; }
 // Read into a fresh tracked device buffer (nullptr if count 0).
 inline real_t* ckpt_rd_dev(std::ifstream& f){
     size_t n = 0; f.read((char*)&n, sizeof(n)); if (!n) return nullptr;
@@ -503,7 +521,7 @@ bool steom_ckpt_load(EOMChainContext& ctx, const char* path){
         std::cout << "  [STEOM ckpt] " << path << " bad magic — ignoring." << std::endl; return false; }
     int cached = 0; ckpt_rd(f, cached);
     ckpt_rd(f, ctx.cc_t1n); ckpt_rd(f, ctx.cc_t2n); ckpt_rd(f, ctx.cc_E);
-    ctx.cc_t1 = ckpt_rd_dev(f); ctx.cc_t2 = ckpt_rd_dev(f);
+    ctx.cc_t1 = ckpt_rd_dev_host(f); ctx.cc_t2 = ckpt_rd_dev_host(f);   // host-parked (cache contract)
     ctx.cc_ground_cached = (cached != 0);
     { auto& c = ctx.cis_nto_result;
       ckpt_rd(f, c.nocc_active); ckpt_rd(f, c.nvir); ckpt_rd(f, c.num_frozen);
@@ -776,10 +794,11 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     // shares one thread-local buffer that a stage's internal CCSD re-solve would
     // otherwise clobber; the rebuilds live in the CIS helper + IP/EA operators).
     if (ctx && ctx->prefer_ri_block && gpu::gpu_available() && !ctx->eri_block_src) {
-        ctx->eri_block_src = dynamic_cast<const ERI_RI*>(&eri_method);
+        ctx->eri_block_src = eri_method.mo_eri_block_source();
         if (!ctx->eri_block_src)
             std::cout << "  [DMET-STEOM] GANSU_DMET_STEOM_RI_BLOCK set but eri_method "
-                         "is not RI — falling back to the dense cluster MO-ERI." << std::endl;
+                         "has no B-block source — falling back to the dense "
+                         "cluster MO-ERI." << std::endl;
     }
 
     // (debug accelerator) Resume from a STEOM checkpoint: load CIS-NTO / IP / EA
@@ -790,6 +809,44 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     if (ctx) {
         if (const char* ck = std::getenv("GANSU_DMET_STEOM_CKPT")) {
             ckpt_loaded = steom_ckpt_load(*ctx, ck);
+            // (2026-09-05) GANSU_DMET_STEOM_CKPT_IGNORE_EA=1 drops the restored EA
+            // stage (results + the 3 EA bar-H) so EA re-runs from the resumed
+            // CCSD+IP state — the cluster-path twin of the plain-path switch. Used
+            // to re-solve an EA that the soft-acceptance rule had let through
+            // unconverged (MgO 374: max|r| ~1e-2) without redoing the 2-5 h IP.
+            if (ckpt_loaded) {
+                const char* ig = std::getenv("GANSU_DMET_STEOM_CKPT_IGNORE_EA");
+                if (ig && ig[0] == '1') {
+                    ctx->ea_eom_result = EAEOMResult{};
+                    auto drop = [](real_t*& p) { if (p) { tracked_cudaFree(p); p = nullptr; } };
+                    drop(ctx->barh.d_Wvovv); drop(ctx->barh.d_Wvvvv); drop(ctx->barh.d_Wvvvo);
+                    ctx->barh.has_ea = false;
+                    std::cout << "  [STEOM ckpt] EA stage DISCARDED on request "
+                                 "(GANSU_DMET_STEOM_CKPT_IGNORE_EA=1) — EA-EOM will re-run; "
+                                 "the after-EA save upgrades the file." << std::endl;
+                }
+            }
+            // (2026-09-13) GANSU_DMET_STEOM_CKPT_CC_ONLY=1 keeps ONLY the cluster ground
+            // (T1/T2/E, cc=y) from the file and discards the CIS-NTO active space, the
+            // IP/EA results and all 11 bar-H blocks. Use: the active-space threshold
+            // pair (3e-4 / 1e-4) on the SAME cluster basis (.basis restore) shares the
+            // canonical CCSD (70 min at n_emb 337) while CIS-NTO/IP/EA/STEOM re-run with
+            // the new threshold. Point the env at a COPY of the 3e-4 file: the after-IP
+            // and after-EA saves overwrite the path they were loaded from.
+            if (ckpt_loaded) {
+                const char* co = std::getenv("GANSU_DMET_STEOM_CKPT_CC_ONLY");
+                if (co && co[0] == '1') {
+                    ctx->cis_nto_result = CISNTOResult{};
+                    ctx->ip_eom_result  = IPEOMResult{};
+                    ctx->ea_eom_result  = EAEOMResult{};
+                    ctx->barh.free();
+                    ctx->barh.has_ip = false; ctx->barh.has_ea = false;
+                    std::cout << "  [STEOM ckpt] CC-ONLY resume (GANSU_DMET_STEOM_CKPT_CC_ONLY=1): "
+                                 "cluster ground kept (cc=" << (ctx->cc_ground_cached ? "y" : "n")
+                              << "), CIS-NTO / IP / EA / bar-H discarded — they re-run with this "
+                                 "run's thresholds." << std::endl;
+                }
+            }
             ckpt_had_ea = ckpt_loaded && !ctx->ea_eom_result.per_active.empty();
             if (ckpt_loaded && ctx->barh.complete()) ctx->share_barh = true;  // borrow the restored bar-H
         }
@@ -927,7 +984,15 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                 if (d == ea_dev) continue;
                 if (D < 0 || freeb[d] > bf) { bf = freeb[d]; D = d; }
             }
-            if (D >= 0) {
+            const char* e_bh = std::getenv("GANSU_STEOM_BARH_IP_HOST");
+            if (D >= 0 && e_bh && e_bh[0] == '1') {
+                // (p8d autopsy) the freest peer is ALSO an EA multi-GPU σ replica
+                // target (~75 GB at nocc=234), so 65 GB of bar-H there OOMs the EA
+                // setup. Park the 8 on the host instead; keep D as the STEOM
+                // build-device hint (ip_dev) so the later choreography is unchanged.
+                ctx->barh.park_ip_on_host();
+                ctx->barh.ip_dev = D;
+            } else if (D >= 0) {
                 ctx->barh.migrate_ip_to(D);
                 std::cout << "  [DMET-STEOM share-barH] moved IP bar-H (8) off the "
                              "EA-solve device " << ea_dev << " → GPU " << D
@@ -1050,6 +1115,45 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         }
     }
 
+    // (2026-09-07, diagnostic) GANSU_STEOM_EA_PAIR_ROTATE=<theta>: rotate, by a fixed
+    // angle, every pair of ACTIVE EA roots that is exactly degenerate (|dω| < 1e-7 Ha —
+    // in practice the Re/Im halves of a complex Ritz pair, whose split is an arbitrary
+    // phase that differs run to run). Ŝ^EA = R2·(active R1)⁻¹ is invariant under any
+    // invertible recombination of the same active set, so the STEOM roots must not
+    // move beyond the ~1 meV ground-recompute noise; if they do, a non-invariant term
+    // exists in the build (MgO 374: 12 meV run-to-run with converged EA vectors).
+    if (ctx) {
+        if (const char* e = std::getenv("GANSU_STEOM_EA_PAIR_ROTATE")) {
+            const double th = std::atof(e);
+            const double c = std::cos(th), s = std::sin(th);
+            auto& pa = ctx->ea_eom_result.per_active;
+            std::vector<char> used(pa.size(), 0);
+            int n_rot = 0;
+            for (size_t i = 0; i < pa.size(); ++i) {
+                if (used[i] || pa[i].canonical_vir_label < 0) continue;
+                for (size_t j = i + 1; j < pa.size(); ++j) {
+                    if (used[j] || pa[j].canonical_vir_label < 0) continue;
+                    if (std::fabs(pa[i].omega - pa[j].omega) >= 1e-7) continue;
+                    if (pa[i].R1.size() != pa[j].R1.size() || pa[i].R2.size() != pa[j].R2.size()) continue;
+                    auto rot = [&](std::vector<real_t>& a, std::vector<real_t>& b) {
+                        for (size_t k = 0; k < a.size(); ++k) {
+                            const real_t x = a[k], y = b[k];
+                            a[k] = c * x - s * y;  b[k] = s * x + c * y;
+                        }
+                    };
+                    rot(pa[i].R1, pa[j].R1);
+                    rot(pa[i].R2, pa[j].R2);
+                    used[i] = used[j] = 1; ++n_rot;
+                    std::cout << "  [STEOM PAIR ROTATE] active ã=" << i << " and ã=" << j
+                              << " (ω=" << std::fixed << std::setprecision(8) << pa[i].omega
+                              << " Ha) rotated by " << th << " rad" << std::endl;
+                    break;
+                }
+            }
+            std::cout << "  [STEOM PAIR ROTATE] " << n_rot << " degenerate active EA pair(s) rotated"
+                      << std::defaultfloat << std::endl;
+        }
+    }
     // Sanity check — both per_active vectors must now have entries.
     const IPEOMResult& ip_result = ctx ? ctx->ip_eom_result : rhf.get_ip_eom_result();
     const EAEOMResult& ea_result = ctx ? ctx->ea_eom_result : rhf.get_ea_eom_result();
@@ -1291,6 +1395,26 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         cudaMemcpy(d_t1, bt.T1.data(), t1n * sizeof(real_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_t2, bt.T2.data(), t2n * sizeof(real_t), cudaMemcpyHostToDevice);
         std::cout << "  STEOM using DLPNO back-transformed canonical T1/T2 (hybrid bt-PNO-STEOM P5b)." << std::endl;
+        // (2026-09-07) Prefer the cached/checkpointed cluster ground over the freshly
+        // recomputed bt-PNO amplitudes (resume-deterministic; see the IP-stage note).
+        if (ctx && ctx->cc_ground_cached && ctx->cc_t1n == t1n && ctx->cc_t2n == t2n) {
+            cudaMemcpy(d_t1, ctx->cc_t1, t1n * sizeof(real_t), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(d_t2, ctx->cc_t2, t2n * sizeof(real_t), cudaMemcpyDeviceToDevice);
+            std::cout << "  STEOM: bt-PNO T1/T2 overridden by the cached/checkpointed cluster ground "
+                         "(resume-deterministic)." << std::endl;
+        } else if (ctx && !std::getenv("GANSU_STEOM_NO_CCSD_CACHE")) {
+            steom_cache_cluster_ground_host(ctx, d_t1, d_t2, t1n, t2n,
+                                            (ctx->dlpno_bt ? ctx->dlpno_E : ctx->post_hf_energy));
+            // Upgrade a resumed cc=n checkpoint with the ground now cached, so every
+            // later resume of the SAME file uses identical T1/T2 (the STEOM G of a
+            // near-defective cluster moves by meV under ~1e-7 Ha ground noise).
+            if (ckpt_loaded)
+                if (const char* ck = std::getenv("GANSU_DMET_STEOM_CKPT")) {
+                    steom_ckpt_save(*ctx, ck);
+                    std::cout << "  [STEOM ckpt] upgraded with the cluster ground (cc=y) for "
+                                 "deterministic resumes." << std::endl;
+                }
+        }
     } else if (ctx && ctx->cc_ground_cached) {
         // (solve-once) reuse the cluster CCSD ground cached by an earlier stage —
         // IP/EA/STEOM share one cluster ⇒ identical T1/T2. Skips the re-solve.
@@ -1307,9 +1431,14 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         // precomputed (block mode) hand the RI engine to ccsd_spatial_orbital so it
         // builds its own cluster B (build_B_mo over d_C = C_can) and runs the
         // B-native residual (Inc1/2) instead of needing a dense n_emb⁴ tensor.
+        // mo_eri_block_source() == dynamic_cast<const ERI_RI*> for every
+        // molecular engine (byte-identical), and hands back the cluster-B
+        // companion for the periodic one — which is what keeps the cluster
+        // CCSD ground off the n_emb⁴ tensor there too. Without it the periodic
+        // Inc3 path is storage-free everywhere EXCEPT the ground solve.
         const ERI_RI* ccsd_eri_ri =
             (ctx && ctx->prefer_ri_block && d_eri_mo_precomputed == nullptr)
-                ? dynamic_cast<const ERI_RI*>(&eri_method) : nullptr;
+                ? eri_method.mo_eri_block_source() : nullptr;
         real_t E_CCSD = ccsd_spatial_orbital(
             d_eri_ao, d_C, d_eps, num_basis, full_occ,
             /*computing_ccsd_t=*/false, /*ccsd_t_energy=*/nullptr,
@@ -1322,14 +1451,12 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                   << E_CCSD << " Ha   (in " << std::setprecision(3)
                   << ccsd_timer.elapsed_seconds() << " s)" << std::endl;
         // (solve-once) cache the cluster ground for any later reuse.
+        // (2026-09-19) HOST-parked, like the bt-PNO branch above: the device copy
+        // (o^2 v^2 = 8.3 GB at nocc 238) sat on the home GPU through the IP build.
         if (ctx && !std::getenv("GANSU_STEOM_NO_CCSD_CACHE")) {
             const size_t t1n = (size_t)nocc_active*nvir;
             const size_t t2n = (size_t)nocc_active*nocc_active*(size_t)nvir*nvir;
-            tracked_cudaMalloc(&ctx->cc_t1, t1n*sizeof(real_t));
-            tracked_cudaMalloc(&ctx->cc_t2, t2n*sizeof(real_t));
-            cudaMemcpy(ctx->cc_t1, d_t1, t1n*sizeof(real_t), cudaMemcpyDeviceToDevice);
-            cudaMemcpy(ctx->cc_t2, d_t2, t2n*sizeof(real_t), cudaMemcpyDeviceToDevice);
-            ctx->cc_t1n=t1n; ctx->cc_t2n=t2n; ctx->cc_E=E_CCSD; ctx->cc_ground_cached=true;
+            steom_cache_cluster_ground_host(ctx, d_t1, d_t2, t1n, t2n, E_CCSD);
         }
     }
 
@@ -1350,7 +1477,7 @@ static void compute_steom_ccsd_impl(RHF& rhf,
                              || (ctx && ctx->prefer_ri_block))
                             && gpu::gpu_available();
     if (want_block) {
-        eri_ri_block = dynamic_cast<const ERI_RI*>(&eri_method);
+        eri_ri_block = eri_method.mo_eri_block_source();
         if (eri_ri_block) {
             d_B_mo_blocks = eri_ri_block->build_B_mo(d_C, num_basis);
             if (!d_B_mo_blocks) eri_ri_block = nullptr;  // CPU / budget fail
@@ -1751,7 +1878,40 @@ static void compute_steom_ccsd_impl(RHF& rhf,
     const bool force_dense    = (std::getenv("GANSU_STEOM_DENSE_DIAG") != nullptr);
     const bool force_davidson = (std::getenv("GANSU_STEOM_DAVIDSON")  != nullptr);
     size_t diag_free_b = 0, diag_total_b = 0;
-    if (gpu::gpu_available()) cudaMemGetInfo(&diag_free_b, &diag_total_b);
+    // (2026-09-05) Probe EVERY device, not just the current one. On the MgO 374
+    // cluster the current device at this point is the bar-H GPU (share-barH
+    // choreography), holding ~120 GB of borrowed bar-H, so its free memory
+    // (~22 GB) failed the dense probe and every prize run silently took the
+    // Davidson this file calls unreliable — while device 0 sat at 2 GB used.
+    // The dense diag only needs G (peer-copied below), so it can run on the
+    // device with the most free memory. GANSU_STEOM_DIAG_DEVICE=<n> forces one.
+    int  diag_best_dev = -1;      // device chosen for the dense geev (-1 = current)
+    bool diag_redirected = false; // set when the diag moved off the G-owner device
+    int  diag_prev_dev = -1;
+    if (gpu::gpu_available()) {
+        int cur_dev = 0; cudaGetDevice(&cur_dev);
+        int n_dev = 0;   cudaGetDeviceCount(&n_dev);
+        const char* e_dd = std::getenv("GANSU_STEOM_DIAG_DEVICE");
+        if (e_dd && e_dd[0] >= '0' && e_dd[0] <= '9' && std::atoi(e_dd) < n_dev) {
+            diag_best_dev = std::atoi(e_dd);
+            cudaSetDevice(diag_best_dev);
+            cudaMemGetInfo(&diag_free_b, &diag_total_b);
+            cudaSetDevice(cur_dev);
+        } else {
+            for (int d = 0; d < n_dev; ++d) {
+                cudaSetDevice(d);
+                size_t fb = 0, tb = 0;
+                if (cudaMemGetInfo(&fb, &tb) == cudaSuccess && fb > diag_free_b) {
+                    diag_free_b = fb; diag_total_b = tb; diag_best_dev = d;
+                }
+            }
+            cudaSetDevice(cur_dev);
+        }
+        if (n_dev > 1)
+            std::cout << "  [STEOM diag] dense geev device candidate: GPU " << diag_best_dev
+                      << " (free " << (diag_free_b >> 30) << " GB; current GPU " << cur_dev
+                      << ")" << std::endl;
+    }
     const size_t dense_need_b = 3 * 5 * (size_t)total_dim * (size_t)total_dim * sizeof(real_t);
     const bool   dense_auto_ok = (total_dim <= dense_auto_min)
                                  || (diag_free_b > 0 && dense_need_b < diag_free_b);
@@ -1853,17 +2013,30 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         // Querying the pointer's owner is robust against any balance layout;
         // GPUHandle::reset rebinds cuBLAS/cuSOLVER to that device (established
         // idiom — Ship 15 does the same on redirect).
+        int g_owner_dev = -1;   // device owning d_G_ (peer-copy source)
         if (gpu::gpu_available() && steom_op.get_G_device() != nullptr) {
             cudaPointerAttributes gattr{};
             if (cudaPointerGetAttributes(&gattr, steom_op.get_G_device()) == cudaSuccess
                 && gattr.type == cudaMemoryTypeDevice) {
+                g_owner_dev = gattr.device;
                 int cur = -1;
                 cudaGetDevice(&cur);
-                if (cur != gattr.device) {
-                    cudaSetDevice(gattr.device);
+                // (2026-09-05) Run the geev on the device with the most free memory
+                // (probed above) rather than on G's owner: G is copied anyway
+                // (d_G_cm), and a peer copy costs the same as a local one. The
+                // owner is kept only when it IS the best device.
+                const int target = (diag_best_dev >= 0) ? diag_best_dev : gattr.device;
+                if (target != gattr.device) {
+                    diag_redirected = true;
+                    diag_prev_dev = cur;
+                }
+                if (cur != target) {
+                    cudaSetDevice(target);
                     gpu::GPUHandle::reset();
-                    std::cout << "  [STEOM dense diag] pinned to GPU " << gattr.device
-                              << " (owner of d_G_; was on GPU " << cur
+                    std::cout << "  [STEOM dense diag] pinned to GPU " << target
+                              << (target == gattr.device ? " (owner of d_G_" : " (most free memory; d_G_ owned by GPU ")
+                              << (target == gattr.device ? std::string("") : std::to_string(gattr.device))
+                              << "; was on GPU " << cur
                               << "; cuBLAS/cuSOLVER handles rebuilt)." << std::endl;
                 }
             }
@@ -1885,10 +2058,59 @@ static void compute_steom_ccsd_impl(RHF& rhf,
         }
         real_t* d_G_cm = nullptr;
         tracked_cudaMalloc(&d_G_cm, (size_t)total_dim * total_dim * sizeof(real_t));
+#ifndef GANSU_CPU_ONLY
+        {
+            int cur_d = -1; cudaGetDevice(&cur_d);
+            if (g_owner_dev >= 0 && cur_d != g_owner_dev)
+                cudaMemcpyPeer(d_G_cm, cur_d, steom_op.get_G_device(), g_owner_dev,
+                               (size_t)total_dim * total_dim * sizeof(real_t));
+            else
+                cudaMemcpy(d_G_cm, steom_op.get_G_device(),
+                           (size_t)total_dim * total_dim * sizeof(real_t),
+                           cudaMemcpyDeviceToDevice);
+        }
+#else
         cudaMemcpy(d_G_cm, steom_op.get_G_device(),
                    (size_t)total_dim * total_dim * sizeof(real_t),
                    cudaMemcpyDeviceToDevice);
+#endif
         gpu::transposeMatrixInPlace(d_G_cm, total_dim);  // row-major G → column-major G
+#ifndef GANSU_CPU_ONLY
+        // (2026-09-07) G fingerprint — always printed. Two runs with identical inputs
+        // must print identical numbers here; if they do not, the run-to-run scatter
+        // of the STEOM roots (MgO 374: 10 meV; 2x1x1 control: higher roots swap
+        // 6.6056 <-> 6.8393 <-> 7.1612) is in the G BUILD, not in the diagonaliser.
+        {
+            cublasHandle_t hfp = gpu::GPUHandle::cublas();
+            const size_t nn = (size_t)total_dim * total_dim;
+            real_t fro = 0.0, asum = 0.0, asym = 0.0;
+            cublasDnrm2(hfp, (int)std::min<size_t>(nn, 2147483647), d_G_cm, 1, &fro);
+            cublasDasum(hfp, (int)std::min<size_t>(nn, 2147483647), d_G_cm, 1, &asum);
+            std::vector<real_t> hd(total_dim);
+            cudaMemcpy2D(hd.data(), sizeof(real_t), d_G_cm, (size_t)(total_dim + 1) * sizeof(real_t),
+                         sizeof(real_t), total_dim, cudaMemcpyDeviceToHost);
+            double tr = 0.0; for (real_t v : hd) tr += v;
+            // asymmetry: the operator's row-major buffer is G^T in column-major, so
+            // ||G - G^T||_F = ||d_G_cm - G_rowmajor||_F
+            {
+                real_t* d_tmp = nullptr;
+                tracked_cudaMalloc(&d_tmp, nn * sizeof(real_t));
+                int cur_d = -1; cudaGetDevice(&cur_d);
+                if (g_owner_dev >= 0 && cur_d != g_owner_dev)
+                    cudaMemcpyPeer(d_tmp, cur_d, steom_op.get_G_device(), g_owner_dev, nn * sizeof(real_t));
+                else
+                    cudaMemcpy(d_tmp, steom_op.get_G_device(), nn * sizeof(real_t), cudaMemcpyDeviceToDevice);
+                const real_t m1 = -1.0;
+                cublasDaxpy(hfp, (int)std::min<size_t>(nn, 2147483647), &m1, d_G_cm, 1, d_tmp, 1);
+                cublasDnrm2(hfp, (int)std::min<size_t>(nn, 2147483647), d_tmp, 1, &asym);
+                tracked_cudaFree(d_tmp);
+            }
+            std::cout << "  [STEOM G fingerprint] dim=" << total_dim << std::scientific << std::setprecision(12)
+                      << "  ||G||_F=" << fro << "  sum|G|=" << asum << "  trace=" << tr
+                      << "  ||G-G^T||_F=" << asym << "  G00=" << hd[0] << "  Gnn=" << hd[total_dim - 1]
+                      << std::defaultfloat << std::endl;
+        }
+#endif
 
         // Robustness rescue (GANSU_STEOM_SYMMETRIZE=1, OPT-IN, default OFF ⇒
         // byte-identical). The analytic 2nd-order STEOM G is non-Hermitian and, at
@@ -2044,10 +2266,98 @@ static void compute_steom_ccsd_impl(RHF& rhf,
             }
         }
 
+#ifndef GANSU_CPU_ONLY
+        // (2026-09-07, diagnostic) GANSU_STEOM_DENSE_PERTURB=<rel>: eigenvalue
+        // conditioning probe. Re-solve G with its diagonal perturbed by uniform noise
+        // of relative size <rel> (× max|G_ii|) and print how far the lowest roots move.
+        // A well-conditioned spectrum moves by O(rel·|G|); a near-defective one (the
+        // complex Ritz pairs of MgO 374) moves by O(sqrt(rel·|G|)) — 1e-13 roundoff
+        // then becomes meV, which is exactly the run-to-run scatter seen with
+        // bit-identical inputs (p4m 4.8600 vs p6b 4.8504 eV, same IP/EA/ground).
+        if (const char* pe = std::getenv("GANSU_STEOM_DENSE_PERTURB")) {
+            const double rel = std::atof(pe);
+            const size_t nn = (size_t)total_dim * total_dim;
+            std::vector<real_t> h_diag(total_dim);
+            cublasHandle_t hcb = gpu::GPUHandle::cublas();
+            // d_G_cm is column-major G (transposed in place above); its diagonal is the
+            // same as G's. Pull the diagonal, build the noise vector, add with stride n+1.
+            cudaMemcpy2D(h_diag.data(), sizeof(real_t), d_G_cm, (size_t)(total_dim + 1) * sizeof(real_t),
+                         sizeof(real_t), total_dim, cudaMemcpyDeviceToHost);
+            real_t gmax = 0.0; for (real_t v : h_diag) gmax = std::max(gmax, std::fabs(v));
+            std::mt19937_64 rng(20260907ULL);
+            std::uniform_real_distribution<real_t> uni(-1.0, 1.0);
+            std::vector<real_t> h_noise(total_dim);
+            for (int i = 0; i < total_dim; ++i) h_noise[i] = rel * gmax * uni(rng);
+            real_t* d_G2 = nullptr; real_t* d_noise = nullptr;
+            real_t* d_ev2 = nullptr; real_t* d_ev2i = nullptr; real_t* d_vec2 = nullptr;
+            tracked_cudaMalloc(&d_G2, nn * sizeof(real_t));
+            cudaMemcpy(d_G2, d_G_cm, nn * sizeof(real_t), cudaMemcpyDeviceToDevice);
+            tracked_cudaMalloc(&d_noise, (size_t)total_dim * sizeof(real_t));
+            cudaMemcpy(d_noise, h_noise.data(), (size_t)total_dim * sizeof(real_t), cudaMemcpyHostToDevice);
+            const real_t one = 1.0;
+            cublasDaxpy(hcb, total_dim, &one, d_noise, 1, d_G2, total_dim + 1);
+            // GANSU_STEOM_DENSE_PERTURB_RANK1=<rel2>: additionally a GENERAL (non-normal)
+            // rank-1 perturbation rel2·|G|max·u·vᵀ with random unit u, v. A diagonal
+            // perturbation is a normal one and cannot expose Jordan-type sensitivity;
+            // a near-defective pair responds to u·vᵀ with a √ law.
+            if (const char* pr = std::getenv("GANSU_STEOM_DENSE_PERTURB_RANK1")) {
+                const double rel2 = std::atof(pr);
+                std::vector<real_t> h_u(total_dim), h_v(total_dim);
+                double nu = 0.0, nv = 0.0;
+                for (int i = 0; i < total_dim; ++i) { h_u[i] = uni(rng); h_v[i] = uni(rng); nu += h_u[i]*h_u[i]; nv += h_v[i]*h_v[i]; }
+                nu = std::sqrt(nu); nv = std::sqrt(nv);
+                for (int i = 0; i < total_dim; ++i) { h_u[i] /= nu; h_v[i] /= nv; }
+                real_t* d_u = nullptr; real_t* d_v = nullptr;
+                tracked_cudaMalloc(&d_u, (size_t)total_dim * sizeof(real_t));
+                tracked_cudaMalloc(&d_v, (size_t)total_dim * sizeof(real_t));
+                cudaMemcpy(d_u, h_u.data(), (size_t)total_dim * sizeof(real_t), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_v, h_v.data(), (size_t)total_dim * sizeof(real_t), cudaMemcpyHostToDevice);
+                const real_t a1 = rel2 * gmax;
+                cublasDger(hcb, total_dim, total_dim, &a1, d_u, 1, d_v, 1, d_G2, total_dim);
+                tracked_cudaFree(d_u); tracked_cudaFree(d_v);
+                std::cout << "  [STEOM dense PERTURB] + rank-1 general perturbation rel=" << std::scientific
+                          << std::setprecision(1) << rel2 << " (Frobenius " << a1 << " Ha)" << std::defaultfloat << std::endl;
+            }
+            tracked_cudaMalloc(&d_ev2,  (size_t)total_dim * sizeof(real_t));
+            tracked_cudaMalloc(&d_ev2i, (size_t)total_dim * sizeof(real_t));
+            tracked_cudaMalloc(&d_vec2, nn * sizeof(real_t));
+            const int info2 = gpu::eigenDecompositionNonSymmetric(d_G2, d_ev2, d_vec2, total_dim,
+                                                                  geev_host, d_ev2i);
+            std::vector<real_t> e2(total_dim), e2i(total_dim);
+            cudaMemcpy(e2.data(),  d_ev2,  (size_t)total_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(e2i.data(), d_ev2i, (size_t)total_dim * sizeof(real_t), cudaMemcpyDeviceToHost);
+            // lowest positive real parts, complex pairs collapsed to one entry
+            std::vector<real_t> low;
+            for (int i = 0; i < total_dim && (int)low.size() < 8; ++i) {
+                if (e2[i] <= 0.0) continue;
+                if (i > 0 && std::fabs(e2[i] - e2[i - 1]) < 1e-12 && std::fabs(e2i[i]) > 1e-12) continue;
+                low.push_back(e2[i]);
+            }
+            std::cout << "  [STEOM dense PERTURB] diag noise rel=" << std::scientific << std::setprecision(1)
+                      << rel << " (|G_ii|max=" << gmax << ", info=" << info2 << "); lowest roots (eV):";
+            for (size_t i = 0; i < low.size() && i < 6; ++i)
+                std::cout << " " << std::fixed << std::setprecision(4) << low[i] * 27.211386;
+            std::cout << "   -> compare with the unperturbed table above; shifts >> rel·|G| = "
+                      << std::scientific << std::setprecision(1) << rel * gmax * 27.211386
+                      << " eV mean ill-conditioned (near-defective) roots" << std::defaultfloat << std::endl;
+            tracked_cudaFree(d_G2); tracked_cudaFree(d_noise);
+            tracked_cudaFree(d_ev2); tracked_cudaFree(d_ev2i); tracked_cudaFree(d_vec2);
+        }
+#endif
         tracked_cudaFree(d_G_cm);
         tracked_cudaFree(d_all_evals);
         tracked_cudaFree(d_all_evals_imag);
         tracked_cudaFree(d_all_evecs);
+#ifndef GANSU_CPU_ONLY
+        // (2026-09-05) Undo the most-free-device redirect: downstream code (and the
+        // impl-exit restore) expects the device that was current before the diag.
+        if (diag_redirected && diag_prev_dev >= 0) {
+            cudaSetDevice(diag_prev_dev);
+            gpu::GPUHandle::reset();
+            std::cout << "  [STEOM dense diag] device restored to GPU " << diag_prev_dev
+                      << " after geev." << std::endl;
+        }
+#endif
 
         std::cout << "  STEOM-CCSD solve time: " << std::fixed << std::setprecision(3)
                   << solve_timer.elapsed_seconds() << " s "
@@ -2688,8 +2998,32 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
             cfg.get_dlpno_localizer_conv(), cfg.get_dlpno_lmp2_max_iter(),
             cfg.get_dlpno_lmp2_conv(), cfg.get_dlpno_sc_pno_iter(),
             cfg.get_dlpno_pno_os_only(), cfg.get_dlpno_verbose());
+        // Hand DLPNO the RI factor source, not the outer ERI. DLPNO decides
+        // between its blockwise Phase-2.4 path and the legacy dense n_emb⁴
+        // build with dynamic_cast<const ERI_RI*>(&eri) (dlpno_ccsd.cu:310).
+        // On the periodic path the outer object is ERI_PBC_Gamma_RHF, which
+        // derives from ERI and NOT from ERI_RI, so that cast failed and every
+        // Phase-2.4 call rebuilt the periodic dense tensor: a 2 h probe on MgO
+        // 2x1x1 did 95 of them and had not finished LMP2, against 7 min for
+        // the canonical solver. mo_eri_block_source() is the Inc3 accessor
+        // that already exists for exactly this (it returns the cluster-B
+        // ERI_RI); for a molecular ERI_RI it returns `this`, so the molecular
+        // path is unchanged — including the ERI_RI_Distributed_RHF cast that
+        // DLPNO does for its multi-GPU fan-out, which still sees one object.
+        const ERI_RI* dl_src = eri_method.mo_eri_block_source();
+        const ERI& dl_eri = dl_src ? static_cast<const ERI&>(*dl_src) : eri_method;
+        // Prime the periodic cluster-B anchor with the FULL cluster C before
+        // DLPNO starts asking. The anchor policy adopts the first build, which
+        // on the canonical chain is always the full C — but DLPNO's first
+        // request is a tiny pair block (observed: na=5), and every later,
+        // larger request then failed the nmo<=na test and went back to the
+        // lattice sum (295 rebuilds in 2.3 h). One full-space build here — the
+        // same cost the canonical chain pays once anyway — makes every
+        // pair/domain/PNO request a rotation inside the anchor span.
+        if (dl_src && &dl_eri != &eri_method)
+            (void)dl_src->build_B_mo(C.device_ptr(), n_emb);
         if (want_lmp2_test) {
-            auto lm = solve_dlpno_lmp2(cfg, eri_method, p, &cs);
+            auto lm = solve_dlpno_lmp2(cfg, dl_eri, p, &cs);
             std::cout << "  [DMET-STEOM lmp2-test] cluster DLPNO-LMP2 (C "
                       << nao << "x" << n_emb << (nao == n_emb ? " square" : " RECTANGULAR")
                       << ", nocc_c=" << cs.nocc << ", nfrozen_c=" << cs.nfrozen
@@ -2704,7 +3038,7 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
             cfg.set_collect_dlpno_bt(true);
             real_t E_dl = 0.0;
             {
-                DLPNOCCSD drv(cfg, eri_method, p, &cs);
+                DLPNOCCSD drv(cfg, dl_eri, p, &cs);
                 E_dl = drv.compute_energy();
             }
             cfg.set_collect_dlpno_bt(false);
@@ -2741,7 +3075,15 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
                 real_t* d_t1p = nullptr;
                 real_t* d_t2p = nullptr;
                 real_t E_T_can = 0.0;
-                const ERI_RI* pol_ri = dynamic_cast<const ERI_RI*>(&eri_method);
+                // Same resolution as the DLPNO ground above: the polish needs
+                // the RI factor SOURCE, and on the periodic path the outer
+                // object is not an ERI_RI, so the direct cast handed the
+                // polish a null ERI and it "converged" to E_corr = 0 — which
+                // the STEOM chain then consumed without complaint (observed:
+                // roots 1.7 eV below canonical). mo_eri_block_source() returns
+                // `this` for a molecular ERI_RI (bit-identical there) and the
+                // cluster-B object for the periodic engine.
+                const ERI_RI* pol_ri = eri_method.mo_eri_block_source();
                 const real_t E_pol = ccsd_spatial_orbital(
                     /*d_eri_ao=*/nullptr, C.device_ptr(), eps.device_ptr(),
                     n_emb, n_emb_occ,
@@ -2761,6 +3103,17 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
                            cudaMemcpyDeviceToHost);
                 tracked_cudaFree(d_t1p);
                 tracked_cudaFree(d_t2p);
+                // A polish that returns exactly 0 while the DLPNO ground found
+                // real correlation is not a result — it means the polish ran
+                // without integrals (this happened: a failed ERI_RI cast on
+                // the periodic path) and the chain would consume zero
+                // amplitudes without any further complaint, shifting every
+                // excitation by ~eV. Refuse loudly instead.
+                if (E_pol == 0.0 && std::abs(E_dl) > 1e-10)
+                    THROW_EXCEPTION(
+                        "cluster bt-polish returned E_corr = 0 while the DLPNO "
+                        "ground found " + std::to_string(E_dl) +
+                        " Ha — the polish ran without a usable RI source.");
                 cfg.set_dlpno_bt_amplitudes(std::move(bt));
                 E_final = E_pol;
                 std::cout << "  [cluster bt-polish] E_corr = " << std::fixed

@@ -109,10 +109,23 @@ std::vector<Atom> parseXYZ(const std::string& filename) {
             }
         }
 
+        // Ghost atom "X-<El>": <El>'s basis functions at this site, no nucleus,
+        // no electrons. effective_charge = 0 makes every charge consumer
+        // (V_ne, nuclear repulsion, PBC Ewald, SAD skip, frozen-core auto)
+        // treat it as chargeless — the same mechanism ECP and the internal
+        // zero-charge dummy of pbc_gamma_1e already rely on. The electron
+        // count skips it in the Molecular constructor. Not wired for ECP
+        // files (a ghost of an ECP element would wrongly attach the ECP).
+        bool ghost = false;
+        if (symbol.size() > 2 && (symbol[0] == 'X' || symbol[0] == 'x')
+            && symbol[1] == '-') {
+            ghost = true;
+            symbol = symbol.substr(2);
+        }
         int Z = element_name_to_atomic_number(symbol);
         Atom atom{
             .atomic_number = Z,
-            .effective_charge = Z,  // default: no ECP
+            .effective_charge = ghost ? 0 : Z,  // default: no ECP
             .coordinate = coordinate
         };
 

@@ -157,18 +157,28 @@ struct Atom {
  * @brief Constant values
  */
 
-inline real_t angstrom_to_bohr(const real_t angstrom){
-    const real_t a_to_b = 1.8897259886; ///< 1 Angstrom = 1.8897259886 Bohr
-    return angstrom * a_to_b;
+/// Single source of truth for the length unit (CODATA 2018 Bohr radius).
+///
+/// Both directions are DERIVED from this one number on purpose. They used to be
+/// independent literals -- 1.8897259886 forward, 0.529177210903 back -- and
+/// those are NOT reciprocals: 1/0.529177210903 = 1.8897261246, so the round
+/// trip lost 7.2e-8 relative (angstrom_to_bohr then bohr_to_angstrom returned
+/// 0.99999992802 x the input) and every geometry read from an xyz came out
+/// contracted by that factor. Deriving both from one constant is what stops the
+/// pair from drifting apart again. Diagnosis in
+/// GANSU-for-Material/rfc/RSDF_GammaJK_RFC.md section 36.
+inline constexpr real_t kBohrInAngstrom = 0.529177210903;
+
+inline constexpr real_t angstrom_to_bohr(const real_t angstrom){
+    return angstrom / kBohrInAngstrom;
 }
 
 /**
  * @brief Constant values
  */
 
-inline real_t bohr_to_angstrom(const real_t bohr){
-    const real_t b_to_a = 0.529177210903; ///< 1 bohr = 0.529177210903 angstrom
-    return bohr * b_to_a;
+inline constexpr real_t bohr_to_angstrom(const real_t bohr){
+    return bohr * kBohrInAngstrom;
 }
 
 /**

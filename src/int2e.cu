@@ -1649,7 +1649,7 @@ __global__ void MD_1T1SP(double* g_int2e, const PrimitiveShell* g_shell, const r
     const int num_basis, const double* g_boys_grid, const size_t head_bra, const size_t head_ket)
 {
     // 通し番号indexの計算
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
 
 
     if (id >= num_threads) return;

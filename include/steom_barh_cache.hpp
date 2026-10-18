@@ -129,7 +129,16 @@ struct SteomBarHCache {
     int ea_dev = 0;   ///< GPU holding Wvovv/Wvvvv/Wvvvo
 
     /// Migrate the 8 IP-side buffers from ip_dev → dst (peer copy) and set ip_dev.
+    /// No-op once park_ip_on_host() has run (the buffers are device-agnostic).
     void migrate_ip_to(int dst);
+    /// (p8d autopsy 2026-09-08) Re-home the 8 IP-side buffers on HOST-parked
+    /// managed memory (preferred location CPU, AccessedBy every GPU): the EA
+    /// multi-GPU σ replicates ~75 GB onto every peer, and the 65 GB IP bar-H
+    /// (nocc=234) parked on "the freest peer" collided with it. Bit-identical
+    /// (same bytes; consumers read them through UVM). ip_dev keeps its value
+    /// as the STEOM build-device hint. Env GANSU_STEOM_BARH_IP_HOST=1 selects it.
+    void park_ip_on_host();
+    bool ip_host_parked = false;   ///< set by park_ip_on_host()
     /// Migrate the 3 EA-side buffers from ea_dev → dst (peer copy) and set ea_dev.
     void migrate_ea_to(int dst);
 };

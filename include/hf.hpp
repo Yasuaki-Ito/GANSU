@@ -80,7 +80,7 @@ public:
      * @details This function computes the nuclear repulsion energy.
      * @details The nuclear repulsion energy is given by \f$\displaystyle E_{\text{nuc}} = \sum_{i} \sum_{j>i} \frac{Z_i Z_j}{r_{ij}} \f$
      */
-    void compute_nuclear_repulsion_energy();
+    virtual void compute_nuclear_repulsion_energy(); ///< virtual: PBC derivations substitute the Ewald sum
 
     /**
      * @brief Compute the core Hamiltonian matrix
@@ -90,7 +90,7 @@ public:
      * @details The nuclear attraction matrix is given by \f$ V_{\mu \nu} = -\sum_{A} \int \chi_{\mu}(\mathbf{r}) \frac{Z_A}{r_A} \chi_{\nu}(\mathbf{r}) d\mathbf{r} \f$
      * @details The core Hamiltonian matrix is given by \f$ h_{\mu \nu} = T_{\mu \nu} + V_{\mu \nu} \f$
      */
-    void compute_core_hamiltonian_matrix();
+    virtual void compute_core_hamiltonian_matrix(); ///< virtual: PBC derivations substitute lattice-summed S/h
 
     /**
      * @brief Precompute the ERIs
@@ -103,15 +103,26 @@ public:
      * @brief Compute the transformation matrix
      * @details This function computes the transform matrix \f$X\f$ by diagonalizing the overlap matrix \f$S\f$.
      * @details (1) Symetrize the overlap matrix by \f$U^{T}SU = s\f$
-     * @details (2) Compute the transformation matrix by \f$X = U s^{-1/2}\f$
+     * @details (2) Compute the transformation matrix by \f$X = U s^{-1/2}\f$ (canonical orthogonalization)
+     * @details When lindep_threshold > 0, near-linear-dependent directions (s_i < threshold)
+     *          are projected out by zeroing the corresponding columns of X
+     *          (num_independent_basis is reduced accordingly). Virtual so that
+     *          periodic derivations can substitute a per-k orthogonalization.
      */
-    void compute_transform_matrix();
+    virtual void compute_transform_matrix();
 
 
     /**
      * @brief Get the number of basis functions
      */
     int get_num_basis() const { return num_basis; }
+
+    /**
+     * @brief Number of linearly independent basis functions kept by the
+     *        canonical orthogonalization (== num_basis unless lindep_threshold
+     *        dropped some overlap eigenvalues).
+     */
+    int get_num_independent_basis() const { return static_cast<int>(num_independent_basis_); }
 
     /// Phase 1 spherical-basis accessors (forwarded from Molecular at construction).
     bool get_use_spherical()              const { return use_spherical_; }
@@ -262,6 +273,8 @@ public:
     const std::string& get_dmet_cluster_solver() const { return dmet_cluster_solver_; }
     double get_dmet_nto_bath()     const { return dmet_nto_bath_; }
     double get_dmet_nto_bath_occ() const { return dmet_nto_bath_occ_; }
+    double get_dmet_nto_bath_wfloor() const { return dmet_nto_bath_wfloor_; }
+    const std::string& get_dmet_steom_auto_select() const { return dmet_steom_auto_select_; }
     bool   get_dmet_level_shift_denom_only() const { return dmet_level_shift_denom_only_; }
     /// DMET cluster excited-state solver: "steom" (STEOM-CCSD) or "adc2" (ADC(2)).
     const std::string& get_dmet_excited_method() const { return dmet_excited_method_; }
@@ -689,6 +702,8 @@ protected:
     std::string dmet_cluster_solver_ = "canonical";  ///< DMET-STEOM cluster ground solver: canonical | dlpno
     double dmet_nto_bath_     = 0.0;  ///< NTO-bath augmentation τ_vir (0 = off; env GANSU_DMET_STEOM_NTO_BATH overrides)
     double dmet_nto_bath_occ_ = 0.0;  ///< NTO-bath augmentation τ_occ (0 = off; env ..._NTO_BATH_OCC overrides)
+    double dmet_nto_bath_wfloor_ = 0.0;  ///< NTO-bath relative occupation floor (0 = off; env GANSU_DMET_STEOM_NTO_BATH_WFLOOR overrides)
+    std::string dmet_steom_auto_select_ = "atom";  ///< auto-fragment selection rule: atom | shell (2026-09-24)
     bool   dmet_level_shift_denom_only_ = true;  ///< denominator-only cluster level shift (correct, unbiased); false = legacy biased form
     std::string dmet_excited_method_ = "steom";      ///< DMET cluster excited solver: steom | adc2
     double dmet_n_tol_ = 1e-5;  ///< DMET: bisection tolerance on |Σ N_frag − N_elec|
@@ -809,6 +824,9 @@ protected:
 
 
     DeviceHostMatrix<real_t> transform_matrix; ///< Transformation matrix
+
+    real_t lindep_threshold_ = 0.0; ///< canonical-orthogonalization cutoff on overlap eigenvalues (0 = off)
+    size_t num_independent_basis_ = 0; ///< basis count after lindep removal (== num_basis when nothing dropped); set in compute_transform_matrix
 
     real_t nuclear_repulsion_energy_; ///< Nuclear repulsion energy
 

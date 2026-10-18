@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <numeric>
 #include <random>
+#include <cstdlib>
 
 namespace gansu {
 
@@ -146,24 +147,72 @@ void DavidsonSolver::allocate_memory() {
 
     size_t free_mem, total_mem;
     cudaMemGetInfo(&free_mem, &total_mem);
-    if (total_bytes > free_mem) {
-        std::ostringstream oss;
-        oss << "Davidson solver requires "
-            << CudaMemoryManager<real_t>::format_bytes(total_bytes)
-            << " but only "
-            << CudaMemoryManager<real_t>::format_bytes(free_mem)
-            << " available on GPU. "
-            << "Consider using schur_omega solver for large systems.";
-        throw std::runtime_error(oss.str());
+    // 2026-09-04: when the subspace does not fit the device, put the four
+    // dim-sized buffers (subspace, sigma, residuals, eigenvectors) on MANAGED
+    // memory instead of throwing. The per-iteration DGEMMs (V^T sigma,
+    // projections) then stream the oversubscribed pages over the interconnect
+    // — seconds per iteration, against a solve that could not run at all
+    // (MgO n_emb=374 IP-EOM: dim 7.7M x 89 roots = 71 GB vs 46 GB free after
+    // the DLPNO ground). GANSU_DAVIDSON_UVM=1 forces it, =0 restores the throw.
+    bool use_managed = false;
+    // (2026-09-16) GANSU_DAVIDSON_UVM=2: HOST-preferred managed buffers (host
+    // first-touch, preferred location CPU, direct access from this device).
+    // The =1 mode is device-preferred and thrashes once oversubscribed (MgO
+    // pob IP at 1.5x stalled); host-preferred pages are simply streamed by the
+    // subspace DGEMMs and the sigma reads — seconds per iteration — so the
+    // subspace cap no longer competes with the operator for device memory
+    // (MgO 3x3x3 EA: cap 5-7 on device stalled at max|r| ~0.1; cap 10 = 45 GB).
+    bool host_managed = false;
+    {
+        const char* e = std::getenv("GANSU_DAVIDSON_UVM");
+        const bool force = e && (e[0] == '1' || e[0] == '2');
+        host_managed = e && e[0] == '2';
+        const bool allow = !(e && e[0] == '0');
+        if (force || (allow && total_bytes > free_mem)) use_managed = true;
+        if (total_bytes > free_mem && !use_managed) {
+            std::ostringstream oss;
+            oss << "Davidson solver requires "
+                << CudaMemoryManager<real_t>::format_bytes(total_bytes)
+                << " but only "
+                << CudaMemoryManager<real_t>::format_bytes(free_mem)
+                << " available on GPU. "
+                << "Consider using schur_omega solver for large systems.";
+            throw std::runtime_error(oss.str());
+        }
+        if (use_managed) {
+            std::cout << "  Davidson: subspace " << CudaMemoryManager<real_t>::format_bytes(total_bytes)
+                      << " vs free " << CudaMemoryManager<real_t>::format_bytes(free_mem)
+                      << " -> dim-sized buffers on MANAGED memory (oversubscribable)"
+                      << (force ? "  (forced)" : "") << std::endl;
+            if (total_bytes > free_mem)
+                gansu::dump_tracked_allocations("Davidson managed fallback: device residents");
+        }
     }
+    auto alloc_dim = [&](real_t** p, size_t bytes) {
+        if (use_managed && host_managed) {
+            gansu::tracked_cudaMallocManagedHost(p, bytes);
+            int dev = 0; cudaGetDevice(&dev);
+            cudaMemLocation lh{}; lh.type = cudaMemLocationTypeHost;   lh.id = 0;
+            cudaMemLocation ld{}; ld.type = cudaMemLocationTypeDevice; ld.id = dev;
+            cudaMemAdvise(*p, bytes, cudaMemAdviseSetPreferredLocation, lh);
+            cudaMemAdvise(*p, bytes, cudaMemAdviseSetAccessedBy, ld);
+        }
+        else if (use_managed) gansu::tracked_cudaMallocManaged(p, bytes);
+        else                  tracked_cudaMalloc(p, bytes);
+    };
+    if (use_managed && host_managed)
+        std::cout << "  Davidson: dim-sized buffers on HOST-preferred managed memory (GANSU_DAVIDSON_UVM=2): "
+                  << CudaMemoryManager<real_t>::format_bytes(
+                         static_cast<size_t>(dim_) * (2 * config_.max_subspace_size + 2 * config_.num_eigenvalues) * sizeof(real_t))
+                  << " off device" << std::endl;
 
     // Subspace vectors: dim × max_subspace_size (use size_t to avoid int overflow)
-    tracked_cudaMalloc(&d_subspace_vectors_,
-                       static_cast<size_t>(dim_) * config_.max_subspace_size * sizeof(real_t));
+    alloc_dim(&d_subspace_vectors_,
+              static_cast<size_t>(dim_) * config_.max_subspace_size * sizeof(real_t));
 
     // Sigma vectors: dim × max_subspace_size
-    tracked_cudaMalloc(&d_sigma_vectors_,
-                       static_cast<size_t>(dim_) * config_.max_subspace_size * sizeof(real_t));
+    alloc_dim(&d_sigma_vectors_,
+              static_cast<size_t>(dim_) * config_.max_subspace_size * sizeof(real_t));
 
     // Subspace matrix: max_subspace_size × max_subspace_size
     tracked_cudaMalloc(&d_subspace_matrix_,
@@ -179,13 +228,21 @@ void DavidsonSolver::allocate_memory() {
     tracked_cudaMalloc(&d_subspace_eigenvectors_,
                        static_cast<size_t>(config_.max_subspace_size) * config_.max_subspace_size * sizeof(real_t));
 
-    // Residuals: dim × num_eigenvalues
-    tracked_cudaMalloc(&d_residuals_,
-                       static_cast<size_t>(dim_) * config_.num_eigenvalues * sizeof(real_t));
-
-    // Final eigenvectors: dim × num_eigenvalues
-    tracked_cudaMalloc(&d_eigenvectors_,
-                       static_cast<size_t>(dim_) * config_.num_eigenvalues * sizeof(real_t));
+    // Residuals / final eigenvectors: dim × num_eigenvalues. In the streamable
+    // mode these stay on the DEVICE (2 × nev × dim, e.g. 5.8 GB at MgO 3x3x3 EA):
+    // they are the working set of every iteration, and the blocked Ritz/residual
+    // GEMMs write straight into them.
+    host_managed_ = use_managed && host_managed;
+    if (host_managed_) {
+        tracked_cudaMalloc(&d_residuals_,    static_cast<size_t>(dim_) * config_.num_eigenvalues * sizeof(real_t));
+        tracked_cudaMalloc(&d_eigenvectors_, static_cast<size_t>(dim_) * config_.num_eigenvalues * sizeof(real_t));
+        tracked_cudaMalloc(&d_block_scratch_, static_cast<size_t>(dim_) * 2 * config_.num_eigenvalues * sizeof(real_t));
+    } else {
+        alloc_dim(&d_residuals_,
+                  static_cast<size_t>(dim_) * config_.num_eigenvalues * sizeof(real_t));
+        alloc_dim(&d_eigenvectors_,
+                  static_cast<size_t>(dim_) * config_.num_eigenvalues * sizeof(real_t));
+    }
 
     if (config_.verbose > 2) {
         size_t total_bytes = (
@@ -211,6 +268,8 @@ void DavidsonSolver::free_memory() {
     if (d_subspace_eigenvectors_) tracked_cudaFree(d_subspace_eigenvectors_);
     if (d_residuals_) tracked_cudaFree(d_residuals_);
     if (d_eigenvectors_) tracked_cudaFree(d_eigenvectors_);
+    if (d_block_scratch_) tracked_cudaFree(d_block_scratch_);
+    d_block_scratch_ = nullptr;
 
     d_subspace_vectors_ = nullptr;
     d_sigma_vectors_ = nullptr;
@@ -220,6 +279,29 @@ void DavidsonSolver::free_memory() {
     d_subspace_eigenvectors_ = nullptr;
     d_residuals_ = nullptr;
     d_eigenvectors_ = nullptr;
+}
+
+// (2026-09-16) See the header note: stage the sigma block through the device
+// scratch in the streamable mode; plain pass-through otherwise (byte-identical).
+void DavidsonSolver::apply_sigma_block(int first, int n) {
+    if (n <= 0) return;
+    if (!host_managed_ || !d_block_scratch_) {
+        linear_op_.apply_batch(&d_subspace_vectors_[static_cast<size_t>(first) * dim_],
+                               &d_sigma_vectors_[static_cast<size_t>(first) * dim_], n);
+        return;
+    }
+    const int nev = config_.num_eigenvalues;
+    real_t* d_in  = d_block_scratch_;
+    real_t* d_out = d_block_scratch_ + static_cast<size_t>(nev) * dim_;
+    for (int off = 0; off < n; off += nev) {
+        const int nb = std::min(nev, n - off);
+        const size_t bytes = static_cast<size_t>(nb) * dim_ * sizeof(real_t);
+        cudaMemcpy(d_in, &d_subspace_vectors_[static_cast<size_t>(first + off) * dim_], bytes, cudaMemcpyDefault);
+        linear_op_.apply_batch(d_in, d_out, nb);
+        cudaDeviceSynchronize();
+        cudaMemcpy(&d_sigma_vectors_[static_cast<size_t>(first + off) * dim_], d_out, bytes, cudaMemcpyDefault);
+    }
+    cudaDeviceSynchronize();
 }
 
 // ========== Main Solve Method ==========
@@ -274,9 +356,7 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
             // streamed out-of-core intermediate (host-staged EA σ) share each slab
             // across the batch, amortizing H2D by n_new.
             if (n_new > 0) {
-                linear_op_.apply_batch(&d_subspace_vectors_[static_cast<size_t>(sigma_computed_) * dim_],
-                                       &d_sigma_vectors_[static_cast<size_t>(sigma_computed_) * dim_],
-                                       n_new);
+                apply_sigma_block(sigma_computed_, n_new);
             }
             sigma_computed_ = subspace_dim_;
             cudaDeviceSynchronize();
@@ -346,6 +426,50 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
                 converged = true;
             }
 
+            // (2026-09-06) Complex-pair stagnation acceptance. A complex Ritz pair's
+            // "residual" (of the real-part vector against the real-part eigenvalue) has
+            // a floor ~|Im λ|·‖V Im c‖ that no iteration can lower, so with any_complex
+            // the strict rule above can never fire and the solve burns max_iterations
+            // (MgO 374 EA: max|r| pinned at 1.79e-5 for 70 iterations, 4.8 h wasted).
+            // Accept when (a) every REAL root is below tol, (b) the eigenvalues are
+            // stable, and (c) max|r| has not moved by >0.1% for 10 consecutive
+            // iterations — i.e. the only thing left is the complex-pair floor. The
+            // returned vectors are exactly what max_iterations would have returned.
+            // GANSU_EOM_NO_COMPLEX_STAGNATION_ACCEPT=1 disables.
+            {
+                static const bool allow_stag = [] {
+                    const char* e = std::getenv("GANSU_EOM_NO_COMPLEX_STAGNATION_ACCEPT");
+                    return !(e && e[0] == '1');
+                }();
+                if (stag_prev_max_res_ > 0.0
+                    && std::fabs(max_res - stag_prev_max_res_) < 1e-3 * max_res)
+                    ++stag_count_;
+                else
+                    stag_count_ = 0;
+                stag_prev_max_res_ = max_res;
+                if (!converged && allow_stag && any_complex && stag_count_ >= 10
+                    && max_eval_change < config_.convergence_threshold) {
+                    bool real_roots_ok = true;
+                    int  n_complex = 0;
+                    for (int i = 0; i < config_.num_eigenvalues; ++i) {
+                        if (config_.min_eigenvalue > 0.0 && h_eigenvalues_[i] < config_.min_eigenvalue)
+                            continue;
+                        if (std::abs(h_eigenvalues_imag_[i]) > 1e-8) { ++n_complex; continue; }
+                        if (residual_norms_[i] > config_.convergence_threshold) { real_roots_ok = false; break; }
+                    }
+                    if (real_roots_ok) {
+                        if (config_.verbose > 0)
+                            std::cout << "  Davidson: all real roots converged; " << n_complex
+                                      << " complex-pair root(s) hold max|r| at " << std::scientific
+                                      << std::setprecision(2) << max_res
+                                      << " (stagnant 10 iters) — accepting" << std::defaultfloat
+                                      << std::endl;
+                        converged = true;
+                    }
+                }
+                if (converged) { stag_count_ = 0; stag_prev_max_res_ = -1.0; }
+            }
+
             // Softer fallback: eigenvalues stable to 10*tol for N consecutive iters,
             // accept regardless of residual. (1e-6 boundary noise is common at
             // the 6th decimal; 10*tol = 1e-5 still gives 5-digit eigenvalues.)
@@ -354,8 +478,26 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
             } else {
                 eigenvalue_only_stable_count = 0;
             }
+            // (2026-09-05) GANSU_EOM_NO_SOFT_ACCEPT=1 disables this fallback:
+            // on MgO 374 the EA solve was accepted at max|r| ~ 1e-2 (tol 1e-5)
+            // and the unconverged vectors shifted the STEOM root 0 by 10 meV
+            // between runs. With the switch the solve runs to true convergence
+            // or max_iterations (then the caller sees unconverged status).
+            static const bool no_soft_accept = [] {
+                const char* e = std::getenv("GANSU_EOM_NO_SOFT_ACCEPT");
+                return e && e[0] == '1';
+            }();
             if (!converged && !any_complex &&
                 eigenvalue_only_stable_count >= eigenvalue_only_stable_required) {
+                if (no_soft_accept) {
+                    if (config_.verbose > 0 && eigenvalue_only_stable_count == eigenvalue_only_stable_required)
+                        std::cout << "  Davidson: eigenvalues stable for "
+                                  << eigenvalue_only_stable_required
+                                  << " consecutive iters but max|r|=" << std::scientific
+                                  << std::setprecision(2) << max_res
+                                  << " > tol — NOT accepting (GANSU_EOM_NO_SOFT_ACCEPT=1), continuing"
+                                  << std::defaultfloat << std::endl;
+                } else {
                 if (config_.verbose > 0) {
                     std::cout << "  Davidson: eigenvalues stable for "
                               << eigenvalue_only_stable_required
@@ -364,6 +506,7 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
                               << "), accepting" << std::defaultfloat << std::endl;
                 }
                 converged = true;
+                }   // !no_soft_accept
             }
         }
         prev_eigenvalues = h_eigenvalues_;
@@ -415,18 +558,42 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
             sigma_computed_ = 0;  // Ritz vectors replaced old basis — recompute sigma
             subspace_matrix_built_ = 0;  // Subspace matrix must be rebuilt after restart
 
+            // (2026-09-06) GANSU_DAVIDSON_RESTART_CHECK=1: re-evaluate the restarted
+            // basis immediately (sigma + H + Ritz + residuals) and print the lowest
+            // eigenvalues and max|r| next to the pre-restart values. A sound thick
+            // restart reproduces both; a jump here localises the defect to the
+            // restart itself (MgO 374 EA: max|r| 1e-4 → 1e-2..1 at every restart).
+            static const bool restart_check = [] {
+                const char* e = std::getenv("GANSU_DAVIDSON_RESTART_CHECK");
+                return e && e[0] == '1';
+            }();
+            const real_t pre_restart_max_res =
+                *std::max_element(residual_norms_.begin(), residual_norms_.end());
             // Detect eigenvalue collapse after restart for non-Hermitian problems
-            if (config_.min_eigenvalue > 0.0) {
+            if (config_.min_eigenvalue > 0.0 || restart_check) {
                 // Recompute sigma and subspace matrix to check new eigenvalues
                 if (subspace_dim_ - sigma_computed_ > 0) {
-                    linear_op_.apply_batch(&d_subspace_vectors_[static_cast<size_t>(sigma_computed_) * dim_],
-                                           &d_sigma_vectors_[static_cast<size_t>(sigma_computed_) * dim_],
-                                           subspace_dim_ - sigma_computed_);
+                    apply_sigma_block(sigma_computed_, subspace_dim_ - sigma_computed_);
                 }
                 sigma_computed_ = subspace_dim_;
                 cudaDeviceSynchronize();
                 build_subspace_matrix();
+                subspace_matrix_built_ = subspace_dim_;
                 solve_subspace_eigenproblem();
+                if (restart_check) {
+                    compute_ritz_vectors_and_residuals();
+                    const real_t post_max_res =
+                        *std::max_element(residual_norms_.begin(), residual_norms_.end());
+                    std::cout << "  Davidson: RESTART CHECK  kept=" << subspace_dim_
+                              << "  max|r| pre=" << std::scientific << std::setprecision(2)
+                              << pre_restart_max_res << " post=" << post_max_res
+                              << "  ev0 pre=" << std::fixed << std::setprecision(6)
+                              << pre_restart_evals[0] << " post=" << h_eigenvalues_[0]
+                              << "  ev" << (config_.num_eigenvalues - 1) << " pre="
+                              << pre_restart_evals[config_.num_eigenvalues - 1]
+                              << " post=" << h_eigenvalues_[config_.num_eigenvalues - 1]
+                              << std::defaultfloat << std::endl;
+                }
 
                 // Check if eigenvalues collapsed (dropped by >50% or below threshold)
                 bool collapsed = false;
@@ -456,6 +623,28 @@ bool DavidsonSolver::solve(const real_t* d_initial_guess) {
     if (!converged && config_.verbose > 0) {
         std::cout << "  Warning: Davidson did not converge in "
                  << config_.max_iterations << " iterations" << std::endl;
+    }
+
+    // (2026-09-06) Exit residual summary by root class. The per-iteration line
+    // prints only max|r|, which a complex pair can pin (MgO 374 EA: 1.8e-5 for
+    // 70+ iterations) while saying nothing about the quality of the REAL roots
+    // that STEOM actually consumes. Print both so a log records what was reached.
+    if (config_.verbose > 0) {
+        real_t max_real = 0.0, max_cplx = 0.0;
+        int n_real = 0, n_cplx = 0, n_real_unconv = 0;
+        for (int i = 0; i < config_.num_eigenvalues; ++i) {
+            if (config_.min_eigenvalue > 0.0 && h_eigenvalues_[i] < config_.min_eigenvalue) continue;
+            const bool cplx = (!config_.symmetric && std::abs(h_eigenvalues_imag_[i]) > 1e-8);
+            if (cplx) { ++n_cplx; max_cplx = std::max(max_cplx, residual_norms_[i]); }
+            else      { ++n_real; max_real = std::max(max_real, residual_norms_[i]);
+                        if (residual_norms_[i] > config_.convergence_threshold) ++n_real_unconv; }
+        }
+        std::cout << "  Davidson exit: real roots " << n_real << " (max|r|=" << std::scientific
+                  << std::setprecision(2) << max_real << ", " << n_real_unconv << " above tol "
+                  << config_.convergence_threshold << ")";
+        if (n_cplx > 0)
+            std::cout << "; complex-pair roots " << n_cplx << " (max|r|=" << max_cplx << ")";
+        std::cout << std::defaultfloat << std::endl;
     }
 
     // (FULL mode) Unresolved complex Ritz pairs at exit: the reported real part
@@ -576,7 +765,13 @@ void DavidsonSolver::orthogonalize_vectors(int start_index, int num_vectors) {
             real_t* vec_i = &d_subspace_vectors_[static_cast<size_t>(i) * dim_];
             Map<VectorXd> vi(vec_i, dim_);
 
-            // Orthogonalize against all previous vectors
+            // Orthogonalize against all previous vectors (CGS2 — see the GPU path
+            // note; GANSU_DAVIDSON_CGS1=1 restores the single pass)
+            static const int n_gs_passes_cpu = [] {
+                const char* e = std::getenv("GANSU_DAVIDSON_CGS1");
+                return (e && e[0] == '1') ? 1 : 2;
+            }();
+            for (int pass = 0; pass < n_gs_passes_cpu; ++pass)
             for (int j = 0; j < i; ++j) {
                 const real_t* vec_j = &d_subspace_vectors_[static_cast<size_t>(j) * dim_];
                 Map<const VectorXd> vj(vec_j, dim_);
@@ -612,10 +807,102 @@ void DavidsonSolver::orthogonalize_vectors(int start_index, int num_vectors) {
     // GPU implementation
     cublasHandle_t handle = gansu::gpu::GPUHandle::cublas();
 
+    // (2026-09-16) Streamable mode: block CGS2 against the old basis with two
+    // DGEMMs per pass (the host-resident basis is read ONCE per GEMM), then a
+    // small in-block Gram-Schmidt on the device scratch. The per-vector ddot/axpy
+    // loop below reads the whole basis per new vector and, with the basis on the
+    // host, took > 5 h for one iteration at MgO 3x3x3 EA (dim 7.9e6, 46 roots).
+    if (host_managed_ && d_block_scratch_ && num_vectors > 0
+        && num_vectors <= 2 * config_.num_eigenvalues) {
+        const int k = num_vectors, m = start_index;
+        real_t* d_blk = d_block_scratch_;
+        const size_t blk_bytes = static_cast<size_t>(dim_) * k * sizeof(real_t);
+        cudaMemcpy(d_blk, &d_subspace_vectors_[static_cast<size_t>(m) * dim_], blk_bytes, cudaMemcpyDefault);
+        const real_t one = 1.0, zero = 0.0, minus_one = -1.0;
+        static const int n_gs_passes_blk = [] {
+            const char* e = std::getenv("GANSU_DAVIDSON_CGS1");
+            return (e && e[0] == '1') ? 1 : 2;
+        }();
+        real_t* d_P = nullptr;
+        if (m > 0) {
+            tracked_cudaMalloc(&d_P, static_cast<size_t>(m) * k * sizeof(real_t));
+            for (int pass = 0; pass < n_gs_passes_blk; ++pass) {
+                // P (m x k) = V_old^T (m x dim) * B (dim x k)
+                cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, m, k, dim_,
+                            &one, d_subspace_vectors_, dim_, d_blk, dim_, &zero, d_P, m);
+                // B -= V_old (dim x m) * P (m x k)
+                cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, dim_, k, m,
+                            &minus_one, d_subspace_vectors_, dim_, d_P, m, &one, d_blk, dim_);
+            }
+        }
+        // in-block CGS2 + normalisation on the device scratch
+        for (int i = 0; i < k; ++i) {
+            real_t* d_vi = d_blk + static_cast<size_t>(i) * dim_;
+            for (int pass = 0; pass < n_gs_passes_blk; ++pass)
+                for (int j = 0; j < i; ++j) {
+                    const real_t* d_vj = d_blk + static_cast<size_t>(j) * dim_;
+                    real_t proj = 0.0;
+                    cublasDdot(handle, dim_, d_vj, 1, d_vi, 1, &proj);
+                    const real_t alpha = -proj;
+                    cublasDaxpy(handle, dim_, &alpha, d_vj, 1, d_vi, 1);
+                }
+            real_t norm = 0.0;
+            cublasDnrm2(handle, dim_, d_vi, 1, &norm);
+            if (norm < 1e-12) {
+                if (config_.verbose > 0)
+                    std::cout << "Warning: Linear dependence detected in vector "
+                              << (m + i) << ", replacing with random vector" << std::endl;
+                std::vector<real_t> h_random(dim_);
+                std::mt19937_64 rng(1234ULL + m + i);
+                std::normal_distribution<real_t> dist(0.0, 1.0);
+                for (int q = 0; q < dim_; ++q) h_random[q] = dist(rng);
+                cudaMemcpy(d_vi, h_random.data(), dim_ * sizeof(real_t), cudaMemcpyHostToDevice);
+                // project the random vector out of the old basis (2 GEMV passes) and the block
+                if (m > 0) {
+                    for (int pass = 0; pass < 2; ++pass) {
+                        cublasDgemv(handle, CUBLAS_OP_T, dim_, m, &one, d_subspace_vectors_, dim_,
+                                    d_vi, 1, &zero, d_P, 1);
+                        cublasDgemv(handle, CUBLAS_OP_N, dim_, m, &minus_one, d_subspace_vectors_, dim_,
+                                    d_P, 1, &one, d_vi, 1);
+                    }
+                }
+                for (int pass = 0; pass < 2; ++pass)
+                    for (int j = 0; j < i; ++j) {
+                        const real_t* d_vj = d_blk + static_cast<size_t>(j) * dim_;
+                        real_t proj = 0.0;
+                        cublasDdot(handle, dim_, d_vj, 1, d_vi, 1, &proj);
+                        const real_t alpha = -proj;
+                        cublasDaxpy(handle, dim_, &alpha, d_vj, 1, d_vi, 1);
+                    }
+                cublasDnrm2(handle, dim_, d_vi, 1, &norm);
+            }
+            const real_t inv_norm = 1.0 / norm;
+            cublasDscal(handle, dim_, &inv_norm, d_vi, 1);
+        }
+        if (d_P) tracked_cudaFree(d_P);
+        cudaMemcpy(&d_subspace_vectors_[static_cast<size_t>(m) * dim_], d_blk, blk_bytes, cudaMemcpyDefault);
+        cudaDeviceSynchronize();
+        return;
+    }
+
+    // (2026-09-06) Re-orthogonalisation ("twice is enough", CGS2). A single
+    // classical Gram-Schmidt pass loses orthogonality as the basis grows; with
+    // ~1000 vectors of dimension 4.6e6 (MgO 374 EA-EOM, subspace 1140) V^T V
+    // drifted far enough from I that the Rayleigh-Ritz problem grew GHOST roots
+    // (a 0.000240 Ha eigenvalue in the lowest slot, max|r| jumping 1e-4 -> 1e-2..1
+    // mid-cycle, not at restarts — RESTART CHECK showed the restart itself sound).
+    // Two passes keep V orthonormal to working precision. GANSU_DAVIDSON_CGS1=1
+    // restores the single pass (byte-identical legacy) for A/B.
+    static const int n_gs_passes = [] {
+        const char* e = std::getenv("GANSU_DAVIDSON_CGS1");
+        return (e && e[0] == '1') ? 1 : 2;
+    }();
+
     for (int i = start_index; i < start_index + num_vectors; ++i) {
         real_t* d_vec_i = &d_subspace_vectors_[static_cast<size_t>(i) * dim_];
 
-        // Orthogonalize against all previous vectors
+        // Orthogonalize against all previous vectors (CGS2: two passes)
+        for (int pass = 0; pass < n_gs_passes; ++pass)
         for (int j = 0; j < i; ++j) {
             const real_t* d_vec_j = &d_subspace_vectors_[static_cast<size_t>(j) * dim_];
 
@@ -654,6 +941,80 @@ void DavidsonSolver::orthogonalize_vectors(int start_index, int num_vectors) {
         real_t inv_norm = 1.0 / norm;
         cublasDscal(handle, dim_, &inv_norm, d_vec_i, 1);
     }
+}
+
+// (2026-09-05) Restart-basis orthonormalisation with compaction.
+//
+// Why a separate routine: the kept Ritz vectors of a NON-Hermitian problem are
+// not orthogonal and can be nearly dependent (Re/Im parts of an almost-real
+// complex pair, near-degenerate roots). orthogonalize_vectors() is a single-pass
+// classical Gram-Schmidt with an ABSOLUTE 1e-12 threshold, so a vector whose
+// projected remainder is 1e-6 of its length is kept and scaled up by 1e6 — pure
+// roundoff noise enters the basis. Observed on the MgO 374 EA-EOM solve: every
+// restart kicked max|r| from 1e-4 back to 1e-2..1, and the fourth restart put a
+// spurious 0.000000 eigenvalue into the lowest slot. Here: two projection passes
+// (CGS2, "twice is enough") and a RELATIVE dependence test; a dependent vector
+// is dropped and the basis compacted (span of the kept vectors is unchanged
+// up to the dropped, already-represented direction). Restart-only, so runs that
+// never fill the subspace are byte-identical.
+int DavidsonSolver::orthonormalize_compact(int num_vectors, real_t* base) {
+    using Eigen::Map;
+    using Eigen::VectorXd;
+    const real_t rel_tol = 1e-8;
+    const real_t abs_tol = 1e-14;
+    int kept = 0;
+    real_t* const Vb = base ? base : d_subspace_vectors_;   // (2026-09-16) streamable mode passes the device scratch
+
+    if (!gpu::gpu_available()) {
+        for (int i = 0; i < num_vectors; ++i) {
+            real_t* vec_i = &d_subspace_vectors_[static_cast<size_t>(i) * dim_];
+            Map<VectorXd> vi(vec_i, dim_);
+            const real_t norm0 = vi.norm();
+            if (!(norm0 > abs_tol)) continue;
+            for (int pass = 0; pass < 2; ++pass)
+                for (int j = 0; j < kept; ++j) {
+                    Map<const VectorXd> vj(&d_subspace_vectors_[static_cast<size_t>(j) * dim_], dim_);
+                    vi -= vj.dot(vi) * vj;
+                }
+            const real_t norm = vi.norm();
+            if (norm < rel_tol * norm0 || norm < abs_tol) continue;   // dependent → drop
+            vi *= 1.0 / norm;
+            if (i != kept) {
+                Map<VectorXd> vk(&d_subspace_vectors_[static_cast<size_t>(kept) * dim_], dim_);
+                vk = vi;
+            }
+            ++kept;
+        }
+        return kept;
+    }
+
+    cublasHandle_t handle = gansu::gpu::GPUHandle::cublas();
+    for (int i = 0; i < num_vectors; ++i) {
+        real_t* d_vec_i = &Vb[static_cast<size_t>(i) * dim_];
+        real_t norm0 = 0.0;
+        cublasDnrm2(handle, dim_, d_vec_i, 1, &norm0);
+        if (!(norm0 > abs_tol)) continue;
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int j = 0; j < kept; ++j) {
+                const real_t* d_vec_j = &Vb[static_cast<size_t>(j) * dim_];
+                real_t proj = 0.0;
+                cublasDdot(handle, dim_, d_vec_j, 1, d_vec_i, 1, &proj);
+                const real_t alpha = -proj;
+                cublasDaxpy(handle, dim_, &alpha, d_vec_j, 1, d_vec_i, 1);
+            }
+        }
+        real_t norm = 0.0;
+        cublasDnrm2(handle, dim_, d_vec_i, 1, &norm);
+        if (norm < rel_tol * norm0 || norm < abs_tol) continue;       // dependent → drop
+        const real_t inv_norm = 1.0 / norm;
+        cublasDscal(handle, dim_, &inv_norm, d_vec_i, 1);
+        if (i != kept) {
+            cudaMemcpy(&Vb[static_cast<size_t>(kept) * dim_], d_vec_i,
+                       static_cast<size_t>(dim_) * sizeof(real_t), cudaMemcpyDeviceToDevice);
+        }
+        ++kept;
+    }
+    return kept;
 }
 
 // ========== Subspace Matrix Construction ==========
@@ -922,6 +1283,36 @@ void DavidsonSolver::compute_ritz_vectors_and_residuals() {
     // GPU implementation
     cublasHandle_t handle = gansu::gpu::GPUHandle::cublas();
 
+    // (2026-09-16) Streamable mode: Psi = V C and H Psi = Sigma C as two DGEMMs
+    // (each reads the host-resident basis / sigma once), then r_i = H psi_i -
+    // lambda_i psi_i on the device buffers. The per-root Dgemv loop below reads V
+    // and Sigma once PER ROOT (4 TB per iteration at MgO 3x3x3 EA).
+    if (host_managed_) {
+        const real_t one = 1.0, zero = 0.0;
+        const int nev = config_.num_eigenvalues;
+        // Eigenvector i lives in COLUMN i of the row-major (subspace x subspace)
+        // buffer, i.e. c_i[j] = buf[i + j*ld] (the Dgemv path reads it with
+        // incx = subspace_dim_). Viewed column-major that buffer is C^T, so the
+        // coefficient operand is OP_T here (2026-09-16: OP_N made the 2x1x1 gate
+        // wander for 394 iterations at max|r| ~0.7).
+        cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, dim_, nev, subspace_dim_,
+                    &one, d_subspace_vectors_, dim_, d_subspace_eigenvectors_, subspace_dim_,
+                    &zero, d_eigenvectors_, dim_);
+        cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, dim_, nev, subspace_dim_,
+                    &one, d_sigma_vectors_, dim_, d_subspace_eigenvectors_, subspace_dim_,
+                    &zero, d_residuals_, dim_);
+        for (int i = 0; i < nev; ++i) {
+            const real_t minus_lambda = -h_eigenvalues_[i];
+            cublasDaxpy(handle, dim_, &minus_lambda,
+                        &d_eigenvectors_[static_cast<size_t>(i) * dim_], 1,
+                        &d_residuals_[static_cast<size_t>(i) * dim_], 1);
+            real_t res_norm = 0.0;
+            cublasDnrm2(handle, dim_, &d_residuals_[static_cast<size_t>(i) * dim_], 1, &res_norm);
+            residual_norms_[i] = res_norm;
+        }
+        return;
+    }
+
     for (int i = 0; i < config_.num_eigenvalues; ++i) {
         // Compute Ritz vector: ψ_i = V * c_i (linear combination of basis vectors)
         // eigenDecomposition transposes eigenvectors to row-major, so eigenvector i
@@ -1152,12 +1543,47 @@ void DavidsonSolver::restart_subspace() {
         // Gram-Schmidt preserves span(kept Ritz vectors), so the restart stays
         // mathematically sound; for Hermitian problems the Ritz vectors are
         // already orthonormal and this is a numerical no-op.
-        orthogonalize_vectors(0, num_keep);
+        // (2026-09-05) CGS2 + drop dependent kept vectors (see orthonormalize_compact).
+        {
+            const int kept = orthonormalize_compact(num_keep);
+            if (kept < num_keep && config_.verbose > 0)
+                std::cout << "  Davidson: restart dropped " << (num_keep - kept)
+                          << " dependent Ritz vector(s) (kept " << kept << ")" << std::endl;
+            subspace_dim_ = std::max(kept, 1);
+        }
         return;
     }
 
     // GPU implementation
     cublasHandle_t handle = gansu::gpu::GPUHandle::cublas();
+
+    // (2026-09-16) Streamable mode: the kept Ritz vectors are formed with ONE
+    // DGEMM into the device scratch (dim x 2 nev >= dim x num_keep), orthonormalised
+    // there, and written back to the host-resident basis once.
+    if (host_managed_ && d_block_scratch_) {
+        real_t* d_tmp = d_block_scratch_;
+        const int n_from_eigvecs = std::min(config_.num_eigenvalues, num_keep);
+        cudaMemcpy(d_tmp, d_eigenvectors_,
+                   static_cast<size_t>(dim_) * n_from_eigvecs * sizeof(real_t), cudaMemcpyDeviceToDevice);
+        if (num_keep > n_from_eigvecs) {
+            const real_t one = 1.0, zero = 0.0;
+            // same layout as compute_ritz_vectors_and_residuals: OP_T on C^T,
+            // eigenvectors n_from.. are ROWS n_from.. of the stored buffer (+n_from offset)
+            cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, dim_, num_keep - n_from_eigvecs, subspace_dim_,
+                        &one, d_subspace_vectors_, dim_,
+                        &d_subspace_eigenvectors_[static_cast<size_t>(n_from_eigvecs)], subspace_dim_,
+                        &zero, &d_tmp[static_cast<size_t>(n_from_eigvecs) * dim_], dim_);
+        }
+        const int kept = orthonormalize_compact(num_keep, d_tmp);
+        if (kept < num_keep && config_.verbose > 0)
+            std::cout << "  Davidson: restart dropped " << (num_keep - kept)
+                      << " dependent Ritz vector(s) (kept " << kept << ")" << std::endl;
+        subspace_dim_ = std::max(kept, 1);
+        cudaMemcpy(d_subspace_vectors_, d_tmp,
+                   static_cast<size_t>(dim_) * subspace_dim_ * sizeof(real_t), cudaMemcpyDefault);
+        cudaDeviceSynchronize();
+        return;
+    }
 
     // (2026-07-11) Scratch = d_sigma_vectors_ (dim × max_subspace ≥ dim × num_keep):
     // every sigma is invalidated/recomputed after a restart, so borrowing it here
@@ -1197,7 +1623,14 @@ void DavidsonSolver::restart_subspace() {
     // above: non-Hermitian Ritz vectors are not mutually orthogonal, and every
     // downstream step assumes an orthonormal V. Span-preserving, so restarts
     // stay mathematically sound; Hermitian case ≈ numerical no-op.
-    orthogonalize_vectors(0, num_keep);
+    // (2026-09-05) CGS2 + drop dependent kept vectors (see orthonormalize_compact).
+    {
+        const int kept = orthonormalize_compact(num_keep);
+        if (kept < num_keep && config_.verbose > 0)
+            std::cout << "  Davidson: restart dropped " << (num_keep - kept)
+                      << " dependent Ritz vector(s) (kept " << kept << ")" << std::endl;
+        subspace_dim_ = std::max(kept, 1);
+    }
 }
 
 // ========== Public Getters ==========

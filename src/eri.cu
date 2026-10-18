@@ -505,6 +505,13 @@ real_t* ERI_Stored::build_mo_eri(const real_t* d_C, int nmo) const {
     return d_eri_mo;
 }
 
+const ERI_RI* ERI::mo_eri_block_source() const {
+    // Exactly what the Inc3 call sites used to spell out inline, so no
+    // molecular engine changes its answer. See the declaration for why the
+    // periodic engine needs to override it.
+    return dynamic_cast<const ERI_RI*>(this);
+}
+
 void ERI::build_mo_eri_into(const real_t* d_C, int nmo,
                             real_t* d_eri_out) const {
     // Step 6.3c — default fallback: delegate to build_mo_eri (which allocates
@@ -1168,7 +1175,15 @@ void ERI_RI::mo_eri_block_into(const real_t* d_B_mo, int nmo,
             "ERI_RI::mo_eri_block_into: d_B_mo is null (build_B_mo failed — "
             "B replication rejected or out of memory)");
     }
-    const int naux = num_auxiliary_basis_;
+    // ⚠ The ROW COUNT of d_B_mo, via the virtual getter — not the
+    // num_auxiliary_basis_ member. They differ for the periodic cluster-B
+    // source when the Gc dial appends exact rows, and reading the member there
+    // silently gathered only the fitted rows: the exact contribution was
+    // subtracted from the fit but never added back, and the cluster
+    // correlation energy collapsed in proportion to the number of ignored rows
+    // (-0.695 -> -0.108 Ha as the dial went 0 -> 2.0). For every molecular
+    // engine the getter returns that same member, so this is inert there.
+    const int naux = get_num_auxiliary_basis();
     const size_t nPQ = (size_t)pn * qn;
     const size_t nRS = (size_t)rn * sn;
 

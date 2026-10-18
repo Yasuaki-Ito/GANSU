@@ -10,6 +10,7 @@
 #include "dlpno_resid_gpu.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +24,7 @@
 
 #ifndef GANSU_CPU_ONLY
 #include <cuda_runtime.h>
+#include "device_host_memory.hpp"   // (2026-09-21) dump_tracked_allocations on ResidGpu OOM
 #include <cublas_v2.h>
 #include "gpu_manager.hpp"
 #include "multi_gpu_manager.hpp"  // MultiGpuManager, DeviceGuard
@@ -132,9 +134,11 @@ __global__ void pack_V_meta_kernel(
     int voooo_sparse,
     const int*    __restrict__ d_kl_slot,      // [Σ n_slots] kl(=k·nocc+l) per slot
     const size_t* __restrict__ d_slot_offset,  // [N_pair+1] kl-slot CSR offsets
-    const int*    __restrict__ d_n_slots)      // [N_pair] slots per pair
+    const int*    __restrict__ d_n_slots,      // [N_pair] slots per pair
+    int idx0, int idx1)                        // (2026-09-21) pair-index chunk [idx0, idx1)
 {
-    const int idx = blockIdx.x;
+    const int idx = idx0 + static_cast<int>(blockIdx.x);
+    if (idx >= idx1) return;
     const int n   = d_n_pno[idx];
     if (n == 0) return;
 
@@ -212,6 +216,15 @@ __global__ void pack_V_meta_kernel(
 
 inline void check_cuda_(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
+        // (2026-09-21) MgO 3x3x2 + NTO bath died here (cudaMalloc d_T_flat) with a
+        // single <= 8 GB staging chunk, i.e. the device was already full for
+        // another reason. Say which device, how full, and what the tracked
+        // allocator holds, before throwing.
+        int dev = -1; cudaGetDevice(&dev);
+        size_t fb = 0, tb = 0; cudaMemGetInfo(&fb, &tb);
+        std::fprintf(stderr, "[ResidGpu] CUDA failure in %s on GPU %d: free %.2f GB / total %.2f GB\n",
+                     what, dev, fb / 1e9, tb / 1e9);
+        dump_tracked_allocations("ResidGpu failure");
         throw std::runtime_error(std::string("ResidGpu CUDA error in ")
                                  + what + ": " + cudaGetErrorString(e));
     }
@@ -536,9 +549,19 @@ __global__ void oooo_lad_kernel(
     // coupling (k,l) blocks (slot layout); Phase 1 iterates the kl-slots and
     // fills s_W_eff[kl] only for coupling (k,l). Requires pit_sparse (Phase 2
     // reads s_W_eff only at coupling kl), guaranteed by the ctor gate.
-    int voooo_sparse)
+    int voooo_sparse,
+    // nocc ceiling fix (2026-09-04): when nocc² · sizeof(real_t) exceeds the
+    // device opt-in shared-memory cap (H200: 227 KB → nocc > 168; MgO 374
+    // cluster has nocc=234 = 438 KB) the W_eff[kl] cache lives in a per-block
+    // global scratch instead (d_W_eff_global + blockIdx.x · nocc²). Reads in
+    // Phase 2 are warp-uniform in kl, so they broadcast through L1. nullptr =
+    // shared-memory path (unchanged).
+    real_t*       __restrict__ d_W_eff_global)
 {
-    extern __shared__ real_t s_W_eff[];  // size nocc² doubles
+    extern __shared__ real_t s_W_eff[];  // size nocc² doubles (or 0 when global)
+    real_t* W_eff_p = d_W_eff_global
+        ? d_W_eff_global + static_cast<size_t>(blockIdx.x) * nocc * nocc
+        : s_W_eff;
 
     const int idx = blockIdx.x + pair_begin;
     if (idx >= N_pair) return;
@@ -566,7 +589,7 @@ __global__ void oooo_lad_kernel(
     const int tid       = threadIdx.y * blockDim.x + threadIdx.x;
     const int nthreads  = blockDim.x * blockDim.y;
 
-    // ---- Phase 1: cooperatively compute s_W_eff[kl] = W_oooo[kl] + W_dress. ----
+    // ---- Phase 1: cooperatively compute W_eff_p[kl] = W_oooo[kl] + W_dress. ----
     // Threads stride through kl (dense) or over the kl-slots (D3a sparse). Per
     // kl: read W_oooo + compute W_dress (n_ij² mul-adds on V and Y_pad_T, both
     // accessed sequentially row-wise for L1-friendly cache-line reuse).
@@ -588,7 +611,7 @@ __global__ void oooo_lad_kernel(
                 for (int cc = 0; cc < n_ij; ++cc)
                     W_dress += V_row[cc] * Y_row[cc];
             }
-            s_W_eff[kl] = d_W_oooo[w_pair_off + kl] + W_dress;
+            W_eff_p[kl] = d_W_oooo[w_pair_off + kl] + W_dress;
         }
     } else {
         for (int kl = tid; kl < nocc2; kl += nthreads) {
@@ -608,7 +631,7 @@ __global__ void oooo_lad_kernel(
                     W_dress += V_row[cc] * Y_row[cc];
                 }
             }
-            s_W_eff[kl] = d_W_oooo[w_pair_off + kl] + W_dress;
+            W_eff_p[kl] = d_W_oooo[w_pair_off + kl] + W_dress;
         }
     }
     __syncthreads();
@@ -637,11 +660,11 @@ __global__ void oooo_lad_kernel(
                     const int kl = d_kl_slot[slot_base + s];
                     const real_t pi_val = d_pi_T_stack[pi_pair_off
                                              + static_cast<size_t>(s) * pi_kl_stride];
-                    acc += s_W_eff[kl] * pi_val;
+                    acc += W_eff_p[kl] * pi_val;
                 }
             } else {
                 for (int kl = 0; kl < nocc2; ++kl) {
-                    const real_t W_eff  = s_W_eff[kl];
+                    const real_t W_eff  = W_eff_p[kl];
                     const real_t pi_val = d_pi_T_stack[pi_pair_off
                                              + static_cast<size_t>(kl) * pi_kl_stride];
                     acc += W_eff * pi_val;
@@ -769,6 +792,7 @@ struct ResidGpu::Impl {
     // max-padded for now (separate refactor passes).
     real_t* d_V_stacked_oooo_pad = nullptr;   // S10b: packed total = v_oooo_packed_total
     real_t* d_W_oooo             = nullptr;   // (N × nocc²) — unchanged
+    real_t* d_W_eff_scratch      = nullptr;   // (slab_n × nocc²) oooo_lad W_eff cache when nocc² > shmem cap; nullptr = shared path
     int*    d_active_pos         = nullptr;   // (N_pair) orig pair idx → a in [0, n_active_in_slab_) or -1
     size_t* d_v_oooo_off_packed  = nullptr;   // (n_active_in_slab_ + 1) prefix sum of nocc² · n_ij²
     size_t  v_oooo_packed_total  = 0;         // total packed element count (= host offset_packed.back())
@@ -798,6 +822,14 @@ struct ResidGpu::Impl {
     real_t* d_T_meta_packed     = nullptr;
     size_t* d_per_pair_meta_off = nullptr;   // (N_pair) elements
     size_t  packed_meta_total   = 0;
+    // 2026-09-04: the three metas are the largest iter-invariant buffers
+    // (3 × Σ n_ij²·nocc²; 114 GB/dev on the MgO 374 cluster, nocc=234). When
+    // the plain budget fails, they are parked on the HOST as managed memory
+    // (preferred location CPU, GPU direct access) and dropped from `need` —
+    // the same trick as CCSD's v_oooo/v_oovo. Reads stream over the
+    // interconnect once per iteration (bucket GEMMs), which is cheap next to
+    // the CPU fallback this replaces.
+    bool    meta_on_host        = false;
 
     // Step S11 Phase 2a (2026-05-18) — packed device buffers for the
     // remaining 14 cuBLAS-touched ResidGpu buffers + 3 packed offset
@@ -910,6 +942,7 @@ struct ResidGpu::Impl {
         free_d(&d_dF_ki);
         free_d(&d_V_stacked_oooo_pad);
         free_d(&d_W_oooo);
+        free_d(&d_W_eff_scratch);
         free_di(&d_active_pos);
         if (d_v_oooo_off_packed) {
             cudaFree(d_v_oooo_off_packed);
@@ -1146,6 +1179,12 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
 
     p_ = new Impl();
     Impl& s = *p_;
+    {   // (2026-09-21) per-device headroom at construction (diagnostic)
+        int dev = -1; cudaGetDevice(&dev);
+        size_t fb = 0, tb = 0; cudaMemGetInfo(&fb, &tb);
+        std::printf("[ResidGpu] ctor on GPU %d: free %.2f GB / total %.2f GB before allocations "
+                    "(N_pair=%d nocc=%d max_n=%d)\n", dev, fb / 1e9, tb / 1e9, N_pair_, nocc_, max_n_);
+    }
     s.N_pair = N_pair_;
     s.max_n  = max_n_;
     s.nocc   = nocc_;
@@ -1329,7 +1368,38 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
                 (need > free_b) ? "NO" : "YES");
             std::fflush(stdout);
         }
-        if (need > free_b) {
+        // Meta host-parking (see Impl::meta_on_host). Auto when the plain budget
+        // fails but fits without the 3 metas; GANSU_DLPNO_RESID_META_HOST=1
+        // forces it, =0 disables the auto step (then the old gate decides).
+        size_t need_eff = need;
+        {
+            const char* e_mh = std::getenv("GANSU_DLPNO_RESID_META_HOST");
+            const bool force   = e_mh && e_mh[0] == '1';
+            const bool allowed = !(e_mh && e_mh[0] == '0');
+            const size_t need_parked = need - 3 * bytes_meta_packed;
+            if (allowed && bytes_meta_packed > 0
+                && (force || (need > free_b && need_parked <= free_b))) {
+                s.meta_on_host = true;
+                need_eff = need_parked;
+                std::printf("[ResidGpu dev=%d] metas (V_meta_T/TT + T_meta, 3 x %.1f GB) parked on "
+                            "HOST (managed, GPU direct access): need %.1f -> %.1f GB vs free %.1f GB%s\n",
+                            pgpu.device_id(),
+                            static_cast<double>(bytes_meta_packed) / (1024.0 * kMiB),
+                            mib_need / 1024.0,
+                            static_cast<double>(need_eff) / (1024.0 * kMiB),
+                            mib_free / 1024.0, force ? "  (forced)" : "");
+                std::fflush(stdout);
+            }
+        }
+        if (need_eff > free_b) {
+            // Always say so: an inactive device silently drags the whole T2 solve
+            // into the host fallback (V_meta/T_meta/pi_T_stack caches for ALL
+            // pairs), which at nocc~230 is a >1 TB, hours-long build.
+            std::printf("[ResidGpu dev=%d] INACTIVE: need %.1f GB > free %.1f GB "
+                        "(slab [%d,%d) n_active=%d nocc=%d max_n=%d) -> CPU fallback for this slab\n",
+                        pgpu.device_id(), mib_need / 1024.0, mib_free / 1024.0,
+                        pgpu.pair_begin(), pgpu.pair_end(), n_active_in_slab_, nocc_, max_n_);
+            std::fflush(stdout);
             delete p_; p_ = nullptr; active_ = false; return;
         }
     }
@@ -1357,6 +1427,37 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
                     "alloc d_V_stacked_oooo_pad (packed)");
         check_cuda_(cudaMalloc(&s.d_W_oooo,             bytes_w_oooo),
                     "alloc d_W_oooo");
+        // nocc ceiling fix (2026-09-04): oooo_lad_kernel caches W_eff[kl] (nocc²
+        // doubles) in shared memory; above the device opt-in cap (H200 227 KB
+        // ⇒ nocc > 168) the launch fails with "invalid argument". Give it a
+        // per-block global scratch instead (slab_n × nocc²; MgO 374: 1047 pairs
+        // × 234² × 8 B = 459 MB). Only allocated when needed, so every run
+        // with nocc ≤ 168 is byte-identical to before.
+        {
+            const size_t shmem_needed = static_cast<size_t>(nocc_) * nocc_ * sizeof(real_t);
+            cudaDeviceProp prop{};
+            size_t max_smem = 48u * 1024u;
+            if (cudaGetDeviceProperties(&prop, pgpu.device_id()) == cudaSuccess)
+                max_smem = prop.sharedMemPerBlockOptin ? prop.sharedMemPerBlockOptin
+                                                        : prop.sharedMemPerBlock;
+            // GANSU_DLPNO_OOOO_WEFF_GLOBAL=1 forces the global path (A/B gate on
+            // small systems where shared would fit).
+            static const bool force_global = []() {
+                const char* e = std::getenv("GANSU_DLPNO_OOOO_WEFF_GLOBAL");
+                return e && e[0] == '1'; }();
+            if (shmem_needed > max_smem || force_global) {
+                const size_t slab_n = static_cast<size_t>(
+                    std::max(1, pgpu.pair_end() - pgpu.pair_begin()));
+                check_cuda_(cudaMalloc(&s.d_W_eff_scratch, slab_n * shmem_needed),
+                            "alloc d_W_eff_scratch (oooo_lad W_eff, nocc > shmem cap)");
+                static std::atomic<int> once{0};
+                if (once.fetch_add(1) == 0)
+                    std::printf("[ResidGpu] oooo_lad W_eff cache: nocc=%d needs %zu KB shared > cap %zu KB "
+                                "-> per-block GLOBAL scratch (%.1f MB/dev)\n",
+                                nocc_, shmem_needed / 1024, max_smem / 1024,
+                                static_cast<double>(slab_n * shmem_needed) / 1e6);
+            }
+        }
         // Step S10b — d_active_pos: orig pair idx → a in [0, n_active_in_slab_) or -1.
         check_cuda_(cudaMalloc(&s.d_active_pos,
                                static_cast<size_t>(N_pair_) * sizeof(int)),
@@ -1388,12 +1489,32 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
         // device pointers are never null.
         const size_t bytes_meta_packed_alloc =
             bytes_meta_packed > 0 ? bytes_meta_packed : 1;
-        check_cuda_(cudaMalloc(&s.d_V_meta_T_packed,  bytes_meta_packed_alloc),
-                    "alloc d_V_meta_T_packed");
-        check_cuda_(cudaMalloc(&s.d_V_meta_TT_packed, bytes_meta_packed_alloc),
-                    "alloc d_V_meta_TT_packed");
-        check_cuda_(cudaMalloc(&s.d_T_meta_packed,    bytes_meta_packed_alloc),
-                    "alloc d_T_meta_packed");
+        if (s.meta_on_host) {
+            // Host-parked metas: managed allocation, preferred location CPU,
+            // direct access from this device (CUDA 13 cudaMemLocation API —
+            // same recipe as CCSD's v_oooo/v_oovo park in eri_stored.cu).
+            // pack_V_meta_kernel writes them once at construction; the bucket
+            // GEMMs read them every iteration over the interconnect.
+            cudaMemLocation loc_host{}; loc_host.type = cudaMemLocationTypeHost;   loc_host.id = 0;
+            cudaMemLocation loc_dev{};  loc_dev.type  = cudaMemLocationTypeDevice; loc_dev.id  = pgpu.device_id();
+            real_t** metas[3] = { &s.d_V_meta_T_packed, &s.d_V_meta_TT_packed, &s.d_T_meta_packed };
+            const char* names[3] = { "d_V_meta_T_packed", "d_V_meta_TT_packed", "d_T_meta_packed" };
+            for (int m = 0; m < 3; ++m) {
+                check_cuda_(cudaMallocManaged(metas[m], bytes_meta_packed_alloc),
+                            (std::string("alloc (managed, host-parked) ") + names[m]).c_str());
+                cudaMemAdvise(*metas[m], bytes_meta_packed_alloc, cudaMemAdviseSetPreferredLocation, loc_host);
+                cudaMemAdvise(*metas[m], bytes_meta_packed_alloc, cudaMemAdviseSetAccessedBy,         loc_dev);
+                cudaMemPrefetchAsync(*metas[m], bytes_meta_packed_alloc, loc_host, /*flags=*/0, /*stream=*/0);
+            }
+            cudaDeviceSynchronize();
+        } else {
+            check_cuda_(cudaMalloc(&s.d_V_meta_T_packed,  bytes_meta_packed_alloc),
+                        "alloc d_V_meta_T_packed");
+            check_cuda_(cudaMalloc(&s.d_V_meta_TT_packed, bytes_meta_packed_alloc),
+                        "alloc d_V_meta_TT_packed");
+            check_cuda_(cudaMalloc(&s.d_T_meta_packed,    bytes_meta_packed_alloc),
+                        "alloc d_T_meta_packed");
+        }
         s.packed_meta_total = packed_meta_total_;
         check_cuda_(cudaMalloc(&s.d_per_pair_meta_off,
                                static_cast<size_t>(N_pair_) * sizeof(size_t)),
@@ -1639,54 +1760,23 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
                         pair_sz * sizeof(real_t));
         }
 
-        // Device-side source + offsets. 1-byte stub on empty slab so
-        // the device pointers remain valid (kernel still guards via
-        // active_pos).
-        real_t* d_V_flat = nullptr;
-        real_t* d_T_flat = nullptr;
-        size_t* d_pair_src_off = nullptr;
-        const size_t total_src_bytes =
-            total_src_sz > 0 ? total_src_sz * sizeof(real_t) : 1;
-        check_cuda_(cudaMalloc(&d_V_flat,    total_src_bytes), "cudaMalloc d_V_flat");
-        check_cuda_(cudaMalloc(&d_T_flat,    total_src_bytes), "cudaMalloc d_T_flat");
-        check_cuda_(cudaMalloc(&d_pair_src_off,
-                               (N_pair_ + 1) * sizeof(size_t)),
-                    "cudaMalloc d_pair_src_off");
-
-        if (total_src_sz > 0) {
-            check_cuda_(cudaMemcpy(d_V_flat, h_V_flat.data(),
-                                   total_src_sz * sizeof(real_t),
-                                   cudaMemcpyHostToDevice), "H2D V_flat");
-            check_cuda_(cudaMemcpy(d_T_flat, h_T_flat.data(),
-                                   total_src_sz * sizeof(real_t),
-                                   cudaMemcpyHostToDevice), "H2D T_flat");
+        // (2026-09-21) CHUNKED staging. d_V_flat / d_T_flat are transient
+        // sources (nocc^2 * n^2 per slab-active pair) for the pack kernel. At
+        // MgO 3x3x2 + NTO bath (nocc 204, 4469 active pairs) they reached
+        // ~50 GB EACH and OOM'd the device next to the periodic-B mirrors
+        // (cudaMalloc d_T_flat). Upload + pack in pair-index chunks holding at
+        // most GANSU_DLPNO_RESID_STAGE_GB (default 8) GB per buffer. The pack
+        // kernel is per-pair, so the result is bit-identical to the single
+        // upload; a run whose total fits in one chunk takes exactly the old path.
+        const int* d_n_pno = pgpu.device_n_pno();
+        if (d_n_pno == nullptr) {
+            delete p_; p_ = nullptr; active_ = false; return;
         }
-        check_cuda_(cudaMemcpy(d_pair_src_off, pair_src_off_host.data(),
-                               (N_pair_ + 1) * sizeof(size_t),
-                               cudaMemcpyHostToDevice),
-                    "H2D pair_src_off");
-
-        // S11 Phase 2d — padded V_meta memsets removed. The packed
-        // V_meta/T_meta buffers are fully written by pack_V_meta_kernel
-        // (no inter-block padding inside the per-pair slot). V_stacked_oooo
-        // is still per-pair packed and zeroed below to clear the small
-        // inter-(k,l)-block region.
         if (bytes_v_oooo_packed > 0) {
             check_cuda_(cudaMemset(s.d_V_stacked_oooo_pad, 0, bytes_v_oooo_packed),
                         "memset V_stacked_oooo (packed)");
         }
-
-        // Launch GPU pack. d_n_pno is borrowed from pgpu (uploaded once).
-        const int* d_n_pno = pgpu.device_n_pno();
-        if (d_n_pno == nullptr) {
-            cudaFree(d_V_flat); cudaFree(d_T_flat); cudaFree(d_pair_src_off);
-            delete p_; p_ = nullptr; active_ = false; return;
-        }
         const dim3 block(16, 16);
-        const dim3 grid(static_cast<unsigned>(N_pair_));
-        // S11 Phase 2d — pack_V_meta_kernel writes only to packed sinks.
-        // Inactive pairs (d_active_pos[idx] < 0) early-return inside the
-        // kernel.
         // Stage D (D3a): sparse V_stacked_oooo needs the pgpu kl-slot list.
         const int*    d_kl_slot_pack   = s.voooo_sparse ? pgpu.device_kl_slot()     : nullptr;
         const size_t* d_slot_off_pack  = s.voooo_sparse ? pgpu.device_slot_offset() : nullptr;
@@ -1694,16 +1784,72 @@ ResidGpu::ResidGpu(const PiCacheGpu&             pgpu,
         const int     voooo_sparse_i   =
             (s.voooo_sparse && d_kl_slot_pack && d_slot_off_pack && d_n_slots_pack)
             ? 1 : 0;
-        pack_V_meta_kernel<<<grid, block>>>(
-            d_V_flat, d_T_flat, d_n_pno, d_pair_src_off,
-            s.d_active_pos, s.d_v_oooo_off_packed,
-            s.d_per_pair_meta_off,
-            s.d_V_meta_T_packed, s.d_V_meta_TT_packed, s.d_T_meta_packed,
-            s.d_V_stacked_oooo_pad,
-            nocc_,
-            voooo_sparse_i, d_kl_slot_pack, d_slot_off_pack, d_n_slots_pack);
-        check_cuda_(cudaGetLastError(),
-                    "pack_V_meta_kernel launch");
+
+        static const size_t stage_cap_elems = []() {
+            double gb = 8.0;
+            if (const char* e = std::getenv("GANSU_DLPNO_RESID_STAGE_GB"))
+                if (std::atof(e) > 0.0) gb = std::atof(e);
+            return static_cast<size_t>(gb * 1e9 / sizeof(real_t));
+        }();
+        std::vector<int> chunk_start{0};
+        {
+            size_t acc = 0;
+            for (int idx = 0; idx < N_pair_; ++idx) {
+                const size_t sz = pair_src_off_host[idx + 1] - pair_src_off_host[idx];
+                if (acc > 0 && acc + sz > stage_cap_elems) { chunk_start.push_back(idx); acc = 0; }
+                acc += sz;
+            }
+            chunk_start.push_back(N_pair_);
+        }
+        size_t max_chunk = 1;
+        for (size_t c = 0; c + 1 < chunk_start.size(); ++c)
+            max_chunk = std::max(max_chunk,
+                pair_src_off_host[chunk_start[c + 1]] - pair_src_off_host[chunk_start[c]]);
+        real_t* d_V_flat = nullptr;
+        real_t* d_T_flat = nullptr;
+        size_t* d_pair_src_off = nullptr;
+        check_cuda_(cudaMalloc(&d_V_flat, max_chunk * sizeof(real_t)), "cudaMalloc d_V_flat");
+        check_cuda_(cudaMalloc(&d_T_flat, max_chunk * sizeof(real_t)), "cudaMalloc d_T_flat");
+        check_cuda_(cudaMalloc(&d_pair_src_off, (N_pair_ + 1) * sizeof(size_t)),
+                    "cudaMalloc d_pair_src_off");
+        {
+            static std::atomic<int> once_chunk{0};
+            if (chunk_start.size() > 2 && once_chunk.fetch_add(1) == 0)
+                std::printf("[ResidGpu] V/T staging in %zu pair chunks (cap %.1f GB/buffer, "
+                            "total %.1f GB/buffer on this device; env GANSU_DLPNO_RESID_STAGE_GB)\n",
+                            chunk_start.size() - 1,
+                            static_cast<double>(stage_cap_elems) * sizeof(real_t) / 1e9,
+                            static_cast<double>(total_src_sz) * sizeof(real_t) / 1e9);
+        }
+        std::vector<size_t> rel_off(N_pair_ + 1, 0);
+        for (size_t c = 0; c + 1 < chunk_start.size(); ++c) {
+            const int p0 = chunk_start[c], p1 = chunk_start[c + 1];
+            if (p1 <= p0) continue;
+            const size_t base = pair_src_off_host[p0];
+            const size_t nel  = pair_src_off_host[p1] - base;
+            for (int idx = p0; idx <= p1; ++idx) rel_off[idx] = pair_src_off_host[idx] - base;
+            if (nel > 0) {
+                check_cuda_(cudaMemcpy(d_V_flat, h_V_flat.data() + base, nel * sizeof(real_t),
+                                       cudaMemcpyHostToDevice), "H2D V_flat");
+                check_cuda_(cudaMemcpy(d_T_flat, h_T_flat.data() + base, nel * sizeof(real_t),
+                                       cudaMemcpyHostToDevice), "H2D T_flat");
+            }
+            check_cuda_(cudaMemcpy(d_pair_src_off, rel_off.data(),
+                                   (N_pair_ + 1) * sizeof(size_t), cudaMemcpyHostToDevice),
+                        "H2D pair_src_off");
+            const dim3 grid(static_cast<unsigned>(p1 - p0));
+            pack_V_meta_kernel<<<grid, block>>>(
+                d_V_flat, d_T_flat, d_n_pno, d_pair_src_off,
+                s.d_active_pos, s.d_v_oooo_off_packed,
+                s.d_per_pair_meta_off,
+                s.d_V_meta_T_packed, s.d_V_meta_TT_packed, s.d_T_meta_packed,
+                s.d_V_stacked_oooo_pad,
+                nocc_,
+                voooo_sparse_i, d_kl_slot_pack, d_slot_off_pack, d_n_slots_pack,
+                p0, p1);
+            check_cuda_(cudaGetLastError(), "pack_V_meta_kernel launch");
+            check_cuda_(cudaDeviceSynchronize(), "pack_V_meta_kernel sync");
+        }
 
         // Free temporary device buffers (pack done).
         cudaFree(d_V_flat);
@@ -2319,8 +2465,8 @@ void ResidGpu::compute_async(const std::vector<real_t>& dF_ki_host)
         // in Phase 1 (cache-line waste was ~max(1, max_n / cache_line/8) ×).
         const real_t* d_Y_pad_T = pgpu_->device_Y_pad_T();
         if (d_Y_pad_T) {
-            const size_t shmem_bytes =
-                static_cast<size_t>(nocc) * nocc * sizeof(real_t);
+            const size_t shmem_bytes = s.d_W_eff_scratch
+                ? 0 : static_cast<size_t>(nocc) * nocc * sizeof(real_t);
             // S11 Phase 2c — oooo ladder R write also switched to packed.
             oooo_lad_kernel<<<grid, block, shmem_bytes>>>(
                 s.d_V_stacked_oooo_pad, s.d_W_oooo,
@@ -2329,7 +2475,8 @@ void ResidGpu::compute_async(const std::vector<real_t>& dF_ki_host)
                 s.d_per_pair_R_off, s.d_R_ph_packed,
                 N, nocc, max_n, ib,
                 pit_sparse ? 1 : 0, d_n_slots, d_kl_slot, d_slot_off,
-                s.voooo_sparse ? 1 : 0);   // Stage D (D3a): sparse V_stacked_oooo
+                s.voooo_sparse ? 1 : 0,   // Stage D (D3a): sparse V_stacked_oooo
+                s.d_W_eff_scratch);        // nullptr = shared-memory W_eff path
         }
         if (s.e_after_O) cudaEventRecord(s.e_after_O, /*stream=*/0);
 

@@ -38,7 +38,7 @@ void compute_gradients_two_electron(double* g_gradients, const real_t* g_density
                                     const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3,
                                     const size_t num_threads, const int num_basis, const double* g_boys_grid)
 {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if(id >= num_threads) return;
 
     // Compute 4D index from thread id
@@ -309,7 +309,7 @@ void compute_gradients_two_electron_uhf(double* g_gradients, const real_t* g_den
                                         const ShellTypeInfo shell_s0, const ShellTypeInfo shell_s1, const ShellTypeInfo shell_s2, const ShellTypeInfo shell_s3,
                                         const size_t num_threads, const int num_basis, const double* g_boys_grid)
 {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if(id >= num_threads) return;
 
     // Compute 4D index from thread id

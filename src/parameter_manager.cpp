@@ -55,6 +55,8 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"convergence_energy_threshold", "1e-6"},   // real_t
         {"schwarz_screening_threshold", "1e-12"},   // real_t 
         {"initial_guess", "core"},                  // string
+        {"density_in", ""},                         // string: SCF restart — read a converged total density (written by density_out; nbf must match) and start from it. RHF/PBC_RHF
+        {"density_out", ""},                        // string: SCF restart — write the converged total density after SCF (before post-HF, so a killed post-HF still leaves the checkpoint)
         {"convergence_method", "diis"},             // string
         {"damping_factor", "0.9"},                  // real_t (0<=damping_factor<=1)
         {"diis_size", "8"},                         // int
@@ -86,6 +88,8 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"dmet_mu_refine_ccsd", "0"},                      // bool (0/1): refine μ with CCSD-relaxed density after HF stage
         {"dmet_level_shift_denom_only", "1"},              // int (bool)        // bool: apply the DMET cluster level shift to the CCSD DENOMINATORS only and carry the shift through the chain, so the solve converges to the TRUE unshifted cluster energy. false = legacy biased direct form (excitation energies come out high by roughly the shift: ~4 eV on doxorubicin). Env GANSU_DMET_LEVEL_SHIFT_DENOM_ONLY can only force it on
         {"dmet_nto_bath",     "0.0"},                   // real_t: NTO-bath augmentation τ_vir (Löwdin environment fraction; 0 = off = bare Schmidt bath). Methodological choice, so it belongs on the command line; env GANSU_DMET_STEOM_NTO_BATH still overrides. dox/paclitaxel production recipe = 0.01
+        {"dmet_steom_auto_select", "atom"},                 // string: auto-fragment selection rule. atom = per-atom NTO weight, greedy, absolute floor (molecular default). shell = seeded coordination-shell growth by minimum-image distance (the periodic recipe: cell-independent shell-structured fragments, one shell system per excitation centre; the per-atom floor is not used). Env GANSU_DMET_STEOM_AUTO_SEED_FLOOR (default 0.02) = minimum relative weight for a new centre.
+        {"dmet_nto_bath_wfloor", "0.0"},                   // real_t: NTO-bath augmentation RELATIVE occupation floor: an NTO is a bath candidate only if its occupation >= wfloor x the leading occupation of its channel (0 = off = every active NTO above tau is a candidate; 0.01 = production). Micro-weight NTOs (occupation ~1e-3 of the leading one) are noise directions: at MgO 3x3x2 tau 0.5 alone added 40 vir + 51 occ (n_emb 398->489) and the DLPNO LMP2 diverged; with 0.01 the same run adds ~5+5 and keeps ~85% of the occupation-weighted uncaptured signal.
         {"dmet_nto_bath_occ", "0.0"},                      // real_t: NTO-bath augmentation τ_occ (occupied channel; 0 = off). Production recipe = 0.5. Env GANSU_DMET_STEOM_NTO_BATH_OCC overrides
         {"dmet_cluster_solver", "canonical"},            // string: dmet_steom cluster ground-state solver — "canonical" (exact cluster CCSD) or "dlpno" (cluster-space DLPNO-CCSD + bt-polish; the ~500-orbital-cluster production mode, formerly env GANSU_DMET_STEOM_DLPNO=2 which still overrides when set)
         {"dmet_excited_method", "steom"},                  // string: DMET cluster excited-state solver on the embedded cluster — "steom" (default; STEOM-CCSD chain) or "adc2" (ADC(2), cheaper, supports triplets). Shares the same auto-fragment / bath machinery.
@@ -109,6 +113,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"opt_energy_threshold", "1.0e-6"},                // real_t: energy change threshold (Hartree)
         {"opt_disp_threshold", "3.0e-4"},                  // real_t: max displacement (Bohr)
         {"opt_step_max", "0.3"},                           // real_t: trust-region radius (Bohr)
+        {"lindep_threshold", "0"},
         {"thc_n_radial", "50"},                            // int: THC grid radial points per atom (Treutler-Ahlrichs M3)
         {"thc_lebedev_order", "194"},                      // int: THC angular grid (110, 194, 302)
         {"thc_n_laplace", "12"},                           // int: Laplace quadrature points for THC-SOS-MP2

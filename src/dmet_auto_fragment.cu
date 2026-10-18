@@ -31,6 +31,8 @@
 #include <set>
 #include <fstream>   // per-state JSON (Phase C)
 #include <string>
+#include <algorithm>
+#include <utility>
 #include <Eigen/Dense>
 
 #include "dmet_auto_fragment.hpp"
@@ -80,14 +82,134 @@ Selection greedy_select(const std::vector<double>& score,   // per-atom, normali
     return sel;
 }
 
+// (2026-09-24) Seeded SHELL growth -- the periodic selection rule.
+//
+// The per-atom greedy picker above ranks atoms by Lowdin NTO weight and cuts at an
+// absolute floor. For a point-defect excitation in a crystal that fails twice over:
+// the weight is spread nearly flat over the neighbour shells (MgO F-centre 2x2x2:
+// 12 O at 1.8 % each, 6 Mg at 1.6 %), so there is no knee to cut at, and an
+// absolute floor on a sum-to-one weight cuts MORE atoms the LARGER the cell
+// (coverage 0.68 at 2x2x2 -> 0.495 at 3x3x2 for the same defect, +0.27 eV).
+//
+// Here the fragment grows in coordination shells. Candidates compete by weight:
+//   * a new centre = the heaviest unselected atom (its own weight), or
+//   * the next shell of an existing centre (the shell's summed weight, atoms
+//     grouped by minimum-image distance from that centre within shell_tol);
+// the heavier candidate is taken, a whole shell at a time, until the coverage
+// target or the orbital budget is reached. A new centre below seed_rel_floor x
+// (max weight) never starts (delocalised tail). One-centre excitations therefore
+// give the coordination shells of that centre, cell-independently; two-centre
+// (CT, defect pair) excitations give one shell system per centre.
+struct ShellRow { int seed; double r_bohr; int n; double w; double cum; int est_n_emb; std::string elems; };
+
+template <class Atoms>
+Selection shell_select(const std::vector<double>& score, const std::vector<int>& ao_count,
+                       const Atoms& all,
+                       double target, int budget, double seed_rel_floor,
+                       std::vector<ShellRow>& rows)
+{
+    const int N = (int)score.size();
+    auto dist = [&](int i, int j) {
+        double d[3] = {(double)(all[i].coordinate.x - all[j].coordinate.x),
+                       (double)(all[i].coordinate.y - all[j].coordinate.y),
+                       (double)(all[i].coordinate.z - all[j].coordinate.z)};
+        return std::sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+    };
+    const double shell_tol = 0.1;   // Bohr: atoms within this radius band form one shell
+    struct Seed { int atom; std::vector<std::pair<double,int>> order; size_t cur = 0; };
+    std::vector<Seed> seeds;
+    std::vector<char> taken(N, 0);
+    double wmax = 0.0;
+    for (double s : score) wmax = std::max(wmax, s);
+    Selection out;
+    int n_frag_ao = 0;
+
+    // next untaken shell of a seed: [i0, i1) in its distance order, weight w, AO count ao
+    auto next_shell = [&](const Seed& s, size_t& i0, size_t& i1, double& w, int& ao) -> bool {
+        size_t i = s.cur;
+        while (i < s.order.size() && taken[s.order[i].second]) ++i;
+        if (i >= s.order.size()) return false;
+        size_t j = i; w = 0.0; ao = 0;
+        while (j < s.order.size() && s.order[j].first - s.order[i].first < shell_tol) {
+            if (!taken[s.order[j].second]) { w += score[s.order[j].second]; ao += ao_count[s.order[j].second]; }
+            ++j;
+        }
+        i0 = i; i1 = j; return true;
+    };
+
+    while (out.coverage < target) {
+        int best_new = -1; double w_new = -1.0;
+        for (int a = 0; a < N; ++a) if (!taken[a] && score[a] > w_new) { w_new = score[a]; best_new = a; }
+        int best_seed = -1; double w_seed = -1.0; size_t bi0 = 0, bi1 = 0; int bao = 0;
+        for (size_t s = 0; s < seeds.size(); ++s) {
+            size_t i0, i1; double w; int ao;
+            if (next_shell(seeds[s], i0, i1, w, ao) && w > w_seed) { w_seed = w; best_seed = (int)s; bi0 = i0; bi1 = i1; bao = ao; }
+        }
+        if (best_new < 0 && best_seed < 0) break;                       // nothing left
+        if (best_seed < 0 || w_new > w_seed) {                           // start a new centre
+            if (w_new < seed_rel_floor * wmax) break;                    // only a delocalised tail remains
+            Seed sd; sd.atom = best_new;
+            for (int a = 0; a < N; ++a) if (!taken[a]) sd.order.push_back({dist(best_new, a), a});
+            std::sort(sd.order.begin(), sd.order.end());
+            seeds.push_back(std::move(sd));
+            continue;                                                    // its r = 0 shell (itself) is taken next
+        }
+        const int est = 2 * (n_frag_ao + bao) + 30;                      // same NTO-aug allowance as greedy_select
+        if (est > budget) { out.budget_hit = true; break; }
+        Seed& s = seeds[(size_t)best_seed];
+        ShellRow row; row.seed = s.atom; row.r_bohr = s.order[bi0].first; row.n = 0;
+        row.w = w_seed; row.est_n_emb = est;
+        for (size_t k = bi0; k < bi1; ++k) {
+            const int a = s.order[k].second;
+            if (taken[a]) continue;
+            taken[a] = 1; out.atoms.push_back(a); ++row.n;
+            const std::string el = atomic_number_to_element_name(all[a].atomic_number);
+            if (row.elems.find(el) == std::string::npos) { if (!row.elems.empty()) row.elems += "/"; row.elems += el; }
+        }
+        s.cur = bi1;
+        n_frag_ao += bao; out.coverage += w_seed; row.cum = out.coverage;
+        rows.push_back(row);
+    }
+    if (out.coverage < target && !out.budget_hit) out.delocalized = true;
+    std::sort(out.atoms.begin(), out.atoms.end());
+    return out;
+}
+
 // Connected-component count of the selected atoms under a bond-length cutoff
 // (heavy-heavy bonds are ≤ ~2.9 Bohr; 3.2 Bohr keeps a fragment connected while
 // separating a through-space donor…acceptor pair into distinct regions).
+// (2026-09-21) Two fixes for solids, both diagnostic-only (the count is printed,
+// never used for the selection): (1) the cutoff adapts to the structure --
+// max(3.2 Bohr, 1.2 x nearest heavy-atom distance) -- because the fixed 3.2 Bohr
+// (1.7 A) molecular bond length is shorter than every cation-anion contact in an
+// ionic crystal (MgO 2.106 A = 3.98 Bohr), which reported the shell-structured
+// 30-atom F-centre fragment of MgO 2x2x2 as "30 disconnected regions";
+// (2) with a lattice, distances use the minimum image so a fragment wrapping the
+// cell boundary stays one region. Ghost sites (no nucleus) join the graph with
+// the same cutoff but do not set the nearest-neighbour scale.
 template <class Atoms>
 int connected_components(const std::vector<int>& atoms, const Atoms& all,
-                         real_t bond_cut_bohr = 3.2)
+                         real_t* cutoff_used = nullptr)
 {
     const int n = (int)atoms.size();
+    auto dist2 = [&](const Coordinate& ci, const Coordinate& cj) {
+        double d[3] = {(double)(ci.x - cj.x), (double)(ci.y - cj.y), (double)(ci.z - cj.z)};
+        return (real_t)(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+    };
+    // nearest heavy-atom (nucleus-bearing) contact over the WHOLE structure
+    real_t dnn2 = -1.0;
+    const int N = (int)all.size();
+    for (int i = 0; i < N; ++i) {
+        if (all[i].effective_charge == 0) continue;
+        for (int j = i + 1; j < N; ++j) {
+            if (all[j].effective_charge == 0) continue;
+            const real_t r2 = dist2(all[i].coordinate, all[j].coordinate);
+            if (r2 > 1e-8 && (dnn2 < 0 || r2 < dnn2)) dnn2 = r2;
+        }
+    }
+    real_t bond_cut_bohr = 3.2;
+    if (dnn2 > 0) bond_cut_bohr = std::max(bond_cut_bohr, (real_t)(1.2 * std::sqrt((double)dnn2)));
+    if (cutoff_used) *cutoff_used = bond_cut_bohr;
     if (n <= 1) return n;
     const real_t r2c = bond_cut_bohr * bond_cut_bohr;
     std::vector<int> comp(n, -1);
@@ -102,9 +224,7 @@ int connected_components(const std::vector<int>& atoms, const Atoms& all,
             const auto& ci = all[atoms[i]].coordinate;
             for (int j = 0; j < n; ++j) {
                 if (comp[j] >= 0) continue;
-                const auto& cj = all[atoms[j]].coordinate;
-                const real_t dx = ci.x - cj.x, dy = ci.y - cj.y, dz = ci.z - cj.z;
-                if (dx*dx + dy*dy + dz*dz < r2c) { comp[j] = ncomp; stack.push_back(j); }
+                if (dist2(ci, all[atoms[j]].coordinate) < r2c) { comp[j] = ncomp; stack.push_back(j); }
             }
         }
         ++ncomp;
@@ -143,6 +263,10 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
     std::cout << "  n_cis=" << n_cis << " coverage_target=" << T
               << " atom_floor=" << floor << " budget(n_emb)=" << budget
               << " include_h=" << (include_h ? "yes" : "no") << std::endl;
+    const std::string sel_mode = rhf.get_dmet_steom_auto_select();   // atom | shell
+    std::cout << "  [auto-frag] selection rule: " << sel_mode
+              << (sel_mode == "shell" ? " (seeded coordination-shell growth)"
+                                      : " (per-atom weight, greedy with absolute floor)") << std::endl;
 
     // ---- Full-system state-averaged CIS-NTO (cached on rhf for reuse) ------
     eri.compute_cis_nto(n_cis);
@@ -248,7 +372,14 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
     for (int A = 0; A < num_atoms; ++A)
         ao_count[A] = (int)(a2b[A].end_index - a2b[A].start_index);
 
+    // hole and particle are also kept SEPARATELY: only the combined score
+    // drives the selection (unchanged), but the split is what distinguishes a
+    // cavity-internal excitation (both channels on the vacancy) from a
+    // charge-transfer one (particle in the cavity, hole on the anions) — a
+    // question the combined weight cannot answer (RFC 84.6).
+    std::vector<double> score_hole(num_atoms, 0.0), score_part(num_atoms, 0.0);
     auto accumulate = [&](bool occ, int n_act, const std::vector<real_t>& occs) {
+        std::vector<double>& dst = occ ? score_hole : score_part;
         for (int k = 0; k < n_act; ++k) {
             const double w = (k < (int)occs.size()) ? std::max(0.0, (double)occs[k]) : 0.0;
             if (w <= 0.0) continue;
@@ -258,6 +389,7 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
                 for (size_t mu = a2b[A].start_index; mu < a2b[A].end_index; ++mu)
                     s += phi[(int)mu] * phi[(int)mu];
                 score[A] += w * s;
+                dst[A]   += w * s;
             }
         }
     };
@@ -267,9 +399,34 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
     const double total = std::accumulate(score.begin(), score.end(), 0.0);
     if (total <= 1e-12) return fallback_whole("all per-atom NTO weights ≈ 0");
     for (double& s : score) s /= total;   // normalize so Σ_A score = 1
+    {   // each channel normalized within itself, so the columns read as
+        // "where does the hole live" / "where does the particle live"
+        const double th = std::accumulate(score_hole.begin(), score_hole.end(), 0.0);
+        const double tp = std::accumulate(score_part.begin(), score_part.end(), 0.0);
+        if (th > 1e-12) for (double& v : score_hole) v /= th;
+        if (tp > 1e-12) for (double& v : score_part) v /= tp;
+        double gh = 0.0, gp = 0.0;   // ghost sites: basis but no nucleus
+        const auto& at_ch = rhf.get_atoms();
+        for (int A = 0; A < num_atoms; ++A) {
+            if (at_ch[A].effective_charge == 0) {
+                gh += score_hole[A];
+                gp += score_part[A];
+            }
+        }
+        std::cout << "  [NTO channels] ghost-site share: hole=" << std::fixed
+                  << std::setprecision(4) << gh << "  particle=" << gp
+                  << std::defaultfloat
+                  << "   (cavity-internal: both high; anion->cavity CT: "
+                     "particle high, hole low)" << std::endl;
+    }
 
-    // ---- Greedy selection + budget guard ----------------------------------
-    Selection sel = greedy_select(score, ao_count, floor, T, budget);
+    // ---- Selection + budget guard ------------------------------------------
+    std::vector<ShellRow> shell_rows;
+    double seed_rel_floor = 0.02;   // a new centre must carry >= 2 % of the heaviest atom's weight
+    if (const char* e = std::getenv("GANSU_DMET_STEOM_AUTO_SEED_FLOOR")) seed_rel_floor = std::atof(e);
+    Selection sel = (sel_mode == "shell")
+        ? shell_select(score, ao_count, rhf.get_atoms(), T, budget, seed_rel_floor, shell_rows)
+        : greedy_select(score, ao_count, floor, T, budget);
     if (sel.atoms.empty())
         return fallback_whole("no atom above the per-atom floor");
 
@@ -296,7 +453,8 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
     out.coverage    = sel.coverage;
     out.budget_hit  = sel.budget_hit;
     out.delocalized = sel.delocalized;
-    out.n_components = connected_components(sel.atoms, atoms);
+    real_t conn_cut = 0.0;
+    out.n_components = connected_components(sel.atoms, atoms, &conn_cut);
 
     // ---- Diagnostics (numerically inert) ----------------------------------
     {
@@ -305,7 +463,7 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
         std::iota(order.begin(), order.end(), 0);
         std::sort(order.begin(), order.end(), [&](int a, int b){ return score[a] > score[b]; });
         std::cout << "  per-atom NTO weight (occupation-weighted hole+particle, normalized):\n"
-                  << "     rank  atom  elem     score     cumsum   sel" << std::endl;
+                  << "     rank  atom  elem     score     cumsum       hole   particle  sel" << std::endl;
         double cum = 0.0;
         const int show = std::min(num_atoms, 24);   // top rows only (large systems)
         for (int r = 0; r < show; ++r) {
@@ -316,6 +474,8 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
                       << "  " << std::setw(4) << atomic_number_to_element_name(atoms[A].atomic_number)
                       << "   " << std::fixed << std::setprecision(5) << std::setw(9) << score[A]
                       << "   " << std::setw(8) << cum
+                      << "   " << std::setw(8) << score_hole[A]
+                      << "   " << std::setw(8) << score_part[A]
                       << "   " << (selset.count(A) ? "*" : " ") << std::defaultfloat << std::endl;
         }
         if (show < num_atoms)
@@ -326,12 +486,23 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
         for (int A : sel.atoms) std::cout << " " << A << atomic_number_to_element_name(atoms[A].atomic_number);
         std::cout << std::endl;
 
+        if (sel_mode == "shell") {
+            std::cout << "  [auto-frag shell] growth log (r = radius from the centre):" << std::endl
+                      << "     centre    r[A]   n  elems     shell_w    cum    est_n_emb" << std::endl;
+            for (const auto& r : shell_rows)
+                std::cout << std::setfill(' ') << "     " << std::setw(6) << r.seed
+                          << "  " << std::fixed << std::setprecision(3) << std::setw(6) << r.r_bohr * kBohrInAngstrom
+                          << "  " << std::setw(3) << r.n << "  " << std::setw(8) << r.elems
+                          << "  " << std::setprecision(4) << std::setw(8) << r.w
+                          << "  " << std::setw(6) << r.cum << "  " << std::setw(6) << r.est_n_emb
+                          << std::defaultfloat << std::endl;
+        }
         // Sensitivity: reselect at f/2 and 2f (no CIS recompute) — set change warns.
         auto set_of = [](const Selection& s){ return std::set<int>(s.atoms.begin(), s.atoms.end()); };
         const std::set<int> base_set = set_of(sel);
         const std::set<int> lo = set_of(greedy_select(score, ao_count, floor * 0.5, T, budget));
         const std::set<int> hi = set_of(greedy_select(score, ao_count, floor * 2.0, T, budget));
-        if (lo != base_set || hi != base_set)
+        if (sel_mode != "shell" && (lo != base_set || hi != base_set))
             std::cout << "  [auto-frag] WARNING: selection is floor-sensitive "
                          "(atom set changes at f/2 or 2f) — knee is soft; verify the fragment."
                       << std::endl;
@@ -348,6 +519,9 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
                       << " < target " << T << " — excitation is delocalized/diffuse "
                          "(DMET localization assumption weak; expect degeneration toward full STEOM)."
                       << std::endl;
+        std::cout << "  [auto-frag] connectivity: cutoff " << std::fixed << std::setprecision(2)
+                  << conn_cut << " Bohr" << std::defaultfloat
+                  << ", regions=" << out.n_components << std::endl;
         if (out.n_components > 3)
             std::cout << "  [auto-frag] WARNING: selected atoms span " << out.n_components
                       << " disconnected regions (>3) — likely a mix of spatially distinct "
@@ -361,7 +535,7 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
     // Paper / visualization: the auto-extracted fragment geometry in Ångström.
     const std::string& xyz_path = rhf.get_dmet_steom_auto_xyz();
     if (!xyz_path.empty()) {
-        const double bohr2ang = 1.0 / 1.8897259886;
+        const double bohr2ang = kBohrInAngstrom; // types.hpp: single source
         std::ofstream fx(xyz_path);
         fx << out.atoms.size() << "\n"
            << "DMET-STEOM auto-selected chromophore fragment (coverage="
@@ -413,7 +587,7 @@ DMETAutoFragmentResult dmet_steom_auto_extract_fragment(
             js << "  \"elements\": [";
             for (int A = 0; A < num_atoms; ++A) js << (A ? "," : "") << "\"" << atomic_number_to_element_name(atoms[A].atomic_number) << "\"";
             js << "],\n";
-            const double bohr2ang = 1.0 / 1.8897259886;
+            const double bohr2ang = kBohrInAngstrom; // types.hpp: single source
             js << "  \"coords_angstrom\": [";
             for (int A = 0; A < num_atoms; ++A) {
                 const auto& c = atoms[A].coordinate;

@@ -28,7 +28,7 @@ namespace gansu::gpu{
 
 // 重なり部分の微分の係数
 __global__ void compute_W_Matrix_kernel(real_t* d_W_matrix, const real_t* d_coefficient_matrix, const real_t* d_orbital_energies, const int num_electron, const int num_basis){
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_basis * num_basis) return;
 
     size_t i = idx / num_basis;
@@ -66,7 +66,7 @@ void compute_W_Matrix_cpu(real_t* d_W_matrix, const real_t* d_coefficient_matrix
 
 // 核反発部分の微分を計算
 __global__ void compute_nuclear_repulsion_gradient_kernel(double* g_grad, const Atom* g_atom, const int num_atoms){
-    size_t A = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t A = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (A >= num_atoms) return;
 
     double grad_x = 0.0;

@@ -34,6 +34,7 @@
 #include <utility>
 #include <iostream>
 #include "gpu_manager.hpp"
+#include "launch_audit.hpp"
 #include "utils.hpp"
 #include<sys/time.h>
 #include <cusolverDn.h>
@@ -128,7 +129,7 @@ __global__ void FCImake_hdiag_uhf_part_kernel_large(
     const int32_t *occslist,
     int rank)
 {
-    size_t tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid    = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)blockDim.x * gridDim.x;
 
     for (size_t i = tid; i < size; i += stride) {
@@ -389,6 +390,7 @@ void gen_linkstr_index(int32_t nelec, int32_t norb, int32_t nstring, int amin, i
     
     CUDA_CHECK(cudaMemset(d_scratch, 0, total_scratch_bytes));
     
+    ::gansu::gpu::auditLaunchSize("propgate1e_kernel", ::gansu::gpu::launchExtent(blocks) * ::gansu::gpu::launchExtent(threads));
     propgate1e_kernel<<<blocks, threads>>>(nelec, norb, nstring, amin, na,
         d_link_index,  d_occslst,  d_link_nnorb, nvir, nlink, d_scratch);
 
@@ -416,7 +418,7 @@ __global__ void dot_partial_kernel(
         printf("ERROR: blockDim.x = %d\n", blockDim.x);
     }
     size_t tid = threadIdx.x;
-    size_t idx = blockIdx.x * blockDim.x + tid;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + tid;
     size_t stride = gridDim.x * blockDim.x;
 
     double sum = 0.0;
@@ -527,7 +529,7 @@ void fill_heff_hermitian_gpu_fast(cublasHandle_t handle, ncclComm_t ncclComm, cu
 
 __global__ void Dscal_kernel(double *in, double *out, double k, size_t np)
 {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)blockDim.x * gridDim.x;
 
     for (size_t id = tid; id < np; id += stride) {
@@ -536,7 +538,7 @@ __global__ void Dscal_kernel(double *in, double *out, double k, size_t np)
 }
 __global__ void Dscalplus_kernel(double *in, double *out, double k, size_t np)
 {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)blockDim.x * gridDim.x;
 
     for (size_t id = tid; id < np; id += stride) {
@@ -547,7 +549,7 @@ __global__ void Dscalplus_kernel(double *in, double *out, double k, size_t np)
 
 __global__ void Dscal_accum_kernel(const double* __restrict__ d_ci0_list, const double* __restrict__ d_ci1_list, double* __restrict__ d_ci0, double* __restrict__ d_ci1, const  double* __restrict__ v, int space, size_t np)
 {
-    size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= np) return;
     double x = d_ci0[id] * v[space - 1];
     double y = d_ci1[id] * v[space - 1];
@@ -572,6 +574,7 @@ void gen_x0_gpu(double *v, double *d_ci0_list,  double *d_ci1_list, double *d_ci
     CUDA_CHECK(cudaMemcpyAsync(d_v, v, space * sizeof(double),
                                cudaMemcpyHostToDevice, computeStream));
 
+    ::gansu::gpu::auditLaunchSize("Dscal_accum_kernel", ::gansu::gpu::launchExtent(blocks) * ::gansu::gpu::launchExtent(threads));
     Dscal_accum_kernel<<<blocks, threads, 0, computeStream>>>(
         d_ci0_list, d_ci1_list, d_ci0, d_ci1, d_v, space, np);
     CUDA_CHECK(cudaGetLastError());
@@ -589,11 +592,13 @@ void gen_x0_gpu_incpu(double *h_v, double *h_c_list, double *d_x0, double* d_tmp
 
     // Initialize with the last term
     CUDA_CHECK(cudaMemcpyAsync(d_tmp, h_c_list + (space - 1) * np, sizeof(double) * np, cudaMemcpyHostToDevice, computeStream));
+    ::gansu::gpu::auditLaunchSize("Dscal_kernel", ::gansu::gpu::launchExtent(nblock) * ::gansu::gpu::launchExtent(nthread));
     Dscal_kernel<<<nblock, nthread, 0, computeStream>>>(d_tmp, d_x0, h_v[space - 1], np);
     
     // Accumulate remaining terms
     for (int i = space - 2; i >= 0; i--) {
         CUDA_CHECK(cudaMemcpyAsync(d_tmp, h_c_list + i * np, sizeof(double) * np, cudaMemcpyHostToDevice, computeStream));
+        ::gansu::gpu::auditLaunchSize("Dscalplus_kernel", ::gansu::gpu::launchExtent(nblock) * ::gansu::gpu::launchExtent(nthread));
         Dscalplus_kernel<<<nblock, nthread, 0, computeStream>>>(d_tmp, d_x0, h_v[i], np);
     }
 }
@@ -601,7 +606,7 @@ void gen_x0_gpu_incpu(double *h_v, double *h_c_list, double *d_x0, double* d_tmp
 
 
 __global__ void precond_kernel(const double* __restrict__ diag, double* __restrict__ dx, double e, double level_shift, size_t np){
-    size_t tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid    = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)blockDim.x * gridDim.x;
     
     const double threshold = 1e-8;
@@ -616,17 +621,17 @@ __global__ void precond_kernel(const double* __restrict__ diag, double* __restri
 
 
 __global__ void Dscalminus_kernel(double *in, double *out, double k,  size_t np){
-     size_t id=blockIdx.x * blockDim.x + threadIdx.x;
+     size_t id=(size_t)blockIdx.x * blockDim.x + threadIdx.x;
      if (id>=np) return;
      out[id]-=k*in[id];
 }
 __global__ void Ddiv_kernel(double *in, double *out, double k,  size_t np){
-     size_t id=blockIdx.x * blockDim.x + threadIdx.x;
+     size_t id=(size_t)blockIdx.x * blockDim.x + threadIdx.x;
      if (id>=np) return;
      out[id]=in[id]/k;
 }
 __global__ void Dscalminus_largekernel(const double* __restrict__ in, double* __restrict__ out, double k, size_t np){
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)blockDim.x * gridDim.x;
 
     for (size_t id = tid; id < np; id += stride) {
@@ -635,7 +640,7 @@ __global__ void Dscalminus_largekernel(const double* __restrict__ in, double* __
 }
 
 __global__ void Ddiv_largekernel(const double* __restrict__ in, double* __restrict__ out, double k, size_t np){
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)blockDim.x * gridDim.x;
 
     for (size_t id = tid; id < np; id += stride) {
@@ -690,9 +695,11 @@ void normalize_xt_gpu_large(
             CUDA_CHECK(cudaMemcpyAsync(d_tmp, &d_ci0_list[i * mynp],
                                        mynp * sizeof(double),
                                        cudaMemcpyHostToDevice, computeStream));
+            ::gansu::gpu::auditLaunchSize("Dscalminus_largekernel", ::gansu::gpu::launchExtent(nblock) * ::gansu::gpu::launchExtent(nthread));
             Dscalminus_largekernel<<<nblock, nthread, 0, computeStream>>>(
                 d_tmp, d_ci0, tmp, mynp);
         } else {
+            ::gansu::gpu::auditLaunchSize("Dscalminus_largekernel", ::gansu::gpu::launchExtent(nblock) * ::gansu::gpu::launchExtent(nthread));
             Dscalminus_largekernel<<<nblock, nthread, 0, computeStream>>>(
                 d_ci0_list + i * mynp, d_ci0, tmp, mynp);
         }
@@ -718,6 +725,7 @@ void normalize_xt_gpu_large(
     const double norm_sq = h_single[0];
     if (norm_sq > lindep && sqrt(norm_sq) > 1e-14) {
         const double norm = sqrt(norm_sq);
+        ::gansu::gpu::auditLaunchSize("Ddiv_largekernel", ::gansu::gpu::launchExtent(nblock) * ::gansu::gpu::launchExtent(nthread));
         Ddiv_largekernel<<<nblock, nthread, 0, computeStream>>>(
             d_ci0, d_ci0, norm, mynp);
         CUDA_CHECK(cudaGetLastError());
@@ -766,9 +774,11 @@ void normalize_xt_gpu(
 
         // Subtract projection: ci0 -= tmp * ci0_list[i]
         if (in_cpu == 1) {
+            ::gansu::gpu::auditLaunchSize("Dscalminus_kernel", ::gansu::gpu::launchExtent(nblock) * ::gansu::gpu::launchExtent(nthread));
             Dscalminus_kernel<<<nblock, nthread, 0, computeStream>>>(
                 d_tmp, d_ci0, tmp, mynp);
         } else {
+            ::gansu::gpu::auditLaunchSize("Dscalminus_kernel", ::gansu::gpu::launchExtent(nblock) * ::gansu::gpu::launchExtent(nthread));
             Dscalminus_kernel<<<nblock, nthread, 0, computeStream>>>(
                 d_ci0_list + i * mynp, d_ci0, tmp, mynp);
         }
@@ -793,6 +803,7 @@ void normalize_xt_gpu(
 
     if (norm_sq > lindep) {
         const double norm = sqrt(norm_sq);
+        ::gansu::gpu::auditLaunchSize("Ddiv_kernel", ::gansu::gpu::launchExtent(nblock) * ::gansu::gpu::launchExtent(nthread));
         Ddiv_kernel<<<nblock, nthread, 0, computeStream>>>(d_ci0, d_ci0, norm, mynp);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -894,6 +905,7 @@ void contract_2e_spin1_gpu(
     }
 
     for (int32_t strb0 = 0; strb0 < nb; strb0 += chunk) {
+        ::gansu::gpu::auditLaunchSize("_build_t1", ::gansu::gpu::launchExtent(nblocks) * ::gansu::gpu::launchExtent(threadsPerBlock));
         _build_t1<<<nblocks, threadsPerBlock, 0, computeStream>>>(
             d_ci0, d_t1, strb0, na, nb, nnorb, d_linknn, chunk, nab);
         CUDA_CHECK(cudaGetLastError());
@@ -901,6 +913,7 @@ void contract_2e_spin1_gpu(
         CUBLAS_CHECK(cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
             nab, nnorb, nnorb, &D1, d_t1, nab, d_eri, nnorb, &D0, d_vt1, nab));
 
+        ::gansu::gpu::auditLaunchSize("_gather", ::gansu::gpu::launchExtent(nblocks) * ::gansu::gpu::launchExtent(threadsPerBlock));
         _gather<<<nblocks, threadsPerBlock, 0, computeStream>>>(
             d_ci1, d_vt1, strb0, na, nb, nnorb, chunk, nab, d_clink, nlink);
         CUDA_CHECK(cudaGetLastError());
@@ -939,7 +952,7 @@ __global__ void _build_t1_buf(
     int mode,
     int rank)
 {
-    const size_t thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t thread_id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t ntile_sz = (size_t)ntile;
     const size_t ntile2_sz = (size_t)ntile2;
     const size_t total_threads = (size_t)na_self * ntile2_sz;
@@ -1027,7 +1040,7 @@ __global__ void _gather_buf(
     int mode,
     int rank)
 {
-    const size_t thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t thread_id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t total_threads = (size_t)na_self * ntile2;
     
     if (thread_id >= total_threads) return;
@@ -1125,7 +1138,7 @@ void _add_to_c_option(
     int nprocs,
     int rank)
 {
-    size_t thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t thread_id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t total_threads = (size_t)na_per_node * ntile2;
     
     if (thread_id >= total_threads) return;
@@ -1582,7 +1595,7 @@ __global__ void normalize_kernel(double* __restrict__ ci0, size_t np,
     
     const double inv_norm = 1.0 / norm;
     
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)blockDim.x * gridDim.x;
 
     for (size_t id = tid; id < np; id += stride) {
@@ -1625,7 +1638,7 @@ __global__ void dr_kernel_safe(
     double lambda,
     size_t n)
 {
-    size_t tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid    = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = (size_t)blockDim.x * gridDim.x;
 
     for (size_t i = tid; i < n; i += stride) {
@@ -1827,6 +1840,7 @@ void davidson(
         CUDA_CHECK(cudaMemcpyAsync(d_inner_global, d_inner_local, sizeof(double),
                                    cudaMemcpyDeviceToDevice, computeStream));
     }
+    ::gansu::gpu::auditLaunchSize("normalize_kernel", ::gansu::gpu::launchExtent(nblock_small) * ::gansu::gpu::launchExtent(nthread));
     normalize_kernel<<<nblock_small, nthread, 0, computeStream>>>(
         d_ci0, mynp, d_inner_global, lindep);
     CUDA_CHECK(cudaGetLastError());
@@ -1974,6 +1988,7 @@ void davidson(
                 }
                 space = 0; reset_state = 1; continue;
             }
+            ::gansu::gpu::auditLaunchSize("dr_kernel_safe", ::gansu::gpu::launchExtent(nblock_small) * ::gansu::gpu::launchExtent(nthread));
             dr_kernel_safe<<<nblock_small, nthread, 0, computeStream>>>(
                 d_ci0, d_ci1, d_tmp, e[0], mynp);
             CUDA_CHECK(cudaGetLastError());
@@ -1990,6 +2005,7 @@ void davidson(
 
         // --- Residual ---
         
+        ::gansu::gpu::auditLaunchSize("dr_kernel_safe", ::gansu::gpu::launchExtent(nblock_small) * ::gansu::gpu::launchExtent(nthread));
         dr_kernel_safe<<<nblock_small, nthread, 0, computeStream>>>(
             d_ci0, d_ci1, d_ci0, e[0], mynp);
         CUDA_CHECK(cudaGetLastError());
@@ -2005,9 +2021,11 @@ void davidson(
             if (cfg.in_cpu == 1) {
                 CUDA_CHECK(cudaMemcpyAsync(d_tmp, hdiag, mynp * sizeof(double),
                                            cudaMemcpyHostToDevice, computeStream));
+                ::gansu::gpu::auditLaunchSize("precond_kernel", ::gansu::gpu::launchExtent(nblock_small) * ::gansu::gpu::launchExtent(nthread));
                 precond_kernel<<<nblock_small, nthread, 0, computeStream>>>(
                     d_tmp, d_ci0, e[0], level_shift, mynp);
             } else {
+                ::gansu::gpu::auditLaunchSize("precond_kernel", ::gansu::gpu::launchExtent(nblock_small) * ::gansu::gpu::launchExtent(nthread));
                 precond_kernel<<<nblock_small, nthread, 0, computeStream>>>(
                     d_hdiag, d_ci0, e[0], level_shift, mynp);
             }
@@ -2017,6 +2035,7 @@ void davidson(
             allreduce_to_host();
             if (h_single[0] > 0.0) {
                 const double tmpk = pow(h_single[0], -0.5);
+                ::gansu::gpu::auditLaunchSize("Dscal_kernel", ::gansu::gpu::launchExtent(nblock_small) * ::gansu::gpu::launchExtent(nthread));
                 Dscal_kernel<<<nblock_small, nthread, 0, computeStream>>>(
                     d_ci0, d_ci0, tmpk, mynp);
                 CUDA_CHECK(cudaGetLastError());
@@ -2367,6 +2386,7 @@ double fci_mpi(
     // =========================================================
     // Compute Hamiltonian diagonal elements (in_cpu=0 fixed: GPU path only)
     // =========================================================
+    ::gansu::gpu::auditLaunchSize("FCImake_hdiag_uhf_part_kernel_large", ::gansu::gpu::launchExtent(large_blocks) * ::gansu::gpu::launchExtent(nthread));
     FCImake_hdiag_uhf_part_kernel_large<<<large_blocks, nthread, 0, computeStream>>>(
         d_hdiag, mynp, d_Gmo1e_local, d_jdiag, d_kdiag,
         norb, my_na, na, amin, neleca, d_occslst, rank);

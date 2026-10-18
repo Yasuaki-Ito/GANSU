@@ -18,9 +18,12 @@
  *
  * Supports three solver modes (controlled by --adc2_solver parameter):
  *
- *   schur_static: Static Schur complement (ω=0), approximate (~0.005-0.02 Ha error)
+ *   schur_static: Static Schur complement (ω=0), approximate (~0.005-0.02 Ha error
+ *     = ~0.15-0.6 eV on excitation energies — as large as the CIS -> ADC(2)
+ *     improvement itself, so opt in deliberately, never by default)
  *     M_eff(0) = M11 + M12 · diag(1/(0-D2)) · M21
- *     Single diagonalization, fastest but least accurate.
+ *     Single diagonalization, fastest but least accurate. Worth ~8x only once
+ *     the singles space is large (measured: 1.0x at singles=315, 8.2x at 2079).
  *
  *   schur_omega: ω-dependent Schur complement (default), exact
  *     M_eff(ω) = M11 + M12 · diag(1/(ω-D2)) · M21
@@ -365,8 +368,22 @@ static void compute_adc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, re
 
     int doubles_dim = num_occ * num_occ * num_vir * num_vir;
 
-    // Auto solver selection: schur_static is fastest but inaccurate with frozen core.
-    // Frozen core: use full Davidson (Schur complement approximation breaks down).
+    // Auto solver selection. This used to fall through to schur_static, on the
+    // premise (see the old comment) that it was only inaccurate with a frozen
+    // core. Measured 2026-08-15, with no frozen core anywhere:
+    //
+    //   system            singles  static   omega   speed   |Δω|
+    //   H2O   / STO-3G         10    2.7s    2.7s    1.0x   5-8 mHa
+    //   C6H6  / STO-3G        315    2.8s    2.9s    1.0x    22 mHa
+    //   C6H6  / cc-pVDZ      2079    5.6s   45.8s    8.2x    18 mHa
+    //
+    // so the ω=0 approximation costs ~0.5 eV on excitation energies, which is
+    // the same size as the CIS -> ADC(2) improvement it is supposed to deliver,
+    // and it buys nothing at all until the singles space is large. Silently
+    // trading that away is not a defensible default for an excited-state
+    // method, and the file header above already documents schur_omega as the
+    // exact default. schur_static stays available explicitly for anyone who
+    // wants the 8x at that price.
     if (solver_mode == "auto") {
         if (singles_dim > 10000) {
             // Dense M_eff diag is prohibitive at this size — matrix-free Davidson.
@@ -376,8 +393,10 @@ static void compute_adc2_impl(RHF& rhf, const real_t* d_eri_ao, int n_states, re
             solver_mode = "full";
             std::cout << "  Auto solver: full (frozen core)" << std::endl;
         } else {
-            solver_mode = "schur_static";
-            std::cout << "  Auto solver: schur_static" << std::endl;
+            solver_mode = "schur_omega";
+            std::cout << "  Auto solver: schur_omega (exact; --adc2_solver "
+                         "schur_static is faster for large singles but shifts "
+                         "roots by ~0.5 eV)" << std::endl;
         }
     }
 

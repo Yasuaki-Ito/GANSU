@@ -15,6 +15,7 @@
 
 
 #include "gpu_manager.hpp"
+#include "launch_audit.hpp"
 #include "int1e.hpp"
 #include "int2e.hpp"
 #include "utils.hpp" // THROW_EXCEPTION
@@ -49,6 +50,22 @@
 
 #include <Eigen/Dense>
 #include "cpu_integrals.hpp"
+
+namespace gansu::gpu {
+// Threshold is 2^31, half of the danger point, so a run that is merely close
+// still shows up.
+void auditLaunchSize(const char* what, size_t num_threads) {
+    if (num_threads < (1ULL << 31)) return;
+    if (!std::getenv("GANSU_LAUNCH_AUDIT")) return;
+    static size_t worst = 0;
+    if (num_threads <= worst) return;
+    worst = num_threads;
+    fprintf(stderr, "[launch-audit] %-8s threads=%zu  (2^31=%llu, 2^32=%llu)"
+            "  %s\n", what, num_threads,
+            (unsigned long long)(1ULL << 31), (unsigned long long)(1ULL << 32),
+            num_threads >= (1ULL << 32) ? "*** WOULD HAVE WRAPPED ***" : "");
+}
+} // namespace gansu::gpu
 
 namespace gansu::gpu{
 
@@ -982,6 +999,7 @@ void invertSqrtElements(real_t* d_vectors, const size_t size, const double thres
     }
     size_t blockSize = 256;
     size_t numBlocks = (size + blockSize - 1) / blockSize;
+    ::gansu::gpu::auditLaunchSize("inverseSqrt_kernel", ::gansu::gpu::launchExtent(numBlocks) * ::gansu::gpu::launchExtent(blockSize));
     inverseSqrt_kernel<<<numBlocks, blockSize>>>(d_vectors, size, threshold);
 #endif
 }
@@ -1007,6 +1025,7 @@ void sqrtElements(real_t* d_vectors, const size_t size) {
     }
     size_t blockSize = 256;
     size_t numBlocks = (size + blockSize - 1) / blockSize;
+    ::gansu::gpu::auditLaunchSize("sqrt_kernel", ::gansu::gpu::launchExtent(numBlocks) * ::gansu::gpu::launchExtent(blockSize));
     sqrt_kernel<<<numBlocks, blockSize>>>(d_vectors, size);
 #endif
 }
@@ -1023,6 +1042,7 @@ void sqrtElements(real_t* d_vectors, const size_t size) {
     }
     dim3 blockSize(WARP_SIZE, WARP_SIZE);
     dim3 gridSize((size + WARP_SIZE - 1) / WARP_SIZE, (size + WARP_SIZE - 1) / WARP_SIZE);
+    ::gansu::gpu::auditLaunchSize("transposeMatrixInPlace_kernel", ::gansu::gpu::launchExtent(gridSize) * ::gansu::gpu::launchExtent(blockSize));
     transposeMatrixInPlace_kernel<<<gridSize, blockSize>>>(d_matrix, size);
 #endif
 }
@@ -1069,6 +1089,7 @@ void makeDiagonalMatrix(const real_t* d_vector, real_t* d_matrix, const int size
     real_t h_trace = 0.0;
     const int num_threads_per_block = 1024;
     const int num_blocks = (size + num_threads_per_block - 1) / num_threads_per_block;
+    ::gansu::gpu::auditLaunchSize("getMatrixTrace", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads_per_block));
     getMatrixTrace<<<num_blocks, num_threads_per_block>>>(d_matrix, d_trace, size);
     cudaMemcpy(&h_trace, d_trace, sizeof(real_t), cudaMemcpyDeviceToHost);
 
@@ -1155,6 +1176,15 @@ void computeCoreHamiltonianMatrix(const std::vector<ShellTypeInfo>& shell_type_i
 
             int index = (2*(shell_type_count-1)-s0+1)*s0 / 2 + s1;
 
+            // (2026-09-14) A shell type with no shells (e.g. an s+d basis with
+            // no p functions) gives num_shell_pairs = 0 and a 0-block launch,
+            // which cudaLaunchKernel rejects with cudaErrorInvalidValue. The
+            // result was still correct (nothing to compute) but the error stayed
+            // pending on the host thread and was later mistaken for a real one
+            // by downstream cudaGetLastError checks (PBC cluster-ERI guard,
+            // forced-streaming suite). Skip empty pair classes.
+            if (num_shell_pairs == 0) continue;
+
             // call the kernel functions
             get_overlap_kinetic_kernel(s0, s1, int1e_method)<<<num_blocks, threads_per_block, 0, streams[index]>>>(d_overlap_matrix, d_core_hamiltonian_matrix, d_primitive_shells, d_cgto_normalization_factors, shell_s0, shell_s1, num_shell_pairs, num_basis);
             get_nuclear_attraction_kernel(s0, s1, int1e_method)<<<num_blocks, threads_per_block, 0, V_streams[index]>>>(d_core_hamiltonian_matrix, d_primitive_shells, d_cgto_normalization_factors, d_atoms, num_atoms, shell_s0, shell_s1, num_shell_pairs, num_basis, d_boys_grid);
@@ -1164,7 +1194,9 @@ void computeCoreHamiltonianMatrix(const std::vector<ShellTypeInfo>& shell_type_i
     cudaDeviceSynchronize();
 
     const int num_blocks_sym = (num_basis * num_basis + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("matrixSymmetrization", ::gansu::gpu::launchExtent(num_blocks_sym) * ::gansu::gpu::launchExtent(threads_per_block));
     matrixSymmetrization<<<num_blocks_sym, threads_per_block>>>(d_overlap_matrix, num_basis);
+    ::gansu::gpu::auditLaunchSize("matrixSymmetrization", ::gansu::gpu::launchExtent(num_blocks_sym) * ::gansu::gpu::launchExtent(threads_per_block));
     matrixSymmetrization<<<num_blocks_sym, threads_per_block>>>(d_core_hamiltonian_matrix, num_basis);
 
     // destory streams
@@ -1499,6 +1531,7 @@ void computeDensityMatrix_RHF(const real_t* d_coefficient_matrix, real_t* d_dens
     }
     size_t threads_per_block = 256;
     size_t num_blocks = (num_basis * num_basis + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("computeDensityMatrix_RHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     computeDensityMatrix_RHF_kernel<<<num_blocks, threads_per_block>>>(
         d_coefficient_matrix,
         d_density_matrix,
@@ -1539,6 +1572,7 @@ void computeDensityMatrix_UHF(const real_t* d_coefficient_matrix, real_t* d_dens
     }
     size_t threads_per_block = 256;
     size_t num_blocks = (num_basis * num_basis + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("computeDensityMatrix_UHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     computeDensityMatrix_UHF_kernel<<<num_blocks, threads_per_block>>>(
         d_coefficient_matrix,
         d_density_matrix,
@@ -1596,6 +1630,7 @@ void computeDensityMatrix_ROHF(const real_t* d_coefficient_matrix, real_t* d_den
     // === GPU path (existing code) ===
     size_t threads_per_block = 256;
     size_t num_blocks = (num_basis * num_basis + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("computeDensityMatrix_ROHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     computeDensityMatrix_ROHF_kernel<<<num_blocks, threads_per_block>>>(
         d_coefficient_matrix,
         d_density_matrix_closed,
@@ -1654,6 +1689,7 @@ void computeFockMatrix_RHF(const real_t* d_density_matrix, const real_t* d_core_
     const int num_blocks = num_basis * num_basis;
     dim3 blocks(num_blocks);
     dim3 threads(WARP_SIZE, warpsPerBlock);
+    ::gansu::gpu::auditLaunchSize("computeFockMatrix_RHF_kernel", ::gansu::gpu::launchExtent(blocks) * ::gansu::gpu::launchExtent(threads));
     computeFockMatrix_RHF_kernel<<<blocks, threads>>>(d_density_matrix, d_core_hamiltonian_matrix, d_eri, d_fock_matrix, num_basis);
 #endif
 }
@@ -1715,6 +1751,7 @@ void computeFockMatrix_UHF(const real_t* d_density_matrix_a, const real_t* d_den
     //const int num_blocks = num_basis * (num_basis + 1) / 2;
     dim3 blocks(num_blocks);
     dim3 threads(WARP_SIZE, warpsPerBlock);
+    ::gansu::gpu::auditLaunchSize("computeFockMatrix_UHF_kernel", ::gansu::gpu::launchExtent(blocks) * ::gansu::gpu::launchExtent(threads));
     computeFockMatrix_UHF_kernel<<<blocks, threads>>>(d_density_matrix_a, d_density_matrix_b, d_core_hamiltonian_matrix, d_eri, d_fock_matrix_a, d_fock_matrix_b, num_basis);
 #endif
 }
@@ -1854,6 +1891,7 @@ void computeFockMatrix_ROHF(const real_t* d_density_matrix_closed, const real_t*
         //const int num_blocks = num_basis * (num_basis + 1) / 2;
         dim3 blocks(num_blocks);
         dim3 threads(WARP_SIZE, warpsPerBlock);
+        ::gansu::gpu::auditLaunchSize("computeFockMatrix_ROHF_kernel", ::gansu::gpu::launchExtent(blocks) * ::gansu::gpu::launchExtent(threads));
         computeFockMatrix_ROHF_kernel<<<blocks, threads>>>(d_density_matrix_closed, d_density_matrix_open, d_core_hamiltonian_matrix, d_eri, d_fock_matrix_closed, d_fock_matrix_open, num_basis);
     }
 
@@ -1871,6 +1909,7 @@ void computeFockMatrix_ROHF(const real_t* d_density_matrix_closed, const real_t*
         const size_t num_elements = num_basis * (num_basis+1) / 2;
         const size_t threads_per_block = 256;
         const size_t num_blocks = (num_elements + threads_per_block - 1) / threads_per_block;
+        ::gansu::gpu::auditLaunchSize("computeUnifiedFockMatrix_ROHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
         computeUnifiedFockMatrix_ROHF_kernel<<<num_blocks, threads_per_block>>>(d_temp_F_MO_closed, d_temp_F_MO_open, ROH_parameters, d_temp_R_MO, num_closed, num_open, num_basis);
     }
 
@@ -2554,6 +2593,7 @@ void computeFockMatrixDIIS(real_t* d_error_matrices, real_t* d_fock_matrices, re
     // Compute the initial Fock matrix
     size_t threads_per_block = 256;
     size_t num_blocks = (num_basis * num_basis + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("computeInitialFockMatrix_GWH_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     computeInitialFockMatrix_GWH_kernel<<<num_blocks, threads_per_block>>>(d_core_hamiltonian_matrix, d_overlap_matrix, d_temp_FockMatrix, num_basis, cx);
 
     // Diagonalize the Fock matrix
@@ -2767,6 +2807,7 @@ void choleskyDecomposition(double* d_A, const int N) {
     const int num_threads = 256;
     const int num_blocks = (N * N + num_threads - 1) / num_threads;
 
+    ::gansu::gpu::auditLaunchSize("setZeroUpperTriangle", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
     setZeroUpperTriangle<<<num_blocks, num_threads>>>(d_A, N);
 
     // Cleanup
@@ -3013,6 +3054,7 @@ void computeIntermediateMatrixB(
     // === GPU path ===
     const int num_threads = 256;
     const int num_blocks = (num_auxiliary_basis * num_basis * num_basis + num_threads - 1) / num_threads;
+    ::gansu::gpu::auditLaunchSize("computeRIIntermediateMatrixB_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
     computeRIIntermediateMatrixB_kernel<<<num_blocks, num_threads>>>(d_three_center_eri, d_two_center_eri, d_intermediate_matrix_B, num_basis, num_auxiliary_basis);
 #endif // !GANSU_CPU_ONLY
 }
@@ -3106,6 +3148,7 @@ void computeFockMatrix_RI_RHF_with_density_matrix(
     ////////////////////////////////// compute J-matrix //////////////////////////////////
     cublasDgemv(cublasHandle, CUBLAS_OP_T, num_basis*num_basis, num_auxiliary_basis, &alpha, d_intermediate_matrix_B, num_basis*num_basis, d_density_matrix, 1, &beta, d_W, 1);
     // J = sum(W[i] * B[i])
+    ::gansu::gpu::auditLaunchSize("weighted_sum_matrices_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
     weighted_sum_matrices_kernel<<<num_blocks, num_threads>>>(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
 
     ////////////////////////////////// compute K-matrix //////////////////////////////////
@@ -3132,10 +3175,12 @@ void computeFockMatrix_RI_RHF_with_density_matrix(
         num_auxiliary_basis
     );
     // K = sum(V^p)
+    ::gansu::gpu::auditLaunchSize("sum_matrices_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
     sum_matrices_kernel<<<num_blocks, num_threads>>>(d_K, d_V, num_basis, num_auxiliary_basis);
 
     ////////////////////////////////// compute Fock matrix //////////////////////////////////
     // F = H + J - (1/2)*K
+    ::gansu::gpu::auditLaunchSize("computeFockMatrix_RI_RHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
     computeFockMatrix_RI_RHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, num_basis);
     cudaDeviceSynchronize();
 #endif // !GANSU_CPU_ONLY
@@ -3261,6 +3306,7 @@ void computeFockMatrix_RI_RHF_with_coefficient_matrix(
     ////////////////////////////////// compute J-matrix //////////////////////////////////
     cublasDgemv(cublasHandle, CUBLAS_OP_T, num_basis*num_basis, num_auxiliary_basis, &alpha, d_intermediate_matrix_B, num_basis*num_basis, d_density_matrix, 1, &beta, d_W, 1);
     // J = sum(W[i] * B[i])
+    ::gansu::gpu::auditLaunchSize("weighted_sum_matrices_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
     weighted_sum_matrices_kernel<<<num_blocks, num_threads>>>(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
 
     ////////////////////////////////// compute K-matrix //////////////////////////////////
@@ -3291,6 +3337,7 @@ void computeFockMatrix_RI_RHF_with_coefficient_matrix(
 
     ////////////////////////////////// compute Fock matrix //////////////////////////////////
     // F = H + J - (1/2)*K
+    ::gansu::gpu::auditLaunchSize("computeFockMatrix_RI_RHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
     computeFockMatrix_RI_RHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, num_basis);
     cudaDeviceSynchronize();
 #endif // !GANSU_CPU_ONLY
@@ -3351,6 +3398,7 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
         double alpha = 1.0;
         double beta = 0.0;
         cublasDgemv(cublasHandle, CUBLAS_OP_T, num_basis*num_basis, num_auxiliary_basis, &alpha, d_intermediate_matrix_B, num_basis*num_basis, d_density_matrix, 1, &beta, d_W, 1);
+        ::gansu::gpu::auditLaunchSize("weighted_sum_matrices_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
         weighted_sum_matrices_kernel<<<num_blocks, num_threads>>>(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
     }
 #endif
@@ -3397,6 +3445,7 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
     } else {
         const int num_threads = 256;
         const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+        ::gansu::gpu::auditLaunchSize("sum_matrices_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
         sum_matrices_kernel<<<num_blocks, num_threads>>>(d_Ka, d_V, num_basis, num_auxiliary_basis);
     }
 #endif
@@ -3427,6 +3476,7 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
     } else {
         const int num_threads = 256;
         const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+        ::gansu::gpu::auditLaunchSize("sum_matrices_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
         sum_matrices_kernel<<<num_blocks, num_threads>>>(d_Kb, d_V, num_basis, num_auxiliary_basis);
     }
 #endif
@@ -3448,7 +3498,9 @@ void computeFockMatrix_RI_UHF(const real_t* d_density_matrix_a, const real_t* d_
     } else {
         const int num_threads = 256;
         const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+        ::gansu::gpu::auditLaunchSize("computeFockMatrix_RI_UHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
         computeFockMatrix_RI_UHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_Ka, d_fock_matrix_a, num_basis);
+        ::gansu::gpu::auditLaunchSize("computeFockMatrix_RI_UHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
         computeFockMatrix_RI_UHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_Kb, d_fock_matrix_b, num_basis);
     }
 #endif
@@ -3537,6 +3589,7 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
             double alpha = 1.0;
             double beta = 0.0;
             cublasDgemv(cublasHandle, CUBLAS_OP_T, num_basis*num_basis, num_auxiliary_basis, &alpha, d_intermediate_matrix_B, num_basis*num_basis, d_density_matrix, 1, &beta, d_W, 1);
+            ::gansu::gpu::auditLaunchSize("weighted_sum_matrices_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
             weighted_sum_matrices_kernel<<<num_blocks, num_threads>>>(d_J, d_intermediate_matrix_B, d_W, num_basis, num_auxiliary_basis);
         }
 #endif
@@ -3578,6 +3631,7 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
         } else {
             const int num_threads = 256;
             const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+            ::gansu::gpu::auditLaunchSize("sum_matrices_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
             sum_matrices_kernel<<<num_blocks, num_threads>>>(d_Kclosed, d_V, num_basis, num_auxiliary_basis);
         }
 #endif
@@ -3607,6 +3661,7 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
         } else {
             const int num_threads = 256;
             const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+            ::gansu::gpu::auditLaunchSize("sum_matrices_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
             sum_matrices_kernel<<<num_blocks, num_threads>>>(d_Kopen, d_V, num_basis, num_auxiliary_basis);
         }
 #endif
@@ -3625,6 +3680,7 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
         } else {
             const int num_threads = 256;
             const int num_blocks = (num_basis * num_basis + num_threads - 1) / num_threads;
+            ::gansu::gpu::auditLaunchSize("computeFockMatrix_RI_ROHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
             computeFockMatrix_RI_ROHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_Kclosed, d_Kopen, d_fock_matrix_closed, d_fock_matrix_open, num_basis);
         }
 #endif
@@ -3676,6 +3732,7 @@ void computeFockMatrix_RI_ROHF(const real_t* d_density_matrix_closed, const real
             const size_t num_elements = num_basis * (num_basis+1) / 2;
             const size_t threads_per_block = 256;
             const size_t num_blocks = (num_elements + threads_per_block - 1) / threads_per_block;
+            ::gansu::gpu::auditLaunchSize("computeUnifiedFockMatrix_ROHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
             computeUnifiedFockMatrix_ROHF_kernel<<<num_blocks, threads_per_block>>>(d_temp_F_MO_closed, d_temp_F_MO_open, ROH_parameters, d_temp_R_MO, num_closed, num_open, num_basis);
         }
 #endif
@@ -4217,6 +4274,7 @@ void computeFockMatrix_Direct_RHF(
             const int num_init_blocks = (num_bra_groups + num_threads_per_block - 1) / num_threads_per_block;
             //cudaMemset(d_global_counters[kernel_idx], 0, sizeof(int) * num_bra_groups);
             cudaMemsetAsync(d_global_counters[kernel_idx], 0, sizeof(int) * num_bra_groups, streams[kernel_idx]);
+            ::gansu::gpu::auditLaunchSize("initializeMinSkippedColumns", ::gansu::gpu::launchExtent(num_init_blocks) * ::gansu::gpu::launchExtent(num_threads_per_block));
             initializeMinSkippedColumns<<<num_init_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>(d_min_skipped_columns[kernel_idx], num_bra_groups, num_ket_groups);
 
             //gpu::get_eri_kernel_direct(s0, s1, s2, s3)<<<num_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
@@ -4232,6 +4290,7 @@ void computeFockMatrix_Direct_RHF(
                  head_bra, head_ket, num_bra, num_ket, num_fock_replicas);
         }
         else {
+            ::gansu::gpu::auditLaunchSize("RysERI_direct", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads_per_block));
             RysERI_direct<<<num_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
                 (d_fock_matrix_replicas, d_density_matrix, d_primitive_shells, num_fock_replicas, 
                  d_cgto_normalization_factors, shell_s0, shell_s1, shell_s2, shell_s3, 
@@ -4261,6 +4320,7 @@ void computeFockMatrix_Direct_RHF(
     }
 
     const int num_blocks_fock = ((num_basis * (num_basis + 1) / 2) + num_threads_per_block - 1) / num_threads_per_block;
+    ::gansu::gpu::auditLaunchSize("composeFockMatrix", ::gansu::gpu::launchExtent(num_blocks_fock) * ::gansu::gpu::launchExtent(num_threads_per_block));
     composeFockMatrix<<<num_blocks_fock, num_threads_per_block>>>(d_fock_matrix, d_fock_matrix_replicas, d_core_hamiltonian_matrix, num_basis, num_fock_replicas);
 
     cudaDeviceSynchronize();
@@ -4327,6 +4387,7 @@ void makeDensityMatrixDifferenceShellPairs(
     const int threads_per_block = 256;
     const int num_primitive_shell_pairs = num_primitive_shells * (num_primitive_shells + 1) / 2;
     const int num_blocks = (num_primitive_shell_pairs + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("densityMatrixDifferenceShellPairsKernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     densityMatrixDifferenceShellPairsKernel<<<num_blocks, threads_per_block>>>(d_density_matrix_diff_shell, d_density_matrix_diff, d_primitive_shells, d_primitive_shell_pair_indices, num_primitive_shells, num_basis);
     cudaDeviceSynchronize();
 }
@@ -4431,6 +4492,7 @@ void computeFockMatrix_Direct_RHF(
             const int num_init_blocks = (num_bra_groups + num_threads_per_block - 1) / num_threads_per_block;
             //cudaMemset(d_global_counters[kernel_idx], 0, sizeof(int) * num_bra_groups);
             cudaMemsetAsync(d_global_counters[kernel_idx], 0, sizeof(int) * num_bra_groups, streams[kernel_idx]);
+            ::gansu::gpu::auditLaunchSize("initializeMinSkippedColumns", ::gansu::gpu::launchExtent(num_init_blocks) * ::gansu::gpu::launchExtent(num_threads_per_block));
             initializeMinSkippedColumns<<<num_init_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>(d_min_skipped_columns[kernel_idx], num_bra_groups, num_ket_groups);
 
             //if (s0 == 0 && s1 == 0 && s2 == 0 && s3 == 0) {
@@ -4461,6 +4523,7 @@ void computeFockMatrix_Direct_RHF(
                 }
         }
         else {
+            ::gansu::gpu::auditLaunchSize("RysERI_direct", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads_per_block));
             RysERI_direct<<<num_blocks, num_threads_per_block, 0, streams[kernel_idx]>>>
                 (d_fock_matrix_replicas, d_density_matrix_diff, d_primitive_shells, num_fock_replicas, 
                  d_cgto_normalization_factors, shell_s0, shell_s1, shell_s2, shell_s3, 
@@ -4491,6 +4554,7 @@ void computeFockMatrix_Direct_RHF(
 
     const int num_blocks_fock = ((num_basis * (num_basis + 1) / 2) + num_threads_per_block - 1) / num_threads_per_block;
     //composeFockMatrix<<<num_blocks_fock, num_threads_per_block>>>(d_fock_matrix, d_fock_matrix_replicas, d_core_hamiltonian_matrix, num_basis, num_fock_replicas, is_first_call);
+    ::gansu::gpu::auditLaunchSize("composeFockMatrix", ::gansu::gpu::launchExtent(num_blocks_fock) * ::gansu::gpu::launchExtent(num_threads_per_block));
     composeFockMatrix<<<num_blocks_fock, num_threads_per_block>>>(d_fock_matrix_prev, d_fock_matrix_replicas, d_core_hamiltonian_matrix, num_basis, num_fock_replicas, is_first_call);
     cudaMemcpy(d_fock_matrix, d_fock_matrix_prev, sizeof(real_t) * num_basis * num_basis, cudaMemcpyDeviceToDevice);
 
@@ -4552,6 +4616,7 @@ void computeMullikenPopulation_RHF(
     // Compute the diagonal elements of the product of the density matrix and the overlap matrix
     const size_t threads_per_block = 256;
     const size_t num_blocks = (num_basis + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("compute_diagonal_of_product", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     compute_diagonal_of_product<<<num_blocks, threads_per_block>>>(
         d_density_matrix,
         d_overlap_matrix,
@@ -4606,6 +4671,7 @@ void computeMullikenPopulation_UHF(
     // Compute the diagonal elements of the product of the density matrix and the overlap matrix
     const size_t threads_per_block = 256;
     const size_t num_blocks = (num_basis + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("compute_diagonal_of_product_sum", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     compute_diagonal_of_product_sum<<<num_blocks, threads_per_block>>>(
         d_density_matrix_a,
         d_density_matrix_b,
@@ -4831,6 +4897,7 @@ void computeFockMatrix_Hash_RHF(
 
     // Push ERI contributions into replicas
     const int num_blocks = (num_entries + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("computeFockMatrix_COO_Push_RHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     computeFockMatrix_COO_Push_RHF_kernel<<<num_blocks, threads_per_block>>>(
         d_density_matrix, d_coo_keys, d_coo_values, num_entries,
         d_fock_replicas, num_basis, num_fock_replicas);
@@ -4839,6 +4906,7 @@ void computeFockMatrix_Hash_RHF(
     cudaMemset(d_fock_matrix, 0, matrix_size * sizeof(real_t));
     const int num_utm = num_basis * (num_basis + 1) / 2;
     const int num_blocks_compose = (num_utm + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("composeFockMatrix", ::gansu::gpu::launchExtent(num_blocks_compose) * ::gansu::gpu::launchExtent(threads_per_block));
     composeFockMatrix<<<num_blocks_compose, threads_per_block>>>(
         d_fock_matrix, d_fock_replicas, d_core_hamiltonian_matrix,
         num_basis, num_fock_replicas, true);
@@ -4866,6 +4934,7 @@ void computeFockMatrix_Hash_Indexed_RHF(
     cudaMemset(d_fock_replicas, 0, matrix_size * num_fock_replicas * sizeof(real_t));
 
     const int num_blocks = (num_nonzero + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("computeFockMatrix_Hash_Push_Indexed_RHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     computeFockMatrix_Hash_Push_Indexed_RHF_kernel<<<num_blocks, threads_per_block>>>(
         d_density_matrix, d_hash_keys, d_hash_values, d_nonzero_indices, num_nonzero,
         d_fock_replicas, num_basis, num_fock_replicas);
@@ -4873,6 +4942,7 @@ void computeFockMatrix_Hash_Indexed_RHF(
     cudaMemset(d_fock_matrix, 0, matrix_size * sizeof(real_t));
     const int num_utm = num_basis * (num_basis + 1) / 2;
     const int num_blocks_compose = (num_utm + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("composeFockMatrix", ::gansu::gpu::launchExtent(num_blocks_compose) * ::gansu::gpu::launchExtent(threads_per_block));
     composeFockMatrix<<<num_blocks_compose, threads_per_block>>>(
         d_fock_matrix, d_fock_replicas, d_core_hamiltonian_matrix,
         num_basis, num_fock_replicas, true);
@@ -4899,6 +4969,7 @@ void computeFockMatrix_Hash_FullScan_RHF(
     cudaMemset(d_fock_replicas, 0, matrix_size * num_fock_replicas * sizeof(real_t));
 
     const size_t num_blocks = (hash_capacity + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("computeFockMatrix_Hash_Push_RHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     computeFockMatrix_Hash_Push_RHF_kernel<<<num_blocks, threads_per_block>>>(
         d_density_matrix, d_hash_keys, d_hash_values, hash_capacity,
         d_fock_replicas, num_basis, num_fock_replicas);
@@ -4906,6 +4977,7 @@ void computeFockMatrix_Hash_FullScan_RHF(
     cudaMemset(d_fock_matrix, 0, matrix_size * sizeof(real_t));
     const int num_utm = num_basis * (num_basis + 1) / 2;
     const int num_blocks_compose = (num_utm + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("composeFockMatrix", ::gansu::gpu::launchExtent(num_blocks_compose) * ::gansu::gpu::launchExtent(threads_per_block));
     composeFockMatrix<<<num_blocks_compose, threads_per_block>>>(
         d_fock_matrix, d_fock_replicas, d_core_hamiltonian_matrix,
         num_basis, num_fock_replicas, true);
@@ -4920,7 +4992,7 @@ void computeFockMatrix_Hash_FullScan_RHF(
 
 // before = |after - before|
 __global__ void calcDiffMatrix(const real_t* d_matrix_after, real_t* d_matrix_before, int size) {
-    size_t id = blockIdx.x*blockDim.x + threadIdx.x;
+    size_t id = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
     if(id >= size * size) return;
 
     d_matrix_before[id] = d_matrix_after[id] - d_matrix_before[id];
@@ -4959,6 +5031,7 @@ void computeInverseByDtrsm(real_t* two_center_eris, real_t* two_center_eris_inve
 
     const int num_threads = 1024;
     const int num_blocks = (num_auxiliary_basis * num_auxiliary_basis + num_threads - 1) / num_threads;
+    ::gansu::gpu::auditLaunchSize("makeIdentityMatrix", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
     makeIdentityMatrix<<<num_blocks, num_threads>>>(two_center_eris_inverse, num_auxiliary_basis);
     cudaDeviceSynchronize();
 
@@ -5076,6 +5149,7 @@ const int threads_per_block = 128;
         // c_kernel = compute_RI_Direct_c_kernel;
 
 
+        ::gansu::gpu::auditLaunchSize("c_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
         c_kernel<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(d_c, d_density_matrix, d_primitive_shells, d_auxiliary_primitive_shells, 
                                                                                 d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors, 
                                                                                 shell_s0, shell_s1, shell_s2, 
@@ -5190,6 +5264,7 @@ const int threads_per_block = 128;
 
         // J_kernel = compute_RI_Direct_J_kernel;
 
+        ::gansu::gpu::auditLaunchSize("J_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
         J_kernel<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(d_J, d_t, d_primitive_shells, d_auxiliary_primitive_shells, 
                                                                                 d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors, 
                                                                                 shell_s0, shell_s1, shell_s2, 
@@ -5487,6 +5562,7 @@ void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_
             else W_kernel = compute_RI_Direct_W_kernel;
             // W_kernel = compute_RI_Direct_W_kernel;
 
+            ::gansu::gpu::auditLaunchSize("W_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
             W_kernel<<<num_blocks, threads_per_block, 0, streams[stream_id]>>>(d_W_diff, &d_coefficient_matrix_diff[iter * num_basis], d_primitive_shells, d_auxiliary_primitive_shells, 
                                                                                                     d_cgto_normalization_factors, d_auxiliary_cgto_normalization_factors, 
                                                                                                     shell_s0, shell_s1, shell_s2, 
@@ -5568,6 +5644,7 @@ void computeFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, const real_
     // ////////////////////////////////// compute Fock matrix //////////////////////////////////
 
     // // F = H + J - (1/2)*K
+    ::gansu::gpu::auditLaunchSize("computeFockMatrix_RI_RHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
     computeFockMatrix_RI_RHF_kernel<<<num_blocks, num_threads, 0, stream_main>>>(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, num_basis);
 
     cudaDeviceSynchronize();
@@ -5728,6 +5805,7 @@ void computeFockMatrix_RI_Direct_v2(
             const size_t total = (size_t)actual * nao * num_occ;
             const int th = 256;
             const int bl = (total + th - 1) / th;
+            ::gansu::gpu::auditLaunchSize("packThreeDimensionalTensorX", ::gansu::gpu::launchExtent(bl) * ::gansu::gpu::launchExtent(th));
             packThreeDimensionalTensorX<<<bl, th>>>(d_X_chunk, d_X_packed_chunk, nao, actual, num_occ);
         }
 
@@ -5749,6 +5827,7 @@ void computeFockMatrix_RI_Direct_v2(
     {
         const int th = 256;
         const int bl = (nao2 + th - 1) / th;
+        ::gansu::gpu::auditLaunchSize("computeFockMatrix_RI_RHF_kernel", ::gansu::gpu::launchExtent(bl) * ::gansu::gpu::launchExtent(th));
         computeFockMatrix_RI_RHF_kernel<<<bl, th>>>(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, nao);
         cudaDeviceSynchronize();
     }
@@ -5877,6 +5956,7 @@ void computeFockMatrix_RI_SemiDirect_UHF(
                 const size_t total = (size_t)actual * nao * nocc;
                 const int th = 256;
                 const int bl = (total + th - 1) / th;
+                ::gansu::gpu::auditLaunchSize("packThreeDimensionalTensorX", ::gansu::gpu::launchExtent(bl) * ::gansu::gpu::launchExtent(th));
                 packThreeDimensionalTensorX<<<bl, th>>>(d_X_chunk, d_X_packed_chunk, nao, actual, nocc);
             }
 
@@ -5905,7 +5985,9 @@ void computeFockMatrix_RI_SemiDirect_UHF(
     {
         const int th = 256;
         const int bl = (nao2 + th - 1) / th;
+        ::gansu::gpu::auditLaunchSize("computeFockMatrix_RI_UHF_kernel", ::gansu::gpu::launchExtent(bl) * ::gansu::gpu::launchExtent(th));
         computeFockMatrix_RI_UHF_kernel<<<bl, th>>>(d_core_hamiltonian_matrix, d_J, d_Ka, d_fock_matrix_a, nao);
+        ::gansu::gpu::auditLaunchSize("computeFockMatrix_RI_UHF_kernel", ::gansu::gpu::launchExtent(bl) * ::gansu::gpu::launchExtent(th));
         computeFockMatrix_RI_UHF_kernel<<<bl, th>>>(d_core_hamiltonian_matrix, d_J, d_Kb, d_fock_matrix_b, nao);
         cudaDeviceSynchronize();
     }
@@ -5980,6 +6062,7 @@ void compute_W(real_t* d_W_matrix, const real_t* d_coefficient_matrix, const rea
     }
     const int threads_per_block = 128;
     const int blocks = (num_basis*num_basis + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("compute_W_Matrix_kernel", ::gansu::gpu::launchExtent(blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     compute_W_Matrix_kernel<<<blocks, threads_per_block>>>(d_W_matrix, d_coefficient_matrix, d_orbital_energies, num_electron, num_basis);
 #endif
 }
@@ -6129,6 +6212,7 @@ void computeMolucularGradients(double* d_grad_total, double* d_grad_N, double* d
     }
 
     const int NR_blocks = (num_atoms * num_atoms + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("compute_nuclear_repulsion_gradient_kernel", ::gansu::gpu::launchExtent(NR_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     compute_nuclear_repulsion_gradient_kernel<<<NR_blocks, threads_per_block, 0, streams[stream_id]>>>(d_grad_N, d_atoms, num_atoms);
 
     // syncronize streams
@@ -6404,6 +6488,7 @@ std::vector<double> computeEnergyGradient_general(
     }
 
     const int NR_blocks = (num_atoms * num_atoms + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("compute_nuclear_repulsion_gradient_kernel", ::gansu::gpu::launchExtent(NR_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     compute_nuclear_repulsion_gradient_kernel<<<NR_blocks, threads_per_block, 0, streams[stream_id]>>>(d_grad_N, d_atoms, num_atoms);
 
     cudaDeviceSynchronize();
@@ -6565,6 +6650,7 @@ void computeMolucularGradients_UHF(double* d_grad_total, double* d_grad_N, doubl
     }
 
     const int NR_blocks = (num_atoms * num_atoms + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("compute_nuclear_repulsion_gradient_kernel", ::gansu::gpu::launchExtent(NR_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     compute_nuclear_repulsion_gradient_kernel<<<NR_blocks, threads_per_block, 0, streams[stream_id]>>>(d_grad_N, d_atoms, num_atoms);
 
     cudaError_t err = cudaDeviceSynchronize();
@@ -6779,6 +6865,7 @@ const int threads_per_block = 128;
         const int num_tasks = ( (s0==s1) ? (shell_s0.count*(shell_s0.count+1)/2) : (shell_s0.count*shell_s1.count) ) * shell_s2.count; // the number of pairs of primitive shells = the number of threads
         const int num_blocks = (num_tasks + threads_per_block - 1) / threads_per_block; // the number of blocks
         
+        ::gansu::gpu::auditLaunchSize("compute_RI_Direct_Z_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
         compute_RI_Direct_Z_kernel<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(d_Z, d_C, d_L_inv, d_primitive_shells, d_auxiliary_primitive_shells, 
                                                                                                 d_cgto_nomalization_factors, d_auxiliary_cgto_nomalization_factors, 
                                                                                                 shell_s0, shell_s1, shell_s2, 
@@ -7011,6 +7098,7 @@ void computeInitialFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, cons
         );
 
         // printf("    Add\n");
+        ::gansu::gpu::auditLaunchSize("addMatrix", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
         addMatrix<<< num_blocks, num_threads >>>(d_K, d_K_iter, num_basis*num_basis);
         // addMatrix<<< num_blocks, num_threads >>>(d_K, d_Z, num_basis, num_auxiliary_basis);
         // cudaDeviceSynchronize();
@@ -7021,6 +7109,7 @@ void computeInitialFockMatrix_RI_Direct_RHF(const real_t* d_density_matrix, cons
     // ////////////////////////////////// compute Fock matrix //////////////////////////////////
 
     // // F = H + J - (1/2)*K
+    ::gansu::gpu::auditLaunchSize("computeFockMatrix_RI_RHF_kernel", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(num_threads));
     computeFockMatrix_RI_RHF_kernel<<<num_blocks, num_threads>>>(d_core_hamiltonian_matrix, d_J, d_K, d_fock_matrix, num_basis);
     // cudaMemcpy(d_fock_matrix, d_J, sizeof(real_t)*num_basis*num_basis, cudaMemcpyDeviceToDevice);
 
@@ -7184,6 +7273,7 @@ std::vector<double> computeSkeletonHessian_RHF(
         const size_t num_braket = ((s0==s2)&&(s1==s3)) ? num_bra*(num_bra+1)/2 : num_bra*num_ket;
         const int num_blocks = (num_braket + threads_per_block - 1) / threads_per_block;
 
+        ::gansu::gpu::auditLaunchSize("Rys_compute_hessian_two_electron", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
         Rys_compute_hessian_two_electron<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
             d_hessian, d_density_matrix, d_primitive_shells, d_cgto_normalization_factors,
             ss0, ss1, ss2, ss3, num_braket, num_basis, num_atoms, d_boys_grid);
@@ -7196,12 +7286,15 @@ std::vector<double> computeSkeletonHessian_RHF(
             const int num_pairs = (s0==s1) ? (ss0.count*(ss0.count+1)/2) : (ss0.count*ss1.count);
             const int num_blocks = (num_pairs + threads_per_block - 1) / threads_per_block;
 
+            ::gansu::gpu::auditLaunchSize("compute_hessian_overlap", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
             compute_hessian_overlap<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
                 d_hessian, d_W_matrix, d_primitive_shells, d_cgto_normalization_factors,
                 num_basis, num_atoms, ss0, ss1, num_pairs);
+            ::gansu::gpu::auditLaunchSize("compute_hessian_kinetic", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
             compute_hessian_kinetic<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
                 d_hessian, d_density_matrix, d_primitive_shells, d_cgto_normalization_factors,
                 num_basis, num_atoms, ss0, ss1, num_pairs);
+            ::gansu::gpu::auditLaunchSize("compute_hessian_nuclear_attraction", ::gansu::gpu::launchExtent(num_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
             compute_hessian_nuclear_attraction<<<num_blocks, threads_per_block, 0, streams[stream_id++]>>>(
                 d_hessian, d_density_matrix, d_primitive_shells, d_cgto_normalization_factors,
                 d_atoms, num_basis, num_atoms, ss0, ss1, num_pairs, d_boys_grid);
@@ -7211,6 +7304,7 @@ std::vector<double> computeSkeletonHessian_RHF(
     // --- Nuclear repulsion Hessian ---
     const int num_pairs = num_atoms * (num_atoms + 1) / 2;
     const int NR_blocks = (num_pairs + threads_per_block - 1) / threads_per_block;
+    ::gansu::gpu::auditLaunchSize("compute_hessian_nuclear_repulsion", ::gansu::gpu::launchExtent(NR_blocks) * ::gansu::gpu::launchExtent(threads_per_block));
     compute_hessian_nuclear_repulsion<<<NR_blocks, threads_per_block, 0, streams[stream_id]>>>(
         d_hessian, d_atoms, num_atoms);
 

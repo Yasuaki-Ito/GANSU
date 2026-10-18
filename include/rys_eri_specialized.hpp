@@ -112,7 +112,7 @@ void RysERI_T(
     const double* g_boys_grid,
     const size_t head_bra, const size_t head_ket)
 {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_threads) return;
 
     // Compile-time constants

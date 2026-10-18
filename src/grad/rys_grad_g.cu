@@ -100,7 +100,7 @@ void Rys_compute_gradients_two_electron(
     const int num_basis,
     const double* g_boys_grid)
 {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_threads) return;
 
     // --- Thread → shell quartet mapping (same as grad_g.cu) ---
@@ -349,7 +349,7 @@ void Rys_compute_gradients_two_electron_2pdm(
     const double* g_gamma_4idx)   // nao^4 symmetrized 2-PDM correction
 {
     // Identical to Rys_compute_gradients_two_electron except density_w includes Gamma
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_threads) return;
 
     size_t ket_size;
@@ -581,7 +581,7 @@ void Rys_compute_gradients_two_electron_uhf(
     // Exchange: Da and Db separately
     // density_w = 0.5*Dt_ab*Dt_cd - 0.25*(Da_ac*Da_bd + Da_ad*Da_bc + Db_ac*Db_bd + Db_ad*Db_bc)
 
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_threads) return;
 
     size_t ket_size;

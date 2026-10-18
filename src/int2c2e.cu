@@ -21,7 +21,7 @@ namespace gansu::gpu{
 
 /* (s|s) */
 __global__ void calc_ss_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		const size_t2 ab = index1to2(idx, true);
@@ -51,7 +51,7 @@ __global__ void calc_ss_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 
 /* (s|p) */
 __global__ void calc_sp_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		size_t2 ab = index1to2(idx, false, shell_s1.count);
@@ -80,7 +80,7 @@ __global__ void calc_sp_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 
 /* (s|d) */
 __global__ void calc_sd_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		size_t2 ab = index1to2(idx, false, shell_s1.count);
@@ -110,7 +110,7 @@ __global__ void calc_sd_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 
 /* (s|f) */
 __global__ void calc_sf_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		size_t2 ab = index1to2(idx, false, shell_s1.count);
@@ -138,7 +138,7 @@ __global__ void calc_sf_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 
 /* (p|p) */
 __global__ void calc_pp_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		const size_t2 ab = index1to2(idx, true);
@@ -167,7 +167,7 @@ __global__ void calc_pp_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 
 /* (p|d) */
 __global__ void calc_pd_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		size_t2 ab = index1to2(idx, false, shell_s1.count);
@@ -197,7 +197,7 @@ __global__ void calc_pd_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 
 /* (p|f) */
 __global__ void calc_pf_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		size_t2 ab = index1to2(idx, false, shell_s1.count);
@@ -227,7 +227,7 @@ __global__ void calc_pf_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 
 /* (d|d) */
 __global__ void calc_dd_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		const size_t2 ab = index1to2(idx, true);
@@ -257,7 +257,7 @@ __global__ void calc_dd_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 
 /* (d|f) */
 __global__ void calc_df_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		size_t2 ab = index1to2(idx, false, shell_s1.count);
@@ -285,7 +285,7 @@ __global__ void calc_df_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 
 /* (f|f) */
 __global__ void calc_ff_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		const size_t2 ab = index1to2(idx, true);
@@ -319,7 +319,7 @@ __global__ void calc_ff_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 #if defined(COMPUTE_G_AUX)
 /* (s|g) */
 __global__ void calc_sg_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		size_t2 ab = index1to2(idx, false, shell_s1.count);
@@ -346,7 +346,7 @@ __global__ void calc_sg_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 
 /* (p|g) */
 __global__ void calc_pg_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		size_t2 ab = index1to2(idx, false, shell_s1.count);
@@ -373,7 +373,7 @@ __global__ void calc_pg_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 
 /* (d|g) */
 __global__ void calc_dg_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		size_t2 ab = index1to2(idx, false, shell_s1.count);
@@ -400,7 +400,7 @@ __global__ void calc_dg_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 
 /* (f|g) */
 __global__ void calc_fg_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		size_t2 ab = index1to2(idx, false, shell_s1.count);
@@ -429,7 +429,7 @@ __global__ void calc_fg_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux
 
 /* (g|g) */
 __global__ void calc_gg_gpu(real_t* g_result, const PrimitiveShell* g_pshell_aux, const real_t* d_auxiliary_cgto_normalization_factors, ShellTypeInfo shell_s0, ShellTypeInfo shell_s1, int num_shell_pairs, const double* g_upper_bound_factors, const double schwarz_screening_threshold, int num_auxiliary_basis, const double* g_boys_grid) {
-	uint64_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+	uint64_t idx = (size_t)blockIdx.x*blockDim.x + threadIdx.x;
 
 	if(idx < num_shell_pairs){
 		const size_t2 ab = index1to2(idx, true);
@@ -475,7 +475,7 @@ __global__ void MD_int2c2e_1T1SP(real_t* g_result, const PrimitiveShell* g_pshel
 								 const double* g_boys_grid){
 {
     // 通し番号indexの計算
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
 
 
     if (id >= num_shell_pairs) return;

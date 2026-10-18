@@ -1,3 +1,4 @@
+#include "launch_audit.hpp"
 /*
  * GANSU: GPU Accelerated Numerical Simulation Utility
  *
@@ -299,7 +300,7 @@ __global__ void pack_K_dev_kernel(real_t* __restrict__ dst,        // H + off_K_
                                   const real_t* __restrict__ d_K,  // 3·n³ (s,a,b,d)
                                   int n, int mn) {
     const size_t total = static_cast<size_t>(3) * n * n * n;
-    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x) {
         const int d = static_cast<int>(idx % n);
         size_t r = idx / n;
@@ -316,7 +317,7 @@ __global__ void pack_M_dev_kernel(real_t* __restrict__ dst,        // H + off_M_
                                   const real_t* __restrict__ d_M,  // 9·nocc·n (slot,l,a)
                                   int n, int nocc, int mn) {
     const size_t total = static_cast<size_t>(9) * nocc * n;
-    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x) {
         const int a = static_cast<int>(idx % n);
         size_t r = idx / n;
@@ -335,7 +336,7 @@ __global__ void pack_Tpart_dev_kernel(real_t* __restrict__ dst,    // H + off_T_
                                       int n, int mn) {
     // element (slot, c, d); transpose [c,d] → [d,c]
     const size_t total = static_cast<size_t>(9) * n * n;
-    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x) {
         const int d = static_cast<int>(idx % n);
         size_t r = idx / n;
@@ -359,7 +360,7 @@ __global__ void pack_Text_dev_kernel(real_t* __restrict__ dst,     // H + off_T_
     const size_t total = static_cast<size_t>(3) * nocc * n * n;
     const size_t mn2    = static_cast<size_t>(mn) * mn;
     const size_t no_mn2 = static_cast<size_t>(nocc) * mn2;
-    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x) {
         const int bb = static_cast<int>(idx % n);   // the 'b' index
         size_t r = idx / n;
@@ -766,6 +767,7 @@ real_t TripleTGpu::flush_batch() {
         dim3 grid(gn, gn, 6 * N);
         dim3 block(gn);
         const size_t shmem_bytes = sizeof(real_t) * (gn + nocc_);
+        ::gansu::gpu::auditLaunchSize("build_w_batched_kernel", ::gansu::gpu::launchExtent(grid) * ::gansu::gpu::launchExtent(block));
         build_w_batched_kernel<<<grid, block, shmem_bytes, stream>>>(
             d_W_, d_input_, d_n_tno_,
             per_triple_words_, off_K_, off_M_, off_T_part_, off_T_ext_,
@@ -776,6 +778,7 @@ real_t TripleTGpu::flush_batch() {
     {
         dim3 grid(gn, gn, 6 * N);
         dim3 block(gn);
+        ::gansu::gpu::auditLaunchSize("apply_r3_batched_kernel", ::gansu::gpu::launchExtent(grid) * ::gansu::gpu::launchExtent(block));
         apply_r3_batched_kernel<<<grid, block, 0, stream>>>(
             d_W_, d_R3W_, d_n_tno_, mn);
     }
@@ -784,6 +787,7 @@ real_t TripleTGpu::flush_batch() {
     {
         dim3 grid(gn, gn, N);
         dim3 block(gn);
+        ::gansu::gpu::auditLaunchSize("build_d_inv_batched_kernel", ::gansu::gpu::launchExtent(grid) * ::gansu::gpu::launchExtent(block));
         build_d_inv_batched_kernel<<<grid, block, 0, stream>>>(
             d_D_inv_, d_input_, d_eps_sum_, d_n_tno_, d_d3_factor_,
             per_triple_words_, off_eps_, mn);
@@ -794,6 +798,7 @@ real_t TripleTGpu::flush_batch() {
         const int threads = 256;
         dim3 grid(6, 6, N);
         size_t shmem_bytes = sizeof(real_t) * threads;
+        ::gansu::gpu::auditLaunchSize("contract36_batched_kernel", ::gansu::gpu::launchExtent(grid) * ::gansu::gpu::launchExtent(threads));
         contract36_batched_kernel<<<grid, threads, shmem_bytes, stream>>>(
             d_W_, d_R3W_, d_D_inv_, d_partial_, d_n_tno_, mn);
     }

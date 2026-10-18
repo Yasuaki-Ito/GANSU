@@ -50,6 +50,12 @@ namespace gansu {
  * @param n_emb_occ  Occupied cluster orbitals (virtuals = n_emb - n_emb_occ)
  * @param verbose    >0 prints the decisions and the reason for each
  */
-void dmet_apply_memory_policy(int n_emb, int n_emb_occ, int verbose = 1);
+/// @param allow_cluster_gpu  false for periodic (Gamma-PBC) runs: the PBC RI
+///        cluster ERI (buildSrFit / ClusterB) reads the SCF device's Boys grid and
+///        cached lattice contexts, so moving the cluster solve to another GPU
+///        before that build faults (pob-DZVP@2x2x1, 2026-09-08: illegal address in
+///        GammaSR3cFoldEnv). RI_BLOCK already removes the n_emb^4 tensor there.
+void dmet_apply_memory_policy(int n_emb, int n_emb_occ, int verbose = 1,
+                              bool allow_cluster_gpu = true);
 
 } // namespace gansu

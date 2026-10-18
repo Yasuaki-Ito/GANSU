@@ -49,11 +49,49 @@
 #include "ip_eom_ccsd_operator.hpp"
 #include "ip_eom_result.hpp"
 #include "eom_chain_context.hpp"   // DMET-STEOM: standalone cluster electronic state
+#include "steom_cluster_ground_cache.hpp"
 #include "davidson_solver.hpp"
 #include "device_host_memory.hpp"
 #include "gpu_manager.hpp"
 #include "profiler.hpp"
 #include "utils.hpp"
+
+// (2026-09-09 pob-DZVP@2x2x1) The IP operator's own T2 copy is NO²NV² (20 GiB at
+// nocc=156/nvir=332) and sits next to the host-parked cluster-ground cache holding
+// the same numbers. Park it on the host as well (managed, preferred location CPU,
+// GPU direct access): the build kernels stream it a few times (~1 s each over
+// the interconnect), and the operator frees it through tracked_cudaFree as before.
+// Env GANSU_IP_T2_UVM: 1 = always, 0 = never, unset = auto when the copy exceeds
+// 12 GB. Math-inert (same bytes).
+static void ip_alloc_t2(gansu::real_t** d_t2, size_t t2n) {
+    using gansu::real_t;
+    const size_t bytes = t2n * sizeof(real_t);
+    bool uvm = false;
+    if (const char* e = std::getenv("GANSU_IP_T2_UVM")) uvm = (e[0] == '1');
+    else uvm = bytes > (size_t)12e9;
+    if (!uvm) { gansu::tracked_cudaMalloc(d_t2, bytes); return; }
+    gansu::tracked_cudaMallocManagedHost(d_t2, bytes);
+    int dev = 0; cudaGetDevice(&dev);
+    cudaMemLocation loc_host{}; loc_host.type = cudaMemLocationTypeHost;   loc_host.id = 0;
+    cudaMemLocation loc_dev{};  loc_dev.type  = cudaMemLocationTypeDevice; loc_dev.id  = dev;
+    cudaMemAdvise(*d_t2, bytes, cudaMemAdviseSetPreferredLocation, loc_host);
+    cudaMemAdvise(*d_t2, bytes, cudaMemAdviseSetAccessedBy, loc_dev);
+    std::cout << "  [IP-EOM] operator T2 copy parked on HOST (managed, preferred location CPU, "
+                 "GPU direct access; " << bytes / 1e9 << " GB off device " << dev
+              << ", env GANSU_IP_T2_UVM)" << std::endl;
+}
+// Evict a managed T2 copy to the host AFTER it has been filled (the filling
+// cudaMemcpy leaves the pages device-resident whatever the advice says). No-op
+// for a plain device allocation.
+static void ip_park_t2_after_copy(gansu::real_t* d_t2, size_t t2n) {
+    if (!d_t2) return;
+    cudaPointerAttributes attr{};
+    if (cudaPointerGetAttributes(&attr, d_t2) != cudaSuccess) { cudaGetLastError(); return; }
+    if (attr.type != cudaMemoryTypeManaged) return;
+    cudaMemLocation loc_host{}; loc_host.type = cudaMemLocationTypeHost; loc_host.id = 0;
+    cudaMemPrefetchAsync(d_t2, t2n * sizeof(gansu::real_t), loc_host, /*flags=*/0, /*stream=*/0);
+    cudaDeviceSynchronize();
+}
 
 namespace gansu {
 
@@ -183,22 +221,43 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
         const size_t t1n = (size_t)nocc_active * nvir;
         const size_t t2n = (size_t)nocc_active * nocc_active * nvir * nvir;
         tracked_cudaMalloc(&d_t1, t1n * sizeof(real_t));
-        tracked_cudaMalloc(&d_t2, t2n * sizeof(real_t));
+        ip_alloc_t2(&d_t2, t2n);
         cudaMemcpy(d_t1, bt.T1.data(), t1n * sizeof(real_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_t2, bt.T2.data(), t2n * sizeof(real_t), cudaMemcpyHostToDevice);
+        ip_park_t2_after_copy(d_t2, t2n);
         E_CCSD = (ctx && ctx->dlpno_bt) ? ctx->dlpno_E
                                         : rhf.get_post_hf_energy();  // DLPNO-CCSD energy (set by stage 1)
         if (ctx) ctx->post_hf_energy = E_CCSD;
         std::cout << "  Using DLPNO back-transformed canonical T1/T2 (hybrid bt-PNO-STEOM P5b)." << std::endl;
+        // (2026-09-07) Make the bt-PNO ground checkpointable and resume-deterministic.
+        // The DLPNO ground is recomputed on every checkpoint resume (ckpt had cc=n) and
+        // is not bit-reproducible under the multi-GPU fan-out (E_corr moves ~4e-7 Ha
+        // run to run), so every STEOM re-solve saw slightly different T2. If an earlier
+        // stage or a loaded checkpoint cached the cluster amplitudes, use THAT copy;
+        // otherwise cache this stage's so the after-IP/EA checkpoint carries them.
+        if (ctx && ctx->cc_ground_cached && ctx->cc_t1n == t1n && ctx->cc_t2n == t2n) {
+            cudaMemcpy(d_t1, ctx->cc_t1, t1n * sizeof(real_t), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(d_t2, ctx->cc_t2, t2n * sizeof(real_t), cudaMemcpyDeviceToDevice);
+            ip_park_t2_after_copy(d_t2, t2n);
+            E_CCSD = ctx->cc_E; ctx->post_hf_energy = E_CCSD;
+            std::cout << "  bt-PNO T1/T2 overridden by the cached/checkpointed cluster ground "
+                         "(resume-deterministic): E_corr " << std::fixed << std::setprecision(10)
+                      << E_CCSD << " Ha" << std::endl;
+        } else if (ctx && !std::getenv("GANSU_STEOM_NO_CCSD_CACHE")) {
+            // Cache on HOST-parked managed memory (GPU direct access): a device copy
+            // (+8.6 GB at MgO 374) tipped the IP operator build into OOM (p7a).
+            steom_cache_cluster_ground_host(ctx, d_t1, d_t2, t1n, t2n, E_CCSD);
+        }
     } else if (ctx && ctx->cc_ground_cached) {
         // (solve-once) reuse the cluster CCSD ground cached by an earlier stage —
         // IP/EA/STEOM share one cluster ⇒ identical T1/T2. Skips the re-solve.
         const size_t t1n = (size_t)nocc_active*nvir;
         const size_t t2n = (size_t)nocc_active*nocc_active*(size_t)nvir*nvir;
         tracked_cudaMalloc(&d_t1, t1n*sizeof(real_t));
-        tracked_cudaMalloc(&d_t2, t2n*sizeof(real_t));
+        ip_alloc_t2(&d_t2, t2n);
         cudaMemcpy(d_t1, ctx->cc_t1, t1n*sizeof(real_t), cudaMemcpyDeviceToDevice);
         cudaMemcpy(d_t2, ctx->cc_t2, t2n*sizeof(real_t), cudaMemcpyDeviceToDevice);
+        ip_park_t2_after_copy(d_t2, t2n);
         E_CCSD = ctx->cc_E;
         ctx->post_hf_energy = E_CCSD;
         std::cout << "  CCSD ground reused from cache (solve-once): " << std::fixed
@@ -224,14 +283,12 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
         if (ctx) ctx->post_hf_energy = E_CCSD;
         else     rhf.set_post_hf_energy(E_CCSD);
         // (solve-once) cache the cluster ground for the later EA/STEOM stages.
+        // (2026-09-19) HOST-parked, like the bt-PNO branch above: the device copy
+        // (o^2 v^2 = 8.3 GB at nocc 238) sat on the home GPU through the IP build.
         if (ctx && !std::getenv("GANSU_STEOM_NO_CCSD_CACHE")) {
             const size_t t1n = (size_t)nocc_active*nvir;
             const size_t t2n = (size_t)nocc_active*nocc_active*(size_t)nvir*nvir;
-            tracked_cudaMalloc(&ctx->cc_t1, t1n*sizeof(real_t));
-            tracked_cudaMalloc(&ctx->cc_t2, t2n*sizeof(real_t));
-            cudaMemcpy(ctx->cc_t1, d_t1, t1n*sizeof(real_t), cudaMemcpyDeviceToDevice);
-            cudaMemcpy(ctx->cc_t2, d_t2, t2n*sizeof(real_t), cudaMemcpyDeviceToDevice);
-            ctx->cc_t1n=t1n; ctx->cc_t2n=t2n; ctx->cc_E=E_CCSD; ctx->cc_ground_cached=true;
+            steom_cache_cluster_ground_host(ctx, d_t1, d_t2, t1n, t2n, E_CCSD);
         }
     }
 
@@ -446,6 +503,21 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
     config.num_eigenvalues       = n_roots_to_compute;
     config.convergence_threshold = rhf.get_ip_eom_d_tol();
     config.max_subspace_size     = std::min(total_dim, std::max(80, 20 * n_roots_to_compute));
+    // (2026-08-28) IP Davidson device footprint = dim x max_subspace x 2 vectors.
+    // On the MgO 2x2x2 cluster (dim = nocc + nocc^2*nvir = 4.64e6, ~76 roots ->
+    // subspace 1520) that is 119 GB, more than an H200 has free next to the
+    // resident cluster tensors, and the solve refuses (RFC 92.2/93.3 — adding
+    // GPUs does not help; the resident set sits on the Davidson device either
+    // way).  GANSU_EOM_MAX_SUB_PER_ROOT=<m> caps the subspace at m*nroots
+    // (floor 4*nroots; more restarts, same converged roots), mirroring the EA
+    // path which has had this knob since 2026-07-09.  Unset = legacy sizing
+    // (bit-identical).  Predicted cost at this cluster: m=8 -> 51 GB, m=6 -> 40 GB.
+    if (const char* e = std::getenv("GANSU_EOM_MAX_SUB_PER_ROOT")) {
+        const int m = std::atoi(e);
+        if (m >= 4)
+            config.max_subspace_size = std::min(total_dim,
+                std::max(4 * n_roots_to_compute, m * n_roots_to_compute));
+    }
     config.max_iterations        = rhf.get_ip_eom_max_iter();
     config.use_preconditioner    = true;
     config.symmetric             = false;   // bar-H is non-Hermitian (STEOM.md §14.1)
@@ -554,7 +626,10 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
         LinearOperator& dop = *dlpno_op;
 
         DavidsonConfig pcfg = config;
-        pcfg.max_subspace_size = std::min(dop.dimension(), std::max(80, 20 * n_roots_to_compute));
+        // NB: this used to re-derive the hardcoded 20*nroots, which would undo
+        // the cap applied to `config` above (RFC 92.3).  Carry the (possibly
+        // capped) value over and only clamp it to this operator's dimension.
+        pcfg.max_subspace_size = std::min(dop.dimension(), config.max_subspace_size);
         DavidsonSolver solver(dop, pcfg);
         converged = solver.solve();
         eigenvalues = solver.get_eigenvalues();
@@ -681,8 +756,19 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
             const auto& pr = result.per_active[m];
             os << "  " << std::setw(2) << m;
             if (pr.canonical_occ_label < 0) {
-                os << "   (no Davidson root passed %singles ≥ " << std::setprecision(3) << ip_thresh
-                   << " — try lowering ip_eom_ip_thresh or raising ip_eom_safety_margin)\n";
+                if (m < (int)decision.unassigned_by_floor.size()
+                    && decision.unassigned_by_floor[m]) {
+                    os << "   (UNASSIGNED: best FollowCIS overlap "
+                       << std::scientific << std::setprecision(2)
+                       << decision.best_below_floor << " < floor "
+                       << decision.overlap_floor << std::fixed
+                       << " — no IP root corresponds to this NTO, so its Ŝ^IP "
+                          "contribution is zero. Raise ip_eom_safety_margin to "
+                          "compute more roots)\n";
+                } else {
+                    os << "   (no Davidson root passed %singles ≥ " << std::setprecision(3) << ip_thresh
+                       << " — try lowering ip_eom_ip_thresh or raising ip_eom_safety_margin)\n";
+                }
             } else {
                 os << "   " << std::setw(12) << std::setprecision(8) << std::fixed << pr.omega
                    << "   " << std::setw(10) << std::setprecision(4) << (pr.omega * 27.2114)
@@ -690,6 +776,16 @@ static void compute_ip_eom_ccsd_impl(RHF& rhf,
                    << "   " << std::setw(7) << std::setprecision(4) << pr.followcis_overlap
                    << "    "  << decision.assigned_root_for_m[m] << "\n";
             }
+        }
+        if (decision.n_below_floor > 0) {
+            os << "  ⚠ [IP routing] " << decision.n_below_floor << " of "
+               << cis_nto.n_act_occ << " active NTO(s) left UNASSIGNED: no Davidson "
+                  "root reached the FollowCIS overlap floor ("
+               << std::scientific << std::setprecision(1) << decision.overlap_floor
+               << std::fixed << "). Their Ŝ^IP contribution is zero. Before this "
+                  "floor existed a ~0-overlap root was assigned anyway, and WHICH "
+                  "one won was decided by rounding noise — worth 20.7 meV on the "
+                  "excitation energies (RFC 86.3b).\n";
         }
         if (!result.auxiliary.empty()) {
             os << "  Auxiliary IP roots (Davidson found, not routed to an active NTO):\n"

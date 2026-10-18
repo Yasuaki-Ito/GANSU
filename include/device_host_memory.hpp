@@ -32,10 +32,15 @@
 #include <map>
 #include <stdexcept>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <iomanip>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
+#ifdef __linux__
+#include <execinfo.h>  // backtrace on the OOM fatal path
+#endif
 #include <vector>
 
 #include "utils.hpp" // THROW_EXCEPTION
@@ -973,6 +978,16 @@ protected:
  */
 inline std::unordered_map<void*, std::pair<size_t, int>> g_allocated_memory_map;
 inline std::mutex g_allocated_memory_map_mutex;
+// Pointers in g_allocated_memory_map that came from tracked_cudaMallocManaged
+// (UVM). Diagnostic only: lets dump_tracked_allocations label them "UVM" --
+// a host-parked managed buffer is NOT device-resident, and the p8b autopsy
+// (2026-09-08) mis-read 84 GiB of parked constants as raw device memory.
+inline std::unordered_set<void*> g_managed_ptr_set;
+// Allocation call site (file, line) per live pointer, filled by the *_at
+// wrappers the cudaMalloc / tracked_cudaMalloc macros expand to (end of this
+// header). Diagnostic only: the OOM dump names each buffer's origin so an
+// autopsy no longer has to infer buffers from their byte sizes.
+inline std::unordered_map<void*, std::pair<const char*, int>> g_alloc_site;
 
 /**
  * @brief Diagnostic dump of the live tracked device allocations (measure-first).
@@ -1004,27 +1019,33 @@ inline void dump_tracked_allocations(const char* label, int top_k = 25) {
     // Snapshot both registries under their locks, then format without holding.
     // Each entry: (size, device, is_cmm). "raw" = tracked_cudaMalloc path,
     // "CMM" = DeviceHostMemory/Matrix (e.g. the RI B tensor).
-    struct Alloc { size_t size; int dev; bool cmm; };
+    struct Alloc { size_t size; int dev; bool cmm; bool uvm; const char* file; int line; };
     std::vector<Alloc> allocs;
-    size_t raw_n = 0, cmm_n = 0;
+    size_t raw_n = 0, cmm_n = 0, uvm_n = 0;
     {
         std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
         raw_n = g_allocated_memory_map.size();
         allocs.reserve(raw_n);
-        for (const auto& kv : g_allocated_memory_map)
-            allocs.push_back({kv.second.first, kv.second.second, false});
+        for (const auto& kv : g_allocated_memory_map) {
+            const bool uvm = g_managed_ptr_set.count(kv.first) > 0;
+            uvm_n += uvm ? 1 : 0;
+            const char* f = nullptr; int ln = 0;
+            auto st = g_alloc_site.find(kv.first);
+            if (st != g_alloc_site.end()) { f = st->second.first; ln = st->second.second; }
+            allocs.push_back({kv.second.first, kv.second.second, false, uvm, f, ln});
+        }
     }
     {
         std::lock_guard<std::mutex> lock(g_cmm_allocated_memory_map_mutex);
         cmm_n = g_cmm_allocated_memory_map.size();
         allocs.reserve(allocs.size() + cmm_n);
         for (const auto& kv : g_cmm_allocated_memory_map)
-            allocs.push_back({kv.second.first, kv.second.second, true});
+            allocs.push_back({kv.second.first, kv.second.second, true, false, nullptr, 0});
     }
 
     std::cout << "\n=== [tracked-mem dump] " << label << " ===" << std::endl;
     std::cout << "  live allocations: " << allocs.size()
-              << " (raw=" << raw_n << ", CMM=" << cmm_n << ")"
+              << " (raw=" << raw_n - uvm_n << ", UVM=" << uvm_n << ", CMM=" << cmm_n << ")"
               << "   global current: "
               << fmt(GlobalGpuMemoryTracker::get_current()) << std::endl;
     const auto per_dev = GlobalGpuMemoryTracker::get_per_device_snapshot();
@@ -1042,10 +1063,17 @@ inline void dump_tracked_allocations(const char* label, int top_k = 25) {
               [](const Alloc& a, const Alloc& b) { return a.size > b.size; });
     const int klist = std::min<int>(top_k, static_cast<int>(allocs.size()));
     std::cout << "  largest " << klist << " allocations:" << std::endl;
-    for (int i = 0; i < klist; ++i)
+    for (int i = 0; i < klist; ++i) {
         std::cout << "    [" << std::setw(2) << i << "] " << std::setw(10)
                   << fmt(allocs[i].size) << "  (GPU " << allocs[i].dev << ", "
-                  << (allocs[i].cmm ? "CMM" : "raw") << ")" << std::endl;
+                  << (allocs[i].cmm ? "CMM" : (allocs[i].uvm ? "UVM" : "raw")) << ")";
+        if (allocs[i].file) {
+            const char* base = allocs[i].file;
+            for (const char* q = allocs[i].file; *q; ++q) if (*q == '/' || *q == '\\') base = q + 1;
+            std::cout << "  " << base << ":" << allocs[i].line;
+        }
+        std::cout << std::endl;
+    }
 
     // Group by identical byte-size to expose replicated buffers. Only sizes that
     // appear more than once OR are ≥ 256 MB are reported (keeps it short).
@@ -1128,9 +1156,61 @@ inline cudaError_t tracked_cudaMalloc(T** ptr, size_t size) {
             << "  Attempted to allocate: " << CudaMemoryManager<T>::format_bytes(size) << "\n"
             << "  Current allocated (global): " << CudaMemoryManager<T>::format_bytes(current_mem) << "\n"
             << "  Total would be:             " << CudaMemoryManager<T>::format_bytes(current_mem + size);
+#ifdef __linux__
+        // (OOM diagnostic) name the CALLER: the n_emb=339 cluster-STEOM OOM
+        // (RFC 81.4) came from a frame with no profiler scope, so the dump
+        // above could not attribute the failing allocation. backtrace_symbols
+        // gives mangled names + offsets — enough to pin the source line with
+        // addr2line. Fatal path only; zero cost on success.
+        {
+            void* frames[32];
+            const int nf = backtrace(frames, 32);
+            char** syms = backtrace_symbols(frames, nf);
+            if (syms) {
+                oss << "\n  Backtrace (" << nf << " frames):";
+                for (int i = 0; i < nf; ++i) oss << "\n    " << syms[i];
+                free(syms);
+            }
+        }
+#endif
         throw std::runtime_error(oss.str());
     }
 
+    return err;
+}
+
+/**
+ * @brief tracked_cudaMalloc variant backed by MANAGED (UVM) memory.
+ *
+ * Same tracking/bookkeeping as tracked_cudaMalloc, so tracked_cudaFree works
+ * unchanged on the returned pointer. Managed memory may be OVERSUBSCRIBED:
+ * the driver pages it to host when device memory is needed elsewhere. Used
+ * for the periodic cluster MO-ERI tensor (RFC 81.5): it is read in a setup
+ * sweep per STEOM stage and idle during the iterations, exactly the access
+ * pattern UVM eviction handles — the CCSD working pool (~n_emb^4-scale at
+ * occ-heavy DMET clusters) then no longer has to COEXIST with it on device.
+ */
+template <typename T = void>
+inline cudaError_t tracked_cudaMallocManaged(T** ptr, size_t size) {
+    cudaError_t err = cudaMallocManaged(reinterpret_cast<void**>(ptr), size);
+    if (err == cudaSuccess) {
+        cudaMemset(*ptr, 0, size);
+        int dev = -1;
+        cudaGetDevice(&dev);
+        {
+            std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
+            g_allocated_memory_map[*ptr] = {size, dev};
+            g_managed_ptr_set.insert(*ptr);
+        }
+        CudaMemoryManager<T>::track_allocation(size, dev);
+    } else {
+        dump_tracked_allocations("OOM failure (tracked_cudaMallocManaged)");
+        std::ostringstream oss;
+        oss << "tracked_cudaMallocManaged failed: " << cudaGetErrorString(err)
+            << "\n  Attempted to allocate: "
+            << CudaMemoryManager<T>::format_bytes(size);
+        throw std::runtime_error(oss.str());
+    }
     return err;
 }
 
@@ -1158,6 +1238,8 @@ inline cudaError_t tracked_cudaFree(void* ptr) {
             size = it->second.first;
             dev  = it->second.second;
             g_allocated_memory_map.erase(it);
+            g_managed_ptr_set.erase(ptr);
+            g_alloc_site.erase(ptr);
         }
     }
 
@@ -1243,6 +1325,8 @@ inline cudaError_t tracked_cudaFreeAsync(void* ptr, cudaStream_t stream) {
             size = it->second.first;
             dev  = it->second.second;
             g_allocated_memory_map.erase(it);
+            g_managed_ptr_set.erase(ptr);
+            g_alloc_site.erase(ptr);
         }
     }
 
@@ -1260,6 +1344,74 @@ inline cudaError_t tracked_cudaFreeAsync(void* ptr, cudaStream_t stream) {
 }
 
 
+/**
+ * @brief Managed allocation whose pages are first-touched on the HOST.
+ *
+ * (2026-09-09) tracked_cudaMallocManaged zero-fills with a DEVICE cudaMemset, which
+ * places every page on the current GPU. On this driver (H200, CUDA 13) pages that
+ * have once been device-resident are NOT returned to the device free pool by a
+ * later cudaMemPrefetchAsync(host) (measured: 20 GB managed, memset -> advise ->
+ * H2D copy -> prefetch(host) -> free unchanged; all APIs "no error"). So every
+ * "host-parked" buffer in the code base was actually device-resident. This
+ * variant zero-fills with std::memset on the host instead: the pages are
+ * created on the host and, with cudaMemAdviseSetPreferredLocation(host) set
+ * before any device access, stay there while GPU kernels read them over the
+ * interconnect. Use it for every buffer that is meant to live on the host.
+ */
+template<typename T>
+inline cudaError_t tracked_cudaMallocManagedHost(T** ptr, size_t size) {
+    cudaError_t err = cudaMallocManaged(reinterpret_cast<void**>(ptr), size);
+    if (err == cudaSuccess) {
+        std::memset(static_cast<void*>(*ptr), 0, size);   // host first-touch (NOT cudaMemset)
+        int dev = -1;
+        cudaGetDevice(&dev);
+        {
+            std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
+            g_allocated_memory_map[*ptr] = {size, dev};
+            g_managed_ptr_set.insert(*ptr);
+        }
+        CudaMemoryManager<T>::track_allocation(size, dev);
+    } else {
+        dump_tracked_allocations("OOM failure (tracked_cudaMallocManagedHost)");
+        std::ostringstream oss;
+        oss << "tracked_cudaMallocManagedHost failed: " << cudaGetErrorString(err)
+            << "\n  Attempted to allocate: " << CudaMemoryManager<T>::format_bytes(size);
+        throw std::runtime_error(oss.str());
+    }
+    return err;
+}
+
+// Call-site recording wrappers (see g_alloc_site). Same allocation path as the
+// plain functions; on success the (file, line) of the caller is remembered for
+// dump_tracked_allocations. The macros at the end of this header route every
+// cudaMalloc / tracked_cudaMalloc / tracked_cudaMallocManaged call here.
+template<typename T>
+inline cudaError_t tracked_cudaMalloc_at(T** ptr, size_t size, const char* file, int line) {
+    cudaError_t err = tracked_cudaMalloc(ptr, size);
+    if (err == cudaSuccess && ptr && *ptr) {
+        std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
+        g_alloc_site[reinterpret_cast<void*>(*ptr)] = {file, line};
+    }
+    return err;
+}
+template<typename T>
+inline cudaError_t tracked_cudaMallocManagedHost_at(T** ptr, size_t size, const char* file, int line) {
+    cudaError_t err = tracked_cudaMallocManagedHost(ptr, size);
+    if (err == cudaSuccess && ptr && *ptr) {
+        std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
+        g_alloc_site[reinterpret_cast<void*>(*ptr)] = {file, line};
+    }
+    return err;
+}
+template<typename T>
+inline cudaError_t tracked_cudaMallocManaged_at(T** ptr, size_t size, const char* file, int line) {
+    cudaError_t err = tracked_cudaMallocManaged(ptr, size);
+    if (err == cudaSuccess && ptr && *ptr) {
+        std::lock_guard<std::mutex> lock(g_allocated_memory_map_mutex);
+        g_alloc_site[reinterpret_cast<void*>(*ptr)] = {file, line};
+    }
+    return err;
+}
 
 } // namespace gansu
 
@@ -1271,5 +1423,18 @@ inline cudaError_t tracked_cudaFreeAsync(void* ptr, cudaStream_t stream) {
 // macros are purely textual and only match the exact tokens `cudaMalloc` /
 // `cudaFree` — cudaMallocHost, cudaMallocAsync, cudaFreeHost, cudaFreeAsync
 // are different identifiers and are unaffected.
-#define cudaMalloc gansu::tracked_cudaMalloc
+// Unqualified expansion: call sites may already be qualified
+// (gansu::tracked_cudaMalloc(...)), so the macro must not prepend a namespace.
+// These global using-declarations make the unqualified *_at names resolvable
+// from every namespace (incl. after a bare `using gansu::tracked_cudaMalloc;`).
+using gansu::tracked_cudaMalloc_at;
+using gansu::tracked_cudaMallocManaged_at;
+using gansu::tracked_cudaMallocManagedHost_at;
+#define cudaMalloc(p, s) tracked_cudaMalloc_at((p), (s), __FILE__, __LINE__)
+// Direct tracked_* calls get the call site too (function-like macros: a bare
+// `using gansu::tracked_cudaMalloc;` or an explicit template-argument call is
+// not expanded and still binds the plain function).
+#define tracked_cudaMalloc(p, s) tracked_cudaMalloc_at((p), (s), __FILE__, __LINE__)
+#define tracked_cudaMallocManaged(p, s) tracked_cudaMallocManaged_at((p), (s), __FILE__, __LINE__)
+#define tracked_cudaMallocManagedHost(p, s) tracked_cudaMallocManagedHost_at((p), (s), __FILE__, __LINE__)
 #define cudaFree gansu::tracked_cudaFree

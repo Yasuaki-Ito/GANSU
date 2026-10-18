@@ -198,7 +198,7 @@ static const std::vector<LebedevOrbit> LEBEDEV_302 = {
 // Bragg-Slater atomic radii (in Bohr).
 //
 // Indexed by atomic number Z (Z=1 -> [1]).  Source: Treutler & Ahlrichs
-// 1995, table 1, converted from Angstrom to Bohr (x 1.8897259886).  Beyond
+// 1995, table 1, converted from Angstrom to Bohr.  Beyond
 // Xe (Z=54) we fall back to the heaviest tabulated value.
 // -----------------------------------------------------------------------------
 
@@ -217,11 +217,10 @@ static double bragg_slater_radius_bohr(int z)
         1.80, 1.55, 1.45, 1.45, 1.35, 1.30, 1.35, 1.40, 1.60, 1.55, // Y-Cd
         1.55, 1.45, 1.45, 1.40, 1.40, 1.30                      // In-Xe
     };
-    constexpr double ang_to_bohr = 1.8897259886;
-    if (z < 1) return 0.5 * ang_to_bohr;
+    if (z < 1) return angstrom_to_bohr(0.5);
     const int z_max = static_cast<int>(sizeof(r_ang)/sizeof(r_ang[0])) - 1;
     if (z > z_max) z = z_max;
-    return r_ang[z] * ang_to_bohr;
+    return angstrom_to_bohr(r_ang[z]);
 }
 
 // -----------------------------------------------------------------------------
@@ -408,16 +407,21 @@ const std::vector<GridPoint>& get_lebedev_grid(LebedevOrder order)
 // -----------------------------------------------------------------------------
 
 MolecularGrid build_molecular_grid(const std::vector<Atom>& atoms,
-                                    const ThcGridOptions& options)
+                                    const ThcGridOptions& options,
+                                    std::size_t n_generate)
 {
     MolecularGrid grid;
-    grid.atom_ranges.reserve(atoms.size());
+    // Points are generated for the first n_gen atoms; the PARTITION below still
+    // runs over `atoms` in full, so the weights are unchanged (see the header).
+    const std::size_t n_gen =
+        (n_generate == 0) ? atoms.size() : std::min(n_generate, atoms.size());
+    grid.atom_ranges.reserve(n_gen);
 
     const auto& angular = get_lebedev_grid(options.lebedev);
 
     std::vector<real_t> r_radial, w_radial;
 
-    for (std::size_t a = 0; a < atoms.size(); ++a) {
+    for (std::size_t a = 0; a < n_gen; ++a) {
         const auto& atom = atoms[a];
         treutler_ahlrichs_m3(atom.atomic_number, options.n_radial, r_radial, w_radial);
 

@@ -15,6 +15,8 @@
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <fstream>
+#include <string>
 #include <cmath>
 #include <chrono>
 #include <cstdio>
@@ -409,7 +411,7 @@ std::vector<DMETFragment> DMET::auto_fragments_by_bonds(
               << " fragment(s) by X-H bond proximity (threshold "
               << bond_threshold_bohr << " Bohr ≈ "
               << std::fixed << std::setprecision(2)
-              << bond_threshold_bohr / 1.8897259886 << " Å)";
+              << bohr_to_angstrom(bond_threshold_bohr) << " Å)";
     if (orphan_h > 0)
         std::cout << ", " << orphan_h << " orphan H atom(s)";
     std::cout << std::defaultfloat << std::endl;
@@ -753,7 +755,8 @@ STEOMResult DMET::solve_fragment_steom(
         std::cout << "  [DMET-STEOM] full-system cluster (n_emb = nao = " << nao
                   << ") → plain reduction (" << rhf_.get_dmet_excited_method() << ")." << std::endl;
         // Pick the tensor layouts this size needs before anything reads them.
-        dmet_apply_memory_policy(nao, full_occ, rhf_.get_verbose());
+        dmet_apply_memory_policy(nao, full_occ, rhf_.get_verbose(),
+                                 /*allow_cluster_gpu=*/true);
         // Full RHF ε are physical (no level shift) → valid for ADC(2) directly.
         STEOMResult r;
         if (rhf_.get_dmet_excited_method() == "adc2") {
@@ -904,6 +907,92 @@ STEOMResult DMET::solve_fragment_steom(
     tracked_cudaMalloc(&d_C_can, nao * n_emb * sizeof(real_t));
     cudaMemcpy(d_C_can, h_C_can.data(), nao * n_emb * sizeof(real_t), cudaMemcpyHostToDevice);
 
+    // (2026-09-08) Checkpointed cluster basis. The STEOM checkpoint (GANSU_DMET_STEOM_CKPT)
+    // stores IP/EA vectors, bar-H and T1/T2 in THIS canonical cluster basis. On MgO the
+    // canonicalisation is not reproducible: near-degenerate eigenvalues of h_emb make
+    // the eigenvectors (and hence C_can) rotate between runs, so a resume silently mixed
+    // a rotated basis with the stored vectors and moved the STEOM roots by ~10 meV
+    // (p4h..p6c; fresh runs agree to 0.1 meV). Remedy: alongside the checkpoint keep
+    // "<ckpt>.basis" = {nao, n_emb, C_can, eps(shifted), eps_phys}. First run writes it;
+    // a resume restores it, after verifying it is a canonical basis of THIS run's
+    // Fock (C_oldᵀ F C_old diagonal to 1e-6 with the same eigenvalues) — a different
+    // fragment/threshold fails the check and is refused rather than mixed.
+    // GANSU_DMET_STEOM_CKPT_BASIS_IGNORE=1 skips the restore (diagnostics / A-B).
+    if (const char* ck = std::getenv("GANSU_DMET_STEOM_CKPT")) {
+        const std::string bpath = std::string(ck) + ".basis";
+        const bool ignore = [] { const char* e = std::getenv("GANSU_DMET_STEOM_CKPT_BASIS_IGNORE");
+                                 return e && e[0] == '1'; }();
+        std::vector<real_t> h_eps_now(n_emb);
+        cudaMemcpy(h_eps_now.data(), d_eigvals, n_emb * sizeof(real_t), cudaMemcpyDeviceToHost);
+        std::ifstream fin(bpath, std::ios::binary);
+        if (fin && !ignore) {
+            int nao_f = 0, n_f = 0;
+            fin.read(reinterpret_cast<char*>(&nao_f), sizeof(int));
+            fin.read(reinterpret_cast<char*>(&n_f), sizeof(int));
+            if (nao_f != nao || n_f != n_emb)
+                throw std::runtime_error("[DMET-STEOM ckpt] " + bpath + " has (nao,n_emb)=("
+                    + std::to_string(nao_f) + "," + std::to_string(n_f) + ") but this run has ("
+                    + std::to_string(nao) + "," + std::to_string(n_emb) + ") — refusing to resume.");
+            std::vector<real_t> C_old((size_t)nao * n_emb), eps_old(n_emb), eps_phys_old(n_emb);
+            fin.read(reinterpret_cast<char*>(C_old.data()), C_old.size() * sizeof(real_t));
+            fin.read(reinterpret_cast<char*>(eps_old.data()), (size_t)n_emb * sizeof(real_t));
+            fin.read(reinterpret_cast<char*>(eps_phys_old.data()), (size_t)n_emb * sizeof(real_t));
+            if (!fin) throw std::runtime_error("[DMET-STEOM ckpt] short read on " + bpath);
+            // Consistency: C_oldᵀ F C_old must be diagonal with eigenvalues eps_phys_old.
+            std::vector<real_t> FC((size_t)nao * n_emb, 0.0);
+            #pragma omp parallel for
+            for (int mu = 0; mu < nao; ++mu)
+                for (int q = 0; q < n_emb; ++q) {
+                    real_t v = 0.0;
+                    for (int nu = 0; nu < nao; ++nu) v += h_fock[(size_t)mu * nao + nu] * C_old[(size_t)nu * n_emb + q];
+                    FC[(size_t)mu * n_emb + q] = v;
+                }
+            double max_off = 0.0, max_diag_dev = 0.0, max_eps_dev = 0.0;
+            for (int p = 0; p < n_emb; ++p) {
+                for (int q = 0; q < n_emb; ++q) {
+                    double v = 0.0;
+                    for (int mu = 0; mu < nao; ++mu) v += C_old[(size_t)mu * n_emb + p] * FC[(size_t)mu * n_emb + q];
+                    if (p == q) max_diag_dev = std::max(max_diag_dev, std::fabs(v - eps_phys_old[p]));
+                    else        max_off      = std::max(max_off, std::fabs(v));
+                }
+                max_eps_dev = std::max(max_eps_dev, (double)std::fabs(eps_phys_old[p] - h_eps_phys[p]));
+            }
+            std::cout << "  [DMET-STEOM ckpt] cluster basis file " << bpath
+                      << ": Fock-consistency max|offdiag|=" << std::scientific << std::setprecision(2) << max_off
+                      << " max|diag-eps|=" << max_diag_dev << " max|eps_old-eps_now|=" << max_eps_dev
+                      << std::defaultfloat << std::endl;
+            if (max_off > 1e-6 || max_diag_dev > 1e-6 || max_eps_dev > 1e-5) {
+                const char* force = std::getenv("GANSU_DMET_STEOM_CKPT_BASIS_FORCE");
+                if (!(force && force[0] == '1'))
+                    throw std::runtime_error("[DMET-STEOM ckpt] stored cluster basis is not a canonical basis of "
+                        "this run's Fock (different fragment/threshold/geometry?) — refusing to resume. "
+                        "Delete the .basis/.ckpt files or set GANSU_DMET_STEOM_CKPT_BASIS_FORCE=1.");
+            }
+            h_C_can = C_old; h_eps_phys = eps_phys_old;
+            cudaMemcpy(d_C_can, h_C_can.data(), (size_t)nao * n_emb * sizeof(real_t), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_eigvals, eps_old.data(), (size_t)n_emb * sizeof(real_t), cudaMemcpyHostToDevice);
+            std::cout << "  [DMET-STEOM ckpt] cluster basis RESTORED from " << bpath
+                      << " (C_can + eps overwritten; the checkpointed IP/EA/bar-H/T are consistent with it)."
+                      << std::endl;
+        } else if (!fin) {
+            std::ofstream fout(bpath, std::ios::binary);
+            if (fout) {
+                fout.write(reinterpret_cast<const char*>(&nao), sizeof(int));
+                fout.write(reinterpret_cast<const char*>(&n_emb), sizeof(int));
+                fout.write(reinterpret_cast<const char*>(h_C_can.data()), h_C_can.size() * sizeof(real_t));
+                fout.write(reinterpret_cast<const char*>(h_eps_now.data()), (size_t)n_emb * sizeof(real_t));
+                fout.write(reinterpret_cast<const char*>(h_eps_phys.data()), (size_t)n_emb * sizeof(real_t));
+                std::cout << "  [DMET-STEOM ckpt] cluster basis saved to " << bpath
+                          << " (nao=" << nao << ", n_emb=" << n_emb << ")." << std::endl;
+            } else {
+                std::cout << "  [DMET-STEOM ckpt] WARN cannot write " << bpath << std::endl;
+            }
+        } else {
+            std::cout << "  [DMET-STEOM ckpt] cluster basis file present but IGNORED on request "
+                         "(GANSU_DMET_STEOM_CKPT_BASIS_IGNORE=1) — resume uses this run's basis." << std::endl;
+        }
+    }
+
     // 4. Cluster integrals + 5. cluster STEOM. With GANSU_DMET_STEOM_RI_BLOCK the
     //    chain pulls MO-ERI blocks on the fly from the cluster B (build_B_mo,
     //    naux·n_emb²) — the dense n_emb⁴ tensor (OOM for large fragments: the
@@ -912,7 +1001,8 @@ STEOMResult DMET::solve_fragment_steom(
     //    passing d_eri_mo == nullptr routes the whole chain through the cluster B.
     //    The policy below turns it (and the CCSD/EA layout family) on exactly when
     //    the direct layout would not fit, so a published command line needs no env.
-    dmet_apply_memory_policy(n_emb, n_emb_occ, rhf_.get_verbose());
+    dmet_apply_memory_policy(n_emb, n_emb_occ, rhf_.get_verbose(),
+                             /*allow_cluster_gpu=*/true);
     STEOMResult r;
     if (rhf_.get_dmet_excited_method() == "adc2") {
         // ADC(2) on the cluster. Uses the PHYSICAL (un-shifted) ε. With an RI
@@ -931,9 +1021,12 @@ STEOMResult DMET::solve_fragment_steom(
         tracked_cudaFree(d_eps_phys);
         if (d_eri_mo) tracked_cudaFree(d_eri_mo);
     } else {
+        // mo_eri_block_source() == dynamic_cast<ERI_RI*> for every molecular
+        // engine; the periodic Gamma engine returns its cluster-B companion
+        // (it is not itself an ERI_RI). See ERI::mo_eri_block_source.
         const bool ri_block = (std::getenv("GANSU_DMET_STEOM_RI_BLOCK") != nullptr)
                               && gpu::gpu_available()
-                              && (dynamic_cast<ERI_RI*>(&eri_method) != nullptr);
+                              && (eri_method.mo_eri_block_source() != nullptr);
         real_t* d_eri_mo = ri_block ? nullptr : eri_method.build_mo_eri(d_C_can, n_emb);
         r = steom_spatial_orbital(rhf_, eri_method, d_C_can, d_eigvals, d_eri_mo,
                                   /*nao=*/nao, /*n_emb=*/n_emb,
@@ -982,6 +1075,12 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
         auto_mode = true;
         auto_budget_hit = ar.budget_hit;
         build_chromo_from_atoms(ar.atoms);
+        // (2026-09-24) Selection-only run: the full-system CIS-NTO + fragment choice is
+        // the cheap part; stop here to study the selection rule across cells/bases.
+        if (const char* dr = std::getenv("GANSU_DMET_STEOM_AUTO_DRYRUN"); dr && dr[0] == '1') {
+            std::cout << "  [auto-frag] DRY RUN (GANSU_DMET_STEOM_AUTO_DRYRUN=1): fragment selected, stopping before the cluster build." << std::endl;
+            return STEOMResult{};
+        }
         if ((int)ar.atoms.size() == num_atoms_)
             std::cout << "  [auto-frag] whole molecule selected → DMET degenerates to plain STEOM."
                       << std::endl;
@@ -1181,6 +1280,14 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
     real_t leak_occ = (real_t)rhf_.get_dmet_nto_bath_occ();
     if (const char* e = std::getenv("GANSU_DMET_STEOM_NTO_BATH"))     leak_vir = std::atof(e);
     if (const char* e = std::getenv("GANSU_DMET_STEOM_NTO_BATH_OCC")) leak_occ = std::atof(e);
+    // (2026-09-21) Relative occupation floor on the augmentation candidates. The
+    // leak test alone admits every ACTIVE NTO above tau, and the active set reaches
+    // down to occupation ~3e-4 -- noise directions that leak by construction. At
+    // MgO 3x3x2 that added 40 vir + 51 occ orbitals (n_emb 398 -> 489) and the
+    // cluster DLPNO LMP2 diverged; the occupation-weighted uncaptured signal is
+    // ~85% in the top-5 NTOs of each channel. 0 = off (byte-identical).
+    real_t wfloor = (real_t)rhf_.get_dmet_nto_bath_wfloor();
+    if (const char* e = std::getenv("GANSU_DMET_STEOM_NTO_BATH_WFLOOR")) wfloor = std::atof(e);
     // §4.3 bath-sufficiency diagnostic (self-contained: no full STEOM needed).
     // Auto-on whenever augmentation runs; force standalone with GANSU_DMET_STEOM_BATH_DIAG=1.
     bool bath_diag = (leak_vir > 0.0 || leak_occ > 0.0);
@@ -1417,14 +1524,21 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
 
         std::vector<std::vector<real_t>> added;   // accepted env-NTO bath columns (Löwdin)
         int n_occ_added = 0;
-        // Linear-dependence-safe augmentation: each group of candidates (virtual, then
-        // occupied) is projected onto the complement of the current cluster span with the
-        // metric-corrected projector  φ ← φ − C (CᵀC)⁻¹ Cᵀ φ  (applied twice; the bare
-        // columns are orthonormal only to ~1e-4), then orthonormalised CANONICALLY:
-        // diagonalise the candidates' overlap matrix and keep only directions with
-        // eigenvalue ≥ lindep_thresh. The former single Gram-Schmidt pass with a 1e-6
-        // residual-norm test let near-dependent candidates through as amplified
-        // round-off, producing a ~zero-norm cluster orbital and spurious roots.
+        // Linear-dependence-safe augmentation (2026-10-16). The former scheme ran ONE
+        // modified Gram-Schmidt pass per candidate against the cluster and accepted any
+        // residual with norm ≥ 1e-6, then normalised it. A candidate lying (almost)
+        // inside the cluster span therefore survived as amplified round-off, nearly
+        // parallel to an existing column; the canonicalised cluster then carried a
+        // ~zero-norm virtual (CᵀSC ≈ 5e-10, ε ≈ 0, posing as the LUMO) and a ~2-norm
+        // partner, which produced spurious CIS/STEOM roots (2-hexadecanone STO-3G:
+        // 6.06 / 8.19 eV with no counterpart in the whole molecule). Now each group of
+        // candidates (virtual, then occupied) is projected onto the complement of the
+        // current cluster span with the metric-corrected projector
+        //   φ ← φ − C (CᵀC)⁻¹ Cᵀ φ   (applied twice; the bare columns are orthonormal
+        //                            only to ~1e-4),
+        // then orthonormalised CANONICALLY: diagonalise the candidates' overlap matrix
+        // and keep only directions with eigenvalue ≥ lindep_thresh — which also removes
+        // near-parallel candidates among themselves.
         const double lindep_thresh = 1e-6;
 
         // Project a Löwdin candidate onto the environment (zero fragment AOs);
@@ -1443,12 +1557,19 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
             for (int p = 0; p < n_emb; ++p) Cb(mu, p) = (double)C_emb_lo[mu * n_emb + p];
         const Eigen::LDLT<Eigen::MatrixXd> Gb_ldlt(Cb.transpose() * Cb);
 
+        int n_floor_skipped_vir = 0, n_floor_skipped_occ = 0;
+        auto below_floor = [&](const std::vector<real_t>& occs, int k) {
+            if (wfloor <= 0.0 || occs.empty() || k >= (int)occs.size()) return false;
+            return occs[k] < wfloor * occs[0];
+        };
         // Collect the leaking candidates of one kind, project them onto the complement
         // of (bare cluster ∪ already-accepted columns), canonically orthonormalise, and
         // append the surviving directions to `added`. Returns the number kept.
-        auto augment_group = [&](bool occ, double tau, int n_act) -> int {
+        auto augment_group = [&](bool occ, double tau, const std::vector<real_t>& occs,
+                                 int n_act, int& n_floor_skipped) -> int {
             std::vector<std::vector<real_t>> cand;
             for (int k = 0; k < n_act; ++k) {
+                if (below_floor(occs, k)) { ++n_floor_skipped; continue; }
                 std::vector<real_t> phi = build_nto(occ, k);
                 if (env_project(phi) < tau) continue;
                 cand.push_back(std::move(phi));
@@ -1481,13 +1602,17 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
         };
         // --- VIRTUAL NTOs (particle leak) → extra cluster virtuals ---------------
         if (leak_vir > 0.0)
-            augment_group(/*occ=*/false, leak_vir, nto.n_act_vir);
+            augment_group(/*occ=*/false, leak_vir, nto.nto_vir_occupations, nto.n_act_vir, n_floor_skipped_vir);
         const int n_vir_added = (int)added.size();
 
         // --- OCCUPIED NTOs (hole leak) → extra cluster occupieds (n_emb_occ += k) -
         if (leak_occ > 0.0)
-            n_occ_added = augment_group(/*occ=*/true, leak_occ, nto.n_act_occ);
+            n_occ_added = augment_group(/*occ=*/true, leak_occ, nto.nto_occ_occupations, nto.n_act_occ, n_floor_skipped_occ);
 
+        if (wfloor > 0.0)
+            std::cout << "  [DMET-STEOM bath aug] occupation floor " << wfloor
+                      << " x leading: skipped " << n_floor_skipped_vir << " virtual + "
+                      << n_floor_skipped_occ << " occupied micro-weight NTO(s) (--dmet_nto_bath_wfloor)" << std::endl;
         if (!added.empty()) {
             const int n_added = (int)added.size();
             const int n_emb_aug = n_emb + n_added;
@@ -2794,6 +2919,18 @@ real_t ERI_RI_RHF::compute_dmet_ccsd() {
 real_t ERI_RI_RHF::compute_dmet_ccsd_t() {
     DMET dmet(rhf_, *this);
     return dmet.compute_energy(/*with_triples=*/true);
+}
+
+// Canonical-cluster DMET-STEOM for the STORED ERI method (no RI). The cluster
+// STEOM chain consumes integrals only through build_mo_eri, which ERI_Stored
+// supports, so the RI entry's extra machinery (DLPNO cluster modes, B-matrix
+// fast paths) is simply not engaged here.
+void ERI_Stored_RHF::compute_dmet_steom_ccsd(int n_states) {
+    DMET dmet(rhf_, *this);
+    STEOMResult r = dmet.compute_steom(*this, n_states);
+    rhf_.set_post_hf_energy(r.ground_corr_energy);
+    rhf_.append_excited_state_report(r.report);
+    rhf_.set_steom_result(std::move(r));
 }
 
 } // namespace gansu

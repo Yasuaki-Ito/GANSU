@@ -254,6 +254,51 @@ TEST(IPEOMRouting, PercentSinglesFilterRejectsLowSinglesRoots) {
     EXPECT_EQ(decision.assigned_root_for_m[1], -1); // no second qualifying root
 }
 
+// Regression pin for RFC 86.3b: an active NTO with NO corresponding Davidson
+// root must be left UNASSIGNED, not handed the nearest ~zero-overlap root.
+//
+// Before the overlap floor, the greedy picked among candidates whose overlaps
+// were all ~0, so the winner was decided by rounding noise. Two roots at very
+// different energies could swap places between runs of the same input — worth
+// 20.7 meV on the STEOM excitation energies. Here root 0 matches NTO 0
+// cleanly; NTO 1 has no partner (both remaining roots are orthogonal to it),
+// and the two candidates sit at very different omegas, exactly the shape that
+// used to flip.
+TEST(IPEOMRouting, ZeroOverlapNTOIsLeftUnassignedNotGivenANoiseRoot) {
+    const int nocc_active = 4;
+    const int n_act_occ   = 2;   // NTOs are orbitals 0 and 1
+    CISNTOResult cis_nto = make_identity_cis_nto(nocc_active, n_act_occ);
+
+    std::vector<IPEOMResult::PerRoot> roots;
+    roots.push_back(make_singles_root(/*omega=*/0.30, nocc_active, /*orbital=*/0));
+
+    // Two candidates for NTO 1, both living entirely on orbitals 2/3 => zero
+    // overlap with NTO 1, and far apart in energy.
+    auto orth_root = [&](real_t omega, int orbital) {
+        IPEOMResult::PerRoot pr;
+        pr.omega = omega;
+        pr.R1.assign(nocc_active, 0.0);
+        pr.R1[orbital] = 1.0;
+        pr.R2.assign((size_t)nocc_active * nocc_active * 1, 0.0);
+        pr.percent_singles = 1.0;
+        return pr;
+    };
+    roots.push_back(orth_root(0.42, 2));
+    roots.push_back(orth_root(0.58, 3));
+
+    auto decision = select_active_ip_roots(cis_nto, roots, nocc_active, /*ip_thresh=*/0.80);
+
+    EXPECT_EQ(decision.assigned_root_for_m[0], 0);
+    EXPECT_EQ(decision.assigned_root_for_m[1], -1)
+        << "an NTO whose best overlap is below the floor must stay unassigned; "
+           "assigning one of two ~zero-overlap roots is a coin flip";
+    EXPECT_EQ(decision.n_below_floor, 1);
+    EXPECT_TRUE(decision.unassigned_by_floor[1]);
+    EXPECT_FALSE(decision.root_taken[1]);
+    EXPECT_FALSE(decision.root_taken[2]);
+    EXPECT_GT(decision.overlap_floor, 0.0);
+}
+
 TEST(IPEOMRouting, ZeroR1NormProducesNoOverlap) {
     // Pathological root whose R1 is entirely zero (would be ‖R1‖²=0). Must not
     // divide by zero; root must be left untouched.

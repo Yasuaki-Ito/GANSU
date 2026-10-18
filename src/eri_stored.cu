@@ -8263,6 +8263,35 @@ __global__ void transpose_square_kernel(const double* __restrict__ in,
     out[(size_t)r*n + c] = in[(size_t)c*n + r];
 }
 
+// Transpose only a COLUMN BLOCK of a square row-major matrix:
+//   out[r_local, c] = in[c, c0 + r_local]   for r_local in [0, nc), c in [0, n).
+// Used for the OCCI Wklij^T·tau term: each device needs Wklij^T only for its
+// own i-block rows ij in [c0, c0+nc), so materialising the full n×n transpose
+// (o⁴, 24 GB at nocc=234) is wasted; this carves nc·n instead (6 GB at NG=4).
+// nc == n and c0 == 0 reproduces transpose_square_kernel exactly.
+__global__ void transpose_colblock_kernel(const double* __restrict__ in,
+                                          double* __restrict__ out,
+                                          int n, int c0, int nc) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (size_t)nc * n) return;
+    int c = (int)(gid % n);
+    int r = (int)(gid / n);
+    out[(size_t)r*n + c] = in[(size_t)c*n + (c0 + r)];
+}
+// Same as transpose_colblock_kernel but the input has its own column stride
+// ld_in (a COMPACT row-block copy of an n x n column-major matrix: ld_in = nc,
+// c0 = 0). out[r,c] = in[c*ld_in + c0 + r]. Used by the island-compact peer
+// Wklij (GANSU_CCSD_WKLIJ_PEER_COMPACT): bit-identical values to the full path.
+__global__ void transpose_colblock_ld_kernel(const double* __restrict__ in,
+                                             double* __restrict__ out,
+                                             int n, int ld_in, int c0, int nc) {
+    size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (size_t)nc * n) return;
+    int c = (int)(gid % n);
+    int r = (int)(gid / n);
+    out[(size_t)r*n + c] = in[(size_t)c*ld_in + (c0 + r)];
+}
+
 // ---- Warm-start side channel for ccsd_spatial_orbital (bt-polish) ----
 // Staged host amplitudes replace the MP2 initial guess on the NEXT call
 // (consumed-and-cleared; pointers must stay valid for that call). Layouts are
@@ -8385,7 +8414,12 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         const char* e_oi = std::getenv("GANSU_CCSD_OCCI");
         if (use_tiled_ladder && ri_bnative && e_oi && e_oi[0]=='1') {
             ccsd_occi = true;
-            occi_NG   = MultiGpuManager::instance().num_devices();
+            // Zero-guard: on a path that never initialized MultiGpuManager
+            // (the periodic engine manages its own GPUs), num_devices() is 0
+            // and occi_split's integer division SIGFPEs (observed: MgO 2x2x2
+            // cluster polish, nocc/0). One device degrades OCCI to a no-op
+            // split, which is the correct meaning of "no distribution".
+            occi_NG   = std::max(1, MultiGpuManager::instance().num_devices());
             iblk_n0   = occi_split(nocc, occi_NG, 0).second;
             std::cout << "[CCSD OCCI] occ-i raw distribution across " << occi_NG
                       << " GPU(s) (env GANSU_CCSD_OCCI)" << std::endl;
@@ -8651,7 +8685,17 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     // (B-native Inc2) the three nvir⁴ ladder buffers (d_v_vvvv, d_Wabcd, the ladder
     // part of d_ovvv_t1) are not needed when the ladder is evaluated tile-by-tile
     // from B_mo: shrink their carve to 1 / the non-ladder scratch need (oo·vv).
-    const size_t sz_tau = t2Size, sz_Wabcd = use_tiled_ladder ? (size_t)1 : vv*vv, sz_Wklij = oo*oo, sz_raw = t2Size;
+    // (GANSU_CCSD_WKLIJ_UVM=1, p8b autopsy 2026-09-08) Wklij (o^4 = 22.34 GiB at
+    // nocc=234) is the largest member of the single pooled cudaMalloc (84.4 GiB on
+    // device 0 at n_emb=374, the card at 143 GiB before the peer replicas). It is
+    // rebuilt on the device every iteration (DGEMM + ccsd_Wklij_kernel) and read
+    // once by the compact transpose, so it can live on HOST-parked managed memory
+    // exactly like v_oooo/v_oovo: carve a size-1 stub here, allocate it separately
+    // below. Tiled ladder only (the legacy path round-trips it through the host
+    // std::vector and gains nothing). Math-inert: same bytes, same kernels.
+    const bool wklij_uvm = use_tiled_ladder
+        && std::getenv("GANSU_CCSD_WKLIJ_UVM") && std::getenv("GANSU_CCSD_WKLIJ_UVM")[0] == '1';
+    const size_t sz_tau = t2Size, sz_Wabcd = use_tiled_ladder ? (size_t)1 : vv*vv, sz_Wklij = wklij_uvm ? (size_t)1 : oo*oo, sz_raw = t2Size;
     const size_t sz_w_oovv = oo*vv, sz_v_oovv = oo*vv, sz_Fki = oo;
     // (DS-4 device-0 shard) Zt1 (= d_ovvv_t1 in the tiled path) and d_Z hold only
     // device-0's I_0 i-block when occi ⇒ carve COMPACT (vv·iblk_n0·{nocc,nvir}).
@@ -8749,6 +8793,20 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
     double *d_tau       = carve(sz_tau);
     double *d_Wabcd     = carve(sz_Wabcd);
     double *d_Wklij     = carve(sz_Wklij);
+    if (wklij_uvm) {
+        const size_t b_wk = oo*oo*sizeof(double);
+        tracked_cudaMallocManagedHost((void**)&d_Wklij, b_wk);
+        int dev0 = 0; cudaGetDevice(&dev0);
+        cudaMemLocation loc_host{}; loc_host.type = cudaMemLocationTypeHost;   loc_host.id = 0;
+        cudaMemLocation loc_dev{};  loc_dev.type  = cudaMemLocationTypeDevice; loc_dev.id  = dev0;
+        cudaMemAdvise(d_Wklij, b_wk, cudaMemAdviseSetPreferredLocation, loc_host);
+        cudaMemAdvise(d_Wklij, b_wk, cudaMemAdviseSetAccessedBy, loc_dev);
+        cudaMemPrefetchAsync(d_Wklij, b_wk, loc_host, /*flags=*/0, /*stream=*/0);
+        cudaDeviceSynchronize();
+        std::cout << "[CCSD] Wklij (o^4) parked on HOST outside the pool (managed, preferred location CPU, "
+                     "GPU direct access; " << b_wk / 1e9 << " GB off device " << dev0
+                  << ", env GANSU_CCSD_WKLIJ_UVM)" << std::endl;
+    }
     double *d_raw       = carve(sz_raw);
     double *d_w_oovv    = carve(sz_w_oovv);
     double *d_v_oovv    = carve(sz_v_oovv);
@@ -8967,10 +9025,61 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         tracked_cudaMalloc((void**)&d_Dijab, t2Size * sizeof(double));
         cudaMemcpy(d_Dijab, Dijab.data(), t2Size * sizeof(double), cudaMemcpyHostToDevice);
         // (P0-4) Wklij device build: v_oooo/v_oovo constants (upload once)
-        tracked_cudaMalloc((void**)&d_v_oooo, oo*oo * sizeof(double));
-        tracked_cudaMalloc((void**)&d_v_oovo, (size_t)nocc*nocc*nvir*nocc * sizeof(double));
+        // (GANSU_CCSD_OOOO_UVM=1) v_oooo (o⁴) and v_oovo (o³v) are uploaded once
+        // here and only READ afterwards (Wklij / Wakic / Wakci / Lki kernels, one
+        // peer copy to the occ-i islands), so they are ideal oversubscription
+        // candidates: on managed memory the driver pages them in on read
+        // instead of pinning them next to the CCSD pool. Measured on the MgO
+        // 2x2x2 cluster polish (nocc=234): 22.34 + 13.36 GiB resident on device 0
+        // — exactly the two allocations that put the setup 4.8 GiB over the
+        // card (148.5 GiB needed) after OCCI had already trimmed the arena.
+        // Math-inert (same bytes, same kernels); opt-in, default = pinned.
+        {
+            const char* e_uvm = std::getenv("GANSU_CCSD_OOOO_UVM");
+            const bool oooo_uvm = e_uvm && e_uvm[0] == '1';
+            const size_t sz_oooo = oo*oo, sz_oovo = (size_t)nocc*nocc*nvir*nocc;
+            if (oooo_uvm) {
+                tracked_cudaMallocManagedHost((void**)&d_v_oooo, sz_oooo * sizeof(double));
+                tracked_cudaMallocManagedHost((void**)&d_v_oovo, sz_oovo * sizeof(double));
+                std::cout << "[CCSD] v_oooo/v_oovo on MANAGED memory ("
+                          << (sz_oooo + sz_oovo) * 8.0 / 1e9 << " GB oversubscribable, "
+                             "env GANSU_CCSD_OOOO_UVM)" << std::endl;
+            } else {
+                tracked_cudaMalloc((void**)&d_v_oooo, sz_oooo * sizeof(double));
+                tracked_cudaMalloc((void**)&d_v_oovo, sz_oovo * sizeof(double));
+            }
+        }
         cudaMemcpy(d_v_oooo, v_oooo.data(), oo*oo * sizeof(double), cudaMemcpyHostToDevice);
         cudaMemcpy(d_v_oovo, v_oovo.data(), (size_t)nocc*nocc*nvir*nocc * sizeof(double), cudaMemcpyHostToDevice);
+        // (GANSU_CCSD_OOOO_UVM, part 2) Managed alone was not enough: the H2D copy
+        // above leaves the pages RESIDENT on the device, and a later plain
+        // cudaMalloc does not evict managed pages to make room — it just fails
+        // (observed: with v_oooo/v_oovo managed the polish got past both of them
+        // and died on the next 8 GiB pinned alloc at 173.9 GiB "global").
+        // So park them on the HOST explicitly: preferred location = CPU, GPU
+        // access allowed (reads go over the interconnect, ~38 GB per polish
+        // iteration — well under a second), and prefetch them off the device now.
+        {
+            const char* e_uvm = std::getenv("GANSU_CCSD_OOOO_UVM");
+            if (e_uvm && e_uvm[0] == '1') {
+                int dev0 = 0; cudaGetDevice(&dev0);
+                const size_t b_oooo = oo*oo*sizeof(double);
+                const size_t b_oovo = (size_t)nocc*nocc*nvir*nocc*sizeof(double);
+                // CUDA 13 API: locations are cudaMemLocation structs (the int
+                // device-id overloads were removed).
+                cudaMemLocation loc_host{}; loc_host.type = cudaMemLocationTypeHost;   loc_host.id = 0;
+                cudaMemLocation loc_dev{};  loc_dev.type  = cudaMemLocationTypeDevice; loc_dev.id  = dev0;
+                cudaMemAdvise(d_v_oooo, b_oooo, cudaMemAdviseSetPreferredLocation, loc_host);
+                cudaMemAdvise(d_v_oovo, b_oovo, cudaMemAdviseSetPreferredLocation, loc_host);
+                cudaMemAdvise(d_v_oooo, b_oooo, cudaMemAdviseSetAccessedBy, loc_dev);
+                cudaMemAdvise(d_v_oovo, b_oovo, cudaMemAdviseSetAccessedBy, loc_dev);
+                cudaMemPrefetchAsync(d_v_oooo, b_oooo, loc_host, /*flags=*/0, /*stream=*/0);
+                cudaMemPrefetchAsync(d_v_oovo, b_oovo, loc_host, /*flags=*/0, /*stream=*/0);
+                cudaDeviceSynchronize();
+                std::cout << "[CCSD] v_oooo/v_oovo parked on HOST (preferred location CPU, "
+                             "GPU direct access) — device pages released" << std::endl;
+            }
+        }
         // (⑦-1) Wakic/Wakci device single-index: separate ovvv_t1 ic/dc (both survive
         // for the kernels) + Wakic/Wakci arrays + v_voov/v_vovo constants.
         // (DS-4 device-0 shard) ovvv_t1_ic/dc hold only I_0 when occi (each k-block
@@ -9000,15 +9109,48 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // overwritten by the w_ovvv_R×tau DGEMM and lacks the host fov add).
         tracked_cudaMalloc((void**)&d_newT1,    (size_t)ov * sizeof(double));
         tracked_cudaMalloc((void**)&d_Fkc_t1,   (size_t)ov * sizeof(double));
-        tracked_cudaMalloc((void**)&d_w_voov_c, oo*vv * sizeof(double));
-        tracked_cudaMalloc((void**)&d_w_ooov_c, (size_t)oo*ov * sizeof(double));
+        // (GANSU_CCSD_T1CONST_UVM=1, 2026-09-08) The three iteration-invariant
+        // constants w_voov_c (o²v²), w_ooov_c (o³v) and v_ooov_c (o³v) are uploaded
+        // once and only READ (T1-update kernel, Lki kernel), exactly like v_oooo/
+        // v_oovo above. On the MgO 2x2x2 n_emb=374 polish they are the 8 + 13.4 +
+        // 13.4 GiB that OCCI leaves full-size on device 0 (pinned working set
+        // ~175 GiB vs a 143 GiB card, prize7). Park them on the HOST (managed,
+        // preferred location CPU, GPU direct access): ~35 GB of reads per polish
+        // iteration over the interconnect (~1 s), no device residency. Math-inert.
+        const bool t1const_uvm = [] { const char* e = std::getenv("GANSU_CCSD_T1CONST_UVM");
+                                      return e && e[0] == '1'; }();
+        if (t1const_uvm) {
+            tracked_cudaMallocManagedHost((void**)&d_w_voov_c, oo*vv * sizeof(double));
+            tracked_cudaMallocManagedHost((void**)&d_w_ooov_c, (size_t)oo*ov * sizeof(double));
+        } else {
+            tracked_cudaMalloc((void**)&d_w_voov_c, oo*vv * sizeof(double));
+            tracked_cudaMalloc((void**)&d_w_ooov_c, (size_t)oo*ov * sizeof(double));
+        }
         tracked_cudaMalloc((void**)&d_Dia,      (size_t)ov * sizeof(double));
         cudaMemcpy(d_w_voov_c, w_voov.data(), oo*vv * sizeof(double), cudaMemcpyHostToDevice);
         cudaMemcpy(d_w_ooov_c, w_ooov.data(), (size_t)oo*ov * sizeof(double), cudaMemcpyHostToDevice);
         cudaMemcpy(d_Dia, Dia.data(), (size_t)ov * sizeof(double), cudaMemcpyHostToDevice);
         // (③ Lki) bare v_ooov (constant) for the device L^k_i build.
-        tracked_cudaMalloc((void**)&d_v_ooov_c, (size_t)oo*ov * sizeof(double));
+        if (t1const_uvm) tracked_cudaMallocManagedHost((void**)&d_v_ooov_c, (size_t)oo*ov * sizeof(double));
+        else             tracked_cudaMalloc((void**)&d_v_ooov_c, (size_t)oo*ov * sizeof(double));
         cudaMemcpy(d_v_ooov_c, v_ooov.data(), (size_t)oo*ov * sizeof(double), cudaMemcpyHostToDevice);
+        if (t1const_uvm) {
+            int dev0 = 0; cudaGetDevice(&dev0);
+            cudaMemLocation loc_host{}; loc_host.type = cudaMemLocationTypeHost;   loc_host.id = 0;
+            cudaMemLocation loc_dev{};  loc_dev.type  = cudaMemLocationTypeDevice; loc_dev.id  = dev0;
+            const size_t b1 = oo*vv*sizeof(double), b2 = (size_t)oo*ov*sizeof(double);
+            double* bufs[3] = { d_w_voov_c, d_w_ooov_c, d_v_ooov_c };
+            size_t  bsz[3]  = { b1, b2, b2 };
+            for (int k = 0; k < 3; ++k) {
+                cudaMemAdvise(bufs[k], bsz[k], cudaMemAdviseSetPreferredLocation, loc_host);
+                cudaMemAdvise(bufs[k], bsz[k], cudaMemAdviseSetAccessedBy, loc_dev);
+                cudaMemPrefetchAsync(bufs[k], bsz[k], loc_host, /*flags=*/0, /*stream=*/0);
+            }
+            cudaDeviceSynchronize();
+            std::cout << "[CCSD] w_voov_c/w_ooov_c/v_ooov_c parked on HOST (managed, preferred "
+                         "location CPU, GPU direct access; " << (b1 + 2*b2) / 1e9
+                      << " GB off device 0, env GANSU_CCSD_T1CONST_UVM)" << std::endl;
+        }
         // (Z build) bare v_ovov (constant) for the device Z build.
         // (Phase-1a Cat-B, device-0 I_0 shard) carved i-block COMPACT (= ov·ov when
         // iblk_n0=nocc). v_ovov[k,b,i,c]: (k,b) rows × (i,c) cols, I_0 = first iblk_n0·nvir.
@@ -9937,12 +10079,20 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
         // Wklij_T[ij,kl] so the output ij rows can be i-block sliced by pointer
         // offset. Full range ⇒ byte-identical to the transA=true full GEMM.
         {
+            // (OCCI device-0 footprint) Only this device's i-block rows of
+            // Wklij^T are read below, so transpose just that column block of
+            // Wklij: (iblk_n·nocc)×oo instead of oo×oo. At nocc=234 / NG=4 that is
+            // 6 GB instead of 24 GB — the very allocation that put the n_emb=374
+            // cluster polish over the card (148.5 GB needed, RFC PBC_DLPNO §…).
+            // Full range (iblk_start=0, iblk_n=nocc) ⇒ identical to before.
+            const size_t wt_rows = (size_t)iblk_n * nocc;
             double* d_Wklij_T = nullptr;
-            tracked_cudaMalloc((void**)&d_Wklij_T, oo*oo*sizeof(double));
-            { size_t tot=oo*oo; int th=256; int bl=(int)((tot+th-1)/th);
-              transpose_square_kernel<<<bl,th>>>(d_Wklij, d_Wklij_T, (int)oo); }
-            gpu::matrixMatrixProductRect(d_Wklij_T + (size_t)iblk_start*nocc*oo, d_tau, d_raw + ib_off,
-                                    (int)((size_t)iblk_n*nocc), (int)vv, (int)oo,
+            tracked_cudaMalloc((void**)&d_Wklij_T, wt_rows*oo*sizeof(double));
+            { size_t tot=wt_rows*oo; int th=256; int bl=(int)((tot+th-1)/th);
+              transpose_colblock_kernel<<<bl,th>>>(d_Wklij, d_Wklij_T, (int)oo,
+                                                   (int)((size_t)iblk_start*nocc), (int)wt_rows); }
+            gpu::matrixMatrixProductRect(d_Wklij_T, d_tau, d_raw + ib_off,
+                                    (int)wt_rows, (int)vv, (int)oo,
                                     false, false, true, 0.5);
             tracked_cudaFree(d_Wklij_T);
         }
@@ -10266,6 +10416,22 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
             const int TB = std::min(12, nvir);
             const size_t bmo_sz = (size_t)eri_ri->get_num_auxiliary_basis() * (size_t)N * N;
             std::vector<double*> raw_d(occi_NG, nullptr); raw_d[0] = d_raw;
+            // (p8b autopsy 2026-09-08) peer-device footprint knobs, both math-inert:
+            //  GANSU_CCSD_WKLIJ_PEER_COMPACT=1 -- p_Wklij holds only this island's
+            //    row block of Wklij (ibn*nocc x oo, the very block (9) transposes)
+            //    instead of the full o^4: 22.34 -> 5.6 GiB per peer at nocc=234.
+            //  GANSU_CCSD_OOVO_PEER_SHARED=1 -- with GANSU_CCSD_OOOO_UVM the host-
+            //    parked managed d_v_oovo is readable from every device, so the o^3v
+            //    peer replica (13.36 GiB) is dropped and Wakic/Wakci read it directly.
+            const char* e_wkc = std::getenv("GANSU_CCSD_WKLIJ_PEER_COMPACT");
+            const bool wk_compact = e_wkc && e_wkc[0] == '1';
+            const char* e_ovs = std::getenv("GANSU_CCSD_OOVO_PEER_SHARED");
+            const char* e_oou = std::getenv("GANSU_CCSD_OOOO_UVM");
+            const bool oovo_shared = e_ovs && e_ovs[0] == '1' && e_oou && e_oou[0] == '1';
+            if (wk_compact || oovo_shared)
+                std::cout << "[CCSD MULTIGPU] peer footprint: p_Wklij "
+                          << (wk_compact ? "island-COMPACT" : "full o^4")
+                          << " | v_oovo " << (oovo_shared ? "SHARED managed (no replica)" : "replicated") << std::endl;
             for (int d = 1; d < occi_NG; d++) {
                 MultiGpuManager::DeviceGuard g(d);
                 gpu::GPUHandle::reset();
@@ -10297,7 +10463,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 tracked_cudaMalloc((void**)&p_Zt1,   vv*(size_t)ibn*nocc*sizeof(double));  // compact Zt1[I_d]
                 tracked_cudaMalloc((void**)&p_Wakic, (size_t)nocc*ibn*vv*sizeof(double));  // compact I_d
                 tracked_cudaMalloc((void**)&p_Wakci, (size_t)nocc*ibn*vv*sizeof(double));
-                tracked_cudaMalloc((void**)&p_Wklij, oo*oo*sizeof(double));
+                tracked_cudaMalloc((void**)&p_Wklij, (wk_compact ? (size_t)ibn*nocc*oo : oo*oo)*sizeof(double));
                 tracked_cudaMalloc((void**)&p_Bmo,   bmo_sz*sizeof(double));
                 // (Cat-A fast-path) RESIDENT: p_vt_a = full v_ovvv_T (peer-copied from
                 // device 0), p_vt_b = unused stub; term1/term2 read p_vt_a+offset
@@ -10316,7 +10482,13 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 // (Phase-1a Cat-B, device-d≥1 I_d shard) v_voov/v_vovo compact (i∈I_d).
                 tracked_cudaMalloc((void**)&p_v_voov, (size_t)vo*ibn*nvir*sizeof(double));
                 tracked_cudaMalloc((void**)&p_v_vovo, (size_t)vo*nvir*ibn*sizeof(double));
-                tracked_cudaMalloc((void**)&p_v_oovo, p_oovo*sizeof(double));
+                if (oovo_shared) {
+                    p_v_oovo = d_v_oovo;   // host-parked managed, readable from device d
+                    cudaMemLocation loc_d{}; loc_d.type = cudaMemLocationTypeDevice; loc_d.id = d;
+                    cudaMemAdvise(d_v_oovo, p_oovo*sizeof(double), cudaMemAdviseSetAccessedBy, loc_d);
+                } else {
+                    tracked_cudaMalloc((void**)&p_v_oovo, p_oovo*sizeof(double));
+                }
                 tracked_cudaMalloc((void**)&p_ot1ic,  p_ot1*sizeof(double));   // compact I_d
                 tracked_cudaMalloc((void**)&p_ot1dc,  p_ot1*sizeof(double));
                 // (VR-tile Stage 3) p_V_R/W_R/V_R2 are size-1 stubs when vr_tile (built
@@ -10341,7 +10513,16 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 cudaMemcpyPeer(p_Lac,   d, (const void*)d_Lac,      0, vv*sizeof(double));
                 cudaMemcpyPeer(p_Lki,   d, (const void*)d_Lki,      0, oo*sizeof(double));
                 // (DS-4 C) p_Zt1 is NOT broadcast — device d builds Z[I_d]→Zt1[I_d] itself.
-                cudaMemcpyPeer(p_Wklij, d, (const void*)d_Wklij,    0, oo*oo*sizeof(double));
+                if (wk_compact) {
+                    // Rows [ib0*nocc, +ibn*nocc) of every column of the column-major
+                    // oo x oo Wklij: a strided 2D copy (UVA; source may be device 0 or
+                    // host-parked managed). Compact layout ld = ibn*nocc.
+                    cudaMemcpy2D(p_Wklij, (size_t)ibn*nocc*sizeof(double),
+                                 d_Wklij + (size_t)ib0*nocc, oo*sizeof(double),
+                                 (size_t)ibn*nocc*sizeof(double), oo, cudaMemcpyDefault);
+                } else {
+                    cudaMemcpyPeer(p_Wklij, d, (const void*)d_Wklij,    0, oo*oo*sizeof(double));
+                }
                 cudaMemcpyPeer(p_Bmo,   d, (const void*)B_mo,       0, bmo_sz*sizeof(double));
                 // (Cat-A fast-path) RESIDENT: broadcast the full v_ovvv_T once (device 0
                 // holds it full when vt_resident). BUILD-FROM-B: p_vt_a/p_vt_b are built
@@ -10367,7 +10548,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 cudaMemcpy2D(p_v_vovo, (size_t)ibn*sizeof(double),
                              v_vovo.data() + (size_t)ib0, (size_t)nocc*sizeof(double),
                              (size_t)ibn*sizeof(double), (size_t)nvir*nocc*nvir, cudaMemcpyHostToDevice);
-                cudaMemcpyPeer(p_v_oovo,d, (const void*)d_v_oovo,   0, p_oovo*sizeof(double));
+                if (!oovo_shared) cudaMemcpyPeer(p_v_oovo,d, (const void*)d_v_oovo,   0, p_oovo*sizeof(double));
                 // (DS-4 C) p_ot1ic/dc are NOT broadcast — device d builds them (⑥) itself.
                 cudaMemcpy2D(p_v_ovov, (size_t)ibn*nvir*sizeof(double),
                              v_ovov.data() + (size_t)ib0*nvir, ov*sizeof(double),
@@ -10391,7 +10572,10 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 tracked_cudaMalloc((void**)&t_rawt, (size_t)oo*TA*TB*sizeof(double));
                 tracked_cudaMalloc((void**)&t_t1s,  (size_t)nocc*TA*sizeof(double));
                 tracked_cudaMalloc((void**)&t_t1sb, (size_t)nocc*TB*sizeof(double));
-                tracked_cudaMalloc((void**)&t_WklijT, oo*oo*sizeof(double));
+                // (OCCI island footprint) only this island's I_d rows of Wklij^T
+                // are used (see the ⑨' Wklij×tau GEMM): carve ibn·nocc × oo, not oo².
+                tracked_cudaMalloc((void**)&t_WklijT,
+                                   (size_t)occi_split(nocc, occi_NG, d).second * nocc * oo * sizeof(double));
                 // (occ-i Wex shard) A/C1/C2 are i-block COMPACT (nvir·ibn rows);
                 // B (t2 reshape) is i-independent ⇒ full OV2. This is where the
                 // per-device Wex memory actually shrinks to ≈ /NG.
@@ -10469,6 +10653,13 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 // ⑨ ladder (Cat-A 2D a-tile × b-tile, this device's i-block). v_ovvv_T is
                 // either RESIDENT (p_vt_a = full, read at +a0/+b0 offset, transA=false) or
                 // built per-tile from p_Bmo (chem^T via transA=true). vt_resident selects.
+                // (OCCI × MULTIGPU) When the distributed a-tile ladder (ccsd_dist) is on,
+                // device 0's d_raw already holds the FULL ladder for every ij row — the
+                // AllReduce there covers I_d too — so this island must NOT add its own
+                // ladder or the I_d rows are counted twice after the occ-i AllReduce.
+                // Observed on MgO 2x1x1: OCCI alone and MULTIGPU alone both reproduce
+                // canonical (-0.6974303717); both together gave -0.6572839188.
+                if (!ccsd_dist)
                 for (int a0 = 0; a0 < nvir; a0 += TA) {
                     int ta = std::min(TA, nvir - a0);
                     cudaMemcpy2D(t_t1s, (size_t)ta*sizeof(double), p_t1 + a0, (size_t)nvir*sizeof(double),
@@ -10510,10 +10701,17 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                           scatter_add_abtile2d_kernel<<<bl,th>>>(t_rawt, p_raw, nocc, nvir, a0, ta, b0, tb, ib0*nocc, ibn*nocc); }
                     }
                 }
-                // ⑨ Wklij×tau
-                { size_t tt=oo*oo; int th=256; int bl=(int)((tt+th-1)/th);
-                  transpose_square_kernel<<<bl,th>>>(p_Wklij, t_WklijT, (int)oo); }
-                gpu::matrixMatrixProductRect(t_WklijT + (size_t)ib0*nocc*oo, p_tau, p_raw + iboff,
+                // ⑨ Wklij×tau — island-compact transpose: only rows ij ∈ I_d
+                // (ibn·nocc of them) are contracted, so materialise just that
+                // column block of Wklij (t_WklijT is carved ibn·nocc × oo above).
+                { size_t tt=(size_t)ibn*nocc*oo; int th=256; int bl=(int)((tt+th-1)/th);
+                  if (wk_compact)
+                      transpose_colblock_ld_kernel<<<bl,th>>>(p_Wklij, t_WklijT, (int)oo,
+                                                       (int)((size_t)ibn*nocc), 0, (int)((size_t)ibn*nocc));
+                  else
+                      transpose_colblock_kernel<<<bl,th>>>(p_Wklij, t_WklijT, (int)oo,
+                                                       (int)((size_t)ib0*nocc), (int)((size_t)ibn*nocc)); }
+                gpu::matrixMatrixProductRect(t_WklijT, p_tau, p_raw + iboff,
                                         (int)((size_t)ibn*nocc), (int)vv, (int)oo, false, false, true, 0.5);
                 // ⑩ Lac×t2
                 gpu::matrixMatrixProductBatched(p_Lac, p_t2v + iboff, p_raw + iboff,
@@ -10558,7 +10756,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
                 tracked_cudaFree(p_Bmo); tracked_cudaFree(p_vt_a); tracked_cudaFree(p_vt_b); tracked_cudaFree(p_vvooo);
                 if (p_voovv) tracked_cudaFree(p_voovv);   // freed early (dual-use); guard
                 if (p_voovv_iblk) tracked_cudaFree(p_voovv_iblk);
-                tracked_cudaFree(p_v_voov); tracked_cudaFree(p_v_vovo); tracked_cudaFree(p_v_oovo);
+                tracked_cudaFree(p_v_voov); tracked_cudaFree(p_v_vovo); if (!oovo_shared) tracked_cudaFree(p_v_oovo);
                 tracked_cudaFree(p_ot1ic); tracked_cudaFree(p_ot1dc);
                 tracked_cudaFree(p_Z); tracked_cudaFree(p_ovvv_k); tracked_cudaFree(p_ovvv_perm_k); tracked_cudaFree(p_v_ovov);
                 tracked_cudaFree(p_V_R); tracked_cudaFree(p_W_R); tracked_cudaFree(p_V_R2);
@@ -10746,6 +10944,7 @@ real_t ccsd_spatial_orbital(const real_t* __restrict__ d_eri_ao,
 #endif
 
     // Free pre-allocated GPU buffers
+    if (wklij_uvm) tracked_cudaFree(d_Wklij);  // separate managed Wklij (GANSU_CCSD_WKLIJ_UVM)
     tracked_cudaFree(d_gpu_pool);  // single deallocation for all GPU buffers
     // (Inc-G1/G2 + P0-2) per-tile ovvv scratch + reduced-T2 buffers (nullptr-safe)
     if (d_ovvv_k)      tracked_cudaFree(d_ovvv_k);

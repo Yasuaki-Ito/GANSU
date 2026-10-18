@@ -144,6 +144,19 @@ public:
      */
     DeviceHostMemory<real_t>& get_orbital_energies() { return orbital_energies; } ///< Get the orbital energies
 
+protected:
+    /// Whether `orbital_energies` was ever filled. False for a derived solver
+    /// that does not produce a single set of MO energies (the k-point path has
+    /// bands instead), so the report can say "not applicable" rather than
+    /// print zeros that look like results.
+    virtual bool has_orbital_energies() const { return true; }
+
+    /// Let a derived class that runs its OWN SCF report the result through the
+    /// same field. PBC_RHF does this for the k-point solver, which cannot go
+    /// through compute_energy() -- that reads the single real Fock and density
+    /// this class owns, and a k-point run has neither.
+    void set_electronic_energy(real_t e) { energy_ = e; }
+
 private:
     real_t energy_; ///< Energy
     DeviceHostMemory<real_t> orbital_energies; ///< Orbital energies
@@ -156,6 +169,8 @@ private:
 
     const std::string initial_guess_method_; ///< Initial guess method name
     const std::string gbsfilename_; ///< Basis set file name (Gaussian basis set file)
+    const std::string density_in_;  ///< SCF restart: read converged density (density_in param)
+    const std::string density_out_; ///< SCF restart: write converged density (density_out param)
 
 };
 
@@ -929,6 +944,10 @@ public:
     void compute_steom_ccsd(int n_states) override;
     real_t compute_dmet_ccsd() override;
     real_t compute_dmet_ccsd_t() override;
+    /// Canonical-cluster DMET-STEOM without RI (the cluster chain consumes
+    /// integrals only via build_mo_eri). Also what lets the periodic Gamma
+    /// path pass the base ctor's post-HF support check (see src/dmet.cu).
+    void compute_dmet_steom_ccsd(int n_states) override;
 
     /// Set CCSD algorithm: 0=spatial-optimized (default), 1=spatial-naive, 2=spin-orbital
     void set_ccsd_algorithm(int algo) { ccsd_algorithm_ = algo; }
@@ -1263,6 +1282,12 @@ public:
 
     /// Access distributed B data
     int num_gpus() const { return num_gpus_; }
+    /// (Phase 4) generic multi-device contract — identical to what DLPNO used
+    /// to obtain through dynamic_cast + num_gpus() + replicate_B_to_all_gpus().
+    int  mo_eri_devices() const override { return num_gpus_; }
+    bool prepare_mo_eri_devices() const override {
+        return const_cast<ERI_RI_Distributed_RHF*>(this)->replicate_B_to_all_gpus();
+    }
     const std::vector<int>& get_naux_local() const { return naux_local_; }
     const std::vector<real_t*>& get_d_B_local() const { return d_B_local_; }
 

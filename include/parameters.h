@@ -15,7 +15,10 @@
 
 
 //#define CONTRACTIONS 3
-#define ANGSTROM_PER_BOHR 0.5291772083
+// Length unit: use gansu::kBohrInAngstrom / angstrom_to_bohr() /
+// bohr_to_angstrom() from types.hpp. This define carried yet another
+// value (0.5291772083) and is kept only so old includes still compile.
+#define ANGSTROM_PER_BOHR 0.529177210903
 //#define NUM_CGTOS 2
 
 #define A_TR 0.352905920120321

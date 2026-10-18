@@ -20,6 +20,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 
 #ifdef _OPENMP
@@ -76,6 +77,32 @@ void set_dlpno_force_multigpu_iter(bool v) { g_dlpno_force_multigpu_iter = v; }
 
 namespace {
 using RowMatXd = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+
+// Bug report (5) (cisplatin def2-SVP/ECP: corr=nan while HF is fine): with
+// deep core orbitals left in the localization set (all-electron runs on
+// systems with 3rd-row or heavier elements / ECPs), the Pipek-Mezey metric is
+// indifferent to same-atom core-shell mixing, the resulting LMOs carry huge
+// off-diagonal Fock couplings (|F_LMO[i≠j]| ≈ 35 Ha observed), and the
+// semi-canonical Jacobi update diverges (growth ≈ 1.24×/iter). The loops
+// previously ran to max_iter and CONTINUED with overflowed amplitudes,
+// surfacing only as nan energies much later. Abort with an actionable
+// message instead.
+constexpr real_t kDlpnoResidDivergedAbs  = 1e3;   // mid-loop: clearly diverged
+constexpr real_t kDlpnoResidMaxIterCap   = 1e-4;  // at max_iter: too far off
+
+inline std::string dlpno_diverged_msg_(const char* stage, real_t r_max,
+                                       int iters) {
+    std::ostringstream oss;
+    oss << "DLPNO " << stage << " iteration diverged or failed to converge "
+        << "(max|R|=" << std::scientific << std::setprecision(3) << r_max
+        << " after " << iters << " iteration(s)). This typically means the "
+           "occupied localization set contains deep core orbitals whose "
+           "off-diagonal LMO Fock couplings the semi-canonical Jacobi update "
+           "cannot damp (all-electron runs on systems with 3rd-row or heavier "
+           "elements / ECPs). Rerun with --frozen_core auto (recommended) or "
+           "an explicit frozen-core count.";
+    return oss.str();
+}
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -623,12 +650,21 @@ LMP2Status iterate_lmp2(
                       << "  max|R|=" << std::scientific
                       << std::setprecision(3) << r_max << std::endl;
         }
+        if (!std::isfinite(r_max) || r_max > kDlpnoResidDivergedAbs) {
+            throw std::runtime_error(
+                dlpno_diverged_msg_("LMP2", r_max, iter + 1));
+        }
         if (r_max < conv_tol) {
             st.iters     = iter + 1;
             st.converged = true;
             break;
         }
         st.iters = iter + 1;
+    }
+    if (!st.converged
+        && (!std::isfinite(st.max_R) || st.max_R > kDlpnoResidMaxIterCap)) {
+        throw std::runtime_error(
+            dlpno_diverged_msg_("LMP2", st.max_R, st.iters));
     }
     {
         const double dt_total =
@@ -1087,14 +1123,68 @@ LMP2Status iterate_dlpno_ccsd_t2(
             }
             total_w += w[i];
         }
-        long long target = (total_w + n_gpus - 1) / n_gpus;
+        // (2026-09-21) Capacity-weighted boundaries. The devices do not start
+        // equal: on the periodic DMET chain GPU 0 also carries the cluster-B
+        // working slot (+20 GB at MgO 3x3x2), and the equal split OOM'd its
+        // ResidGpu (free 54 GB vs 78-82 GB on GPUs 1-3, need ~58 GB each). Weight
+        // each device's share of the index-ordered pair list by its free memory
+        // at split time; only the boundaries move, never which pairs exist or
+        // how they are computed. GANSU_DLPNO_SLAB_MEM_WEIGHT=0 restores the
+        // equal split (bit-for-bit the old boundaries).
+        std::vector<double> cap(n_gpus, 1.0);
+        bool cap_weighted = false;
+        {
+            bool on = true;
+            if (const char* e = std::getenv("GANSU_DLPNO_SLAB_MEM_WEIGHT")) on = (e[0] != '0');
+#ifndef GANSU_CPU_ONLY
+            if (on && n_gpus > 1) {
+                int cur = 0; cudaGetDevice(&cur);
+                double cmin = 1e300, cmax = 0.0;
+                for (int d = 0; d < n_gpus; ++d) {
+                    size_t fb = 0, tb = 0;
+                    if (cudaSetDevice(d) == cudaSuccess && cudaMemGetInfo(&fb, &tb) == cudaSuccess)
+                        cap[d] = static_cast<double>(fb);
+                    cmin = std::min(cmin, cap[d]); cmax = std::max(cmax, cap[d]);
+                }
+                cudaSetDevice(cur);
+                if (cmin > 0.0 && cmax / cmin >= 1.05) {
+                    cap_weighted = true;
+                    std::printf("[DLPNO-slab] capacity-weighted split by free device memory (GB):");
+                    for (int d = 0; d < n_gpus; ++d) std::printf(" %.1f", cap[d] / 1e9);
+                    std::printf("  (env GANSU_DLPNO_SLAB_MEM_WEIGHT)\n");
+                } else {
+                    std::fill(cap.begin(), cap.end(), 1.0);
+                }
+            }
+#endif
+        }
         long long acc = 0;
         int g = 0;
-        for (int i = 0; i < N_pair && g < n_gpus - 1; ++i) {
-            acc += w[i];
-            if (acc >= target * (g + 1)) {
-                slab_starts[g + 1] = i + 1;
-                ++g;
+        if (cap_weighted) {
+            double cap_total = 0.0;
+            for (double c : cap) cap_total += c;
+            std::vector<long long> cum_target(n_gpus + 1, 0);
+            double run = 0.0;
+            for (int d = 0; d < n_gpus; ++d) {
+                run += cap[d];
+                cum_target[d + 1] = static_cast<long long>(
+                    std::llround(static_cast<double>(total_w) * run / cap_total));
+            }
+            for (int i = 0; i < N_pair && g < n_gpus - 1; ++i) {
+                acc += w[i];
+                if (acc >= cum_target[g + 1]) {
+                    slab_starts[g + 1] = i + 1;
+                    ++g;
+                }
+            }
+        } else {
+            long long target = (total_w + n_gpus - 1) / n_gpus;
+            for (int i = 0; i < N_pair && g < n_gpus - 1; ++i) {
+                acc += w[i];
+                if (acc >= target * (g + 1)) {
+                    slab_starts[g + 1] = i + 1;
+                    ++g;
+                }
             }
         }
         slab_starts[n_gpus] = N_pair;
@@ -1253,6 +1343,41 @@ LMP2Status iterate_dlpno_ccsd_t2(
     }
     dt_setup_rgpu += std::chrono::duration<double>(
         prof_clock::now() - t_setup_rgpu_0).count();
+    {
+        // Per-device activation summary (always printed). Partial activation
+        // sends the inactive slab to the host fallback AND rebuilds the full
+        // host V_meta_T/TT + T_meta + V_stacked_oooo caches for EVERY pair —
+        // at nocc~230 that is a >1 TB, hours-long build (MgO 374, 2026-09-04),
+        // and in sparse mode the CPU ph-ladder fallback is also approximate.
+        std::string act;
+        for (int d = 0; d < n_gpus; ++d)
+            act += (rgpus[d] && rgpus[d]->active()) ? " GPU" : " CPU";
+        std::cout << "[DLPNO-CCSD] ResidGpu per device:" << act
+                  << (all_rgpu_active ? "  (all GPU)"
+                                      : "  (PARTIAL -> host fallback caches)")
+                  << std::endl;
+        if (!all_rgpu_active && phase24 != nullptr && phase24->nocc == nocc) {
+            double host_est = 0.0;
+            for (const auto& pr : pairs) {
+                const double nn = static_cast<double>(nocc) * pr.n_pno;
+                host_est += (3.0 * nn * nn
+                             + static_cast<double>(nocc) * nocc
+                               * pr.n_pno * pr.n_pno) * sizeof(real_t);
+            }
+            std::cout << "[DLPNO-CCSD]   host fallback caches est. "
+                      << std::fixed << std::setprecision(1) << host_est / 1e9
+                      << " GB (V_meta_T/TT + T_meta + V_stacked_oooo, all pairs)"
+                      << std::defaultfloat << std::endl;
+            const char* allow = std::getenv("GANSU_DLPNO_ALLOW_HOST_FALLBACK");
+            if (host_est > 400e9 && !(allow && allow[0] == '1'))
+                throw std::runtime_error(
+                    "[DLPNO-CCSD] partial ResidGpu activation would build >400 GB "
+                    "of host fallback caches (see the [ResidGpu dev=..] INACTIVE "
+                    "line above for the device and its shortfall). Rebalance the "
+                    "device slabs / free device memory, or set "
+                    "GANSU_DLPNO_ALLOW_HOST_FALLBACK=1 to run the host path anyway.");
+        }
+    }
 
     // ---- pi_T_stack (Step 3): per-iter (k, l, d)-stacked projection ----
     // pi_T_stack[idx](a, (k·nocc + l)·n + d) = π_{k, l}^{oriented}[a, d]
@@ -2500,12 +2625,21 @@ LMP2Status iterate_dlpno_ccsd_t2(
           report_progress("dlpno_ccsd", iter + 1, 2, vals); }
         dt_iter_misc += std::chrono::duration<double>(
             prof_clock::now() - t_misc_0).count();
+        if (!std::isfinite(r_max) || r_max > kDlpnoResidDivergedAbs) {
+            throw std::runtime_error(
+                dlpno_diverged_msg_("CCSD T2", r_max, iter + 1));
+        }
         if (r_max < conv_tol) {
             st.iters     = iter + 1;
             st.converged = true;
             break;
         }
         st.iters = iter + 1;
+    }
+    if (!st.converged
+        && (!std::isfinite(st.max_R) || st.max_R > kDlpnoResidMaxIterCap)) {
+        throw std::runtime_error(
+            dlpno_diverged_msg_("CCSD T2", st.max_R, st.iters));
     }
     // CCSD T2 per-phase profiling (ITER-PROF + per-stage RESID-CPU/GPU-PROF).
     // Detailed diagnostic — gated to verbose>=2 to keep the default log to

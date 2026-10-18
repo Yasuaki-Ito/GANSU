@@ -69,7 +69,7 @@ void Rys_int2c2e(
     int num_auxiliary_basis,
     const double* g_boys_grid)
 {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_shell_pairs) return;
 
     // Thread mapping (same as MD_int2c2e_1T1SP)

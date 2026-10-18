@@ -81,6 +81,13 @@ struct EAEOMRoutingDecision {
     std::vector<int>    assigned_root_for_a;  ///< size n_act_vir, -1 = unassigned
     std::vector<real_t> overlap_for_a;        ///< size n_act_vir, FollowCIS overlap of the assigned root (0 if -1)
     std::vector<bool>   root_taken;           ///< size n_roots, true if assigned to some ã
+
+    // ---- overlap-floor diagnostics; see steom_followcis_overlap_floor()
+    // (declared in ip_eom_result.hpp — IP and EA share one floor) ----
+    std::vector<char>   unassigned_by_floor;
+    real_t overlap_floor      = 0.0;
+    real_t best_below_floor   = 0.0;
+    int    n_below_floor      = 0;
 };
 
 EAEOMRoutingDecision select_active_ea_roots(

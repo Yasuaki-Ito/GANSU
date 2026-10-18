@@ -31,6 +31,8 @@
 #endif
 
 #include <limits> // numeric_limits<double>::max();
+#include <fstream> // density_in/density_out SCF restart files
+#include <cstdint>
 #include <iomanip> // std::setprecision
 #include <filesystem>
 #include <numeric>
@@ -56,6 +58,8 @@ RHF::RHF(const Molecular& molecular, const ParameterManager& parameters) :
     orbital_energies(num_basis),
     initial_guess_method_(parameters.get<std::string>("initial_guess")),
     gbsfilename_(parameters.get<std::string>("gbsfilename")),
+    density_in_(parameters.get<std::string>("density_in")),
+    density_out_(parameters.get<std::string>("density_out")),
     fock_matrix(num_basis, num_basis)
 {
     // check if the number of electrons is even (condition for restricted Hartree Fock method)
@@ -271,6 +275,21 @@ void RHF::precompute_eri_matrix(){
 void RHF::post_process_after_scf() {
     PROFILE_FUNCTION();
 
+    // SCF density checkpoint (density_out): written before any post-HF so a
+    // crashed or killed post-HF stage still leaves the restart file behind.
+    if (!density_out_.empty()) {
+        density_matrix.toHost();
+        std::ofstream f(density_out_, std::ios::binary);
+        if (!f) THROW_EXCEPTION("density_out: cannot open " + density_out_);
+        const int64_t n = (int64_t)num_basis;
+        f.write("GDNS1", 5);
+        f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+        f.write(reinterpret_cast<const char*>(density_matrix.host_ptr()),
+                (size_t)num_basis * num_basis * sizeof(real_t));
+        std::cout << "[density_out] converged density written to "
+                  << density_out_ << std::endl;
+    }
+
     PostHFMethod post_hf_method = get_post_hf_method();
     if(post_hf_method == PostHFMethod::None){
         post_hf_energy_ = 0.0;
@@ -370,6 +389,37 @@ void RHF::post_process_after_scf() {
  */
 void RHF::guess_initial_fock_matrix(const real_t* density_matrix_a, const real_t* density_matrix_b, bool force_density) {
     PROFILE_FUNCTION();
+
+    // SCF density restart (density_in): load a converged total density written
+    // by density_out and start from it — a rerun of the same system converges
+    // in ~1-2 iterations instead of repaying the full SCF (the MgO supercell
+    // campaign repaid a 3 h SCF ~8 times, RFC 81.15). nbf is enforced; any
+    // mismatch throws rather than silently seeding garbage.
+    std::vector<real_t> din_a, din_b;
+    if (!force_density && density_matrix_a == nullptr && !density_in_.empty()) {
+        std::ifstream f(density_in_, std::ios::binary);
+        if (!f) THROW_EXCEPTION("density_in: cannot open " + density_in_);
+        char magic[6] = {};
+        int64_t n = 0;
+        f.read(magic, 5);
+        f.read(reinterpret_cast<char*>(&n), sizeof(n));
+        if (std::string(magic) != "GDNS1" || n != (int64_t)num_basis) {
+            THROW_EXCEPTION("density_in: header mismatch in " + density_in_
+                            + " (file nbf=" + std::to_string(n)
+                            + ", expected " + std::to_string(num_basis) + ")");
+        }
+        din_a.resize((size_t)num_basis * num_basis);
+        f.read(reinterpret_cast<char*>(din_a.data()),
+               din_a.size() * sizeof(real_t));
+        if (!f) THROW_EXCEPTION("density_in: truncated file " + density_in_);
+        for (auto& v : din_a) v *= 0.5;  // total D -> alpha = beta = D/2
+        din_b = din_a;
+        density_matrix_a = din_a.data();
+        density_matrix_b = din_b.data();
+        force_density = true;
+        std::cout << "[density_in] SCF restart density loaded from "
+                  << density_in_ << std::endl;
+    }
 
     std::unique_ptr<InitialGuess_RHF> initial_guess; // the life time is only here since initial guess is performed only once
 
@@ -1245,8 +1295,18 @@ void RHF::report() {
         std::cout.precision(old_precision);
     }
 
-    // Orbital energies
-    {
+    // Orbital energies.
+    //
+    // A solver that never filled this array must not print it: a column of
+    // 0.000000 reads as "computed, and it came out zero", which is a stronger
+    // claim than "not applicable". The k-point path is the case in hand --
+    // there is no single set of MO energies there, only bands, and it reports
+    // its own HOMO/LUMO instead.
+    if (!has_orbital_energies()) {
+        std::cout << std::endl
+                  << "[Orbital Energies] not applicable to this solver"
+                  << std::endl;
+    } else {
         std::cout << std::endl;
         std::cout << "[Orbital Energies]" << std::endl;
         const int N = num_basis;

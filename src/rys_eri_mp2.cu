@@ -158,7 +158,7 @@ void RysERI_half_transform(
     const size_t head_bra,
     const size_t head_ket)
 {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_threads) return;
 
     // --- Thread → shell quartet mapping (identical to RysERI) ---

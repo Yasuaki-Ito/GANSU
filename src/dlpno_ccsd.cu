@@ -21,6 +21,7 @@
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -96,6 +97,28 @@ inline void check_cuda_ccsd_(cudaError_t e, const char* what) {
         throw std::runtime_error(std::string("DLPNO pair-ERI CUDA error in ")
                                  + what + ": " + cudaGetErrorString(e));
     }
+}
+
+// Bug report (5) — same divergence guard as iterate_lmp2 / iterate_dlpno_
+// ccsd_t2 (see dlpno_pair_data.cu): deep core orbitals in the localization
+// set give |F_LMO[i≠j]| couplings the semi-canonical T1 Jacobi update cannot
+// damp; the loop previously ran to max_iter and continued with overflowed
+// amplitudes (nan energies). Abort with an actionable message instead.
+constexpr real_t kDlpnoT1DivergedAbs = 1e3;
+constexpr real_t kDlpnoT1MaxIterCap  = 1e-4;
+
+inline std::string dlpno_t1_diverged_msg_(const char* stage, real_t r_max,
+                                          int iters) {
+    std::ostringstream oss;
+    oss << "DLPNO " << stage << " iteration diverged or failed to converge "
+        << "(max|R|=" << std::scientific << std::setprecision(3) << r_max
+        << " after " << iters << " iteration(s)). This typically means the "
+           "occupied localization set contains deep core orbitals whose "
+           "off-diagonal LMO Fock couplings the semi-canonical Jacobi update "
+           "cannot damp (all-electron runs on systems with 3rd-row or heavier "
+           "elements / ECPs). Rerun with --frozen_core auto (recommended) or "
+           "an explicit frozen-core count.";
+    return oss.str();
 }
 
 /// Scoped environment-variable override. set() records the prior value and
@@ -262,12 +285,11 @@ inline Phase24Integrals precompute_phase24_integrals(
     //   the back-end is not distributed (or has a single GPU).
     int num_gpus = 1;
 #ifdef GANSU_MULTI_GPU
-    if (auto* eri_dist = dynamic_cast<const ERI_RI_Distributed_RHF*>(&eri)) {
-        if (eri_dist->num_gpus() > 1) {
-            const bool ok = const_cast<ERI_RI_Distributed_RHF*>(eri_dist)
-                                ->replicate_B_to_all_gpus();
-            if (ok) num_gpus = eri_dist->num_gpus();
-        }
+    {   // Phase 4: back-end-neutral contract (distributed RI replicates B;
+        // periodic ClusterB rotates per device from its managed anchor).
+        const ERI_RI* eri_ri_ = nullptr;
+        const int nd = (eri_ri_ = dynamic_cast<const ERI_RI*>(&eri)) ? eri_ri_->mo_eri_devices() : 1;
+        if (nd > 1 && eri_ri_->prepare_mo_eri_devices()) num_gpus = nd;
     }
 #endif // GANSU_MULTI_GPU
 
@@ -843,7 +865,16 @@ real_t DLPNOCCSD::compute_energy()
         // a hang from the caller's side.
         { double vals[] = {r_max, conv_tol};
           report_progress("dlpno_t1", t1_iter, 2, vals); }
+        if (!std::isfinite(r_max) || r_max > kDlpnoT1DivergedAbs) {
+            throw std::runtime_error(
+                dlpno_t1_diverged_msg_("T1", r_max, t1_iter));
+        }
         if (r_max < conv_tol) { t1_converged = true; break; }
+    }
+    if (!t1_converged
+        && (!std::isfinite(r_max_last) || r_max_last > kDlpnoT1MaxIterCap)) {
+        throw std::runtime_error(
+            dlpno_t1_diverged_msg_("T1", r_max_last, t1_iter));
     }
 
     real_t t1_norm_max = 0.0;
@@ -914,12 +945,10 @@ real_t DLPNOCCSD::compute_energy()
     int t2_num_gpus = 1;
     const bool user_explicit_n_gpus = (rhf_.get_num_gpus() != -1);
 #ifdef GANSU_MULTI_GPU
-    if (auto* eri_dist = dynamic_cast<const ERI_RI_Distributed_RHF*>(&eri_)) {
-        if (eri_dist->num_gpus() > 1) {
-            const bool ok = const_cast<ERI_RI_Distributed_RHF*>(eri_dist)
-                                ->replicate_B_to_all_gpus();
-            if (ok) t2_num_gpus = eri_dist->num_gpus();
-        }
+    {   // Phase 4: back-end-neutral contract
+        const ERI_RI* eri_ri_ = nullptr;
+        const int nd = (eri_ri_ = dynamic_cast<const ERI_RI*>(&eri_)) ? eri_ri_->mo_eri_devices() : 1;
+        if (nd > 1 && eri_ri_->prepare_mo_eri_devices()) t2_num_gpus = nd;
     }
 #endif
     if (params_.verbose >= 1) {
@@ -1704,6 +1733,10 @@ real_t DLPNOCCSD::compute_energy()
                           << std::setw(3) << t1_iter << "  max|R|="
                           << std::scientific << std::setprecision(3) << r_max
                           << std::endl;
+            }
+            if (!std::isfinite(r_max) || r_max > kDlpnoT1DivergedAbs) {
+                throw std::runtime_error(
+                    dlpno_t1_diverged_msg_("T1(singles)", r_max, t1_iter));
             }
             if (r_max < conv_tol) { t1_converged = true; break; }
         }
@@ -3564,11 +3597,9 @@ real_t ERI_RI_RHF::compute_dlpno_ccsd_t_impl(const DLPNOClusterSpace* cluster) {
     // RI back-end; if not, fall back to single-GPU.
     int num_gpus = 1;
 #ifdef GANSU_MULTI_GPU
-    if (auto* eri_dist =
-            dynamic_cast<ERI_RI_Distributed_RHF*>(this)) {
-        if (eri_dist->num_gpus() > 1) {
-            num_gpus = eri_dist->num_gpus();
-        }
+    {   // Phase 4: back-end-neutral contract
+        const int nd = this->mo_eri_devices();
+        if (nd > 1 && this->prepare_mo_eri_devices()) num_gpus = nd;
     }
 #endif // GANSU_MULTI_GPU
     // Phase 3.2.0: TNO basis builder needs AO-basis Fock and overlap.

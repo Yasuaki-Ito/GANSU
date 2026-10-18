@@ -170,7 +170,7 @@ void RysERI(
     const double* g_boys_grid,
     const size_t head_bra, const size_t head_ket)
 {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_threads) return;
 
     // --- Thread → shell quartet mapping ---
@@ -459,7 +459,7 @@ void RysERI_Hash(
     const size_t head_bra, const size_t head_ket,
     size_t capacity_mask_unused)
 {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_threads) return;
 
     int ket_size;

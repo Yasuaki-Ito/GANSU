@@ -110,6 +110,7 @@ public:
 
         // Select and build the HF class
         const std::string method = parameters.get<std::string>("method");
+
         if(method == "rhf"){
             return std::make_unique<RHF>(molecular, parameters);
         }else if(method == "uhf"){

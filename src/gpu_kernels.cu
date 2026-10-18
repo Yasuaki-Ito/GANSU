@@ -28,7 +28,7 @@ namespace gansu::gpu{
  *         The input vector is modified in place.
  */
  __global__ void inverseSqrt_kernel(real_t* d_eigenvalues, const size_t size, const double threshold) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         double value = d_eigenvalues[idx];
         if (value < threshold) {
@@ -48,7 +48,7 @@ namespace gansu::gpu{
  *         The input vector is modified in place.
  */
  __global__ void sqrt_kernel(real_t* d_eigenvalues, const size_t size, const double threshold) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         if(d_eigenvalues[idx] < threshold){
             d_eigenvalues[idx] = threshold; // Avoid negative square roots or zero
@@ -69,7 +69,7 @@ namespace gansu::gpu{
  * @details The density matrix is given by \f$ D_{ij} = 2 \sum_{k=1}^{N/2} C_{ik} C_{jk} \f$.
  */
  __global__ void computeDensityMatrix_RHF_kernel(const real_t* d_coefficient_matrix, real_t* d_density_matrix, const int num_electron, const size_t num_basis) {
-    size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_basis * num_basis) return;
 
     size_t i = id / num_basis;
@@ -92,7 +92,7 @@ namespace gansu::gpu{
  * @details The density matrix is given by \f$ D_{ij} = \sum_{k=1}^{N} C_{ik} C_{jk} \f$.
  */
  __global__ void computeDensityMatrix_UHF_kernel(const double* d_coefficient_matrix, double* d_density_matrix, const int num_spin, const size_t num_basis) {
-    size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_basis * num_basis) return;
 
     size_t i = id / num_basis;
@@ -119,7 +119,7 @@ namespace gansu::gpu{
  * @details This function computes the density matrix using the coefficient matrix.
  */
  __global__ void computeDensityMatrix_ROHF_kernel(const double* d_coefficient_matrix, double* d_density_matrix_closed, double* d_density_matrix_open, double* d_density_matrix, const int num_closed, const int num_open, const size_t num_basis) {
-    size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_basis * num_basis) return;
 
     size_t i = id / num_basis;
@@ -401,7 +401,7 @@ __global__ void computeFockMatrix_ROHF_kernel(const real_t* d_density_matrix_clo
 
 
 __global__ void computeUnifiedFockMatrix_ROHF_kernel(const real_t* d_fock_mo_closed_matrix, const real_t* d_fock_mo_open_matrix, const ROHF_ParameterSet rohf_params, real_t* d_unified_fock_matrix, const int num_closed, const int num_open, const size_t num_basis) {
-    size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_basis * (num_basis+1) / 2) return;
 
     const size_t2 ij = index1to2(id, true);
@@ -492,7 +492,7 @@ __global__ void getMatrixTrace(const double* g_matrix, double* g_trace, const in
  * @param c_x Constant c_x
  */
 __global__ void computeInitialFockMatrix_GWH_kernel(const double* d_core_hamiltonian_matrix, const double* d_overlap_matrix, double* d_fock_matrix, const int num_basis, const double c_x) {
-    size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_basis * num_basis) return;
 
     size_t p = id / num_basis;
@@ -503,7 +503,7 @@ __global__ void computeInitialFockMatrix_GWH_kernel(const double* d_core_hamilto
 
 
 __global__ void computeRIIntermediateMatrixB_kernel(const double* d_three_center_eri, const double* d_matrix_L, double* d_matrix_B, const int num_basis, const int num_auxiliary_basis){
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_auxiliary_basis * num_basis * num_basis) return;
 
     const size_t p = id / (num_basis*num_basis);
@@ -550,7 +550,7 @@ __global__ void computeFockMatrix_RI_ROHF_kernel(const double* d_core_hamiltonia
  * @param N The size of the matrix (number of rows/columns).
  */
  __global__ void setZeroUpperTriangle(double* d_A, const int N) {
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t row = id / N;
     const size_t col = id % N;
     if (row < N && col < N && col > row) {
@@ -611,7 +611,7 @@ __global__ void denseToHash_kernel(const real_t* d_dense_eri,
     unsigned long long* d_hash_keys, real_t* d_hash_values,
     size_t hash_capacity_mask, const int num_basis)
 {
-    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t N = num_basis;
     const size_t num_pairs = N * (N + 1) / 2;
     const size_t num_unique = num_pairs * (num_pairs + 1) / 2;

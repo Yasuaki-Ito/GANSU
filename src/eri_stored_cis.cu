@@ -625,7 +625,6 @@ static void cluster_cis_ri_from_block(const ERI_RI* eri_block_src,
                                       bool is_triplet, int n_states,
                                       std::vector<real_t>* out_amplitudes) {
 #ifndef GANSU_CPU_ONLY
-    const int naux    = eri_block_src->get_num_auxiliary_basis();
     const int nocc    = full_occ - num_frozen;
     const int nvir    = nmo - full_occ;
     const int cis_dim = nocc * nvir;
@@ -634,6 +633,10 @@ static void cluster_cis_ri_from_block(const ERI_RI* eri_block_src,
     // build_B_mo returns a SHARED thread-local workspace valid until the next
     // build_B_mo call — extract immediately (no intervening build_B_mo here).
     const real_t* d_B_mo = eri_block_src->build_B_mo(d_C, nmo);
+    // ⚠ Row count read AFTER the build. The periodic source's count depends on
+    // the Gc dial, and reading it first is how the exact rows got silently
+    // dropped once already.
+    const int naux    = eri_block_src->get_num_auxiliary_basis();
     if (!d_B_mo)
         throw std::runtime_error("cluster_cis_ri_from_block: build_B_mo returned null");
 
@@ -843,18 +846,20 @@ static void build_ovov_oovv_direct(
  * Helper: run CIS Davidson with OVOV/OOVV sub-blocks.
  * Shared by Direct and Hash CIS.
  */
-static void run_cis_with_subblocks(
-    RHF& rhf, const real_t* d_ovov, const real_t* d_oovv,
-    int n_states, const std::string& method_label)
+/// Solve + properties for a CIS operator of any shape. Split out of
+/// run_cis_with_subblocks so the storage-free (B-native) periodic path reaches
+/// the SAME solver settings and the SAME oscillator-strength / report code as
+/// the dense-block path — the only difference between them is which operator
+/// is handed in.
+static void run_cis_with_operator(
+    RHF& rhf, LinearOperator& cis_op,
+    int n_states, const std::string& method_label,
+    std::vector<real_t>* out_eigenvectors)
 {
     const int nao = rhf.get_num_basis();
     const int nocc = rhf.get_num_electrons() / 2;
     const int nvir = nao - nocc;
     const int cis_dim = nocc * nvir;
-    const bool is_triplet = rhf.is_triplet();
-    const real_t* d_eps = rhf.get_orbital_energies().device_ptr();
-
-    CISOperator_HalfTransform cis_op(d_ovov, d_oovv, d_eps, nocc, nvir, is_triplet);
 
     DavidsonConfig config;
     config.num_eigenvalues = n_states;
@@ -874,6 +879,7 @@ static void run_cis_with_subblocks(
 
     std::vector<real_t> h_eigenvectors(cis_dim * n_states);
     solver.copy_eigenvectors_to_host(h_eigenvectors.data());
+    if (out_eigenvectors) *out_eigenvectors = h_eigenvectors;
 
     rhf.get_coefficient_matrix().toHost();
     const auto& prim_shells = rhf.get_primitive_shells();
@@ -891,6 +897,20 @@ static void run_cis_with_subblocks(
         n_states, nao, nocc, nvir);
     rhf.set_oscillator_strengths(es_result.oscillator_strengths);
     rhf.set_excited_state_report(es_result.report);
+}
+
+static void run_cis_with_subblocks(
+    RHF& rhf, const real_t* d_ovov, const real_t* d_oovv,
+    int n_states, const std::string& method_label,
+    std::vector<real_t>* out_eigenvectors = nullptr)
+{
+    const int nao = rhf.get_num_basis();
+    const int nocc = rhf.get_num_electrons() / 2;
+    const int nvir = nao - nocc;
+    CISOperator_HalfTransform cis_op(d_ovov, d_oovv,
+                                     rhf.get_orbital_energies().device_ptr(),
+                                     nocc, nvir, rhf.is_triplet());
+    run_cis_with_operator(rhf, cis_op, n_states, method_label, out_eigenvectors);
 }
 
 

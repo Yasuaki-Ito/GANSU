@@ -17,6 +17,10 @@
 #include <iomanip>  // For std::setw and std::setfill
 #include "console.hpp" // Font color
 #include <chrono>
+#include <cstdlib>
+#ifndef GANSU_CPU_ONLY
+#include <cuda_runtime.h>   // (2026-09-23) GANSU_TIMER_CUDA_PEEK: report a pending CUDA error at section END
+#endif
 
 namespace gansu {
 
@@ -77,6 +81,24 @@ void GlobalProfiler::stop(const std::string& name) {
                   << std::setw(3) << std::setfill('0') << milliseconds << ConsoleColor::RESET << "] END:   "
                   << name << " after " << std::setprecision(5) << duration_milliseconds << " ms" << std::endl;
     }
+#ifndef GANSU_CPU_ONLY
+    // (2026-09-23) MgO 4x4x3 (nbf 2696) finished with a wrong energy while a CUDA
+    // "invalid argument" sat pending on the main thread; the only peek was inside
+    // the LR stage, far from the origin. Under GANSU_TIMER_CUDA_PEEK=1 every
+    // section END peeks (never consumes) and reports the FIRST section at which
+    // a new pending error is seen, which localizes the failing launch/API call.
+    static const bool peek_on = std::getenv("GANSU_TIMER_CUDA_PEEK") != nullptr;
+    if (peek_on) {
+        static std::string last_err;
+        const cudaError_t e = cudaPeekAtLastError();
+        const std::string cur = (e == cudaSuccess) ? std::string() : std::string(cudaGetErrorString(e));
+        if (cur != last_err) {
+            std::cout << "[timer-peek] pending CUDA error at END of " << name << ": "
+                      << (cur.empty() ? "cleared" : cur) << std::endl;
+            last_err = cur;
+        }
+    }
+#endif
 }
 
 void GlobalProfiler::report() {
@@ -84,8 +106,8 @@ void GlobalProfiler::report() {
     std::cout << "\n[Timing Summary]\n";
     for (const auto& entry : executionTimes) {
         double duration_milliseconds = static_cast<double>(entry.second) / 1000;
-        std::cout << entry.first << ": " 
-                  << std::setprecision(5) << duration_milliseconds << " microseconds total, "
+        std::cout << entry.first << ": "
+                  << std::setprecision(5) << duration_milliseconds << " ms total, "
                   << "called " << callCounts[entry.first] << " times.\n";
     }
 }

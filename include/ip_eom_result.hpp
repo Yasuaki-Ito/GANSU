@@ -86,7 +86,37 @@ struct IPEOMRoutingDecision {
     std::vector<int>    assigned_root_for_m;  ///< size n_act_occ, -1 = unassigned
     std::vector<real_t> overlap_for_m;        ///< size n_act_occ, FollowCIS overlap of the assigned root (0 if -1)
     std::vector<bool>   root_taken;           ///< size n_roots, true if assigned to some m̃
+
+    // ---- overlap-floor diagnostics (see steom_followcis_overlap_floor) ----
+    /// true for each m̃ left unassigned because every remaining candidate's
+    /// overlap was below the floor — as opposed to the %singles filter.
+    std::vector<char>   unassigned_by_floor;
+    real_t overlap_floor      = 0.0;  ///< floor actually applied
+    real_t best_below_floor   = 0.0;  ///< largest overlap the floor rejected (0 if none)
+    int    n_below_floor      = 0;    ///< how many m̃ that left unassigned
 };
+
+/**
+ * @brief Minimum FollowCIS overlap for a Davidson root to represent an NTO.
+ *
+ * Below this, a root is NOT a representative of that NTO and assigning it
+ * anyway is a modelling error, not just a tie-break detail: the greedy match
+ * then picks among candidates whose overlaps are all ~0, so the winner is
+ * decided by ~1e-9 noise from the arbitrary rotation of near-degenerate
+ * Davidson eigenvectors. Measured consequence before this floor existed: on
+ * MgO 2x1x1 + ghost the SAME input gave STEOM roots differing by 20.7 meV
+ * across runs, while the Davidson roots themselves agreed to every printed
+ * digit — only the routing flipped (RFC 86.3b).
+ *
+ * Default 1e-4. Calibrated against every routing table in the campaign logs:
+ * genuine assignments bottom out at 4.2e-3, while the noise-driven ones print
+ * as 0.0000 (< 5e-5) — the floor sits in that 100x gap. An NTO left
+ * unassigned contributes zero to S^IP / S^EA, which is what "no corresponding
+ * root was found" means; raise `ip_eom_safety_margin` to compute more roots if
+ * a real partner is expected. GANSU_STEOM_OVERLAP_FLOOR overrides (0 disables,
+ * restoring the pre-fix behaviour for A/B).
+ */
+real_t steom_followcis_overlap_floor();
 
 IPEOMRoutingDecision select_active_ip_roots(
     const CISNTOResult& cis_nto,

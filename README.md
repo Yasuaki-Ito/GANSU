@@ -168,7 +168,7 @@ GANSU provides both a **C++ CLI** and a **Python API** for flexible usage.
 
 ## Installation
 
-### Quick install via pip (recommended)
+### Quick install via pip (recommended) [![PyPI Downloads](https://static.pepy.tech/personalized-badge/gansu?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/gansu)
 
 ```bash
 pip install gansu

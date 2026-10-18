@@ -160,6 +160,7 @@ private:
     real_t* d_Fov_    = nullptr;  // [nocc · nvir]          Fov = cc_Fov                          (PySCF cc_Fov)
     real_t* d_Woooo_  = nullptr;  // [nocc^4]               Woooo (PySCF IP version, no t1·t1 symmetrization)
     real_t* d_Wooov_  = nullptr;  // [nocc² · nocc · nvir]  Wooov = ooov + t1·ovov                (PySCF Wooov)
+    bool    w_uvm_    = false;    // GANSU_IP_W_UVM: Wovov/Wovvo (=2: +Wooov/Wovoo) live on HOST-parked managed memory
     real_t* d_Wovov_  = nullptr;  // [nocc · nvir · nocc · nvir]  Wovov = W1ovov + W2ovov         (PySCF Wovov, IP)
     real_t* d_Wovvo_  = nullptr;  // [nocc · nvir · nvir · nocc]  Wovvo = W1ovvo + W2ovvo         (PySCF Wovvo, IP)
     real_t* d_Wovoo_  = nullptr;  // [nocc · nvir · nocc²]  Wovoo (PySCF, used in 1h↔2h1p coupling)
@@ -234,6 +235,7 @@ private:
     // back 66 MB — negligible; the Woooo GEMM stays on the solve device).
     // ip_gemm_peer_dev_ = -1 → resident path (byte-identical legacy).
     mutable int     ip_gemm_peer_dev_ = -1;
+    int             ip_gemm_peer_reserved_ = -1;  // setup_multi_gpu: peer kept free of replicas for the big-term GEMMs
     mutable void*   ip_gemm_cublas_   = nullptr;  // cuBLAS handle on the peer
     mutable real_t* d_peer_r2_    = nullptr;      // peer copy of r2 [h2p]
     mutable real_t* d_out1_stage_ = nullptr;      // solve-device staging for peer out1/out2

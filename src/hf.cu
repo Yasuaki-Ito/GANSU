@@ -26,6 +26,7 @@
 #include <cstring>   // memcpy
 #include <cmath> // sqrt
 #include <iomanip> // std::setprecision
+#include <limits>  // std::numeric_limits (overlap-spectrum diagnostics)
 #include <fstream> // std::ofstream (optimized geometry .xyz export)
 
 #include "hf.hpp"
@@ -119,6 +120,8 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
 {
     adc_c_t_ = parameters.get<double>("adc_c_t");
     adc_c_c_ = parameters.get<double>("adc_c_c");
+    lindep_threshold_ = parameters.get<double>("lindep_threshold");
+    num_independent_basis_ = num_basis;
     dmet_fragments_str_ = parameters.get<std::string>("dmet_fragments");
     dmet_threshold_ = parameters.get<double>("dmet_threshold");
     dmet_mu_refine_ccsd_ = parameters.get<bool>("dmet_mu_refine_ccsd");
@@ -134,6 +137,10 @@ HF::HF(const Molecular& molecular, const ParameterManager& parameters) :
     }
     dmet_nto_bath_     = parameters.get<double>("dmet_nto_bath");
     dmet_nto_bath_occ_ = parameters.get<double>("dmet_nto_bath_occ");
+    dmet_nto_bath_wfloor_ = parameters.get<double>("dmet_nto_bath_wfloor");
+    dmet_steom_auto_select_ = toLowerCase(parameters.get<std::string>("dmet_steom_auto_select"));
+    if (dmet_steom_auto_select_ != "atom" && dmet_steom_auto_select_ != "shell")
+        throw std::runtime_error("Invalid dmet_steom_auto_select: " + dmet_steom_auto_select_ + " (atom | shell)");
     dmet_level_shift_denom_only_ = (parameters.get<int>("dmet_level_shift_denom_only") != 0);
     dmet_n_tol_ = parameters.get<double>("dmet_n_tol");
     dmet_steom_auto_fragment_   = parameters.get<bool>("dmet_steom_auto_fragment");
@@ -642,8 +649,68 @@ void HF::compute_transform_matrix(){
         }
     }
 
-    // compute the transformation matrix
-    gpu::invertSqrtElements(eigenvalue.device_ptr(), num_basis);
+    // --- overlap-spectrum diagnostics (always; essential for near-linear-
+    //     dependent bases: diffuse-rich molecular sets, pob solid bases) ---
+    eigenvalue.toHost(); // does not modify device data
+    real_t s_min = eigenvalue[0], s_max = eigenvalue[0];
+    size_t n_drop = 0;
+    for (size_t i = 0; i < num_basis; i++) {
+        if (eigenvalue[i] < s_min) s_min = eigenvalue[i];
+        if (eigenvalue[i] > s_max) s_max = eigenvalue[i];
+        if (lindep_threshold_ > 0.0 && eigenvalue[i] < lindep_threshold_) n_drop++;
+    }
+    std::cout << "Overlap spectrum: min = " << std::scientific << std::setprecision(3) << s_min
+              << ", max = " << s_max
+              << ", cond = " << ((s_min > 0.0) ? s_max / s_min : std::numeric_limits<real_t>::infinity())
+              << std::defaultfloat;
+    if (lindep_threshold_ > 0.0) {
+        std::cout << " (lindep_threshold = " << std::scientific << lindep_threshold_
+                  << std::defaultfloat << ", dropped = " << n_drop << ")";
+    }
+    std::cout << std::endl;
+    if (lindep_threshold_ <= 0.0 && s_min < 1e-8) {
+        std::cout << "WARNING: overlap matrix is near-singular (min eigenvalue "
+                  << std::scientific << s_min << std::defaultfloat
+                  << "). Consider --lindep_threshold 1e-7." << std::endl;
+    }
+
+    num_independent_basis_ = num_basis - n_drop;
+
+    if (n_drop == 0) {
+        // exact legacy path (device data untouched by the diagnostics above)
+        // compute the transformation matrix
+        gpu::invertSqrtElements(eigenvalue.device_ptr(), num_basis);
+    } else {
+        // canonical orthogonalization with zero-column projection:
+        // X keeps its num_basis x num_basis storage; dropped directions get
+        // s^{-1/2} = 0, i.e. zero columns. Downstream (F' = X^T F X ->
+        // diagonalization -> C = X C') then produces n_drop spurious
+        // eigenvalues at exactly 0 whose C columns are zero vectors. This is
+        // safe for the aufbau occupation as long as all occupied orbital
+        // energies are negative (the usual case); post-HF / gradients would
+        // mix the spurious eps = 0 virtuals, hence the guards below.
+        if (post_hf_method_ != PostHFMethod::None) {
+            THROW_EXCEPTION("lindep_threshold with a post-HF method is not supported yet "
+                            "(spurious eps=0 virtuals would contaminate the correlation treatment). "
+                            "Run with post_hf_method=none.");
+        }
+        if (run_type_ != "energy") {
+            THROW_EXCEPTION("lindep_threshold currently supports run_type=energy only.");
+        }
+        std::cout << "Canonical orthogonalization: dropped " << n_drop
+                  << " near-linear-dependent direction(s); "
+                  << num_independent_basis_ << " of " << num_basis
+                  << " basis functions kept. NOTE: " << n_drop
+                  << " spurious orbital energies will appear at exactly 0 "
+                  << "(zero-column projection); verify that occupied orbitals stay below 0."
+                  << std::endl;
+        for (size_t i = 0; i < num_basis; i++) {
+            eigenvalue[i] = (eigenvalue[i] < lindep_threshold_)
+                                ? real_t(0)
+                                : real_t(1) / std::sqrt(eigenvalue[i]);
+        }
+        eigenvalue.toDevice();
+    }
 
     if(verbose){
         // copy the transform matrix to the host memory

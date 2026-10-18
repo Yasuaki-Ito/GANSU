@@ -236,7 +236,7 @@ void get_schwarz_upper_bound_factors_general(
     double max_upper_bound_factor = 0.0;
 
     // 通し番号indexの計算
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_bra) return;
 
     const double size_Rmid=1377;
@@ -477,7 +477,7 @@ void get_schwarz_upper_bound_factors_aux_general(
     double max_upper_bound_factor = 0.0;
 
     // 通し番号indexの計算
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_bra) return;
 
     const double size_Rmid=1377;
@@ -670,7 +670,7 @@ void get_schwarz_upper_bound_factors_general_for_SAD_K_computation(
     double max_upper_bound_factor = 0.0;
 
     // 通し番号indexの計算
-    const size_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= num_bra) return;
 
     const double size_Rmid=1377;
