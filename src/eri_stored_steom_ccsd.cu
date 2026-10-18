@@ -2800,6 +2800,90 @@ static int dlpno_bt_polish_setting(const HF& hf) {
 // the canonical STEOM chain over the precomputed cluster MO-ERI. The full chain
 // (CIS-NTO/IP/EA/STEOM) reads its electronic state from ctx, never from `cfg`
 // (which supplies only config + AO basis). Mirrors ccsd_spatial_orbital (dmet.cu).
+// Per-root atom-resolved hole/particle character of a cluster excited-state result
+// (report-only; env GANSU_STEOM_ATOM_CHAR=1). hC = cluster MO coefficients [nao × n_emb]
+// row-major; sr.per_root[k].R1 = singles amplitudes [nocc_active × nvir]. Shared by
+// steom_spatial_orbital and adc2_spatial_orbital (declared in eom_chain_context.hpp).
+void report_cluster_atom_character(RHF& cfg, const real_t* hC, int nao, int n_emb,
+                                   const STEOMResult& sr) {
+    const int no = sr.nocc_active, nv = sr.nvir, nf = sr.num_frozen;
+    const auto& a2b = cfg.get_atom_to_basis_range();
+    const auto& atoms = cfg.get_atoms();
+    const int nat = (int)a2b.size();
+    if (no > 0 && nv > 0 && nf + no + nv == n_emb && nat > 0) {
+        cfg.get_overlap_matrix().toHost();
+        const real_t* hS = cfg.get_overlap_matrix().host_ptr(); // [nao × nao]
+        auto weights = [&](const std::vector<double>& X, int ncol, std::vector<double>& w) {
+            // X: nao × ncol (row-major); w[A] = Σ_{μ∈A} Σ_c X[μ,c]·(S X)[μ,c]
+            std::vector<double> SX((size_t)nao * ncol, 0.0);
+            #pragma omp parallel for
+            for (int mu = 0; mu < nao; ++mu)
+                for (int nu = 0; nu < nao; ++nu) {
+                    const double s = hS[(size_t)mu * nao + nu];
+                    if (s == 0.0) continue;
+                    for (int c = 0; c < ncol; ++c) SX[(size_t)mu * ncol + c] += s * X[(size_t)nu * ncol + c];
+                }
+            w.assign(nat, 0.0);
+            for (int A = 0; A < nat; ++A)
+                for (size_t mu = a2b[A].start_index; mu < a2b[A].end_index; ++mu)
+                    for (int c = 0; c < ncol; ++c)
+                        w[A] += X[mu * ncol + c] * SX[mu * ncol + c];
+        };
+        std::ostringstream os;
+        os << "  [STEOM atom character] per-root hole/particle Mulliken weights "
+              "(GANSU_STEOM_ATOM_CHAR; top atoms, 0-based atom index):\n";
+        const int nroot = (int)sr.per_root.size();
+        for (int k = 0; k < nroot; ++k) {
+            const auto& pr = sr.per_root[k];
+            if ((int)pr.R1.size() != no * nv) continue;
+            double n2 = 0.0;
+            for (real_t v : pr.R1) n2 += (double)v * v;
+            if (n2 <= 0.0) continue;
+            const double inv = 1.0 / std::sqrt(n2);
+            std::vector<double> X((size_t)nao * nv, 0.0), Y((size_t)nao * no, 0.0);
+            #pragma omp parallel for
+            for (int mu = 0; mu < nao; ++mu) {
+                for (int i = 0; i < no; ++i) {
+                    const double co = hC[(size_t)mu * n_emb + (nf + i)];
+                    for (int a = 0; a < nv; ++a) {
+                        const double r = (double)pr.R1[(size_t)i * nv + a] * inv;
+                        X[(size_t)mu * nv + a] += co * r;
+                    }
+                }
+                for (int a = 0; a < nv; ++a) {
+                    const double cv = hC[(size_t)mu * n_emb + (nf + no + a)];
+                    for (int i = 0; i < no; ++i)
+                        Y[(size_t)mu * no + i] += cv * (double)pr.R1[(size_t)i * nv + a] * inv;
+                }
+            }
+            std::vector<double> wh, wp;
+            weights(X, nv, wh);
+            weights(Y, no, wp);
+            auto top = [&](const std::vector<double>& w) {
+                std::vector<int> ord(nat);
+                std::iota(ord.begin(), ord.end(), 0);
+                std::sort(ord.begin(), ord.end(), [&](int x, int y) { return w[x] > w[y]; });
+                std::ostringstream t;
+                for (int q = 0; q < std::min(5, nat); ++q)
+                    t << " " << atomic_number_to_element_name(atoms[ord[q]].atomic_number)
+                      << ord[q] << ":" << std::fixed << std::setprecision(2) << w[ord[q]];
+                return t.str();
+            };
+            double hO = 0.0, hN = 0.0, pO = 0.0, pN = 0.0;
+            for (int A = 0; A < nat; ++A) {
+                if (atoms[A].atomic_number == 8) { hO += wh[A]; pO += wp[A]; }
+                if (atoms[A].atomic_number == 7) { hN += wh[A]; pN += wp[A]; }
+            }
+            os << "   k=" << k << "  " << std::fixed << std::setprecision(4)
+               << pr.omega * 27.211386245988 << " eV"
+               << "  hole[O " << std::setprecision(2) << hO << ", N " << hN << "]:" << top(wh)
+               << "\n" << std::string(22, ' ')
+               << "particle[O " << pO << ", N " << pN << "]:" << top(wp) << "\n";
+        }
+        std::cout << os.str() << std::flush;
+    }
+}
+
 STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
                                   const real_t* d_C_can,
                                   const real_t* d_eps,
@@ -3211,6 +3295,66 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
     // Carry the cluster CCSD ground correlation energy out so the caller can report
     // it as the post-HF correction (was lost with ctx ⇒ summary showed 0).
     ctx.steom_result.ground_corr_energy = ctx.post_hf_energy;
+
+    // Cluster-orbital orthonormality audit (ALWAYS printed; GANSU_STEOM_METRIC_CHECK=0
+    // skips it): G = Cᵀ S C of the canonical cluster MOs handed to the STEOM chain
+    // must be I. Added 2026-10-16 after the NTO-bath augmentation was found to emit
+    // a ~zero-norm virtual (CᵀSC ≈ 5e-10) that posed as the LUMO and produced
+    // spurious roots; a broken cluster now shows up in every log.
+    if (const char* mc = std::getenv("GANSU_STEOM_METRIC_CHECK"); !(mc && mc[0] == '0')) {
+        C.toHost();
+        eps.toHost();
+        cfg.get_overlap_matrix().toHost();
+        const real_t* hC = C.host_ptr();
+        const real_t* hS = cfg.get_overlap_matrix().host_ptr();
+        const real_t* he = eps.host_ptr();
+        std::vector<double> SC((size_t)nao * n_emb, 0.0);
+        #pragma omp parallel for
+        for (int mu = 0; mu < nao; ++mu)
+            for (int nu = 0; nu < nao; ++nu) {
+                const double s = hS[(size_t)mu * nao + nu];
+                if (s == 0.0) continue;
+                for (int p = 0; p < n_emb; ++p) SC[(size_t)mu * n_emb + p] += s * hC[(size_t)nu * n_emb + p];
+            }
+        std::vector<double> gdiag(n_emb, 0.0), goff(n_emb, 0.0);
+        #pragma omp parallel for schedule(dynamic)
+        for (int p = 0; p < n_emb; ++p)
+            for (int q = p; q < n_emb; ++q) {
+                double g = 0.0;
+                for (int mu = 0; mu < nao; ++mu) g += hC[(size_t)mu * n_emb + p] * SC[(size_t)mu * n_emb + q];
+                if (p == q) gdiag[p] = g; else goff[p] = std::max(goff[p], std::fabs(g));
+            }
+        double dev = 0.0;
+        std::ostringstream bad;
+        int nbad = 0;
+        for (int p = 0; p < n_emb; ++p) {
+            dev = std::max(dev, std::max(std::fabs(gdiag[p] - 1.0), goff[p]));
+            if (std::fabs(gdiag[p] - 1.0) > 1e-3 && nbad < 12) {
+                bad << " p" << p << (p < n_emb_occ ? "(occ" : "(vir") << ",ε=" << std::setprecision(4)
+                    << (double)he[p] << "):" << std::setprecision(4) << gdiag[p];
+                ++nbad;
+            }
+        }
+        std::cout << "  [STEOM metric] cluster MO orthonormality max|CᵀSC−I| = " << std::scientific
+                  << std::setprecision(2) << dev << std::defaultfloat
+                  << (dev > 1e-3 ? "  ⚠ CLUSTER ORBITALS NOT ORTHONORMAL — roots untrustworthy" : "")
+                  << (nbad ? "; non-normalised:" + bad.str() : std::string("")) << std::endl;
+    }
+
+    // (diagnostic, env GANSU_STEOM_ATOM_CHAR=1; report-only, numerically inert)
+    // Per-root atom-resolved hole / particle character, for assigning n→π* vs π→π*
+    // on DMET clusters whose MO labels are not comparable to anything external.
+    // R1 (normalised) is mapped to AO via the cluster C; Mulliken partition of the
+    // hole density C_o R Rᵀ C_oᵀ and particle density C_v Rᵀ R C_vᵀ:
+    //   w_hole[A] = Σ_{μ∈A} Σ_a X[μ,a]·(S X)[μ,a],  X = C_occ·R   (nao × nvir)
+    //   w_part[A] = Σ_{μ∈A} Σ_i Y[μ,i]·(S Y)[μ,i],  Y = C_vir·Rᵀ  (nao × nocc)
+    // Each sums to 1 (cluster MOs are S-orthonormal). Reports the top atoms and the
+    // O / N totals: an n→π* has its hole on a carbonyl O (in-plane lone pair) and its
+    // particle on the C=O π*; a π→π* has its hole spread over the π carbons.
+    if (const char* ac = std::getenv("GANSU_STEOM_ATOM_CHAR"); ac && ac[0] == '1') {
+        C.toHost();
+        report_cluster_atom_character(cfg, C.host_ptr(), nao, n_emb, ctx.steom_result);
+    }
 
     return std::move(ctx.steom_result);
 }

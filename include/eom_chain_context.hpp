@@ -202,6 +202,11 @@ STEOMResult steom_spatial_orbital(RHF& cfg, ERI& eri_method,
                                   real_t level_shift = 0.0);
 
 // DMET-cluster ADC(2) entry — the ADC(2) analogue of steom_spatial_orbital.
+// Report-only per-root atom-resolved hole/particle character (GANSU_STEOM_ATOM_CHAR=1).
+// hC = cluster MO coefficients [nao × n_emb] row-major (host). Defined in eri_stored_steom_ccsd.cu.
+void report_cluster_atom_character(RHF& cfg, const real_t* hC, int nao, int n_emb,
+                                   const STEOMResult& sr);
+
 // Runs ADC(2) on the embedded cluster (physical, UN-shifted ε required):
 //   d_C_can  [nao × n_emb]  cluster canonical MO coefficients (unused by ADC2 math; kept for signature parity)
 //   d_eps    [n_emb]        cluster orbital energies — PHYSICAL (not level-shifted)

@@ -796,16 +796,19 @@ def build_normalized_s(r2_ip_list, r2_ea_list, r1_ip_list, r1_ea_list,
                          for lam in range(n_act_vir)])
     rinv_EA = np.linalg.inv(R1mat_EA)
 
-    # s_IP[m,i,j,b] = -Σ_λ r2_ip[λ][i,j,b]·rinv_IP[λ,m]
+    # S = R2·U^{-1} with U[m,λ] = r1[λ][m] = R1mat[λ,m]  =>  coefficient (R1mat^T)^{-1}[λ,m]
+    # = rinv[m,λ].  (rinv[λ,m] — the transpose — was the 2026-10-14 nπ* bug: F_eff_oo
+    # eigenvalues drifted off the IP roots and n/σ hole mixing was lost; C2v H2O/CH2O hide it.)
+    # s_IP[m,i,j,b] = -Σ_λ r2_ip[λ][i,j,b]·rinv_IP[m,λ]
     s_IP = np.zeros((n_act_occ, nocc, nocc, nvir))
     for m in range(n_act_occ):
         for lam in range(n_act_occ):
-            s_IP[m] -= r2_ip_list[lam] * rinv_IP[lam, m]
-    # s_EA[e,i,a,b] = +Σ_λ r2_ea[λ][i,a,b]·rinv_EA[λ,e]
+            s_IP[m] -= r2_ip_list[lam] * rinv_IP[m, lam]
+    # s_EA[e,i,a,b] = +Σ_λ r2_ea[λ][i,a,b]·rinv_EA[e,λ]
     s_EA = np.zeros((n_act_vir, nocc, nvir, nvir))
     for e in range(n_act_vir):
         for lam in range(n_act_vir):
-            s_EA[e] += r2_ea_list[lam] * rinv_EA[lam, e]
+            s_EA[e] += r2_ea_list[lam] * rinv_EA[e, lam]
     return s_IP, s_EA
 
 
@@ -851,7 +854,7 @@ def build_g_canonical_full(
         # u_ae[a] = Σ_{k,c} Fov[k,c] s̃[k,a,c] + Σ_{c,d,l} Wvovv[a,l,c,d] s̃[l,c,d]
         u_ae = np.einsum("kc,kac->a", Fov, st) \
              + np.einsum("alcd,lcd->a", Wvovv, st)
-        F_eff_vv[active_vir_idx[e], :] += u_ae
+        F_eff_vv[:, active_vir_idx[e]] += u_ae      # <a|G_EA|e> = Lvv[a,e] + u_e[a] (column e)
 
     # ---------- hp intermediates (Eq.38-39) ----------
     # u_ma[m,a] = -Σ_{k,l,d} Wovvo[k,d,a,l]·s̃_IP[m][k,l,d]
@@ -911,7 +914,8 @@ def build_g_canonical_full(
                 + np.einsum("JGF,BIGF->IBJ", ss, Wvovv)
                 + np.einsum("NBF,INJF->IBJ", ss, wn_ooov))
         blk = 0.5 * (Ablk + Bblk)                    # [I,B,J]
-        u_akei[active_vir_idx[e], :, :, :] += np.einsum("IBJ->JBI", blk)  # [a,j,b,i]
+        # stored transposed: S^EA root on the KET particle (column), cf. F_eff_vv (2026-10-15)
+        u_akei[:, :, active_vir_idx[e], :] += np.einsum("IBJ->BIJ", blk)  # [a,j,b,i]
     # u_amei[a,m,e,i] (Eq.58, cross)
     u_amei = np.zeros((nvir, n_act_occ, n_act_vir, nocc))
     for m in range(n_act_occ):
@@ -1060,7 +1064,7 @@ def build_g_canonical_full(
                     if i == j:
                         val += F_eff_vv[a, b]
                     if a == b:
-                        val -= F_eff_oo[i, j]
+                        val -= F_eff_oo[j, i]   # <i|G_IP|m> = -F_eff_oo[m,i] (ket hole = row)
                     val += 2.0 * g_phhp[b, j, i, a]
                     val -=       g_phph[a, j, b, i]
                     G[row, col] += val

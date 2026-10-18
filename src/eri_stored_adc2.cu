@@ -525,7 +525,7 @@ STEOMResult adc2_spatial_orbital(RHF& cfg, ERI& eri_method,
                                  int nao, int n_emb, int n_emb_occ,
                                  int n_states, int n_frozen)
 {
-    (void)eri_method; (void)d_C_can; (void)nao;   // integrals already in MO basis (d_eri_mo)
+    (void)eri_method;   // integrals already in MO basis (d_eri_mo); d_C_can/nao used by the atom-character diagnostic
     const int num_occ = n_emb_occ - n_frozen;     // active occupied
     const int num_vir = n_emb - n_emb_occ;
     const int singles_dim = num_occ * num_vir;
@@ -671,6 +671,8 @@ STEOMResult adc2_spatial_orbital(RHF& cfg, ERI& eri_method,
     for (int k = 0; k < (int)exc.size(); ++k) {
         STEOMResult::PerRoot pr;
         pr.omega = exc[k];
+        if (evec.size() >= (size_t)(k + 1) * singles_dim)   // singles vector [i*nvir+a]
+            pr.R1.assign(evec.begin() + (size_t)k * singles_dim, evec.begin() + (size_t)(k + 1) * singles_dim);
         r.per_root.push_back(pr);
         rep << "   " << std::setw(2) << k << "   "
             << std::fixed << std::setprecision(8) << std::setw(12) << exc[k] << "   "
@@ -678,6 +680,13 @@ STEOMResult adc2_spatial_orbital(RHF& cfg, ERI& eri_method,
     }
     r.report = rep.str();
     std::cout << r.report;
+    // (diagnostic, env GANSU_STEOM_ATOM_CHAR=1) per-root hole/particle atom character,
+    // same analysis as the STEOM path; R1 = the ADC(2) singles vector.
+    if (const char* ac = std::getenv("GANSU_STEOM_ATOM_CHAR"); ac && ac[0] == '1' && d_C_can) {
+        std::vector<real_t> hC((size_t)nao * n_emb);
+        cudaMemcpy(hC.data(), d_C_can, hC.size() * sizeof(real_t), cudaMemcpyDeviceToHost);
+        report_cluster_atom_character(cfg, hC.data(), nao, n_emb, r);
+    }
     return r;
 }
 

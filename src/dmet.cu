@@ -605,6 +605,33 @@ DMET::build_bath_orbitals(const DMETFragment& frag,
         }
     }
 
+    // Orthonormality audit of the Schmidt cluster (report-only, always printed).
+    // The bath columns are normalised ANALYTICALLY by 1/√(1−σ²) with σ taken from the
+    // eigenvalues of AᵀA; for σ → 1 the environment norm √(1−σ²) is tiny and an
+    // absolute eigenvalue error ε makes the analytic norm wrong by ~ε/(1−σ²).
+    {
+        double min_1ms2 = 1e300, max_norm_dev = 0.0, max_off = 0.0;
+        int b = 0;
+        for (int i = 0; i < k; i++) {
+            if (!(sigma[i] > svd_threshold_ && sigma[i] < 1.0 - core_threshold)) continue;
+            min_1ms2 = std::min(min_1ms2, (double)(1.0 - sigma[i] * sigma[i]));
+            double nrm2 = 0.0;
+            for (int mu = 0; mu < nao; mu++) { const double v = C_emb_lo[mu * n_emb + n_frag + b]; nrm2 += v * v; }
+            max_norm_dev = std::max(max_norm_dev, std::fabs(nrm2 - 1.0));
+            ++b;
+        }
+        for (int p = n_frag; p < n_emb; p++)
+            for (int q = p + 1; q < n_emb; q++) {
+                double g = 0.0;
+                for (int mu = 0; mu < nao; mu++) g += (double)C_emb_lo[mu * n_emb + p] * C_emb_lo[mu * n_emb + q];
+                max_off = std::max(max_off, std::fabs(g));
+            }
+        std::cout << "  [DMET metric] Schmidt cluster: n_bath=" << n_bath << "  min(1−σ²) over kept bath = "
+                  << std::scientific << std::setprecision(2) << (n_bath ? min_1ms2 : 0.0)
+                  << "  max|‖bath‖²−1| = " << max_norm_dev << "  max|⟨bath|bath'⟩| = " << max_off
+                  << std::defaultfloat << std::endl;
+    }
+
     // C_emb_ao = S^{-1/2} × C_emb_lo
     std::vector<real_t> C_emb(nao * n_emb, 0.0);
     for (int mu = 0; mu < nao; mu++)
@@ -1589,15 +1616,23 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
             }
             Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(Phi.transpose() * Phi);
             int kept = 0;
+            double lam_min_kept = 0.0, lam_max_dropped = 0.0;
             for (int j = m - 1; j >= 0; --j) {      // descending eigenvalue → deterministic order
                 const double lam = es.eigenvalues()[j];
-                if (lam < lindep_thresh) continue;
+                if (lam < lindep_thresh) { lam_max_dropped = std::max(lam_max_dropped, std::max(lam, 0.0)); continue; }
                 const Eigen::VectorXd v = Phi * es.eigenvectors().col(j) / std::sqrt(lam);
                 std::vector<real_t> col(nao);
                 for (int mu = 0; mu < nao; ++mu) col[mu] = (real_t)v[mu];
                 added.push_back(std::move(col));
+                lam_min_kept = lam;
                 ++kept;
             }
+            std::cout << "  [DMET-STEOM bath aug] " << (occ ? "occupied" : "virtual") << " candidates "
+                      << m << " → kept " << kept << " linearly independent direction(s)"
+                      << std::scientific << std::setprecision(2)
+                      << " (min kept eigenvalue " << lam_min_kept
+                      << ", max dropped " << lam_max_dropped << ", threshold " << lindep_thresh << ")"
+                      << std::defaultfloat << std::endl;
             return kept;
         };
         // --- VIRTUAL NTOs (particle leak) → extra cluster virtuals ---------------
@@ -1623,6 +1658,51 @@ STEOMResult DMET::compute_steom(ERI& eri_method, int n_states) {
                     C_lo_aug[(size_t)mu * n_emb_aug + p] = C_emb_lo[mu * n_emb + p];
                 for (int j = 0; j < n_added; ++j)
                     C_lo_aug[(size_t)mu * n_emb_aug + (n_emb + j)] = added[j][mu];
+            }
+            {   // Orthonormality audit of the augmented cluster (always printed):
+                // max|CᵀC − I| over the bare block, the bare×added block and the added
+                // block. A broken augmentation shows up here as an O(1) entry.
+                Eigen::Map<const Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
+                    CA(C_lo_aug.data(), nao, n_emb_aug);
+                const Eigen::MatrixXd G = (CA.transpose() * CA).template cast<double>()
+                                          - Eigen::MatrixXd::Identity(n_emb_aug, n_emb_aug);
+                const double d_bare  = G.topLeftCorner(n_emb, n_emb).cwiseAbs().maxCoeff();
+                const double d_cross = G.topRightCorner(n_emb, n_added).cwiseAbs().maxCoeff();
+                const double d_added = G.bottomRightCorner(n_added, n_added).cwiseAbs().maxCoeff();
+                std::cout << "  [DMET-STEOM bath aug] cluster orthonormality max|CᵀC−I|: bare "
+                          << std::scientific << std::setprecision(2) << d_bare
+                          << ", bare×added " << d_cross << ", added " << d_added << std::defaultfloat
+                          << ((d_cross > 1e-8 || d_added > 1e-8) ? "  ⚠ added columns not orthonormal" : "")
+                          << std::endl;
+            }
+            {   // §4.3 gauge AFTER augmentation (report-only): same occupation-weighted
+                // uncaptured measure as above, with the cluster span = bare ∪ added. The
+                // added columns are orthonormal and orthogonal to the bare span, so
+                // capture_aug(φ) = capture_bare(φ) + Σ_q (q·φ)².
+                auto capture_aug = [&](const std::vector<real_t>& phi) {
+                    double cap = cluster_capture(phi);
+                    for (const auto& q : added) {
+                        double d = 0.0;
+                        for (int mu = 0; mu < nao; ++mu) d += (double)q[mu] * phi[mu];
+                        cap += d * d;
+                    }
+                    return cap;
+                };
+                auto wunc = [&](bool occ, int n_act, const std::vector<real_t>& occs) {
+                    double sw = 0.0, swu = 0.0;
+                    for (int k = 0; k < n_act; ++k) {
+                        const double w = std::max(0.0, (double)(k < (int)occs.size() ? occs[k] : real_t(0)));
+                        sw += w; swu += w * (1.0 - capture_aug(build_nto(occ, k)));
+                    }
+                    return sw > 0.0 ? swu / sw : 0.0;
+                };
+                const double u_vir = wunc(false, nto.n_act_vir, nto.nto_vir_occupations);
+                const double u_occ = wunc(true,  nto.n_act_occ, nto.nto_occ_occupations);
+                const double u = std::max(u_vir, u_occ);
+                std::cout << "  [DMET-STEOM bath aug] occupation-weighted uncaptured AFTER augmentation = "
+                          << std::fixed << std::setprecision(4) << u << " (vir " << u_vir << " / occ " << u_occ
+                          << ") → bath " << (u < 0.02 ? "SUFFICIENT" : u < 0.10 ? "MARGINAL" : "INSUFFICIENT")
+                          << " for the active excitation space (after augmentation)." << std::defaultfloat << std::endl;
             }
             std::vector<real_t> C_emb_aug((size_t)nao * n_emb_aug, 0.0);
             for (int mu = 0; mu < nao; ++mu)
