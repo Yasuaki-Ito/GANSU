@@ -4083,8 +4083,12 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     };
 #endif
 
-    // ---- s_IP[m][i,j,a] = -Σ_λ R2_IP[λ][i,j,a]·X_IP[m,λ] ; s_EA[e][i,a,b] = +Σ_λ R2_EA[λ]·X_EA[e,λ]
-    //  (X_IP[m_NTO,λ] = rinv_IP[λ,m_NTO] from build_x_matrices, matching build_normalized_s.)
+    // ---- s_IP[m][i,j,a] = -Σ_λ R2_IP[λ][i,j,a]·X_IP[λ,m] ; s_EA[e][i,a,b] = +Σ_λ R2_EA[λ]·X_EA[λ,e]
+    //  build_x_matrices stores U[m_NTO,λ] = r1^(λ)[m] and X = U^{-1}, so Ŝ = R2·U^{-1} needs
+    //  X[λ,m] (same orientation as build_F_eff_oo). Reading X[m,λ] (the transpose) was the
+    //  2026-10-14 nπ* bug: F_eff_oo eigenvalues drifted off the IP roots (cyclohexanone sto-3g
+    //  6.109 vs 6.041 eV) and the n/σ hole mixing was lost (+0.4 eV vs ORCA). Invisible in
+    //  C2v H2O/CH2O, where symmetry keeps U nearly diagonal.
     std::vector<real_t> sIP((size_t)NMo*NO*NO*NV, 0.0);
     std::vector<real_t> sEA((size_t)NMv*NO*NV*NV, 0.0);
     auto siP = [&](int m,int i,int j,int a)->real_t&{ return sIP[(((size_t)m*NO+i)*NO+j)*NV+a]; };
@@ -4092,14 +4096,14 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
     #pragma omp parallel for                       // over m (siP(m,·) distinct per m)
     for (int m=0;m<NMo;++m)
         for (int lam=0;lam<NMo;++lam){
-            const real_t x = XIP[(size_t)m*NMo+lam];
+            const real_t x = XIP[(size_t)lam*NMo+m];
             for (int i=0;i<NO;++i) for(int j=0;j<NO;++j) for(int a=0;a<NV;++a)
                 siP(m,i,j,a) -= r2ip(lam,i,j,a)*x;
         }
     #pragma omp parallel for                       // over e (seA(e,·) distinct per e)
     for (int e=0;e<NMv;++e)
         for (int lam=0;lam<NMv;++lam){
-            const real_t x = XEA[(size_t)e*NMv+lam];
+            const real_t x = XEA[(size_t)lam*NMv+e];
             for (int i=0;i<NO;++i) for(int a=0;a<NV;++a) for(int b=0;b<NV;++b)
                 seA(e,i,a,b) += r2ea(lam,i,a,b)*x;
         }
@@ -4122,11 +4126,14 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
             }
             Foo[(size_t)mrow*NO+i] += u;
         }
+    // Orientation (PySCF IP/EA matvecs, checked vs R1·Ω·R1^{-1} at complete active space):
+    //   <i|G_IP|m> = −Foo[m,i]  — Foo stays row-dressed; the G assembly reads Foo[j,i].
+    //   <a|G_EA|e> = Lvv[a,e] + u_e[a] — the S^EA dressing lands in COLUMN e.
     std::vector<real_t> Fvv = Lvv;   // [NV×NV]
-    #pragma omp parallel for collapse(2)           // (e,a) → Fvv[arow,a] distinct (arow distinct per e)
+    #pragma omp parallel for collapse(2)           // (e,a) → Fvv[a,acol] distinct (acol distinct per e)
     for (int e=0;e<NMv;++e)
         for (int a=0;a<NV;++a){
-            const int arow = active_vir_idx_[e];
+            const int acol = active_vir_idx_[e];
             real_t u=0.0;
             for (int k=0;k<NO;++k) for(int c=0;c<NV;++c){
                 const real_t st = 2.0*seA(e,k,a,c)-seA(e,k,c,a);
@@ -4136,7 +4143,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                 const real_t st = 2.0*seA(e,l,c,d)-seA(e,l,d,c);
                 u += wvovv(a,l,c,d)*st;
             }
-            Fvv[(size_t)arow*NV+a] += u;
+            Fvv[(size_t)a*NV+acol] += u;
         }
 
     bmark("F_eff_oo/vv");
@@ -4942,7 +4949,15 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
                         v -= seA(e,N,c,F)*wooov(N,i,k,F);
                     }
                 }
-                GPHPH(af,k,c,i)+=v;
+                // Placed with the S^EA root on the KET particle (column), like every other
+                // Ŝ dressing (F_eff_vv column, u_amci/u_amei ket hole/particle, g_phhp vswap):
+                // the term computed above is the row (bra-particle) form, so it is stored
+                // transposed — G[(k,c),(i,af)] instead of G[(i,af),(k,c)].  2026-10-15: the
+                // row placement only agreed with ORCA while F_eff_vv was also (wrongly)
+                // row-dressed; with F_eff_vv fixed it left ethylene cc-pVDZ S1 +0.10 eV high
+                // (column placement: +0.001 eV, Python reference).  Writes stay race-free:
+                // (e,k) owns the slab GPHPH(·,·,af,k).
+                GPHPH(c,i,af,k)+=v;
             }
         }
     #pragma omp parallel for collapse(2) schedule(static)  // distinct (kf,cf) per (m,e)
@@ -5602,7 +5617,7 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
             real_t v = triplet_ ? -GPHPH(a,j,b,i)
                                 : 2.0*GPHHP(b,j,i,a) - GPHPH(a,j,b,i);
             if (i==j) v += proj_full ? FvvP[(size_t)a*NV+b] : Fvv[(size_t)a*NV+b];
-            if (a==b) v -= proj_full ? FooP[(size_t)j*NO+i] : Foo[(size_t)i*NO+j];
+            if (a==b) v -= proj_full ? FooP[(size_t)j*NO+i] : Foo[(size_t)j*NO+i];
             Gmat[(size_t)row*total_dim_+col]=v;
         }
     }

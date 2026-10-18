@@ -158,7 +158,7 @@ ParameterManager::ParameterManager(bool set_default_values) {
         {"ip_eom_max_iter",       "500"},                   // int: Davidson max iterations
         {"ip_eom_verbose",        "1"},                     // int: 0 silent, 1 summary, 2 per-iter + intermediate norms
         // ----- EA-EOM-CCSD (bt-PNO-STEOM Phase P2) -----
-        {"ea_eom_ea_thresh",      "0.80"},                  // real_t: %singles filter for EA roots
+        {"ea_eom_ea_thresh",      "0.85"},                  // real_t: %singles filter for EA roots (0.80→0.85 2026-10-15: keeps out 2p1h-contaminated EA roots, e.g. cyclohexanone sto-3g %s=0.834)
         {"ea_eom_safety_margin",  "2"},                     // int: extra Davidson roots beyond n_act_vir
         {"ea_eom_followcis",      "1"},                     // bool: enable FollowCIS overlap-based active-root selection
         {"ea_eom_d_tol",          "1e-5"},                  // real_t: Davidson eigenvalue convergence

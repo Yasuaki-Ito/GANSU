@@ -766,7 +766,7 @@ protected:
     int    ip_eom_verbose_       = 1;
 
     // EA-EOM-CCSD (bt-PNO-STEOM Phase P2)
-    double ea_eom_ea_thresh_     = 0.80;
+    double ea_eom_ea_thresh_     = 0.85;
     int    ea_eom_safety_margin_ = 2;
     bool   ea_eom_followcis_     = true;
     double ea_eom_d_tol_         = 1e-5;
