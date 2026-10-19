@@ -2555,12 +2555,12 @@ static void compute_steom_ccsd_impl(RHF& rhf,
        << (dense_diag ? "dense non-Hermitian geev (deterministic)"
                       : "non-Hermitian Davidson")
        << (steom_triplet
-           ? ". Validated vs Python reference (triplet = F_eff − g_phph, routes "
-             "corrected 2026-06-20): CH2O sto-3g fc2 triplets 4.223 / 5.904 eV "
-             "(ORCA 4.197 / 5.959); H2O sto-3g FC1 lowest ~10.25 eV.\n"
-           : ". Validated vs Python reference (W^eff routes corrected 2026-06-20): "
-             "H2O sto-3g FC1 lowest two roots 0.432663 / 0.496991 Ha "
-             "(11.773 / 13.524 eV; ORCA 11.849 / 13.60).\n")
+           ? ". Checked against ORCA 6.1.1 (triplet = F_eff − g_phph; orientation "
+             "fixes 2026-10-15): CH2O sto-3g fc2 triplets 4.179 / 5.932 eV "
+             "(ORCA 4.197 / 5.959); H2O sto-3g FC1 lowest 10.254 eV (ORCA 10.257).\n"
+           : ". Checked against ORCA 6.1.1 (orientation fixes 2026-10-15): "
+             "H2O sto-3g FC1 lowest two roots 0.435335 / 0.499320 Ha "
+             "(11.846 / 13.587 eV; ORCA 11.848 / 13.601).\n")
        << "  STEOM " << (steom_triplet ? "TRIPLET " : "") << "excited-state energies"
        << (can_eta ? "  (η = % active character; low η ⇒ active space / DMET bath "
                      "under-describes this root, energy untrustworthy)" : "")
