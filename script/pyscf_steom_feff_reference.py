@@ -945,8 +945,9 @@ def build_g_canonical_full(
     # map exactly: Wamef[a_a,k_b,b_b,c_a]=-Wvovv[a,k,c,b], Wmnie[k_a,l_b,i_a,b_b]=Wooov[k,l,i,b])
     # to the closed-shell:
     #   g_phhp[b,j,i,a] += -Σ_kc Wvovv[a,k,c,b] s_IP[m][i,k,c] + 0.5 Σ_kl Wooov[k,l,i,b] s_IP[m][k,l,a]
-    # VALIDATED on BOTH molecules (base+IP singlet): H2O FC1 n→π* 11.773 vs ORCA 11.849;
-    # formaldehyde 4.429 vs ORCA 4.471. layout: g_phhp[b,k,j,c], root m -> k=occ_idx[m],
+    # (Values quoted here before 2026-10-15, H2O 11.773 and formaldehyde 4.429 eV, were
+    # those of the uncorrected orientation; corrected GANSU: H2O FC1 11.846 vs ORCA 11.848,
+    # formaldehyde 4.455 vs ORCA 4.470.) layout: g_phhp[b,k,j,c], root m -> k=occ_idx[m],
     # u_bmjc[:,m,:,:] = block[b, j(=access i), c(=access a)] = [b,i,a].
     u_bmjc = np.zeros((nvir, n_act_occ, nocc, nvir))
     for m in range(n_act_occ):

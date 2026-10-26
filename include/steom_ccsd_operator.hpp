@@ -345,7 +345,8 @@ private:
     /// with normalized s for consistency, and form the dense G^{1h1p} singlet
     /// matrix d_G_. Direct host port of Python build_g_canonical_full
     /// (Nooijen Eq.34-63). Validation gate (H2O sto-3g): lowest singlet
-    /// eigenvalues of d_G_ == 0.432663 / 0.496991 (Python ref, W^eff routes fixed 2026-06-20).
+    /// eigenvalues of d_G_ == 0.435335 / 0.499320 Ha (orientation fixes 2026-10-15;
+    /// ORCA 6.1.1: 11.848 / 13.601 eV).
     void build_W_eff_and_G();
 };
 

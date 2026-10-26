@@ -16,13 +16,19 @@
 #      excludes all H (floor), coverage ~0.97.
 #   3. Phase B gauge: bath MARGINAL with the virtual-space tail line present, and
 #      the size classification reports RIGHT-SIZED.
+#
+# The anchor roots were re-recorded on 2026-10-26 with the corrected STEOM-CCSD
+# solver (commit 35c0e1b, release v2026.10.19). The previous anchors
+# (4.2541 5.3653 5.9557, 2026-07-23) came from the solver before the
+# orientation fixes of 1c41534.
 set -u
 GANSU=${GANSU:-./gansu}
 XYZ=${XYZ:-../xyz/Naphthalene.xyz}
 AUX=${AUX:-../auxiliary_basis/cc-pvdz-rifit.gbs}
 COMMON="-x $XYZ -g cc-pvdz --eri_method ri -ag $AUX --post_hf_method dmet_steom --n_excited_states 3"
-# Anchor roots (eV), naphthalene cc-pVDZ DMET-STEOM auto-off n_cis=7 (2026-07-23):
-ANCHOR=(4.2541 5.3653 5.9557)
+# Anchor roots (eV), naphthalene cc-pVDZ DMET-STEOM auto-off, default active space
+# (corrected solver, 35c0e1b; 2026-10-26):
+ANCHOR=(4.2790 5.3914 5.9839)
 TOL=0.005   # eV
 fail=0
 

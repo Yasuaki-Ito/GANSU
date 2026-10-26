@@ -3942,7 +3942,8 @@ void STEOMCCSDOperator::build_F_eff_vv() {
 //  d_G_ matvec, so no GPU kernel for the build itself.
 //
 //  Validation gate (H2O sto-3g, (3,2) active): lowest singlet eigenvalues
-//  of d_G_ == 0.432663 / 0.496991 (Python reference, W^eff routes fixed 2026-06-20).
+//  of d_G_ == 0.435335 / 0.499320 Ha (orientation fixes 2026-10-15; ORCA 6.1.1:
+//  11.848 / 13.601 eV).
 // ==================================================================
 void STEOMCCSDOperator::build_W_eff_and_G() {
     const int NO = nocc_active_;
@@ -5637,10 +5638,9 @@ void STEOMCCSDOperator::build_W_eff_and_G() {
         for (size_t i=0;i<Gmat.size();++i) d_G_[i]=Gmat[i];
         for (int r=0;r<total_dim_;++r) d_diagonal_[r]=h_diag[r];
     }
-    // Verification aid: HOMO->LUMO diagonal element. After the 2026-06-20 W^eff route
-    // corrections (u_amci Wooov, u_akei ujaie, u_bmjc SO-derived) the H2O sto-3g (3,2)
-    // reference n->pi* diag ~ 0.433 (lowest STEOM root 0.432663 Ha = 11.773 eV; old buggy
-    // routes gave ~0.393).
+    // Verification aid: HOMO->LUMO diagonal element. With the 2026-10-15 orientation
+    // fixes the H2O sto-3g (3,2) n->pi* diag is ~0.435 (lowest STEOM root 0.435335 Ha =
+    // 11.846 eV; ORCA 6.1.1 11.848 eV).
     {
         const int hl = (NO - 1) * NV + 0;
         std::cout << "  STEOM-CCSD G^{1h1p} " << (triplet_ ? "TRIPLET" : "singlet")
